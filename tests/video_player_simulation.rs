@@ -1,0 +1,161 @@
+use debridmoviemapper::rd_client::RealDebridClient;
+use debridmoviemapper::tmdb_client::TmdbClient;
+use debridmoviemapper::vfs::{DebridVfs, VfsNode};
+use debridmoviemapper::identification::identify_torrent;
+use debridmoviemapper::dav_fs::DebridFileSystem;
+use dav_server::fs::{DavFileSystem, OpenOptions};
+use dav_server::davpath::DavPath;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use futures_util::StreamExt;
+use std::io::SeekFrom;
+
+#[tokio::test]
+async fn test_video_player_simulation() {
+    tracing_subscriber::fmt::init();
+    dotenvy::dotenv().ok();
+
+    let api_token = std::env::var("RD_API_TOKEN").expect("RD_API_TOKEN must be set").trim().to_string();
+    let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set").trim().to_string();
+
+    let rd_client = Arc::new(RealDebridClient::new(api_token));
+    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
+    let vfs = Arc::new(RwLock::new(DebridVfs::new()));
+
+    println!("Fetching torrents...");
+    let torrents = rd_client.get_torrents().await.expect("Failed to get torrents");
+    let downloaded = torrents.into_iter().filter(|t| t.status == "downloaded").take(20).collect::<Vec<_>>();
+    println!("Found {} downloaded torrents (sampled first 20)", downloaded.len());
+
+    let mut current_data = Vec::new();
+    let mut stream = futures_util::stream::iter(downloaded)
+        .map(|torrent| {
+            let rd_client = rd_client.clone();
+            let tmdb_client = tmdb_client.clone();
+            async move {
+                let info = rd_client.get_torrent_info(&torrent.id).await.expect("Failed to get torrent info");
+                let metadata = identify_torrent(&info, &tmdb_client).await;
+                (info, metadata)
+            }
+        })
+        .buffer_unordered(1);
+
+    while let Some(result) = stream.next().await {
+        current_data.push(result);
+    }
+
+    println!("Updating VFS...");
+    {
+        let mut vfs_lock = vfs.write().await;
+        vfs_lock.update(current_data);
+    }
+
+    let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone());
+    
+    let mut video_files = Vec::new();
+    {
+        let vfs_lock = vfs.read().await;
+        find_video_files(&vfs_lock.root, String::new(), &mut video_files);
+    }
+
+    if video_files.is_empty() {
+        println!("No video files found in VFS, skipping simulation.");
+        return;
+    }
+
+    // Select a few movies and shows at random
+    use rand::seq::SliceRandom;
+    let mut rng = rand::thread_rng();
+    
+    let movies: Vec<_> = video_files.iter().filter(|(p, _)| p.starts_with("Movies/")).collect();
+    let shows: Vec<_> = video_files.iter().filter(|(p, _)| p.starts_with("Shows/")).collect();
+
+    let mut selected = Vec::new();
+    if let Some(m) = movies.choose(&mut rng) {
+        selected.push(*m);
+    }
+    if let Some(s) = shows.choose(&mut rng) {
+        selected.push(*s);
+    }
+    
+    // If we didn't get enough from both, just pick some from all
+    if selected.len() < 2 {
+        for _ in 0..(2 - selected.len()) {
+            if let Some(any) = video_files.choose(&mut rng) {
+                if !selected.contains(&any) {
+                    selected.push(any);
+                }
+            }
+        }
+    }
+
+    for (path_str, size) in selected {
+        println!("Simulating video player for: {} (size: {})", path_str, size);
+        let encoded_path = encode_path_preserve_slashes(&format!("/{}", path_str));
+        let path = DavPath::new(&encoded_path).unwrap();
+        let mut opts = OpenOptions::default();
+        opts.read = true;
+        let mut file = dav_fs.open(&path, opts).await.expect("Failed to open file");
+
+        // 1. Play from beginning
+        println!("  Reading from beginning (64KB)...");
+        let bytes = file.read_bytes(64 * 1024).await.expect("Failed to read from beginning");
+        assert!(!bytes.is_empty(), "Read 0 bytes from beginning of {}", path_str);
+        println!("    Read {} bytes", bytes.len());
+
+        // 2. Fast forward (skip 10MB or 1MB if small)
+        let skip = if *size > 20 * 1024 * 1024 { 10 * 1024 * 1024 } else { 1024 * 1024 };
+        if *size > skip + 128 * 1024 {
+            println!("  Fast forwarding {} bytes...", skip);
+            let new_pos = file.seek(SeekFrom::Current(skip as i64)).await.expect("Failed to seek forward");
+            println!("    New position: {}", new_pos);
+            let bytes = file.read_bytes(64 * 1024).await.expect("Failed to read after fast forward");
+            assert!(!bytes.is_empty(), "Read 0 bytes after fast forward of {}", path_str);
+            println!("    Read {} bytes", bytes.len());
+        }
+
+        // 3. Skip to middle
+        if *size > 256 * 1024 {
+            let middle = size / 2;
+            println!("  Skipping to middle (pos: {})...", middle);
+            let new_pos = file.seek(SeekFrom::Start(middle)).await.expect("Failed to seek to middle");
+            assert_eq!(new_pos, middle);
+            println!("    New position: {}", new_pos);
+            let bytes = file.read_bytes(64 * 1024).await.expect("Failed to read at middle");
+            assert!(!bytes.is_empty(), "Read 0 bytes at middle of {}", path_str);
+            println!("    Read {} bytes", bytes.len());
+        }
+    }
+}
+
+fn encode_path_preserve_slashes(p: &str) -> String {
+    p.split('/')
+        .map(|seg| urlencoding::encode(seg).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn find_video_files<'a>(node: &'a VfsNode, current_path: String, files: &mut Vec<(String, u64)>) {
+    match node {
+        VfsNode::Directory { name, children, .. } => {
+            let next_path = if current_path.is_empty() {
+                name.clone()
+            } else if name.is_empty() {
+                current_path
+            } else {
+                format!("{}/{}", current_path, name)
+            };
+            for child in children.values() {
+                find_video_files(child, next_path.clone(), files);
+            }
+        }
+        VfsNode::File { name, size, .. } => {
+            let full_path = if current_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", current_path, name)
+            };
+            files.push((full_path, *size));
+        }
+    }
+}

@@ -1,0 +1,6 @@
+/target
+metadata.db/
+.env
+run.log
+.output.txt
+.idea/
