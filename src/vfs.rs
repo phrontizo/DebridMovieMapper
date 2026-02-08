@@ -93,7 +93,11 @@ impl DebridVfs {
             };
 
             let folder_name = if let Some(id) = &metadata.external_id {
-                format!("{} [id={}]", base_name, id)
+                if let Some((source, raw_id)) = id.split_once(':') {
+                    format!("{} [{}id-{}]", base_name, source, raw_id)
+                } else {
+                    format!("{} [id={}]", base_name, id)
+                }
             } else {
                 let count = used_names.entry(base_name.clone()).or_insert(0);
                 let name = if *count == 0 {
@@ -475,8 +479,8 @@ mod tests {
         if let VfsNode::Directory { children, .. } = &vfs.root {
             let movies = children.get("Movies").unwrap();
             if let VfsNode::Directory { children: movie_children, .. } = movies {
-                assert!(movie_children.contains_key("Same Title [id=tmdb:1]"));
-                assert!(movie_children.contains_key("Same Title [id=tmdb:2]"));
+                assert!(movie_children.contains_key("Same Title [tmdbid-1]"));
+                assert!(movie_children.contains_key("Same Title [tmdbid-2]"));
             }
         }
     }
@@ -537,7 +541,7 @@ mod tests {
         if let VfsNode::Directory { children, .. } = &vfs.root {
             let movies = children.get("Movies").unwrap();
             if let VfsNode::Directory { children: movie_children, .. } = movies {
-                let folder = movie_children.get("Duplicate Movie [id=tmdb:123]").expect("Folder missing");
+                let folder = movie_children.get("Duplicate Movie [tmdbid-123]").expect("Folder missing");
                 if let VfsNode::Directory { children: files, .. } = folder {
                     let file = files.get("Movie.mkv").expect("File missing");
                     if let VfsNode::File { size, rd_torrent_id, .. } = file {
