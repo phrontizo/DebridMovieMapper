@@ -29,11 +29,11 @@ TMDB_API_KEY=your_tmdb_api_key
 
 ## Running with Docker
 
-The easiest way to run DebridMovieMapper is using Docker.
+The easiest way to run DebridMovieMapper is using Docker. Pre-built multi-platform images are available via the GitHub Container Registry.
 
-### 1. Build the image
+### 1. Pull the image
 ```bash
-docker build -t debridmoviemapper .
+docker pull ghcr.io/phrontizo/debridmoviemapper:latest
 ```
 
 ### 2. Run the container
@@ -44,7 +44,17 @@ docker run -d \
   -e RD_API_TOKEN=your_token \
   -e TMDB_API_KEY=your_api_key \
   -v $(pwd)/metadata.db:/metadata.db \
-  debridmoviemapper
+  ghcr.io/phrontizo/debridmoviemapper:latest
+```
+
+### Building from source (Optional)
+If you prefer to build the image yourself, you can use the provided `build.sh` script for multi-platform builds:
+```bash
+./build.sh
+```
+Or build locally for your current architecture:
+```bash
+docker build -t debridmoviemapper .
 ```
 
 *Note: Mounting `metadata.db` ensures your media identification cache is preserved across container recreations.*

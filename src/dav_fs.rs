@@ -71,21 +71,39 @@ impl DavFileSystem for DebridFileSystem {
     fn open<'a>(&'a self, path: &'a DavPath, _options: OpenOptions) -> FsFuture<'a, Box<dyn DavFile>> {
         async move {
             let node = self.find_node(path).await.ok_or(FsError::NotFound)?;
-            if let VfsNode::File { name, size, rd_link, .. } = node {
-                Ok(Box::new(DebridFile {
-                    name,
-                    size,
-                    rd_link,
-                    rd_client: self.rd_client.clone(),
-                    link_cache: self.link_cache.clone(),
-                    client: self.client.clone(),
-                    download_semaphore: self.download_semaphore.clone(),
-                    pos: 0,
-                    buffer: Bytes::new(),
-                    buffer_offset: 0,
-                }) as Box<dyn DavFile>)
-            } else {
-                Err(FsError::Forbidden)
+            match node {
+                VfsNode::File { name, size, rd_link, .. } => {
+                    Ok(Box::new(DebridFile {
+                        name,
+                        size,
+                        rd_link: Some(rd_link),
+                        virtual_content: None,
+                        rd_client: self.rd_client.clone(),
+                        link_cache: self.link_cache.clone(),
+                        client: self.client.clone(),
+                        download_semaphore: self.download_semaphore.clone(),
+                        pos: 0,
+                        buffer: Bytes::new(),
+                        buffer_offset: 0,
+                    }) as Box<dyn DavFile>)
+                }
+                VfsNode::VirtualFile { name, content } => {
+                    let size = content.len() as u64;
+                    Ok(Box::new(DebridFile {
+                        name,
+                        size,
+                        rd_link: None,
+                        virtual_content: Some(Bytes::from(content)),
+                        rd_client: self.rd_client.clone(),
+                        link_cache: self.link_cache.clone(),
+                        client: self.client.clone(),
+                        download_semaphore: self.download_semaphore.clone(),
+                        pos: 0,
+                        buffer: Bytes::new(),
+                        buffer_offset: 0,
+                    }) as Box<dyn DavFile>)
+                }
+                VfsNode::Directory { .. } => Err(FsError::Forbidden),
             }
         }.boxed()
     }
@@ -126,6 +144,7 @@ impl DavMetaData for DebridMetaData {
     fn len(&self) -> u64 {
         match &self.node {
             VfsNode::File { size, .. } => *size,
+            VfsNode::VirtualFile { content, .. } => content.len() as u64,
             VfsNode::Directory { .. } => 0,
         }
     }
@@ -157,7 +176,8 @@ impl DavDirEntry for DebridDirEntry {
 struct DebridFile {
     name: String,
     size: u64,
-    rd_link: String,
+    rd_link: Option<String>,
+    virtual_content: Option<Bytes>,
     rd_client: Arc<RealDebridClient>,
     link_cache: Arc<RwLock<std::collections::HashMap<String, String>>>,
     client: reqwest::Client,
@@ -169,11 +189,18 @@ struct DebridFile {
 
 impl DavFile for DebridFile {
     fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
-        let node = VfsNode::File {
-            name: self.name.clone(),
-            size: self.size,
-            rd_torrent_id: "".to_string(),
-            rd_link: self.rd_link.clone(),
+        let node = if let Some(content) = &self.virtual_content {
+            VfsNode::VirtualFile {
+                name: self.name.clone(),
+                content: content.to_vec(),
+            }
+        } else {
+            VfsNode::File {
+                name: self.name.clone(),
+                size: self.size,
+                rd_torrent_id: "".to_string(),
+                rd_link: self.rd_link.clone().unwrap_or_default(),
+            }
         };
         async move {
             Ok(Box::new(DebridMetaData { node }) as Box<dyn DavMetaData>)
@@ -190,13 +217,27 @@ impl DavFile for DebridFile {
 
     fn read_bytes(&mut self, len: usize) -> FsFuture<'_, Bytes> {
         let offset = self.pos;
-        let rd_link = self.rd_link.clone();
+        let rd_link_opt = self.rd_link.clone();
+        let virtual_content = self.virtual_content.clone();
         let rd_client = self.rd_client.clone();
         let link_cache = self.link_cache.clone();
         let client = self.client.clone();
         let semaphore = self.download_semaphore.clone();
 
         async move {
+            // 0. Handle virtual content
+            if let Some(content) = virtual_content {
+                if offset >= content.len() as u64 {
+                    return Ok(Bytes::new());
+                }
+                let to_read = std::cmp::min(len, content.len() - offset as usize);
+                let data = content.slice(offset as usize..offset as usize + to_read);
+                self.pos += to_read as u64;
+                return Ok(data);
+            }
+
+            let rd_link = rd_link_opt.ok_or(FsError::GeneralFailure)?;
+
             // 1. Check if we can serve from buffer
             if offset >= self.buffer_offset && offset < self.buffer_offset + self.buffer.len() as u64 {
                 let start_in_buf = (offset - self.buffer_offset) as usize;

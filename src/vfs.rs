@@ -15,6 +15,10 @@ pub enum VfsNode {
         rd_torrent_id: String,
         rd_link: String,
     },
+    VirtualFile {
+        name: String,
+        content: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -109,6 +113,11 @@ impl DebridVfs {
                         self.add_torrent_files(&mut children, torrent, None);
                     }
                     if !children.is_empty() {
+                        let nfo_content = self.generate_nfo(&metadata);
+                        children.insert("movie.nfo".to_string(), VfsNode::VirtualFile {
+                            name: "movie.nfo".to_string(),
+                            content: nfo_content,
+                        });
                         nodes.insert(folder_name.clone(), VfsNode::Directory {
                             name: folder_name,
                             children,
@@ -151,6 +160,11 @@ impl DebridVfs {
                         }
                     }
                     if !show_children.is_empty() {
+                        let nfo_content = self.generate_nfo(&metadata);
+                        show_children.insert("tvshow.nfo".to_string(), VfsNode::VirtualFile {
+                            name: "tvshow.nfo".to_string(),
+                            content: nfo_content,
+                        });
                         nodes.insert(folder_name.clone(), VfsNode::Directory {
                             name: folder_name,
                             children: show_children,
@@ -170,6 +184,38 @@ impl DebridVfs {
                 children: shows_nodes,
             });
         }
+    }
+
+    fn generate_nfo(&self, metadata: &MediaMetadata) -> Vec<u8> {
+        let tag = match metadata.media_type {
+            MediaType::Movie => "movie",
+            MediaType::Show => "tvshow",
+        };
+        
+        let mut nfo = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" ?>\n<{}>\n  <title>{}</title>\n", tag, metadata.title);
+        if let Some(year) = &metadata.year {
+            nfo.push_str(&format!("  <year>{}</year>\n", year));
+        }
+        
+        if let Some(external_id) = &metadata.external_id {
+            if let Some((source, id)) = external_id.split_once(':') {
+                nfo.push_str(&format!("  <uniqueid type=\"{}\" default=\"true\">{}</uniqueid>\n", source, id));
+                match source {
+                    "tmdb" => {
+                        let path = match metadata.media_type {
+                            MediaType::Movie => "movie",
+                            MediaType::Show => "tv",
+                        };
+                        nfo.push_str(&format!("  <tmdbid>{}</tmdbid>\n", id));
+                        nfo.push_str(&format!("  <url>https://www.themoviedb.org/{}/{}</url>\n", path, id));
+                    },
+                    _ => {}
+                }
+            }
+        }
+        
+        nfo.push_str(&format!("</{}>\n", tag));
+        nfo.into_bytes()
     }
 
     fn add_torrent_files(&self, destination: &mut HashMap<String, VfsNode>, torrent: &TorrentInfo, path_prefix: Option<&str>) {
@@ -323,6 +369,7 @@ mod tests {
                 let movie_dir = movie_children.get("Movie").unwrap();
                 if let VfsNode::Directory { children: files, .. } = movie_dir {
                     assert!(files.contains_key("Movie.2023.1080p.mkv"), "Movie file not found");
+                    assert!(files.contains_key("movie.nfo"), "movie.nfo not found");
                 }
             } else {
                 panic!("Movies should be a directory");
@@ -333,11 +380,30 @@ mod tests {
                 let show_dir = show_children.get("Show").unwrap();
                 if let VfsNode::Directory { children: seasons, .. } = show_dir {
                     assert!(seasons.contains_key("Season 01"), "Season 01 not found");
+                    assert!(seasons.contains_key("tvshow.nfo"), "tvshow.nfo not found");
                 }
             } else {
                 panic!("Shows should be a directory");
             }
         }
+    }
+
+    #[test]
+    fn test_nfo_generation() {
+        let vfs = DebridVfs::new();
+        let metadata = MediaMetadata {
+            title: "Test Movie".to_string(),
+            year: Some("2024".to_string()),
+            media_type: MediaType::Movie,
+            external_id: Some("tmdb:12345".to_string()),
+        };
+        let content = String::from_utf8(vfs.generate_nfo(&metadata)).unwrap();
+        assert!(content.contains("<movie>"));
+        assert!(content.contains("<title>Test Movie</title>"));
+        assert!(content.contains("<year>2024</year>"));
+        assert!(content.contains("<uniqueid type=\"tmdb\" default=\"true\">12345</uniqueid>"));
+        assert!(content.contains("<tmdbid>12345</tmdbid>"));
+        assert!(content.contains("<url>https://www.themoviedb.org/movie/12345</url>"));
     }
 
     #[test]

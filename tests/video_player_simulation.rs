@@ -126,6 +126,33 @@ async fn test_video_player_simulation() {
             println!("    Read {} bytes", bytes.len());
         }
     }
+
+    // 4. Verify NFO files
+    println!("Verifying NFO files...");
+    let mut nfo_files = Vec::new();
+    {
+        let vfs_lock = vfs.read().await;
+        find_nfo_files(&vfs_lock.root, String::new(), &mut nfo_files);
+    }
+    
+    if nfo_files.is_empty() {
+        println!("No NFO files found in VFS, skipping verification.");
+    } else {
+        println!("Found {} NFO files", nfo_files.len());
+        for (path_str, size) in nfo_files.iter().take(5) {
+            println!("  Checking NFO: {} (size: {})", path_str, size);
+            let encoded_path = encode_path_preserve_slashes(&format!("/{}", path_str));
+            let path = DavPath::new(&encoded_path).unwrap();
+            let mut opts = OpenOptions::default();
+            opts.read = true;
+            let mut file = dav_fs.open(&path, opts).await.expect("Failed to open NFO file");
+            let bytes = file.read_bytes(*size as usize).await.expect("Failed to read NFO file");
+            assert_eq!(bytes.len() as u64, *size);
+            let content = String::from_utf8_lossy(&bytes);
+            assert!(content.starts_with("<?xml"));
+            println!("    NFO content starts with <?xml");
+        }
+    }
 }
 
 fn encode_path_preserve_slashes(p: &str) -> String {
@@ -156,6 +183,35 @@ fn find_video_files<'a>(node: &'a VfsNode, current_path: String, files: &mut Vec
                 format!("{}/{}", current_path, name)
             };
             files.push((full_path, *size));
+        }
+        VfsNode::VirtualFile { .. } => {}
+    }
+}
+
+fn find_nfo_files<'a>(node: &'a VfsNode, current_path: String, files: &mut Vec<(String, u64)>) {
+    match node {
+        VfsNode::Directory { name, children, .. } => {
+            let next_path = if current_path.is_empty() {
+                name.clone()
+            } else if name.is_empty() {
+                current_path
+            } else {
+                format!("{}/{}", current_path, name)
+            };
+            for child in children.values() {
+                find_nfo_files(child, next_path.clone(), files);
+            }
+        }
+        VfsNode::File { .. } => {}
+        VfsNode::VirtualFile { name, content } => {
+            if name.ends_with(".nfo") {
+                let full_path = if current_path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", current_path, name)
+                };
+                files.push((full_path, content.len() as u64));
+            }
         }
     }
 }
