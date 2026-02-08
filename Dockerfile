@@ -1,21 +1,22 @@
 # Stage 1: Build the application
-FROM rust:1.84-slim AS builder
+FROM rust:slim AS builder
 
-# Install build dependencies:
-# - musl-tools for static linking
-# - ca-certificates for fetching dependencies via HTTPS
+# Install build dependencies
 RUN apt-get update && apt-get install -y \
     musl-tools \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Determine the Rust target based on the build architecture
-RUN ARCH=$(uname -m) && \
-    if [ "$ARCH" = "x86_64" ]; then \
-        rustup target add x86_64-unknown-linux-musl; \
-    elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then \
-        rustup target add aarch64-unknown-linux-musl; \
-    fi
+# Use buildx provided TARGETARCH to determine Rust target
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        echo "x86_64-unknown-linux-musl" > /target_triple; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+        echo "aarch64-unknown-linux-musl" > /target_triple; \
+    else \
+        echo "Unsupported architecture: $TARGETARCH" && exit 1; \
+    fi && \
+    rustup target add $(cat /target_triple)
 
 WORKDIR /app
 
@@ -24,12 +25,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 # Build the application statically for the determined target
-RUN ARCH=$(uname -m) && \
-    if [ "$ARCH" = "x86_64" ]; then \
-        TARGET="x86_64-unknown-linux-musl"; \
-    elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then \
-        TARGET="aarch64-unknown-linux-musl"; \
-    fi && \
+RUN TARGET=$(cat /target_triple) && \
     cargo build --release --target $TARGET && \
     cp target/$TARGET/release/debridmoviemapper .
 
