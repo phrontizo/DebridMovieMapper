@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use crate::vfs::{DebridVfs, VfsNode};
 use crate::rd_client::RealDebridClient;
+use crate::repair::RepairManager;
 use std::io::SeekFrom;
 use bytes::Bytes;
 use reqwest::StatusCode;
@@ -15,16 +16,18 @@ use rand::Rng;
 pub struct DebridFileSystem {
     pub vfs: Arc<RwLock<DebridVfs>>,
     pub rd_client: Arc<RealDebridClient>,
+    pub repair_manager: Arc<RepairManager>,
     pub link_cache: Arc<RwLock<std::collections::HashMap<String, String>>>,
     pub client: reqwest::Client,
     pub download_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl DebridFileSystem {
-    pub fn new(rd_client: Arc<RealDebridClient>, vfs: Arc<RwLock<DebridVfs>>) -> Self {
+    pub fn new(rd_client: Arc<RealDebridClient>, vfs: Arc<RwLock<DebridVfs>>, repair_manager: Arc<RepairManager>) -> Self {
         Self {
             vfs,
             rd_client,
+            repair_manager,
             link_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             client: reqwest::Client::builder()
                 .user_agent("DebridMovieMapper/0.1.0")
@@ -45,7 +48,7 @@ impl DebridFileSystem {
         
         let path_osstr = path.as_rel_ospath();
         let path_str = path_osstr.to_str().unwrap();
-        if path_str == "." || path_str == "" {
+        if path_str == "." || path_str.is_empty() {
             return Some(current.clone());
         }
 
@@ -72,13 +75,15 @@ impl DavFileSystem for DebridFileSystem {
         async move {
             let node = self.find_node(path).await.ok_or(FsError::NotFound)?;
             match node {
-                VfsNode::File { name, size, rd_link, .. } => {
+                VfsNode::File { name, size, rd_torrent_id, rd_link } => {
                     Ok(Box::new(DebridFile {
                         name,
                         size,
+                        rd_torrent_id: Some(rd_torrent_id),
                         rd_link: Some(rd_link),
                         virtual_content: None,
                         rd_client: self.rd_client.clone(),
+                        repair_manager: self.repair_manager.clone(),
                         link_cache: self.link_cache.clone(),
                         client: self.client.clone(),
                         download_semaphore: self.download_semaphore.clone(),
@@ -92,9 +97,11 @@ impl DavFileSystem for DebridFileSystem {
                     Ok(Box::new(DebridFile {
                         name,
                         size,
+                        rd_torrent_id: None,
                         rd_link: None,
                         virtual_content: Some(Bytes::from(content)),
                         rd_client: self.rd_client.clone(),
+                        repair_manager: self.repair_manager.clone(),
                         link_cache: self.link_cache.clone(),
                         client: self.client.clone(),
                         download_semaphore: self.download_semaphore.clone(),
@@ -176,9 +183,11 @@ impl DavDirEntry for DebridDirEntry {
 struct DebridFile {
     name: String,
     size: u64,
+    rd_torrent_id: Option<String>,
     rd_link: Option<String>,
     virtual_content: Option<Bytes>,
     rd_client: Arc<RealDebridClient>,
+    repair_manager: Arc<RepairManager>,
     link_cache: Arc<RwLock<std::collections::HashMap<String, String>>>,
     client: reqwest::Client,
     download_semaphore: Arc<tokio::sync::Semaphore>,
@@ -218,8 +227,10 @@ impl DavFile for DebridFile {
     fn read_bytes(&mut self, len: usize) -> FsFuture<'_, Bytes> {
         let offset = self.pos;
         let rd_link_opt = self.rd_link.clone();
+        let rd_torrent_id = self.rd_torrent_id.clone();
         let virtual_content = self.virtual_content.clone();
         let rd_client = self.rd_client.clone();
+        let repair_manager = self.repair_manager.clone();
         let link_cache = self.link_cache.clone();
         let client = self.client.clone();
         let semaphore = self.download_semaphore.clone();
@@ -271,13 +282,36 @@ impl DavFile for DebridFile {
                 let download_link = if let Some(link) = download_link {
                     link
                 } else {
-                    let resp = rd_client.unrestrict_link(&rd_link).await.map_err(|e| {
-                        tracing::error!("Failed to unrestrict link {}: {}", rd_link, e);
-                        FsError::GeneralFailure
-                    })?;
-                    let mut cache = link_cache.write().await;
-                    cache.insert(rd_link.clone(), resp.download.clone());
-                    resp.download
+                    match rd_client.unrestrict_link(&rd_link).await {
+                        Ok(resp) => {
+                            let mut cache = link_cache.write().await;
+                            cache.insert(rd_link.clone(), resp.download.clone());
+                            resp.download
+                        }
+                        Err(e) => {
+                            // Check if it's a 503 error - if so, mark for repair and fail immediately
+                            let error_str = e.to_string();
+                            if error_str.contains("503") || error_str.contains("Service Unavailable") {
+                                tracing::error!("503 Service Unavailable on unrestrict for {}. Marking torrent for repair.", rd_link);
+                                // Mark torrent for repair if we have the torrent ID
+                                if let Some(ref torrent_id) = rd_torrent_id {
+                                    repair_manager.mark_broken(torrent_id, &rd_link).await;
+                                }
+                                return Err(FsError::GeneralFailure);
+                            }
+
+                            // For other errors, retry up to 3 attempts
+                            if attempts < 3 {
+                                tracing::warn!("Failed to unrestrict link {}, retrying (attempt {}/3): {}", rd_link, attempts, e);
+                                let delay = Duration::from_millis(2000 * attempts as u64 + rand::thread_rng().gen_range(0..1000));
+                                tokio::time::sleep(delay).await;
+                                continue;
+                            } else {
+                                tracing::error!("Failed to unrestrict link {} after {} attempts: {}", rd_link, attempts, e);
+                                return Err(FsError::GeneralFailure);
+                            }
+                        }
+                    }
                 };
 
                 let mut end = offset + fetch_size as u64 - 1;

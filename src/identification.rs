@@ -8,7 +8,7 @@ pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) 
     let representative_name = info.files.iter()
         .filter(|f| is_video_file(&f.path))
         .max_by_key(|f| f.bytes)
-        .map(|f| f.path.split('/').last().unwrap_or(&f.path))
+        .map(|f| f.path.split('/').next_back().unwrap_or(&f.path))
         .unwrap_or(&info.filename);
 
     if let Some(metadata) = identify_name(representative_name, &info.files, tmdb).await {
@@ -17,7 +17,7 @@ pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) 
         return metadata;
     }
 
-    if representative_name != &info.filename {
+    if representative_name != info.filename {
         debug!("Filename '{}' was generic or no match found. Trying torrent name: '{}'", representative_name, info.filename);
         if let Some(metadata) = identify_name(&info.filename, &info.files, tmdb).await {
             return metadata;
@@ -163,7 +163,7 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
     };
 
     if let Some((title, release_date, id, source, mtype)) = selected {
-        let year_val = release_date.map(|d| d.chars().filter(|c| c.is_digit(10)).take(4).collect());
+        let year_val = release_date.map(|d| d.chars().filter(|c| c.is_ascii_digit()).take(4).collect());
         info!("Identified {} ({:?}) as {:?} via TMDB (ID: {})", title, year_val, mtype, id);
         return Some(MediaMetadata {
             title,
@@ -197,7 +197,7 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     }
 
     // 2. Initial cleanup: replace dots and underscores with spaces
-    title = title.replace('.', " ").replace('_', " ");
+    title = title.replace(['.', '_'], " ");
 
     // 3. Handle "aka" - usually title aka alternative title
     if let Some(pos) = title.to_lowercase().find(" aka ") {
@@ -214,20 +214,16 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
 
     // 5. Handle stop words (technical metadata, quality, codecs, season info)
     let stop_re = Regex::new(r"(?i)\b(1080p|720p|2160p|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d+x\d+|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web-dl|h264|h265|x264|x265|remux|multi|vff|custom|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack|completa|complete|pol|eng|ita|ger|fra|spa|esp|rus|ukr)\b").unwrap();
-    
-    loop {
-        if let Some(m) = stop_re.find(&title) {
-            if m.start() == 0 {
-                // Metadata at start, strip it
-                title = title[m.end()..].to_string();
-                title = title.trim_start_matches(|c: char| !c.is_alphanumeric()).to_string();
-                if title.is_empty() { break; }
-            } else {
-                // Metadata in middle/end, truncate
-                title.truncate(m.start());
-                break;
-            }
+
+    while let Some(m) = stop_re.find(&title) {
+        if m.start() == 0 {
+            // Metadata at start, strip it
+            title = title[m.end()..].to_string();
+            title = title.trim_start_matches(|c: char| !c.is_alphanumeric()).to_string();
+            if title.is_empty() { break; }
         } else {
+            // Metadata in middle/end, truncate
+            title.truncate(m.start());
             break;
         }
     }
@@ -252,7 +248,7 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
 pub fn is_show_guess(files: &[rd_client::TorrentFile]) -> bool {
     let show_regex = Regex::new(r"(?i)s(\d+)\.?e(\d+)|s(\d+)|(\d+)x(\d+)|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|e\d+").unwrap();
     files.iter().any(|f| {
-        let filename = f.path.split('/').last().unwrap_or(&f.path);
+        let filename = f.path.split('/').next_back().unwrap_or(&f.path);
         show_regex.is_match(filename)
     }) ||
     files.iter().filter(|f| is_video_file(&f.path)).count() > 1

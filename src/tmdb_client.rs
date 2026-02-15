@@ -71,7 +71,7 @@ impl TmdbClient {
 
     async fn fetch_with_retry(&self, make_request: impl Fn() -> RequestBuilder) -> Result<TmdbResponse, reqwest::Error> {
         let mut last_error: Option<reqwest::Error> = None;
-        let max_attempts = 3;
+        let max_attempts = 10;
 
         for attempt in 1..=max_attempts {
             if attempt > 1 {
@@ -83,13 +83,17 @@ impl TmdbClient {
             match make_request().send().await {
                 Ok(resp) => {
                     let status = resp.status();
-                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS 
+                       || status == reqwest::StatusCode::SERVICE_UNAVAILABLE 
+                       || status == reqwest::StatusCode::BAD_GATEWAY 
+                       || status == reqwest::StatusCode::GATEWAY_TIMEOUT 
+                    {
                         let retry_after = resp.headers()
                             .get(reqwest::header::RETRY_AFTER)
                             .and_then(|h| h.to_str().ok())
                             .and_then(|s| s.parse::<u64>().ok())
                             .unwrap_or(1);
-                        warn!("TMDB API rate limited (429). Waiting {}s (attempt {}/{})", retry_after, attempt, max_attempts);
+                        warn!("TMDB API returned {} (attempt {}/{}). Waiting {}s", status, attempt, max_attempts, retry_after);
                         tokio::time::sleep(Duration::from_secs(retry_after)).await;
                     }
 

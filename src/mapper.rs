@@ -3,6 +3,7 @@ pub mod vfs;
 pub mod dav_fs;
 pub mod tmdb_client;
 pub mod identification;
+pub mod repair;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

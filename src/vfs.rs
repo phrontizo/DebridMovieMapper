@@ -39,6 +39,12 @@ pub struct DebridVfs {
     pub root: VfsNode,
 }
 
+impl Default for DebridVfs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DebridVfs {
     pub fn new() -> Self {
         let mut children = HashMap::new();
@@ -79,6 +85,9 @@ impl DebridVfs {
 
         let mut used_movie_names: HashMap<String, u32> = HashMap::new();
         let mut used_show_names: HashMap<String, u32> = HashMap::new();
+
+        // Compile regex outside the loop
+        let season_regex = Regex::new(r"(?i)s(\d+)|season\s*(\d+)|(\d+)x\d+").unwrap();
 
         for metadata in sorted_metadata {
             let mut torrents = media_groups.get(&metadata).unwrap().clone();
@@ -130,7 +139,6 @@ impl DebridVfs {
                 }
                 MediaType::Show => {
                     let mut show_children = HashMap::new();
-                    let season_regex = Regex::new(r"(?i)s(\d+)|season\s*(\d+)|(\d+)x\d+").unwrap();
 
                     // For shows, we process all torrents (e.g. different seasons)
                     // They are already sorted by size, so larger files will overwrite smaller ones if paths match
@@ -140,7 +148,7 @@ impl DebridVfs {
                             if file.selected == 1 {
                                 if is_video_file(&file.path) {
                                     if let Some(link) = torrent.links.get(link_idx) {
-                                        let filename = file.path.split('/').last().unwrap_or(&file.path);
+                                        let filename = file.path.split('/').next_back().unwrap_or(&file.path);
                                         let season = season_regex.captures(filename)
                                             .and_then(|cap| {
                                                 cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3))
@@ -204,16 +212,13 @@ impl DebridVfs {
         if let Some(external_id) = &metadata.external_id {
             if let Some((source, id)) = external_id.split_once(':') {
                 nfo.push_str(&format!("  <uniqueid type=\"{}\" default=\"true\">{}</uniqueid>\n", source, id));
-                match source {
-                    "tmdb" => {
-                        let path = match metadata.media_type {
-                            MediaType::Movie => "movie",
-                            MediaType::Show => "tv",
-                        };
-                        nfo.push_str(&format!("  <tmdbid>{}</tmdbid>\n", id));
-                        nfo.push_str(&format!("  <url>https://www.themoviedb.org/{}/{}</url>\n", path, id));
-                    },
-                    _ => {}
+                if source == "tmdb" {
+                    let path = match metadata.media_type {
+                        MediaType::Movie => "movie",
+                        MediaType::Show => "tv",
+                    };
+                    nfo.push_str(&format!("  <tmdbid>{}</tmdbid>\n", id));
+                    nfo.push_str(&format!("  <url>https://www.themoviedb.org/{}/{}</url>\n", path, id));
                 }
             }
         }
@@ -228,7 +233,7 @@ impl DebridVfs {
             if file.selected == 1 {
                 if is_video_file(&file.path) {
                     if let Some(link) = torrent.links.get(link_idx) {
-                        let filename = file.path.split('/').last().unwrap_or(&file.path);
+                        let filename = file.path.split('/').next_back().unwrap_or(&file.path);
                         let path = if let Some(prefix) = path_prefix {
                             format!("{}/{}", prefix, filename.trim_start_matches('/'))
                         } else {

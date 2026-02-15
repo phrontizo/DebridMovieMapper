@@ -3,6 +3,7 @@ use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::vfs::{DebridVfs, VfsNode};
 use debridmoviemapper::identification::identify_torrent;
 use debridmoviemapper::dav_fs::DebridFileSystem;
+use debridmoviemapper::repair::RepairManager;
 use dav_server::fs::{DavFileSystem, OpenOptions};
 use dav_server::davpath::DavPath;
 use std::sync::Arc;
@@ -50,7 +51,8 @@ async fn test_video_player_simulation() {
         vfs_lock.update(current_data);
     }
 
-    let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone());
+    let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
+    let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone(), repair_manager);
     
     let mut video_files = Vec::new();
     {
@@ -93,8 +95,10 @@ async fn test_video_player_simulation() {
         println!("Simulating video player for: {} (size: {})", path_str, size);
         let encoded_path = encode_path_preserve_slashes(&format!("/{}", path_str));
         let path = DavPath::new(&encoded_path).unwrap();
-        let mut opts = OpenOptions::default();
-        opts.read = true;
+        let opts = OpenOptions {
+            read: true,
+            ..Default::default()
+        };
         let mut file = dav_fs.open(&path, opts).await.expect("Failed to open file");
 
         // 1. Play from beginning
@@ -143,8 +147,10 @@ async fn test_video_player_simulation() {
             println!("  Checking NFO: {} (size: {})", path_str, size);
             let encoded_path = encode_path_preserve_slashes(&format!("/{}", path_str));
             let path = DavPath::new(&encoded_path).unwrap();
-            let mut opts = OpenOptions::default();
-            opts.read = true;
+            let opts = OpenOptions {
+                read: true,
+                ..Default::default()
+            };
             let mut file = dav_fs.open(&path, opts).await.expect("Failed to open NFO file");
             let bytes = file.read_bytes(*size as usize).await.expect("Failed to read NFO file");
             assert_eq!(bytes.len() as u64, *size);
@@ -162,7 +168,7 @@ fn encode_path_preserve_slashes(p: &str) -> String {
         .join("/")
 }
 
-fn find_video_files<'a>(node: &'a VfsNode, current_path: String, files: &mut Vec<(String, u64)>) {
+fn find_video_files(node: &VfsNode, current_path: String, files: &mut Vec<(String, u64)>) {
     match node {
         VfsNode::Directory { name, children, .. } => {
             let next_path = if current_path.is_empty() {
@@ -188,7 +194,7 @@ fn find_video_files<'a>(node: &'a VfsNode, current_path: String, files: &mut Vec
     }
 }
 
-fn find_nfo_files<'a>(node: &'a VfsNode, current_path: String, files: &mut Vec<(String, u64)>) {
+fn find_nfo_files(node: &VfsNode, current_path: String, files: &mut Vec<(String, u64)>) {
     match node {
         VfsNode::Directory { name, children, .. } => {
             let next_path = if current_path.is_empty() {
