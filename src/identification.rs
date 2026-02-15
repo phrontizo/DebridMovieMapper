@@ -98,29 +98,42 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
         movie_results.extend(movie_no_year);
     }
 
-    let best_tv = tv_results.iter().find(|r| {
-        normalize_title(&r.title) == normalized_cleaned || 
+    // Find exact matches and prefer highest popularity among exact matches
+    let exact_tv_matches: Vec<_> = tv_results.iter().filter(|r| {
+        normalize_title(&r.title) == normalized_cleaned ||
         r.original_title.as_ref().map(|t| normalize_title(t) == normalized_cleaned).unwrap_or(false)
-    }).or_else(|| {
+    }).collect();
+
+    let best_tv = if !exact_tv_matches.is_empty() {
+        exact_tv_matches.into_iter().max_by(|a, b| {
+            a.popularity.partial_cmp(&b.popularity).unwrap_or(std::cmp::Ordering::Equal)
+        })
+    } else {
         // Only pick first result as fallback if the cleaned name is not too short
         if cleaned_name.len() > 3 {
             tv_initial.first().or(tv_results.first())
         } else {
             None
         }
-    });
+    };
 
-    let best_movie = movie_results.iter().find(|r| {
-        normalize_title(&r.title) == normalized_cleaned || 
+    let exact_movie_matches: Vec<_> = movie_results.iter().filter(|r| {
+        normalize_title(&r.title) == normalized_cleaned ||
         r.original_title.as_ref().map(|t| normalize_title(t) == normalized_cleaned).unwrap_or(false)
-    }).or_else(|| {
+    }).collect();
+
+    let best_movie = if !exact_movie_matches.is_empty() {
+        exact_movie_matches.into_iter().max_by(|a, b| {
+            a.popularity.partial_cmp(&b.popularity).unwrap_or(std::cmp::Ordering::Equal)
+        })
+    } else {
         // Only pick first result as fallback if the cleaned name is not too short
         if cleaned_name.len() > 3 {
             movie_initial.first().or(movie_results.first())
         } else {
             None
         }
-    });
+    };
 
     let selected = match (best_tv, best_movie) {
         (Some(tv), Some(movie)) => {
@@ -466,5 +479,44 @@ mod tests {
         // It should fallback to cleaned name "UC"
         assert_eq!(metadata.title, "UC");
         assert_eq!(metadata.external_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_flow_2024_prefers_popular() {
+        dotenvy::dotenv().ok();
+        let tmdb_api_key = std::env::var("TMDB_API_KEY").unwrap_or_else(|_| "839969cf4f1e183aa5f010f7c4c643f1".to_string());
+        let tmdb_client = TmdbClient::new(tmdb_api_key);
+
+        let info = TorrentInfo {
+            id: "flow_id".to_string(),
+            filename: "Flow.2024.1080p.BluRay.x264.mkv".to_string(),
+            original_filename: "Flow.2024.1080p.BluRay.x264.mkv".to_string(),
+            hash: "hash".to_string(),
+            bytes: 5000000000,
+            original_bytes: 5000000000,
+            host: "host".to_string(),
+            split: 1,
+            progress: 100.0,
+            status: "downloaded".to_string(),
+            added: "2024-01-01".to_string(),
+            files: vec![
+                TorrentFile {
+                    id: 1,
+                    path: "Flow.2024.1080p.BluRay.x264.mkv".to_string(),
+                    bytes: 5000000000,
+                    selected: 1,
+                }
+            ],
+            links: vec!["http://link1".to_string()],
+            ended: Some("2024-01-01".to_string()),
+        };
+
+        let metadata = identify_torrent(&info, &tmdb_client).await;
+
+        // Should identify as the popular Oscar-nominated animated film (823219)
+        // NOT the 8-minute short film (1281775)
+        assert_eq!(metadata.external_id, Some("tmdb:823219".to_string()));
+        assert_eq!(metadata.title, "Flow");
+        assert_eq!(metadata.media_type, MediaType::Movie);
     }
 }

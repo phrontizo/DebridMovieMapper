@@ -289,13 +289,40 @@ impl DavFile for DebridFile {
                             resp.download
                         }
                         Err(e) => {
-                            // Check if it's a 503 error - if so, mark for repair and fail immediately
+                            // Check if it's a 503 error - if so, mark for repair and trigger immediate repair
                             let error_str = e.to_string();
                             if error_str.contains("503") || error_str.contains("Service Unavailable") {
-                                tracing::error!("503 Service Unavailable on unrestrict for {}. Marking torrent for repair.", rd_link);
-                                // Mark torrent for repair if we have the torrent ID
+                                tracing::error!("503 Service Unavailable on unrestrict for {}. Marking torrent for immediate repair.", rd_link);
+                                // Mark torrent for repair and trigger immediate repair if we have the torrent ID
                                 if let Some(ref torrent_id) = rd_torrent_id {
                                     repair_manager.mark_broken(torrent_id, &rd_link).await;
+
+                                    // Trigger immediate repair in background (with deduplication inside repair_manager)
+                                    let repair_mgr = repair_manager.clone();
+                                    let rd_client_clone = rd_client.clone();
+                                    let torrent_id_clone = torrent_id.clone();
+                                    // Generate random delay outside async block to avoid Send issues with ThreadRng
+                                    let delay_ms = rand::thread_rng().gen_range(10..100);
+                                    tokio::spawn(async move {
+                                        // Add small delay to let first task win the race and set Repairing state
+                                        // This prevents all concurrent 503s from calling get_torrent_info simultaneously
+                                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+                                        // The repair_manager will handle deduplication, so we can safely spawn this
+                                        // Multiple spawns for the same torrent will be deduplicated inside repair_torrent()
+                                        match rd_client_clone.get_torrent_info(&torrent_id_clone).await {
+                                            Ok(torrent_info) => {
+                                                tracing::debug!("Fetched torrent info for immediate repair: {}", torrent_id_clone);
+                                                if let Err(e) = repair_mgr.repair_torrent(&torrent_info).await {
+                                                    // Errors are expected (rate limiting, already in progress, etc.)
+                                                    tracing::debug!("Immediate repair skipped for torrent {}: {}", torrent_id_clone, e);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("Failed to fetch torrent info for repair of {}: {}", torrent_id_clone, e);
+                                            }
+                                        }
+                                    });
                                 }
                                 return Err(FsError::GeneralFailure);
                             }

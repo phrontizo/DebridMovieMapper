@@ -21,6 +21,7 @@ pub struct TorrentHealth {
     pub failed_links: HashSet<String>,
     pub last_check: std::time::Instant,
     pub repair_attempts: u32,
+    pub last_repair_trigger: Option<std::time::Instant>,
 }
 
 #[derive(Debug)]
@@ -79,6 +80,7 @@ impl RepairManager {
                 failed_links: HashSet::new(),
                 last_check: std::time::Instant::now(),
                 repair_attempts: previous_attempts,
+                last_repair_trigger: None,
             });
         }
 
@@ -173,25 +175,63 @@ impl RepairManager {
 
     /// Attempt to repair a broken torrent by re-adding it
     pub async fn repair_torrent(&self, torrent_info: &TorrentInfo) -> Result<(), String> {
+        // Check if repair is already in progress or recently triggered (within 30 seconds)
+        {
+            let health_map = self.health_status.read().await;
+            if let Some(health) = health_map.get(&torrent_info.id) {
+                // If already repairing, skip
+                if health.state == RepairState::Repairing {
+                    debug!("Repair already in progress for torrent '{}', skipping duplicate", torrent_info.filename);
+                    return Err("Repair already in progress".to_string());
+                }
+
+                // If repair triggered within last 30 seconds, skip (rate limiting)
+                if let Some(last_trigger) = health.last_repair_trigger {
+                    if last_trigger.elapsed().as_secs() < 30 {
+                        debug!("Repair recently triggered for torrent '{}' ({}s ago), skipping",
+                            torrent_info.filename, last_trigger.elapsed().as_secs());
+                        return Err("Repair rate limited".to_string());
+                    }
+                }
+            }
+        }
+
         info!("========================================");
         info!("REPAIR STARTED: Torrent '{}' ({})", torrent_info.filename, torrent_info.id);
         info!("========================================");
 
         let mut health_map = self.health_status.write().await;
         let attempt_num = if let Some(health) = health_map.get_mut(&torrent_info.id) {
-            health.state = RepairState::Repairing;
-            health.repair_attempts += 1;
-
-            // Don't retry if already failed 3 times
-            if health.repair_attempts > 3 {
+            // Check if already failed 3 times BEFORE incrementing
+            if health.repair_attempts >= 3 {
                 error!("Torrent '{}' ({}) has failed repair 3 times, marking as permanently FAILED",
                     torrent_info.filename, torrent_info.id);
                 health.state = RepairState::Failed;
                 drop(health_map);
                 return Err("Maximum repair attempts exceeded".to_string());
             }
+
+            // Double-check state hasn't changed (another task might have started repairing)
+            if health.state == RepairState::Repairing {
+                debug!("Repair already in progress (race condition detected), skipping");
+                drop(health_map);
+                return Err("Repair already in progress".to_string());
+            }
+
+            health.state = RepairState::Repairing;
+            health.repair_attempts += 1;
+            health.last_repair_trigger = Some(std::time::Instant::now());
             health.repair_attempts
         } else {
+            // First time seeing this torrent
+            health_map.insert(torrent_info.id.clone(), TorrentHealth {
+                torrent_id: torrent_info.id.clone(),
+                state: RepairState::Repairing,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 1,
+                last_repair_trigger: Some(std::time::Instant::now()),
+            });
             1
         };
         drop(health_map);
@@ -259,6 +299,7 @@ impl RepairManager {
                                         failed_links: HashSet::new(),
                                         last_check: std::time::Instant::now(),
                                         repair_attempts: 0,
+                                        last_repair_trigger: None,
                                     });
 
                                     info!("========================================");
@@ -343,6 +384,7 @@ impl RepairManager {
             failed_links,
             last_check: std::time::Instant::now(),
             repair_attempts: previous_attempts,
+            last_repair_trigger: None,
         });
     }
 }
