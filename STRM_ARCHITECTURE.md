@@ -102,7 +102,27 @@ However, with STRM files, the rclone configuration is much simpler since files a
 
 ### Recommended rclone Configuration
 
-**Option 1: Minimal (No Cache) - Recommended**
+**Recommended: Writes Mode (Suppresses Warnings)**
+
+```bash
+rclone mount debrid: /mnt/debrid \
+  --vfs-cache-mode writes \
+  --vfs-write-back 5s \
+  --vfs-cache-max-age 1h \
+  --vfs-cache-max-size 1G \
+  --no-modtime \
+  --dir-cache-time 10m \
+  --poll-interval 30s \
+  --allow-other
+```
+
+**Why `writes` mode:**
+- Suppresses rclone's "cache recommended" warning
+- Only caches write operations (STRM files are read-only, so nothing cached)
+- Max 1GB cache limit (will never fill - STRM files are <1KB each)
+- rclone won't complain about WebDAV streaming limitations
+
+**Alternative: No Cache (Works but shows warning)**
 
 ```bash
 rclone mount debrid: /mnt/debrid \
@@ -113,21 +133,18 @@ rclone mount debrid: /mnt/debrid \
   --allow-other
 ```
 
-**Why this works now:**
-- STRM files are <1KB (no need for VFS cache)
-- Jellyfin only reads tiny text files during scan
-- Actual video streaming goes directly from RD to Jellyfin
-
-**Option 2: Writes Only (If Needed)**
-
-```bash
-rclone mount debrid: /mnt/debrid \
-  --vfs-cache-mode writes \
-  --dir-cache-time 10m \
-  --allow-other
+**Warning in logs:**
+```
+NOTICE: webdav root '': --vfs-cache-mode writes or full is recommended for this remote as it can't stream
 ```
 
-**DO NOT USE:** `--vfs-cache-mode full` (this will try to cache entire files)
+**Why this warning appears:**
+- rclone assumes WebDAV will stream large files
+- With STRM files, we're only reading tiny text files
+- Videos stream directly from Real-Debrid (not through rclone)
+- Warning can be safely ignored, but use `writes` mode to suppress it
+
+**DO NOT USE:** `--vfs-cache-mode full` (will try to download/cache the RD URLs)
 
 ### Jellyfin Library Settings
 
