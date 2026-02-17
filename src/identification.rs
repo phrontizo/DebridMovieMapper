@@ -106,15 +106,16 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
         }
     }
 
-    let tv_has_exact = tv_results.iter().any(|r| {
-        normalize_title(&r.title) == normalized_cleaned || 
-        r.original_title.as_ref().map(|t| normalize_title(t) == normalized_cleaned).unwrap_or(false)
-    });
-    
-    let movie_has_exact = movie_results.iter().any(|r| {
-        normalize_title(&r.title) == normalized_cleaned || 
-        r.original_title.as_ref().map(|t| normalize_title(t) == normalized_cleaned).unwrap_or(false)
-    });
+    // Helper to check if results contain exact title match
+    let has_exact_match = |results: &[TmdbSearchResult]| -> bool {
+        results.iter().any(|r| {
+            normalize_title(&r.title) == normalized_cleaned ||
+            r.original_title.as_ref().map(|t| normalize_title(t) == normalized_cleaned).unwrap_or(false)
+        })
+    };
+
+    let tv_has_exact = has_exact_match(&tv_results);
+    let movie_has_exact = has_exact_match(&movie_results);
 
     // If we have a year but no exact title match yet, try searching without the year
     if !tv_has_exact && !movie_has_exact && year.is_some() {
@@ -132,14 +133,12 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
 
     let best_tv = if !tv_results.is_empty() {
         if is_short_title {
-            // Short title: require exact match + year match (no popularity threshold)
             tv_results.iter().filter(|r| {
                 let normalized_title = normalize_title(&r.title);
                 let title_matches = normalized_title == normalized_cleaned;
                 let year_matches = year.as_ref()
                     .map(|y| r.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false))
                     .unwrap_or(false);
-
                 title_matches && year_matches
             }).max_by(|a, b| {
                 let score_a = score_result(a, &normalized_cleaned, &year);
@@ -147,7 +146,6 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
                 score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
             })
         } else {
-            // Normal length title: use standard scoring
             tv_results.iter().max_by(|a, b| {
                 let score_a = score_result(a, &normalized_cleaned, &year);
                 let score_b = score_result(b, &normalized_cleaned, &year);
@@ -160,14 +158,12 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
 
     let best_movie = if !movie_results.is_empty() {
         if is_short_title {
-            // Short title: require exact match + year match (no popularity threshold)
             movie_results.iter().filter(|r| {
                 let normalized_title = normalize_title(&r.title);
                 let title_matches = normalized_title == normalized_cleaned;
                 let year_matches = year.as_ref()
                     .map(|y| r.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false))
                     .unwrap_or(false);
-
                 title_matches && year_matches
             }).max_by(|a, b| {
                 let score_a = score_result(a, &normalized_cleaned, &year);
@@ -175,7 +171,6 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
                 score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
             })
         } else {
-            // Normal length title: use standard scoring
             movie_results.iter().max_by(|a, b| {
                 let score_a = score_result(a, &normalized_cleaned, &year);
                 let score_b = score_result(b, &normalized_cleaned, &year);
@@ -188,13 +183,23 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
 
     let selected = match (best_tv, best_movie) {
         (Some(tv), Some(movie)) => {
-            let tv_exact = normalize_title(&tv.title) == normalized_cleaned || 
-                           tv.original_title.as_ref().map(|t| normalize_title(t) == normalized_cleaned).unwrap_or(false);
-            let movie_exact = normalize_title(&movie.title) == normalized_cleaned || 
-                              movie.original_title.as_ref().map(|t| normalize_title(t) == normalized_cleaned).unwrap_or(false);
+            // Helper to check exact title match
+            let is_exact = |r: &TmdbSearchResult| -> bool {
+                normalize_title(&r.title) == normalized_cleaned ||
+                r.original_title.as_ref().map(|t| normalize_title(t) == normalized_cleaned).unwrap_or(false)
+            };
 
-            let tv_year_match = year.as_ref().map(|y| tv.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false)).unwrap_or(false);
-            let movie_year_match = year.as_ref().map(|y| movie.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false)).unwrap_or(false);
+            // Helper to check year match
+            let has_year_match = |r: &TmdbSearchResult| -> bool {
+                year.as_ref()
+                    .map(|y| r.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false))
+                    .unwrap_or(false)
+            };
+
+            let tv_exact = is_exact(tv);
+            let movie_exact = is_exact(movie);
+            let tv_year_match = has_year_match(tv);
+            let movie_year_match = has_year_match(movie);
 
             let tv_exact_year = tv_exact && tv_year_match;
             let movie_exact_year = movie_exact && movie_year_match;
