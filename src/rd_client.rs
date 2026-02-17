@@ -161,7 +161,7 @@ impl RealDebridClient {
     /// Helper to handle rate limiting and retry-after headers
     async fn handle_retryable_status(
         status: reqwest::StatusCode,
-        headers: &reqwest::header::HeaderMap,
+        headers: &HeaderMap,
         attempt: u32,
         max_attempts: u32,
     ) {
@@ -325,13 +325,13 @@ impl RealDebridClient {
 
                     if status.is_success() {
                         // Try to parse the response
-                        match resp.json::<UnrestrictResponse>().await {
-                            Ok(_) => return true,
+                        return match resp.json::<UnrestrictResponse>().await {
+                            Ok(_) => true,
                             Err(e) => {
                                 warn!("Link health check failed to parse response for {}: {}", link, e);
-                                return false;
+                                false
                             }
-                        }
+                        };
                     } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                         // 429 - Rate limited, use exponential backoff
                         let retry_after = resp.headers()
