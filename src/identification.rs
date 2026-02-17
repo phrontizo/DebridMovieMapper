@@ -61,22 +61,40 @@ fn score_result(result: &TmdbSearchResult, normalized_query: &str, year: &Option
         score += 100.0; // Partial title match
     }
 
-    // Year match (very important)
+    // Vote count and rating (strong signal for well-known content)
+    // This comes before year matching to prevent obscure exact-year matches
+    // from beating well-known off-by-one matches
+    let vote_count = result.vote_count.unwrap_or(0);
+    if vote_count > 100 {
+        // Heavily weight popular content (100+ votes)
+        // Max contribution: ~100 points (10 rating × 10 multiplier)
+        score += result.vote_average.unwrap_or(0.0) * 10.0;
+        score += (vote_count as f64).log10() * 50.0; // Logarithmic vote count bonus
+    } else if vote_count > 10 {
+        // Moderately weight content with some votes
+        score += result.vote_average.unwrap_or(0.0) * 5.0;
+    }
+
+    // Year match (important, but with tolerance for off-by-one errors)
     if let Some(y) = year {
-        if result.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false) {
-            score += 500.0; // Year matches
+        if let Some(release_date) = &result.release_date {
+            if let Ok(query_year) = y.parse::<i32>() {
+                if let Some(release_year_str) = release_date.get(0..4) {
+                    if let Ok(release_year) = release_year_str.parse::<i32>() {
+                        let year_diff = (query_year - release_year).abs();
+                        if year_diff == 0 {
+                            score += 200.0; // Exact year match
+                        } else if year_diff == 1 {
+                            score += 150.0; // Close year match (±1 year)
+                        }
+                    }
+                }
+            }
         }
     }
 
-    // Popularity and rating (tiebreakers)
+    // Popularity (minor tiebreaker)
     score += result.popularity;
-
-    // When popularity is close, prefer higher-rated content
-    // Vote average is 0-10, scaled to be worth up to 10 points
-    // Only count if there are enough votes (>10) to be meaningful
-    if result.vote_count.unwrap_or(0) > 10 {
-        score += result.vote_average.unwrap_or(0.0);
-    }
 
     score
 }
