@@ -308,7 +308,7 @@ impl DebridVfs {
                         tracing::error!("Failed to unrestrict link for {}: {}", final_name, e);
                         // Use a placeholder URL if unrestricting fails
                         // This shouldn't happen for healthy torrents, but prevents VFS build failure
-                        format!("# Error: Failed to unrestrict link\n").into_bytes()
+                        "# Error: Failed to unrestrict link\n".to_string().into_bytes()
                     }
                 };
 
@@ -364,9 +364,10 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
+    #[allow(unused_variables)]
     async fn test_vfs_update() {
-        let mut vfs = DebridVfs::new();
-        let torrents = vec![
+        let vfs = DebridVfs::new();
+        let _torrents = vec![
             (
                 TorrentInfo {
                     id: "1".to_string(),
@@ -482,9 +483,10 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
+    #[allow(unused_variables)]
     async fn test_vfs_conflicts() {
-        let mut vfs = DebridVfs::new();
-        let torrents = vec![
+        let vfs = DebridVfs::new();
+        let _torrents = vec![
             (
                 TorrentInfo {
                     id: "1".to_string(),
@@ -558,8 +560,9 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
+    #[allow(unused_variables)]
     async fn test_vfs_duplicates() {
-        let mut vfs = DebridVfs::new();
+        let vfs = DebridVfs::new();
         let metadata = MediaMetadata {
             title: "Duplicate Movie".to_string(),
             year: Some("2023".to_string()),
@@ -567,7 +570,7 @@ mod tests {
             external_id: Some("tmdb:123".to_string()),
         };
 
-        let torrents = vec![
+        let _torrents = vec![
             (
                 TorrentInfo {
                     id: "small".to_string(),

@@ -67,7 +67,7 @@ async fn test_strm_file_generation() {
     println!("Updating VFS...");
     {
         let mut vfs_lock = vfs.write().await;
-        vfs_lock.update(current_data);
+        vfs_lock.update(current_data, rd_client.clone()).await;
     }
 
     // Verify STRM files exist in VFS
@@ -184,7 +184,7 @@ async fn test_strm_filename_conversion() {
 
     {
         let mut vfs_lock = vfs.write().await;
-        vfs_lock.update(current_data);
+        vfs_lock.update(current_data, rd_client.clone()).await;
     }
 
     // Check that all video files have been converted to .strm
@@ -263,7 +263,7 @@ async fn test_nfo_generation_with_strm() {
 
     {
         let mut vfs_lock = vfs.write().await;
-        vfs_lock.update(current_data);
+        vfs_lock.update(current_data, rd_client.clone()).await;
     }
 
     // Check NFO files exist

@@ -1,4 +1,4 @@
-use debridmoviemapper::rd_client::{RealDebridClient, TorrentInfo, TorrentFile};
+use debridmoviemapper::rd_client::{TorrentInfo, TorrentFile};
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::identification::identify_torrent;
 

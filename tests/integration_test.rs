@@ -44,7 +44,7 @@ async fn test_all_torrents_identification() {
     println!("Updating VFS...");
     {
         let mut vfs_lock = vfs.write().await;
-        vfs_lock.update(current_data.clone());
+        vfs_lock.update(current_data.clone(), rd_client.clone()).await;
     }
 
     println!("Verifying VFS contents...");
