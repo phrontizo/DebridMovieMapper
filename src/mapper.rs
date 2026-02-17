@@ -56,7 +56,7 @@ pub async fn run_full_scan(
 
     info!("Updating VFS with {} identified items", current_data.len());
     let mut vfs_lock = vfs.write().await;
-    vfs_lock.update(current_data);
-    
+    vfs_lock.update(current_data, rd_client.clone()).await;
+
     Ok(())
 }

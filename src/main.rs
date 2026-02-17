@@ -206,7 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
 
                                 let mut vfs_lock = vfs_clone.write().await;
-                                vfs_lock.update(filtered_data);
+                                vfs_lock.update(filtered_data, rd_client_clone.clone()).await;
                             }
                         }
                     } else {
@@ -219,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         let mut vfs_lock = vfs_clone.write().await;
-                        vfs_lock.update(filtered_data);
+                        vfs_lock.update(filtered_data, rd_client_clone.clone()).await;
                     }
 
                     // Clean up seen_torrents that are no longer in the list
