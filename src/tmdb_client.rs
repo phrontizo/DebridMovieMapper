@@ -14,6 +14,8 @@ pub struct TmdbSearchResult {
     pub release_date: Option<String>,
     #[serde(default)]
     pub popularity: f64,
+    pub vote_average: Option<f64>,
+    pub vote_count: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

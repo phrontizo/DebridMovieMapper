@@ -68,8 +68,15 @@ fn score_result(result: &TmdbSearchResult, normalized_query: &str, year: &Option
         }
     }
 
-    // Popularity (tiebreaker)
+    // Popularity and rating (tiebreakers)
     score += result.popularity;
+
+    // When popularity is close, prefer higher-rated content
+    // Vote average is 0-10, scaled to be worth up to 10 points
+    // Only count if there are enough votes (>10) to be meaningful
+    if result.vote_count.unwrap_or(0) > 10 {
+        score += result.vote_average.unwrap_or(0.0);
+    }
 
     score
 }
