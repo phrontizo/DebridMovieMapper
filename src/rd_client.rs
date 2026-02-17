@@ -119,6 +119,8 @@ struct CachedUnrestrictResponse {
 pub struct RealDebridClient {
     client: reqwest::Client,
     unrestrict_cache: Arc<RwLock<HashMap<String, CachedUnrestrictResponse>>>,
+    // Rate limiter: allows max 1 request per 100ms (10 requests/sec)
+    rate_limiter: Arc<tokio::sync::Semaphore>,
 }
 
 impl RealDebridClient {
@@ -140,7 +142,19 @@ impl RealDebridClient {
         Self {
             client,
             unrestrict_cache: Arc::new(RwLock::new(HashMap::new())),
+            rate_limiter: Arc::new(tokio::sync::Semaphore::new(1)),
         }
+    }
+
+    /// Helper to enforce rate limiting before making API requests
+    /// Ensures at least 100ms between requests (10 requests/sec max)
+    async fn rate_limit(&self) {
+        // Acquire the semaphore permit
+        let _permit = self.rate_limiter.acquire().await.unwrap();
+
+        // Hold the permit for 100ms to enforce rate limit
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Permit is automatically released when dropped
     }
 
     /// Helper to apply exponential backoff with jitter
@@ -290,6 +304,8 @@ impl RealDebridClient {
     pub async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error> {
         let url = format!("https://api.real-debrid.com/rest/1.0/torrents/delete/{}", torrent_id);
 
+        self.rate_limit().await;
+
         // Try to delete, but don't treat 404 as an error
         match self.client.delete(&url).send().await {
             Ok(resp) => {
@@ -315,6 +331,8 @@ impl RealDebridClient {
         let max_attempts = 5; // More attempts for rate limits
 
         for attempt in 1..=max_attempts {
+            self.rate_limit().await;
+
             match self.client.post(url)
                 .form(&[("link", link)])
                 .send()
@@ -392,6 +410,7 @@ impl RealDebridClient {
 
         for attempt in 1..=max_attempts {
             Self::apply_backoff(attempt).await;
+            self.rate_limit().await;
 
             let request = make_request();
             match request.send().await {
@@ -457,6 +476,7 @@ impl RealDebridClient {
 
         for attempt in 1..=max_attempts {
             Self::apply_backoff(attempt).await;
+            self.rate_limit().await;
 
             let request = make_request();
             match request.send().await {
@@ -530,6 +550,7 @@ impl RealDebridClient {
 
         for attempt in 1..=max_attempts {
             Self::apply_backoff(attempt).await;
+            self.rate_limit().await;
 
             let request = make_request();
             match request.send().await {
