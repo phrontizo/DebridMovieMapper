@@ -86,7 +86,7 @@ fn collect_links(node: &VfsNode, links: &mut std::collections::HashSet<String>) 
                 collect_links(child, links);
             }
         }
-        VfsNode::File { rd_link, .. } => {
+        VfsNode::StrmFile { rd_link, .. } => {
             links.insert(rd_link.clone());
         }
         VfsNode::VirtualFile { .. } => {}

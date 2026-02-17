@@ -9,7 +9,6 @@ use dav_server::davpath::DavPath;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use futures_util::StreamExt;
-use std::io::SeekFrom;
 
 #[tokio::test]
 async fn test_video_player_simulation() {
@@ -92,43 +91,29 @@ async fn test_video_player_simulation() {
     }
 
     for (path_str, size) in selected {
-        println!("Simulating video player for: {} (size: {})", path_str, size);
+        println!("Testing STRM file: {} (size: {} bytes)", path_str, size);
         let encoded_path = encode_path_preserve_slashes(&format!("/{}", path_str));
         let path = DavPath::new(&encoded_path).unwrap();
         let opts = OpenOptions {
             read: true,
             ..Default::default()
         };
-        let mut file = dav_fs.open(&path, opts).await.expect("Failed to open file");
+        let mut file = dav_fs.open(&path, opts).await.expect("Failed to open STRM file");
 
-        // 1. Play from beginning
-        println!("  Reading from beginning (64KB)...");
-        let bytes = file.read_bytes(64 * 1024).await.expect("Failed to read from beginning");
-        assert!(!bytes.is_empty(), "Read 0 bytes from beginning of {}", path_str);
+        // STRM files are tiny - just read the whole thing
+        println!("  Reading entire STRM file...");
+        let bytes = file.read_bytes(*size as usize).await.expect("Failed to read STRM file");
+        assert!(!bytes.is_empty(), "Read 0 bytes from STRM file {}", path_str);
         println!("    Read {} bytes", bytes.len());
 
-        // 2. Fast forward (skip 10MB or 1MB if small)
-        let skip = if *size > 20 * 1024 * 1024 { 10 * 1024 * 1024 } else { 1024 * 1024 };
-        if *size > skip + 128 * 1024 {
-            println!("  Fast forwarding {} bytes...", skip);
-            let new_pos = file.seek(SeekFrom::Current(skip as i64)).await.expect("Failed to seek forward");
-            println!("    New position: {}", new_pos);
-            let bytes = file.read_bytes(64 * 1024).await.expect("Failed to read after fast forward");
-            assert!(!bytes.is_empty(), "Read 0 bytes after fast forward of {}", path_str);
-            println!("    Read {} bytes", bytes.len());
-        }
-
-        // 3. Skip to middle
-        if *size > 256 * 1024 {
-            let middle = size / 2;
-            println!("  Skipping to middle (pos: {})...", middle);
-            let new_pos = file.seek(SeekFrom::Start(middle)).await.expect("Failed to seek to middle");
-            assert_eq!(new_pos, middle);
-            println!("    New position: {}", new_pos);
-            let bytes = file.read_bytes(64 * 1024).await.expect("Failed to read at middle");
-            assert!(!bytes.is_empty(), "Read 0 bytes at middle of {}", path_str);
-            println!("    Read {} bytes", bytes.len());
-        }
+        // Verify it's a valid URL
+        let content = String::from_utf8_lossy(&bytes);
+        let content = content.trim();
+        assert!(content.starts_with("http://") || content.starts_with("https://"),
+            "STRM file should contain a URL, got: {}", content);
+        assert!(content.contains("real-debrid.com") || content.contains("download"),
+            "STRM file should contain Real-Debrid download URL, got: {}", content);
+        println!("    ✓ Valid Real-Debrid URL: {}...", &content[..std::cmp::min(50, content.len())]);
     }
 
     // 4. Verify NFO files
@@ -182,13 +167,14 @@ fn find_video_files(node: &VfsNode, current_path: String, files: &mut Vec<(Strin
                 find_video_files(child, next_path.clone(), files);
             }
         }
-        VfsNode::File { name, size, .. } => {
+        VfsNode::StrmFile { name, .. } => {
+            // STRM files are tiny text files, use nominal size
             let full_path = if current_path.is_empty() {
                 name.clone()
             } else {
                 format!("{}/{}", current_path, name)
             };
-            files.push((full_path, *size));
+            files.push((full_path, 200)); // STRM files are ~200 bytes
         }
         VfsNode::VirtualFile { .. } => {}
     }
@@ -208,7 +194,7 @@ fn find_nfo_files(node: &VfsNode, current_path: String, files: &mut Vec<(String,
                 find_nfo_files(child, next_path.clone(), files);
             }
         }
-        VfsNode::File { .. } => {}
+        VfsNode::StrmFile { .. } => {}
         VfsNode::VirtualFile { name, content } => {
             if name.ends_with(".nfo") {
                 let full_path = if current_path.is_empty() {

@@ -4,3 +4,7 @@ metadata.db/
 run.log
 .output.txt
 .idea/
+*.log
+output.log
+test_debug.log
+test_output.log
