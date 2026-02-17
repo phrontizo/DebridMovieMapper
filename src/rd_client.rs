@@ -143,6 +143,63 @@ impl RealDebridClient {
         }
     }
 
+    /// Helper to apply exponential backoff with jitter
+    async fn apply_backoff(attempt: u32) {
+        if attempt > 1 {
+            // Exponential backoff: 1s, 2s, 4s, 8s
+            let backoff = 2u64.pow(attempt - 2) * 1000;
+            // Add jitter (up to 500ms)
+            let jitter = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() % 500) as u64;
+            let delay = Duration::from_millis(backoff + jitter);
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    /// Helper to handle rate limiting and retry-after headers
+    async fn handle_retryable_status(
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+        attempt: u32,
+        max_attempts: u32,
+    ) {
+        let retry_after = headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+
+        if let Some(seconds) = retry_after {
+            warn!(
+                "RD API returned {} (attempt {}/{}). Respecting Retry-After: {}s",
+                status, attempt, max_attempts, seconds
+            );
+            tokio::time::sleep(Duration::from_secs(seconds)).await;
+        } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE && attempt < max_attempts {
+            // Extended exponential backoff for 503, capped at 30s
+            let backoff_secs = 2u64.pow(attempt);
+            let delay = Duration::from_secs(std::cmp::min(backoff_secs, 30));
+            let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..1000));
+            let total_delay = delay + jitter;
+            warn!(
+                "RD API service unavailable (503) (attempt {}/{}). Using extended backoff: {}ms",
+                attempt,
+                max_attempts,
+                total_delay.as_millis()
+            );
+            tokio::time::sleep(total_delay).await;
+        }
+    }
+
+    /// Helper to check if a status code should trigger a retry
+    fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+        status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            || status == reqwest::StatusCode::BAD_GATEWAY
+            || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+    }
+
     pub async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
         let mut all_torrents = Vec::new();
         let mut page = 1;
@@ -334,42 +391,15 @@ impl RealDebridClient {
         let max_attempts = 10;
 
         for attempt in 1..=max_attempts {
-            if attempt > 1 {
-                // Exponential backoff: 1s, 2s, 4s, 8s
-                let backoff = 2u64.pow(attempt as u32 - 2) * 1000;
-                // Add jitter (up to 500ms)
-                let jitter = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() % 500) as u64;
-                let delay = Duration::from_millis(backoff + jitter);
-                tokio::time::sleep(delay).await;
-            }
+            Self::apply_backoff(attempt).await;
 
             let request = make_request();
             match request.send().await {
                 Ok(resp) => {
                     let status = resp.status();
-                    
-                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                       || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                       || status == reqwest::StatusCode::BAD_GATEWAY
-                       || status == reqwest::StatusCode::GATEWAY_TIMEOUT
-                    {
-                        let retry_after = resp.headers()
-                            .get(reqwest::header::RETRY_AFTER)
-                            .and_then(|h| h.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok());
 
-                        if let Some(seconds) = retry_after {
-                            warn!("RD API returned {} (attempt {}/{}). Respecting Retry-After: {}s", status, attempt, max_attempts, seconds);
-                            tokio::time::sleep(Duration::from_secs(seconds)).await;
-                        } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE && attempt < max_attempts {
-                            // Extended exponential backoff for 503, capped at 30s
-                            let backoff_secs = 2u64.pow(attempt as u32);
-                            let delay = Duration::from_secs(std::cmp::min(backoff_secs, 30));
-                            let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..1000));
-                            let total_delay = delay + jitter;
-                            warn!("RD API service unavailable (503) (attempt {}/{}). Using extended backoff: {}ms", attempt, max_attempts, total_delay.as_millis());
-                            tokio::time::sleep(total_delay).await;
-                        }
+                    if Self::is_retryable_status(status) {
+                        Self::handle_retryable_status(status, resp.headers(), attempt, max_attempts).await;
                     }
 
                     match resp.error_for_status() {
@@ -426,14 +456,7 @@ impl RealDebridClient {
         let max_attempts = 10;
 
         for attempt in 1..=max_attempts {
-            if attempt > 1 {
-                // Exponential backoff: 1s, 2s, 4s, 8s
-                let backoff = 2u64.pow(attempt as u32 - 2) * 1000;
-                // Add jitter (up to 500ms)
-                let jitter = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() % 500) as u64;
-                let delay = Duration::from_millis(backoff + jitter);
-                tokio::time::sleep(delay).await;
-            }
+            Self::apply_backoff(attempt).await;
 
             let request = make_request();
             match request.send().await {
@@ -446,19 +469,12 @@ impl RealDebridClient {
                         return resp.error_for_status()?.json().await;
                     }
 
+                    // Handle other retryable statuses (excluding 503)
                     if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                       || status == reqwest::StatusCode::BAD_GATEWAY
-                       || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+                        || status == reqwest::StatusCode::BAD_GATEWAY
+                        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
                     {
-                        let retry_after = resp.headers()
-                            .get(reqwest::header::RETRY_AFTER)
-                            .and_then(|h| h.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok());
-
-                        if let Some(seconds) = retry_after {
-                            warn!("RD API returned {} (attempt {}/{}). Respecting Retry-After: {}s", status, attempt, max_attempts, seconds);
-                            tokio::time::sleep(Duration::from_secs(seconds)).await;
-                        }
+                        Self::handle_retryable_status(status, resp.headers(), attempt, max_attempts).await;
                     }
 
                     match resp.error_for_status() {
@@ -513,14 +529,7 @@ impl RealDebridClient {
         let max_attempts = 10;
 
         for attempt in 1..=max_attempts {
-            if attempt > 1 {
-                // Exponential backoff: 1s, 2s, 4s, 8s
-                let backoff = 2u64.pow(attempt as u32 - 2) * 1000;
-                // Add jitter (up to 500ms)
-                let jitter = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() % 500) as u64;
-                let delay = Duration::from_millis(backoff + jitter);
-                tokio::time::sleep(delay).await;
-            }
+            Self::apply_backoff(attempt).await;
 
             let request = make_request();
             match request.send().await {
@@ -533,29 +542,9 @@ impl RealDebridClient {
                         return resp.error_for_status()?.json().await;
                     }
 
-                    // Handle 429 (rate limiting) and 5xx errors with retry logic
-                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                        || status == reqwest::StatusCode::BAD_GATEWAY
-                        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
-                    {
-                        let retry_after = resp.headers()
-                            .get(reqwest::header::RETRY_AFTER)
-                            .and_then(|h| h.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok());
-
-                        if let Some(seconds) = retry_after {
-                            warn!("RD API returned {} (attempt {}/{}). Respecting Retry-After: {}s", status, attempt, max_attempts, seconds);
-                            tokio::time::sleep(Duration::from_secs(seconds)).await;
-                        } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE && attempt < max_attempts {
-                            // Extended exponential backoff for 503, capped at 30s
-                            let backoff_secs = 2u64.pow(attempt as u32);
-                            let delay = Duration::from_secs(std::cmp::min(backoff_secs, 30));
-                            let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..1000));
-                            let total_delay = delay + jitter;
-                            warn!("RD API service unavailable (503) (attempt {}/{}). Using extended backoff: {}ms", attempt, max_attempts, total_delay.as_millis());
-                            tokio::time::sleep(total_delay).await;
-                        }
+                    // Handle retryable statuses
+                    if Self::is_retryable_status(status) {
+                        Self::handle_retryable_status(status, resp.headers(), attempt, max_attempts).await;
                     }
 
                     match resp.error_for_status() {
