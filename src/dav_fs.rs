@@ -116,7 +116,7 @@ struct DebridMetaData {
 impl DavMetaData for DebridMetaData {
     fn len(&self) -> u64 {
         match &self.node {
-            VfsNode::StrmFile { .. } => 0, // Will be set dynamically when content is generated
+            VfsNode::StrmFile { .. } => 200, // Approximate STRM file size (RD URLs are ~150-200 bytes)
             VfsNode::VirtualFile { content, .. } => content.len() as u64,
             VfsNode::Directory { .. } => 0,
         }
