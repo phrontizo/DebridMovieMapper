@@ -9,11 +9,12 @@ pub enum VfsNode {
         name: String,
         children: HashMap<String, VfsNode>,
     },
-    File {
+    /// STRM file that contains a direct Real-Debrid download URL
+    /// Jellyfin will read this tiny file and stream directly from RD
+    StrmFile {
         name: String,
-        size: u64,
+        rd_link: String, // The /torrents link that needs unrestricting
         rd_torrent_id: String,
-        rd_link: String,
     },
     VirtualFile {
         name: String,
@@ -203,12 +204,23 @@ impl DebridVfs {
             MediaType::Movie => "movie",
             MediaType::Show => "tvshow",
         };
-        
-        let mut nfo = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" ?>\n<{}>\n  <title>{}</title>\n", tag, metadata.title);
+
+        let mut nfo = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" ?>\n<{}>\n", tag);
+
+        // Title
+        nfo.push_str(&format!("  <title>{}</title>\n", xml_escape(&metadata.title)));
+
+        // Original title (same as title for now)
+        nfo.push_str(&format!("  <originaltitle>{}</originaltitle>\n", xml_escape(&metadata.title)));
+
+        // Year
         if let Some(year) = &metadata.year {
             nfo.push_str(&format!("  <year>{}</year>\n", year));
+            // Add full date for better compatibility
+            nfo.push_str(&format!("  <premiered>{}-01-01</premiered>\n", year));
         }
-        
+
+        // External IDs
         if let Some(external_id) = &metadata.external_id {
             if let Some((source, id)) = external_id.split_once(':') {
                 nfo.push_str(&format!("  <uniqueid type=\"{}\" default=\"true\">{}</uniqueid>\n", source, id));
@@ -222,7 +234,17 @@ impl DebridVfs {
                 }
             }
         }
-        
+
+        // Placeholder plot (tells Jellyfin this is from TMDB)
+        nfo.push_str("  <plot>Metadata available from TheMovieDB.</plot>\n");
+        nfo.push_str("  <outline>Metadata available from TheMovieDB.</outline>\n");
+
+        // Lockdata to prevent Jellyfin from overwriting our NFO
+        nfo.push_str("  <lockdata>false</lockdata>\n");
+
+        // Source indicator
+        nfo.push_str("  <source>debridmoviemapper</source>\n");
+
         nfo.push_str(&format!("</{}>\n", tag));
         nfo.into_bytes()
     }
@@ -247,29 +269,36 @@ impl DebridVfs {
         }
     }
 
-    fn add_path_to_tree(&self, root: &mut HashMap<String, VfsNode>, path: &str, size: u64, torrent_id: String, link: String) {
+    fn add_path_to_tree(&self, root: &mut HashMap<String, VfsNode>, path: &str, _size: u64, torrent_id: String, link: String) {
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         let mut current_children = root;
 
         for i in 0..parts.len() {
             let part = parts[i].to_string();
             if i == parts.len() - 1 {
-                let mut final_part = part.clone();
+                // This is the video file - convert to .strm
+                let strm_name = if let Some(pos) = part.rfind('.') {
+                    format!("{}.strm", &part[..pos])
+                } else {
+                    format!("{}.strm", part)
+                };
+
+                let mut final_name = strm_name.clone();
                 let mut counter = 1;
-                while current_children.contains_key(&final_part) {
-                    if let Some(pos) = part.rfind('.') {
-                        let (base, ext) = part.split_at(pos);
-                        final_part = format!("{} ({}){}", base, counter, ext);
+                while current_children.contains_key(&final_name) {
+                    if let Some(pos) = strm_name.rfind(".strm") {
+                        let base = &strm_name[..pos];
+                        final_name = format!("{} ({}).strm", base, counter);
                     } else {
-                        final_part = format!("{} ({})", part, counter);
+                        final_name = format!("{} ({})", strm_name, counter);
                     }
                     counter += 1;
                 }
-                current_children.insert(final_part.clone(), VfsNode::File {
-                    name: final_part,
-                    size,
-                    rd_torrent_id: torrent_id.clone(),
+
+                current_children.insert(final_name.clone(), VfsNode::StrmFile {
+                    name: final_name,
                     rd_link: link.clone(),
+                    rd_torrent_id: torrent_id.clone(),
                 });
             } else {
                 let entry = current_children.entry(part.clone()).or_insert_with(|| VfsNode::Directory {
@@ -289,13 +318,21 @@ impl DebridVfs {
 
 pub fn is_video_file(path: &str) -> bool {
     let lower = path.to_lowercase();
-    if lower.contains("sample") || lower.contains("trailer") || lower.contains("extra") || 
+    if lower.contains("sample") || lower.contains("trailer") || lower.contains("extra") ||
        lower.contains("bonus") || lower.contains("featurette") {
         return false;
     }
-    lower.ends_with(".mkv") || lower.ends_with(".mp4") || lower.ends_with(".avi") || 
-    lower.ends_with(".m4v") || lower.ends_with(".mov") || lower.ends_with(".wmv") || 
+    lower.ends_with(".mkv") || lower.ends_with(".mp4") || lower.ends_with(".avi") ||
+    lower.ends_with(".m4v") || lower.ends_with(".mov") || lower.ends_with(".wmv") ||
     lower.ends_with(".flv") || lower.ends_with(".ts") || lower.ends_with(".m2ts")
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 #[cfg(test)]
@@ -377,7 +414,7 @@ mod tests {
                 assert!(movie_children.contains_key("Movie"), "Movie folder not found");
                 let movie_dir = movie_children.get("Movie").unwrap();
                 if let VfsNode::Directory { children: files, .. } = movie_dir {
-                    assert!(files.contains_key("Movie.2023.1080p.mkv"), "Movie file not found");
+                    assert!(files.contains_key("Movie.2023.1080p.strm"), "Movie STRM file not found");
                     assert!(files.contains_key("movie.nfo"), "movie.nfo not found");
                 }
             } else {
@@ -409,10 +446,14 @@ mod tests {
         let content = String::from_utf8(vfs.generate_nfo(&metadata)).unwrap();
         assert!(content.contains("<movie>"));
         assert!(content.contains("<title>Test Movie</title>"));
+        assert!(content.contains("<originaltitle>Test Movie</originaltitle>"));
         assert!(content.contains("<year>2024</year>"));
+        assert!(content.contains("<premiered>2024-01-01</premiered>"));
         assert!(content.contains("<uniqueid type=\"tmdb\" default=\"true\">12345</uniqueid>"));
         assert!(content.contains("<tmdbid>12345</tmdbid>"));
         assert!(content.contains("<url>https://www.themoviedb.org/movie/12345</url>"));
+        assert!(content.contains("<plot>Metadata available from TheMovieDB.</plot>"));
+        assert!(content.contains("<source>debridmoviemapper</source>"));
     }
 
     #[test]
@@ -548,12 +589,11 @@ mod tests {
             if let VfsNode::Directory { children: movie_children, .. } = movies {
                 let folder = movie_children.get("Duplicate Movie [tmdbid-123]").expect("Folder missing");
                 if let VfsNode::Directory { children: files, .. } = folder {
-                    let file = files.get("Movie.mkv").expect("File missing");
-                    if let VfsNode::File { size, rd_torrent_id, .. } = file {
-                        assert_eq!(*size, 5000, "Should have picked the larger file");
+                    let file = files.get("Movie.strm").expect("STRM file missing");
+                    if let VfsNode::StrmFile { rd_torrent_id, .. } = file {
                         assert_eq!(rd_torrent_id, "large", "Should have picked the large torrent");
                     } else {
-                        panic!("Should be a file");
+                        panic!("Should be a STRM file");
                     }
                 }
             }

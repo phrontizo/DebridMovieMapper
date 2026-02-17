@@ -175,10 +175,16 @@ impl RepairManager {
 
     /// Attempt to repair a broken torrent by re-adding it
     pub async fn repair_torrent(&self, torrent_info: &TorrentInfo) -> Result<(), String> {
-        // Check if repair is already in progress or recently triggered (within 30 seconds)
+        // Check if repair is already in progress, recently triggered, or permanently failed
         {
             let health_map = self.health_status.read().await;
             if let Some(health) = health_map.get(&torrent_info.id) {
+                // If already failed permanently, skip
+                if health.state == RepairState::Failed {
+                    debug!("Torrent '{}' has permanently failed repair, skipping", torrent_info.filename);
+                    return Err("Torrent permanently failed".to_string());
+                }
+
                 // If already repairing, skip
                 if health.state == RepairState::Repairing {
                     debug!("Repair already in progress for torrent '{}', skipping duplicate", torrent_info.filename);

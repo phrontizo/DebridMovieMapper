@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-use tracing::{info, error, warn};
+use tracing::{info, error, warn, debug};
 use std::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -75,8 +75,8 @@ pub struct UnrestrictResponse {
     pub id: String,
     #[serde(default)]
     pub filename: String,
-    #[serde(rename = "mimeType", default)]
-    pub mime_type: String,
+    #[serde(rename = "mimeType")]
+    pub mime_type: Option<String>,
     #[serde(default)]
     pub filesize: u64,
     pub link: String,
@@ -174,7 +174,7 @@ impl RealDebridClient {
 
     pub async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
         let url = format!("https://api.real-debrid.com/rest/1.0/torrents/info/{}", id);
-        self.fetch_with_retry(|| self.client.get(&url)).await
+        self.fetch_with_retry_except_404(|| self.client.get(&url)).await
     }
 
     pub async fn unrestrict_link(&self, link: &str) -> Result<UnrestrictResponse, reqwest::Error> {
@@ -458,6 +458,103 @@ impl RealDebridClient {
                         if let Some(seconds) = retry_after {
                             warn!("RD API returned {} (attempt {}/{}). Respecting Retry-After: {}s", status, attempt, max_attempts, seconds);
                             tokio::time::sleep(Duration::from_secs(seconds)).await;
+                        }
+                    }
+
+                    match resp.error_for_status() {
+                        Ok(resp) => {
+                            let headers = resp.headers().clone();
+                            let text = resp.text().await?;
+                            if text.trim().is_empty() || status.as_u16() == 204 {
+                                if let Ok(val) = serde_json::from_str::<T>("[]") {
+                                    return Ok(val);
+                                }
+                                warn!("RD API returned empty body or 204 (attempt {}/{}) - Status: {}, Headers: {:?}", attempt, max_attempts, status, headers);
+                                continue;
+                            }
+                            match serde_json::from_str::<T>(&text) {
+                                Ok(val) => return Ok(val),
+                                Err(e) => {
+                                    error!("Failed to decode RD response: {}. Status: {}, Body: {}, Headers: {:?}", e, status, text, headers);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("RD API error status (attempt {}/{}): {}. Status: {}", attempt, max_attempts, e, status);
+                            last_error = Some(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("RD API request failed (attempt {}/{}): {}", attempt, max_attempts, e);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // If we reach here, we exhausted retries or got a terminal error.
+        if let Some(e) = last_error {
+            Err(e)
+        } else {
+            // This happens if we got empty body or decoding error every time.
+            // Do one last request to get a proper reqwest::Error from .json()
+            make_request().send().await?.error_for_status()?.json().await
+        }
+    }
+
+    /// Same as fetch_with_retry but treats 404 Not Found as a terminal error
+    /// (no retries). Used for get_torrent_info where 404 means torrent was deleted.
+    async fn fetch_with_retry_except_404<T, F>(&self, make_request: F) -> Result<T, reqwest::Error>
+    where
+        T: serde::de::DeserializeOwned,
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let mut last_error: Option<reqwest::Error> = None;
+        let max_attempts = 10;
+
+        for attempt in 1..=max_attempts {
+            if attempt > 1 {
+                // Exponential backoff: 1s, 2s, 4s, 8s
+                let backoff = 2u64.pow(attempt as u32 - 2) * 1000;
+                // Add jitter (up to 500ms)
+                let jitter = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() % 500) as u64;
+                let delay = Duration::from_millis(backoff + jitter);
+                tokio::time::sleep(delay).await;
+            }
+
+            let request = make_request();
+            match request.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+
+                    // 404 Not Found is a terminal error - torrent doesn't exist, no retries
+                    if status == reqwest::StatusCode::NOT_FOUND {
+                        debug!("RD API returned 404 Not Found - treating as terminal error, no retries");
+                        return resp.error_for_status()?.json().await;
+                    }
+
+                    // Handle 429 (rate limiting) and 5xx errors with retry logic
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                        || status == reqwest::StatusCode::BAD_GATEWAY
+                        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+                    {
+                        let retry_after = resp.headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|h| h.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok());
+
+                        if let Some(seconds) = retry_after {
+                            warn!("RD API returned {} (attempt {}/{}). Respecting Retry-After: {}s", status, attempt, max_attempts, seconds);
+                            tokio::time::sleep(Duration::from_secs(seconds)).await;
+                        } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE && attempt < max_attempts {
+                            // Extended exponential backoff for 503, capped at 30s
+                            let backoff_secs = 2u64.pow(attempt as u32);
+                            let delay = Duration::from_secs(std::cmp::min(backoff_secs, 30));
+                            let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..1000));
+                            let total_delay = delay + jitter;
+                            warn!("RD API service unavailable (503) (attempt {}/{}). Using extended backoff: {}ms", attempt, max_attempts, total_delay.as_millis());
+                            tokio::time::sleep(total_delay).await;
                         }
                     }
 

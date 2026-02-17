@@ -1,7 +1,7 @@
 use regex::Regex;
 use tracing::{info, warn, debug};
 use crate::rd_client;
-use crate::tmdb_client::TmdbClient;
+use crate::tmdb_client::{TmdbClient, TmdbSearchResult};
 use crate::vfs::{MediaMetadata, MediaType, is_video_file};
 
 pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) -> MediaMetadata {
@@ -44,6 +44,34 @@ pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) 
         media_type: if is_show_guess(&info.files) { MediaType::Show } else { MediaType::Movie },
         external_id: None,
     }
+}
+
+/// Score a search result based on how well it matches the query
+/// Higher score = better match
+fn score_result(result: &TmdbSearchResult, normalized_query: &str, year: &Option<String>) -> f64 {
+    let mut score = 0.0;
+
+    // Title match (most important)
+    let normalized_title = normalize_title(&result.title);
+    let normalized_original = result.original_title.as_ref().map(|t| normalize_title(t));
+
+    if normalized_title == normalized_query || normalized_original.as_ref().map(|t| t == normalized_query).unwrap_or(false) {
+        score += 1000.0; // Exact title match
+    } else if normalized_title.contains(normalized_query) || normalized_original.as_ref().map(|t| t.contains(normalized_query)).unwrap_or(false) {
+        score += 100.0; // Partial title match
+    }
+
+    // Year match (very important)
+    if let Some(y) = year {
+        if result.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false) {
+            score += 500.0; // Year matches
+        }
+    }
+
+    // Popularity (tiebreaker)
+    score += result.popularity;
+
+    score
 }
 
 pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &TmdbClient) -> Option<MediaMetadata> {
@@ -98,41 +126,64 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
         movie_results.extend(movie_no_year);
     }
 
-    // Find exact matches and prefer highest popularity among exact matches
-    let exact_tv_matches: Vec<_> = tv_results.iter().filter(|r| {
-        normalize_title(&r.title) == normalized_cleaned ||
-        r.original_title.as_ref().map(|t| normalize_title(t) == normalized_cleaned).unwrap_or(false)
-    }).collect();
+    // Score all results and pick the best TV and movie matches
+    // For short titles (≤3 chars), require exact match + year match
+    let is_short_title = cleaned_name.len() <= 3;
 
-    let best_tv = if !exact_tv_matches.is_empty() {
-        exact_tv_matches.into_iter().max_by(|a, b| {
-            a.popularity.partial_cmp(&b.popularity).unwrap_or(std::cmp::Ordering::Equal)
-        })
-    } else {
-        // Only pick first result as fallback if the cleaned name is not too short
-        if cleaned_name.len() > 3 {
-            tv_initial.first().or(tv_results.first())
+    let best_tv = if !tv_results.is_empty() {
+        if is_short_title {
+            // Short title: require exact match + year match (no popularity threshold)
+            tv_results.iter().filter(|r| {
+                let normalized_title = normalize_title(&r.title);
+                let title_matches = normalized_title == normalized_cleaned;
+                let year_matches = year.as_ref()
+                    .map(|y| r.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false))
+                    .unwrap_or(false);
+
+                title_matches && year_matches
+            }).max_by(|a, b| {
+                let score_a = score_result(a, &normalized_cleaned, &year);
+                let score_b = score_result(b, &normalized_cleaned, &year);
+                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
         } else {
-            None
+            // Normal length title: use standard scoring
+            tv_results.iter().max_by(|a, b| {
+                let score_a = score_result(a, &normalized_cleaned, &year);
+                let score_b = score_result(b, &normalized_cleaned, &year);
+                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
         }
+    } else {
+        None
     };
 
-    let exact_movie_matches: Vec<_> = movie_results.iter().filter(|r| {
-        normalize_title(&r.title) == normalized_cleaned ||
-        r.original_title.as_ref().map(|t| normalize_title(t) == normalized_cleaned).unwrap_or(false)
-    }).collect();
+    let best_movie = if !movie_results.is_empty() {
+        if is_short_title {
+            // Short title: require exact match + year match (no popularity threshold)
+            movie_results.iter().filter(|r| {
+                let normalized_title = normalize_title(&r.title);
+                let title_matches = normalized_title == normalized_cleaned;
+                let year_matches = year.as_ref()
+                    .map(|y| r.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false))
+                    .unwrap_or(false);
 
-    let best_movie = if !exact_movie_matches.is_empty() {
-        exact_movie_matches.into_iter().max_by(|a, b| {
-            a.popularity.partial_cmp(&b.popularity).unwrap_or(std::cmp::Ordering::Equal)
-        })
-    } else {
-        // Only pick first result as fallback if the cleaned name is not too short
-        if cleaned_name.len() > 3 {
-            movie_initial.first().or(movie_results.first())
+                title_matches && year_matches
+            }).max_by(|a, b| {
+                let score_a = score_result(a, &normalized_cleaned, &year);
+                let score_b = score_result(b, &normalized_cleaned, &year);
+                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
         } else {
-            None
+            // Normal length title: use standard scoring
+            movie_results.iter().max_by(|a, b| {
+                let score_a = score_result(a, &normalized_cleaned, &year);
+                let score_b = score_result(b, &normalized_cleaned, &year);
+                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
         }
+    } else {
+        None
     };
 
     let selected = match (best_tv, best_movie) {
@@ -518,5 +569,44 @@ mod tests {
         assert_eq!(metadata.external_id, Some("tmdb:823219".to_string()));
         assert_eq!(metadata.title, "Flow");
         assert_eq!(metadata.media_type, MediaType::Movie);
+    }
+
+    #[tokio::test]
+    async fn test_dune_2000_identification() {
+        dotenvy::dotenv().ok();
+        let tmdb_api_key = std::env::var("TMDB_API_KEY").unwrap_or_else(|_| "839969cf4f1e183aa5f010f7c4c643f1".to_string());
+        let tmdb_client = TmdbClient::new(tmdb_api_key);
+
+        let info = TorrentInfo {
+            id: "dune_id".to_string(),
+            filename: "Dune.2000.S01E01.1080p.BluRay.x264-PFa.mkv".to_string(),
+            original_filename: "Dune.2000.S01E01.1080p.BluRay.x264-PFa.mkv".to_string(),
+            hash: "hash".to_string(),
+            bytes: 3000000000,
+            original_bytes: 3000000000,
+            host: "host".to_string(),
+            split: 1,
+            progress: 100.0,
+            status: "downloaded".to_string(),
+            added: "2000-01-01".to_string(),
+            files: vec![
+                TorrentFile {
+                    id: 1,
+                    path: "Dune.2000.S01E01.1080p.BluRay.x264-PFa.mkv".to_string(),
+                    bytes: 3000000000,
+                    selected: 1,
+                }
+            ],
+            links: vec!["http://link1".to_string()],
+            ended: Some("2000-01-01".to_string()),
+        };
+
+        let metadata = identify_torrent(&info, &tmdb_client).await;
+
+        // Should identify as Frank Herbert's Dune miniseries (19566)
+        // NOT Fly Tales (15911) or Dune 2021 (438631)
+        assert_eq!(metadata.external_id, Some("tmdb:19566".to_string()));
+        assert_eq!(metadata.title, "Frank Herbert's Dune");
+        assert_eq!(metadata.media_type, MediaType::Show);
     }
 }
