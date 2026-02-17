@@ -22,19 +22,31 @@ Jellyfin → rclone mount (--vfs-cache-mode full) → WebDAV proxy → Real-Debr
 ## New Architecture (Fast)
 
 ```
-Jellyfin → rclone mount → WebDAV (serves tiny .strm + .nfo files)
-                                    ↓
-                            .strm contains: http://rd-direct-link
-                                    ↓
-        Jellyfin reads .strm → Streams directly from Real-Debrid
+                    ┌─────────────────────────────────────┐
+                    │                                     │
+                    │  During Library Scan:               │
+                    │                                     │
+Jellyfin ────────→ rclone mount ────→ WebDAV Server      │
+   │                   (reads tiny      (serves .strm    │
+   │                    STRM files)      & .nfo files)   │
+   │                                                      │
+   │                                                      │
+   │  During Playback:                                   │
+   │                                                      │
+   │  1. Read STRM file (contains RD URL) ────────────────┘
+   │  2. Jellyfin streams video directly:
+   │
+   └────────────────────→ Real-Debrid (direct HTTP stream)
 ```
 
 **Benefits:**
-- **Instant scans**: STRM files are <1KB text files
-- **No proxy overhead**: Jellyfin streams directly from Real-Debrid
+- **Instant scans**: STRM files are <1KB text files, no need for VFS cache
+- **Direct streaming**: Jellyfin streams video directly from Real-Debrid (no proxy)
 - **90% simpler code**: Removed complex buffering and range request logic
-- **No VFS cache needed**: rclone only needs to serve directory listings
+- **Minimal rclone config**: Only needs to read tiny files, not cache videos
 - **Automatic link refresh**: STRM content regenerated on-the-fly when RD links expire
+
+**Key Insight:** rclone is still needed (Jellyfin requires filesystem), but its role changed from "cache multi-GB videos" to "read <1KB text files"
 
 ## How It Works
 
@@ -82,7 +94,15 @@ https://download41.real-debrid.com/d/ABC123XYZ.../Inception.2010.1080p.mkv
 
 ## Jellyfin Configuration
 
-### Option 1: Minimal rclone (Recommended)
+### Why rclone is Still Required
+
+**Important:** Jellyfin does NOT support WebDAV natively (see [Jellyfin Forum](https://forum.jellyfin.org/t-webdav-smb--5255)). You **must** use rclone to mount the WebDAV as a local filesystem.
+
+However, with STRM files, the rclone configuration is much simpler since files are tiny.
+
+### Recommended rclone Configuration
+
+**Option 1: Minimal (No Cache) - Recommended**
 
 ```bash
 rclone mount debrid: /mnt/debrid \
@@ -93,9 +113,12 @@ rclone mount debrid: /mnt/debrid \
   --allow-other
 ```
 
-No VFS cache needed since files are tiny!
+**Why this works now:**
+- STRM files are <1KB (no need for VFS cache)
+- Jellyfin only reads tiny text files during scan
+- Actual video streaming goes directly from RD to Jellyfin
 
-### Option 2: Writes cache only
+**Option 2: Writes Only (If Needed)**
 
 ```bash
 rclone mount debrid: /mnt/debrid \
@@ -103,6 +126,8 @@ rclone mount debrid: /mnt/debrid \
   --dir-cache-time 10m \
   --allow-other
 ```
+
+**DO NOT USE:** `--vfs-cache-mode full` (this will try to cache entire files)
 
 ### Jellyfin Library Settings
 
