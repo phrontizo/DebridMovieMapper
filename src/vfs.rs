@@ -235,11 +235,10 @@ impl DebridVfs {
             }
         }
 
-        // Placeholder plot (tells Jellyfin this is from TMDB)
-        nfo.push_str("  <plot>Metadata available from TheMovieDB.</plot>\n");
-        nfo.push_str("  <outline>Metadata available from TheMovieDB.</outline>\n");
+        // Don't include plot/outline - let Jellyfin fetch from TMDB
+        // Including placeholder text causes duplication in Jellyfin UI
 
-        // Lockdata to prevent Jellyfin from overwriting our NFO
+        // Lockdata set to false allows Jellyfin to fetch full metadata from TMDB
         nfo.push_str("  <lockdata>false</lockdata>\n");
 
         // Source indicator
@@ -452,7 +451,7 @@ mod tests {
         assert!(content.contains("<uniqueid type=\"tmdb\" default=\"true\">12345</uniqueid>"));
         assert!(content.contains("<tmdbid>12345</tmdbid>"));
         assert!(content.contains("<url>https://www.themoviedb.org/movie/12345</url>"));
-        assert!(content.contains("<plot>Metadata available from TheMovieDB.</plot>"));
+        assert!(content.contains("<lockdata>false</lockdata>"));
         assert!(content.contains("<source>debridmoviemapper</source>"));
     }
 
