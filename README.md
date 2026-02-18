@@ -88,70 +88,12 @@ docker build -t debridmoviemapper .
 
 ## Docker Compose Setup with Jellyfin
 
-The recommended way to use DebridMovieMapper with Jellyfin is via Docker Compose with rclone mounting the WebDAV endpoint:
+The recommended way to use DebridMovieMapper with Jellyfin is via Docker Compose with rclone mounting the WebDAV endpoint.
 
-```yaml
-services:
-  debridmoviemapper:
-    image: ghcr.io/phrontizo/debridmoviemapper:latest
-    container_name: debridmoviemapper
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    environment:
-      - RD_API_TOKEN=your_real_debrid_token
-      - TMDB_API_KEY=your_tmdb_api_key
-      - SCAN_INTERVAL_SECS=60
-      - REPAIR_INTERVAL_SECS=3600
-    volumes:
-      - ./metadata.db:/metadata.db
-
-  rclone:
-    image: rclone/rclone:latest
-    container_name: rclone
-    restart: unless-stopped
-    depends_on:
-      - debridmoviemapper
-    devices:
-      - /dev/fuse
-    cap_add:
-      - SYS_ADMIN
-    security_opt:
-      - apparmor:unconfined
-    volumes:
-      - ./rclone.conf:/config/rclone/rclone.conf
-      - jellyfin-media:/mnt/debrid:rshared
-    command: >
-      mount debrid: /mnt/debrid
-      --vfs-cache-mode writes
-      --vfs-cache-max-size 1G
-      --allow-other
-      --allow-non-empty
-      --dir-cache-time 10s
-      --poll-interval 15s
-
-  jellyfin:
-    image: jellyfin/jellyfin:latest
-    container_name: jellyfin
-    restart: unless-stopped
-    depends_on:
-      - rclone
-    ports:
-      - "8096:8096"
-    environment:
-      - JELLYFIN_PublishedServerUrl=http://localhost:8096
-    volumes:
-      - jellyfin-config:/config
-      - jellyfin-cache:/cache
-      - jellyfin-media:/media:ro
-    devices:
-      - /dev/dri:/dev/dri  # Optional: for hardware transcoding
-
-volumes:
-  jellyfin-media: {}
-  jellyfin-cache: {}
-  jellyfin-config: {}
-```
+A complete [`compose.yml`](compose.yml) file is provided in the repository that includes:
+- DebridMovieMapper service
+- rclone for mounting the WebDAV endpoint
+- Jellyfin for media playback
 
 ### rclone.conf
 
@@ -172,7 +114,7 @@ vendor = other
    touch metadata.db rclone.conf
    ```
 
-2. Add your credentials to the `docker-compose.yml` file
+2. Add your credentials to the `compose.yml` file
 
 3. Create the `rclone.conf` file with the configuration above
 
