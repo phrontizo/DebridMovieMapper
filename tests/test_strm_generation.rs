@@ -12,6 +12,7 @@ use futures_util::StreamExt;
 
 /// Test that STRM files are correctly generated with valid Real-Debrid URLs
 #[tokio::test]
+#[ignore]
 async fn test_strm_file_generation() {
     let _ = tracing_subscriber::fmt::try_init();
     dotenvy::dotenv().ok();
@@ -143,6 +144,7 @@ async fn test_strm_file_generation() {
 
 /// Test that STRM files are properly named (video extension replaced with .strm)
 #[tokio::test]
+#[ignore]
 async fn test_strm_filename_conversion() {
     let _ = tracing_subscriber::fmt::try_init();
     dotenvy::dotenv().ok();
@@ -222,6 +224,7 @@ async fn test_strm_filename_conversion() {
 
 /// Test NFO files are generated alongside STRM files
 #[tokio::test]
+#[ignore]
 async fn test_nfo_generation_with_strm() {
     let _ = tracing_subscriber::fmt::try_init();
     dotenvy::dotenv().ok();

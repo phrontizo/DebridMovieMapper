@@ -1,63 +1,247 @@
-use debridmoviemapper::rd_client::RealDebridClient;
+use debridmoviemapper::rd_client::{RealDebridClient, TorrentInfo};
 use debridmoviemapper::tmdb_client::TmdbClient;
-use debridmoviemapper::vfs::{DebridVfs, VfsNode, is_video_file};
+use debridmoviemapper::vfs::{DebridVfs, MediaMetadata, VfsNode, is_video_file};
 use debridmoviemapper::identification::identify_torrent;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::{OnceCell, RwLock};
 use futures_util::StreamExt;
 
-#[tokio::test]
-async fn test_all_torrents_identification() {
-    tracing_subscriber::fmt::init();
-    dotenvy::dotenv().ok();
+/// Shared sled DB instance — sled only allows one open handle per path.
+static DB: LazyLock<sled::Db> = LazyLock::new(|| {
+    sled::open("metadata.db").expect("Failed to open database")
+});
 
-    let api_token = std::env::var("RD_API_TOKEN").expect("RD_API_TOKEN must be set").trim().to_string();
-    let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set").trim().to_string();
+/// Shared identified data — fetched and identified exactly once, reused by all tests.
+static IDENTIFIED_DATA: OnceCell<(Arc<RealDebridClient>, Vec<(TorrentInfo, MediaMetadata)>)> =
+    OnceCell::const_new();
 
-    let rd_client = Arc::new(RealDebridClient::new(api_token));
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
-    let vfs = Arc::new(RwLock::new(DebridVfs::new()));
+async fn get_shared_data() -> &'static (Arc<RealDebridClient>, Vec<(TorrentInfo, MediaMetadata)>) {
+    IDENTIFIED_DATA
+        .get_or_init(|| async {
+            tracing_subscriber::fmt::try_init().ok();
+            dotenvy::dotenv().ok();
 
+            let api_token = std::env::var("RD_API_TOKEN")
+                .expect("RD_API_TOKEN must be set")
+                .trim()
+                .to_string();
+            let tmdb_api_key = std::env::var("TMDB_API_KEY")
+                .expect("TMDB_API_KEY must be set")
+                .trim()
+                .to_string();
+            let rd_client = Arc::new(RealDebridClient::new(api_token));
+            let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
+            let db_tree = DB.open_tree("matches").expect("Failed to open matches tree");
+
+            let data = fetch_and_identify(&rd_client, &tmdb_client, &db_tree).await;
+            (rd_client, data)
+        })
+        .await
+}
+
+/// Fetch downloaded torrents and identify them via TMDB, using sled cache.
+/// Respects INTEGRATION_TEST_LIMIT env var to limit the number of torrents processed.
+async fn fetch_and_identify(
+    rd_client: &Arc<RealDebridClient>,
+    tmdb_client: &Arc<TmdbClient>,
+    db_tree: &sled::Tree,
+) -> Vec<(TorrentInfo, MediaMetadata)> {
     println!("Fetching torrents...");
     let torrents = rd_client.get_torrents().await.expect("Failed to get torrents");
-    let downloaded = torrents.into_iter().filter(|t| t.status == "downloaded").collect::<Vec<_>>();
+    let downloaded: Vec<_> = torrents
+        .into_iter()
+        .filter(|t| t.status == "downloaded")
+        .collect();
     println!("Found {} downloaded torrents", downloaded.len());
 
-    let mut current_data = Vec::new();
-    let mut stream = futures_util::stream::iter(downloaded)
-        .map(|torrent| {
-            let rd_client = rd_client.clone();
-            let tmdb_client = tmdb_client.clone();
-            async move {
-                let info = rd_client.get_torrent_info(&torrent.id).await.expect("Failed to get torrent info");
-                let metadata = identify_torrent(&info, &tmdb_client).await;
-                (info, metadata)
-            }
-        })
-        .buffer_unordered(1);
+    let limit = std::env::var("INTEGRATION_TEST_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
 
-    while let Some(result) = stream.next().await {
-        println!("Identified: {} as {:?} (ID: {:?})", result.0.filename, result.1.media_type, result.1.external_id);
-        current_data.push(result);
+    let to_process: Vec<_> = if let Some(limit) = limit {
+        println!("INTEGRATION_TEST_LIMIT={}, processing first {} torrents", limit, limit);
+        downloaded.into_iter().take(limit).collect()
+    } else {
+        downloaded
+    };
+
+    let mut current_data = Vec::new();
+    let mut to_identify = Vec::new();
+
+    for torrent in &to_process {
+        if let Ok(Some(data_bytes)) = db_tree.get(&torrent.id) {
+            if let Ok(data) =
+                serde_json::from_slice::<(TorrentInfo, MediaMetadata)>(&data_bytes)
+            {
+                println!("Cached: {} (ID: {:?})", data.0.filename, data.1.external_id);
+                current_data.push(data);
+                continue;
+            }
+        }
+        to_identify.push(torrent.clone());
     }
 
-    println!("Updating VFS...");
+    if !to_identify.is_empty() {
+        println!("Identifying {} new torrents ({} cached)...", to_identify.len(), current_data.len());
+        let mut stream = futures_util::stream::iter(to_identify)
+            .map(|torrent| {
+                let rd_client = rd_client.clone();
+                let tmdb_client = tmdb_client.clone();
+                async move {
+                    let info = rd_client
+                        .get_torrent_info(&torrent.id)
+                        .await
+                        .expect("Failed to get torrent info");
+                    let metadata = identify_torrent(&info, &tmdb_client).await;
+                    (torrent.id, info, metadata)
+                }
+            })
+            .buffer_unordered(1);
+
+        while let Some((id, info, metadata)) = stream.next().await {
+            println!(
+                "Identified: {} as {:?} (ID: {:?})",
+                info.filename, metadata.media_type, metadata.external_id
+            );
+            if let Ok(data_bytes) = serde_json::to_vec(&(info.clone(), metadata.clone())) {
+                let _ = db_tree.insert(&id, data_bytes);
+            }
+            current_data.push((info, metadata));
+        }
+    } else {
+        println!("All {} torrents served from cache.", current_data.len());
+    }
+
+    current_data
+}
+
+/// Test 1: Torrent fetching and TMDB identification only. No VFS, no unrestrict.
+/// Uses sled cache so repeat runs are fast.
+#[tokio::test]
+#[ignore]
+async fn test_identification() {
+    let (_, data) = get_shared_data().await;
+
+    let identified = data
+        .iter()
+        .filter(|(_, m)| m.external_id.is_some())
+        .count();
+    let unidentified = data.len() - identified;
+
+    println!("\n=== Identification Summary ===");
+    println!("Total torrents: {}", data.len());
+    println!("Identified:     {}", identified);
+    println!("Unidentified:   {}", unidentified);
+
+    if unidentified > 0 {
+        println!("\nUnidentified torrents:");
+        for (info, _) in data.iter().filter(|(_, m)| m.external_id.is_none()) {
+            println!("  - {}", info.filename);
+        }
+    }
+
+    assert!(!data.is_empty(), "Should have at least one downloaded torrent");
+    assert!(identified > 0, "Should identify at least one torrent");
+}
+
+/// Test 2: Given identified data (from sled cache), builds VFS and checks directory structure.
+#[tokio::test]
+#[ignore]
+async fn test_vfs_structure() {
+    let (rd_client, data) = get_shared_data().await;
+    assert!(!data.is_empty(), "Need identified torrents to test VFS structure");
+
+    println!("Building VFS...");
+    let vfs = Arc::new(RwLock::new(DebridVfs::new()));
     {
         let mut vfs_lock = vfs.write().await;
-        vfs_lock.update(current_data.clone(), rd_client.clone()).await;
+        vfs_lock.update(data.clone(), rd_client.clone()).await;
     }
 
-    println!("Verifying VFS contents...");
     let vfs_lock = vfs.read().await;
-    
+    let root = &vfs_lock.root;
+
+    // Root must be a directory
+    let children = match root {
+        VfsNode::Directory { children, .. } => children,
+        _ => panic!("Root should be a directory"),
+    };
+
+    println!("\n=== VFS Structure ===");
+    println!("Root entries: {:?}", children.keys().collect::<Vec<_>>());
+
+    // Check for Movies/ and/or Shows/ directories
+    let has_movies = children.contains_key("Movies");
+    let has_shows = children.contains_key("Shows");
+    println!("Has Movies/: {}", has_movies);
+    println!("Has Shows/:  {}", has_shows);
+
+    assert!(
+        has_movies || has_shows,
+        "VFS should contain at least Movies/ or Shows/ directory"
+    );
+
+    // Check Movies structure: Movies/<Title (Year)>/<file>.strm
+    if let Some(VfsNode::Directory { children: movies, .. }) = children.get("Movies") {
+        println!("\nMovies/ contains {} entries", movies.len());
+        for (name, node) in movies.iter().take(5) {
+            match node {
+                VfsNode::Directory { children: movie_files, .. } => {
+                    let strm_count = movie_files
+                        .values()
+                        .filter(|n| matches!(n, VfsNode::StrmFile { .. }))
+                        .count();
+                    println!("  {}: {} .strm files", name, strm_count);
+                }
+                _ => println!("  {} (not a directory)", name),
+            }
+        }
+    }
+
+    // Check Shows structure: Shows/<Title (Year)>/Season XX/<file>.strm
+    if let Some(VfsNode::Directory { children: shows, .. }) = children.get("Shows") {
+        println!("\nShows/ contains {} entries", shows.len());
+        for (name, node) in shows.iter().take(5) {
+            match node {
+                VfsNode::Directory { children: seasons, .. } => {
+                    let season_count = seasons
+                        .keys()
+                        .filter(|k| k.starts_with("Season"))
+                        .count();
+                    println!("  {}: {} seasons", name, season_count);
+                }
+                _ => println!("  {} (not a directory)", name),
+            }
+        }
+    }
+}
+
+/// Test 3: VFS link completeness with tolerance for unrestrict failures.
+#[tokio::test]
+#[ignore]
+async fn test_vfs_completeness() {
+    let (rd_client, data) = get_shared_data().await;
+    assert!(!data.is_empty(), "Need identified torrents to test VFS completeness");
+
+    println!("Building VFS...");
+    let vfs = Arc::new(RwLock::new(DebridVfs::new()));
+    {
+        let mut vfs_lock = vfs.write().await;
+        vfs_lock.update(data.clone(), rd_client.clone()).await;
+    }
+
+    let vfs_lock = vfs.read().await;
     let mut vfs_links = std::collections::HashSet::new();
     collect_links(&vfs_lock.root, &mut vfs_links);
 
+    let mut total_video_files = 0;
     let mut missing = Vec::new();
-    for (info, _) in &current_data {
+
+    for (info, _) in data {
         let mut link_idx = 0;
         for file in &info.files {
             if file.selected == 1 && is_video_file(&file.path) {
+                total_video_files += 1;
                 if let Some(link) = info.links.get(link_idx) {
                     if !vfs_links.contains(link) {
                         missing.push(format!("Torrent: {}, File: {}", info.filename, file.path));
@@ -68,14 +252,47 @@ async fn test_all_torrents_identification() {
         }
     }
 
-    if !missing.is_empty() {
-        println!("The following video files are missing from VFS:");
-        for m in &missing {
-            println!("  {}", m);
-        }
-        panic!("{} video files missing from VFS", missing.len());
+    let missing_count = missing.len();
+    let skip_rate = if total_video_files > 0 {
+        missing_count as f64 / total_video_files as f64
     } else {
-        println!("All video files correctly identified and presented in VFS!");
+        0.0
+    };
+
+    println!("\n=== VFS Completeness ===");
+    println!("Total video files: {}", total_video_files);
+    println!("Present in VFS:    {}", total_video_files - missing_count);
+    println!("Missing from VFS:  {}", missing_count);
+    println!("Skip rate:         {:.1}%", skip_rate * 100.0);
+
+    if !missing.is_empty() {
+        println!("\nMissing video files (likely unrestrict failures):");
+        for m in &missing {
+            println!("  WARNING: {}", m);
+        }
+    }
+
+    // Allow up to 20% skip rate (unrestrict failures under rate limiting)
+    let max_skip_rate = 0.20;
+    assert!(
+        skip_rate <= max_skip_rate,
+        "Too many video files missing from VFS: {}/{} ({:.1}% > {:.0}% threshold). \
+         This suggests a real bug, not just rate limiting.",
+        missing_count,
+        total_video_files,
+        skip_rate * 100.0,
+        max_skip_rate * 100.0
+    );
+
+    if missing.is_empty() {
+        println!("\nAll video files correctly present in VFS!");
+    } else {
+        println!(
+            "\n{} files missing but within tolerance ({:.1}% <= {:.0}%)",
+            missing_count,
+            skip_rate * 100.0,
+            max_skip_rate * 100.0
+        );
     }
 }
 

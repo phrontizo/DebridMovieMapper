@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
 #[tokio::test]
+#[ignore]
 async fn test_repair_process_integration() {
     let _ = tracing_subscriber::fmt::try_init();
     dotenvy::dotenv().ok();
@@ -104,6 +105,7 @@ async fn test_repair_process_integration() {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_503_triggers_immediate_repair() {
     let _ = tracing_subscriber::fmt::try_init();
     dotenvy::dotenv().ok();
@@ -178,6 +180,7 @@ async fn test_503_triggers_immediate_repair() {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_broken_torrents_hidden_from_webdav() {
     let _ = tracing_subscriber::fmt::try_init();
     dotenvy::dotenv().ok();

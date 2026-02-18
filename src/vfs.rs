@@ -369,15 +369,33 @@ mod tests {
         );
     }
 
-    // TODO: Tests below are disabled because update() requires a real RealDebridClient
-    // and makes live API calls. Refactor to use a mock RealDebridClient.
+    use crate::rd_client::{RealDebridClient, UnrestrictResponse};
+
+    /// Create a RealDebridClient with pre-seeded unrestrict cache for given links.
+    /// No real API calls will be made for cached links.
+    async fn mock_rd_client(links: &[&str]) -> Arc<RealDebridClient> {
+        let client = Arc::new(RealDebridClient::new("fake-token".to_string()));
+        for link in links {
+            client.seed_unrestrict_cache(link, UnrestrictResponse {
+                id: "mock".to_string(),
+                filename: "mock.mkv".to_string(),
+                mime_type: Some("video/x-matroska".to_string()),
+                filesize: 1000,
+                link: link.to_string(),
+                host: "mock".to_string(),
+                chunks: 1,
+                crc: 0,
+                download: format!("https://mock-download.example.com/{}", link),
+                streamable: 0,
+            }).await;
+        }
+        client
+    }
 
     #[tokio::test]
-    #[ignore]
-    #[allow(unused_variables)]
     async fn test_vfs_update() {
-        let vfs = DebridVfs::new();
-        let _torrents = vec![
+        let mut vfs = DebridVfs::new();
+        let torrents = vec![
             (
                 TorrentInfo {
                     id: "1".to_string(),
@@ -438,7 +456,8 @@ mod tests {
             ),
         ];
 
-        // vfs.update(torrents, create_mock_rd_client().await).await;
+        let rd_client = mock_rd_client(&["http://link1", "http://link2"]).await;
+        vfs.update(torrents, rd_client).await;
 
         if let VfsNode::Directory { children, .. } = &vfs.root {
             let movies = children.get("Movies").expect("Movies directory missing");
@@ -469,7 +488,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_nfo_generation() {
         let vfs = DebridVfs::new();
         let metadata = MediaMetadata {
@@ -492,11 +510,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
-    #[allow(unused_variables)]
     async fn test_vfs_conflicts() {
-        let vfs = DebridVfs::new();
-        let _torrents = vec![
+        let mut vfs = DebridVfs::new();
+        let torrents = vec![
             (
                 TorrentInfo {
                     id: "1".to_string(),
@@ -557,7 +573,8 @@ mod tests {
             ),
         ];
 
-        // vfs.update(torrents, create_mock_rd_client().await).await;
+        let rd_client = mock_rd_client(&["http://l1", "http://l2"]).await;
+        vfs.update(torrents, rd_client).await;
 
         if let VfsNode::Directory { children, .. } = &vfs.root {
             let movies = children.get("Movies").unwrap();
@@ -582,10 +599,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
-    #[allow(unused_variables)]
     async fn test_vfs_duplicates() {
-        let vfs = DebridVfs::new();
+        let mut vfs = DebridVfs::new();
         let metadata = MediaMetadata {
             title: "Duplicate Movie".to_string(),
             year: Some("2023".to_string()),
@@ -593,7 +608,7 @@ mod tests {
             external_id: Some("tmdb:123".to_string()),
         };
 
-        let _torrents = vec![
+        let torrents = vec![
             (
                 TorrentInfo {
                     id: "small".to_string(),
@@ -634,7 +649,8 @@ mod tests {
             ),
         ];
 
-        // vfs.update(torrents, create_mock_rd_client().await).await;
+        let rd_client = mock_rd_client(&["http://small", "http://large"]).await;
+        vfs.update(torrents, rd_client).await;
 
         if let VfsNode::Directory { children, .. } = &vfs.root {
             let movies = children.get("Movies").unwrap();

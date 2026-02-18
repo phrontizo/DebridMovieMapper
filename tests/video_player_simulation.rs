@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use futures_util::StreamExt;
 
 #[tokio::test]
+#[ignore]
 async fn test_video_player_simulation() {
     tracing_subscriber::fmt::init();
     dotenvy::dotenv().ok();

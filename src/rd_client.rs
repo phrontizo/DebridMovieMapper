@@ -392,6 +392,16 @@ impl RealDebridClient {
             make_request().send().await?.error_for_status()?.json().await
         }
     }
+
+    /// Pre-populate the unrestrict cache with a fake response.
+    /// Used by unit/integration tests to avoid real API calls.
+    pub async fn seed_unrestrict_cache(&self, link: &str, response: UnrestrictResponse) {
+        let mut cache = self.unrestrict_cache.write().await;
+        cache.insert(link.to_string(), CachedUnrestrictResponse {
+            response,
+            cached_at: std::time::Instant::now(),
+        });
+    }
 }
 
 #[cfg(test)]

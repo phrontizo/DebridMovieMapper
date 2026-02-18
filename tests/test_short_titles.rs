@@ -3,6 +3,7 @@ use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::identification::identify_torrent;
 
 #[tokio::test]
+#[ignore]
 async fn test_short_title_identification() {
     dotenvy::dotenv().ok();
 
