@@ -43,15 +43,23 @@ async fn test_repair_process_integration() {
 
     println!("Found {} downloaded torrents (using first 5)", downloaded.len());
 
-    // Prepare data with metadata for health check
+    // Prepare data with metadata for health check (skip torrents deleted by prior repair runs)
     let mut torrent_data = Vec::new();
     for torrent in &downloaded {
-        let info = rd_client
-            .get_torrent_info(&torrent.id)
-            .await
-            .expect("Failed to get torrent info");
-        let metadata = identify_torrent(&info, &tmdb_client).await;
-        torrent_data.push((info, metadata));
+        match rd_client.get_torrent_info(&torrent.id).await {
+            Ok(info) => {
+                let metadata = identify_torrent(&info, &tmdb_client).await;
+                torrent_data.push((info, metadata));
+            }
+            Err(e) => {
+                println!("Skipping torrent {} (info unavailable: {})", torrent.id, e);
+            }
+        }
+    }
+
+    if torrent_data.is_empty() {
+        println!("No accessible downloaded torrents found, skipping test.");
+        return;
     }
 
     // Test 1: Mark a torrent as broken and verify it can be detected
@@ -129,7 +137,7 @@ async fn test_503_triggers_immediate_repair() {
     let downloaded: Vec<_> = torrents
         .into_iter()
         .filter(|t| t.status == "downloaded")
-        .take(1)
+        .take(5)
         .collect();
 
     if downloaded.is_empty() {
@@ -137,11 +145,25 @@ async fn test_503_triggers_immediate_repair() {
         return;
     }
 
-    let test_torrent = &downloaded[0];
-    let info = rd_client
-        .get_torrent_info(&test_torrent.id)
-        .await
-        .expect("Failed to get torrent info");
+    // Find a torrent whose info is still accessible (previous tests may have
+    // repaired/deleted some, making their old IDs return 404).
+    let mut info = None;
+    let mut test_torrent = None;
+    for t in &downloaded {
+        match rd_client.get_torrent_info(&t.id).await {
+            Ok(i) => {
+                info = Some(i);
+                test_torrent = Some(t);
+                break;
+            }
+            Err(e) => {
+                println!("Skipping torrent {} (info unavailable: {})", t.id, e);
+            }
+        }
+    }
+
+    let info = info.expect("No accessible downloaded torrent found");
+    let test_torrent = test_torrent.unwrap();
 
     println!("Using test torrent: {}", info.filename);
 
@@ -218,28 +240,41 @@ async fn test_broken_torrents_hidden_from_webdav() {
     }
     println!("  ✓ Torrents initially visible in WebDAV");
 
-    // Mark first two as broken
-    for (i, torrent) in downloaded.iter().take(2).enumerate() {
-        let info = rd_client
-            .get_torrent_info(&torrent.id)
-            .await
-            .expect("Failed to get torrent info");
+    // Mark first two as broken (skip any whose info is unavailable due to prior repairs)
+    let mut marked_ids = Vec::new();
+    for torrent in &downloaded {
+        if marked_ids.len() >= 2 {
+            break;
+        }
+        let info = match rd_client.get_torrent_info(&torrent.id).await {
+            Ok(i) => i,
+            Err(e) => {
+                println!("Skipping torrent {} (info unavailable: {})", torrent.id, e);
+                continue;
+            }
+        };
 
         if let Some(link) = info.links.first() {
-            println!("Marking torrent {} as broken: {}", i + 1, info.filename);
+            println!("Marking torrent {} as broken: {}", marked_ids.len() + 1, info.filename);
             repair_manager.mark_broken(&torrent.id, link).await;
+            marked_ids.push(torrent.id.clone());
         }
+    }
+
+    if marked_ids.len() < 2 {
+        println!("Could not find 2 accessible torrents to mark, skipping test.");
+        return;
     }
 
     sleep(Duration::from_millis(500)).await;
 
     // Verify they are now hidden
     let mut hidden_count = 0;
-    for torrent in downloaded.iter().take(2) {
-        let should_hide = repair_manager.should_hide_torrent(&torrent.id).await;
+    for id in &marked_ids {
+        let should_hide = repair_manager.should_hide_torrent(id).await;
         if should_hide {
             hidden_count += 1;
-            println!("  ✓ Torrent {} is hidden from WebDAV", torrent.id);
+            println!("  ✓ Torrent {} is hidden from WebDAV", id);
         }
     }
 

@@ -7,6 +7,74 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use rand::Rng;
 
+const MIN_INTERVAL_MS: u64 = 100;   // 10 req/s max (baseline)
+const MAX_INTERVAL_MS: u64 = 2000;  // 0.5 req/s min (under heavy throttling)
+const RECOVERY_MS: u64 = 10;        // Decrease interval by 10ms per success
+
+struct RateLimiterState {
+    /// Current interval between requests in milliseconds
+    interval_ms: u64,
+    /// When the next request is allowed
+    next_allowed: tokio::time::Instant,
+}
+
+/// Adaptive token bucket rate limiter that slows down on 429s and recovers on success.
+/// Bucket capacity is 1 (no bursting).
+pub struct AdaptiveRateLimiter {
+    state: tokio::sync::Mutex<RateLimiterState>,
+}
+
+impl std::fmt::Debug for AdaptiveRateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdaptiveRateLimiter").finish()
+    }
+}
+
+impl AdaptiveRateLimiter {
+    fn new() -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(RateLimiterState {
+                interval_ms: MIN_INTERVAL_MS,
+                next_allowed: tokio::time::Instant::now(),
+            }),
+        }
+    }
+
+    /// Wait until a token is available, then reserve it.
+    async fn wait_for_token(&self) {
+        let deadline = {
+            let mut state = self.state.lock().await;
+            let now = tokio::time::Instant::now();
+            if state.next_allowed < now {
+                state.next_allowed = now;
+            }
+            let deadline = state.next_allowed;
+            let interval = Duration::from_millis(state.interval_ms);
+            state.next_allowed += interval;
+            deadline
+        };
+        tokio::time::sleep_until(deadline).await;
+    }
+
+    /// Record a successful request — gradually decrease interval toward baseline.
+    async fn record_success(&self) {
+        let mut state = self.state.lock().await;
+        state.interval_ms = state.interval_ms.saturating_sub(RECOVERY_MS).max(MIN_INTERVAL_MS);
+    }
+
+    /// Record a 429 throttle — double the interval and optionally respect Retry-After.
+    async fn record_throttle(&self, retry_after: Option<u64>) {
+        let mut state = self.state.lock().await;
+        state.interval_ms = (state.interval_ms * 2).min(MAX_INTERVAL_MS);
+        if let Some(seconds) = retry_after {
+            let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+            if retry_deadline > state.next_allowed {
+                state.next_allowed = retry_deadline;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Torrent {
     pub id: String,
@@ -119,8 +187,7 @@ struct CachedUnrestrictResponse {
 pub struct RealDebridClient {
     client: reqwest::Client,
     unrestrict_cache: Arc<RwLock<HashMap<String, CachedUnrestrictResponse>>>,
-    // Rate limiter: allows max 1 request per 100ms (10 requests/sec)
-    rate_limiter: Arc<tokio::sync::Semaphore>,
+    rate_limiter: Arc<AdaptiveRateLimiter>,
 }
 
 impl RealDebridClient {
@@ -142,37 +209,11 @@ impl RealDebridClient {
         Self {
             client,
             unrestrict_cache: Arc::new(RwLock::new(HashMap::new())),
-            rate_limiter: Arc::new(tokio::sync::Semaphore::new(1)),
+            rate_limiter: Arc::new(AdaptiveRateLimiter::new()),
         }
     }
 
-    /// Helper to enforce rate limiting before making API requests
-    /// Ensures at least 100ms between requests (10 requests/sec max)
-    async fn rate_limit(&self) {
-        // Acquire the semaphore permit
-        let _permit = self.rate_limiter.acquire().await.unwrap();
-
-        // Hold the permit for 100ms to enforce rate limit
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        // Permit is automatically released when dropped
-    }
-
-    /// Helper to apply exponential backoff with jitter
-    async fn backoff_delay(attempt: u32) {
-        if attempt > 1 {
-            // Exponential backoff: 1s, 2s, 4s, 8s
-            let backoff = 2u64.pow(attempt - 2) * 1000;
-            // Add jitter (up to 500ms)
-            let jitter = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() % 500) as u64;
-            let delay = Duration::from_millis(backoff + jitter);
-            tokio::time::sleep(delay).await;
-        }
-    }
-
-    /// Helper to handle rate limiting and retry-after headers
+    /// Helper to handle 503 and other non-429 retryable status codes
     async fn wait_for_retry(
         status: reqwest::StatusCode,
         headers: &HeaderMap,
@@ -190,14 +231,15 @@ impl RealDebridClient {
                 status, attempt, max_attempts, seconds
             );
             tokio::time::sleep(Duration::from_secs(seconds)).await;
-        } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE && attempt < max_attempts {
-            // Extended exponential backoff for 503, capped at 30s
+        } else if attempt < max_attempts {
+            // Extended exponential backoff for 503/502/504, capped at 30s
             let backoff_secs = 2u64.pow(attempt);
             let delay = Duration::from_secs(std::cmp::min(backoff_secs, 30));
             let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..1000));
             let total_delay = delay + jitter;
             warn!(
-                "RD API service unavailable (503) (attempt {}/{}). Using extended backoff: {}ms",
+                "RD API {} (attempt {}/{}). Using extended backoff: {}ms",
+                status,
                 attempt,
                 max_attempts,
                 total_delay.as_millis()
@@ -305,17 +347,23 @@ impl RealDebridClient {
     pub async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error> {
         let url = format!("https://api.real-debrid.com/rest/1.0/torrents/delete/{}", torrent_id);
 
-        self.rate_limit().await;
+        self.rate_limiter.wait_for_token().await;
 
-        // Try to delete, but don't treat 404 as an error
         match self.client.delete(&url).send().await {
             Ok(resp) => {
                 let status = resp.status();
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    let retry_after = resp.headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|h| h.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok());
+                    self.rate_limiter.record_throttle(retry_after).await;
+                } else {
+                    self.rate_limiter.record_success().await;
+                }
                 if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-                    // Success or already deleted - both are fine
                     Ok(())
                 } else {
-                    // Other error - convert to reqwest::Error
                     resp.error_for_status().map(|_| ())
                 }
             }
@@ -336,8 +384,7 @@ impl RealDebridClient {
         let max_attempts = 10;
 
         for attempt in 1..=max_attempts {
-            Self::backoff_delay(attempt).await;
-            self.rate_limit().await;
+            self.rate_limiter.wait_for_token().await;
 
             match make_request().send().await {
                 Ok(resp) => {
@@ -345,12 +392,22 @@ impl RealDebridClient {
 
                     if terminal_statuses.contains(&status) {
                         warn!("RD API returned terminal status {} — not retrying (attempt {}/{})", status, attempt, max_attempts);
-                        // error_for_status() returns Err for non-2xx; ? propagates immediately.
                         return Err(resp.error_for_status().unwrap_err());
+                    }
+
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        let retry_after = resp.headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|h| h.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok());
+                        self.rate_limiter.record_throttle(retry_after).await;
+                        warn!("RD API returned 429 (attempt {}/{}). Adaptive limiter adjusted.", attempt, max_attempts);
+                        continue;
                     }
 
                     if Self::should_retry_status(status) {
                         Self::wait_for_retry(status, resp.headers(), attempt, max_attempts).await;
+                        continue;
                     }
 
                     match resp.error_for_status() {
@@ -359,6 +416,7 @@ impl RealDebridClient {
                             let text = resp.text().await?;
                             if text.trim().is_empty() || status.as_u16() == 204 {
                                 if let Ok(val) = serde_json::from_str::<T>("[]") {
+                                    self.rate_limiter.record_success().await;
                                     return Ok(val);
                                 }
                                 warn!("RD API empty body or 204 (attempt {}/{}). Status: {}, Headers: {:?}",
@@ -366,7 +424,10 @@ impl RealDebridClient {
                                 continue;
                             }
                             match serde_json::from_str::<T>(&text) {
-                                Ok(val) => return Ok(val),
+                                Ok(val) => {
+                                    self.rate_limiter.record_success().await;
+                                    return Ok(val);
+                                }
                                 Err(e) => {
                                     error!("Failed to decode RD response: {}. Status: {}, Body: {}, Headers: {:?}",
                                         e, status, text, headers);
@@ -478,5 +539,65 @@ mod tests {
         // This test documents the intent; the compile-time guard is that no
         // call sites exist in the codebase.
         assert!(true);
+    }
+
+    // --- AdaptiveRateLimiter ---
+
+    #[tokio::test]
+    async fn adaptive_limiter_starts_at_baseline() {
+        let limiter = AdaptiveRateLimiter::new();
+        let state = limiter.state.lock().await;
+        assert_eq!(state.interval_ms, MIN_INTERVAL_MS);
+    }
+
+    #[tokio::test]
+    async fn adaptive_limiter_doubles_on_throttle() {
+        let limiter = AdaptiveRateLimiter::new();
+        limiter.record_throttle(None).await;
+        let state = limiter.state.lock().await;
+        assert_eq!(state.interval_ms, 200);
+    }
+
+    #[tokio::test]
+    async fn adaptive_limiter_caps_at_max() {
+        let limiter = AdaptiveRateLimiter::new();
+        // Double repeatedly: 100 -> 200 -> 400 -> 800 -> 1600 -> 2000 (capped)
+        for _ in 0..10 {
+            limiter.record_throttle(None).await;
+        }
+        let state = limiter.state.lock().await;
+        assert_eq!(state.interval_ms, MAX_INTERVAL_MS);
+    }
+
+    #[tokio::test]
+    async fn adaptive_limiter_recovers_on_success() {
+        let limiter = AdaptiveRateLimiter::new();
+        // Throttle to 200ms
+        limiter.record_throttle(None).await;
+        // Recover: 200 -> 190
+        limiter.record_success().await;
+        let state = limiter.state.lock().await;
+        assert_eq!(state.interval_ms, 190);
+    }
+
+    #[tokio::test]
+    async fn adaptive_limiter_floors_at_min() {
+        let limiter = AdaptiveRateLimiter::new();
+        // Already at min, success shouldn't go below
+        limiter.record_success().await;
+        let state = limiter.state.lock().await;
+        assert_eq!(state.interval_ms, MIN_INTERVAL_MS);
+    }
+
+    #[tokio::test]
+    async fn adaptive_limiter_retry_after_advances_next_allowed() {
+        let limiter = AdaptiveRateLimiter::new();
+        let before = tokio::time::Instant::now();
+        limiter.record_throttle(Some(5)).await;
+        let state = limiter.state.lock().await;
+        // next_allowed should be at least 5 seconds from now
+        assert!(state.next_allowed >= before + Duration::from_secs(5));
+        // interval should also have doubled
+        assert_eq!(state.interval_ms, 200);
     }
 }

@@ -59,7 +59,7 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 |------|---------|
 | `main.rs` | Initializes shared state, spawns scan task, starts WebDAV server on port 8080 |
 | `tasks.rs` | `run_scan_loop` — polls Real-Debrid, identifies new torrents, updates VFS |
-| `rd_client.rs` | Real-Debrid API client with exponential backoff (429 handling), 1-hour response cache |
+| `rd_client.rs` | Real-Debrid API client with adaptive token bucket rate limiter, 1-hour response cache |
 | `identification.rs` | Filename cleaning, camelCase splitting, TMDB scoring to identify movies/shows |
 | `vfs.rs` | In-memory virtual filesystem: creates `Movies/`+`Shows/` hierarchy, generates `.strm` files |
 | `dav_fs.rs` | Maps VFS to WebDAV; re-unrestricts links on read and triggers on-demand repair on 503 |
@@ -77,8 +77,21 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 ## Key Design Decisions
 
 - **Static linking / scratch Docker image:** The Dockerfile builds with musl targets (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) producing a minimal final image on `scratch`.
-- **Rate limiting:** Real-Debrid 429 responses trigger exponential backoff. 503 on `unrestrict/link` is a terminal status (no retry) — it signals a broken torrent and triggers on-demand repair.
+- **Adaptive rate limiting:** An `AdaptiveRateLimiter` (token bucket, capacity 1) is shared across all Real-Debrid API calls. Baseline: 10 req/s (100ms interval). On 429: interval doubles (max 2000ms / 0.5 req/s) and Retry-After header is respected. On success: interval decreases by 10ms (min 100ms). This prevents 429 cascades by slowing all requests globally. 503 on `unrestrict/link` is a terminal status (no retry) — it signals a broken torrent and triggers on-demand repair.
 - **Single retry method:** `rd_client.rs` has one `fetch_with_retry(make_request, terminal_statuses)` — callers pass the status codes that should abort without retrying (e.g. 404 for `get_torrent_info`, 503 for `unrestrict_link`).
 - **Identification scoring:** `identification.rs` cleans filenames extensively before TMDB lookup. Shows vs. movies are detected by file structure (presence of multiple video files with episode patterns).
 - **On-demand repair:** When a `.strm` file is read, `dav_fs.rs` re-unrestricts the link (cached, so free when healthy). On 503 it calls `repair_manager.repair_by_id()` in a background task and hides the torrent until repaired.
 - **Repair hides broken torrents:** During repair, entries are hidden from the VFS so they don't appear in Jellyfin until healthy again.
+
+## Development Process
+
+- **Test-Driven Development (TDD) is required.** When implementing new features or fixing bugs:
+  1. Write a failing test first that captures the expected behavior.
+  2. Write the minimum code to make the test pass.
+  3. Refactor while keeping tests green.
+  4. Run `cargo test` after every change to confirm nothing is broken.
+- **Before every commit, run all unit and integration tests:**
+  ```bash
+  cargo test && INTEGRATION_TEST_LIMIT=10 cargo test --test integration_test -- --ignored && INTEGRATION_TEST_LIMIT=10 cargo test --test repair_integration_test -- --ignored
+  ```
+  Integration test binaries must run sequentially (not `-- --ignored` on all at once) because they share the sled database lock and the Real-Debrid API rate limit. Do not commit if any test fails.

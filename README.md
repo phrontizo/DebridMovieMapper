@@ -154,7 +154,7 @@ You can add this URL as a network drive in your OS or directly as a WebDAV sourc
 
 - `src/main.rs`: Entry point — initialises shared state and starts the WebDAV server.
 - `src/tasks.rs`: Background scan loop — polls Real-Debrid, identifies new torrents, updates the VFS.
-- `src/rd_client.rs`: Real-Debrid API client with exponential backoff, rate limiting, and response caching.
+- `src/rd_client.rs`: Real-Debrid API client with adaptive token bucket rate limiter and response caching.
 - `src/tmdb_client.rs`: TMDB API client for media metadata.
 - `src/repair.rs`: On-demand torrent repair state machine triggered at playback time.
 - `src/vfs.rs`: Virtual File System logic for library organisation.
@@ -184,7 +184,7 @@ There is no background repair loop. Instead, repair is triggered at playback tim
 ### Error Handling
 
 - **503 Service Unavailable**: Immediately marks torrent as broken and triggers repair without retries
-- **429 Rate Limit**: Exponential backoff with Retry-After header support (2s, 4s, 8s, 16s, 32s)
+- **429 Rate Limit**: Adaptive token bucket rate limiter shared across all API calls — on 429, the global request interval doubles (max 2s between requests) and Retry-After headers are respected; on success, the interval gradually recovers toward the baseline of 10 req/s
 - **404 Not Found**: Treated as success for delete operations (idempotent)
 - **Playback Errors**: WebDAV read failures automatically trigger repair process
 
