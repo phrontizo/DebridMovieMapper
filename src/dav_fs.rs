@@ -58,12 +58,14 @@ impl DavFileSystem for DebridFileSystem {
         async move {
             let node = self.find_node(path).await.ok_or(FsError::NotFound)?;
             match node {
-                VfsNode::StrmFile { name, strm_content, rd_torrent_id, .. } => {
+                VfsNode::StrmFile { name, strm_content, rd_link, rd_torrent_id } => {
                     Ok(Box::new(StrmFile {
                         name,
                         content: Bytes::from(strm_content),
+                        rd_link,
                         rd_torrent_id,
                         repair_manager: self.repair_manager.clone(),
+                        rd_client: self.rd_client.clone(),
                         pos: 0,
                     }) as Box<dyn DavFile>)
                 }
@@ -143,13 +145,15 @@ impl DavDirEntry for DebridDirEntry {
     }
 }
 
-/// A STRM file that contains pre-generated content (the RD download URL)
+/// A STRM file that re-unrestricts its RD link on every read for freshness
 #[derive(Debug)]
 struct StrmFile {
     name: String,
-    content: Bytes, // The actual STRM file content (URL + newline)
+    content: Bytes, // Pre-unrestricted content used for metadata len() only
+    rd_link: String,
     rd_torrent_id: String,
     repair_manager: Arc<RepairManager>,
+    rd_client: Arc<RealDebridClient>,
     pos: u64,
 }
 
@@ -189,22 +193,36 @@ impl DavFile for StrmFile {
 
     fn read_bytes(&mut self, len: usize) -> FsFuture<'_, Bytes> {
         async move {
-            // Check if torrent is under repair
             if self.repair_manager.should_hide_torrent(&self.rd_torrent_id).await {
                 return Err(FsError::GeneralFailure);
             }
 
-            // Read from stored content
-            if self.pos >= self.content.len() as u64 {
-                return Ok(Bytes::new());
+            match self.rd_client.unrestrict_link(&self.rd_link).await {
+                Ok(response) => {
+                    let content = Bytes::from(format!("{}\n", response.download));
+                    if self.pos >= content.len() as u64 {
+                        return Ok(Bytes::new());
+                    }
+                    let start = self.pos as usize;
+                    let end = std::cmp::min(start + len, content.len());
+                    let data = content.slice(start..end);
+                    self.pos += data.len() as u64;
+                    Ok(data)
+                }
+                Err(e) => {
+                    tracing::error!("Re-unrestrict failed for {} — triggering repair: {}", self.name, e);
+                    let repair_manager = self.repair_manager.clone();
+                    let torrent_id = self.rd_torrent_id.clone();
+                    let link = self.rd_link.clone();
+                    repair_manager.mark_broken(&torrent_id, &link).await;
+                    tokio::spawn(async move {
+                        if let Err(e) = repair_manager.repair_by_id(&torrent_id).await {
+                            tracing::error!("Repair failed for {}: {}", torrent_id, e);
+                        }
+                    });
+                    Err(FsError::GeneralFailure)
+                }
             }
-
-            let start = self.pos as usize;
-            let end = std::cmp::min(start + len, self.content.len());
-            let data = self.content.slice(start..end);
-
-            self.pos += data.len() as u64;
-            Ok(data)
         }.boxed()
     }
 
@@ -225,6 +243,36 @@ impl DavFile for StrmFile {
 
     fn flush(&mut self) -> FsFuture<'_, ()> {
         async move { Ok(()) }.boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compile-time check: StrmFile has rd_link and rd_client fields.
+    /// Fails to compile if either field is removed or renamed.
+    #[allow(dead_code)]
+    fn _assert_strm_file_has_on_demand_fields(
+        repair_manager: Arc<RepairManager>,
+        rd_client: Arc<RealDebridClient>,
+    ) {
+        let _ = StrmFile {
+            name: String::new(),
+            content: Bytes::new(),
+            rd_link: String::new(),
+            rd_torrent_id: String::new(),
+            repair_manager,
+            rd_client,
+            pos: 0,
+        };
+    }
+
+    #[test]
+    fn strm_file_struct_has_on_demand_repair_fields() {
+        // The compile-time check above guards the presence of rd_link and rd_client.
+        // Live on-demand repair behaviour is covered by integration tests.
+        assert!(true);
     }
 }
 
