@@ -12,6 +12,7 @@ Future work:
 * Add a web-ui to track progress and correct mismatches
 * Automatically populate Read Debrid with watchlist content from Trakt and newly released episodes from already tracked shows
 
+This was 100% vibe coded using a mix of Claude and Junie as further AI experimentation.
 ## Features
 
 - **Media Identification**: Automatically identifies movies and TV shows using TMDB metadata based on torrent filenames.
