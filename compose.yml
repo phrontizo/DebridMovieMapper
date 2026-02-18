@@ -3,6 +3,7 @@ services:
     image: ghcr.io/phrontizo/debridmoviemapper:latest
     container_name: debridmoviemapper
     restart: unless-stopped
+    user: "65534:65534"
     ports:
       - "8080:8080"
     environment:
@@ -16,6 +17,7 @@ services:
     image: rclone/rclone:latest
     container_name: rclone
     restart: unless-stopped
+    user: "1000:1000"
     depends_on:
       - debridmoviemapper
     devices:
@@ -40,6 +42,7 @@ services:
     image: jellyfin/jellyfin:latest
     container_name: jellyfin
     restart: unless-stopped
+    user: "1000:1000"
     depends_on:
       - rclone
     ports:

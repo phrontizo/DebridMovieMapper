@@ -32,14 +32,14 @@ RUN TARGET=$(cat /target_triple) && \
 # Stage 2: Final runtime image (minimal 'scratch' image)
 FROM scratch
 
-# Copy the statically linked binary
-COPY --from=builder /app/debridmoviemapper /debridmoviemapper
-
 # Copy system CA certificates so that the app can make HTTPS requests
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /app/debridmoviemapper /debridmoviemapper
 
 # Expose the WebDAV port (default 8080)
 EXPOSE 8080
+
+USER 65534:65534
 
 # The application requires RD_API_TOKEN and TMDB_API_KEY environment variables.
 # It uses 'metadata.db' in the current directory for persistence.
