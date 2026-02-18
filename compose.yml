@@ -9,7 +9,6 @@ services:
       - RD_API_TOKEN=your_real_debrid_token
       - TMDB_API_KEY=your_tmdb_api_key
       - SCAN_INTERVAL_SECS=60
-      - REPAIR_INTERVAL_SECS=3600
     volumes:
       - ./metadata.db:/metadata.db
 
