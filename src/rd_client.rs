@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-use tracing::{info, error, warn, debug};
+use tracing::{info, error, warn};
 use std::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -422,7 +422,9 @@ impl RealDebridClient {
                     let status = resp.status();
 
                     if terminal_statuses.contains(&status) {
-                        return resp.error_for_status()?.json().await;
+                        warn!("RD API returned terminal status {} — not retrying (attempt {}/{})", status, attempt, max_attempts);
+                        // error_for_status() returns Err for non-2xx; ? propagates immediately.
+                        return Err(resp.error_for_status().unwrap_err());
                     }
 
                     if Self::should_retry_status(status) {
