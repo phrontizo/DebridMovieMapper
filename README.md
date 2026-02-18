@@ -2,6 +2,16 @@
 
 A Rust-based service that maps your Real-Debrid torrent library to a Jellyfin/Plex-compatible WebDAV endpoint with automatic media identification via TMDB.
 
+I created this project as:
+* I was using the various arrs, and found it cumbersome, plus I ran out of storage space, meaning I needed to use a Debrid service of some kind
+* Zurg didn't work for me as I needed the folder structure for Jellyfin
+
+I use Debrid Media Manager for keeping Real Debrid populated at the moment, but am thinking of incorporating that into this service as well.
+
+Future work:
+* Add a web-ui to track progress and correct mismatches
+* Automatically populate Read Debrid with watchlist content from Trakt and newly released episodes from already tracked shows
+
 ## Features
 
 - **Media Identification**: Automatically identifies movies and TV shows using TMDB metadata based on torrent filenames.
@@ -76,16 +86,121 @@ docker build -t debridmoviemapper .
 
 *Note: Mounting `metadata.db` ensures your media identification cache is preserved across container recreations.*
 
+## Docker Compose Setup with Jellyfin
+
+The recommended way to use DebridMovieMapper with Jellyfin is via Docker Compose with rclone mounting the WebDAV endpoint:
+
+```yaml
+services:
+  debridmoviemapper:
+    image: ghcr.io/phrontizo/debridmoviemapper:latest
+    container_name: debridmoviemapper
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - RD_API_TOKEN=your_real_debrid_token
+      - TMDB_API_KEY=your_tmdb_api_key
+      - SCAN_INTERVAL_SECS=60
+      - REPAIR_INTERVAL_SECS=3600
+    volumes:
+      - ./metadata.db:/metadata.db
+
+  rclone:
+    image: rclone/rclone:latest
+    container_name: rclone
+    restart: unless-stopped
+    depends_on:
+      - debridmoviemapper
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - ./rclone.conf:/config/rclone/rclone.conf
+      - jellyfin-media:/mnt/debrid:rshared
+    command: >
+      mount debrid: /mnt/debrid
+      --vfs-cache-mode writes
+      --vfs-cache-max-size 1G
+      --allow-other
+      --allow-non-empty
+      --dir-cache-time 10s
+      --poll-interval 15s
+
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+    depends_on:
+      - rclone
+    ports:
+      - "8096:8096"
+    environment:
+      - JELLYFIN_PublishedServerUrl=http://localhost:8096
+    volumes:
+      - jellyfin-config:/config
+      - jellyfin-cache:/cache
+      - jellyfin-media:/media:ro
+    devices:
+      - /dev/dri:/dev/dri  # Optional: for hardware transcoding
+
+volumes:
+  jellyfin-media: {}
+  jellyfin-cache: {}
+  jellyfin-config: {}
+```
+
+### rclone.conf
+
+Create an `rclone.conf` file in the same directory with the following content:
+
+```ini
+[debrid]
+type = webdav
+url = http://debridmoviemapper:8080
+vendor = other
+```
+
+### Setup Steps
+
+1. Create the directory structure:
+   ```bash
+   mkdir -p jellyfin-config jellyfin-cache
+   touch metadata.db rclone.conf
+   ```
+
+2. Add your credentials to the `docker-compose.yml` file
+
+3. Create the `rclone.conf` file with the configuration above
+
+4. Start the services:
+   ```bash
+   docker-compose up -d
+   ```
+
+5. Access Jellyfin at `http://localhost:8096` and add `/media` as a library path
+
+### Notes
+
+- The WebDAV server runs on port 8080 and is accessible within the Docker network
+- rclone mounts the WebDAV endpoint to `/mnt/debrid` with minimal caching
+- Jellyfin reads from `/media` which is bind-mounted from rclone
+- Files appear as `.strm` files containing Real-Debrid download URLs
+- Jellyfin will stream directly from Real-Debrid when playing content
+
 ## Usage
 
-Once running, the WebDAV server will be available at `http://localhost:8080`. 
+Once running, the WebDAV server will be available at `http://localhost:8080`.
 
 You can add this URL as a network drive in your OS or directly as a WebDAV source in media players like:
 - **Infuse** (iOS/tvOS/macOS)
 - **VLC**
 - **Kodi**
-- **Jellyfin** (via Rclone mount)
-- **Plex** (via Rclone mount)
+- **Jellyfin** (via rclone mount - see Docker Compose example above)
+- **Plex** (via rclone mount)
 
 ## Technical Details
 
