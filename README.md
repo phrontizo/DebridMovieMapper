@@ -108,19 +108,18 @@ vendor = other
 
 ### Setup Steps
 
-1. Create the directory structure:
+1. Create required files:
    ```bash
-   mkdir -p jellyfin-config jellyfin-cache
    touch metadata.db rclone.conf
    ```
 
-2. Add your credentials to the `compose.yml` file
+2. Add your Real-Debrid and TMDB credentials to the `compose.yml` file
 
-3. Create the `rclone.conf` file with the configuration above
+3. Add the rclone configuration to `rclone.conf` (see above)
 
 4. Start the services:
    ```bash
-   docker-compose up -d
+   docker compose up -d
    ```
 
 5. Access Jellyfin at `http://localhost:8096` and add `/media` as a library path
