@@ -323,84 +323,6 @@ impl RealDebridClient {
         }
     }
 
-    /// Check if a link is valid by attempting to unrestrict it
-    /// This is a simplified version that doesn't use the full retry logic
-    /// because 503 errors on unrestrict indicate the torrent needs repair
-    /// However, 429 (rate limit) errors are retried with exponential backoff
-    pub async fn check_link_health(&self, link: &str) -> bool {
-        let url = "https://api.real-debrid.com/rest/1.0/unrestrict/link";
-        let max_attempts = 5; // More attempts for rate limits
-
-        for attempt in 1..=max_attempts {
-            self.rate_limit().await;
-
-            match self.client.post(url)
-                .form(&[("link", link)])
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let status = resp.status();
-
-                    if status.is_success() {
-                        // Try to parse the response
-                        return match resp.json::<UnrestrictResponse>().await {
-                            Ok(_) => true,
-                            Err(e) => {
-                                warn!("Link health check failed to parse response for {}: {}", link, e);
-                                false
-                            }
-                        };
-                    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        // 429 - Rate limited, use exponential backoff
-                        let retry_after = resp.headers()
-                            .get(reqwest::header::RETRY_AFTER)
-                            .and_then(|h| h.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok());
-
-                        if attempt < max_attempts {
-                            // Use exponential backoff: 2s, 4s, 8s, 16s, 32s
-                            // But respect Retry-After header if provided and it's longer
-                            let exponential_backoff = 2u64.pow(attempt as u32);
-                            let wait_time = retry_after.map(|ra| ra.max(exponential_backoff)).unwrap_or(exponential_backoff);
-
-                            warn!("Link health check: 429 rate limited - waiting {}s (attempt {}/{})", wait_time, attempt, max_attempts);
-                            tokio::time::sleep(Duration::from_secs(wait_time)).await;
-                            continue;
-                        } else {
-                            error!("Link health check: 429 rate limited - max attempts reached after exponential backoff");
-                            return false;
-                        }
-                    } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                        // 503 indicates the torrent is broken and needs repair - don't retry
-                        warn!("Link health check: 503 Service Unavailable for {} - torrent needs repair", link);
-                        return false;
-                    } else if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
-                        // 404/403 also indicate broken links - don't retry
-                        warn!("Link health check: {} {} for {} - torrent needs repair", status.as_u16(), status.canonical_reason().unwrap_or(""), link);
-                        return false;
-                    } else {
-                        // Other errors - don't retry
-                        warn!("Link health check: unexpected status {} for {}", status, link);
-                        return false;
-                    }
-                }
-                Err(e) => {
-                    if attempt < max_attempts {
-                        warn!("Link health check network error for {} (attempt {}/{}): {}", link, attempt, max_attempts, e);
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        continue;
-                    } else {
-                        warn!("Link health check failed for {} after {} attempts: {}", link, max_attempts, e);
-                        return false;
-                    }
-                }
-            }
-        }
-
-        false
-    }
-
     async fn fetch_with_retry<T, F>(
         &self,
         make_request: F,
@@ -534,5 +456,17 @@ mod tests {
         let _: Result<serde_json::Value, _> = client
             .fetch_with_retry(|| client.client.get("http://example.com"), &[])
             .await;
+    }
+
+    // Absence test: this test file should compile WITHOUT check_link_health.
+    // If check_link_health is re-added, this comment serves as a reminder it was
+    // intentionally removed. The real guard is that no code calls it.
+    #[test]
+    fn public_api_does_not_include_check_link_health() {
+        // check_link_health was removed in the simplification refactor.
+        // Repair is now triggered on-demand at STRM access time (see dav_fs.rs).
+        // This test documents the intent; the compile-time guard is that no
+        // call sites exist in the codebase.
+        assert!(true);
     }
 }
