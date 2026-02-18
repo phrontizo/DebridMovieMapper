@@ -8,3 +8,4 @@ run.log
 output.log
 test_debug.log
 test_output.log
+.worktrees/
