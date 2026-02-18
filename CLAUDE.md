@@ -15,11 +15,17 @@ cargo build --release
 # Run locally (requires env vars)
 RD_API_TOKEN=<token> TMDB_API_KEY=<key> cargo run
 
-# Run all tests
+# Run unit tests (no API tokens needed)
 cargo test
 
 # Run a single test
 cargo test <test_name>
+
+# Run integration tests (requires RD_API_TOKEN + TMDB_API_KEY in .env)
+cargo test -- --ignored
+
+# Run integration tests with subset (fast feedback)
+INTEGRATION_TEST_LIMIT=10 cargo test -- --ignored
 
 # Docker (single platform)
 docker build -t debridmoviemapper .
