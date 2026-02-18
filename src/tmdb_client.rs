@@ -40,31 +40,35 @@ impl TmdbClient {
     }
 
     pub async fn search_movie(&self, query: &str, year: Option<&str>) -> Vec<TmdbSearchResult> {
-        let mut url = format!(
-            "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
-            self.api_key,
-            urlencoding::encode(query)
-        );
+        let url = "https://api.themoviedb.org/3/search/movie";
+        let mut params = vec![
+            ("api_key", self.api_key.as_str()),
+            ("query", query),
+        ];
+        let year_string;
         if let Some(y) = year {
-            url.push_str(&format!("&year={}", y));
+            year_string = y.to_string();
+            params.push(("year", &year_string));
         }
-        self.search(&url).await
+        self.search(url, params).await
     }
 
     pub async fn search_tv(&self, query: &str, year: Option<&str>) -> Vec<TmdbSearchResult> {
-        let mut url = format!(
-            "https://api.themoviedb.org/3/search/tv?api_key={}&query={}",
-            self.api_key,
-            urlencoding::encode(query)
-        );
+        let url = "https://api.themoviedb.org/3/search/tv";
+        let mut params = vec![
+            ("api_key", self.api_key.as_str()),
+            ("query", query),
+        ];
+        let year_string;
         if let Some(y) = year {
-            url.push_str(&format!("&first_air_date_year={}", y));
+            year_string = y.to_string();
+            params.push(("first_air_date_year", &year_string));
         }
-        self.search(&url).await
+        self.search(url, params).await
     }
 
-    async fn search(&self, url: &str) -> Vec<TmdbSearchResult> {
-        match self.fetch_with_retry(|| self.client.get(url)).await {
+    async fn search(&self, url: &str, params: Vec<(&str, &str)>) -> Vec<TmdbSearchResult> {
+        match self.fetch_with_retry(|| self.client.get(url).query(&params)).await {
             Ok(resp) => resp.results,
             Err(e) => {
                 error!("TMDB search failed: {}", e);
