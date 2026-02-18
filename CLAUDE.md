@@ -38,28 +38,28 @@ docker compose up -d
 
 **Optional:**
 - `SCAN_INTERVAL_SECS` (default: 60) — how often to poll Real-Debrid
-- `REPAIR_INTERVAL_SECS` (default: 3600) — how often to check torrent health
 
 ## Architecture
 
 The project is structured as both a binary (`main.rs`) and a library (`mapper.rs` as lib root).
 
 **Background tasks (spawned in `main.rs`):**
-- **Scan task** (every `SCAN_INTERVAL_SECS`): Polls Real-Debrid → identifies torrents via TMDB → updates the in-memory VFS
-- **Repair task** (every `REPAIR_INTERVAL_SECS`): Checks link health → detects broken torrents → triggers repair via magnet links
+- **Scan task** (every `SCAN_INTERVAL_SECS`): Polls Real-Debrid → identifies torrents via TMDB → updates the in-memory VFS. Implemented in `tasks.rs`.
+- **Repair:** On-demand only — triggered when a `.strm` file is read and its link returns 503. No background polling.
 
 **Module responsibilities:**
 
 | File | Purpose |
 |------|---------|
-| `main.rs` | Initializes shared state, spawns tasks, starts WebDAV server on port 8080 |
+| `main.rs` | Initializes shared state, spawns scan task, starts WebDAV server on port 8080 |
+| `tasks.rs` | `run_scan_loop` — polls Real-Debrid, identifies new torrents, updates VFS |
 | `rd_client.rs` | Real-Debrid API client with exponential backoff (429 handling), 1-hour response cache |
 | `identification.rs` | Filename cleaning, camelCase splitting, TMDB scoring to identify movies/shows |
 | `vfs.rs` | In-memory virtual filesystem: creates `Movies/`+`Shows/` hierarchy, generates `.strm` files |
-| `dav_fs.rs` | Maps VFS to WebDAV protocol via the `dav-server` crate |
-| `repair.rs` | Torrent health state machine (Healthy→Checking→Broken→Repairing→Failed), auto-repair |
+| `dav_fs.rs` | Maps VFS to WebDAV; re-unrestricts links on read and triggers on-demand repair on 503 |
+| `repair.rs` | Torrent repair state machine (Healthy→Broken→Repairing→Failed), on-demand repair |
 | `tmdb_client.rs` | TMDB search for movies and TV shows |
-| `mapper.rs` | Library root — module declarations and shared utilities |
+| `mapper.rs` | Library root — module declarations |
 
 **Data flow for playback:**
 1. Jellyfin/player reads a `.strm` file via WebDAV
@@ -71,6 +71,8 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 ## Key Design Decisions
 
 - **Static linking / scratch Docker image:** The Dockerfile builds with musl targets (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) producing a minimal final image on `scratch`.
-- **Rate limiting:** Real-Debrid 429 responses trigger exponential backoff (2s→4s→8s→16s→32s). 503 responses bypass retries and trigger immediate repair.
+- **Rate limiting:** Real-Debrid 429 responses trigger exponential backoff. 503 on `unrestrict/link` is a terminal status (no retry) — it signals a broken torrent and triggers on-demand repair.
+- **Single retry method:** `rd_client.rs` has one `fetch_with_retry(make_request, terminal_statuses)` — callers pass the status codes that should abort without retrying (e.g. 404 for `get_torrent_info`, 503 for `unrestrict_link`).
 - **Identification scoring:** `identification.rs` cleans filenames extensively before TMDB lookup. Shows vs. movies are detected by file structure (presence of multiple video files with episode patterns).
-- **Repair hides broken torrents:** During repair, entries are removed from the VFS so they don't appear in Jellyfin until healthy again.
+- **On-demand repair:** When a `.strm` file is read, `dav_fs.rs` re-unrestricts the link (cached, so free when healthy). On 503 it calls `repair_manager.repair_by_id()` in a background task and hides the torrent until repaired.
+- **Repair hides broken torrents:** During repair, entries are hidden from the VFS so they don't appear in Jellyfin until healthy again.

@@ -471,3 +471,68 @@ impl RealDebridClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- should_retry_status ---
+
+    #[test]
+    fn should_retry_status_retries_429() {
+        assert!(RealDebridClient::should_retry_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[test]
+    fn should_retry_status_retries_503() {
+        assert!(RealDebridClient::should_retry_status(reqwest::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn should_retry_status_retries_502() {
+        assert!(RealDebridClient::should_retry_status(reqwest::StatusCode::BAD_GATEWAY));
+    }
+
+    #[test]
+    fn should_retry_status_retries_504() {
+        assert!(RealDebridClient::should_retry_status(reqwest::StatusCode::GATEWAY_TIMEOUT));
+    }
+
+    #[test]
+    fn should_retry_status_does_not_retry_200() {
+        assert!(!RealDebridClient::should_retry_status(reqwest::StatusCode::OK));
+    }
+
+    #[test]
+    fn should_retry_status_does_not_retry_404() {
+        assert!(!RealDebridClient::should_retry_status(reqwest::StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn should_retry_status_does_not_retry_500() {
+        assert!(!RealDebridClient::should_retry_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    // --- Compile-time signature checks for the unified fetch_with_retry ---
+    // These functions are never called; they exist only to fail compilation
+    // if the method signatures change unexpectedly.
+
+    #[allow(dead_code)]
+    async fn _assert_fetch_with_retry_accepts_terminal_statuses(client: &RealDebridClient) {
+        // Verifies fetch_with_retry accepts &[StatusCode] as second argument.
+        // If the signature changes this will not compile.
+        let _: Result<serde_json::Value, _> = client
+            .fetch_with_retry(
+                || client.client.get("http://example.com"),
+                &[reqwest::StatusCode::NOT_FOUND, reqwest::StatusCode::SERVICE_UNAVAILABLE],
+            )
+            .await;
+    }
+
+    #[allow(dead_code)]
+    async fn _assert_fetch_with_retry_accepts_empty_terminal_statuses(client: &RealDebridClient) {
+        let _: Result<serde_json::Value, _> = client
+            .fetch_with_retry(|| client.client.get("http://example.com"), &[])
+            .await;
+    }
+}
