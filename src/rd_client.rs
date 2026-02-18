@@ -158,7 +158,7 @@ impl RealDebridClient {
     }
 
     /// Helper to apply exponential backoff with jitter
-    async fn apply_backoff(attempt: u32) {
+    async fn backoff_delay(attempt: u32) {
         if attempt > 1 {
             // Exponential backoff: 1s, 2s, 4s, 8s
             let backoff = 2u64.pow(attempt - 2) * 1000;
@@ -173,7 +173,7 @@ impl RealDebridClient {
     }
 
     /// Helper to handle rate limiting and retry-after headers
-    async fn handle_retryable_status(
+    async fn wait_for_retry(
         status: reqwest::StatusCode,
         headers: &HeaderMap,
         attempt: u32,
@@ -207,7 +207,7 @@ impl RealDebridClient {
     }
 
     /// Helper to check if a status code should trigger a retry
-    fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    fn should_retry_status(status: reqwest::StatusCode) -> bool {
         status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
             || status == reqwest::StatusCode::BAD_GATEWAY
@@ -220,7 +220,7 @@ impl RealDebridClient {
         loop {
             info!("Fetching torrents page {}...", page);
             let url = format!("https://api.real-debrid.com/rest/1.0/torrents?page={}&limit=50", page);
-            let res: Result<Vec<Torrent>, reqwest::Error> = self.fetch_with_retry(|| self.client.get(&url)).await;
+            let res: Result<Vec<Torrent>, reqwest::Error> = self.fetch_with_retry(|| self.client.get(&url), &[]).await;
             
             match res {
                 Ok(torrents) => {
@@ -245,7 +245,7 @@ impl RealDebridClient {
 
     pub async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
         let url = format!("https://api.real-debrid.com/rest/1.0/torrents/info/{}", id);
-        self.fetch_with_retry_except_404(|| self.client.get(&url)).await
+        self.fetch_with_retry(|| self.client.get(&url), &[reqwest::StatusCode::NOT_FOUND]).await
     }
 
     pub async fn unrestrict_link(&self, link: &str) -> Result<UnrestrictResponse, reqwest::Error> {
@@ -265,9 +265,10 @@ impl RealDebridClient {
         // Not in cache or expired, fetch from API
         // Special handling: 503 on unrestrict means broken torrent, no retries
         let url = "https://api.real-debrid.com/rest/1.0/unrestrict/link";
-        let response: UnrestrictResponse = self.fetch_with_retry_except_503(|| {
-            self.client.post(url).form(&[("link", link)])
-        }).await?;
+        let response: UnrestrictResponse = self.fetch_with_retry(
+            || self.client.post(url).form(&[("link", link)]),
+            &[reqwest::StatusCode::SERVICE_UNAVAILABLE],
+        ).await?;
 
         // Store in cache
         {
@@ -286,7 +287,7 @@ impl RealDebridClient {
         let url = "https://api.real-debrid.com/rest/1.0/torrents/addMagnet";
         self.fetch_with_retry(|| {
             self.client.post(url).form(&[("magnet", magnet)])
-        }).await
+        }, &[]).await
     }
 
     /// Select files for a torrent
@@ -295,7 +296,7 @@ impl RealDebridClient {
         // Use empty type for no response body expected
         let _: serde_json::Value = self.fetch_with_retry(|| {
             self.client.post(&url).form(&[("files", file_ids)])
-        }).await?;
+        }, &[]).await?;
         Ok(())
     }
 
@@ -400,7 +401,11 @@ impl RealDebridClient {
         false
     }
 
-    async fn fetch_with_retry<T, F>(&self, make_request: F) -> Result<T, reqwest::Error>
+    async fn fetch_with_retry<T, F>(
+        &self,
+        make_request: F,
+        terminal_statuses: &[reqwest::StatusCode],
+    ) -> Result<T, reqwest::Error>
     where
         T: serde::de::DeserializeOwned,
         F: Fn() -> reqwest::RequestBuilder,
@@ -409,92 +414,19 @@ impl RealDebridClient {
         let max_attempts = 10;
 
         for attempt in 1..=max_attempts {
-            Self::apply_backoff(attempt).await;
+            Self::backoff_delay(attempt).await;
             self.rate_limit().await;
 
-            let request = make_request();
-            match request.send().await {
+            match make_request().send().await {
                 Ok(resp) => {
                     let status = resp.status();
 
-                    if Self::is_retryable_status(status) {
-                        Self::handle_retryable_status(status, resp.headers(), attempt, max_attempts).await;
-                    }
-
-                    match resp.error_for_status() {
-                        Ok(resp) => {
-                            let headers = resp.headers().clone();
-                            let text = resp.text().await?;
-                            if text.trim().is_empty() || status.as_u16() == 204 {
-                                if let Ok(val) = serde_json::from_str::<T>("[]") {
-                                    return Ok(val);
-                                }
-                                warn!("RD API returned empty body or 204 (attempt {}/{}) - Status: {}, Headers: {:?}", attempt, max_attempts, status, headers);
-                                continue;
-                            }
-                            match serde_json::from_str::<T>(&text) {
-                                Ok(val) => return Ok(val),
-                                Err(e) => {
-                                    error!("Failed to decode RD response: {}. Status: {}, Body: {}, Headers: {:?}", e, status, text, headers);
-                                    // This is a decoding error. reqwest::Error can be created from it.
-                                    // Actually, let's just use the error from a failed .json() call to get a reqwest::Error.
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("RD API error status (attempt {}/{}): {}. Status: {}", attempt, max_attempts, e, status);
-                            last_error = Some(e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("RD API request failed (attempt {}/{}): {}", attempt, max_attempts, e);
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        // If we reach here, we exhausted retries or got a terminal error.
-        if let Some(e) = last_error {
-            Err(e)
-        } else {
-            // This happens if we got empty body or decoding error every time.
-            // Do one last request to get a proper reqwest::Error from .json()
-            make_request().send().await?.error_for_status()?.json().await
-        }
-    }
-
-    /// Same as fetch_with_retry but treats 503 Service Unavailable as a terminal error
-    /// (no retries). Used for unrestrict endpoint where 503 indicates broken torrent.
-    async fn fetch_with_retry_except_503<T, F>(&self, make_request: F) -> Result<T, reqwest::Error>
-    where
-        T: serde::de::DeserializeOwned,
-        F: Fn() -> reqwest::RequestBuilder,
-    {
-        let mut last_error: Option<reqwest::Error> = None;
-        let max_attempts = 10;
-
-        for attempt in 1..=max_attempts {
-            Self::apply_backoff(attempt).await;
-            self.rate_limit().await;
-
-            let request = make_request();
-            match request.send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-
-                    // 503 on unrestrict is a terminal error - no retries
-                    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                        warn!("RD API returned 503 Service Unavailable on unrestrict - treating as broken torrent, no retries");
+                    if terminal_statuses.contains(&status) {
                         return resp.error_for_status()?.json().await;
                     }
 
-                    // Handle other retryable statuses (excluding 503)
-                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                        || status == reqwest::StatusCode::BAD_GATEWAY
-                        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
-                    {
-                        Self::handle_retryable_status(status, resp.headers(), attempt, max_attempts).await;
+                    if Self::should_retry_status(status) {
+                        Self::wait_for_retry(status, resp.headers(), attempt, max_attempts).await;
                     }
 
                     match resp.error_for_status() {
@@ -505,18 +437,20 @@ impl RealDebridClient {
                                 if let Ok(val) = serde_json::from_str::<T>("[]") {
                                     return Ok(val);
                                 }
-                                warn!("RD API returned empty body or 204 (attempt {}/{}) - Status: {}, Headers: {:?}", attempt, max_attempts, status, headers);
+                                warn!("RD API empty body or 204 (attempt {}/{}). Status: {}, Headers: {:?}",
+                                    attempt, max_attempts, status, headers);
                                 continue;
                             }
                             match serde_json::from_str::<T>(&text) {
                                 Ok(val) => return Ok(val),
                                 Err(e) => {
-                                    error!("Failed to decode RD response: {}. Status: {}, Body: {}, Headers: {:?}", e, status, text, headers);
+                                    error!("Failed to decode RD response: {}. Status: {}, Body: {}, Headers: {:?}",
+                                        e, status, text, headers);
                                 }
                             }
                         }
                         Err(e) => {
-                            warn!("RD API error status (attempt {}/{}): {}. Status: {}", attempt, max_attempts, e, status);
+                            warn!("RD API error (attempt {}/{}): {}. Status: {}", attempt, max_attempts, e, status);
                             last_error = Some(e);
                         }
                     }
@@ -528,83 +462,9 @@ impl RealDebridClient {
             }
         }
 
-        // If we reach here, we exhausted retries or got a terminal error.
         if let Some(e) = last_error {
             Err(e)
         } else {
-            // This happens if we got empty body or decoding error every time.
-            // Do one last request to get a proper reqwest::Error from .json()
-            make_request().send().await?.error_for_status()?.json().await
-        }
-    }
-
-    /// Same as fetch_with_retry but treats 404 Not Found as a terminal error
-    /// (no retries). Used for get_torrent_info where 404 means torrent was deleted.
-    async fn fetch_with_retry_except_404<T, F>(&self, make_request: F) -> Result<T, reqwest::Error>
-    where
-        T: serde::de::DeserializeOwned,
-        F: Fn() -> reqwest::RequestBuilder,
-    {
-        let mut last_error: Option<reqwest::Error> = None;
-        let max_attempts = 10;
-
-        for attempt in 1..=max_attempts {
-            Self::apply_backoff(attempt).await;
-            self.rate_limit().await;
-
-            let request = make_request();
-            match request.send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-
-                    // 404 Not Found is a terminal error - torrent doesn't exist, no retries
-                    if status == reqwest::StatusCode::NOT_FOUND {
-                        debug!("RD API returned 404 Not Found - treating as terminal error, no retries");
-                        return resp.error_for_status()?.json().await;
-                    }
-
-                    // Handle retryable statuses
-                    if Self::is_retryable_status(status) {
-                        Self::handle_retryable_status(status, resp.headers(), attempt, max_attempts).await;
-                    }
-
-                    match resp.error_for_status() {
-                        Ok(resp) => {
-                            let headers = resp.headers().clone();
-                            let text = resp.text().await?;
-                            if text.trim().is_empty() || status.as_u16() == 204 {
-                                if let Ok(val) = serde_json::from_str::<T>("[]") {
-                                    return Ok(val);
-                                }
-                                warn!("RD API returned empty body or 204 (attempt {}/{}) - Status: {}, Headers: {:?}", attempt, max_attempts, status, headers);
-                                continue;
-                            }
-                            match serde_json::from_str::<T>(&text) {
-                                Ok(val) => return Ok(val),
-                                Err(e) => {
-                                    error!("Failed to decode RD response: {}. Status: {}, Body: {}, Headers: {:?}", e, status, text, headers);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("RD API error status (attempt {}/{}): {}. Status: {}", attempt, max_attempts, e, status);
-                            last_error = Some(e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("RD API request failed (attempt {}/{}): {}", attempt, max_attempts, e);
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        // If we reach here, we exhausted retries or got a terminal error.
-        if let Some(e) = last_error {
-            Err(e)
-        } else {
-            // This happens if we got empty body or decoding error every time.
-            // Do one last request to get a proper reqwest::Error from .json()
             make_request().send().await?.error_for_status()?.json().await
         }
     }
