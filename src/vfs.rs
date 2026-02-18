@@ -369,9 +369,8 @@ mod tests {
         );
     }
 
-    // NOTE: Tests are temporarily disabled because update() now requires async rd_client
-    // and makes real API calls to unrestrict links. These tests need to be refactored
-    // to use a proper mock RealDebridClient.
+    // TODO: Tests below are disabled because update() requires a real RealDebridClient
+    // and makes live API calls. Refactor to use a mock RealDebridClient.
 
     #[tokio::test]
     #[ignore]
