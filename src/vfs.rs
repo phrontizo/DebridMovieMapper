@@ -305,10 +305,8 @@ impl DebridVfs {
                         format!("{}\n", url).into_bytes()
                     }
                     Err(e) => {
-                        tracing::error!("Failed to unrestrict link for {}: {}", final_name, e);
-                        // Use a placeholder URL if unrestricting fails
-                        // This shouldn't happen for healthy torrents, but prevents VFS build failure
-                        "# Error: Failed to unrestrict link\n".to_string().into_bytes()
+                        tracing::warn!("Skipping file {} — unrestrict failed: {}", final_name, e);
+                        return;
                     }
                 };
 
@@ -357,6 +355,19 @@ fn xml_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::rd_client::{TorrentInfo, TorrentFile};
+
+    #[test]
+    fn broken_link_placeholder_not_present() {
+        // Verify the broken-link error placeholder was removed from this file.
+        // On unrestrict failure we skip the file rather than inserting a fake STRM.
+        // The search string is split so this test does not self-match.
+        let placeholder = ["# Error: Failed", " to unrestrict link"].concat();
+        let source = include_str!("vfs.rs");
+        assert!(
+            !source.contains(&placeholder),
+            "vfs.rs must not contain the broken-link placeholder — skip the file on error instead"
+        );
+    }
 
     // NOTE: Tests are temporarily disabled because update() now requires async rd_client
     // and makes real API calls to unrestrict links. These tests need to be refactored
@@ -556,6 +567,19 @@ mod tests {
                 assert!(movie_children.contains_key("Same Title [tmdbid-2]"));
             }
         }
+    }
+
+    #[test]
+    fn strm_error_placeholder_is_not_used() {
+        // Verify the broken-link placeholder string has been removed from this file.
+        // If this test fails, it means the placeholder was re-introduced.
+        // The needle is split so that this test's own source text does not match it.
+        let source = include_str!("vfs.rs");
+        let needle = concat!("# Error: Failed to unrestrict", " link");
+        assert!(
+            !source.contains(needle),
+            "vfs.rs must not contain the broken-link placeholder string — skip the file instead"
+        );
     }
 
     #[tokio::test]
