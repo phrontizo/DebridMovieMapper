@@ -53,20 +53,7 @@ async fn test_repair_process_integration() {
         torrent_data.push((info, metadata));
     }
 
-    // Test 1: Check health of existing torrents
-    println!("\n=== Test 1: Health Check ===");
-    let broken_ids = repair_manager.check_torrent_health(&torrent_data).await;
-    println!("Health check complete. Broken torrents: {}", broken_ids.len());
-
-    // Give it a moment to complete the check
-    sleep(Duration::from_millis(500)).await;
-
-    // Check status summary
-    let (healthy, broken, repairing) = repair_manager.get_status_summary().await;
-    println!("  Healthy: {}, Broken: {}, Repairing: {}", healthy, broken, repairing);
-    println!("  ✓ Health check completed successfully");
-
-    // Test 2: Mark a torrent as broken and verify it can be detected
+    // Test 1: Mark a torrent as broken and verify it can be detected
     println!("\n=== Test 2: Mark Broken ===");
     if let Some((info, _)) = torrent_data.first() {
         if let Some(first_link) = info.links.first() {

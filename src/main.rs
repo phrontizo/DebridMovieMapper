@@ -49,61 +49,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = sled::open("metadata.db").expect("Failed to open database");
     let tree = db.open_tree("matches").expect("Failed to open database tree");
 
-    // Background repair task
-    let repair_manager_clone = repair_manager.clone();
-    let tree_repair = tree.clone();
+    // Background repair task placeholder — on-demand repair is now triggered at STRM access time.
     let repair_interval = repair_interval_secs;
     tokio::spawn(async move {
-        // Wait for the configured interval before starting first repair check
-        info!("Repair task: waiting {} seconds before first health check", repair_interval);
-        tokio::time::sleep(Duration::from_secs(repair_interval)).await;
-
+        info!("Repair task: on-demand repair enabled; background interval set to {} seconds (unused)", repair_interval);
         loop {
-            info!("Starting torrent health check...");
-
-            // Load current torrents from DB
-            let mut current_torrents = Vec::new();
-            for result in tree_repair.iter().flatten() {
-                let (_id_bytes, data_bytes) = result;
-                if let Ok(data) = serde_json::from_slice::<(debridmoviemapper::rd_client::TorrentInfo, MediaMetadata)>(&data_bytes) {
-                    current_torrents.push(data);
-                }
-            }
-
-            // Check health
-            let broken_ids = repair_manager_clone.check_torrent_health(&current_torrents).await;
-
-            // Try to repair broken torrents
-            if !broken_ids.is_empty() {
-                info!("Found {} broken torrents, initiating repairs...", broken_ids.len());
-                let mut repaired = 0;
-                let mut repair_failed = 0;
-
-                for broken_id in broken_ids {
-                    if let Some((torrent_info, _)) = current_torrents.iter().find(|(t, _)| t.id == broken_id) {
-                        match repair_manager_clone.repair_torrent(torrent_info).await {
-                            Ok(_) => {
-                                repaired += 1;
-                                // Trigger VFS refresh by removing from DB (it will be re-added)
-                                let _ = tree_repair.remove(&broken_id);
-                            }
-                            Err(e) => {
-                                error!("REPAIR FAILED for torrent '{}' ({}): {}", torrent_info.filename, broken_id, e);
-                                repair_failed += 1;
-                            }
-                        }
-                    }
-                }
-
-                info!("Repair cycle complete: {} repaired, {} failed", repaired, repair_failed);
-            } else {
-                info!("No broken torrents found, all healthy!");
-            }
-
-            let (healthy, repairing, failed) = repair_manager_clone.get_status_summary().await;
-            info!("Overall repair status: {} healthy, {} in repair, {} permanently failed", healthy, repairing, failed);
-
-            info!("Repair task: sleeping for {} seconds until next check", repair_interval);
             tokio::time::sleep(Duration::from_secs(repair_interval)).await;
         }
     });
