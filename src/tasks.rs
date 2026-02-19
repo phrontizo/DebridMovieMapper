@@ -157,11 +157,11 @@ pub async fn run_scan_loop(
                                 "Progress: {}/{} new torrents identified",
                                 processed_new, new_total
                             );
-                            update_vfs(&vfs, &current_data, &repair_manager, &rd_client).await;
+                            update_vfs(&vfs, &current_data, &repair_manager).await;
                         }
                     }
                 } else {
-                    update_vfs(&vfs, &current_data, &repair_manager, &rd_client).await;
+                    update_vfs(&vfs, &current_data, &repair_manager).await;
                 }
 
                 let current_ids: std::collections::HashSet<String> =
@@ -181,7 +181,6 @@ async fn update_vfs(
     vfs: &Arc<RwLock<DebridVfs>>,
     current_data: &[(crate::rd_client::TorrentInfo, MediaMetadata)],
     repair_manager: &Arc<RepairManager>,
-    rd_client: &Arc<RealDebridClient>,
 ) {
     let mut filtered = Vec::new();
     for (torrent_info, metadata) in current_data {
@@ -190,7 +189,7 @@ async fn update_vfs(
         }
     }
     // Build VFS without holding the lock to avoid blocking WebDAV reads during scans
-    let new_vfs = DebridVfs::build(filtered, rd_client.clone()).await;
+    let new_vfs = DebridVfs::build(filtered);
     // Only hold write lock briefly to swap
     let mut vfs_lock = vfs.write().await;
     *vfs_lock = new_vfs;

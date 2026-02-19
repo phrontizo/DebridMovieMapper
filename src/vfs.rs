@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use serde::{Deserialize, Serialize};
-use crate::rd_client::{TorrentInfo, RealDebridClient};
+use crate::rd_client::TorrentInfo;
 use regex::Regex;
 
 pub const VIDEO_EXTENSIONS: &[&str] = &[
@@ -73,7 +73,7 @@ impl DebridVfs {
         }
     }
 
-    pub async fn build(torrents: Vec<(TorrentInfo, MediaMetadata)>, rd_client: Arc<RealDebridClient>) -> Self {
+    pub fn build(torrents: Vec<(TorrentInfo, MediaMetadata)>) -> Self {
         let mut movies_nodes = BTreeMap::new();
         let mut shows_nodes = BTreeMap::new();
 
@@ -128,7 +128,7 @@ impl DebridVfs {
                     let mut children = BTreeMap::new();
                     // For movies, only take the largest torrent to avoid duplicates
                     if let Some(torrent) = torrents.first() {
-                        Self::add_torrent_files(&mut children, torrent, None, &rd_client).await;
+                        Self::add_torrent_files(&mut children, torrent, None);
                     }
                     if !children.is_empty() {
                         let nfo_content = Self::generate_nfo(&metadata);
@@ -172,7 +172,7 @@ impl DebridVfs {
                                         });
 
                                         if let VfsNode::Directory { children: season_children } = season_dir {
-                                            Self::add_path_to_tree(season_children, filename, file.bytes, torrent.id.clone(), link.clone(), &rd_client).await;
+                                            Self::add_path_to_tree(season_children, filename, file.bytes, torrent.id.clone(), link.clone());
                                         }
                                     }
                                 }
@@ -255,7 +255,7 @@ impl DebridVfs {
         nfo.into_bytes()
     }
 
-    async fn add_torrent_files(destination: &mut BTreeMap<String, VfsNode>, torrent: &TorrentInfo, path_prefix: Option<&str>, rd_client: &Arc<RealDebridClient>) {
+    fn add_torrent_files(destination: &mut BTreeMap<String, VfsNode>, torrent: &TorrentInfo, path_prefix: Option<&str>) {
         let selected_count = torrent.files.iter().filter(|f| f.selected == 1).count();
         if selected_count != torrent.links.len() {
             tracing::warn!(
@@ -274,7 +274,7 @@ impl DebridVfs {
                         } else {
                             filename.to_string()
                         };
-                        Self::add_path_to_tree(destination, &path, file.bytes, torrent.id.clone(), link.clone(), rd_client).await;
+                        Self::add_path_to_tree(destination, &path, file.bytes, torrent.id.clone(), link.clone());
                     }
                 }
                 link_idx += 1;
@@ -282,7 +282,7 @@ impl DebridVfs {
         }
     }
 
-    async fn add_path_to_tree(root: &mut BTreeMap<String, VfsNode>, path: &str, _size: u64, torrent_id: String, link: String, rd_client: &Arc<RealDebridClient>) {
+    fn add_path_to_tree(root: &mut BTreeMap<String, VfsNode>, path: &str, _size: u64, torrent_id: String, link: String) {
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         let mut current_children = root;
 
@@ -308,18 +308,9 @@ impl DebridVfs {
                     counter += 1;
                 }
 
-                // Unrestrict the link to get the actual download URL
-                let strm_content = match rd_client.unrestrict_link(&link).await {
-                    Ok(response) => {
-                        let url = response.download;
-                        tracing::debug!("Unrestricted link for {}: {}", final_name, url);
-                        format!("{}\n", url).into_bytes()
-                    }
-                    Err(e) => {
-                        tracing::warn!("Skipping file {} — unrestrict failed: {}", final_name, e);
-                        return;
-                    }
-                };
+                // strm_content is a size placeholder only — the actual download URL
+                // is fetched on-demand by dav_fs::StrmFile::read_bytes via unrestrict_link
+                let strm_content = format!("{}\n", link).into_bytes();
 
                 current_children.insert(final_name, VfsNode::StrmFile {
                     strm_content,
@@ -377,31 +368,8 @@ mod tests {
         );
     }
 
-    use crate::rd_client::{RealDebridClient, UnrestrictResponse};
-
-    /// Create a RealDebridClient with pre-seeded unrestrict cache for given links.
-    /// No real API calls will be made for cached links.
-    async fn mock_rd_client(links: &[&str]) -> Arc<RealDebridClient> {
-        let client = Arc::new(RealDebridClient::new("fake-token".to_string()).unwrap());
-        for link in links {
-            client.seed_unrestrict_cache(link, UnrestrictResponse {
-                id: "mock".to_string(),
-                filename: "mock.mkv".to_string(),
-                mime_type: Some("video/x-matroska".to_string()),
-                filesize: 1000,
-                link: link.to_string(),
-                host: "mock".to_string(),
-                chunks: 1,
-                crc: 0,
-                download: format!("https://mock-download.example.com/{}", link),
-                streamable: 0,
-            }).await;
-        }
-        client
-    }
-
-    #[tokio::test]
-    async fn test_vfs_update() {
+    #[test]
+    fn test_vfs_update() {
         let torrents = vec![
             (
                 TorrentInfo {
@@ -463,8 +431,7 @@ mod tests {
             ),
         ];
 
-        let rd_client = mock_rd_client(&["http://link1", "http://link2"]).await;
-        let vfs = DebridVfs::build(torrents, rd_client).await;
+        let vfs = DebridVfs::build(torrents);
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").expect("Movies directory missing");
@@ -515,8 +482,8 @@ mod tests {
         assert!(content.contains("<source>debridmoviemapper</source>"));
     }
 
-    #[tokio::test]
-    async fn test_vfs_conflicts() {
+    #[test]
+    fn test_vfs_conflicts() {
         let torrents = vec![
             (
                 TorrentInfo {
@@ -578,8 +545,7 @@ mod tests {
             ),
         ];
 
-        let rd_client = mock_rd_client(&["http://l1", "http://l2"]).await;
-        let vfs = DebridVfs::build(torrents, rd_client).await;
+        let vfs = DebridVfs::build(torrents);
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
@@ -618,8 +584,8 @@ mod tests {
         assert!(!content.contains("&<"), "No unescaped special characters should appear");
     }
 
-    #[tokio::test]
-    async fn test_vfs_duplicates() {
+    #[test]
+    fn test_vfs_duplicates() {
         let metadata = MediaMetadata {
             title: "Duplicate Movie".to_string(),
             year: Some("2023".to_string()),
@@ -668,8 +634,7 @@ mod tests {
             ),
         ];
 
-        let rd_client = mock_rd_client(&["http://small", "http://large"]).await;
-        let vfs = DebridVfs::build(torrents, rd_client).await;
+        let vfs = DebridVfs::build(torrents);
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();

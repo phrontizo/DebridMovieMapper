@@ -159,11 +159,11 @@ async fn test_identification() {
 #[tokio::test]
 #[ignore]
 async fn test_vfs_structure() {
-    let (rd_client, data) = get_shared_data().await;
+    let (_, data) = get_shared_data().await;
     assert!(!data.is_empty(), "Need identified torrents to test VFS structure");
 
     println!("Building VFS...");
-    let new_vfs = DebridVfs::build(data.clone(), rd_client.clone()).await;
+    let new_vfs = DebridVfs::build(data.clone());
     let vfs = Arc::new(RwLock::new(new_vfs));
 
     let vfs_lock = vfs.read().await;
@@ -228,11 +228,11 @@ async fn test_vfs_structure() {
 #[tokio::test]
 #[ignore]
 async fn test_vfs_completeness() {
-    let (rd_client, data) = get_shared_data().await;
+    let (_, data) = get_shared_data().await;
     assert!(!data.is_empty(), "Need identified torrents to test VFS completeness");
 
     println!("Building VFS...");
-    let new_vfs = DebridVfs::build(data.clone(), rd_client.clone()).await;
+    let new_vfs = DebridVfs::build(data.clone());
     let vfs = Arc::new(RwLock::new(new_vfs));
 
     let vfs_lock = vfs.read().await;

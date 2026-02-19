@@ -67,7 +67,7 @@ async fn test_strm_file_generation() {
 
     println!("Updating VFS...");
     {
-        let new_vfs = DebridVfs::build(current_data, rd_client.clone()).await;
+        let new_vfs = DebridVfs::build(current_data);
         let mut vfs_lock = vfs.write().await;
         *vfs_lock = new_vfs;
     }
@@ -186,7 +186,7 @@ async fn test_strm_filename_conversion() {
     }
 
     {
-        let new_vfs = DebridVfs::build(current_data, rd_client.clone()).await;
+        let new_vfs = DebridVfs::build(current_data);
         let mut vfs_lock = vfs.write().await;
         *vfs_lock = new_vfs;
     }
@@ -267,7 +267,7 @@ async fn test_nfo_generation_with_strm() {
     }
 
     {
-        let new_vfs = DebridVfs::build(current_data, rd_client.clone()).await;
+        let new_vfs = DebridVfs::build(current_data);
         let mut vfs_lock = vfs.write().await;
         *vfs_lock = new_vfs;
     }
