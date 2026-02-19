@@ -1,8 +1,16 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use serde::{Deserialize, Serialize};
 use crate::rd_client::{TorrentInfo, RealDebridClient};
 use regex::Regex;
+
+pub const VIDEO_EXTENSIONS: &[&str] = &[
+    ".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
+];
+
+static SEASON_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)s(\d+)|season\s*(\d+)|(\d+)x\d+").unwrap()
+});
 
 #[derive(Debug, Clone)]
 pub enum VfsNode {
@@ -90,9 +98,6 @@ impl DebridVfs {
         let mut used_movie_names: HashMap<String, u32> = HashMap::new();
         let mut used_show_names: HashMap<String, u32> = HashMap::new();
 
-        // Compile regex outside the loop
-        let season_regex = Regex::new(r"(?i)s(\d+)|season\s*(\d+)|(\d+)x\d+").unwrap();
-
         for metadata in sorted_metadata {
             let mut torrents = media_groups.get(&metadata).unwrap().clone();
             // Sort torrents by size descending to pick the best/largest one
@@ -153,7 +158,7 @@ impl DebridVfs {
                                 if is_video_file(&file.path) {
                                     if let Some(link) = torrent.links.get(link_idx) {
                                         let filename = file.path.split('/').next_back().unwrap_or(&file.path);
-                                        let season = season_regex.captures(filename)
+                                        let season = SEASON_RE.captures(filename)
                                             .and_then(|cap| {
                                                 cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3))
                                             })
@@ -334,13 +339,12 @@ impl DebridVfs {
 
 pub fn is_video_file(path: &str) -> bool {
     let lower = path.to_lowercase();
-    if lower.contains("sample") || lower.contains("trailer") || lower.contains("extra") ||
-       lower.contains("bonus") || lower.contains("featurette") {
+    let filename = lower.rsplit('/').next().unwrap_or(&lower);
+    if filename.contains("sample") || filename.contains("trailer") || filename.contains("extra") ||
+       filename.contains("bonus") || filename.contains("featurette") {
         return false;
     }
-    lower.ends_with(".mkv") || lower.ends_with(".mp4") || lower.ends_with(".avi") ||
-    lower.ends_with(".m4v") || lower.ends_with(".mov") || lower.ends_with(".wmv") ||
-    lower.ends_with(".flv") || lower.ends_with(".ts") || lower.ends_with(".m2ts")
+    VIDEO_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
 }
 
 fn xml_escape(s: &str) -> String {

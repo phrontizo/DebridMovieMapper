@@ -1,8 +1,23 @@
+use std::sync::LazyLock;
 use regex::Regex;
 use tracing::{info, warn, debug};
 use crate::rd_client;
 use crate::tmdb_client::{TmdbClient, TmdbSearchResult};
-use crate::vfs::{MediaMetadata, MediaType, is_video_file};
+use crate::vfs::{MediaMetadata, MediaType, is_video_file, VIDEO_EXTENSIONS};
+
+static CAMEL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([a-z])([A-Z])").unwrap());
+
+static PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(\[.*?\]|\(.*?\)|[\w.-]+\.[a-z]{2,6}\s+-\s+|d3us-|m-|Bond[\s.]+\d+|James[\s.]*Bond|007)\s*").unwrap());
+
+static YEAR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(19|20)\d{2}\b").unwrap());
+
+static STOP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(1080p|720p|2160p|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d+x\d+|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web-dl|h264|h265|x264|x265|remux|multi|vff|custom|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack|completa|complete|pol|eng|ita|ger|fra|spa|esp|rus|ukr)\b").unwrap());
+
+static YEAR_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(19|20)\d{2}[\s-]+(19|20)\d{2}\b").unwrap());
+
+static SHOW_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)s(\d+)\.?e(\d+)|s(\d+)|(\d+)x(\d+)|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|e\d+").unwrap());
+
+static GENERIC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(episode|season|part|volume|vol)\s*(\d+|[a-z])?$").unwrap());
 
 pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) -> MediaMetadata {
     let representative_name = info.files.iter()
@@ -118,8 +133,7 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
 
     // If no results found, try CamelCase splitting as a fallback
     if tv_results.is_empty() && movie_results.is_empty() {
-        let camel_re = Regex::new(r"([a-z])([A-Z])").unwrap();
-        let split_name = camel_re.replace_all(&cleaned_name, "$1 $2").to_string();
+        let split_name = CAMEL_RE.replace_all(&cleaned_name, "$1 $2").to_string();
         if split_name != cleaned_name {
             debug!("No results for '{}', trying CamelCase split: '{}'", cleaned_name, split_name);
             let (tv_extra, movie_extra) = tokio::join!(
@@ -276,16 +290,14 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     // 0. Remove file extension if present
     if let Some(pos) = title.rfind('.') {
         let ext = &title[pos..].to_lowercase();
-        if ext == ".mkv" || ext == ".mp4" || ext == ".avi" || ext == ".m4v" || 
-           ext == ".mov" || ext == ".wmv" || ext == ".flv" || ext == ".ts" || ext == ".m2ts" {
+        if VIDEO_EXTENSIONS.iter().any(|e| *e == ext) {
             title.truncate(pos);
         }
     }
 
     // 1. Remove common site prefixes and garbage at the start
     // Patterns like "[ site ] ", "( site )", "site.com - ", "d3us-", "m-", "Bond.50."
-    let prefix_re = Regex::new(r"(?i)^(\[.*?\]|\(.*?\)|[\w.-]+\.[a-z]{2,6}\s+-\s+|d3us-|m-|Bond[\s.]+\d+|James[\s.]*Bond|007)\s*").unwrap();
-    if let Some(m) = prefix_re.find(&title) {
+    if let Some(m) = PREFIX_RE.find(&title) {
         // Only strip if it's followed by a separator (dot, space, dash) or it's a known prefix
         title = title[m.end()..].trim_start_matches(|c: char| !c.is_alphanumeric()).to_string();
     }
@@ -303,13 +315,10 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     }
 
     // 4. Find year (19xx or 20xx)
-    let year_re = Regex::new(r"\b(19|20)\d{2}\b").unwrap();
-    let year = year_re.find(&title).map(|m| m.as_str().to_string());
+    let year = YEAR_RE.find(&title).map(|m| m.as_str().to_string());
 
     // 5. Handle stop words (technical metadata, quality, codecs, season info)
-    let stop_re = Regex::new(r"(?i)\b(1080p|720p|2160p|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d+x\d+|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web-dl|h264|h265|x264|x265|remux|multi|vff|custom|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack|completa|complete|pol|eng|ita|ger|fra|spa|esp|rus|ukr)\b").unwrap();
-
-    while let Some(m) = stop_re.find(&title) {
+    while let Some(m) = STOP_RE.find(&title) {
         if m.start() == 0 {
             // Metadata at start, strip it
             title = title[m.end()..].to_string();
@@ -323,11 +332,10 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     }
 
     // 6. Truncate at year if it appears in title (and is not at the very start)
-    if let Some(m) = year_re.find(&title) {
+    if let Some(m) = YEAR_RE.find(&title) {
         if m.start() > 0 {
             // Check if this year is part of a range (e.g. 1985-1999 or 1985 1999)
-            let range_re = Regex::new(r"\b(19|20)\d{2}[\s-]+(19|20)\d{2}\b").unwrap();
-            if !range_re.is_match(&title) {
+            if !YEAR_RANGE_RE.is_match(&title) {
                 title.truncate(m.start());
             }
         }
@@ -340,10 +348,9 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
 }
 
 pub fn is_show_guess(files: &[rd_client::TorrentFile]) -> bool {
-    let show_regex = Regex::new(r"(?i)s(\d+)\.?e(\d+)|s(\d+)|(\d+)x(\d+)|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|e\d+").unwrap();
     files.iter().any(|f| {
         let filename = f.path.split('/').next_back().unwrap_or(&f.path);
-        show_regex.is_match(filename)
+        SHOW_RE.is_match(filename)
     }) ||
     files.iter().filter(|f| is_video_file(&f.path)).count() > 1
 }
@@ -384,8 +391,7 @@ fn is_generic_title(s: &str) -> bool {
     }
 
     // Generic terms that might have survived cleaning
-    let generic_re = Regex::new(r"(?i)^(episode|season|part|volume|vol)\s*(\d+|[a-z])?$").unwrap();
-    if generic_re.is_match(&lower) {
+    if GENERIC_RE.is_match(&lower) {
         return true;
     }
 
