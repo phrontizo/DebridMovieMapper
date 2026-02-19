@@ -46,6 +46,7 @@ pub struct MediaMetadata {
 
 pub struct DebridVfs {
     pub root: VfsNode,
+    pub created_at: std::time::SystemTime,
 }
 
 impl Default for DebridVfs {
@@ -68,6 +69,7 @@ impl DebridVfs {
             root: VfsNode::Directory {
                 children,
             },
+            created_at: std::time::SystemTime::now(),
         }
     }
 
@@ -193,6 +195,7 @@ impl DebridVfs {
         });
         Self {
             root: VfsNode::Directory { children: root_children },
+            created_at: std::time::SystemTime::now(),
         }
     }
 
