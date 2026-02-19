@@ -544,18 +544,6 @@ mod tests {
             .await;
     }
 
-    // Absence test: this test file should compile WITHOUT check_link_health.
-    // If check_link_health is re-added, this comment serves as a reminder it was
-    // intentionally removed. The real guard is that no code calls it.
-    #[test]
-    fn public_api_does_not_include_check_link_health() {
-        // check_link_health was removed in the simplification refactor.
-        // Repair is now triggered on-demand at STRM access time (see dav_fs.rs).
-        // This test documents the intent; the compile-time guard is that no
-        // call sites exist in the codebase.
-        assert!(true);
-    }
-
     // --- AdaptiveRateLimiter ---
 
     #[tokio::test]

@@ -76,7 +76,6 @@ impl DavFileSystem for DebridFileSystem {
                 }
                 VfsNode::VirtualFile { content } => {
                     Ok(Box::new(VirtualFile {
-                        name,
                         content: Bytes::from(content),
                         pos: 0,
                     }) as Box<dyn DavFile>)
@@ -289,13 +288,6 @@ mod tests {
     }
 
     #[test]
-    fn strm_file_struct_has_on_demand_repair_fields() {
-        // The compile-time check above guards the presence of rd_link and rd_client.
-        // Live on-demand repair behaviour is covered by integration tests.
-        assert!(true);
-    }
-
-    #[test]
     fn find_node_in_rejects_dotdot_traversal() {
         let vfs = DebridVfs::new();
 
@@ -319,7 +311,6 @@ mod tests {
 /// Simple virtual file (NFO files, etc)
 #[derive(Debug)]
 struct VirtualFile {
-    name: String,
     content: Bytes,
     pos: u64,
 }

@@ -212,9 +212,4 @@ mod tests {
         run_scan_loop(rd_client, tmdb_client, vfs, db, repair_manager, 60).await;
     }
 
-    #[test]
-    fn scan_loop_module_exists() {
-        // The compile-time check above guards the public signature of run_scan_loop.
-        assert!(true);
-    }
 }
