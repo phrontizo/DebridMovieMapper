@@ -40,6 +40,13 @@ impl RepairManager {
         self.health_status.clone()
     }
 
+    async fn set_repair_failed(&self, torrent_id: &str) {
+        let mut health_map = self.health_status.write().await;
+        if let Some(health) = health_map.get_mut(torrent_id) {
+            health.state = RepairState::Failed;
+        }
+    }
+
     /// Attempt to repair a broken torrent by re-adding it
     pub async fn repair_torrent(&self, torrent_info: &TorrentInfo) -> Result<(), String> {
         // Check if repair is already in progress, recently triggered, or permanently failed
@@ -184,38 +191,26 @@ impl RepairManager {
                                 }
                                 Err(e) => {
                                     error!("Failed to select files for repaired torrent {}: {}", add_response.id, e);
-                                    let mut health_map = self.health_status.write().await;
-                                    if let Some(health) = health_map.get_mut(&torrent_info.id) {
-                                        health.state = RepairState::Failed;
-                                    }
+                                    self.set_repair_failed(&torrent_info.id).await;
                                     Err(format!("Failed to select files: {}", e))
                                 }
                             }
                         } else {
                             error!("No matching files found in repaired torrent {}", add_response.id);
-                            let mut health_map = self.health_status.write().await;
-                            if let Some(health) = health_map.get_mut(&torrent_info.id) {
-                                health.state = RepairState::Failed;
-                            }
+                            self.set_repair_failed(&torrent_info.id).await;
                             Err("No matching files found".to_string())
                         }
                     }
                     Err(e) => {
                         error!("Failed to get info for repaired torrent {}: {}", add_response.id, e);
-                        let mut health_map = self.health_status.write().await;
-                        if let Some(health) = health_map.get_mut(&torrent_info.id) {
-                            health.state = RepairState::Failed;
-                        }
+                        self.set_repair_failed(&torrent_info.id).await;
                         Err(format!("Failed to get torrent info: {}", e))
                     }
                 }
             }
             Err(e) => {
                 error!("Failed to re-add torrent {}: {}", torrent_info.id, e);
-                let mut health_map = self.health_status.write().await;
-                if let Some(health) = health_map.get_mut(&torrent_info.id) {
-                    health.state = RepairState::Failed;
-                }
+                self.set_repair_failed(&torrent_info.id).await;
                 Err(format!("Failed to add magnet: {}", e))
             }
         }

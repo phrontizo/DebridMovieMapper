@@ -61,6 +61,94 @@ pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) 
     }
 }
 
+fn best_scored_result<'a>(
+    results: &'a [TmdbSearchResult],
+    normalized_query: &str,
+    year: &Option<String>,
+    is_short_title: bool,
+) -> Option<&'a TmdbSearchResult> {
+    if results.is_empty() {
+        return None;
+    }
+    if is_short_title {
+        results.iter()
+            .filter(|r| {
+                let normalized_title = normalize_title(&r.title);
+                let title_matches = normalized_title == normalized_query;
+                let year_matches = year.as_ref()
+                    .map(|y| r.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false))
+                    .unwrap_or(false);
+                title_matches && year_matches
+            })
+            .max_by(|a, b| {
+                score_result(a, normalized_query, year)
+                    .partial_cmp(&score_result(b, normalized_query, year))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    } else {
+        results.iter().max_by(|a, b| {
+            score_result(a, normalized_query, year)
+                .partial_cmp(&score_result(b, normalized_query, year))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+}
+
+fn select_best_match(
+    tv: Option<&TmdbSearchResult>,
+    movie: Option<&TmdbSearchResult>,
+    normalized_query: &str,
+    year: &Option<String>,
+    is_show_guess: bool,
+) -> Option<(String, Option<String>, String, &'static str, MediaType)> {
+    let is_exact = |r: &TmdbSearchResult| -> bool {
+        normalize_title(&r.title) == normalized_query ||
+        r.original_title.as_ref().map(|t| normalize_title(t) == normalized_query).unwrap_or(false)
+    };
+    let has_year_match = |r: &TmdbSearchResult| -> bool {
+        year.as_ref()
+            .map(|y| r.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false))
+            .unwrap_or(false)
+    };
+
+    match (tv, movie) {
+        (Some(tv), Some(movie)) => {
+            let tv_exact = is_exact(tv);
+            let movie_exact = is_exact(movie);
+            let tv_year_match = has_year_match(tv);
+            let movie_year_match = has_year_match(movie);
+            let tv_exact_year = tv_exact && tv_year_match;
+            let movie_exact_year = movie_exact && movie_year_match;
+
+            let (selected, media_type) = if tv_exact_year && !movie_exact_year {
+                (tv, MediaType::Show)
+            } else if movie_exact_year && !tv_exact_year {
+                (movie, MediaType::Movie)
+            } else if is_show_guess && tv_year_match {
+                (tv, MediaType::Show)
+            } else if !is_show_guess && movie_year_match {
+                (movie, MediaType::Movie)
+            } else if tv_exact && !movie_exact {
+                (tv, MediaType::Show)
+            } else if movie_exact && !tv_exact {
+                (movie, MediaType::Movie)
+            } else if tv_year_match && !movie_year_match {
+                (tv, MediaType::Show)
+            } else if movie_year_match && !tv_year_match {
+                (movie, MediaType::Movie)
+            } else if is_show_guess {
+                (tv, MediaType::Show)
+            } else {
+                (movie, MediaType::Movie)
+            };
+            Some((selected.title.clone(), selected.release_date.clone(), selected.id.to_string(), "tmdb", media_type))
+        }
+        (Some(tv), None) => Some((tv.title.clone(), tv.release_date.clone(), tv.id.to_string(), "tmdb", MediaType::Show)),
+        (None, Some(movie)) => Some((movie.title.clone(), movie.release_date.clone(), movie.id.to_string(), "tmdb", MediaType::Movie)),
+        (None, None) => None,
+    }
+}
+
 /// Score a search result based on how well it matches the query
 /// Higher score = better match
 fn score_result(result: &TmdbSearchResult, normalized_query: &str, year: &Option<String>) -> f64 {
@@ -170,105 +258,10 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
     // For short titles (≤3 chars), require exact match + year match
     let is_short_title = cleaned_name.len() <= 3;
 
-    let best_tv = if !tv_results.is_empty() {
-        if is_short_title {
-            tv_results.iter().filter(|r| {
-                let normalized_title = normalize_title(&r.title);
-                let title_matches = normalized_title == normalized_cleaned;
-                let year_matches = year.as_ref()
-                    .map(|y| r.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false))
-                    .unwrap_or(false);
-                title_matches && year_matches
-            }).max_by(|a, b| {
-                let score_a = score_result(a, &normalized_cleaned, &year);
-                let score_b = score_result(b, &normalized_cleaned, &year);
-                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
-            })
-        } else {
-            tv_results.iter().max_by(|a, b| {
-                let score_a = score_result(a, &normalized_cleaned, &year);
-                let score_b = score_result(b, &normalized_cleaned, &year);
-                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
-            })
-        }
-    } else {
-        None
-    };
+    let best_tv = best_scored_result(&tv_results, &normalized_cleaned, &year, is_short_title);
+    let best_movie = best_scored_result(&movie_results, &normalized_cleaned, &year, is_short_title);
 
-    let best_movie = if !movie_results.is_empty() {
-        if is_short_title {
-            movie_results.iter().filter(|r| {
-                let normalized_title = normalize_title(&r.title);
-                let title_matches = normalized_title == normalized_cleaned;
-                let year_matches = year.as_ref()
-                    .map(|y| r.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false))
-                    .unwrap_or(false);
-                title_matches && year_matches
-            }).max_by(|a, b| {
-                let score_a = score_result(a, &normalized_cleaned, &year);
-                let score_b = score_result(b, &normalized_cleaned, &year);
-                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
-            })
-        } else {
-            movie_results.iter().max_by(|a, b| {
-                let score_a = score_result(a, &normalized_cleaned, &year);
-                let score_b = score_result(b, &normalized_cleaned, &year);
-                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
-            })
-        }
-    } else {
-        None
-    };
-
-    let selected = match (best_tv, best_movie) {
-        (Some(tv), Some(movie)) => {
-            // Helper to check exact title match
-            let is_exact = |r: &TmdbSearchResult| -> bool {
-                normalize_title(&r.title) == normalized_cleaned ||
-                r.original_title.as_ref().map(|t| normalize_title(t) == normalized_cleaned).unwrap_or(false)
-            };
-
-            // Helper to check year match
-            let has_year_match = |r: &TmdbSearchResult| -> bool {
-                year.as_ref()
-                    .map(|y| r.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false))
-                    .unwrap_or(false)
-            };
-
-            let tv_exact = is_exact(tv);
-            let movie_exact = is_exact(movie);
-            let tv_year_match = has_year_match(tv);
-            let movie_year_match = has_year_match(movie);
-
-            let tv_exact_year = tv_exact && tv_year_match;
-            let movie_exact_year = movie_exact && movie_year_match;
-
-            if tv_exact_year && !movie_exact_year {
-                Some((tv.title.clone(), tv.release_date.clone(), tv.id.to_string(), "tmdb", MediaType::Show))
-            } else if movie_exact_year && !tv_exact_year {
-                Some((movie.title.clone(), movie.release_date.clone(), movie.id.to_string(), "tmdb", MediaType::Movie))
-            } else if is_show_guess && tv_year_match {
-                Some((tv.title.clone(), tv.release_date.clone(), tv.id.to_string(), "tmdb", MediaType::Show))
-            } else if !is_show_guess && movie_year_match {
-                Some((movie.title.clone(), movie.release_date.clone(), movie.id.to_string(), "tmdb", MediaType::Movie))
-            } else if tv_exact && !movie_exact {
-                Some((tv.title.clone(), tv.release_date.clone(), tv.id.to_string(), "tmdb", MediaType::Show))
-            } else if movie_exact && !tv_exact {
-                Some((movie.title.clone(), movie.release_date.clone(), movie.id.to_string(), "tmdb", MediaType::Movie))
-            } else if tv_year_match && !movie_year_match {
-                Some((tv.title.clone(), tv.release_date.clone(), tv.id.to_string(), "tmdb", MediaType::Show))
-            } else if movie_year_match && !tv_year_match {
-                Some((movie.title.clone(), movie.release_date.clone(), movie.id.to_string(), "tmdb", MediaType::Movie))
-            } else if is_show_guess {
-                Some((tv.title.clone(), tv.release_date.clone(), tv.id.to_string(), "tmdb", MediaType::Show))
-            } else {
-                Some((movie.title.clone(), movie.release_date.clone(), movie.id.to_string(), "tmdb", MediaType::Movie))
-            }
-        }
-        (Some(tv), None) => Some((tv.title.clone(), tv.release_date.clone(), tv.id.to_string(), "tmdb", MediaType::Show)),
-        (None, Some(movie)) => Some((movie.title.clone(), movie.release_date.clone(), movie.id.to_string(), "tmdb", MediaType::Movie)),
-        (None, None) => None,
-    };
+    let selected = select_best_match(best_tv, best_movie, &normalized_cleaned, &year, is_show_guess);
 
     if let Some((title, release_date, id, source, mtype)) = selected {
         let year_val = release_date.map(|d| d.chars().filter(|c| c.is_ascii_digit()).take(4).collect());
