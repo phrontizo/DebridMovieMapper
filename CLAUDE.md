@@ -72,7 +72,7 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 2. The `.strm` contains a Real-Debrid unrestrict URL
 3. Player streams directly from Real-Debrid (no proxying)
 
-**Persistence:** Embedded `sled` database (`metadata.db`) caches TMDB identifications and unrestrict responses. The file must exist before starting (`touch metadata.db`).
+**Persistence:** Embedded `redb` database (`metadata.db`) caches TMDB identifications. The file is created automatically on first run.
 
 ## Key Design Decisions
 
@@ -94,4 +94,4 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
   ```bash
   cargo test && INTEGRATION_TEST_LIMIT=10 cargo test --test integration_test -- --ignored && INTEGRATION_TEST_LIMIT=10 cargo test --test repair_integration_test -- --ignored
   ```
-  Integration test binaries must run sequentially (not `-- --ignored` on all at once) because they share the sled database lock and the Real-Debrid API rate limit. Do not commit if any test fails.
+  Integration test binaries must run sequentially (not `-- --ignored` on all at once) because they share the redb database lock and the Real-Debrid API rate limit. Do not commit if any test fails.

@@ -20,7 +20,7 @@ This was 100% vibe coded using a mix of Claude and Junie as further AI experimen
 - **Season Grouping**: Automatically groups TV show episodes into `Season XX` folders.
 - **WebDAV Streaming**: Provides a standard WebDAV endpoint (port 8080) for direct streaming without downloading.
 - **On-Demand Repair**: Detects broken links at playback time (503 from Real-Debrid) and automatically re-downloads the torrent via its magnet link without user intervention.
-- **Persistent Cache**: Uses an embedded database (`sled`) to cache media identifications and unrestrict responses, reducing API calls and speeding up restarts.
+- **Persistent Cache**: Uses an embedded database (`redb`) to cache media identifications, reducing API calls and speeding up restarts.
 - **Configurable Scan Interval**: Customizable scan interval via environment variable.
 - **Robust Identification Logic**: Handles complex torrent naming conventions, including CamelCase splitting, technical metadata stripping, and multi-service fallback strategies.
 
@@ -146,7 +146,7 @@ You can add this URL as a network drive in your OS or directly as a WebDAV sourc
   - `dav-server`: WebDAV protocol implementation.
   - `tokio`: Async runtime.
   - `reqwest`: HTTP client with `rustls`.
-  - `sled`: Embedded key-value store.
+  - `redb`: Embedded ACID key-value store.
   - `serde`: Serialization/Deserialization.
   - `regex`: Filename parsing and cleaning.
 
