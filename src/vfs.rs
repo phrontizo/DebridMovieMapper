@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 use crate::rd_client::TorrentInfo;
 use regex::Regex;
 
+/// Fixed size for STRM file metadata. All STRM files report this size in WebDAV
+/// metadata (PROPFIND and GET Content-Length). The actual content (URL + padding)
+/// is padded to this size so metadata and content are always consistent.
+/// Real-Debrid download URLs are typically 100-300 bytes.
+pub const STRM_FIXED_SIZE: usize = 1024;
+
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     ".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
 ];
@@ -308,9 +314,10 @@ impl DebridVfs {
                     counter += 1;
                 }
 
-                // strm_content is a size placeholder only — the actual download URL
-                // is fetched on-demand by dav_fs::StrmFile::read_bytes via unrestrict_link
-                let strm_content = format!("{}\n", link).into_bytes();
+                // Pad to STRM_FIXED_SIZE so PROPFIND metadata matches GET Content-Length.
+                // The actual download URL is fetched on-demand by dav_fs::StrmFile::read_bytes.
+                let mut strm_content = format!("{}\n", link).into_bytes();
+                strm_content.resize(STRM_FIXED_SIZE, b' ');
 
                 current_children.insert(final_name, VfsNode::StrmFile {
                     strm_content,

@@ -149,11 +149,15 @@ async fn test_video_player_simulation() {
 }
 
 /// Test that STRM file content matches metadata size and the URL is downloadable.
-/// This catches the bug where metadata reports placeholder size but read_bytes returns
-/// a longer unrestricted URL, causing WebDAV clients to truncate the content.
+/// Verifies all three metadata paths are consistent:
+/// - DavFileSystem::metadata() (PROPFIND / GET Content-Length)
+/// - DavDirEntry::metadata() (directory listing sizes)
+/// - DavFile::metadata() (opened file metadata)
 #[tokio::test]
 #[ignore]
 async fn test_strm_url_complete_and_downloadable() {
+    use debridmoviemapper::vfs::STRM_FIXED_SIZE;
+
     let _ = tracing_subscriber::fmt::try_init();
     dotenvy::dotenv().ok();
 
@@ -200,33 +204,41 @@ async fn test_strm_url_complete_and_downloadable() {
     println!("Testing STRM file: {}", path_str);
 
     let encoded_path = encode_path_preserve_slashes(&format!("/{}", path_str));
-    let path = DavPath::new(&encoded_path).unwrap();
+    let dav_path = DavPath::new(&encoded_path).unwrap();
+
+    // Step 1: Verify DavFileSystem::metadata() reports STRM_FIXED_SIZE
+    // This is the path used by dav-server for PROPFIND and GET Content-Length
+    let fs_meta = dav_fs.metadata(&dav_path).await.expect("DavFileSystem::metadata failed");
+    let fs_meta_size = fs_meta.len();
+    println!("  DavFileSystem::metadata() size: {} bytes", fs_meta_size);
+    assert_eq!(
+        fs_meta_size, STRM_FIXED_SIZE as u64,
+        "PROPFIND metadata should report STRM_FIXED_SIZE"
+    );
+
+    // Step 2: Open file and verify DavFile::metadata() matches
     let opts = OpenOptions { read: true, ..Default::default() };
-    let mut file = dav_fs.open(&path, opts).await.expect("Failed to open STRM file");
+    let mut file = dav_fs.open(&dav_path, opts).await.expect("Failed to open STRM file");
+    let file_meta = file.metadata().await.expect("DavFile::metadata failed");
+    let file_meta_size = file_meta.len();
+    println!("  DavFile::metadata() size: {} bytes", file_meta_size);
+    assert_eq!(
+        file_meta_size, fs_meta_size,
+        "DavFile and DavFileSystem metadata sizes must match"
+    );
 
-    // Step 1: Get metadata size — this is what WebDAV clients use for Content-Length
-    let meta = file.metadata().await.expect("Failed to get file metadata");
-    let meta_size = meta.len();
-    println!("  Metadata reports size: {} bytes", meta_size);
+    // Step 3: Read exactly metadata-size bytes (mimics real WebDAV client behavior)
+    let bytes = file.read_bytes(file_meta_size as usize).await.expect("Failed to read STRM file");
+    assert_eq!(bytes.len() as u64, file_meta_size, "read_bytes should return exactly metadata-size bytes");
 
-    // Step 2: Read exactly metadata-size bytes (mimics real WebDAV client behavior)
-    let bytes = file.read_bytes(meta_size as usize).await.expect("Failed to read STRM file");
+    // Step 4: Trim padding and verify URL is complete
     let url = String::from_utf8_lossy(&bytes).trim().to_string();
-    println!("  STRM content: {}", url);
-
-    // Step 3: Verify URL is complete (not truncated)
+    println!("  STRM content (trimmed): {}", url);
     assert!(url.starts_with("https://"), "URL should start with https://, got: {}", url);
     assert!(url.contains("real-debrid.com"), "Should be a Real-Debrid URL, got: {}", url);
     assert!(url.contains("/d/"), "URL should contain /d/ path, got: {}", url);
-    // Real-Debrid download URLs have long tokens after /d/ — truncated ones are very short
     let after_d = url.rsplit("/d/").next().unwrap_or("");
     assert!(after_d.len() > 10, "URL appears truncated — /d/ token too short ({}): {}", after_d.len(), url);
-
-    // Step 4: Verify content length matches metadata
-    assert_eq!(
-        bytes.len() as u64, meta_size,
-        "read_bytes should return exactly metadata-size bytes"
-    );
 
     // Step 5: Download first 100KB from the unrestricted URL
     println!("  Downloading first 100KB from URL...");

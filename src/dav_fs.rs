@@ -3,7 +3,7 @@ use dav_server::davpath::DavPath;
 use futures_util::FutureExt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::vfs::{DebridVfs, VfsNode};
+use crate::vfs::{DebridVfs, VfsNode, STRM_FIXED_SIZE};
 use crate::rd_client::RealDebridClient;
 use crate::repair::RepairManager;
 use bytes::Bytes;
@@ -177,7 +177,9 @@ impl StrmFile {
 
         match self.rd_client.unrestrict_link(&self.rd_link).await {
             Ok(response) => {
-                let content = Bytes::from(format!("{}\n", response.download));
+                let mut buf = format!("{}\n", response.download).into_bytes();
+                buf.resize(STRM_FIXED_SIZE, b' ');
+                let content = Bytes::from(buf);
                 self.resolved_content = Some(content.clone());
                 Ok(content)
             }
