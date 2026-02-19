@@ -63,15 +63,15 @@ impl DavFileSystem for DebridFileSystem {
                 .unwrap_or("")
                 .to_string();
             match node {
-                VfsNode::StrmFile { strm_content, rd_link, rd_torrent_id } => {
+                VfsNode::StrmFile { rd_link, rd_torrent_id, .. } => {
                     Ok(Box::new(StrmFile {
                         name,
-                        content: Bytes::from(strm_content),
                         rd_link,
                         rd_torrent_id,
                         repair_manager: self.repair_manager.clone(),
                         rd_client: self.rd_client.clone(),
                         pos: 0,
+                        resolved_content: None,
                     }) as Box<dyn DavFile>)
                 }
                 VfsNode::VirtualFile { content } => {
@@ -155,39 +155,62 @@ impl DavDirEntry for DebridDirEntry {
     }
 }
 
-/// A STRM file that re-unrestricts its RD link on every read for freshness
+/// A STRM file that lazily unrestricts its RD link on first access.
+/// The resolved download URL is cached so metadata() and read_bytes() are consistent.
 #[derive(Debug)]
 struct StrmFile {
     name: String,
-    content: Bytes, // Pre-unrestricted content used for metadata len() only
     rd_link: String,
     rd_torrent_id: String,
     repair_manager: Arc<RepairManager>,
     rd_client: Arc<RealDebridClient>,
     pos: u64,
+    resolved_content: Option<Bytes>,
+}
+
+impl StrmFile {
+    /// Lazily resolve the unrestricted download URL, caching the result.
+    async fn resolve(&mut self) -> Result<Bytes, FsError> {
+        if let Some(ref content) = self.resolved_content {
+            return Ok(content.clone());
+        }
+
+        match self.rd_client.unrestrict_link(&self.rd_link).await {
+            Ok(response) => {
+                let content = Bytes::from(format!("{}\n", response.download));
+                self.resolved_content = Some(content.clone());
+                Ok(content)
+            }
+            Err(e) => {
+                tracing::error!("Re-unrestrict failed for {} — triggering repair: {}", self.name, e);
+                let repair_manager = self.repair_manager.clone();
+                let torrent_id = self.rd_torrent_id.clone();
+                let link = self.rd_link.clone();
+                repair_manager.mark_broken(&torrent_id, &link).await;
+                tokio::spawn(async move {
+                    if let Err(e) = repair_manager.repair_by_id(&torrent_id).await {
+                        tracing::error!("Repair failed for {}: {}", torrent_id, e);
+                    }
+                });
+                Err(FsError::GeneralFailure)
+            }
+        }
+    }
 }
 
 impl DavFile for StrmFile {
     fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
         async move {
-            // Check if torrent is under repair
             if self.repair_manager.should_hide_torrent(&self.rd_torrent_id).await {
-                // Return minimal metadata to indicate file is unavailable
                 return Ok(Box::new(DebridMetaData {
-                    node: VfsNode::VirtualFile {
-                        content: vec![],
-                    },
+                    node: VfsNode::VirtualFile { content: vec![] },
                     modified_time: SystemTime::UNIX_EPOCH,
                 }) as Box<dyn DavMetaData>);
             }
 
-            // Return metadata with actual content size
+            let content = self.resolve().await?;
             Ok(Box::new(DebridMetaData {
-                node: VfsNode::StrmFile {
-                    strm_content: self.content.to_vec(),
-                    rd_link: String::new(), // Not needed for metadata
-                    rd_torrent_id: self.rd_torrent_id.clone(),
-                },
+                node: VfsNode::VirtualFile { content: content.to_vec() },
                 modified_time: SystemTime::UNIX_EPOCH,
             }) as Box<dyn DavMetaData>)
         }.boxed()
@@ -207,32 +230,15 @@ impl DavFile for StrmFile {
                 return Err(FsError::GeneralFailure);
             }
 
-            match self.rd_client.unrestrict_link(&self.rd_link).await {
-                Ok(response) => {
-                    let content = Bytes::from(format!("{}\n", response.download));
-                    if self.pos >= content.len() as u64 {
-                        return Ok(Bytes::new());
-                    }
-                    let start = self.pos as usize;
-                    let end = std::cmp::min(start + len, content.len());
-                    let data = content.slice(start..end);
-                    self.pos += data.len() as u64;
-                    Ok(data)
-                }
-                Err(e) => {
-                    tracing::error!("Re-unrestrict failed for {} — triggering repair: {}", self.name, e);
-                    let repair_manager = self.repair_manager.clone();
-                    let torrent_id = self.rd_torrent_id.clone();
-                    let link = self.rd_link.clone();
-                    repair_manager.mark_broken(&torrent_id, &link).await;
-                    tokio::spawn(async move {
-                        if let Err(e) = repair_manager.repair_by_id(&torrent_id).await {
-                            tracing::error!("Repair failed for {}: {}", torrent_id, e);
-                        }
-                    });
-                    Err(FsError::GeneralFailure)
-                }
+            let content = self.resolve().await?;
+            if self.pos >= content.len() as u64 {
+                return Ok(Bytes::new());
             }
+            let start = self.pos as usize;
+            let end = std::cmp::min(start + len, content.len());
+            let data = content.slice(start..end);
+            self.pos += data.len() as u64;
+            Ok(data)
         }.boxed()
     }
 
@@ -248,7 +254,8 @@ impl DavFile for StrmFile {
                     result as u64
                 }
                 std::io::SeekFrom::End(p) => {
-                    let size = self.content.len() as i64;
+                    let content = self.resolve().await?;
+                    let size = content.len() as i64;
                     let result = size.checked_add(p)
                         .filter(|&n| n >= 0)
                         .ok_or(FsError::GeneralFailure)?;
@@ -278,12 +285,12 @@ mod tests {
     ) {
         let _ = StrmFile {
             name: String::new(),
-            content: Bytes::new(),
             rd_link: String::new(),
             rd_torrent_id: String::new(),
             repair_manager,
             rd_client,
             pos: 0,
+            resolved_content: None,
         };
     }
 

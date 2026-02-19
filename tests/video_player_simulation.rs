@@ -148,6 +148,108 @@ async fn test_video_player_simulation() {
     }
 }
 
+/// Test that STRM file content matches metadata size and the URL is downloadable.
+/// This catches the bug where metadata reports placeholder size but read_bytes returns
+/// a longer unrestricted URL, causing WebDAV clients to truncate the content.
+#[tokio::test]
+#[ignore]
+async fn test_strm_url_complete_and_downloadable() {
+    let _ = tracing_subscriber::fmt::try_init();
+    dotenvy::dotenv().ok();
+
+    let api_token = std::env::var("RD_API_TOKEN").expect("RD_API_TOKEN must be set").trim().to_string();
+    let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set").trim().to_string();
+
+    let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
+    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
+
+    // Fetch just 2 torrents — enough to get at least one STRM file
+    let torrents = rd_client.get_torrents().await.expect("Failed to get torrents");
+    let downloaded: Vec<_> = torrents.into_iter().filter(|t| t.status == "downloaded").take(2).collect();
+    assert!(!downloaded.is_empty(), "Need at least one downloaded torrent");
+
+    let mut current_data = Vec::new();
+    let mut stream = futures_util::stream::iter(downloaded)
+        .map(|torrent| {
+            let rd_client = rd_client.clone();
+            let tmdb_client = tmdb_client.clone();
+            async move {
+                let info = rd_client.get_torrent_info(&torrent.id).await.expect("Failed to get torrent info");
+                let metadata = identify_torrent(&info, &tmdb_client).await;
+                (info, metadata)
+            }
+        })
+        .buffer_unordered(1);
+    while let Some(result) = stream.next().await {
+        current_data.push(result);
+    }
+
+    let vfs = Arc::new(RwLock::new(DebridVfs::build(current_data)));
+    let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
+    let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone(), repair_manager);
+
+    // Find a STRM file
+    let mut strm_files = Vec::new();
+    {
+        let vfs_lock = vfs.read().await;
+        find_video_files(&vfs_lock.root, "", String::new(), &mut strm_files);
+    }
+    assert!(!strm_files.is_empty(), "No STRM files found in VFS");
+
+    let (path_str, _) = &strm_files[0];
+    println!("Testing STRM file: {}", path_str);
+
+    let encoded_path = encode_path_preserve_slashes(&format!("/{}", path_str));
+    let path = DavPath::new(&encoded_path).unwrap();
+    let opts = OpenOptions { read: true, ..Default::default() };
+    let mut file = dav_fs.open(&path, opts).await.expect("Failed to open STRM file");
+
+    // Step 1: Get metadata size — this is what WebDAV clients use for Content-Length
+    let meta = file.metadata().await.expect("Failed to get file metadata");
+    let meta_size = meta.len();
+    println!("  Metadata reports size: {} bytes", meta_size);
+
+    // Step 2: Read exactly metadata-size bytes (mimics real WebDAV client behavior)
+    let bytes = file.read_bytes(meta_size as usize).await.expect("Failed to read STRM file");
+    let url = String::from_utf8_lossy(&bytes).trim().to_string();
+    println!("  STRM content: {}", url);
+
+    // Step 3: Verify URL is complete (not truncated)
+    assert!(url.starts_with("https://"), "URL should start with https://, got: {}", url);
+    assert!(url.contains("real-debrid.com"), "Should be a Real-Debrid URL, got: {}", url);
+    assert!(url.contains("/d/"), "URL should contain /d/ path, got: {}", url);
+    // Real-Debrid download URLs have long tokens after /d/ — truncated ones are very short
+    let after_d = url.rsplit("/d/").next().unwrap_or("");
+    assert!(after_d.len() > 10, "URL appears truncated — /d/ token too short ({}): {}", after_d.len(), url);
+
+    // Step 4: Verify content length matches metadata
+    assert_eq!(
+        bytes.len() as u64, meta_size,
+        "read_bytes should return exactly metadata-size bytes"
+    );
+
+    // Step 5: Download first 100KB from the unrestricted URL
+    println!("  Downloading first 100KB from URL...");
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(&url)
+        .header("Range", "bytes=0-102399")
+        .send()
+        .await
+        .expect("Failed to HTTP GET the download URL");
+
+    let status = resp.status();
+    assert!(
+        status.is_success() || status == reqwest::StatusCode::PARTIAL_CONTENT,
+        "Download failed with status {}", status
+    );
+
+    let body = resp.bytes().await.expect("Failed to read response body");
+    assert!(body.len() > 0, "Downloaded 0 bytes from {}", url);
+    println!("  Downloaded {} bytes successfully", body.len());
+    println!("  STRM URL is complete and downloadable");
+}
+
 fn encode_path_preserve_slashes(p: &str) -> String {
     p.split('/')
         .map(|seg| urlencoding::encode(seg).to_string())
