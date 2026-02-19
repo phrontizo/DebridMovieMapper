@@ -3,6 +3,8 @@ use reqwest::{Client, RequestBuilder};
 use tracing::{error, warn};
 use std::time::Duration;
 
+const MAX_RETRY_AFTER_SECS: u64 = 300; // Cap Retry-After to 5 minutes
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct TmdbSearchResult {
     pub id: u32,
@@ -91,18 +93,20 @@ impl TmdbClient {
             match make_request().send().await {
                 Ok(resp) => {
                     let status = resp.status();
-                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS 
-                       || status == reqwest::StatusCode::SERVICE_UNAVAILABLE 
-                       || status == reqwest::StatusCode::BAD_GATEWAY 
-                       || status == reqwest::StatusCode::GATEWAY_TIMEOUT 
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                       || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                       || status == reqwest::StatusCode::BAD_GATEWAY
+                       || status == reqwest::StatusCode::GATEWAY_TIMEOUT
                     {
                         let retry_after = resp.headers()
                             .get(reqwest::header::RETRY_AFTER)
                             .and_then(|h| h.to_str().ok())
                             .and_then(|s| s.parse::<u64>().ok())
                             .unwrap_or(1);
-                        warn!("TMDB API returned {} (attempt {}/{}). Waiting {}s", status, attempt, max_attempts, retry_after);
-                        tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                        let capped = std::cmp::min(retry_after, MAX_RETRY_AFTER_SECS);
+                        warn!("TMDB API returned {} (attempt {}/{}). Waiting {}s", status, attempt, max_attempts, capped);
+                        tokio::time::sleep(Duration::from_secs(capped)).await;
+                        continue;  // Without this, the same error response falls through to error_for_status
                     }
 
                     match resp.error_for_status() {

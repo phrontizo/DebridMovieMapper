@@ -10,6 +10,7 @@ use rand::Rng;
 const MIN_INTERVAL_MS: u64 = 100;   // 10 req/s max (baseline)
 const MAX_INTERVAL_MS: u64 = 2000;  // 0.5 req/s min (under heavy throttling)
 const RECOVERY_MS: u64 = 10;        // Decrease interval by 10ms per success
+const MAX_RETRY_AFTER_SECS: u64 = 300; // Cap Retry-After to 5 minutes
 
 const MAX_CACHE_SIZE: usize = 10_000;
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
@@ -70,7 +71,8 @@ impl AdaptiveRateLimiter {
         let mut state = self.state.lock().await;
         state.interval_ms = (state.interval_ms * 2).min(MAX_INTERVAL_MS);
         if let Some(seconds) = retry_after {
-            let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+            let capped_seconds = seconds.min(MAX_RETRY_AFTER_SECS);
+            let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(capped_seconds);
             if retry_deadline > state.next_allowed {
                 state.next_allowed = retry_deadline;
             }
@@ -230,11 +232,12 @@ impl RealDebridClient {
             .and_then(|s| s.parse::<u64>().ok());
 
         if let Some(seconds) = retry_after {
+            let capped = std::cmp::min(seconds, MAX_RETRY_AFTER_SECS);
             warn!(
-                "RD API returned {} (attempt {}/{}). Respecting Retry-After: {}s",
-                status, attempt, max_attempts, seconds
+                "RD API returned {} (attempt {}/{}). Respecting Retry-After: {}s (raw: {}s)",
+                status, attempt, max_attempts, capped, seconds
             );
-            tokio::time::sleep(Duration::from_secs(seconds)).await;
+            tokio::time::sleep(Duration::from_secs(capped)).await;
         } else if attempt < max_attempts {
             // Extended exponential backoff for 503/502/504, capped at 30s
             let backoff_secs = 2u64.pow(attempt);
@@ -357,27 +360,13 @@ impl RealDebridClient {
     /// Returns Ok(()) even if torrent doesn't exist (404), as the end state is the same
     pub async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error> {
         let url = format!("https://api.real-debrid.com/rest/1.0/torrents/delete/{}", torrent_id);
-
-        self.rate_limiter.wait_for_token().await;
-
-        match self.client.delete(&url).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    let retry_after = resp.headers()
-                        .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|h| h.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok());
-                    self.rate_limiter.record_throttle(retry_after).await;
-                } else {
-                    self.rate_limiter.record_success().await;
-                }
-                if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-                    Ok(())
-                } else {
-                    resp.error_for_status().map(|_| ())
-                }
-            }
+        let result: Result<serde_json::Value, _> = self.fetch_with_retry(
+            || self.client.delete(&url),
+            &[reqwest::StatusCode::NOT_FOUND],
+        ).await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) if e.status() == Some(reqwest::StatusCode::NOT_FOUND) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -423,15 +412,14 @@ impl RealDebridClient {
 
                     match resp.error_for_status() {
                         Ok(resp) => {
-                            let headers = resp.headers().clone();
                             let text = resp.text().await?;
                             if text.trim().is_empty() || status.as_u16() == 204 {
                                 if let Ok(val) = serde_json::from_str::<T>("[]") {
                                     self.rate_limiter.record_success().await;
                                     return Ok(val);
                                 }
-                                warn!("RD API empty body or 204 (attempt {}/{}). Status: {}, Headers: {:?}",
-                                    attempt, max_attempts, status, headers);
+                                warn!("RD API empty body or 204 (attempt {}/{}). Status: {}",
+                                    attempt, max_attempts, status);
                                 continue;
                             }
                             match serde_json::from_str::<T>(&text) {
@@ -440,8 +428,8 @@ impl RealDebridClient {
                                     return Ok(val);
                                 }
                                 Err(e) => {
-                                    error!("Failed to decode RD response: {}. Status: {}, Body: {}, Headers: {:?}",
-                                        e, status, text, headers);
+                                    error!("Failed to decode RD response: {}. Status: {}, Body: {}",
+                                        e, status, text);
                                 }
                             }
                         }
@@ -461,7 +449,7 @@ impl RealDebridClient {
         if let Some(e) = last_error {
             Err(e)
         } else {
-            make_request().send().await?.error_for_status()?.json().await
+            unreachable!("fetch_with_retry: all attempts exhausted without a recorded error")
         }
     }
 
@@ -678,5 +666,10 @@ mod tests {
     fn cache_constants_are_reasonable() {
         assert_eq!(MAX_CACHE_SIZE, 10_000);
         assert_eq!(CACHE_TTL, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn retry_after_cap_constant() {
+        assert_eq!(MAX_RETRY_AFTER_SECS, 300);
     }
 }
