@@ -4,33 +4,52 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{info, warn, error};
 use futures_util::StreamExt;
+use redb::{ReadableTable, ReadableDatabase, TableDefinition};
 use crate::rd_client::RealDebridClient;
 use crate::tmdb_client::TmdbClient;
 use crate::vfs::{DebridVfs, MediaMetadata};
 use crate::identification::identify_torrent;
 use crate::repair::RepairManager;
 
+const MATCHES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("matches");
+
 pub async fn run_scan_loop(
     rd_client: Arc<RealDebridClient>,
     tmdb_client: Arc<TmdbClient>,
     vfs: Arc<RwLock<DebridVfs>>,
-    db_tree: sled::Tree,
+    db: Arc<redb::Database>,
     repair_manager: Arc<RepairManager>,
     interval_secs: u64,
 ) {
-    let mut seen_torrents: HashMap<String, (crate::rd_client::TorrentInfo, MediaMetadata)> =
-        HashMap::new();
-
     // Load persisted matches from DB on startup
-    for result in db_tree.iter().flatten() {
-        let (id_bytes, data_bytes) = result;
-        let id = String::from_utf8_lossy(&id_bytes).to_string();
-        if let Ok(data) =
-            serde_json::from_slice::<(crate::rd_client::TorrentInfo, MediaMetadata)>(&data_bytes)
-        {
-            seen_torrents.insert(id, data);
-        }
-    }
+    let db_clone = db.clone();
+    let persisted: HashMap<String, (crate::rd_client::TorrentInfo, MediaMetadata)> =
+        tokio::task::spawn_blocking(move || {
+            let mut map = HashMap::new();
+            if let Ok(read_txn) = db_clone.begin_read() {
+                if let Ok(table) = read_txn.open_table(MATCHES_TABLE) {
+                    if let Ok(iter) = table.iter() {
+                        for entry in iter.flatten() {
+                            let (key, value) = entry;
+                            let id = key.value().to_string();
+                            if let Ok(data) = serde_json::from_slice::<(
+                                crate::rd_client::TorrentInfo,
+                                MediaMetadata,
+                            )>(
+                                value.value()
+                            ) {
+                                map.insert(id, data);
+                            }
+                        }
+                    }
+                }
+            }
+            map
+        })
+        .await
+        .unwrap_or_default();
+
+    let mut seen_torrents = persisted;
     if !seen_torrents.is_empty() {
         info!("Loaded {} persistent matches from database.", seen_torrents.len());
     }
@@ -50,19 +69,29 @@ pub async fn run_scan_loop(
                     if torrent.status == "downloaded" {
                         if let Some(data) = seen_torrents.get(&torrent.id) {
                             current_data.push(data.clone());
-                        } else if let Ok(Some(data_bytes)) = db_tree.get(&torrent.id) {
-                            if let Ok(data) = serde_json::from_slice::<(
-                                crate::rd_client::TorrentInfo,
-                                MediaMetadata,
-                            )>(&data_bytes)
-                            {
+                        } else {
+                            let db_clone = db.clone();
+                            let torrent_id = torrent.id.clone();
+                            let cached = tokio::task::spawn_blocking(move || {
+                                let read_txn = db_clone.begin_read().ok()?;
+                                let table = read_txn.open_table(MATCHES_TABLE).ok()?;
+                                let entry = table.get(torrent_id.as_str()).ok()??;
+                                serde_json::from_slice::<(
+                                    crate::rd_client::TorrentInfo,
+                                    MediaMetadata,
+                                )>(entry.value())
+                                .ok()
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+
+                            if let Some(data) = cached {
                                 seen_torrents.insert(torrent.id.clone(), data.clone());
                                 current_data.push(data);
                             } else {
                                 to_identify.push(torrent.clone());
                             }
-                        } else {
-                            to_identify.push(torrent.clone());
                         }
                     }
                 }
@@ -107,7 +136,17 @@ pub async fn run_scan_loop(
                                 if let Ok(data_bytes) =
                                     serde_json::to_vec(&(info.clone(), metadata.clone()))
                                 {
-                                    let _ = db_tree.insert(id, data_bytes);
+                                    let db_clone = db.clone();
+                                    let id_clone = id.clone();
+                                    let _ = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+                                        let write_txn = db_clone.begin_write()?;
+                                        {
+                                            let mut table = write_txn.open_table(MATCHES_TABLE)?;
+                                            table.insert(id_clone.as_str(), data_bytes.as_slice())?;
+                                        }
+                                        write_txn.commit()?;
+                                        Ok(())
+                                    }).await;
                                 }
                                 current_data.push((info, metadata));
                             }
@@ -167,10 +206,10 @@ mod tests {
         rd_client: Arc<RealDebridClient>,
         tmdb_client: Arc<TmdbClient>,
         vfs: Arc<RwLock<DebridVfs>>,
-        db_tree: sled::Tree,
+        db: Arc<redb::Database>,
         repair_manager: Arc<RepairManager>,
     ) {
-        run_scan_loop(rd_client, tmdb_client, vfs, db_tree, repair_manager, 60).await;
+        run_scan_loop(rd_client, tmdb_client, vfs, db, repair_manager, 60).await;
     }
 
     #[test]

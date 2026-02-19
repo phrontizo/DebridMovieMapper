@@ -5,10 +5,13 @@ use debridmoviemapper::identification::identify_torrent;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{OnceCell, RwLock};
 use futures_util::StreamExt;
+use redb::{Database, ReadableDatabase, TableDefinition};
 
-/// Shared sled DB instance — sled only allows one open handle per path.
-static DB: LazyLock<sled::Db> = LazyLock::new(|| {
-    sled::open("metadata.db").expect("Failed to open database")
+const MATCHES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("matches");
+
+/// Shared redb Database instance — redb only allows one open handle per path.
+static DB: LazyLock<Database> = LazyLock::new(|| {
+    Database::create("metadata.db").expect("Failed to open database")
 });
 
 /// Shared identified data — fetched and identified exactly once, reused by all tests.
@@ -31,20 +34,19 @@ async fn get_shared_data() -> &'static (Arc<RealDebridClient>, Vec<(TorrentInfo,
                 .to_string();
             let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
             let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
-            let db_tree = DB.open_tree("matches").expect("Failed to open matches tree");
 
-            let data = fetch_and_identify(&rd_client, &tmdb_client, &db_tree).await;
+            let data = fetch_and_identify(&rd_client, &tmdb_client, &*DB).await;
             (rd_client, data)
         })
         .await
 }
 
-/// Fetch downloaded torrents and identify them via TMDB, using sled cache.
+/// Fetch downloaded torrents and identify them via TMDB, using redb cache.
 /// Respects INTEGRATION_TEST_LIMIT env var to limit the number of torrents processed.
 async fn fetch_and_identify(
     rd_client: &Arc<RealDebridClient>,
     tmdb_client: &Arc<TmdbClient>,
-    db_tree: &sled::Tree,
+    db: &Database,
 ) -> Vec<(TorrentInfo, MediaMetadata)> {
     println!("Fetching torrents...");
     let torrents = rd_client.get_torrents().await.expect("Failed to get torrents");
@@ -69,16 +71,20 @@ async fn fetch_and_identify(
     let mut to_identify = Vec::new();
 
     for torrent in &to_process {
-        if let Ok(Some(data_bytes)) = db_tree.get(&torrent.id) {
-            if let Ok(data) =
-                serde_json::from_slice::<(TorrentInfo, MediaMetadata)>(&data_bytes)
-            {
-                println!("Cached: {} (ID: {:?})", data.0.filename, data.1.external_id);
-                current_data.push(data);
-                continue;
-            }
+        let cached = {
+            let read_txn = db.begin_read().ok();
+            read_txn.and_then(|txn| {
+                let table = txn.open_table(MATCHES_TABLE).ok()?;
+                let entry = table.get(torrent.id.as_str()).ok()??;
+                serde_json::from_slice::<(TorrentInfo, MediaMetadata)>(entry.value()).ok()
+            })
+        };
+        if let Some(data) = cached {
+            println!("Cached: {} (ID: {:?})", data.0.filename, data.1.external_id);
+            current_data.push(data);
+        } else {
+            to_identify.push(torrent.clone());
         }
-        to_identify.push(torrent.clone());
     }
 
     if !to_identify.is_empty() {
@@ -104,7 +110,12 @@ async fn fetch_and_identify(
                 info.filename, metadata.media_type, metadata.external_id
             );
             if let Ok(data_bytes) = serde_json::to_vec(&(info.clone(), metadata.clone())) {
-                let _ = db_tree.insert(&id, data_bytes);
+                if let Ok(write_txn) = db.begin_write() {
+                    if let Ok(mut table) = write_txn.open_table(MATCHES_TABLE) {
+                        let _ = table.insert(id.as_str(), data_bytes.as_slice());
+                    }
+                    let _ = write_txn.commit();
+                }
             }
             current_data.push((info, metadata));
         }
@@ -116,7 +127,7 @@ async fn fetch_and_identify(
 }
 
 /// Test 1: Torrent fetching and TMDB identification only. No VFS, no unrestrict.
-/// Uses sled cache so repeat runs are fast.
+/// Uses redb cache so repeat runs are fast.
 #[tokio::test]
 #[ignore]
 async fn test_identification() {
@@ -144,7 +155,7 @@ async fn test_identification() {
     assert!(identified > 0, "Should identify at least one torrent");
 }
 
-/// Test 2: Given identified data (from sled cache), builds VFS and checks directory structure.
+/// Test 2: Given identified data (from redb cache), builds VFS and checks directory structure.
 #[tokio::test]
 #[ignore]
 async fn test_vfs_structure() {

@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 use std::net::SocketAddr;
 use hyper::service::service_fn;
 use hyper::Request;
+use redb::Database;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,14 +40,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
     let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
 
-    let db = sled::open("metadata.db").expect("Failed to open database");
-    let tree = db.open_tree("matches").expect("Failed to open database tree");
+    let db = Arc::new(Database::create("metadata.db").expect("Failed to open database"));
 
     tokio::spawn(debridmoviemapper::tasks::run_scan_loop(
         rd_client.clone(),
         tmdb_client.clone(),
         vfs.clone(),
-        tree.clone(),
+        db.clone(),
         repair_manager.clone(),
         scan_interval_secs,
     ));
