@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -17,9 +17,13 @@ hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 bytes = "1"
 dotenvy = "0.15"
-urlencoding = "2"
 rand = "0.8"
 sled = "0.34"
+redb = "3.1"
+thiserror = "2"
+
+[dev-dependencies]
+urlencoding = "2"
 
 [lib]
 name = "debridmoviemapper"
