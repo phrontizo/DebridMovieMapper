@@ -398,9 +398,10 @@ mod tests {
     use crate::rd_client::{TorrentInfo, TorrentFile};
 
     #[tokio::test]
+    #[ignore]
     async fn test_repro_00000_issue() {
         dotenvy::dotenv().ok();
-        let tmdb_api_key = std::env::var("TMDB_API_KEY").unwrap_or_else(|_| "839969cf4f1e183aa5f010f7c4c643f1".to_string());
+        let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key);
 
         let info = TorrentInfo {
@@ -435,9 +436,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_2012_is_not_generic() {
         dotenvy::dotenv().ok();
-        let tmdb_api_key = std::env::var("TMDB_API_KEY").unwrap_or_else(|_| "839969cf4f1e183aa5f010f7c4c643f1".to_string());
+        let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key);
 
         let info = TorrentInfo {
@@ -469,9 +471,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_peaky_blinders_identification() {
         dotenvy::dotenv().ok();
-        let tmdb_api_key = std::env::var("TMDB_API_KEY").unwrap_or_else(|_| "839969cf4f1e183aa5f010f7c4c643f1".to_string());
+        let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key);
 
         let info = TorrentInfo {
@@ -523,9 +526,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_short_name_no_random_match() {
         dotenvy::dotenv().ok();
-        let tmdb_api_key = std::env::var("TMDB_API_KEY").unwrap_or_else(|_| "839969cf4f1e183aa5f010f7c4c643f1".to_string());
+        let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key);
 
         // "UC" cleans to "UC"
@@ -563,9 +567,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_flow_2024_prefers_popular() {
         dotenvy::dotenv().ok();
-        let tmdb_api_key = std::env::var("TMDB_API_KEY").unwrap_or_else(|_| "839969cf4f1e183aa5f010f7c4c643f1".to_string());
+        let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key);
 
         let info = TorrentInfo {
@@ -602,9 +607,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_dune_2000_identification() {
         dotenvy::dotenv().ok();
-        let tmdb_api_key = std::env::var("TMDB_API_KEY").unwrap_or_else(|_| "839969cf4f1e183aa5f010f7c4c643f1".to_string());
+        let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key);
 
         let info = TorrentInfo {

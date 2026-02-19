@@ -8,7 +8,7 @@ async fn test_all_real_debrid_torrents() {
     dotenvy::dotenv().ok();
 
     let rd_token = std::env::var("RD_API_TOKEN").expect("RD_API_TOKEN must be set");
-    let tmdb_api_key = std::env::var("TMDB_API_KEY").unwrap_or_else(|_| "839969cf4f1e183aa5f010f7c4c643f1".to_string());
+    let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
 
     let rd_client = RealDebridClient::new(rd_token);
     let tmdb_client = TmdbClient::new(tmdb_api_key);

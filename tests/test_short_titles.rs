@@ -7,7 +7,7 @@ use debridmoviemapper::identification::identify_torrent;
 async fn test_short_title_identification() {
     dotenvy::dotenv().ok();
 
-    let tmdb_api_key = std::env::var("TMDB_API_KEY").unwrap_or_else(|_| "839969cf4f1e183aa5f010f7c4c643f1".to_string());
+    let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
     let tmdb_client = TmdbClient::new(tmdb_api_key);
 
     println!("\n========================================");
