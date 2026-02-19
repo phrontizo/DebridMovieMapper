@@ -42,7 +42,7 @@ impl DebridFileSystem {
             if component.is_empty() || component == "." {
                 continue;
             }
-            if let VfsNode::Directory { children, .. } = current {
+            if let VfsNode::Directory { children } = current {
                 if let Some(next) = children.get(component) {
                     current = next;
                 } else {
@@ -60,8 +60,12 @@ impl DavFileSystem for DebridFileSystem {
     fn open<'a>(&'a self, path: &'a DavPath, _options: OpenOptions) -> FsFuture<'a, Box<dyn DavFile>> {
         async move {
             let node = self.find_node(path).await.ok_or(FsError::NotFound)?;
+            let name = path.as_rel_ospath().to_str()
+                .and_then(|s| s.rsplit('/').next())
+                .unwrap_or("")
+                .to_string();
             match node {
-                VfsNode::StrmFile { name, strm_content, rd_link, rd_torrent_id } => {
+                VfsNode::StrmFile { strm_content, rd_link, rd_torrent_id } => {
                     Ok(Box::new(StrmFile {
                         name,
                         content: Bytes::from(strm_content),
@@ -72,7 +76,7 @@ impl DavFileSystem for DebridFileSystem {
                         pos: 0,
                     }) as Box<dyn DavFile>)
                 }
-                VfsNode::VirtualFile { name, content } => {
+                VfsNode::VirtualFile { content } => {
                     Ok(Box::new(VirtualFile {
                         name,
                         content: Bytes::from(content),
@@ -87,7 +91,7 @@ impl DavFileSystem for DebridFileSystem {
     fn read_dir<'a>(&'a self, path: &'a DavPath, _meta: ReadDirMeta) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         async move {
             let node = self.find_node(path).await.ok_or(FsError::NotFound)?;
-            if let VfsNode::Directory { children, .. } = node {
+            if let VfsNode::Directory { children } = node {
                 let mut entries: Vec<Box<dyn DavDirEntry>> = Vec::new();
                 for (name, child) in children {
                     entries.push(Box::new(DebridDirEntry {
@@ -168,7 +172,6 @@ impl DavFile for StrmFile {
                 // Return minimal metadata to indicate file is unavailable
                 return Ok(Box::new(DebridMetaData {
                     node: VfsNode::VirtualFile {
-                        name: self.name.clone(),
                         content: vec![],
                     }
                 }) as Box<dyn DavMetaData>);
@@ -177,7 +180,6 @@ impl DavFile for StrmFile {
             // Return metadata with actual content size
             Ok(Box::new(DebridMetaData {
                 node: VfsNode::StrmFile {
-                    name: self.name.clone(),
                     strm_content: self.content.to_vec(),
                     rd_link: String::new(), // Not needed for metadata
                     rd_torrent_id: self.rd_torrent_id.clone(),
@@ -290,7 +292,6 @@ struct VirtualFile {
 impl DavFile for VirtualFile {
     fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
         let node = VfsNode::VirtualFile {
-            name: self.name.clone(),
             content: self.content.to_vec(),
         };
         async move {

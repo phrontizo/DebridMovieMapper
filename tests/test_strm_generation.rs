@@ -75,7 +75,7 @@ async fn test_strm_file_generation() {
     let mut strm_files = Vec::new();
     {
         let vfs_lock = vfs.read().await;
-        collect_strm_files(&vfs_lock.root, String::new(), &mut strm_files);
+        collect_strm_files(&vfs_lock.root, "", String::new(), &mut strm_files);
     }
 
     assert!(!strm_files.is_empty(), "No STRM files found in VFS");
@@ -193,7 +193,7 @@ async fn test_strm_filename_conversion() {
     let mut strm_files = Vec::new();
     {
         let vfs_lock = vfs.read().await;
-        collect_strm_files(&vfs_lock.root, String::new(), &mut strm_files);
+        collect_strm_files(&vfs_lock.root, "", String::new(), &mut strm_files);
     }
 
     println!("Checking {} STRM files for proper naming", strm_files.len());
@@ -275,7 +275,7 @@ async fn test_nfo_generation_with_strm() {
 
     {
         let vfs_lock = vfs.read().await;
-        count_nfo_and_folders(&vfs_lock.root, &mut nfo_count, &mut strm_folders);
+        count_nfo_and_folders(&vfs_lock.root, "", &mut nfo_count, &mut strm_folders);
     }
 
     println!("Found {} NFO files", nfo_count);
@@ -292,25 +292,26 @@ async fn test_nfo_generation_with_strm() {
 
 fn collect_strm_files(
     node: &VfsNode,
+    name: &str,
     current_path: String,
     files: &mut Vec<(String, String)>,
 ) {
     match node {
-        VfsNode::Directory { name, children } => {
+        VfsNode::Directory { children } => {
             let next_path = if current_path.is_empty() {
-                name.clone()
+                name.to_string()
             } else if name.is_empty() {
                 current_path
             } else {
                 format!("{}/{}", current_path, name)
             };
-            for child in children.values() {
-                collect_strm_files(child, next_path.clone(), files);
+            for (child_name, child) in children {
+                collect_strm_files(child, child_name, next_path.clone(), files);
             }
         }
-        VfsNode::StrmFile { name, rd_link, .. } => {
+        VfsNode::StrmFile { rd_link, .. } => {
             let full_path = if current_path.is_empty() {
-                name.clone()
+                name.to_string()
             } else {
                 format!("{}/{}", current_path, name)
             };
@@ -322,30 +323,28 @@ fn collect_strm_files(
 
 fn count_nfo_and_folders(
     node: &VfsNode,
+    name: &str,
     nfo_count: &mut usize,
     strm_folders: &mut std::collections::HashSet<String>,
 ) {
     match node {
-        VfsNode::Directory {
-            name,
-            children,
-        } => {
+        VfsNode::Directory { children } => {
             let has_strm = children
                 .values()
                 .any(|child| matches!(child, VfsNode::StrmFile { .. }));
             let has_nfo = children
-                .values()
-                .any(|child| matches!(child, VfsNode::VirtualFile { name, .. } if name.ends_with(".nfo")));
+                .keys()
+                .any(|k| k.ends_with(".nfo"));
 
             if has_strm {
-                strm_folders.insert(name.clone());
+                strm_folders.insert(name.to_string());
             }
             if has_nfo {
                 *nfo_count += 1;
             }
 
-            for child in children.values() {
-                count_nfo_and_folders(child, nfo_count, strm_folders);
+            for (child_name, child) in children {
+                count_nfo_and_folders(child, child_name, nfo_count, strm_folders);
             }
         }
         _ => {}

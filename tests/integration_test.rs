@@ -163,7 +163,7 @@ async fn test_vfs_structure() {
 
     // Root must be a directory
     let children = match root {
-        VfsNode::Directory { children, .. } => children,
+        VfsNode::Directory { children } => children,
         _ => panic!("Root should be a directory"),
     };
 
@@ -182,11 +182,11 @@ async fn test_vfs_structure() {
     );
 
     // Check Movies structure: Movies/<Title (Year)>/<file>.strm
-    if let Some(VfsNode::Directory { children: movies, .. }) = children.get("Movies") {
+    if let Some(VfsNode::Directory { children: movies }) = children.get("Movies") {
         println!("\nMovies/ contains {} entries", movies.len());
         for (name, node) in movies.iter().take(5) {
             match node {
-                VfsNode::Directory { children: movie_files, .. } => {
+                VfsNode::Directory { children: movie_files } => {
                     let strm_count = movie_files
                         .values()
                         .filter(|n| matches!(n, VfsNode::StrmFile { .. }))
@@ -199,11 +199,11 @@ async fn test_vfs_structure() {
     }
 
     // Check Shows structure: Shows/<Title (Year)>/Season XX/<file>.strm
-    if let Some(VfsNode::Directory { children: shows, .. }) = children.get("Shows") {
+    if let Some(VfsNode::Directory { children: shows }) = children.get("Shows") {
         println!("\nShows/ contains {} entries", shows.len());
         for (name, node) in shows.iter().take(5) {
             match node {
-                VfsNode::Directory { children: seasons, .. } => {
+                VfsNode::Directory { children: seasons } => {
                     let season_count = seasons
                         .keys()
                         .filter(|k| k.starts_with("Season"))
@@ -298,7 +298,7 @@ async fn test_vfs_completeness() {
 
 fn collect_links(node: &VfsNode, links: &mut std::collections::HashSet<String>) {
     match node {
-        VfsNode::Directory { children, .. } => {
+        VfsNode::Directory { children } => {
             for child in children.values() {
                 collect_links(child, links);
             }

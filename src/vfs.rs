@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 use serde::{Deserialize, Serialize};
 use crate::rd_client::{TorrentInfo, RealDebridClient};
@@ -15,20 +15,17 @@ static SEASON_RE: LazyLock<Regex> = LazyLock::new(|| {
 #[derive(Debug, Clone)]
 pub enum VfsNode {
     Directory {
-        name: String,
-        children: HashMap<String, VfsNode>,
+        children: BTreeMap<String, VfsNode>,
     },
     /// STRM file that contains a direct Real-Debrid download URL
     /// Jellyfin will read this tiny file and stream directly from RD
     /// strm_content contains the actual file content (the URL with newline)
     StrmFile {
-        name: String,
         strm_content: Vec<u8>, // The actual STRM file content (URL + newline)
         rd_link: String, // The /torrents link that may need unrestricting
         rd_torrent_id: String,
     },
     VirtualFile {
-        name: String,
         content: Vec<u8>,
     },
 }
@@ -59,27 +56,24 @@ impl Default for DebridVfs {
 
 impl DebridVfs {
     pub fn new() -> Self {
-        let mut children = HashMap::new();
+        let mut children = BTreeMap::new();
         children.insert("Movies".to_string(), VfsNode::Directory {
-            name: "Movies".to_string(),
-            children: HashMap::new(),
+            children: BTreeMap::new(),
         });
         children.insert("Shows".to_string(), VfsNode::Directory {
-            name: "Shows".to_string(),
-            children: HashMap::new(),
+            children: BTreeMap::new(),
         });
 
         Self {
             root: VfsNode::Directory {
-                name: "".to_string(),
                 children,
             },
         }
     }
 
     pub async fn update(&mut self, torrents: Vec<(TorrentInfo, MediaMetadata)>, rd_client: Arc<RealDebridClient>) {
-        let mut movies_nodes = HashMap::new();
-        let mut shows_nodes = HashMap::new();
+        let mut movies_nodes = BTreeMap::new();
+        let mut shows_nodes = BTreeMap::new();
 
         // Group torrents by media (using title, year, type, and external ID)
         let mut media_groups: HashMap<MediaMetadata, Vec<TorrentInfo>> = HashMap::new();
@@ -129,7 +123,7 @@ impl DebridVfs {
 
             match metadata.media_type {
                 MediaType::Movie => {
-                    let mut children = HashMap::new();
+                    let mut children = BTreeMap::new();
                     // For movies, only take the largest torrent to avoid duplicates
                     if let Some(torrent) = torrents.first() {
                         self.add_torrent_files(&mut children, torrent, None, &rd_client).await;
@@ -137,17 +131,15 @@ impl DebridVfs {
                     if !children.is_empty() {
                         let nfo_content = self.generate_nfo(&metadata);
                         children.insert("movie.nfo".to_string(), VfsNode::VirtualFile {
-                            name: "movie.nfo".to_string(),
                             content: nfo_content,
                         });
-                        nodes.insert(folder_name.clone(), VfsNode::Directory {
-                            name: folder_name,
+                        nodes.insert(folder_name, VfsNode::Directory {
                             children,
                         });
                     }
                 }
                 MediaType::Show => {
-                    let mut show_children = HashMap::new();
+                    let mut show_children = BTreeMap::new();
 
                     // For shows, we process all torrents (e.g. different seasons)
                     // They are already sorted by size, so larger files will overwrite smaller ones if paths match
@@ -167,11 +159,10 @@ impl DebridVfs {
 
                                         let season_name = format!("Season {:02}", season);
                                         let season_dir = show_children.entry(season_name.clone()).or_insert_with(|| VfsNode::Directory {
-                                            name: season_name.clone(),
-                                            children: HashMap::new(),
+                                            children: BTreeMap::new(),
                                         });
 
-                                        if let VfsNode::Directory { children: season_children, .. } = season_dir {
+                                        if let VfsNode::Directory { children: season_children } = season_dir {
                                             self.add_path_to_tree(season_children, filename, file.bytes, torrent.id.clone(), link.clone(), &rd_client).await;
                                         }
                                     }
@@ -183,11 +174,9 @@ impl DebridVfs {
                     if !show_children.is_empty() {
                         let nfo_content = self.generate_nfo(&metadata);
                         show_children.insert("tvshow.nfo".to_string(), VfsNode::VirtualFile {
-                            name: "tvshow.nfo".to_string(),
                             content: nfo_content,
                         });
-                        nodes.insert(folder_name.clone(), VfsNode::Directory {
-                            name: folder_name,
+                        nodes.insert(folder_name, VfsNode::Directory {
                             children: show_children,
                         });
                     }
@@ -195,13 +184,11 @@ impl DebridVfs {
             }
         }
 
-        if let VfsNode::Directory { ref mut children, .. } = self.root {
+        if let VfsNode::Directory { ref mut children } = self.root {
             children.insert("Movies".to_string(), VfsNode::Directory {
-                name: "Movies".to_string(),
                 children: movies_nodes,
             });
             children.insert("Shows".to_string(), VfsNode::Directory {
-                name: "Shows".to_string(),
                 children: shows_nodes,
             });
         }
@@ -256,7 +243,7 @@ impl DebridVfs {
         nfo.into_bytes()
     }
 
-    async fn add_torrent_files(&self, destination: &mut HashMap<String, VfsNode>, torrent: &TorrentInfo, path_prefix: Option<&str>, rd_client: &Arc<RealDebridClient>) {
+    async fn add_torrent_files(&self, destination: &mut BTreeMap<String, VfsNode>, torrent: &TorrentInfo, path_prefix: Option<&str>, rd_client: &Arc<RealDebridClient>) {
         let mut link_idx = 0;
         for file in &torrent.files {
             if file.selected == 1 {
@@ -276,7 +263,7 @@ impl DebridVfs {
         }
     }
 
-    async fn add_path_to_tree(&self, root: &mut HashMap<String, VfsNode>, path: &str, _size: u64, torrent_id: String, link: String, rd_client: &Arc<RealDebridClient>) {
+    async fn add_path_to_tree(&self, root: &mut BTreeMap<String, VfsNode>, path: &str, _size: u64, torrent_id: String, link: String, rd_client: &Arc<RealDebridClient>) {
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         let mut current_children = root;
 
@@ -315,18 +302,16 @@ impl DebridVfs {
                     }
                 };
 
-                current_children.insert(final_name.clone(), VfsNode::StrmFile {
-                    name: final_name,
+                current_children.insert(final_name, VfsNode::StrmFile {
                     strm_content,
                     rd_link: link.clone(),
                     rd_torrent_id: torrent_id.clone(),
                 });
             } else {
-                let entry = current_children.entry(part.clone()).or_insert_with(|| VfsNode::Directory {
-                    name: part.clone(),
-                    children: HashMap::new(),
+                let entry = current_children.entry(part).or_insert_with(|| VfsNode::Directory {
+                    children: BTreeMap::new(),
                 });
-                if let VfsNode::Directory { children, .. } = entry {
+                if let VfsNode::Directory { children } = entry {
                     current_children = children;
                 } else {
                     // This should not happen if paths are consistent
@@ -463,14 +448,14 @@ mod tests {
         let rd_client = mock_rd_client(&["http://link1", "http://link2"]).await;
         vfs.update(torrents, rd_client).await;
 
-        if let VfsNode::Directory { children, .. } = &vfs.root {
+        if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").expect("Movies directory missing");
             let shows = children.get("Shows").expect("Shows directory missing");
 
-            if let VfsNode::Directory { children: movie_children, .. } = movies {
+            if let VfsNode::Directory { children: movie_children } = movies {
                 assert!(movie_children.contains_key("Movie"), "Movie folder not found");
                 let movie_dir = movie_children.get("Movie").unwrap();
-                if let VfsNode::Directory { children: files, .. } = movie_dir {
+                if let VfsNode::Directory { children: files } = movie_dir {
                     assert!(files.contains_key("Movie.2023.1080p.strm"), "Movie STRM file not found");
                     assert!(files.contains_key("movie.nfo"), "movie.nfo not found");
                 }
@@ -478,10 +463,10 @@ mod tests {
                 panic!("Movies should be a directory");
             }
 
-            if let VfsNode::Directory { children: show_children, .. } = shows {
+            if let VfsNode::Directory { children: show_children } = shows {
                 assert!(show_children.contains_key("Show"), "Show folder not found");
                 let show_dir = show_children.get("Show").unwrap();
-                if let VfsNode::Directory { children: seasons, .. } = show_dir {
+                if let VfsNode::Directory { children: seasons } = show_dir {
                     assert!(seasons.contains_key("Season 01"), "Season 01 not found");
                     assert!(seasons.contains_key("tvshow.nfo"), "tvshow.nfo not found");
                 }
@@ -580,9 +565,9 @@ mod tests {
         let rd_client = mock_rd_client(&["http://l1", "http://l2"]).await;
         vfs.update(torrents, rd_client).await;
 
-        if let VfsNode::Directory { children, .. } = &vfs.root {
+        if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory { children: movie_children, .. } = movies {
+            if let VfsNode::Directory { children: movie_children } = movies {
                 assert!(movie_children.contains_key("Same Title [tmdbid-1]"));
                 assert!(movie_children.contains_key("Same Title [tmdbid-2]"));
             }
@@ -656,11 +641,11 @@ mod tests {
         let rd_client = mock_rd_client(&["http://small", "http://large"]).await;
         vfs.update(torrents, rd_client).await;
 
-        if let VfsNode::Directory { children, .. } = &vfs.root {
+        if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory { children: movie_children, .. } = movies {
+            if let VfsNode::Directory { children: movie_children } = movies {
                 let folder = movie_children.get("Duplicate Movie [tmdbid-123]").expect("Folder missing");
-                if let VfsNode::Directory { children: files, .. } = folder {
+                if let VfsNode::Directory { children: files } = folder {
                     let file = files.get("Movie.strm").expect("STRM file missing");
                     if let VfsNode::StrmFile { rd_torrent_id, .. } = file {
                         assert_eq!(rd_torrent_id, "large", "Should have picked the large torrent");

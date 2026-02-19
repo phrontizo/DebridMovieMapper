@@ -57,7 +57,7 @@ async fn test_video_player_simulation() {
     let mut video_files = Vec::new();
     {
         let vfs_lock = vfs.read().await;
-        find_video_files(&vfs_lock.root, String::new(), &mut video_files);
+        find_video_files(&vfs_lock.root, "", String::new(), &mut video_files);
     }
 
     if video_files.is_empty() {
@@ -122,7 +122,7 @@ async fn test_video_player_simulation() {
     let mut nfo_files = Vec::new();
     {
         let vfs_lock = vfs.read().await;
-        find_nfo_files(&vfs_lock.root, String::new(), &mut nfo_files);
+        find_nfo_files(&vfs_lock.root, "", String::new(), &mut nfo_files);
     }
     
     if nfo_files.is_empty() {
@@ -154,24 +154,24 @@ fn encode_path_preserve_slashes(p: &str) -> String {
         .join("/")
 }
 
-fn find_video_files(node: &VfsNode, current_path: String, files: &mut Vec<(String, u64)>) {
+fn find_video_files(node: &VfsNode, name: &str, current_path: String, files: &mut Vec<(String, u64)>) {
     match node {
-        VfsNode::Directory { name, children, .. } => {
+        VfsNode::Directory { children } => {
             let next_path = if current_path.is_empty() {
-                name.clone()
+                name.to_string()
             } else if name.is_empty() {
                 current_path
             } else {
                 format!("{}/{}", current_path, name)
             };
-            for child in children.values() {
-                find_video_files(child, next_path.clone(), files);
+            for (child_name, child) in children {
+                find_video_files(child, child_name, next_path.clone(), files);
             }
         }
-        VfsNode::StrmFile { name, .. } => {
+        VfsNode::StrmFile { .. } => {
             // STRM files are tiny text files, use nominal size
             let full_path = if current_path.is_empty() {
-                name.clone()
+                name.to_string()
             } else {
                 format!("{}/{}", current_path, name)
             };
@@ -181,25 +181,25 @@ fn find_video_files(node: &VfsNode, current_path: String, files: &mut Vec<(Strin
     }
 }
 
-fn find_nfo_files(node: &VfsNode, current_path: String, files: &mut Vec<(String, u64)>) {
+fn find_nfo_files(node: &VfsNode, name: &str, current_path: String, files: &mut Vec<(String, u64)>) {
     match node {
-        VfsNode::Directory { name, children, .. } => {
+        VfsNode::Directory { children } => {
             let next_path = if current_path.is_empty() {
-                name.clone()
+                name.to_string()
             } else if name.is_empty() {
                 current_path
             } else {
                 format!("{}/{}", current_path, name)
             };
-            for child in children.values() {
-                find_nfo_files(child, next_path.clone(), files);
+            for (child_name, child) in children {
+                find_nfo_files(child, child_name, next_path.clone(), files);
             }
         }
         VfsNode::StrmFile { .. } => {}
-        VfsNode::VirtualFile { name, content } => {
+        VfsNode::VirtualFile { content } => {
             if name.ends_with(".nfo") {
                 let full_path = if current_path.is_empty() {
-                    name.clone()
+                    name.to_string()
                 } else {
                     format!("{}/{}", current_path, name)
                 };
