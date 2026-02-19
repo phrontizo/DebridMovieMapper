@@ -11,6 +11,9 @@ const MIN_INTERVAL_MS: u64 = 100;   // 10 req/s max (baseline)
 const MAX_INTERVAL_MS: u64 = 2000;  // 0.5 req/s min (under heavy throttling)
 const RECOVERY_MS: u64 = 10;        // Decrease interval by 10ms per success
 
+const MAX_CACHE_SIZE: usize = 10_000;
+const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
+
 struct RateLimiterState {
     /// Current interval between requests in milliseconds
     interval_ms: u64,
@@ -293,8 +296,6 @@ impl RealDebridClient {
 
     pub async fn unrestrict_link(&self, link: &str) -> Result<UnrestrictResponse, reqwest::Error> {
         // Check cache first
-        const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour cache
-
         {
             let cache = self.unrestrict_cache.read().await;
             if let Some(cached) = cache.get(link) {
@@ -320,6 +321,15 @@ impl RealDebridClient {
                 response: response.clone(),
                 cached_at: std::time::Instant::now(),
             });
+        }
+
+        // Evict if cache is too large
+        {
+            let cache = self.unrestrict_cache.read().await;
+            if cache.len() > MAX_CACHE_SIZE {
+                drop(cache);
+                self.evict_expired_cache().await;
+            }
         }
 
         Ok(response)
@@ -464,6 +474,22 @@ impl RealDebridClient {
             cached_at: std::time::Instant::now(),
         });
     }
+
+    /// Evict expired entries from the unrestrict cache, and if still over
+    /// MAX_CACHE_SIZE, remove the oldest entries.
+    pub async fn evict_expired_cache(&self) {
+        let mut cache = self.unrestrict_cache.write().await;
+        cache.retain(|_, v| v.cached_at.elapsed() < CACHE_TTL);
+        // If still over max size, remove oldest entries
+        if cache.len() > MAX_CACHE_SIZE {
+            let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), v.cached_at)).collect();
+            entries.sort_by_key(|(_, t)| *t);
+            let to_remove = cache.len() - MAX_CACHE_SIZE;
+            for (key, _) in entries.into_iter().take(to_remove) {
+                cache.remove(&key);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -600,5 +626,57 @@ mod tests {
         assert!(state.next_allowed >= before + Duration::from_secs(5));
         // interval should also have doubled
         assert_eq!(state.interval_ms, 200);
+    }
+
+    // --- Cache eviction ---
+
+    #[tokio::test]
+    async fn unrestrict_cache_evicts_expired_entries() {
+        let client = RealDebridClient::new("fake-token".to_string()).unwrap();
+        // Seed cache with entries - we need to directly manipulate the cache
+        {
+            let mut cache = client.unrestrict_cache.write().await;
+            // Insert an "old" entry with a manually backdated timestamp
+            cache.insert("old-link".to_string(), CachedUnrestrictResponse {
+                response: UnrestrictResponse {
+                    id: "old".to_string(),
+                    filename: "old.mkv".to_string(),
+                    mime_type: None,
+                    filesize: 0,
+                    link: "old-link".to_string(),
+                    host: String::new(),
+                    chunks: 0,
+                    crc: 0,
+                    download: "http://old".to_string(),
+                    streamable: 0,
+                },
+                cached_at: std::time::Instant::now() - Duration::from_secs(7200), // 2 hours ago
+            });
+            cache.insert("new-link".to_string(), CachedUnrestrictResponse {
+                response: UnrestrictResponse {
+                    id: "new".to_string(),
+                    filename: "new.mkv".to_string(),
+                    mime_type: None,
+                    filesize: 0,
+                    link: "new-link".to_string(),
+                    host: String::new(),
+                    chunks: 0,
+                    crc: 0,
+                    download: "http://new".to_string(),
+                    streamable: 0,
+                },
+                cached_at: std::time::Instant::now(),
+            });
+        }
+        client.evict_expired_cache().await;
+        let cache = client.unrestrict_cache.read().await;
+        assert!(!cache.contains_key("old-link"), "Expired entry should be evicted");
+        assert!(cache.contains_key("new-link"), "Fresh entry should be retained");
+    }
+
+    #[test]
+    fn cache_constants_are_reasonable() {
+        assert_eq!(MAX_CACHE_SIZE, 10_000);
+        assert_eq!(CACHE_TTL, Duration::from_secs(3600));
     }
 }
