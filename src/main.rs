@@ -1,5 +1,7 @@
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::net::SocketAddr;
+use tokio::sync::{RwLock, Semaphore};
+use tokio::net::TcpListener;
 use tracing::info;
 use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::vfs::DebridVfs;
@@ -8,12 +10,13 @@ use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::repair::RepairManager;
 use dav_server::DavHandler;
 use hyper::server::conn::http1;
-use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
-use std::net::SocketAddr;
 use hyper::service::service_fn;
 use hyper::Request;
-use redb::Database;
+use hyper_util::rt::TokioIo;
+use redb::{Database, TableDefinition};
+
+const MAX_CONNECTIONS: usize = 256;
+const MATCHES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("matches");
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,6 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db = Arc::new(Database::create("metadata.db").expect("Failed to open database"));
 
+    // Ensure table exists on fresh databases
+    {
+        let write_txn = db.begin_write().expect("Failed to begin write transaction");
+        write_txn.open_table(MATCHES_TABLE).expect("Failed to create matches table");
+        write_txn.commit().expect("Failed to commit table creation");
+    }
+
     tokio::spawn(debridmoviemapper::tasks::run_scan_loop(
         rd_client.clone(),
         tmdb_client.clone(),
@@ -61,38 +71,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     info!("WebDAV server listening on http://{}", addr);
 
-    loop {
-        let (stream, _addr) = listener.accept().await?;
-        let io = TokioIo::new(stream);
-        let dav_handler = dav_handler.clone();
+    let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
-        tokio::task::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(
-                    io,
-                    service_fn(move |req: Request<hyper::body::Incoming>| {
-                        let dav_handler = dav_handler.clone();
-                        async move { Ok::<_, hyper::Error>(dav_handler.handle(req).await) }
-                    }),
-                )
-                .await
-            {
-                use std::error::Error;
-                if let Some(io_err) =
-                    err.source().and_then(|s| s.downcast_ref::<std::io::Error>())
-                {
-                    if matches!(
-                        io_err.kind(),
-                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
-                    ) {
-                        return;
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _addr) = result?;
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tracing::warn!("Max connections ({}) reached, rejecting", MAX_CONNECTIONS);
+                        drop(stream);
+                        continue;
                     }
-                }
-                if format!("{:?}", err).contains("IncompleteMessage") {
-                    return;
-                }
-                tracing::error!("Error serving connection: {:?}", err);
+                };
+                let io = TokioIo::new(stream);
+                let dav_handler = dav_handler.clone();
+
+                tokio::task::spawn(async move {
+                    let _permit = permit; // Hold permit until connection closes
+                    if let Err(err) = http1::Builder::new()
+                        .serve_connection(
+                            io,
+                            service_fn(move |req: Request<hyper::body::Incoming>| {
+                                let dav_handler = dav_handler.clone();
+                                async move { Ok::<_, hyper::Error>(dav_handler.handle(req).await) }
+                            }),
+                        )
+                        .await
+                    {
+                        use std::error::Error;
+                        if let Some(io_err) =
+                            err.source().and_then(|s| s.downcast_ref::<std::io::Error>())
+                        {
+                            if matches!(
+                                io_err.kind(),
+                                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                            ) {
+                                return;
+                            }
+                        }
+                        // hyper 1.x does not expose is_incomplete_message() — use string check
+                        // This handles clients that disconnect mid-request (common with WebDAV)
+                        if format!("{:?}", err).contains("IncompleteMessage") {
+                            return;
+                        }
+                        tracing::error!("Error serving connection: {:?}", err);
+                    }
+                });
             }
-        });
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received shutdown signal, stopping...");
+                break;
+            }
+        }
     }
+
+    info!("Shutdown complete.");
+    Ok(())
 }
