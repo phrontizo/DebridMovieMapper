@@ -20,7 +20,7 @@ async fn test_repair_process_integration() {
         .trim()
         .to_string();
 
-    let rd_client = Arc::new(RealDebridClient::new(api_token));
+    let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
     let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
     let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
 
@@ -123,7 +123,7 @@ async fn test_503_triggers_immediate_repair() {
         .trim()
         .to_string();
 
-    let rd_client = Arc::new(RealDebridClient::new(api_token));
+    let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
     let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
 
     println!("\n=== Test: 503 Error Triggers Immediate Repair ===");
@@ -212,7 +212,7 @@ async fn test_broken_torrents_hidden_from_webdav() {
         .trim()
         .to_string();
 
-    let rd_client = Arc::new(RealDebridClient::new(api_token));
+    let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
     let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
 
     println!("\n=== Test: Broken Torrents Hidden from WebDAV ===");

@@ -30,7 +30,10 @@ impl DebridFileSystem {
         let mut current = &vfs.root;
 
         let path_osstr = path.as_rel_ospath();
-        let path_str = path_osstr.to_str().unwrap();
+        let path_str = match path_osstr.to_str() {
+            Some(s) => s,
+            None => return None,
+        };
         if path_str == "." || path_str.is_empty() {
             return Some(current.clone());
         }

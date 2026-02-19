@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Scan interval: {}s", scan_interval_secs);
 
-    let rd_client = Arc::new(RealDebridClient::new(api_token));
+    let rd_client = Arc::new(RealDebridClient::new(api_token)?);
     let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
     let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));

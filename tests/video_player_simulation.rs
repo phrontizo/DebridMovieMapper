@@ -19,7 +19,7 @@ async fn test_video_player_simulation() {
     let api_token = std::env::var("RD_API_TOKEN").expect("RD_API_TOKEN must be set").trim().to_string();
     let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set").trim().to_string();
 
-    let rd_client = Arc::new(RealDebridClient::new(api_token));
+    let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
     let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 

@@ -26,7 +26,7 @@ async fn test_strm_file_generation() {
         .trim()
         .to_string();
 
-    let rd_client = Arc::new(RealDebridClient::new(api_token));
+    let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
     let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 
@@ -158,7 +158,7 @@ async fn test_strm_filename_conversion() {
         .trim()
         .to_string();
 
-    let rd_client = Arc::new(RealDebridClient::new(api_token));
+    let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
     let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 
@@ -238,7 +238,7 @@ async fn test_nfo_generation_with_strm() {
         .trim()
         .to_string();
 
-    let rd_client = Arc::new(RealDebridClient::new(api_token));
+    let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
     let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 

@@ -120,6 +120,6 @@ impl TmdbClient {
             }
         }
 
-        Err(last_error.unwrap())
+        Err(last_error.expect("retry loop completed without recording an error"))
     }
 }

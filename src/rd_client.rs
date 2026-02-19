@@ -191,10 +191,11 @@ pub struct RealDebridClient {
 }
 
 impl RealDebridClient {
-    pub fn new(api_token: String) -> Self {
+    pub fn new(api_token: String) -> Result<Self, crate::error::AppError> {
         let mut headers = HeaderMap::new();
         let auth_val = format!("Bearer {}", api_token);
-        let mut auth_header = HeaderValue::from_str(&auth_val).unwrap();
+        let mut auth_header = HeaderValue::from_str(&auth_val)
+            .map_err(|e| crate::error::AppError::Config(format!("Invalid API token for HTTP header: {}", e)))?;
         auth_header.set_sensitive(true);
         headers.insert(AUTHORIZATION, auth_header);
         headers.insert(reqwest::header::ACCEPT, HeaderValue::from_static("application/json"));
@@ -204,13 +205,13 @@ impl RealDebridClient {
             .user_agent("DebridMovieMapper/0.1.0")
             .timeout(Duration::from_secs(60))
             .build()
-            .unwrap();
+            .map_err(|e| crate::error::AppError::Config(format!("Failed to build HTTP client: {}", e)))?;
 
-        Self {
+        Ok(Self {
             client,
             unrestrict_cache: Arc::new(RwLock::new(HashMap::new())),
             rate_limiter: Arc::new(AdaptiveRateLimiter::new()),
-        }
+        })
     }
 
     /// Helper to handle 503 and other non-429 retryable status codes

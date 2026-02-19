@@ -10,7 +10,7 @@ async fn test_all_real_debrid_torrents() {
     let rd_token = std::env::var("RD_API_TOKEN").expect("RD_API_TOKEN must be set");
     let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
 
-    let rd_client = RealDebridClient::new(rd_token);
+    let rd_client = RealDebridClient::new(rd_token).unwrap();
     let tmdb_client = TmdbClient::new(tmdb_api_key);
     
     println!("\n========================================");

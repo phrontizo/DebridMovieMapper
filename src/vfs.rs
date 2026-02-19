@@ -378,7 +378,7 @@ mod tests {
     /// Create a RealDebridClient with pre-seeded unrestrict cache for given links.
     /// No real API calls will be made for cached links.
     async fn mock_rd_client(links: &[&str]) -> Arc<RealDebridClient> {
-        let client = Arc::new(RealDebridClient::new("fake-token".to_string()));
+        let client = Arc::new(RealDebridClient::new("fake-token".to_string()).unwrap());
         for link in links {
             client.seed_unrestrict_cache(link, UnrestrictResponse {
                 id: "mock".to_string(),

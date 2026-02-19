@@ -29,7 +29,7 @@ async fn get_shared_data() -> &'static (Arc<RealDebridClient>, Vec<(TorrentInfo,
                 .expect("TMDB_API_KEY must be set")
                 .trim()
                 .to_string();
-            let rd_client = Arc::new(RealDebridClient::new(api_token));
+            let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
             let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
             let db_tree = DB.open_tree("matches").expect("Failed to open matches tree");
 
