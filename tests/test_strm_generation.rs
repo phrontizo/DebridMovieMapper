@@ -67,8 +67,9 @@ async fn test_strm_file_generation() {
 
     println!("Updating VFS...");
     {
+        let new_vfs = DebridVfs::build(current_data, rd_client.clone()).await;
         let mut vfs_lock = vfs.write().await;
-        vfs_lock.update(current_data, rd_client.clone()).await;
+        *vfs_lock = new_vfs;
     }
 
     // Verify STRM files exist in VFS
@@ -185,8 +186,9 @@ async fn test_strm_filename_conversion() {
     }
 
     {
+        let new_vfs = DebridVfs::build(current_data, rd_client.clone()).await;
         let mut vfs_lock = vfs.write().await;
-        vfs_lock.update(current_data, rd_client.clone()).await;
+        *vfs_lock = new_vfs;
     }
 
     // Check that all video files have been converted to .strm
@@ -265,8 +267,9 @@ async fn test_nfo_generation_with_strm() {
     }
 
     {
+        let new_vfs = DebridVfs::build(current_data, rd_client.clone()).await;
         let mut vfs_lock = vfs.write().await;
-        vfs_lock.update(current_data, rd_client.clone()).await;
+        *vfs_lock = new_vfs;
     }
 
     // Check NFO files exist

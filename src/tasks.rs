@@ -150,8 +150,11 @@ async fn update_vfs(
             filtered.push((torrent_info.clone(), metadata.clone()));
         }
     }
+    // Build VFS without holding the lock to avoid blocking WebDAV reads during scans
+    let new_vfs = DebridVfs::build(filtered, rd_client.clone()).await;
+    // Only hold write lock briefly to swap
     let mut vfs_lock = vfs.write().await;
-    vfs_lock.update(filtered, rd_client.clone()).await;
+    *vfs_lock = new_vfs;
 }
 
 #[cfg(test)]

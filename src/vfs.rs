@@ -71,7 +71,7 @@ impl DebridVfs {
         }
     }
 
-    pub async fn update(&mut self, torrents: Vec<(TorrentInfo, MediaMetadata)>, rd_client: Arc<RealDebridClient>) {
+    pub async fn build(torrents: Vec<(TorrentInfo, MediaMetadata)>, rd_client: Arc<RealDebridClient>) -> Self {
         let mut movies_nodes = BTreeMap::new();
         let mut shows_nodes = BTreeMap::new();
 
@@ -126,10 +126,10 @@ impl DebridVfs {
                     let mut children = BTreeMap::new();
                     // For movies, only take the largest torrent to avoid duplicates
                     if let Some(torrent) = torrents.first() {
-                        self.add_torrent_files(&mut children, torrent, None, &rd_client).await;
+                        Self::add_torrent_files(&mut children, torrent, None, &rd_client).await;
                     }
                     if !children.is_empty() {
-                        let nfo_content = self.generate_nfo(&metadata);
+                        let nfo_content = Self::generate_nfo(&metadata);
                         children.insert("movie.nfo".to_string(), VfsNode::VirtualFile {
                             content: nfo_content,
                         });
@@ -163,7 +163,7 @@ impl DebridVfs {
                                         });
 
                                         if let VfsNode::Directory { children: season_children } = season_dir {
-                                            self.add_path_to_tree(season_children, filename, file.bytes, torrent.id.clone(), link.clone(), &rd_client).await;
+                                            Self::add_path_to_tree(season_children, filename, file.bytes, torrent.id.clone(), link.clone(), &rd_client).await;
                                         }
                                     }
                                 }
@@ -172,7 +172,7 @@ impl DebridVfs {
                         }
                     }
                     if !show_children.is_empty() {
-                        let nfo_content = self.generate_nfo(&metadata);
+                        let nfo_content = Self::generate_nfo(&metadata);
                         show_children.insert("tvshow.nfo".to_string(), VfsNode::VirtualFile {
                             content: nfo_content,
                         });
@@ -184,17 +184,19 @@ impl DebridVfs {
             }
         }
 
-        if let VfsNode::Directory { ref mut children } = self.root {
-            children.insert("Movies".to_string(), VfsNode::Directory {
-                children: movies_nodes,
-            });
-            children.insert("Shows".to_string(), VfsNode::Directory {
-                children: shows_nodes,
-            });
+        let mut root_children = BTreeMap::new();
+        root_children.insert("Movies".to_string(), VfsNode::Directory {
+            children: movies_nodes,
+        });
+        root_children.insert("Shows".to_string(), VfsNode::Directory {
+            children: shows_nodes,
+        });
+        Self {
+            root: VfsNode::Directory { children: root_children },
         }
     }
 
-    fn generate_nfo(&self, metadata: &MediaMetadata) -> Vec<u8> {
+    fn generate_nfo(metadata: &MediaMetadata) -> Vec<u8> {
         let tag = match metadata.media_type {
             MediaType::Movie => "movie",
             MediaType::Show => "tvshow",
@@ -243,7 +245,7 @@ impl DebridVfs {
         nfo.into_bytes()
     }
 
-    async fn add_torrent_files(&self, destination: &mut BTreeMap<String, VfsNode>, torrent: &TorrentInfo, path_prefix: Option<&str>, rd_client: &Arc<RealDebridClient>) {
+    async fn add_torrent_files(destination: &mut BTreeMap<String, VfsNode>, torrent: &TorrentInfo, path_prefix: Option<&str>, rd_client: &Arc<RealDebridClient>) {
         let mut link_idx = 0;
         for file in &torrent.files {
             if file.selected == 1 {
@@ -255,7 +257,7 @@ impl DebridVfs {
                         } else {
                             filename.to_string()
                         };
-                        self.add_path_to_tree(destination, &path, file.bytes, torrent.id.clone(), link.clone(), rd_client).await;
+                        Self::add_path_to_tree(destination, &path, file.bytes, torrent.id.clone(), link.clone(), rd_client).await;
                     }
                 }
                 link_idx += 1;
@@ -263,7 +265,7 @@ impl DebridVfs {
         }
     }
 
-    async fn add_path_to_tree(&self, root: &mut BTreeMap<String, VfsNode>, path: &str, _size: u64, torrent_id: String, link: String, rd_client: &Arc<RealDebridClient>) {
+    async fn add_path_to_tree(root: &mut BTreeMap<String, VfsNode>, path: &str, _size: u64, torrent_id: String, link: String, rd_client: &Arc<RealDebridClient>) {
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         let mut current_children = root;
 
@@ -383,7 +385,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_vfs_update() {
-        let mut vfs = DebridVfs::new();
         let torrents = vec![
             (
                 TorrentInfo {
@@ -446,7 +447,7 @@ mod tests {
         ];
 
         let rd_client = mock_rd_client(&["http://link1", "http://link2"]).await;
-        vfs.update(torrents, rd_client).await;
+        let vfs = DebridVfs::build(torrents, rd_client).await;
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").expect("Movies directory missing");
@@ -478,14 +479,13 @@ mod tests {
 
     #[test]
     fn test_nfo_generation() {
-        let vfs = DebridVfs::new();
         let metadata = MediaMetadata {
             title: "Test Movie".to_string(),
             year: Some("2024".to_string()),
             media_type: MediaType::Movie,
             external_id: Some("tmdb:12345".to_string()),
         };
-        let content = String::from_utf8(vfs.generate_nfo(&metadata)).unwrap();
+        let content = String::from_utf8(DebridVfs::generate_nfo(&metadata)).unwrap();
         assert!(content.contains("<movie>"));
         assert!(content.contains("<title>Test Movie</title>"));
         assert!(content.contains("<originaltitle>Test Movie</originaltitle>"));
@@ -500,7 +500,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_vfs_conflicts() {
-        let mut vfs = DebridVfs::new();
         let torrents = vec![
             (
                 TorrentInfo {
@@ -563,7 +562,7 @@ mod tests {
         ];
 
         let rd_client = mock_rd_client(&["http://l1", "http://l2"]).await;
-        vfs.update(torrents, rd_client).await;
+        let vfs = DebridVfs::build(torrents, rd_client).await;
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
@@ -589,7 +588,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_vfs_duplicates() {
-        let mut vfs = DebridVfs::new();
         let metadata = MediaMetadata {
             title: "Duplicate Movie".to_string(),
             year: Some("2023".to_string()),
@@ -639,7 +637,7 @@ mod tests {
         ];
 
         let rd_client = mock_rd_client(&["http://small", "http://large"]).await;
-        vfs.update(torrents, rd_client).await;
+        let vfs = DebridVfs::build(torrents, rd_client).await;
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();

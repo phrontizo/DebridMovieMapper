@@ -47,8 +47,9 @@ async fn test_video_player_simulation() {
 
     println!("Updating VFS...");
     {
+        let new_vfs = DebridVfs::build(current_data, rd_client.clone()).await;
         let mut vfs_lock = vfs.write().await;
-        vfs_lock.update(current_data, rd_client.clone()).await;
+        *vfs_lock = new_vfs;
     }
 
     let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));

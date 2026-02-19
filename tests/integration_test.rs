@@ -152,11 +152,8 @@ async fn test_vfs_structure() {
     assert!(!data.is_empty(), "Need identified torrents to test VFS structure");
 
     println!("Building VFS...");
-    let vfs = Arc::new(RwLock::new(DebridVfs::new()));
-    {
-        let mut vfs_lock = vfs.write().await;
-        vfs_lock.update(data.clone(), rd_client.clone()).await;
-    }
+    let new_vfs = DebridVfs::build(data.clone(), rd_client.clone()).await;
+    let vfs = Arc::new(RwLock::new(new_vfs));
 
     let vfs_lock = vfs.read().await;
     let root = &vfs_lock.root;
@@ -224,11 +221,8 @@ async fn test_vfs_completeness() {
     assert!(!data.is_empty(), "Need identified torrents to test VFS completeness");
 
     println!("Building VFS...");
-    let vfs = Arc::new(RwLock::new(DebridVfs::new()));
-    {
-        let mut vfs_lock = vfs.write().await;
-        vfs_lock.update(data.clone(), rd_client.clone()).await;
-    }
+    let new_vfs = DebridVfs::build(data.clone(), rd_client.clone()).await;
+    let vfs = Arc::new(RwLock::new(new_vfs));
 
     let vfs_lock = vfs.read().await;
     let mut vfs_links = std::collections::HashSet::new();
