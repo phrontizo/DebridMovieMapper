@@ -146,6 +146,13 @@ impl DebridVfs {
                     // For shows, we process all torrents (e.g. different seasons)
                     // They are already sorted by size, so larger files will overwrite smaller ones if paths match
                     for torrent in torrents {
+                        let selected_count = torrent.files.iter().filter(|f| f.selected == 1).count();
+                        if selected_count != torrent.links.len() {
+                            tracing::warn!(
+                                "Torrent '{}': selected file count ({}) != link count ({})",
+                                torrent.filename, selected_count, torrent.links.len()
+                            );
+                        }
                         let mut link_idx = 0;
                         for file in &torrent.files {
                             if file.selected == 1 {
@@ -215,22 +222,22 @@ impl DebridVfs {
 
         // Year
         if let Some(year) = &metadata.year {
-            nfo.push_str(&format!("  <year>{}</year>\n", year));
+            nfo.push_str(&format!("  <year>{}</year>\n", xml_escape(year)));
             // Add full date for better compatibility
-            nfo.push_str(&format!("  <premiered>{}-01-01</premiered>\n", year));
+            nfo.push_str(&format!("  <premiered>{}-01-01</premiered>\n", xml_escape(year)));
         }
 
         // External IDs
         if let Some(external_id) = &metadata.external_id {
             if let Some((source, id)) = external_id.split_once(':') {
-                nfo.push_str(&format!("  <uniqueid type=\"{}\" default=\"true\">{}</uniqueid>\n", source, id));
+                nfo.push_str(&format!("  <uniqueid type=\"{}\" default=\"true\">{}</uniqueid>\n", xml_escape(source), xml_escape(id)));
                 if source == "tmdb" {
                     let path = match metadata.media_type {
                         MediaType::Movie => "movie",
                         MediaType::Show => "tv",
                     };
-                    nfo.push_str(&format!("  <tmdbid>{}</tmdbid>\n", id));
-                    nfo.push_str(&format!("  <url>https://www.themoviedb.org/{}/{}</url>\n", path, id));
+                    nfo.push_str(&format!("  <tmdbid>{}</tmdbid>\n", xml_escape(id)));
+                    nfo.push_str(&format!("  <url>https://www.themoviedb.org/{}/{}</url>\n", xml_escape(path), xml_escape(id)));
                 }
             }
         }
@@ -249,6 +256,13 @@ impl DebridVfs {
     }
 
     async fn add_torrent_files(destination: &mut BTreeMap<String, VfsNode>, torrent: &TorrentInfo, path_prefix: Option<&str>, rd_client: &Arc<RealDebridClient>) {
+        let selected_count = torrent.files.iter().filter(|f| f.selected == 1).count();
+        if selected_count != torrent.links.len() {
+            tracing::warn!(
+                "Torrent '{}': selected file count ({}) != link count ({})",
+                torrent.filename, selected_count, torrent.links.len()
+            );
+        }
         let mut link_idx = 0;
         for file in &torrent.files {
             if file.selected == 1 {
@@ -587,6 +601,21 @@ mod tests {
             !source.contains(needle),
             "vfs.rs must not contain the broken-link placeholder string — skip the file instead"
         );
+    }
+
+    #[test]
+    fn test_nfo_escapes_special_xml_characters() {
+        let metadata = MediaMetadata {
+            title: "Test & <Movie>".to_string(),
+            year: Some("2024".to_string()),
+            media_type: MediaType::Movie,
+            external_id: Some("tmdb:123".to_string()),
+        };
+        let content = String::from_utf8(DebridVfs::generate_nfo(&metadata)).unwrap();
+        assert!(content.contains("<title>Test &amp; &lt;Movie&gt;</title>"), "Title should be XML-escaped");
+        assert!(content.contains("<originaltitle>Test &amp; &lt;Movie&gt;</originaltitle>"), "Original title should be XML-escaped");
+        // Year and IDs should also be escaped (even if unlikely to contain special chars)
+        assert!(!content.contains("&<"), "No unescaped special characters should appear");
     }
 
     #[tokio::test]
