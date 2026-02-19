@@ -65,6 +65,7 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 | `dav_fs.rs` | Maps VFS to WebDAV; re-unrestricts links on read and triggers on-demand repair on 503 |
 | `repair.rs` | Torrent repair state machine (Healthy→Broken→Repairing→Failed), on-demand repair |
 | `tmdb_client.rs` | TMDB search for movies and TV shows |
+| `error.rs` | Unified error type (`AppError`) using `thiserror` |
 | `mapper.rs` | Library root — module declarations |
 
 **Data flow for playback:**

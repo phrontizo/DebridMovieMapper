@@ -1,5 +1,5 @@
 /target
-metadata.db/
+metadata.db
 .env
 run.log
 .output.txt

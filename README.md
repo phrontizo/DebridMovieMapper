@@ -82,6 +82,8 @@ docker build -t debridmoviemapper .
 
 *Note: Mounting `metadata.db` ensures your media identification cache is preserved across container recreations.*
 
+**Upgrading from sled (pre-redb):** If you previously ran an older version that used sled, your `metadata.db` will be a directory. Remove it before starting the new version: `rm -rf metadata.db`. The redb database will be recreated automatically (TMDB identifications will be re-fetched on the first scan).
+
 ## Docker Compose Setup with Jellyfin
 
 The recommended way to use DebridMovieMapper with Jellyfin is via Docker Compose with rclone mounting the WebDAV endpoint.
@@ -160,6 +162,7 @@ You can add this URL as a network drive in your OS or directly as a WebDAV sourc
 - `src/vfs.rs`: Virtual File System logic for library organisation.
 - `src/dav_fs.rs`: WebDAV filesystem — re-unrestricts links on read and triggers repair on 503.
 - `src/identification.rs`: Smart media identification and filename cleaning logic.
+- `src/error.rs`: Unified error type (`AppError`) using `thiserror`.
 - `src/mapper.rs`: Library root (module declarations).
 
 ## How It Works
