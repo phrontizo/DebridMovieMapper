@@ -164,18 +164,14 @@ fn score_result(result: &TmdbSearchResult, normalized_query: &str, year: &Option
         score += 100.0; // Partial title match
     }
 
-    // Vote count and rating (strong signal for well-known content)
-    // This comes before year matching to prevent obscure exact-year matches
-    // from beating well-known off-by-one matches
+    // Vote count and rating — smooth scaling to avoid cliffs between similarly-popular content
     let vote_count = result.vote_count.unwrap_or(0);
-    if vote_count > 100 {
-        // Heavily weight popular content (100+ votes)
-        // Max contribution: ~100 points (10 rating × 10 multiplier)
-        score += result.vote_average.unwrap_or(0.0) * 10.0;
-        score += (vote_count as f64).log10() * 50.0; // Logarithmic vote count bonus
-    } else if vote_count > 10 {
-        // Moderately weight content with some votes
-        score += result.vote_average.unwrap_or(0.0) * 5.0;
+    if vote_count >= 10 {
+        let vc = vote_count as f64;
+        // Weight ramps smoothly: 5.0 at 10 votes → 10.0 at 100 → 15.0 at 1000+
+        let weight = (vc.log10() * 5.0).min(15.0);
+        score += result.vote_average.unwrap_or(0.0) * weight;
+        score += vc.log10() * 30.0;
     }
 
     // Year match (important, but with tolerance for off-by-one errors)
@@ -191,6 +187,24 @@ fn score_result(result: &TmdbSearchResult, normalized_query: &str, year: &Option
                             score += 150.0; // Close year match (±1 year)
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // Recency bonus when no year is specified in the filename.
+    // Helps disambiguate same-titled content (e.g., two shows both called "Sherwood")
+    // by slightly preferring more recently released content.
+    if year.is_none() {
+        if let Some(release_date) = &result.release_date {
+            if let Some(year_str) = release_date.get(0..4) {
+                if let Ok(release_year) = year_str.parse::<i32>() {
+                    let current_year = (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() / 31_557_600) as i32 + 1970;
+                    let age = (current_year - release_year).max(0) as f64;
+                    score += (80.0 - age * 8.0).max(0.0);
                 }
             }
         }
@@ -603,6 +617,43 @@ mod tests {
         assert_eq!(metadata.external_id, Some("tmdb:823219".to_string()));
         assert_eq!(metadata.title, "Flow");
         assert_eq!(metadata.media_type, MediaType::Movie);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_sherwood_s02_disambiguation() {
+        dotenvy::dotenv().ok();
+        let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
+        let tmdb_client = TmdbClient::new(tmdb_api_key);
+
+        let info = TorrentInfo {
+            id: "sherwood_id".to_string(),
+            filename: "Sherwood.S02E01.1080p.WEB.H264-DiMEPiECE.mkv".to_string(),
+            original_filename: "Sherwood.S02E01.1080p.WEB.H264-DiMEPiECE.mkv".to_string(),
+            hash: "hash".to_string(),
+            bytes: 2000000000,
+            original_bytes: 2000000000,
+            host: "host".to_string(),
+            split: 1,
+            progress: 100.0,
+            status: "downloaded".to_string(),
+            added: "2025-01-01".to_string(),
+            files: vec![
+                TorrentFile {
+                    id: 1,
+                    path: "Sherwood.S02E01.1080p.WEB.H264-DiMEPiECE.mkv".to_string(),
+                    bytes: 2000000000,
+                    selected: 1,
+                },
+            ],
+            links: vec!["http://link1".to_string()],
+            ended: Some("2025-01-01".to_string()),
+        };
+
+        let metadata = identify_torrent(&info, &tmdb_client).await;
+
+        // Should be Sherwood (155243), NOT the wrong one (87399)
+        assert_eq!(metadata.external_id, Some("tmdb:155243".to_string()));
     }
 
     #[tokio::test]
