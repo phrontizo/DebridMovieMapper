@@ -18,7 +18,7 @@ static SEASON_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)s(\d+)|season\s*(\d+)|(\d+)x\d+").unwrap()
 });
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum VfsNode {
     Directory {
         children: BTreeMap<String, VfsNode>,
@@ -34,6 +34,19 @@ pub enum VfsNode {
     VirtualFile {
         content: Vec<u8>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateType {
+    Created,
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VfsChange {
+    pub path: String,
+    pub update_type: UpdateType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
