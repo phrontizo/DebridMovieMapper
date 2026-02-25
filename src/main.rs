@@ -61,7 +61,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_txn.commit().expect("Failed to commit table creation");
     }
 
-    tokio::spawn(debridmoviemapper::tasks::run_scan_loop(
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let scan_handle = tokio::spawn(debridmoviemapper::tasks::run_scan_loop(
         rd_client.clone(),
         tmdb_client.clone(),
         vfs.clone(),
@@ -69,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         repair_manager.clone(),
         scan_interval_secs,
         jellyfin_client,
+        shutdown_rx,
     ));
 
     let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone(), repair_manager.clone());
@@ -82,6 +85,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("WebDAV server listening on http://{}", addr);
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+
+    // Unified shutdown future: triggers on SIGINT (ctrl+c) or SIGTERM (Docker stop)
+    let shutdown_signal = async {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("Failed to register SIGTERM handler");
+            tokio::select! {
+                _ = ctrl_c => info!("Received SIGINT, shutting down..."),
+                _ = sigterm.recv() => info!("Received SIGTERM, shutting down..."),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            ctrl_c.await.ok();
+            info!("Received SIGINT, shutting down...");
+        }
+    };
+    tokio::pin!(shutdown_signal);
 
     loop {
         tokio::select! {
@@ -130,12 +153,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received shutdown signal, stopping...");
+            _ = &mut shutdown_signal => {
                 break;
             }
         }
     }
+
+    // Signal the scan loop to stop and wait for it to finish
+    let _ = shutdown_tx.send(true);
+    info!("Waiting for scan task to finish...");
+    let _ = scan_handle.await;
 
     info!("Shutdown complete.");
     Ok(())

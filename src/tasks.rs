@@ -21,6 +21,7 @@ pub async fn run_scan_loop(
     repair_manager: Arc<RepairManager>,
     interval_secs: u64,
     jellyfin_client: Option<Arc<crate::jellyfin_client::JellyfinClient>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     // Load persisted matches from DB on startup
     let db_clone = db.clone();
@@ -66,6 +67,10 @@ pub async fn run_scan_loop(
     info!("Scan task: running initial scan immediately");
 
     loop {
+        if *shutdown.borrow() {
+            info!("Scan task: shutdown requested, exiting");
+            return;
+        }
         info!("Refreshing torrent list...");
         match rd_client.get_torrents().await {
             Ok(torrents) => {
@@ -137,7 +142,14 @@ pub async fn run_scan_loop(
                         .count();
                     let mut processed_new = 0;
 
-                    while let Some(result) = stream.next().await {
+                    while let Some(result) = tokio::select! {
+                        result = stream.next() => result,
+                        _ = shutdown.changed() => {
+                            info!("Scan task: shutdown during identification, saving progress");
+                            update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client).await;
+                            return;
+                        }
+                    } {
                         processed_new += 1;
                         match result {
                             Ok((id, info, metadata)) => {
@@ -182,7 +194,13 @@ pub async fn run_scan_loop(
         }
 
         info!("Scan task: sleeping {}s until next scan", interval_secs);
-        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
+            _ = shutdown.changed() => {
+                info!("Scan task: shutdown requested, exiting");
+                return;
+            }
+        }
     }
 }
 
@@ -228,8 +246,9 @@ mod tests {
         vfs: Arc<RwLock<DebridVfs>>,
         db: Arc<redb::Database>,
         repair_manager: Arc<RepairManager>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
-        run_scan_loop(rd_client, tmdb_client, vfs, db, repair_manager, 60, None).await;
+        run_scan_loop(rd_client, tmdb_client, vfs, db, repair_manager, 60, None, shutdown).await;
     }
 
 }
