@@ -118,7 +118,7 @@ impl DebridVfs {
             // Sort torrents by size descending to pick the best/largest one
             torrents.sort_by_key(|t| std::cmp::Reverse(t.bytes));
 
-            let base_name = metadata.title.clone();
+            let base_name = sanitize_filename(&metadata.title);
             
             let (used_names, nodes) = match metadata.media_type {
                 MediaType::Movie => (&mut used_movie_names, &mut movies_nodes),
@@ -350,6 +350,18 @@ impl DebridVfs {
             }
         }
     }
+}
+
+/// Replace characters that are invalid in filenames or interpreted as path separators.
+fn sanitize_filename(name: &str) -> String {
+    let replaced: String = name.chars()
+        .flat_map(|c| match c {
+            '/' | '\\' => vec!['-'],
+            ':' => vec![' ', '-'],
+            _ => vec![c],
+        })
+        .collect();
+    replaced.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub fn is_video_file(path: &str) -> bool {
@@ -805,6 +817,54 @@ mod tests {
                         panic!("Should be a STRM file");
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_filename_replaces_slashes() {
+        assert_eq!(sanitize_filename("Alex/October"), "Alex-October");
+        assert_eq!(sanitize_filename("Back\\Slash"), "Back-Slash");
+        assert_eq!(sanitize_filename("Title: Subtitle"), "Title - Subtitle");
+        assert_eq!(sanitize_filename("Normal Title"), "Normal Title");
+    }
+
+    #[test]
+    fn build_sanitizes_title_with_slash() {
+        let torrents = vec![(
+            TorrentInfo {
+                id: "1".to_string(),
+                filename: "Alex.October.mkv".to_string(),
+                original_filename: "Alex.October.mkv".to_string(),
+                hash: "h".to_string(),
+                bytes: 1000,
+                original_bytes: 1000,
+                host: "h".to_string(),
+                split: 1,
+                progress: 100.0,
+                status: "downloaded".to_string(),
+                added: "2023-01-01".to_string(),
+                files: vec![TorrentFile { id: 1, path: "/Alex.October.mkv".to_string(), bytes: 1000, selected: 1 }],
+                links: vec!["http://link1".to_string()],
+                ended: Some("2023-01-01".to_string()),
+            },
+            MediaMetadata {
+                title: "Alex/October".to_string(),
+                year: None,
+                media_type: MediaType::Movie,
+                external_id: Some("tmdb:856721".to_string()),
+            },
+        )];
+
+        let vfs = DebridVfs::build(torrents);
+        if let VfsNode::Directory { children } = &vfs.root {
+            let movies = children.get("Movies").unwrap();
+            if let VfsNode::Directory { children: movie_children } = movies {
+                assert!(
+                    movie_children.contains_key("Alex-October [tmdbid-856721]"),
+                    "Expected sanitized folder name, got: {:?}",
+                    movie_children.keys().collect::<Vec<_>>()
+                );
             }
         }
     }
