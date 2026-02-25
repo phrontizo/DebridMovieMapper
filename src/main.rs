@@ -43,6 +43,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
     let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
 
+    let jellyfin_client = debridmoviemapper::jellyfin_client::JellyfinClient::from_env()
+        .map(Arc::new);
+
+    if jellyfin_client.is_some() {
+        info!("Jellyfin notification enabled");
+    } else {
+        info!("Jellyfin notification disabled (set JELLYFIN_URL, JELLYFIN_API_KEY, JELLYFIN_RCLONE_MOUNT_PATH to enable)");
+    }
+
     let db = Arc::new(Database::create("metadata.db").expect("Failed to open database"));
 
     // Ensure table exists on fresh databases
@@ -59,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db.clone(),
         repair_manager.clone(),
         scan_interval_secs,
+        jellyfin_client,
     ));
 
     let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone(), repair_manager.clone());

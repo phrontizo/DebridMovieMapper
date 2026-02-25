@@ -20,6 +20,7 @@ pub async fn run_scan_loop(
     db: Arc<redb::Database>,
     repair_manager: Arc<RepairManager>,
     interval_secs: u64,
+    jellyfin_client: Option<Arc<crate::jellyfin_client::JellyfinClient>>,
 ) {
     // Load persisted matches from DB on startup
     let db_clone = db.clone();
@@ -157,11 +158,11 @@ pub async fn run_scan_loop(
                                 "Progress: {}/{} new torrents identified",
                                 processed_new, new_total
                             );
-                            update_vfs(&vfs, &current_data, &repair_manager).await;
+                            update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client).await;
                         }
                     }
                 } else {
-                    update_vfs(&vfs, &current_data, &repair_manager).await;
+                    update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client).await;
                 }
 
                 let current_ids: std::collections::HashSet<String> =
@@ -181,6 +182,7 @@ async fn update_vfs(
     vfs: &Arc<RwLock<DebridVfs>>,
     current_data: &[(crate::rd_client::TorrentInfo, MediaMetadata)],
     repair_manager: &Arc<RepairManager>,
+    jellyfin_client: &Option<Arc<crate::jellyfin_client::JellyfinClient>>,
 ) {
     let mut filtered = Vec::new();
     for (torrent_info, metadata) in current_data {
@@ -190,9 +192,20 @@ async fn update_vfs(
     }
     // Build VFS without holding the lock to avoid blocking WebDAV reads during scans
     let new_vfs = DebridVfs::build(filtered);
-    // Only hold write lock briefly to swap
+    // Diff old vs new, then swap
     let mut vfs_lock = vfs.write().await;
+    let changes = crate::vfs::diff_trees(&vfs_lock.root, &new_vfs.root, "");
     *vfs_lock = new_vfs;
+    drop(vfs_lock);
+
+    if !changes.is_empty() {
+        if let Some(client) = jellyfin_client {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client.notify_changes(&changes).await;
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -208,7 +221,7 @@ mod tests {
         db: Arc<redb::Database>,
         repair_manager: Arc<RepairManager>,
     ) {
-        run_scan_loop(rd_client, tmdb_client, vfs, db, repair_manager, 60).await;
+        run_scan_loop(rd_client, tmdb_client, vfs, db, repair_manager, 60, None).await;
     }
 
 }
