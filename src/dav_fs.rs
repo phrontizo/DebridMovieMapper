@@ -163,6 +163,14 @@ impl DavDirEntry for DebridDirEntry {
     }
 }
 
+/// Returns true if the error from unrestrict_link indicates a broken torrent
+/// that should trigger the repair process. Only 503 (Service Unavailable)
+/// means a broken torrent — other errors (network, 404, etc.) should not
+/// trigger repair as they may be transient or indicate intentional deletion.
+fn should_repair_on_unrestrict_error(status: Option<reqwest::StatusCode>) -> bool {
+    status == Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+}
+
 /// A STRM file that lazily unrestricts its RD link on first access.
 /// The resolved download URL is cached so metadata() and read_bytes() are consistent.
 #[derive(Debug)]
@@ -192,16 +200,20 @@ impl StrmFile {
                 Ok(content)
             }
             Err(e) => {
-                tracing::error!("Re-unrestrict failed for {} — triggering repair: {}", self.name, e);
-                let repair_manager = self.repair_manager.clone();
-                let torrent_id = self.rd_torrent_id.clone();
-                let link = self.rd_link.clone();
-                repair_manager.mark_broken(&torrent_id, &link).await;
-                tokio::spawn(async move {
-                    if let Err(e) = repair_manager.repair_by_id(&torrent_id).await {
-                        tracing::error!("Repair failed for {}: {}", torrent_id, e);
-                    }
-                });
+                if should_repair_on_unrestrict_error(e.status()) {
+                    tracing::error!("Re-unrestrict returned 503 for {} — triggering repair", self.name);
+                    let repair_manager = self.repair_manager.clone();
+                    let torrent_id = self.rd_torrent_id.clone();
+                    let link = self.rd_link.clone();
+                    repair_manager.mark_broken(&torrent_id, &link).await;
+                    tokio::spawn(async move {
+                        if let Err(e) = repair_manager.repair_by_id(&torrent_id).await {
+                            tracing::error!("Repair failed for {}: {}", torrent_id, e);
+                        }
+                    });
+                } else {
+                    tracing::warn!("Re-unrestrict failed for {} (not repairing): {}", self.name, e);
+                }
                 Err(FsError::GeneralFailure)
             }
         }
@@ -302,6 +314,22 @@ mod tests {
             pos: 0,
             resolved_content: None,
         };
+    }
+
+    #[test]
+    fn should_repair_only_on_503() {
+        // Only 503 (Service Unavailable) means broken torrent → trigger repair
+        assert!(should_repair_on_unrestrict_error(Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)));
+
+        // Other status codes should NOT trigger repair
+        assert!(!should_repair_on_unrestrict_error(Some(reqwest::StatusCode::NOT_FOUND)));
+        assert!(!should_repair_on_unrestrict_error(Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)));
+        assert!(!should_repair_on_unrestrict_error(Some(reqwest::StatusCode::BAD_GATEWAY)));
+        assert!(!should_repair_on_unrestrict_error(Some(reqwest::StatusCode::GATEWAY_TIMEOUT)));
+        assert!(!should_repair_on_unrestrict_error(Some(reqwest::StatusCode::FORBIDDEN)));
+
+        // Network errors (no status code) should NOT trigger repair
+        assert!(!should_repair_on_unrestrict_error(None));
     }
 
     #[test]
