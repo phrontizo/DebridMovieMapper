@@ -14,6 +14,28 @@ pub const VIDEO_EXTENSIONS: &[&str] = &[
     ".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
 ];
 
+const ARCHIVE_EXTENSIONS: &[&str] = &[
+    ".rar", ".zip", ".7z", ".tar", ".gz", ".bz2",
+];
+
+/// RAR split-volume patterns: .r00, .r01, ..., .r99, .s00, etc.
+fn is_archive_part(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    // .r00-.r99, .s00-.s99 (split RAR volumes)
+    if lower.len() >= 4 {
+        let ext = &lower[lower.len().saturating_sub(4)..];
+        if ext.starts_with(".r") || ext.starts_with(".s") {
+            return ext[2..].chars().all(|c| c.is_ascii_digit());
+        }
+    }
+    false
+}
+
+fn is_archive_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    ARCHIVE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) || is_archive_part(&lower)
+}
+
 static SEASON_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)s(\d+)|season\s*(\d+)|(\d+)x\d+").unwrap()
 });
@@ -141,6 +163,21 @@ impl DebridVfs {
                 *count += 1;
                 name
             };
+
+            // Warn about archive-only torrents that can't be streamed
+            for torrent in &torrents {
+                let has_video = torrent.files.iter().any(|f| f.selected == 1 && is_video_file(&f.path));
+                if !has_video {
+                    let has_archive = torrent.files.iter().any(|f| f.selected == 1 && is_archive_file(&f.path));
+                    if has_archive {
+                        tracing::warn!(
+                            "Torrent '{}' contains only archive files (RAR/ZIP) and cannot be streamed — \
+                             replace with a non-archive version on Real-Debrid",
+                            torrent.filename
+                        );
+                    }
+                }
+            }
 
             match metadata.media_type {
                 MediaType::Movie => {
@@ -819,6 +856,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn is_archive_file_detects_archives() {
+        assert!(is_archive_file("movie.rar"));
+        assert!(is_archive_file("movie.r00"));
+        assert!(is_archive_file("movie.r99"));
+        assert!(is_archive_file("movie.zip"));
+        assert!(is_archive_file("movie.7z"));
+        assert!(is_archive_file("/path/to/movie.RAR"));
+        assert!(is_archive_file("movie.s00"));
+        assert!(!is_archive_file("movie.mkv"));
+        assert!(!is_archive_file("movie.nfo"));
+        assert!(!is_archive_file("movie.srt"));
     }
 
     #[test]

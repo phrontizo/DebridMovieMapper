@@ -202,6 +202,16 @@ There is no background repair loop. Instead, repair is triggered at playback tim
 
 When `JELLYFIN_URL`, `JELLYFIN_API_KEY`, and `JELLYFIN_RCLONE_MOUNT_PATH` are all set, the service notifies Jellyfin of specific changed paths after each VFS update. This uses Jellyfin's `POST /Library/Media/Updated` API to trigger targeted scans of only the affected folders (e.g. a single season directory for a new episode), avoiding full library rescans. Changes from all sources — new torrents, deletions, repairs — are detected automatically.
 
+### Archive-Only Torrents
+
+Some torrents contain RAR/ZIP archives instead of video files. Real-Debrid does not extract these archives, so they cannot be streamed. When such a torrent is detected, a warning is logged:
+
+```
+WARN Torrent 'Movie.Name.1080p.BluRay' contains only archive files (RAR/ZIP) and cannot be streamed — replace with a non-archive version on Real-Debrid
+```
+
+To fix this, delete the torrent from Real-Debrid and find an alternative release that contains video files directly (`.mkv`, `.mp4`, etc.).
+
 ### Error Handling
 
 - **503 Service Unavailable**: Immediately marks torrent as broken and triggers repair without retries
