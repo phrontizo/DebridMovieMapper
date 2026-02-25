@@ -4,6 +4,9 @@ use tracing::info;
 
 const MAX_RETRIES: u32 = 10;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+/// Delay before sending notification to let rclone's directory cache expire.
+/// Must be longer than rclone's --dir-cache-time (default 10s in compose.yml).
+const NOTIFICATION_DELAY: Duration = Duration::from_secs(15);
 
 pub struct JellyfinClient {
     url: String,
@@ -51,10 +54,15 @@ impl JellyfinClient {
         let url = format!("{}/Library/Media/Updated", self.url);
 
         info!(
-            "Notifying Jellyfin of {} change(s): {}",
+            "Notifying Jellyfin of {} change(s) in {}s: {}",
             changes.len(),
+            NOTIFICATION_DELAY.as_secs(),
             changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>().join(", ")
         );
+
+        // Wait for rclone's directory cache to expire so Jellyfin sees fresh data
+        // when it checks the filesystem after receiving our notification.
+        tokio::time::sleep(NOTIFICATION_DELAY).await;
 
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
