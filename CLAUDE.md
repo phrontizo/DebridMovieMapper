@@ -44,6 +44,9 @@ docker compose up -d
 
 **Optional:**
 - `SCAN_INTERVAL_SECS` (default: 60) — how often to poll Real-Debrid
+- `JELLYFIN_URL` — Jellyfin server URL (e.g. `http://jellyfin:8096`)
+- `JELLYFIN_API_KEY` — Jellyfin API key
+- `JELLYFIN_RCLONE_MOUNT_PATH` — rclone mount path as seen by Jellyfin (e.g. `/media`)
 
 ## Architecture
 
@@ -66,6 +69,7 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 | `repair.rs` | Torrent repair state machine (Healthy→Broken→Repairing→Failed), on-demand repair |
 | `tmdb_client.rs` | TMDB search for movies and TV shows |
 | `error.rs` | Unified error type (`AppError`) using `thiserror` |
+| `jellyfin_client.rs` | Optional Jellyfin notification client — notifies Jellyfin of changed paths via `POST /Library/Media/Updated` |
 | `mapper.rs` | Library root — module declarations |
 
 **Data flow for playback:**

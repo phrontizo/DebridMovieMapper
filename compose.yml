@@ -10,6 +10,10 @@ services:
       - RD_API_TOKEN=your_real_debrid_token
       - TMDB_API_KEY=your_tmdb_api_key
       - SCAN_INTERVAL_SECS=60
+      # Jellyfin notifications (all three required to enable)
+      - JELLYFIN_URL=http://jellyfin:8096
+      - JELLYFIN_API_KEY=your_jellyfin_api_key
+      - JELLYFIN_RCLONE_MOUNT_PATH=/media
     volumes:
       - ./metadata.db:/metadata.db
 

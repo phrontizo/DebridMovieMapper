@@ -23,6 +23,7 @@ This was 100% vibe coded using a mix of Claude and Junie as further AI experimen
 - **Persistent Cache**: Uses an embedded database (`redb`) to cache media identifications, reducing API calls and speeding up restarts.
 - **Configurable Scan Interval**: Customizable scan interval via environment variable.
 - **Robust Identification Logic**: Handles complex torrent naming conventions, including CamelCase splitting, technical metadata stripping, and multi-service fallback strategies.
+- **Jellyfin Notifications**: Optionally notifies Jellyfin when content changes so new episodes and movies appear immediately without waiting for a full library scan.
 
 ## Prerequisites
 
@@ -39,6 +40,11 @@ TMDB_API_KEY=your_tmdb_api_key
 
 # Optional
 SCAN_INTERVAL_SECS=60       # How often to scan for new torrents (default: 60)
+
+# Optional: Jellyfin integration (all three required to enable)
+JELLYFIN_URL=http://jellyfin:8096
+JELLYFIN_API_KEY=your_jellyfin_api_key
+JELLYFIN_RCLONE_MOUNT_PATH=/media
 ```
 
 ### Environment Variables
@@ -48,6 +54,9 @@ SCAN_INTERVAL_SECS=60       # How often to scan for new torrents (default: 60)
 | `RD_API_TOKEN` | Yes | - | Your Real-Debrid API token |
 | `TMDB_API_KEY` | Yes | - | Your TMDB (The Movie Database) API key |
 | `SCAN_INTERVAL_SECS` | No | 60 | Interval between torrent library scans (runs immediately on startup) |
+| `JELLYFIN_URL` | No | - | Jellyfin server URL for library update notifications |
+| `JELLYFIN_API_KEY` | No | - | Jellyfin API key for authentication |
+| `JELLYFIN_RCLONE_MOUNT_PATH` | No | - | rclone mount path as seen by Jellyfin (e.g. `/media`) |
 
 ## Running with Docker
 
@@ -163,6 +172,7 @@ You can add this URL as a network drive in your OS or directly as a WebDAV sourc
 - `src/dav_fs.rs`: WebDAV filesystem — re-unrestricts links on read and triggers repair on 503.
 - `src/identification.rs`: Smart media identification and filename cleaning logic.
 - `src/error.rs`: Unified error type (`AppError`) using `thiserror`.
+- `src/jellyfin_client.rs`: Optional Jellyfin notification client for instant library updates.
 - `src/mapper.rs`: Library root (module declarations).
 
 ## How It Works
@@ -183,6 +193,10 @@ There is no background repair loop. Instead, repair is triggered at playback tim
 - When a `.strm` file is read, `dav_fs` re-calls `unrestrict_link` for a fresh URL (the 1-hour response cache makes this free when the torrent is healthy)
 - If `unrestrict_link` returns a 503, the torrent is marked broken and a background `tokio::spawn` calls `repair_by_id`
 - Broken/repairing torrents are hidden from WebDAV until healthy again
+
+### Jellyfin Notifications
+
+When `JELLYFIN_URL`, `JELLYFIN_API_KEY`, and `JELLYFIN_RCLONE_MOUNT_PATH` are all set, the service notifies Jellyfin of specific changed paths after each VFS update. This uses Jellyfin's `POST /Library/Media/Updated` API to trigger targeted scans of only the affected folders (e.g. a single season directory for a new episode), avoiding full library rescans. Changes from all sources — new torrents, deletions, repairs — are detected automatically.
 
 ### Error Handling
 
