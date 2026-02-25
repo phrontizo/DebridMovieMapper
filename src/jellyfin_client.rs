@@ -1,5 +1,9 @@
 use crate::vfs::{VfsChange, UpdateType};
+use std::time::Duration;
 use tracing::info;
+
+const MAX_RETRIES: u32 = 10;
+const RETRY_DELAY: Duration = Duration::from_secs(5);
 
 pub struct JellyfinClient {
     url: String,
@@ -52,28 +56,56 @@ impl JellyfinClient {
             changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>().join(", ")
         );
 
-        match self.http
-            .post(&url)
-            .header("X-Emby-Token", &self.api_key)
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    info!("Jellyfin notified successfully");
-                } else {
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+
+            let result = self.http
+                .post(&url)
+                .header("X-Emby-Token", &self.api_key)
+                .json(&body)
+                .send()
+                .await;
+
+            match result {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        info!("Jellyfin notified successfully");
+                        return;
+                    }
+                    let status = response.status();
+                    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                        tracing::warn!(
+                            "Jellyfin returned 503 (still starting?), retry {}/{}",
+                            attempt + 1,
+                            MAX_RETRIES
+                        );
+                        continue;
+                    }
                     tracing::warn!(
                         "Jellyfin notification returned status {}: {}",
-                        response.status(),
+                        status,
                         response.text().await.unwrap_or_default()
                     );
+                    return;
+                }
+                Err(e) if e.is_connect() => {
+                    tracing::warn!(
+                        "Cannot connect to Jellyfin (not started?), retry {}/{}",
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to notify Jellyfin: {}", e);
+                    return;
                 }
             }
-            Err(e) => {
-                tracing::warn!("Failed to notify Jellyfin: {}", e);
-            }
         }
+
+        tracing::warn!("Jellyfin notification failed after {} retries", MAX_RETRIES);
     }
 
     /// Try to create a JellyfinClient from environment variables.
