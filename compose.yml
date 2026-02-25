@@ -5,11 +5,10 @@ services:
     restart: unless-stopped
     user: "65534:65534"
     ports:
-      - "8080:8080"
+      - "8082:8080"
     environment:
       - RD_API_TOKEN=your_real_debrid_token
       - TMDB_API_KEY=your_tmdb_api_key
-      - SCAN_INTERVAL_SECS=60
       # Jellyfin notifications (all three required to enable)
       - JELLYFIN_URL=http://jellyfin:8096
       - JELLYFIN_API_KEY=your_jellyfin_api_key
@@ -21,7 +20,7 @@ services:
     image: rclone/rclone:latest
     container_name: rclone
     restart: unless-stopped
-    user: "1000:1000"
+    user: "65534:65534"
     depends_on:
       - debridmoviemapper
     devices:
@@ -32,35 +31,37 @@ services:
       - apparmor:unconfined
     volumes:
       - ./rclone.conf:/config/rclone/rclone.conf
-      - jellyfin-media:/mnt/debrid:rshared
+      - ./rclone:/data:rshared
+    tmpfs:
+      - /cache:mode=700,uid=65534,gid=65534
+    environment:
+      - TZ=Europe/London
     command: >
-      mount debrid: /mnt/debrid
+      mount debrid: /data
       --vfs-cache-mode writes
       --vfs-cache-max-size 1G
       --allow-other
       --allow-non-empty
       --dir-cache-time 10s
       --poll-interval 15s
+      --cache-dir /cache
 
   jellyfin:
     image: jellyfin/jellyfin:latest
     container_name: jellyfin
     restart: unless-stopped
-    user: "1000:1000"
+    user: "65534:65534"
     depends_on:
       - rclone
     ports:
       - "8096:8096"
-    environment:
-      - JELLYFIN_PublishedServerUrl=http://localhost:8096
     volumes:
       - jellyfin-config:/config
       - jellyfin-cache:/cache
-      - jellyfin-media:/media:ro
+      - ./rclone:/media:ro
     devices:
       - /dev/dri:/dev/dri  # Optional: for hardware transcoding
 
 volumes:
-  jellyfin-media: {}
   jellyfin-cache: {}
   jellyfin-config: {}

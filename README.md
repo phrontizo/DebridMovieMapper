@@ -8,7 +8,10 @@ I created this project as:
 
 I use Debrid Media Manager for keeping Real Debrid populated at the moment, but am thinking of incorporating that into this service as well.
 
+Note that this is still a work in progress and is provided as-is for educational purposes only.
+
 Future work:
+* Test with Kodi 
 * Add a web-ui to track progress and correct mismatches
 * Automatically populate Read Debrid with watchlist content from Trakt and newly released episodes from already tracked shows
 
@@ -18,7 +21,7 @@ This was 100% vibe coded using a mix of Claude and Junie as further AI experimen
 - **Media Identification**: Automatically identifies movies and TV shows using TMDB metadata based on torrent filenames.
 - **Jellyfin/Plex Structure**: Organizes your library into a clean `Movies/` and `Shows/` directory structure.
 - **Season Grouping**: Automatically groups TV show episodes into `Season XX` folders.
-- **WebDAV Streaming**: Provides a standard WebDAV endpoint (port 8080) for direct streaming without downloading.
+- **WebDAV Endpoint**: Exposes a WebDAV server (port 8080) serving `.strm` files that point to Real-Debrid download URLs. Mount via rclone for use with Jellyfin/Plex.
 - **On-Demand Repair**: Detects broken links at playback time (503 from Real-Debrid) and automatically re-downloads the torrent via its magnet link without user intervention.
 - **Persistent Cache**: Uses an embedded database (`redb`) to cache media identifications, reducing API calls and speeding up restarts.
 - **Configurable Scan Interval**: Customizable scan interval via environment variable.
@@ -49,14 +52,14 @@ JELLYFIN_RCLONE_MOUNT_PATH=/media
 
 ### Environment Variables
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `RD_API_TOKEN` | Yes | - | Your Real-Debrid API token |
-| `TMDB_API_KEY` | Yes | - | Your TMDB (The Movie Database) API key |
-| `SCAN_INTERVAL_SECS` | No | 60 | Interval between torrent library scans (runs immediately on startup) |
-| `JELLYFIN_URL` | No | - | Jellyfin server URL for library update notifications |
-| `JELLYFIN_API_KEY` | No | - | Jellyfin API key for authentication |
-| `JELLYFIN_RCLONE_MOUNT_PATH` | No | - | rclone mount path as seen by Jellyfin (e.g. `/media`) |
+| Variable                     | Required | Default | Description                                                          |
+|------------------------------|----------|---------|----------------------------------------------------------------------|
+| `RD_API_TOKEN`               | Yes      | -       | Your Real-Debrid API token                                           |
+| `TMDB_API_KEY`               | Yes      | -       | Your TMDB (The Movie Database) API key                               |
+| `SCAN_INTERVAL_SECS`         | No       | 60      | Interval between torrent library scans (runs immediately on startup) |
+| `JELLYFIN_URL`               | No       | -       | Jellyfin server URL for library update notifications                 |
+| `JELLYFIN_API_KEY`           | No       | -       | Jellyfin API key for authentication                                  |
+| `JELLYFIN_RCLONE_MOUNT_PATH` | No       | -       | rclone mount path as seen by Jellyfin (e.g. `/media`)                |
 
 ## Running with Docker
 
@@ -115,9 +118,10 @@ vendor = other
 
 ### Setup Steps
 
-1. Create required files:
+1. Create required files and directories:
    ```bash
    touch metadata.db rclone.conf
+   mkdir -p rclone && chown 65534:65534 rclone
    ```
 
 2. Add your Real-Debrid and TMDB credentials to the `compose.yml` file
@@ -131,24 +135,24 @@ vendor = other
 
 5. Access Jellyfin at `http://localhost:8096` and add `/media` as a library path
 
+6. (Optional) To enable instant library updates, set `JELLYFIN_API_KEY` in `compose.yml` to your Jellyfin API key
+
 ### Notes
 
-- The WebDAV server runs on port 8080 and is accessible within the Docker network
-- rclone mounts the WebDAV endpoint to `/mnt/debrid` with minimal caching
-- Jellyfin reads from `/media` which is bind-mounted from rclone
+- The WebDAV server runs on port 8080 internally (mapped to 8082 on the host)
+- rclone mounts the WebDAV endpoint to `./rclone` on the host via a bind mount
+- Jellyfin reads from `/media` which is bind-mounted from `./rclone`
 - Files appear as `.strm` files containing Real-Debrid download URLs
 - Jellyfin will stream directly from Real-Debrid when playing content
 
 ## Usage
 
-Once running, the WebDAV server will be available at `http://localhost:8080`.
+Once running, the WebDAV server will be available at `http://localhost:8080`. Mount it with rclone and point your media server at the mount:
 
-You can add this URL as a network drive in your OS or directly as a WebDAV source in media players like:
-- **Infuse** (iOS/tvOS/macOS)
-- **VLC**
-- **Kodi**
 - **Jellyfin** (via rclone mount - see Docker Compose example above)
 - **Plex** (via rclone mount)
+- **Kodi**
+- **Infuse** (iOS/tvOS/macOS)
 
 ## Technical Details
 
