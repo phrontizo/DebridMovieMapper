@@ -370,6 +370,143 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Diff two VFS trees and return the list of changed paths at the deepest
+/// meaningful level (e.g. season folder for a new episode, movie folder for
+/// a new movie).
+///
+/// Changes are reported at the directory level, never at the individual file
+/// level. When leaf nodes (StrmFile, VirtualFile) inside a directory change,
+/// the directory itself is reported as Modified.
+pub fn diff_trees(old: &VfsNode, new: &VfsNode, prefix: &str) -> Vec<VfsChange> {
+    let mut changes = Vec::new();
+
+    let (old_children, new_children) = match (old, new) {
+        (VfsNode::Directory { children: old_c }, VfsNode::Directory { children: new_c }) => {
+            (old_c, new_c)
+        }
+        // Both are the same leaf — compare for equality
+        (a, b) if a == b => return changes,
+        // Both are leaves but different — parent will report this
+        _ => return changes,
+    };
+
+    // Track whether any non-directory (leaf) children changed. If so, we
+    // report this directory as the change point rather than individual files.
+    let mut has_leaf_changes = false;
+
+    for (name, old_child) in old_children {
+        let child_path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", prefix, name)
+        };
+
+        match new_children.get(name) {
+            None => {
+                match old_child {
+                    VfsNode::Directory { .. } => {
+                        // A child directory was removed — report it as deleted
+                        changes.push(VfsChange {
+                            path: child_path,
+                            update_type: UpdateType::Deleted,
+                        });
+                    }
+                    _ => {
+                        // A leaf was removed — flag for parent-level reporting
+                        has_leaf_changes = true;
+                    }
+                }
+            }
+            Some(new_child) => {
+                match (old_child, new_child) {
+                    (VfsNode::Directory { .. }, VfsNode::Directory { .. }) => {
+                        // Both directories — recurse
+                        let sub = diff_trees(old_child, new_child, &child_path);
+                        if sub.is_empty() && old_child != new_child {
+                            // Children differ but recursion found no deeper change point
+                            // — this directory itself is the change point
+                            changes.push(VfsChange {
+                                path: child_path,
+                                update_type: UpdateType::Modified,
+                            });
+                        } else {
+                            changes.extend(sub);
+                        }
+                    }
+                    (a, b) if a != b => {
+                        // Leaf node changed — flag for parent-level reporting
+                        has_leaf_changes = true;
+                    }
+                    _ => {
+                        // Identical leaf nodes — no change
+                    }
+                }
+            }
+        }
+    }
+
+    // Check for new children
+    for (name, new_child) in new_children {
+        if !old_children.contains_key(name) {
+            let child_path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", prefix, name)
+            };
+
+            match new_child {
+                VfsNode::Directory { children } => {
+                    // A new child directory — report the deepest new directory
+                    let deepest = find_deepest_new_dir(&child_path, children);
+                    changes.push(VfsChange {
+                        path: deepest,
+                        update_type: UpdateType::Created,
+                    });
+                }
+                _ => {
+                    // A new leaf was added — flag for parent-level reporting
+                    has_leaf_changes = true;
+                }
+            }
+        }
+    }
+
+    // If any leaf-level changes occurred, report this directory as modified.
+    // But only if we have a prefix (i.e., we're not at the root level).
+    if has_leaf_changes && !prefix.is_empty() {
+        changes.push(VfsChange {
+            path: prefix.to_string(),
+            update_type: UpdateType::Modified,
+        });
+    }
+
+    changes
+}
+
+/// Walk down a newly created directory tree to find the deepest directory.
+/// For "Shows/Breaking Bad/Season 01/S01E01.strm", returns "Shows/Breaking Bad/Season 01".
+fn find_deepest_new_dir(path: &str, children: &BTreeMap<String, VfsNode>) -> String {
+    // If all children are leaves (files), this is the deepest directory
+    let dir_children: Vec<(&String, &BTreeMap<String, VfsNode>)> = children
+        .iter()
+        .filter_map(|(name, node)| {
+            if let VfsNode::Directory { children: c } = node {
+                Some((name, c))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if dir_children.len() == 1 {
+        let (name, sub_children) = dir_children[0];
+        let sub_path = format!("{}/{}", path, name);
+        find_deepest_new_dir(&sub_path, sub_children)
+    } else {
+        path.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,5 +807,252 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn diff_trees_identical_trees_no_changes() {
+        let old = VfsNode::Directory {
+            children: BTreeMap::from([
+                ("Movies".to_string(), VfsNode::Directory {
+                    children: BTreeMap::from([
+                        ("Inception".to_string(), VfsNode::Directory {
+                            children: BTreeMap::from([
+                                ("Inception.strm".to_string(), VfsNode::StrmFile {
+                                    strm_content: vec![],
+                                    rd_link: "http://link1".to_string(),
+                                    rd_torrent_id: "t1".to_string(),
+                                }),
+                            ]),
+                        }),
+                    ]),
+                }),
+            ]),
+        };
+        let changes = diff_trees(&old, &old, "");
+        assert!(changes.is_empty(), "Identical trees should produce no changes");
+    }
+
+    #[test]
+    fn diff_trees_new_directory_created() {
+        let old = VfsNode::Directory {
+            children: BTreeMap::from([
+                ("Shows".to_string(), VfsNode::Directory { children: BTreeMap::new() }),
+            ]),
+        };
+        let new = VfsNode::Directory {
+            children: BTreeMap::from([
+                ("Shows".to_string(), VfsNode::Directory {
+                    children: BTreeMap::from([
+                        ("Breaking Bad".to_string(), VfsNode::Directory {
+                            children: BTreeMap::from([
+                                ("Season 01".to_string(), VfsNode::Directory {
+                                    children: BTreeMap::from([
+                                        ("S01E01.strm".to_string(), VfsNode::StrmFile {
+                                            strm_content: vec![],
+                                            rd_link: "http://link".to_string(),
+                                            rd_torrent_id: "t1".to_string(),
+                                        }),
+                                    ]),
+                                }),
+                            ]),
+                        }),
+                    ]),
+                }),
+            ]),
+        };
+        let changes = diff_trees(&old, &new, "");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "Shows/Breaking Bad/Season 01");
+        assert_eq!(changes[0].update_type, UpdateType::Created);
+    }
+
+    #[test]
+    fn diff_trees_directory_deleted() {
+        let old = VfsNode::Directory {
+            children: BTreeMap::from([
+                ("Movies".to_string(), VfsNode::Directory {
+                    children: BTreeMap::from([
+                        ("Inception".to_string(), VfsNode::Directory {
+                            children: BTreeMap::from([
+                                ("Inception.strm".to_string(), VfsNode::StrmFile {
+                                    strm_content: vec![],
+                                    rd_link: "http://link".to_string(),
+                                    rd_torrent_id: "t1".to_string(),
+                                }),
+                            ]),
+                        }),
+                    ]),
+                }),
+            ]),
+        };
+        let new = VfsNode::Directory {
+            children: BTreeMap::from([
+                ("Movies".to_string(), VfsNode::Directory { children: BTreeMap::new() }),
+            ]),
+        };
+        let changes = diff_trees(&old, &new, "");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "Movies/Inception");
+        assert_eq!(changes[0].update_type, UpdateType::Deleted);
+    }
+
+    #[test]
+    fn diff_trees_file_modified() {
+        let old = VfsNode::Directory {
+            children: BTreeMap::from([
+                ("Movies".to_string(), VfsNode::Directory {
+                    children: BTreeMap::from([
+                        ("Inception".to_string(), VfsNode::Directory {
+                            children: BTreeMap::from([
+                                ("Inception.strm".to_string(), VfsNode::StrmFile {
+                                    strm_content: vec![],
+                                    rd_link: "http://old-link".to_string(),
+                                    rd_torrent_id: "t1".to_string(),
+                                }),
+                            ]),
+                        }),
+                    ]),
+                }),
+            ]),
+        };
+        let new = VfsNode::Directory {
+            children: BTreeMap::from([
+                ("Movies".to_string(), VfsNode::Directory {
+                    children: BTreeMap::from([
+                        ("Inception".to_string(), VfsNode::Directory {
+                            children: BTreeMap::from([
+                                ("Inception.strm".to_string(), VfsNode::StrmFile {
+                                    strm_content: vec![],
+                                    rd_link: "http://new-link".to_string(),
+                                    rd_torrent_id: "t2".to_string(),
+                                }),
+                            ]),
+                        }),
+                    ]),
+                }),
+            ]),
+        };
+        let changes = diff_trees(&old, &new, "");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "Movies/Inception");
+        assert_eq!(changes[0].update_type, UpdateType::Modified);
+    }
+
+    #[test]
+    fn diff_trees_new_episode_in_existing_show() {
+        let old = VfsNode::Directory {
+            children: BTreeMap::from([
+                ("Shows".to_string(), VfsNode::Directory {
+                    children: BTreeMap::from([
+                        ("Breaking Bad".to_string(), VfsNode::Directory {
+                            children: BTreeMap::from([
+                                ("Season 01".to_string(), VfsNode::Directory {
+                                    children: BTreeMap::from([
+                                        ("S01E01.strm".to_string(), VfsNode::StrmFile {
+                                            strm_content: vec![],
+                                            rd_link: "http://link1".to_string(),
+                                            rd_torrent_id: "t1".to_string(),
+                                        }),
+                                    ]),
+                                }),
+                            ]),
+                        }),
+                    ]),
+                }),
+            ]),
+        };
+        let new = VfsNode::Directory {
+            children: BTreeMap::from([
+                ("Shows".to_string(), VfsNode::Directory {
+                    children: BTreeMap::from([
+                        ("Breaking Bad".to_string(), VfsNode::Directory {
+                            children: BTreeMap::from([
+                                ("Season 01".to_string(), VfsNode::Directory {
+                                    children: BTreeMap::from([
+                                        ("S01E01.strm".to_string(), VfsNode::StrmFile {
+                                            strm_content: vec![],
+                                            rd_link: "http://link1".to_string(),
+                                            rd_torrent_id: "t1".to_string(),
+                                        }),
+                                        ("S01E02.strm".to_string(), VfsNode::StrmFile {
+                                            strm_content: vec![],
+                                            rd_link: "http://link2".to_string(),
+                                            rd_torrent_id: "t2".to_string(),
+                                        }),
+                                    ]),
+                                }),
+                            ]),
+                        }),
+                    ]),
+                }),
+            ]),
+        };
+        let changes = diff_trees(&old, &new, "");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "Shows/Breaking Bad/Season 01");
+        assert_eq!(changes[0].update_type, UpdateType::Modified);
+    }
+
+    #[test]
+    fn diff_trees_multiple_changes() {
+        let old = VfsNode::Directory {
+            children: BTreeMap::from([
+                ("Movies".to_string(), VfsNode::Directory {
+                    children: BTreeMap::from([
+                        ("Old Movie".to_string(), VfsNode::Directory {
+                            children: BTreeMap::from([
+                                ("old.strm".to_string(), VfsNode::StrmFile {
+                                    strm_content: vec![],
+                                    rd_link: "http://old".to_string(),
+                                    rd_torrent_id: "t1".to_string(),
+                                }),
+                            ]),
+                        }),
+                    ]),
+                }),
+                ("Shows".to_string(), VfsNode::Directory { children: BTreeMap::new() }),
+            ]),
+        };
+        let new = VfsNode::Directory {
+            children: BTreeMap::from([
+                ("Movies".to_string(), VfsNode::Directory {
+                    children: BTreeMap::from([
+                        ("New Movie".to_string(), VfsNode::Directory {
+                            children: BTreeMap::from([
+                                ("new.strm".to_string(), VfsNode::StrmFile {
+                                    strm_content: vec![],
+                                    rd_link: "http://new".to_string(),
+                                    rd_torrent_id: "t2".to_string(),
+                                }),
+                            ]),
+                        }),
+                    ]),
+                }),
+                ("Shows".to_string(), VfsNode::Directory {
+                    children: BTreeMap::from([
+                        ("New Show".to_string(), VfsNode::Directory {
+                            children: BTreeMap::from([
+                                ("Season 01".to_string(), VfsNode::Directory {
+                                    children: BTreeMap::from([
+                                        ("S01E01.strm".to_string(), VfsNode::StrmFile {
+                                            strm_content: vec![],
+                                            rd_link: "http://ep".to_string(),
+                                            rd_torrent_id: "t3".to_string(),
+                                        }),
+                                    ]),
+                                }),
+                            ]),
+                        }),
+                    ]),
+                }),
+            ]),
+        };
+        let changes = diff_trees(&old, &new, "");
+        // Old Movie deleted, New Movie created, New Show/Season 01 created
+        assert_eq!(changes.len(), 3);
+        let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+        assert!(paths.contains(&"Movies/Old Movie"));
+        assert!(paths.contains(&"Movies/New Movie"));
+        assert!(paths.contains(&"Shows/New Show/Season 01"));
     }
 }
