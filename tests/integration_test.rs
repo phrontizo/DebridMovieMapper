@@ -301,6 +301,69 @@ async fn test_vfs_completeness() {
     }
 }
 
+/// Test 4: VFS timestamps are populated from RD data and stable across rebuilds.
+#[tokio::test]
+#[ignore]
+async fn test_vfs_timestamps_stable() {
+    let (_, data) = get_shared_data().await;
+    assert!(!data.is_empty(), "Need identified torrents to test timestamps");
+
+    let vfs1 = DebridVfs::build(data.clone());
+    let vfs2 = DebridVfs::build(data.clone());
+
+    // Timestamps should be populated
+    assert!(
+        !vfs1.timestamps.is_empty(),
+        "VFS timestamps should be populated from RD data"
+    );
+
+    // Every directory and file in the tree should have a timestamp
+    let mut paths = Vec::new();
+    collect_paths(&vfs1.root, "", &mut paths);
+    for path in &paths {
+        assert!(
+            vfs1.timestamps.contains_key(path),
+            "Missing timestamp for path: {}",
+            path
+        );
+    }
+
+    // Timestamps should be identical across two builds of the same data
+    assert_eq!(
+        vfs1.timestamps, vfs2.timestamps,
+        "Timestamps must be stable across VFS rebuilds"
+    );
+
+    // No timestamp should be UNIX_EPOCH (all RD torrents have a valid added date)
+    let epoch = std::time::UNIX_EPOCH;
+    for (path, ts) in &vfs1.timestamps {
+        assert_ne!(
+            *ts, epoch,
+            "Timestamp for '{}' should not be UNIX_EPOCH — RD added date not parsed?",
+            path
+        );
+    }
+
+    println!("\n=== VFS Timestamps ===");
+    println!("Total paths with timestamps: {}", vfs1.timestamps.len());
+    println!("All timestamps stable across rebuilds: ✓");
+    println!("No UNIX_EPOCH fallbacks: ✓");
+}
+
+fn collect_paths(node: &VfsNode, prefix: &str, paths: &mut Vec<String>) {
+    if let VfsNode::Directory { children } = node {
+        for (name, child) in children {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", prefix, name)
+            };
+            paths.push(path.clone());
+            collect_paths(child, &path, paths);
+        }
+    }
+}
+
 fn collect_links(node: &VfsNode, links: &mut std::collections::HashSet<String>) {
     match node {
         VfsNode::Directory { children } => {

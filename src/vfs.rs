@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
+use std::time::{SystemTime, Duration, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use crate::rd_client::TorrentInfo;
 use regex::Regex;
@@ -34,6 +35,56 @@ fn is_archive_part(path: &str) -> bool {
 fn is_archive_file(path: &str) -> bool {
     let lower = path.to_lowercase();
     ARCHIVE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) || is_archive_part(&lower)
+}
+
+/// Parse a Real-Debrid date string into SystemTime.
+/// Handles "YYYY-MM-DDTHH:mm:ss.sssZ" (JS toJSON) and "YYYY-MM-DD".
+/// Falls back to UNIX_EPOCH on parse failure.
+pub fn parse_rd_date(s: &str) -> SystemTime {
+    fn days_from_ymd(y: u64, m: u64, d: u64) -> Option<u64> {
+        // Days from year 0 to year y (Gregorian)
+        let is_leap = |yr: u64| yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0);
+        let days_before_month: [u64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+        if m < 1 || m > 12 || d < 1 || d > 31 { return None; }
+        // Days from 1970-01-01 to y-m-d
+        let mut total: i64 = 0;
+        // Years
+        for yr in 1970..y {
+            total += if is_leap(yr) { 366 } else { 365 };
+        }
+        for yr in y..1970 {
+            total -= if is_leap(yr) { 366 } else { 365 };
+        }
+        total += days_before_month[(m - 1) as usize] as i64;
+        if m > 2 && is_leap(y) { total += 1; }
+        total += (d - 1) as i64;
+        if total < 0 { return None; }
+        Some(total as u64)
+    }
+
+    let parse = || -> Option<SystemTime> {
+        let date_part = s.split('T').next()?;
+        let mut parts = date_part.split('-');
+        let y: u64 = parts.next()?.parse().ok()?;
+        let m: u64 = parts.next()?.parse().ok()?;
+        let d: u64 = parts.next()?.parse().ok()?;
+        let mut secs = days_from_ymd(y, m, d)? * 86400;
+
+        // Parse time if present: "HH:mm:ss" or "HH:mm:ss.sss"
+        if let Some(time_part) = s.split('T').nth(1) {
+            let time_str = time_part.trim_end_matches('Z');
+            let mut time_parts = time_str.split(':');
+            let h: u64 = time_parts.next()?.parse().ok()?;
+            let min: u64 = time_parts.next()?.parse().ok()?;
+            let sec_str = time_parts.next().unwrap_or("0");
+            let sec: u64 = sec_str.split('.').next()?.parse().ok()?;
+            secs += h * 3600 + min * 60 + sec;
+        }
+
+        Some(UNIX_EPOCH + Duration::from_secs(secs))
+    };
+
+    parse().unwrap_or(UNIX_EPOCH)
 }
 
 static SEASON_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -87,7 +138,7 @@ pub struct MediaMetadata {
 
 pub struct DebridVfs {
     pub root: VfsNode,
-    pub created_at: std::time::SystemTime,
+    pub timestamps: HashMap<String, SystemTime>,
 }
 
 impl Default for DebridVfs {
@@ -110,13 +161,14 @@ impl DebridVfs {
             root: VfsNode::Directory {
                 children,
             },
-            created_at: std::time::SystemTime::now(),
+            timestamps: HashMap::new(),
         }
     }
 
     pub fn build(torrents: Vec<(TorrentInfo, MediaMetadata)>) -> Self {
         let mut movies_nodes = BTreeMap::new();
         let mut shows_nodes = BTreeMap::new();
+        let mut timestamps: HashMap<String, SystemTime> = HashMap::new();
 
         // Group torrents by media (using title, year, type, and external ID)
         let mut media_groups: HashMap<MediaMetadata, Vec<TorrentInfo>> = HashMap::new();
@@ -184,24 +236,34 @@ impl DebridVfs {
                     let mut children = BTreeMap::new();
                     // For movies, only take the largest torrent to avoid duplicates
                     if let Some(torrent) = torrents.first() {
+                        let torrent_ts = parse_rd_date(&torrent.added);
                         Self::add_torrent_files(&mut children, torrent, None);
-                    }
-                    if !children.is_empty() {
-                        let nfo_content = Self::generate_nfo(&metadata);
-                        children.insert("movie.nfo".to_string(), VfsNode::VirtualFile {
-                            content: nfo_content,
-                        });
-                        nodes.insert(folder_name, VfsNode::Directory {
-                            children,
-                        });
+                        if !children.is_empty() {
+                            let prefix = format!("Movies/{}", folder_name);
+                            for name in children.keys() {
+                                timestamps.insert(format!("{}/{}", prefix, name), torrent_ts);
+                            }
+                            let nfo_content = Self::generate_nfo(&metadata);
+                            children.insert("movie.nfo".to_string(), VfsNode::VirtualFile {
+                                content: nfo_content,
+                            });
+                            timestamps.insert(format!("{}/movie.nfo", prefix), torrent_ts);
+                            nodes.insert(folder_name, VfsNode::Directory {
+                                children,
+                            });
+                        }
                     }
                 }
                 MediaType::Show => {
                     let mut show_children = BTreeMap::new();
+                    let show_prefix = format!("Shows/{}", folder_name);
+                    let mut show_max_ts = UNIX_EPOCH;
 
                     // For shows, we process all torrents (e.g. different seasons)
                     // They are already sorted by size, so larger files will overwrite smaller ones if paths match
                     for torrent in torrents {
+                        let torrent_ts = parse_rd_date(&torrent.added);
+                        if torrent_ts > show_max_ts { show_max_ts = torrent_ts; }
                         let selected_count = torrent.files.iter().filter(|f| f.selected == 1).count();
                         if selected_count != torrent.links.len() {
                             tracing::warn!(
@@ -228,7 +290,8 @@ impl DebridVfs {
                                         });
 
                                         if let VfsNode::Directory { children: season_children } = season_dir {
-                                            Self::add_path_to_tree(season_children, filename, file.bytes, torrent.id.clone(), link.clone());
+                                            let strm_name = Self::add_path_to_tree(season_children, filename, file.bytes, torrent.id.clone(), link.clone());
+                                            timestamps.insert(format!("{}/{}/{}", show_prefix, season_name, strm_name), torrent_ts);
                                         }
                                     }
                                 }
@@ -241,6 +304,7 @@ impl DebridVfs {
                         show_children.insert("tvshow.nfo".to_string(), VfsNode::VirtualFile {
                             content: nfo_content,
                         });
+                        timestamps.insert(format!("{}/tvshow.nfo", show_prefix), show_max_ts);
                         nodes.insert(folder_name, VfsNode::Directory {
                             children: show_children,
                         });
@@ -256,9 +320,37 @@ impl DebridVfs {
         root_children.insert("Shows".to_string(), VfsNode::Directory {
             children: shows_nodes,
         });
-        Self {
-            root: VfsNode::Directory { children: root_children },
-            created_at: std::time::SystemTime::now(),
+        let root = VfsNode::Directory { children: root_children };
+
+        // Compute directory timestamps bottom-up (max of children)
+        Self::compute_dir_timestamps(&root, "", &mut timestamps);
+
+        Self { root, timestamps }
+    }
+
+    /// Walk the tree and insert directory timestamps as the max of their children.
+    fn compute_dir_timestamps(node: &VfsNode, prefix: &str, timestamps: &mut HashMap<String, SystemTime>) -> SystemTime {
+        match node {
+            VfsNode::Directory { children } => {
+                let mut max_ts = UNIX_EPOCH;
+                for (name, child) in children {
+                    let child_path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", prefix, name)
+                    };
+                    let child_ts = Self::compute_dir_timestamps(child, &child_path, timestamps);
+                    if child_ts > max_ts { max_ts = child_ts; }
+                }
+                if !prefix.is_empty() && max_ts > UNIX_EPOCH {
+                    timestamps.insert(prefix.to_string(), max_ts);
+                }
+                max_ts
+            }
+            _ => {
+                // Leaf node — timestamp should already be in the map
+                timestamps.get(prefix).copied().unwrap_or(UNIX_EPOCH)
+            }
         }
     }
 
@@ -338,7 +430,8 @@ impl DebridVfs {
         }
     }
 
-    fn add_path_to_tree(root: &mut BTreeMap<String, VfsNode>, path: &str, _size: u64, torrent_id: String, link: String) {
+    /// Insert a video file into the tree as a .strm node. Returns the final strm filename.
+    fn add_path_to_tree(root: &mut BTreeMap<String, VfsNode>, path: &str, _size: u64, torrent_id: String, link: String) -> String {
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         let mut current_children = root;
 
@@ -369,11 +462,13 @@ impl DebridVfs {
                 let mut strm_content = format!("{}\n", link).into_bytes();
                 strm_content.resize(STRM_FIXED_SIZE, b' ');
 
+                let ret = final_name.clone();
                 current_children.insert(final_name, VfsNode::StrmFile {
                     strm_content,
                     rd_link: link.clone(),
                     rd_torrent_id: torrent_id.clone(),
                 });
+                return ret;
             } else {
                 let entry = current_children.entry(part).or_insert_with(|| VfsNode::Directory {
                     children: BTreeMap::new(),
@@ -382,10 +477,11 @@ impl DebridVfs {
                     current_children = children;
                 } else {
                     // This should not happen if paths are consistent
-                    return;
+                    return String::new();
                 }
             }
         }
+        String::new()
     }
 }
 
@@ -921,6 +1017,88 @@ mod tests {
     }
 
     #[test]
+    fn build_stores_per_path_timestamps() {
+        let torrents = vec![
+            (
+                TorrentInfo {
+                    id: "1".to_string(),
+                    filename: "Movie.2023.1080p.mkv".to_string(),
+                    original_filename: "Movie.2023.1080p.mkv".to_string(),
+                    hash: "".to_string(),
+                    bytes: 1000,
+                    original_bytes: 1000,
+                    host: "".to_string(),
+                    split: 1,
+                    progress: 100.0,
+                    status: "downloaded".to_string(),
+                    added: "2023-06-15T14:30:45.000Z".to_string(),
+                    files: vec![TorrentFile {
+                        id: 1,
+                        path: "/Movie.2023.1080p.mkv".to_string(),
+                        bytes: 1000,
+                        selected: 1,
+                    }],
+                    links: vec!["http://link1".to_string()],
+                    ended: None,
+                },
+                MediaMetadata {
+                    title: "Movie".to_string(),
+                    year: Some("2023".to_string()),
+                    media_type: MediaType::Movie,
+                    external_id: None,
+                },
+            ),
+            (
+                TorrentInfo {
+                    id: "2".to_string(),
+                    filename: "Show.S01E01.mkv".to_string(),
+                    original_filename: "Show.S01E01.mkv".to_string(),
+                    hash: "".to_string(),
+                    bytes: 500,
+                    original_bytes: 500,
+                    host: "".to_string(),
+                    split: 1,
+                    progress: 100.0,
+                    status: "downloaded".to_string(),
+                    added: "2024-03-10T08:00:00.000Z".to_string(),
+                    files: vec![TorrentFile {
+                        id: 1,
+                        path: "/Show.S01E01.mkv".to_string(),
+                        bytes: 500,
+                        selected: 1,
+                    }],
+                    links: vec!["http://link2".to_string()],
+                    ended: None,
+                },
+                MediaMetadata {
+                    title: "Show".to_string(),
+                    year: Some("2024".to_string()),
+                    media_type: MediaType::Show,
+                    external_id: None,
+                },
+            ),
+        ];
+
+        let vfs = DebridVfs::build(torrents);
+        let movie_ts = parse_rd_date("2023-06-15T14:30:45.000Z");
+        let show_ts = parse_rd_date("2024-03-10T08:00:00.000Z");
+
+        // Leaf files get the torrent's added timestamp
+        assert_eq!(vfs.timestamps.get("Movies/Movie/Movie.2023.1080p.strm"), Some(&movie_ts));
+        assert_eq!(vfs.timestamps.get("Movies/Movie/movie.nfo"), Some(&movie_ts));
+        assert_eq!(vfs.timestamps.get("Shows/Show/Season 01/Show.S01E01.strm"), Some(&show_ts));
+        assert_eq!(vfs.timestamps.get("Shows/Show/tvshow.nfo"), Some(&show_ts));
+
+        // Directories get the max timestamp of their children
+        assert_eq!(vfs.timestamps.get("Movies/Movie"), Some(&movie_ts));
+        assert_eq!(vfs.timestamps.get("Shows/Show/Season 01"), Some(&show_ts));
+        assert_eq!(vfs.timestamps.get("Shows/Show"), Some(&show_ts));
+        // Root-level dirs get max of all their children
+        assert_eq!(vfs.timestamps.get("Movies"), Some(&movie_ts));
+        assert_eq!(vfs.timestamps.get("Shows"), Some(&show_ts));
+    }
+
+    #[test]
     fn diff_trees_identical_trees_no_changes() {
         let old = VfsNode::Directory {
             children: BTreeMap::from([
@@ -1102,6 +1280,29 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, "Shows/Breaking Bad/Season 01");
         assert_eq!(changes[0].update_type, UpdateType::Modified);
+    }
+
+    #[test]
+    fn parse_rd_date_full_iso() {
+        // RD returns "YYYY-MM-DDTHH:mm:ss.sssZ" (JavaScript toJSON format)
+        let ts = parse_rd_date("2023-06-15T14:30:45.000Z");
+        // 2023-06-15T14:30:45Z = 1686839445 seconds since UNIX_EPOCH
+        let expected = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1686839445);
+        assert_eq!(ts, expected);
+    }
+
+    #[test]
+    fn parse_rd_date_date_only() {
+        // Test data uses "YYYY-MM-DD"
+        let ts = parse_rd_date("2023-01-01");
+        let expected = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1672531200);
+        assert_eq!(ts, expected);
+    }
+
+    #[test]
+    fn parse_rd_date_invalid_falls_back() {
+        let ts = parse_rd_date("not-a-date");
+        assert_eq!(ts, std::time::UNIX_EPOCH);
     }
 
     #[test]

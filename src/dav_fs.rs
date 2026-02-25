@@ -7,7 +7,7 @@ use crate::vfs::{DebridVfs, VfsNode, STRM_FIXED_SIZE};
 use crate::rd_client::RealDebridClient;
 use crate::repair::RepairManager;
 use bytes::Bytes;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 pub struct DebridFileSystem {
@@ -89,10 +89,16 @@ impl DavFileSystem for DebridFileSystem {
         async move {
             let vfs = self.vfs.read().await;
             let node = Self::find_node_in(&vfs, path).ok_or(FsError::NotFound)?;
-            let modified_time = vfs.created_at;
+            let path_str = path.as_rel_ospath().to_str().unwrap_or("").trim_matches('/').trim_start_matches("./");
             if let VfsNode::Directory { children } = node {
                 let mut entries: Vec<Box<dyn DavDirEntry>> = Vec::new();
                 for (name, child) in children {
+                    let child_path = if path_str.is_empty() || path_str == "." {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", path_str, name)
+                    };
+                    let modified_time = vfs.timestamps.get(&child_path).copied().unwrap_or(UNIX_EPOCH);
                     entries.push(Box::new(DebridDirEntry {
                         name,
                         node: child.clone(),
@@ -111,7 +117,9 @@ impl DavFileSystem for DebridFileSystem {
         async move {
             let vfs = self.vfs.read().await;
             let node = Self::find_node_in(&vfs, path).ok_or(FsError::NotFound)?;
-            Ok(Box::new(DebridMetaData { node, modified_time: vfs.created_at }) as Box<dyn DavMetaData>)
+            let path_str = path.as_rel_ospath().to_str().unwrap_or("").trim_matches('/').trim_start_matches("./");
+            let modified_time = vfs.timestamps.get(path_str).copied().unwrap_or(UNIX_EPOCH);
+            Ok(Box::new(DebridMetaData { node, modified_time }) as Box<dyn DavMetaData>)
         }.boxed()
     }
 }
