@@ -1,0 +1,173 @@
+use crate::vfs::{VfsChange, UpdateType};
+use tracing::info;
+
+pub struct JellyfinClient {
+    url: String,
+    api_key: String,
+    mount_path: String,
+    http: reqwest::Client,
+}
+
+impl JellyfinClient {
+    pub fn new(url: String, api_key: String, mount_path: String) -> Self {
+        Self {
+            url: url.trim_end_matches('/').to_string(),
+            api_key,
+            mount_path: mount_path.trim_end_matches('/').to_string(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    fn build_request_body(&self, changes: &[VfsChange]) -> serde_json::Value {
+        let updates: Vec<serde_json::Value> = changes
+            .iter()
+            .map(|change| {
+                let full_path = format!("{}/{}", self.mount_path, change.path);
+                let update_type = match change.update_type {
+                    UpdateType::Created => "Created",
+                    UpdateType::Modified => "Modified",
+                    UpdateType::Deleted => "Deleted",
+                };
+                serde_json::json!({
+                    "Path": full_path,
+                    "UpdateType": update_type
+                })
+            })
+            .collect();
+
+        serde_json::json!({ "Updates": updates })
+    }
+
+    pub async fn notify_changes(&self, changes: &[VfsChange]) {
+        if changes.is_empty() {
+            return;
+        }
+
+        let body = self.build_request_body(changes);
+        let url = format!("{}/Library/Media/Updated", self.url);
+
+        info!(
+            "Notifying Jellyfin of {} change(s): {}",
+            changes.len(),
+            changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>().join(", ")
+        );
+
+        match self.http
+            .post(&url)
+            .header("X-Emby-Token", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                if response.status().is_success() {
+                    info!("Jellyfin notified successfully");
+                } else {
+                    tracing::warn!(
+                        "Jellyfin notification returned status {}: {}",
+                        response.status(),
+                        response.text().await.unwrap_or_default()
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to notify Jellyfin: {}", e);
+            }
+        }
+    }
+
+    /// Try to create a JellyfinClient from environment variables.
+    /// Returns None if any of the required env vars are missing.
+    pub fn from_env() -> Option<Self> {
+        let url = std::env::var("JELLYFIN_URL").ok()?;
+        let api_key = std::env::var("JELLYFIN_API_KEY").ok()?;
+        let mount_path = std::env::var("JELLYFIN_RCLONE_MOUNT_PATH").ok()?;
+
+        if url.is_empty() || api_key.is_empty() || mount_path.is_empty() {
+            return None;
+        }
+
+        Some(Self::new(url, api_key, mount_path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_request_body_single_created() {
+        let client = JellyfinClient::new(
+            "http://jellyfin:8096".to_string(),
+            "test-key".to_string(),
+            "/mnt/debrid".to_string(),
+        );
+        let changes = vec![VfsChange {
+            path: "Shows/Breaking Bad/Season 03".to_string(),
+            update_type: UpdateType::Created,
+        }];
+        let body = client.build_request_body(&changes);
+        let updates = body["Updates"].as_array().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["Path"], "/mnt/debrid/Shows/Breaking Bad/Season 03");
+        assert_eq!(updates[0]["UpdateType"], "Created");
+    }
+
+    #[test]
+    fn build_request_body_multiple_changes() {
+        let client = JellyfinClient::new(
+            "http://jellyfin:8096".to_string(),
+            "test-key".to_string(),
+            "/mnt/debrid".to_string(),
+        );
+        let changes = vec![
+            VfsChange {
+                path: "Movies/Old Movie".to_string(),
+                update_type: UpdateType::Deleted,
+            },
+            VfsChange {
+                path: "Movies/New Movie".to_string(),
+                update_type: UpdateType::Created,
+            },
+            VfsChange {
+                path: "Shows/Breaking Bad/Season 01".to_string(),
+                update_type: UpdateType::Modified,
+            },
+        ];
+        let body = client.build_request_body(&changes);
+        let updates = body["Updates"].as_array().unwrap();
+        assert_eq!(updates.len(), 3);
+        assert_eq!(updates[0]["UpdateType"], "Deleted");
+        assert_eq!(updates[1]["UpdateType"], "Created");
+        assert_eq!(updates[2]["Path"], "/mnt/debrid/Shows/Breaking Bad/Season 01");
+    }
+
+    #[test]
+    fn build_request_body_trims_trailing_slashes() {
+        let client = JellyfinClient::new(
+            "http://jellyfin:8096/".to_string(),
+            "test-key".to_string(),
+            "/mnt/debrid/".to_string(),
+        );
+        let changes = vec![VfsChange {
+            path: "Movies/Test".to_string(),
+            update_type: UpdateType::Created,
+        }];
+        let body = client.build_request_body(&changes);
+        let updates = body["Updates"].as_array().unwrap();
+        assert_eq!(updates[0]["Path"], "/mnt/debrid/Movies/Test");
+    }
+
+    #[test]
+    fn notify_changes_skips_empty() {
+        // Just verify it doesn't panic on empty input
+        let client = JellyfinClient::new(
+            "http://jellyfin:8096".to_string(),
+            "test-key".to_string(),
+            "/mnt/debrid".to_string(),
+        );
+        let body = client.build_request_body(&[]);
+        let updates = body["Updates"].as_array().unwrap();
+        assert!(updates.is_empty());
+    }
+}
