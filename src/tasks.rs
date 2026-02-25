@@ -55,6 +55,14 @@ pub async fn run_scan_loop(
         info!("Loaded {} persistent matches from database.", seen_torrents.len());
     }
 
+    // Pre-populate the VFS from persisted data so the first scan's diff
+    // only captures genuinely new/changed content, not the entire library.
+    if !seen_torrents.is_empty() {
+        let persisted_data: Vec<_> = seen_torrents.values().cloned().collect();
+        update_vfs(&vfs, &persisted_data, &repair_manager, &None).await;
+        info!("Pre-populated VFS with {} persisted entries", persisted_data.len());
+    }
+
     info!("Scan task: running initial scan immediately");
 
     loop {
