@@ -21,7 +21,7 @@ This was 100% vibe coded using a mix of Claude and Junie as further AI experimen
 - **Media Identification**: Automatically identifies movies and TV shows using TMDB metadata based on torrent filenames.
 - **Jellyfin/Plex Structure**: Organizes your library into a clean `Movies/` and `Shows/` directory structure.
 - **Season Grouping**: Automatically groups TV show episodes into `Season XX` folders.
-- **WebDAV Endpoint**: Exposes a WebDAV server (port 8080) serving `.strm` files that point to Real-Debrid download URLs. Mount via rclone for use with Jellyfin/Plex.
+- **WebDAV Endpoint**: Exposes a WebDAV server (port 8080) serving proxied media files with real file sizes and extensions. Media bytes are fetched on demand from Real-Debrid's CDN. Mount via rclone for use with Jellyfin/Plex.
 - **On-Demand Repair**: Detects broken links at playback time (503 from Real-Debrid) and attempts instant synchronous repair. For cached torrents, playback continues after a ~1-2s delay; for non-cached torrents, a new download is started automatically.
 - **Persistent Cache**: Uses an embedded database (`redb`) to cache media identifications, reducing API calls and speeding up restarts.
 - **Configurable Scan Interval**: Customizable scan interval via environment variable.
@@ -139,11 +139,11 @@ vendor = other
 
 ### Notes
 
-- The WebDAV server runs on port 8080 internally (mapped to 8082 on the host)
+- The WebDAV server runs on port 8080 (mapped to 8080 on the host)
 - rclone mounts the WebDAV endpoint to `./rclone` on the host via a bind mount
 - Jellyfin reads from `/media` which is bind-mounted from `./rclone`
-- Files appear as `.strm` files containing Real-Debrid download URLs
-- Jellyfin will stream directly from Real-Debrid when playing content
+- Files appear as real media files (`.mkv`, `.mp4`, etc.) with correct file sizes — media bytes are proxied from Real-Debrid's CDN on demand
+- Jellyfin probes and plays content normally as if the files were local
 
 ## Usage
 
@@ -156,7 +156,7 @@ Once running, the WebDAV server will be available at `http://localhost:8080`. Mo
 
 ## Technical Details
 
-- **Language**: Rust 2024
+- **Language**: Rust (2021 edition)
 - **Libraries**: 
   - `dav-server`: WebDAV protocol implementation.
   - `tokio`: Async runtime.
@@ -188,7 +188,7 @@ The service runs one background task:
 1. **Scan Task**: Polls Real-Debrid for new/updated torrents and updates the virtual filesystem
    - Runs immediately on startup
    - Repeats every `SCAN_INTERVAL_SECS` (default: 60 seconds)
-   - Files that fail to unrestrict at scan time are silently skipped
+   - Builds the VFS with restricted RD links; unrestriction happens lazily at read time
 
 ### On-Demand Repair
 

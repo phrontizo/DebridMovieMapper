@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Does
 
-DebridMovieMapper is a Rust async service that bridges Real-Debrid (a debrid/torrent service) with media servers like Jellyfin and Plex. It fetches torrents from a Real-Debrid account, identifies them via TMDB metadata, and exposes a WebDAV endpoint serving `.strm` files that point directly to Real-Debrid download URLs for streaming.
+DebridMovieMapper is a Rust async service that bridges Real-Debrid (a debrid/torrent service) with media servers like Jellyfin and Plex. It fetches torrents from a Real-Debrid account, identifies them via TMDB metadata, and exposes a WebDAV endpoint serving proxied media files (the actual `.mkv`/`.mp4` bytes are fetched from Real-Debrid CDN on demand).
 
 ## Commands
 
@@ -55,7 +55,9 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 
 **Background tasks (spawned in `main.rs`):**
 - **Scan task** (every `SCAN_INTERVAL_SECS`): Polls Real-Debrid → identifies torrents via TMDB → updates the in-memory VFS. Implemented in `tasks.rs`.
-- **Repair:** On-demand only — triggered synchronously when a media file is read and its RD link returns 503. For cached torrents, repair completes inline (~1-2s delay); for non-cached torrents, the file fails and a new torrent is left to download.
+
+**On-demand (synchronous, during WebDAV file reads):**
+- **Repair:** Triggered when a media file is read and its RD link returns 503. For cached torrents, repair completes inline (~1-2s delay); for non-cached torrents, the file fails and a new torrent is left to download.
 
 **Module responsibilities:**
 
@@ -65,7 +67,7 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 | `tasks.rs` | `run_scan_loop` — polls Real-Debrid, identifies new torrents, updates VFS |
 | `rd_client.rs` | Real-Debrid API client with adaptive token bucket rate limiter, 1-hour response cache |
 | `identification.rs` | Filename cleaning, camelCase splitting, TMDB scoring to identify movies/shows |
-| `vfs.rs` | In-memory virtual filesystem: creates `Movies/`+`Shows/` hierarchy, generates `.strm` files |
+| `vfs.rs` | In-memory virtual filesystem: creates `Movies/`+`Shows/` hierarchy with media files and NFO metadata |
 | `dav_fs.rs` | Maps VFS to WebDAV; re-unrestricts links on read, attempts synchronous instant repair on 503 |
 | `repair.rs` | Torrent repair state machine (Healthy→Broken→Repairing→Failed), instant repair for cached torrents |
 | `tmdb_client.rs` | TMDB search for movies and TV shows |
@@ -74,9 +76,9 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 | `mapper.rs` | Library root — module declarations |
 
 **Data flow for playback:**
-1. Jellyfin/player reads a `.strm` file via WebDAV
-2. The `.strm` contains a Real-Debrid unrestrict URL
-3. Player streams directly from Real-Debrid (no proxying)
+1. Jellyfin/player opens a media file via WebDAV
+2. `dav_fs.rs` lazily unrestricts the RD link to get a CDN URL (cached for 1 hour)
+3. `ProxiedMediaFile` fetches bytes from the CDN URL with a 2MB read-ahead buffer and serves them to the player
 
 **Persistence:** Embedded `redb` database (`metadata.db`) caches TMDB identifications. The file is created automatically on first run.
 
