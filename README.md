@@ -22,7 +22,7 @@ This was 100% vibe coded using a mix of Claude and Junie as further AI experimen
 - **Jellyfin/Plex Structure**: Organizes your library into a clean `Movies/` and `Shows/` directory structure.
 - **Season Grouping**: Automatically groups TV show episodes into `Season XX` folders.
 - **WebDAV Endpoint**: Exposes a WebDAV server (port 8080) serving `.strm` files that point to Real-Debrid download URLs. Mount via rclone for use with Jellyfin/Plex.
-- **On-Demand Repair**: Detects broken links at playback time (503 from Real-Debrid) and automatically re-downloads the torrent via its magnet link without user intervention.
+- **On-Demand Repair**: Detects broken links at playback time (503 from Real-Debrid) and attempts instant synchronous repair. For cached torrents, playback continues after a ~1-2s delay; for non-cached torrents, a new download is started automatically.
 - **Persistent Cache**: Uses an embedded database (`redb`) to cache media identifications, reducing API calls and speeding up restarts.
 - **Configurable Scan Interval**: Customizable scan interval via environment variable.
 - **Robust Identification Logic**: Handles complex torrent naming conventions, including CamelCase splitting, technical metadata stripping, and multi-service fallback strategies.
@@ -171,9 +171,9 @@ Once running, the WebDAV server will be available at `http://localhost:8080`. Mo
 - `src/tasks.rs`: Background scan loop — polls Real-Debrid, identifies new torrents, updates the VFS.
 - `src/rd_client.rs`: Real-Debrid API client with adaptive token bucket rate limiter and response caching.
 - `src/tmdb_client.rs`: TMDB API client for media metadata.
-- `src/repair.rs`: On-demand torrent repair state machine triggered at playback time.
+- `src/repair.rs`: Torrent repair state machine with synchronous instant repair for cached torrents.
 - `src/vfs.rs`: Virtual File System logic for library organisation.
-- `src/dav_fs.rs`: WebDAV filesystem — re-unrestricts links on read and triggers repair on 503.
+- `src/dav_fs.rs`: WebDAV filesystem — re-unrestricts links on read, attempts instant repair on 503.
 - `src/identification.rs`: Smart media identification and filename cleaning logic.
 - `src/error.rs`: Unified error type (`AppError`) using `thiserror`.
 - `src/jellyfin_client.rs`: Optional Jellyfin notification client for instant library updates.
@@ -192,11 +192,13 @@ The service runs one background task:
 
 ### On-Demand Repair
 
-There is no background repair loop. Instead, repair is triggered at playback time:
+There is no background repair loop. Instead, repair is triggered synchronously at playback time:
 
-- When a `.strm` file is read, `dav_fs` re-calls `unrestrict_link` for a fresh URL (the 1-hour response cache makes this free when the torrent is healthy)
-- If `unrestrict_link` returns a 503, the torrent is marked broken and a background `tokio::spawn` calls `repair_by_id`
-- Broken/repairing torrents are hidden from WebDAV until healthy again
+- When a media file is read, `dav_fs` re-calls `unrestrict_link` for a fresh URL (the 1-hour response cache makes this free when the torrent is healthy)
+- If `unrestrict_link` returns a 503, `try_instant_repair` is called synchronously: re-adds the torrent via magnet, selects the same files, and checks if the torrent is already cached on Real-Debrid's servers
+- **Cached torrents** (most common): repair completes in ~1-2 seconds and the new link is unrestricted inline — playback continues after a brief delay
+- **Non-cached torrents**: the file returns an error, the old torrent is deleted, and the new torrent is left to download (the scan loop picks it up automatically)
+- Non-cached/repairing torrents are hidden from WebDAV until healthy again
 
 ### Jellyfin Notifications
 
@@ -214,10 +216,10 @@ To fix this, delete the torrent from Real-Debrid and find an alternative release
 
 ### Error Handling
 
-- **503 Service Unavailable**: Immediately marks torrent as broken and triggers repair without retries
+- **503 Service Unavailable**: Triggers synchronous instant repair — succeeds inline for cached torrents, fails for non-cached
 - **429 Rate Limit**: Adaptive token bucket rate limiter shared across all API calls — on 429, the global request interval doubles (max 2s between requests) and Retry-After headers are respected; on success, the interval gradually recovers toward the baseline of 10 req/s
 - **404 Not Found**: Treated as success for delete operations (idempotent)
-- **Playback Errors**: WebDAV read failures automatically trigger repair process
+- **Playback Errors**: WebDAV read failures on 503 trigger instant repair (rate-limited to 30s cooldown, max 3 attempts per torrent)
 
 ### Caching
 

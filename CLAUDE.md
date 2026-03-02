@@ -55,7 +55,7 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 
 **Background tasks (spawned in `main.rs`):**
 - **Scan task** (every `SCAN_INTERVAL_SECS`): Polls Real-Debrid → identifies torrents via TMDB → updates the in-memory VFS. Implemented in `tasks.rs`.
-- **Repair:** On-demand only — triggered when a `.strm` file is read and its link returns 503. No background polling.
+- **Repair:** On-demand only — triggered synchronously when a media file is read and its RD link returns 503. For cached torrents, repair completes inline (~1-2s delay); for non-cached torrents, the file fails and a new torrent is left to download.
 
 **Module responsibilities:**
 
@@ -66,8 +66,8 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 | `rd_client.rs` | Real-Debrid API client with adaptive token bucket rate limiter, 1-hour response cache |
 | `identification.rs` | Filename cleaning, camelCase splitting, TMDB scoring to identify movies/shows |
 | `vfs.rs` | In-memory virtual filesystem: creates `Movies/`+`Shows/` hierarchy, generates `.strm` files |
-| `dav_fs.rs` | Maps VFS to WebDAV; re-unrestricts links on read and triggers on-demand repair on 503 |
-| `repair.rs` | Torrent repair state machine (Healthy→Broken→Repairing→Failed), on-demand repair |
+| `dav_fs.rs` | Maps VFS to WebDAV; re-unrestricts links on read, attempts synchronous instant repair on 503 |
+| `repair.rs` | Torrent repair state machine (Healthy→Broken→Repairing→Failed), instant repair for cached torrents |
 | `tmdb_client.rs` | TMDB search for movies and TV shows |
 | `error.rs` | Unified error type (`AppError`) using `thiserror` |
 | `jellyfin_client.rs` | Optional Jellyfin notification client — notifies Jellyfin of changed paths via `POST /Library/Media/Updated` |
@@ -86,8 +86,8 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 - **Adaptive rate limiting:** An `AdaptiveRateLimiter` (token bucket, capacity 1) is shared across all Real-Debrid API calls. Baseline: 10 req/s (100ms interval). On 429: interval doubles (max 2000ms / 0.5 req/s) and Retry-After header is respected. On success: interval decreases by 10ms (min 100ms). This prevents 429 cascades by slowing all requests globally. 503 on `unrestrict/link` is a terminal status (no retry) — it signals a broken torrent and triggers on-demand repair.
 - **Single retry method:** `rd_client.rs` has one `fetch_with_retry(make_request, terminal_statuses)` — callers pass the status codes that should abort without retrying (e.g. 404 for `get_torrent_info`, 503 for `unrestrict_link`).
 - **Identification scoring:** `identification.rs` cleans filenames extensively before TMDB lookup. Shows vs. movies are detected by file structure (presence of multiple video files with episode patterns).
-- **On-demand repair:** When a `.strm` file is read, `dav_fs.rs` re-unrestricts the link (cached, so free when healthy). On 503 it calls `repair_manager.repair_by_id()` in a background task and hides the torrent until repaired.
-- **Repair hides broken torrents:** During repair, entries are hidden from the VFS so they don't appear in Jellyfin until healthy again.
+- **Synchronous instant repair:** When a media file is read, `dav_fs.rs` re-unrestricts the link (cached, so free when healthy). On 503, it calls `repair_manager.try_instant_repair()` synchronously — re-adds the torrent via magnet, selects the same files, and checks if the torrent is already cached on RD. If cached (status "downloaded" within ~1s), the new link is unrestricted inline and playback continues after a brief delay. If not cached, the file fails and the new torrent is left to download (scan loop picks it up).
+- **Repair hides broken torrents:** Non-cached torrents are marked Broken and hidden from WebDAV until the scan loop picks up the replacement torrent.
 
 ## Development Process
 
