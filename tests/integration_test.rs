@@ -189,24 +189,24 @@ async fn test_vfs_structure() {
         "VFS should contain at least Movies/ or Shows/ directory"
     );
 
-    // Check Movies structure: Movies/<Title (Year)>/<file>.strm
+    // Check Movies structure: Movies/<Title (Year)>/<file>.mkv|.mp4
     if let Some(VfsNode::Directory { children: movies }) = children.get("Movies") {
         println!("\nMovies/ contains {} entries", movies.len());
         for (name, node) in movies.iter().take(5) {
             match node {
                 VfsNode::Directory { children: movie_files } => {
-                    let strm_count = movie_files
+                    let media_count = movie_files
                         .values()
-                        .filter(|n| matches!(n, VfsNode::StrmFile { .. }))
+                        .filter(|n| matches!(n, VfsNode::MediaFile { .. }))
                         .count();
-                    println!("  {}: {} .strm files", name, strm_count);
+                    println!("  {}: {} media files", name, media_count);
                 }
                 _ => println!("  {} (not a directory)", name),
             }
         }
     }
 
-    // Check Shows structure: Shows/<Title (Year)>/Season XX/<file>.strm
+    // Check Shows structure: Shows/<Title (Year)>/Season XX/<file>.mkv|.mp4
     if let Some(VfsNode::Directory { children: shows }) = children.get("Shows") {
         println!("\nShows/ contains {} entries", shows.len());
         for (name, node) in shows.iter().take(5) {
@@ -371,7 +371,7 @@ fn collect_links(node: &VfsNode, links: &mut std::collections::HashSet<String>) 
                 collect_links(child, links);
             }
         }
-        VfsNode::StrmFile { rd_link, .. } => {
+        VfsNode::MediaFile { rd_link, .. } => {
             links.insert(rd_link.clone());
         }
         VfsNode::VirtualFile { .. } => {}

@@ -5,12 +5,6 @@ use serde::{Deserialize, Serialize};
 use crate::rd_client::TorrentInfo;
 use regex::Regex;
 
-/// Fixed size for STRM file metadata. All STRM files report this size in WebDAV
-/// metadata (PROPFIND and GET Content-Length). The actual content (URL + padding)
-/// is padded to this size so metadata and content are always consistent.
-/// Real-Debrid download URLs are typically 100-300 bytes.
-pub const STRM_FIXED_SIZE: usize = 1024;
-
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     ".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
 ];
@@ -96,12 +90,11 @@ pub enum VfsNode {
     Directory {
         children: BTreeMap<String, VfsNode>,
     },
-    /// STRM file that contains a direct Real-Debrid download URL
-    /// Jellyfin will read this tiny file and stream directly from RD
-    /// strm_content contains the actual file content (the URL with newline)
-    StrmFile {
-        strm_content: Vec<u8>, // The actual STRM file content (URL + newline)
-        rd_link: String, // The /torrents link that may need unrestricting
+    /// Media file proxied from Real-Debrid CDN.
+    /// WebDAV serves the actual media bytes (not a .strm URL).
+    MediaFile {
+        file_size: u64,       // actual media file size from TorrentFile::bytes
+        rd_link: String,      // restricted RD link for on-demand unrestricting
         rd_torrent_id: String,
     },
     VirtualFile {
@@ -430,41 +423,31 @@ impl DebridVfs {
         }
     }
 
-    /// Insert a video file into the tree as a .strm node. Returns the final strm filename.
-    fn add_path_to_tree(root: &mut BTreeMap<String, VfsNode>, path: &str, _size: u64, torrent_id: String, link: String) -> String {
+    /// Insert a video file into the tree as a MediaFile node. Returns the final filename.
+    fn add_path_to_tree(root: &mut BTreeMap<String, VfsNode>, path: &str, size: u64, torrent_id: String, link: String) -> String {
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         let mut current_children = root;
 
         for i in 0..parts.len() {
             let part = parts[i].to_string();
             if i == parts.len() - 1 {
-                // This is the video file - convert to .strm
-                let strm_name = if let Some(pos) = part.rfind('.') {
-                    format!("{}.strm", &part[..pos])
-                } else {
-                    format!("{}.strm", part)
-                };
-
-                let mut final_name = strm_name.clone();
+                // Keep original filename and extension
+                let mut final_name = part.clone();
                 let mut counter = 1;
                 while current_children.contains_key(&final_name) {
-                    if let Some(pos) = strm_name.rfind(".strm") {
-                        let base = &strm_name[..pos];
-                        final_name = format!("{} ({}).strm", base, counter);
+                    if let Some(pos) = part.rfind('.') {
+                        let base = &part[..pos];
+                        let ext = &part[pos..];
+                        final_name = format!("{} ({}){}", base, counter, ext);
                     } else {
-                        final_name = format!("{} ({})", strm_name, counter);
+                        final_name = format!("{} ({})", part, counter);
                     }
                     counter += 1;
                 }
 
-                // Pad to STRM_FIXED_SIZE so PROPFIND metadata matches GET Content-Length.
-                // The actual download URL is fetched on-demand by dav_fs::StrmFile::read_bytes.
-                let mut strm_content = format!("{}\n", link).into_bytes();
-                strm_content.resize(STRM_FIXED_SIZE, b' ');
-
                 let ret = final_name.clone();
-                current_children.insert(final_name, VfsNode::StrmFile {
-                    strm_content,
+                current_children.insert(final_name, VfsNode::MediaFile {
+                    file_size: size,
                     rd_link: link.clone(),
                     rd_torrent_id: torrent_id.clone(),
                 });
@@ -520,7 +503,7 @@ fn xml_escape(s: &str) -> String {
 /// a new movie).
 ///
 /// Changes are reported at the directory level, never at the individual file
-/// level. When leaf nodes (StrmFile, VirtualFile) inside a directory change,
+/// level. When leaf nodes (MediaFile, VirtualFile) inside a directory change,
 /// the directory itself is reported as Modified.
 pub fn diff_trees(old: &VfsNode, new: &VfsNode, prefix: &str) -> Vec<VfsChange> {
     let mut changes = Vec::new();
@@ -629,7 +612,7 @@ pub fn diff_trees(old: &VfsNode, new: &VfsNode, prefix: &str) -> Vec<VfsChange> 
 }
 
 /// Walk down a newly created directory tree to find the deepest directory.
-/// For "Shows/Breaking Bad/Season 01/S01E01.strm", returns "Shows/Breaking Bad/Season 01".
+/// For "Shows/Breaking Bad/Season 01/S01E01.mkv", returns "Shows/Breaking Bad/Season 01".
 fn find_deepest_new_dir(path: &str, children: &BTreeMap<String, VfsNode>) -> String {
     // If all children are leaves (files), this is the deepest directory
     let dir_children: Vec<(&String, &BTreeMap<String, VfsNode>)> = children
@@ -660,7 +643,7 @@ mod tests {
     #[test]
     fn broken_link_placeholder_not_present() {
         // Verify the broken-link error placeholder was removed from this file.
-        // On unrestrict failure we skip the file rather than inserting a fake STRM.
+        // On unrestrict failure we skip the file rather than inserting a fake entry.
         // The search string is split so this test does not self-match.
         let placeholder = ["# Error: Failed", " to unrestrict link"].concat();
         let source = include_str!("vfs.rs");
@@ -743,7 +726,7 @@ mod tests {
                 assert!(movie_children.contains_key("Movie"), "Movie folder not found");
                 let movie_dir = movie_children.get("Movie").unwrap();
                 if let VfsNode::Directory { children: files } = movie_dir {
-                    assert!(files.contains_key("Movie.2023.1080p.strm"), "Movie STRM file not found");
+                    assert!(files.contains_key("Movie.2023.1080p.mkv"), "Movie media file not found");
                     assert!(files.contains_key("movie.nfo"), "movie.nfo not found");
                 }
             } else {
@@ -859,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn strm_error_placeholder_is_not_used() {
+    fn error_placeholder_is_not_used() {
         // Verify the broken-link placeholder string has been removed from this file.
         // If this test fails, it means the placeholder was re-introduced.
         // The needle is split so that this test's own source text does not match it.
@@ -943,11 +926,11 @@ mod tests {
             if let VfsNode::Directory { children: movie_children } = movies {
                 let folder = movie_children.get("Duplicate Movie [tmdbid-123]").expect("Folder missing");
                 if let VfsNode::Directory { children: files } = folder {
-                    let file = files.get("Movie.strm").expect("STRM file missing");
-                    if let VfsNode::StrmFile { rd_torrent_id, .. } = file {
+                    let file = files.get("Movie.mkv").expect("Media file missing");
+                    if let VfsNode::MediaFile { rd_torrent_id, .. } = file {
                         assert_eq!(rd_torrent_id, "large", "Should have picked the large torrent");
                     } else {
-                        panic!("Should be a STRM file");
+                        panic!("Should be a MediaFile");
                     }
                 }
             }
@@ -1084,9 +1067,9 @@ mod tests {
         let show_ts = parse_rd_date("2024-03-10T08:00:00.000Z");
 
         // Leaf files get the torrent's added timestamp
-        assert_eq!(vfs.timestamps.get("Movies/Movie/Movie.2023.1080p.strm"), Some(&movie_ts));
+        assert_eq!(vfs.timestamps.get("Movies/Movie/Movie.2023.1080p.mkv"), Some(&movie_ts));
         assert_eq!(vfs.timestamps.get("Movies/Movie/movie.nfo"), Some(&movie_ts));
-        assert_eq!(vfs.timestamps.get("Shows/Show/Season 01/Show.S01E01.strm"), Some(&show_ts));
+        assert_eq!(vfs.timestamps.get("Shows/Show/Season 01/Show.S01E01.mkv"), Some(&show_ts));
         assert_eq!(vfs.timestamps.get("Shows/Show/tvshow.nfo"), Some(&show_ts));
 
         // Directories get the max timestamp of their children
@@ -1106,8 +1089,8 @@ mod tests {
                     children: BTreeMap::from([
                         ("Inception".to_string(), VfsNode::Directory {
                             children: BTreeMap::from([
-                                ("Inception.strm".to_string(), VfsNode::StrmFile {
-                                    strm_content: vec![],
+                                ("Inception.mkv".to_string(), VfsNode::MediaFile {
+                                    file_size: 1000,
                                     rd_link: "http://link1".to_string(),
                                     rd_torrent_id: "t1".to_string(),
                                 }),
@@ -1136,8 +1119,8 @@ mod tests {
                             children: BTreeMap::from([
                                 ("Season 01".to_string(), VfsNode::Directory {
                                     children: BTreeMap::from([
-                                        ("S01E01.strm".to_string(), VfsNode::StrmFile {
-                                            strm_content: vec![],
+                                        ("S01E01.mkv".to_string(), VfsNode::MediaFile {
+                                            file_size: 1000,
                                             rd_link: "http://link".to_string(),
                                             rd_torrent_id: "t1".to_string(),
                                         }),
@@ -1163,8 +1146,8 @@ mod tests {
                     children: BTreeMap::from([
                         ("Inception".to_string(), VfsNode::Directory {
                             children: BTreeMap::from([
-                                ("Inception.strm".to_string(), VfsNode::StrmFile {
-                                    strm_content: vec![],
+                                ("Inception.mkv".to_string(), VfsNode::MediaFile {
+                                    file_size: 1000,
                                     rd_link: "http://link".to_string(),
                                     rd_torrent_id: "t1".to_string(),
                                 }),
@@ -1193,8 +1176,8 @@ mod tests {
                     children: BTreeMap::from([
                         ("Inception".to_string(), VfsNode::Directory {
                             children: BTreeMap::from([
-                                ("Inception.strm".to_string(), VfsNode::StrmFile {
-                                    strm_content: vec![],
+                                ("Inception.mkv".to_string(), VfsNode::MediaFile {
+                                    file_size: 1000,
                                     rd_link: "http://old-link".to_string(),
                                     rd_torrent_id: "t1".to_string(),
                                 }),
@@ -1210,8 +1193,8 @@ mod tests {
                     children: BTreeMap::from([
                         ("Inception".to_string(), VfsNode::Directory {
                             children: BTreeMap::from([
-                                ("Inception.strm".to_string(), VfsNode::StrmFile {
-                                    strm_content: vec![],
+                                ("Inception.mkv".to_string(), VfsNode::MediaFile {
+                                    file_size: 1000,
                                     rd_link: "http://new-link".to_string(),
                                     rd_torrent_id: "t2".to_string(),
                                 }),
@@ -1237,8 +1220,8 @@ mod tests {
                             children: BTreeMap::from([
                                 ("Season 01".to_string(), VfsNode::Directory {
                                     children: BTreeMap::from([
-                                        ("S01E01.strm".to_string(), VfsNode::StrmFile {
-                                            strm_content: vec![],
+                                        ("S01E01.mkv".to_string(), VfsNode::MediaFile {
+                                            file_size: 1000,
                                             rd_link: "http://link1".to_string(),
                                             rd_torrent_id: "t1".to_string(),
                                         }),
@@ -1258,13 +1241,13 @@ mod tests {
                             children: BTreeMap::from([
                                 ("Season 01".to_string(), VfsNode::Directory {
                                     children: BTreeMap::from([
-                                        ("S01E01.strm".to_string(), VfsNode::StrmFile {
-                                            strm_content: vec![],
+                                        ("S01E01.mkv".to_string(), VfsNode::MediaFile {
+                                            file_size: 1000,
                                             rd_link: "http://link1".to_string(),
                                             rd_torrent_id: "t1".to_string(),
                                         }),
-                                        ("S01E02.strm".to_string(), VfsNode::StrmFile {
-                                            strm_content: vec![],
+                                        ("S01E02.mkv".to_string(), VfsNode::MediaFile {
+                                            file_size: 1000,
                                             rd_link: "http://link2".to_string(),
                                             rd_torrent_id: "t2".to_string(),
                                         }),
@@ -1313,8 +1296,8 @@ mod tests {
                     children: BTreeMap::from([
                         ("Old Movie".to_string(), VfsNode::Directory {
                             children: BTreeMap::from([
-                                ("old.strm".to_string(), VfsNode::StrmFile {
-                                    strm_content: vec![],
+                                ("old.mkv".to_string(), VfsNode::MediaFile {
+                                    file_size: 1000,
                                     rd_link: "http://old".to_string(),
                                     rd_torrent_id: "t1".to_string(),
                                 }),
@@ -1331,8 +1314,8 @@ mod tests {
                     children: BTreeMap::from([
                         ("New Movie".to_string(), VfsNode::Directory {
                             children: BTreeMap::from([
-                                ("new.strm".to_string(), VfsNode::StrmFile {
-                                    strm_content: vec![],
+                                ("new.mkv".to_string(), VfsNode::MediaFile {
+                                    file_size: 1000,
                                     rd_link: "http://new".to_string(),
                                     rd_torrent_id: "t2".to_string(),
                                 }),
@@ -1346,8 +1329,8 @@ mod tests {
                             children: BTreeMap::from([
                                 ("Season 01".to_string(), VfsNode::Directory {
                                     children: BTreeMap::from([
-                                        ("S01E01.strm".to_string(), VfsNode::StrmFile {
-                                            strm_content: vec![],
+                                        ("S01E01.mkv".to_string(), VfsNode::MediaFile {
+                                            file_size: 1000,
                                             rd_link: "http://ep".to_string(),
                                             rd_torrent_id: "t3".to_string(),
                                         }),

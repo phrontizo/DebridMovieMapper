@@ -1,6 +1,6 @@
 use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::tmdb_client::TmdbClient;
-use debridmoviemapper::vfs::{DebridVfs, VfsNode};
+use debridmoviemapper::vfs::{DebridVfs, VfsNode, VIDEO_EXTENSIONS};
 use debridmoviemapper::identification::identify_torrent;
 use debridmoviemapper::dav_fs::DebridFileSystem;
 use debridmoviemapper::repair::RepairManager;
@@ -10,10 +10,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use futures_util::StreamExt;
 
-/// Test that STRM files are correctly generated with valid Real-Debrid URLs
+/// Test that media files are correctly generated with valid Real-Debrid links
 #[tokio::test]
 #[ignore]
-async fn test_strm_file_generation() {
+async fn test_media_file_generation() {
     let _ = tracing_subscriber::fmt::try_init();
     dotenvy::dotenv().ok();
 
@@ -72,29 +72,31 @@ async fn test_strm_file_generation() {
         *vfs_lock = new_vfs;
     }
 
-    // Verify STRM files exist in VFS
-    let mut strm_files = Vec::new();
+    // Verify media files exist in VFS
+    let mut media_files = Vec::new();
     {
         let vfs_lock = vfs.read().await;
-        collect_strm_files(&vfs_lock.root, "", String::new(), &mut strm_files);
+        collect_media_files(&vfs_lock.root, "", String::new(), &mut media_files);
     }
 
-    assert!(!strm_files.is_empty(), "No STRM files found in VFS");
-    println!("Found {} STRM files in VFS", strm_files.len());
+    assert!(!media_files.is_empty(), "No media files found in VFS");
+    println!("Found {} media files in VFS", media_files.len());
 
-    // Test reading STRM files through WebDAV
+    // Test reading media files through WebDAV (just open and check metadata)
     let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
-    let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone(), repair_manager);
+    let http_client = reqwest::Client::new();
+    let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone(), repair_manager, http_client);
 
-    // Test a few STRM files
-    for (path_str, rd_link) in strm_files.iter().take(3) {
-        println!("\nTesting STRM file: {}", path_str);
-        println!("  Original RD link: {}", rd_link);
+    // Test a few media files
+    for (path_str, rd_link, file_size) in media_files.iter().take(3) {
+        println!("\nTesting media file: {}", path_str);
+        println!("  RD link: {}", rd_link);
+        println!("  File size: {} bytes", file_size);
 
         let encoded_path = encode_path_preserve_slashes(&format!("/{}", path_str));
         let path = DavPath::new(&encoded_path).unwrap();
 
-        // Open the STRM file
+        // Open the media file
         let opts = OpenOptions {
             read: true,
             ..Default::default()
@@ -102,51 +104,37 @@ async fn test_strm_file_generation() {
         let mut file = dav_fs
             .open(&path, opts)
             .await
-            .expect("Failed to open STRM file");
+            .expect("Failed to open media file");
 
-        // Read the STRM content
-        let bytes = file
-            .read_bytes(1024)
-            .await
-            .expect("Failed to read STRM file");
-        assert!(!bytes.is_empty(), "STRM file is empty");
+        // Verify metadata returns the correct file size
+        let meta = file.metadata().await.expect("Failed to get file metadata");
+        assert_eq!(meta.len(), *file_size, "Metadata size should match actual file size");
 
-        let content = String::from_utf8_lossy(&bytes);
-        let url = content.trim();
-
-        println!("  STRM content: {}", url);
-
-        // Verify it's a valid URL
+        // Verify it has a video file extension
+        let has_video_ext = VIDEO_EXTENSIONS.iter().any(|ext| path_str.to_lowercase().ends_with(ext));
         assert!(
-            url.starts_with("http://") || url.starts_with("https://"),
-            "STRM content should be a URL, got: {}",
-            url
-        );
-
-        // Verify it's a Real-Debrid download URL
-        assert!(
-            url.contains("real-debrid.com") && url.contains("/d/"),
-            "STRM should contain Real-Debrid download URL, got: {}",
-            url
-        );
-
-        // Verify filename extension is .strm
-        assert!(
-            path_str.ends_with(".strm"),
-            "File should have .strm extension, got: {}",
+            has_video_ext,
+            "File should have a video extension, got: {}",
             path_str
         );
 
-        println!("  ✓ Valid STRM file with RD download URL");
+        // Verify file size is reasonable (> 1KB for video files)
+        assert!(
+            *file_size > 1024,
+            "Video file size should be > 1KB, got: {} bytes",
+            file_size
+        );
+
+        println!("  ✓ Valid media file with correct size");
     }
 
-    println!("\n✓ All STRM files validated successfully");
+    println!("\n✓ All media files validated successfully");
 }
 
-/// Test that STRM files are properly named (video extension replaced with .strm)
+/// Test that media files keep their original extensions (not converted to .strm)
 #[tokio::test]
 #[ignore]
-async fn test_strm_filename_conversion() {
+async fn test_media_filename_keeps_original_extension() {
     let _ = tracing_subscriber::fmt::try_init();
     dotenvy::dotenv().ok();
 
@@ -191,43 +179,41 @@ async fn test_strm_filename_conversion() {
         *vfs_lock = new_vfs;
     }
 
-    // Check that all video files have been converted to .strm
-    let mut strm_files = Vec::new();
+    // Check that all video files keep their original extensions
+    let mut media_files = Vec::new();
     {
         let vfs_lock = vfs.read().await;
-        collect_strm_files(&vfs_lock.root, "", String::new(), &mut strm_files);
+        collect_media_files(&vfs_lock.root, "", String::new(), &mut media_files);
     }
 
-    println!("Checking {} STRM files for proper naming", strm_files.len());
+    println!("Checking {} media files for proper naming", media_files.len());
 
-    for (path, _) in &strm_files {
-        // Should end with .strm
+    for (path, _, _) in &media_files {
+        // Should NOT end with .strm
         assert!(
-            path.ends_with(".strm"),
-            "File should end with .strm: {}",
+            !path.ends_with(".strm"),
+            "File should not have .strm extension: {}",
             path
         );
 
-        // Should NOT end with video extensions
-        let video_exts = [".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv"];
-        for ext in &video_exts {
-            assert!(
-                !path.ends_with(&format!("{}.strm", ext)),
-                "STRM file should not have double extension: {}",
-                path
-            );
-        }
+        // Should end with a video extension
+        let has_video_ext = VIDEO_EXTENSIONS.iter().any(|ext| path.to_lowercase().ends_with(ext));
+        assert!(
+            has_video_ext,
+            "File should have a video extension: {}",
+            path
+        );
 
         println!("  ✓ {}", path);
     }
 
-    println!("\n✓ All STRM files have correct naming");
+    println!("\n✓ All media files have correct original extensions");
 }
 
-/// Test NFO files are generated alongside STRM files
+/// Test NFO files are generated alongside media files
 #[tokio::test]
 #[ignore]
-async fn test_nfo_generation_with_strm() {
+async fn test_nfo_generation_with_media() {
     let _ = tracing_subscriber::fmt::try_init();
     dotenvy::dotenv().ok();
 
@@ -274,30 +260,30 @@ async fn test_nfo_generation_with_strm() {
 
     // Check NFO files exist
     let mut nfo_count = 0;
-    let mut strm_folders = std::collections::HashSet::new();
+    let mut media_folders = std::collections::HashSet::new();
 
     {
         let vfs_lock = vfs.read().await;
-        count_nfo_and_folders(&vfs_lock.root, "", &mut nfo_count, &mut strm_folders);
+        count_nfo_and_folders(&vfs_lock.root, "", &mut nfo_count, &mut media_folders);
     }
 
     println!("Found {} NFO files", nfo_count);
-    println!("Found {} folders with STRM files", strm_folders.len());
+    println!("Found {} folders with media files", media_folders.len());
 
     assert!(nfo_count > 0, "Should have generated NFO files");
     assert!(
-        nfo_count >= strm_folders.len(),
+        nfo_count >= media_folders.len(),
         "Should have at least one NFO per media folder"
     );
 
-    println!("✓ NFO files properly generated with STRM files");
+    println!("✓ NFO files properly generated with media files");
 }
 
-fn collect_strm_files(
+fn collect_media_files(
     node: &VfsNode,
     name: &str,
     current_path: String,
-    files: &mut Vec<(String, String)>,
+    files: &mut Vec<(String, String, u64)>,
 ) {
     match node {
         VfsNode::Directory { children } => {
@@ -309,16 +295,16 @@ fn collect_strm_files(
                 format!("{}/{}", current_path, name)
             };
             for (child_name, child) in children {
-                collect_strm_files(child, child_name, next_path.clone(), files);
+                collect_media_files(child, child_name, next_path.clone(), files);
             }
         }
-        VfsNode::StrmFile { rd_link, .. } => {
+        VfsNode::MediaFile { rd_link, file_size, .. } => {
             let full_path = if current_path.is_empty() {
                 name.to_string()
             } else {
                 format!("{}/{}", current_path, name)
             };
-            files.push((full_path, rd_link.clone()));
+            files.push((full_path, rd_link.clone(), *file_size));
         }
         VfsNode::VirtualFile { .. } => {}
     }
@@ -328,26 +314,26 @@ fn count_nfo_and_folders(
     node: &VfsNode,
     name: &str,
     nfo_count: &mut usize,
-    strm_folders: &mut std::collections::HashSet<String>,
+    media_folders: &mut std::collections::HashSet<String>,
 ) {
     match node {
         VfsNode::Directory { children } => {
-            let has_strm = children
+            let has_media = children
                 .values()
-                .any(|child| matches!(child, VfsNode::StrmFile { .. }));
+                .any(|child| matches!(child, VfsNode::MediaFile { .. }));
             let has_nfo = children
                 .keys()
                 .any(|k| k.ends_with(".nfo"));
 
-            if has_strm {
-                strm_folders.insert(name.to_string());
+            if has_media {
+                media_folders.insert(name.to_string());
             }
             if has_nfo {
                 *nfo_count += 1;
             }
 
             for (child_name, child) in children {
-                count_nfo_and_folders(child, child_name, nfo_count, strm_folders);
+                count_nfo_and_folders(child, child_name, nfo_count, media_folders);
             }
         }
         _ => {}

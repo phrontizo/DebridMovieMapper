@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     user: "65534:65534"
     ports:
-      - "8082:8080"
+      - "8080:8080"
     environment:
       - RD_API_TOKEN=your_real_debrid_token
       - TMDB_API_KEY=your_tmdb_api_key
@@ -32,19 +32,15 @@ services:
     volumes:
       - ./rclone.conf:/config/rclone/rclone.conf
       - ./rclone:/data:rshared
-    tmpfs:
-      - /cache:mode=700,uid=65534,gid=65534
     environment:
       - TZ=Europe/London
     command: >
       mount debrid: /data
-      --vfs-cache-mode writes
-      --vfs-cache-max-size 1G
+      --vfs-cache-mode off
       --allow-other
       --allow-non-empty
       --dir-cache-time 10s
       --poll-interval 15s
-      --cache-dir /cache
 
   jellyfin:
     image: jellyfin/jellyfin:latest

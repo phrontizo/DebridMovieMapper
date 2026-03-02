@@ -74,7 +74,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_rx,
     ));
 
-    let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone(), repair_manager.clone());
+    let http_client = reqwest::Client::new();
+    let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone(), repair_manager.clone(), http_client);
     let dav_handler = DavHandler::builder()
         .filesystem(Box::new(dav_fs))
         .locksystem(dav_server::fakels::FakeLs::new())

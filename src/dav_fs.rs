@@ -3,25 +3,35 @@ use dav_server::davpath::DavPath;
 use futures_util::FutureExt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::vfs::{DebridVfs, VfsNode, STRM_FIXED_SIZE};
+use crate::vfs::{DebridVfs, VfsNode};
 use crate::rd_client::RealDebridClient;
 use crate::repair::RepairManager;
 use bytes::Bytes;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// 2 MB read-ahead buffer per open file
+const BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct DebridFileSystem {
     vfs: Arc<RwLock<DebridVfs>>,
     rd_client: Arc<RealDebridClient>,
     repair_manager: Arc<RepairManager>,
+    http_client: reqwest::Client,
 }
 
 impl DebridFileSystem {
-    pub fn new(rd_client: Arc<RealDebridClient>, vfs: Arc<RwLock<DebridVfs>>, repair_manager: Arc<RepairManager>) -> Self {
+    pub fn new(
+        rd_client: Arc<RealDebridClient>,
+        vfs: Arc<RwLock<DebridVfs>>,
+        repair_manager: Arc<RepairManager>,
+        http_client: reqwest::Client,
+    ) -> Self {
         Self {
             vfs,
             rd_client,
             repair_manager,
+            http_client,
         }
     }
 
@@ -63,15 +73,19 @@ impl DavFileSystem for DebridFileSystem {
                 .unwrap_or("")
                 .to_string();
             match node {
-                VfsNode::StrmFile { rd_link, rd_torrent_id, .. } => {
-                    Ok(Box::new(StrmFile {
+                VfsNode::MediaFile { file_size, rd_link, rd_torrent_id } => {
+                    Ok(Box::new(ProxiedMediaFile {
                         name,
                         rd_link,
                         rd_torrent_id,
+                        file_size,
                         repair_manager: self.repair_manager.clone(),
                         rd_client: self.rd_client.clone(),
+                        http_client: self.http_client.clone(),
                         pos: 0,
-                        resolved_content: None,
+                        cdn_url: None,
+                        buffer: Vec::new(),
+                        buffer_start: 0,
                     }) as Box<dyn DavFile>)
                 }
                 VfsNode::VirtualFile { content } => {
@@ -133,7 +147,7 @@ struct DebridMetaData {
 impl DavMetaData for DebridMetaData {
     fn len(&self) -> u64 {
         match &self.node {
-            VfsNode::StrmFile { strm_content, .. } => strm_content.len() as u64,
+            VfsNode::MediaFile { file_size, .. } => *file_size,
             VfsNode::VirtualFile { content, .. } => content.len() as u64,
             VfsNode::Directory { .. } => 0,
         }
@@ -171,37 +185,39 @@ fn should_repair_on_unrestrict_error(status: Option<reqwest::StatusCode>) -> boo
     status == Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
 }
 
-/// A STRM file that lazily unrestricts its RD link on first access.
-/// The resolved download URL is cached so metadata() and read_bytes() are consistent.
+/// A media file that lazily unrestricts its RD link and proxies CDN bytes.
+/// The CDN URL is cached per open instance. Reads use a 2MB buffer for read-ahead.
 #[derive(Debug)]
-struct StrmFile {
+struct ProxiedMediaFile {
     name: String,
     rd_link: String,
     rd_torrent_id: String,
+    file_size: u64,
     repair_manager: Arc<RepairManager>,
     rd_client: Arc<RealDebridClient>,
+    http_client: reqwest::Client,
     pos: u64,
-    resolved_content: Option<Bytes>,
+    cdn_url: Option<String>,
+    buffer: Vec<u8>,
+    buffer_start: u64,
 }
 
-impl StrmFile {
-    /// Lazily resolve the unrestricted download URL, caching the result.
-    async fn resolve(&mut self) -> Result<Bytes, FsError> {
-        if let Some(ref content) = self.resolved_content {
-            return Ok(content.clone());
+impl ProxiedMediaFile {
+    /// Lazily resolve the CDN download URL, caching the result.
+    async fn resolve_cdn_url(&mut self) -> Result<String, FsError> {
+        if let Some(ref url) = self.cdn_url {
+            return Ok(url.clone());
         }
 
         match self.rd_client.unrestrict_link(&self.rd_link).await {
             Ok(response) => {
-                let mut buf = format!("{}\n", response.download).into_bytes();
-                buf.resize(STRM_FIXED_SIZE, b' ');
-                let content = Bytes::from(buf);
-                self.resolved_content = Some(content.clone());
-                Ok(content)
+                let url = response.download;
+                self.cdn_url = Some(url.clone());
+                Ok(url)
             }
             Err(e) => {
                 if should_repair_on_unrestrict_error(e.status()) {
-                    tracing::error!("Re-unrestrict returned 503 for {} — triggering repair", self.name);
+                    tracing::error!("Unrestrict returned 503 for {} — triggering repair", self.name);
                     let repair_manager = self.repair_manager.clone();
                     let torrent_id = self.rd_torrent_id.clone();
                     let link = self.rd_link.clone();
@@ -212,15 +228,70 @@ impl StrmFile {
                         }
                     });
                 } else {
-                    tracing::warn!("Re-unrestrict failed for {} (not repairing): {}", self.name, e);
+                    tracing::warn!("Unrestrict failed for {} (not repairing): {}", self.name, e);
                 }
                 Err(FsError::GeneralFailure)
             }
         }
     }
+
+    /// Fetch bytes from CDN, using the read-ahead buffer.
+    async fn fetch_bytes(&mut self, len: usize) -> Result<Bytes, FsError> {
+        if self.pos >= self.file_size {
+            return Ok(Bytes::new());
+        }
+
+        let pos = self.pos;
+        let buffer_end = self.buffer_start + self.buffer.len() as u64;
+
+        // Check if the requested range is within the buffer
+        if pos >= self.buffer_start && pos < buffer_end {
+            let offset = (pos - self.buffer_start) as usize;
+            let available = self.buffer.len() - offset;
+            let to_read = std::cmp::min(len, available);
+            let data = Bytes::copy_from_slice(&self.buffer[offset..offset + to_read]);
+            self.pos += to_read as u64;
+            return Ok(data);
+        }
+
+        // Buffer miss — fetch from CDN
+        let cdn_url = self.resolve_cdn_url().await?;
+        let fetch_size = std::cmp::max(len, BUFFER_SIZE) as u64;
+        let range_end = std::cmp::min(pos + fetch_size - 1, self.file_size - 1);
+
+        let resp = self.http_client
+            .get(&cdn_url)
+            .header("Range", format!("bytes={}-{}", pos, range_end))
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!("CDN fetch failed for {}: {}", self.name, e);
+                FsError::GeneralFailure
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            tracing::warn!("CDN returned {} for {}", status, self.name);
+            return Err(FsError::GeneralFailure);
+        }
+
+        let body = resp.bytes().await.map_err(|e| {
+            tracing::warn!("CDN body read failed for {}: {}", self.name, e);
+            FsError::GeneralFailure
+        })?;
+
+        // Store in buffer
+        self.buffer = body.to_vec();
+        self.buffer_start = pos;
+
+        let to_read = std::cmp::min(len, self.buffer.len());
+        let data = Bytes::copy_from_slice(&self.buffer[..to_read]);
+        self.pos += to_read as u64;
+        Ok(data)
+    }
 }
 
-impl DavFile for StrmFile {
+impl DavFile for ProxiedMediaFile {
     fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
         async move {
             if self.repair_manager.should_hide_torrent(&self.rd_torrent_id).await {
@@ -230,9 +301,12 @@ impl DavFile for StrmFile {
                 }) as Box<dyn DavMetaData>);
             }
 
-            let content = self.resolve().await?;
             Ok(Box::new(DebridMetaData {
-                node: VfsNode::VirtualFile { content: content.to_vec() },
+                node: VfsNode::MediaFile {
+                    file_size: self.file_size,
+                    rd_link: self.rd_link.clone(),
+                    rd_torrent_id: self.rd_torrent_id.clone(),
+                },
                 modified_time: SystemTime::UNIX_EPOCH,
             }) as Box<dyn DavMetaData>)
         }.boxed()
@@ -252,15 +326,7 @@ impl DavFile for StrmFile {
                 return Err(FsError::GeneralFailure);
             }
 
-            let content = self.resolve().await?;
-            if self.pos >= content.len() as u64 {
-                return Ok(Bytes::new());
-            }
-            let start = self.pos as usize;
-            let end = std::cmp::min(start + len, content.len());
-            let data = content.slice(start..end);
-            self.pos += data.len() as u64;
-            Ok(data)
+            self.fetch_bytes(len).await
         }.boxed()
     }
 
@@ -276,8 +342,7 @@ impl DavFile for StrmFile {
                     result as u64
                 }
                 std::io::SeekFrom::End(p) => {
-                    let content = self.resolve().await?;
-                    let size = content.len() as i64;
+                    let size = self.file_size as i64;
                     let result = size.checked_add(p)
                         .filter(|&n| n >= 0)
                         .ok_or(FsError::GeneralFailure)?;
@@ -298,21 +363,25 @@ impl DavFile for StrmFile {
 mod tests {
     use super::*;
 
-    /// Compile-time check: StrmFile has rd_link and rd_client fields.
+    /// Compile-time check: ProxiedMediaFile has rd_link and rd_client fields.
     /// Fails to compile if either field is removed or renamed.
     #[allow(dead_code)]
-    fn _assert_strm_file_has_on_demand_fields(
+    fn _assert_proxied_media_file_has_on_demand_fields(
         repair_manager: Arc<RepairManager>,
         rd_client: Arc<RealDebridClient>,
     ) {
-        let _ = StrmFile {
+        let _ = ProxiedMediaFile {
             name: String::new(),
             rd_link: String::new(),
             rd_torrent_id: String::new(),
+            file_size: 0,
             repair_manager,
             rd_client,
+            http_client: reqwest::Client::new(),
             pos: 0,
-            resolved_content: None,
+            cdn_url: None,
+            buffer: Vec::new(),
+            buffer_start: 0,
         };
     }
 
