@@ -217,16 +217,28 @@ impl ProxiedMediaFile {
             }
             Err(e) => {
                 if should_repair_on_unrestrict_error(e.status()) {
-                    tracing::error!("Unrestrict returned 503 for {} — triggering repair", self.name);
-                    let repair_manager = self.repair_manager.clone();
-                    let torrent_id = self.rd_torrent_id.clone();
-                    let link = self.rd_link.clone();
-                    repair_manager.mark_broken(&torrent_id, &link).await;
-                    tokio::spawn(async move {
-                        if let Err(e) = repair_manager.repair_by_id(&torrent_id).await {
-                            tracing::error!("Repair failed for {}: {}", torrent_id, e);
+                    tracing::warn!("Unrestrict returned 503 for {} — attempting instant repair", self.name);
+                    match self.repair_manager.try_instant_repair(&self.rd_torrent_id, &self.rd_link).await {
+                        Ok(result) => {
+                            tracing::info!("Instant repair succeeded for {} — new torrent {}", self.name, result.new_torrent_id);
+                            self.rd_torrent_id = result.new_torrent_id;
+                            self.rd_link = result.new_rd_link;
+                            // Unrestrict the new link immediately
+                            match self.rd_client.unrestrict_link(&self.rd_link).await {
+                                Ok(response) => {
+                                    let url = response.download;
+                                    self.cdn_url = Some(url.clone());
+                                    return Ok(url);
+                                }
+                                Err(e2) => {
+                                    tracing::error!("Failed to unrestrict repaired link for {}: {}", self.name, e2);
+                                }
+                            }
                         }
-                    });
+                        Err(reason) => {
+                            tracing::error!("Instant repair failed for {}: {} — file unavailable", self.name, reason);
+                        }
+                    }
                 } else {
                     tracing::warn!("Unrestrict failed for {} (not repairing): {}", self.name, e);
                 }
