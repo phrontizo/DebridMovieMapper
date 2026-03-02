@@ -68,8 +68,8 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 | `rd_client.rs` | Real-Debrid API client with adaptive token bucket rate limiter, 1-hour response cache |
 | `identification.rs` | Filename cleaning, camelCase splitting, TMDB scoring to identify movies/shows |
 | `vfs.rs` | In-memory virtual filesystem: creates `Movies/`+`Shows/` hierarchy with media files and NFO metadata |
-| `dav_fs.rs` | Maps VFS to WebDAV; re-unrestricts links on read, attempts synchronous instant repair on 503 |
-| `repair.rs` | Torrent repair state machine (Healthy→Broken→Repairing→Failed), instant repair for cached torrents |
+| `dav_fs.rs` | Maps VFS to WebDAV; lazily unrestricts links on read (cached 1h), attempts synchronous instant repair on 503 |
+| `repair.rs` | Torrent repair state machine (Healthy→Broken→Repairing→Failed), instant repair for cached torrents (30s cooldown, max 3 attempts) |
 | `tmdb_client.rs` | TMDB search for movies and TV shows |
 | `error.rs` | Unified error type (`AppError`) using `thiserror` |
 | `jellyfin_client.rs` | Optional Jellyfin notification client — notifies Jellyfin of changed paths via `POST /Library/Media/Updated` |
@@ -104,3 +104,5 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
   ```
   Integration test binaries must run sequentially (not `-- --ignored` on all at once) because they share the redb database lock and the Real-Debrid API rate limit. Do not commit if any test fails.
 - **Integration tests must be updated for new functionality.** When adding or changing features, update the integration tests to cover the new behavior. Integration tests are the final gate before committing.
+- **Additional integration test files** (all `#[ignore]`, require API tokens): `test_all_rd_torrents.rs`, `test_identification_stats.rs`, `test_short_titles.rs`, `test_media_generation.rs`, `video_player_simulation.rs`. These are supplementary and not part of the pre-commit gate.
+- **Before every commit, validate that `CLAUDE.md` and `README.md` are up-to-date.** If the commit introduces new features, env vars, modules, architectural changes, or modifies existing behavior, update both files to reflect the changes. Documentation must stay in sync with code at all times.

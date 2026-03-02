@@ -428,7 +428,7 @@ impl RealDebridClient {
                                     return Ok(val);
                                 }
                                 Err(e) => {
-                                    error!("Failed to decode RD response: {}. Status: {}, Body: {}",
+                                    error!("Failed to decode RD response: {}. Status: {}, Body: {:.200}",
                                         e, status, text);
                                 }
                             }

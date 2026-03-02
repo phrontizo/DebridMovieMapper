@@ -34,7 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scan_interval_secs = std::env::var("SCAN_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(60);
+        .unwrap_or(60)
+        .max(10); // Enforce minimum 10s to prevent hammering the Real-Debrid API
 
     info!("Scan interval: {}s", scan_interval_secs);
 

@@ -1,5 +1,6 @@
 use crate::vfs::{VfsChange, UpdateType};
 use std::time::Duration;
+use reqwest::header::HeaderValue;
 use tracing::info;
 
 const MAX_RETRIES: u32 = 10;
@@ -10,16 +11,20 @@ const NOTIFICATION_DELAY: Duration = Duration::from_secs(15);
 
 pub struct JellyfinClient {
     url: String,
-    api_key: String,
+    /// Pre-built sensitive header value so the key is never printed in debug output.
+    api_key_header: HeaderValue,
     mount_path: String,
     http: reqwest::Client,
 }
 
 impl JellyfinClient {
     pub fn new(url: String, api_key: String, mount_path: String) -> Self {
+        let mut api_key_header = HeaderValue::from_str(&api_key)
+            .expect("Jellyfin API key contains characters invalid for an HTTP header value");
+        api_key_header.set_sensitive(true);
         Self {
             url: url.trim_end_matches('/').to_string(),
-            api_key,
+            api_key_header,
             mount_path: mount_path.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
         }
@@ -71,7 +76,7 @@ impl JellyfinClient {
 
             let result = self.http
                 .post(&url)
-                .header("X-Emby-Token", &self.api_key)
+                .header("X-Emby-Token", self.api_key_header.clone())
                 .json(&body)
                 .send()
                 .await;
@@ -91,10 +96,11 @@ impl JellyfinClient {
                         );
                         continue;
                     }
+                    let body = response.text().await.unwrap_or_default();
                     tracing::warn!(
-                        "Jellyfin notification returned status {}: {}",
+                        "Jellyfin notification returned status {}: {:.200}",
                         status,
-                        response.text().await.unwrap_or_default()
+                        body
                     );
                     return;
                 }

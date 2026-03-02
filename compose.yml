@@ -15,6 +15,11 @@ services:
       - JELLYFIN_RCLONE_MOUNT_PATH=/media
     volumes:
       - ./metadata.db:/metadata.db
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
 
   rclone:
     image: rclone/rclone:latest

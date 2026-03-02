@@ -73,7 +73,7 @@ impl TmdbClient {
         match self.fetch_with_retry(|| self.client.get(url).query(&params)).await {
             Ok(resp) => resp.results,
             Err(e) => {
-                error!("TMDB search failed: {}", e);
+                error!("TMDB search failed: {}", e.without_url());
                 Vec::new()
             }
         }
@@ -112,12 +112,14 @@ impl TmdbClient {
                     match resp.error_for_status() {
                         Ok(resp) => return resp.json::<TmdbResponse>().await,
                         Err(e) => {
+                            let e = e.without_url();
                             warn!("TMDB API error (attempt {}/{}): {}", attempt, max_attempts, e);
                             last_error = Some(e);
                         }
                     }
                 }
                 Err(e) => {
+                    let e = e.without_url();
                     warn!("TMDB request failed (attempt {}/{}): {}", attempt, max_attempts, e);
                     last_error = Some(e);
                 }
