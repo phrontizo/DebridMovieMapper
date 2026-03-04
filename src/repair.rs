@@ -57,6 +57,15 @@ impl RepairManager {
         self.health_status.clone()
     }
 
+    /// Delete a torrent that was created by add_magnet but whose repair failed.
+    /// Prevents duplicate torrents from accumulating in Real-Debrid.
+    async fn cleanup_leaked_torrent(&self, new_torrent_id: &str) {
+        warn!("Cleaning up leaked torrent {} after failed repair", new_torrent_id);
+        if let Err(e) = self.rd_client.delete_torrent(new_torrent_id).await {
+            error!("Failed to clean up leaked torrent {}: {}", new_torrent_id, e);
+        }
+    }
+
     async fn set_repair_failed(&self, torrent_id: &str) {
         let mut health_map = self.health_status.write().await;
         if let Some(health) = health_map.get_mut(torrent_id) {
@@ -212,18 +221,21 @@ impl RepairManager {
                                 }
                                 Err(e) => {
                                     error!("Failed to select files for repaired torrent {}: {}", add_response.id, e);
+                                    self.cleanup_leaked_torrent(&add_response.id).await;
                                     self.set_repair_failed(&torrent_info.id).await;
                                     Err(format!("Failed to select files: {}", e))
                                 }
                             }
                         } else {
                             error!("No matching files found in repaired torrent {}", add_response.id);
+                            self.cleanup_leaked_torrent(&add_response.id).await;
                             self.set_repair_failed(&torrent_info.id).await;
                             Err("No matching files found".to_string())
                         }
                     }
                     Err(e) => {
                         error!("Failed to get info for repaired torrent {}: {}", add_response.id, e);
+                        self.cleanup_leaked_torrent(&add_response.id).await;
                         self.set_repair_failed(&torrent_info.id).await;
                         Err(format!("Failed to get torrent info: {}", e))
                     }
@@ -343,6 +355,7 @@ impl RepairManager {
         let new_info = match self.rd_client.get_torrent_info(&add_response.id).await {
             Ok(info) => info,
             Err(e) => {
+                self.cleanup_leaked_torrent(&add_response.id).await;
                 self.set_repair_failed(torrent_id).await;
                 return Err(format!("Failed to get new torrent info: {}", e));
             }
@@ -359,6 +372,7 @@ impl RepairManager {
             .collect();
 
         if selected_file_ids.is_empty() {
+            self.cleanup_leaked_torrent(&add_response.id).await;
             self.set_repair_failed(torrent_id).await;
             return Err("No matching files found in new torrent".to_string());
         }
@@ -366,6 +380,7 @@ impl RepairManager {
         let file_ids_str = selected_file_ids.join(",");
         info!("Instant repair: selecting files {} on torrent {}", file_ids_str, add_response.id);
         if let Err(e) = self.rd_client.select_files(&add_response.id, &file_ids_str).await {
+            self.cleanup_leaked_torrent(&add_response.id).await;
             self.set_repair_failed(torrent_id).await;
             return Err(format!("Failed to select files: {}", e));
         }
@@ -377,6 +392,7 @@ impl RepairManager {
         let final_info = match self.rd_client.get_torrent_info(&add_response.id).await {
             Ok(info) => info,
             Err(e) => {
+                self.cleanup_leaked_torrent(&add_response.id).await;
                 self.set_repair_failed(torrent_id).await;
                 return Err(format!("Failed to get final torrent info: {}", e));
             }
@@ -387,6 +403,7 @@ impl RepairManager {
             let new_link = match final_info.links.get(link_index) {
                 Some(link) => link.clone(),
                 None => {
+                    self.cleanup_leaked_torrent(&add_response.id).await;
                     self.set_repair_failed(torrent_id).await;
                     return Err(format!(
                         "Link index {} out of bounds (new torrent has {} links)",

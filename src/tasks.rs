@@ -83,9 +83,39 @@ pub async fn run_scan_loop(
                 if torrents.is_empty() {
                     warn!("No torrents found in Real Debrid account.");
                 }
+
+                // Deduplicate torrents by hash — keep the newest "downloaded" entry per hash.
+                // Duplicates arise when repair's add_magnet leaks a torrent, or when
+                // external tools (e.g. DebridMediaManager) re-add the same hash.
+                let mut seen_hashes: HashMap<String, usize> = HashMap::new();
+                let mut deduped_torrents: Vec<&crate::rd_client::Torrent> = Vec::new();
+                for torrent in &torrents {
+                    if torrent.status != "downloaded" || torrent.hash.is_empty() {
+                        deduped_torrents.push(torrent);
+                        continue;
+                    }
+                    if let Some(&existing_idx) = seen_hashes.get(&torrent.hash) {
+                        // Keep the one we already have (first seen = first in API response = newest),
+                        // schedule the duplicate for deletion
+                        let kept = &deduped_torrents[existing_idx];
+                        warn!("Duplicate hash {} found: keeping torrent {} ({}), deleting duplicate {} ({})",
+                            torrent.hash, kept.id, kept.filename, torrent.id, torrent.filename);
+                        let rd = rd_client.clone();
+                        let dup_id = torrent.id.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = rd.delete_torrent(&dup_id).await {
+                                tracing::error!("Failed to delete duplicate torrent {}: {}", dup_id, e);
+                            }
+                        });
+                    } else {
+                        seen_hashes.insert(torrent.hash.clone(), deduped_torrents.len());
+                        deduped_torrents.push(torrent);
+                    }
+                }
+
                 let mut current_data = Vec::new();
                 let mut to_identify = Vec::new();
-                for torrent in &torrents {
+                for torrent in &deduped_torrents {
                     if torrent.status == "downloaded" {
                         if let Some(data) = seen_torrents.get(&torrent.id) {
                             current_data.push(data.clone());
@@ -121,13 +151,13 @@ pub async fn run_scan_loop(
                                     }
                                     Err(e) => {
                                         error!("Failed to get info for repair replacement {}: {}, falling back to re-identification", torrent.id, e);
-                                        to_identify.push(torrent.clone());
+                                        to_identify.push((*torrent).clone());
                                     }
                                 }
                             } else {
                                 // Old ID not in seen_torrents (edge case), fall back to normal identification
                                 info!("Repair replacement old_id {} not found in seen_torrents, re-identifying {}", old_id, torrent.id);
-                                to_identify.push(torrent.clone());
+                                to_identify.push((*torrent).clone());
                             }
                         } else {
                             let db_clone = db.clone();
@@ -150,7 +180,7 @@ pub async fn run_scan_loop(
                                 seen_torrents.insert(torrent.id.clone(), data.clone());
                                 current_data.push(data);
                             } else {
-                                to_identify.push(torrent.clone());
+                                to_identify.push((*torrent).clone());
                             }
                         }
                     }
@@ -182,7 +212,7 @@ pub async fn run_scan_loop(
                         })
                         .buffer_unordered(1);
 
-                    let new_total = torrents
+                    let new_total = deduped_torrents
                         .iter()
                         .filter(|t| t.status == "downloaded" && !seen_torrents.contains_key(&t.id))
                         .count();
@@ -232,7 +262,7 @@ pub async fn run_scan_loop(
                 }
 
                 let current_ids: std::collections::HashSet<String> =
-                    torrents.iter().map(|t| t.id.clone()).collect();
+                    deduped_torrents.iter().map(|t| t.id.clone()).collect();
                 // Collect stale IDs before retain so we can clean up redb
                 let stale_ids: Vec<String> = seen_torrents.keys()
                     .filter(|id| !current_ids.contains(*id))
