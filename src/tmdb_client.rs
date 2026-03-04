@@ -50,7 +50,7 @@ impl TmdbClient {
         let year_string;
         if let Some(y) = year {
             year_string = y.to_string();
-            params.push(("year", &year_string));
+            params.push(("primary_release_year", &year_string));
         }
         self.search(url, params).await
     }

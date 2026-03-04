@@ -7,7 +7,7 @@ use crate::vfs::{MediaMetadata, MediaType, is_video_file, VIDEO_EXTENSIONS};
 
 static CAMEL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([a-z])([A-Z])").unwrap());
 
-static PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(\[.*?\]|\(.*?\)|[\w.-]+\.[a-z]{2,6}\s+-\s+|d3us-|m-|Bond[\s.]+\d+|James[\s.]*Bond|007)\s*").unwrap());
+static PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(\[.*?\]|\(.*?\)|[\w.-]+\.[a-z]{2,6}\s+-\s+)\s*").unwrap());
 
 static YEAR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(19|20)\d{2}\b").unwrap());
 
@@ -244,6 +244,42 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
             );
             tv_results.extend(tv_extra);
             movie_results.extend(movie_extra);
+        }
+    }
+
+    // If still no results, try stripping leading words (handles franchise prefixes like "Bond 50 Goldfinger")
+    if tv_results.is_empty() && movie_results.is_empty() {
+        let words: Vec<&str> = cleaned_name.split_whitespace().collect();
+        for start in 1..words.len() {
+            let stripped = words[start..].join(" ");
+            if stripped.is_empty() || is_generic_title(&stripped) { continue; }
+            debug!("No results for '{}', trying stripped: '{}'", cleaned_name, stripped);
+            let (tv_extra, movie_extra) = tokio::join!(
+                tmdb.search_tv(&stripped, year.as_deref()),
+                tmdb.search_movie(&stripped, year.as_deref())
+            );
+            if !tv_extra.is_empty() || !movie_extra.is_empty() {
+                tv_results.extend(tv_extra);
+                movie_results.extend(movie_extra);
+                break;
+            }
+        }
+    }
+
+    // If still no results and name contains a dash, try the part after the first dash
+    // (handles release group prefixes like "d3us-Title" or "m-Title")
+    if tv_results.is_empty() && movie_results.is_empty() {
+        if let Some(pos) = cleaned_name.find('-') {
+            let after_dash = cleaned_name[pos + 1..].trim();
+            if !after_dash.is_empty() && !is_generic_title(after_dash) {
+                debug!("No results for '{}', trying after dash: '{}'", cleaned_name, after_dash);
+                let (tv_extra, movie_extra) = tokio::join!(
+                    tmdb.search_tv(after_dash, year.as_deref()),
+                    tmdb.search_movie(after_dash, year.as_deref())
+                );
+                tv_results.extend(tv_extra);
+                movie_results.extend(movie_extra);
+            }
         }
     }
 
@@ -694,5 +730,84 @@ mod tests {
         assert_eq!(metadata.external_id, Some("tmdb:19566".to_string()));
         assert_eq!(metadata.title, "Frank Herbert's Dune");
         assert_eq!(metadata.media_type, MediaType::Show);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_don_2022_tamil_identification() {
+        dotenvy::dotenv().ok();
+        let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
+        let tmdb_client = TmdbClient::new(tmdb_api_key);
+
+        let info = TorrentInfo {
+            id: "don_id".to_string(),
+            filename: "Don (2022) UNCUT 1080p 10bit NF WEBRip x265 HEVC [Org YT Hindi DD 2.0 ~192Kbps + Tamil DD 5.1] ESub ~ Immortal.mkv".to_string(),
+            original_filename: "Don (2022) UNCUT 1080p 10bit NF WEBRip x265 HEVC [Org YT Hindi DD 2.0 ~192Kbps + Tamil DD 5.1] ESub ~ Immortal.mkv".to_string(),
+            hash: "hash".to_string(),
+            bytes: 2000000000,
+            original_bytes: 2000000000,
+            host: "host".to_string(),
+            split: 1,
+            progress: 100.0,
+            status: "downloaded".to_string(),
+            added: "2022-05-12".to_string(),
+            files: vec![
+                TorrentFile {
+                    id: 1,
+                    path: "Don (2022) UNCUT 1080p 10bit NF WEBRip x265 HEVC [Org YT Hindi DD 2.0 ~192Kbps + Tamil DD 5.1] ESub ~ Immortal.mkv".to_string(),
+                    bytes: 2000000000,
+                    selected: 1,
+                }
+            ],
+            links: vec!["http://link1".to_string()],
+            ended: Some("2022-05-12".to_string()),
+        };
+
+        let metadata = identify_torrent(&info, &tmdb_client).await;
+
+        // Should identify as the 2022 Tamil movie "Don" (895033)
+        // NOT "Makoto Kitano: Don't You Guys Go..." (1266372)
+        assert_eq!(metadata.external_id, Some("tmdb:895033".to_string()));
+        assert_eq!(metadata.title, "Don");
+        assert_eq!(metadata.media_type, MediaType::Movie);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_bond_collection_prefix_stripped_generically() {
+        dotenvy::dotenv().ok();
+        let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
+        let tmdb_client = TmdbClient::new(tmdb_api_key);
+
+        let info = TorrentInfo {
+            id: "bond_id".to_string(),
+            filename: "Bond.50.Goldfinger.1964.1080p.BluRay.x264.mkv".to_string(),
+            original_filename: "Bond.50.Goldfinger.1964.1080p.BluRay.x264.mkv".to_string(),
+            hash: "hash".to_string(),
+            bytes: 5000000000,
+            original_bytes: 5000000000,
+            host: "host".to_string(),
+            split: 1,
+            progress: 100.0,
+            status: "downloaded".to_string(),
+            added: "1964-01-01".to_string(),
+            files: vec![
+                TorrentFile {
+                    id: 1,
+                    path: "Bond.50.Goldfinger.1964.1080p.BluRay.x264.mkv".to_string(),
+                    bytes: 5000000000,
+                    selected: 1,
+                }
+            ],
+            links: vec!["http://link1".to_string()],
+            ended: Some("1964-01-01".to_string()),
+        };
+
+        let metadata = identify_torrent(&info, &tmdb_client).await;
+
+        // Should identify as Goldfinger (658) via word-stripping fallback
+        assert_eq!(metadata.external_id, Some("tmdb:658".to_string()));
+        assert_eq!(metadata.title, "Goldfinger");
+        assert_eq!(metadata.media_type, MediaType::Movie);
     }
 }
