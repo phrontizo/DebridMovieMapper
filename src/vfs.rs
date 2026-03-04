@@ -253,7 +253,9 @@ impl DebridVfs {
                     let mut show_max_ts = UNIX_EPOCH;
 
                     // For shows, we process all torrents (e.g. different seasons)
-                    // They are already sorted by size, so larger files will overwrite smaller ones if paths match
+                    // Torrents are sorted by size descending, so larger (better quality) torrents
+                    // are processed first. If a file with the same name already exists in a season
+                    // directory, skip it to avoid creating (1)/(2) duplicates from repair replacements.
                     for torrent in torrents {
                         let torrent_ts = parse_rd_date(&torrent.added);
                         if torrent_ts > show_max_ts { show_max_ts = torrent_ts; }
@@ -283,6 +285,11 @@ impl DebridVfs {
                                         });
 
                                         if let VfsNode::Directory { children: season_children } = season_dir {
+                                            // Skip if this episode already exists (from a larger/earlier torrent)
+                                            if season_children.contains_key(filename) {
+                                                link_idx += 1;
+                                                continue;
+                                            }
                                             let strm_name = Self::add_path_to_tree(season_children, filename, file.bytes, torrent.id.clone(), link.clone());
                                             timestamps.insert(format!("{}/{}/{}", show_prefix, season_name, strm_name), torrent_ts);
                                         }
@@ -1079,6 +1086,88 @@ mod tests {
         // Root-level dirs get max of all their children
         assert_eq!(vfs.timestamps.get("Movies"), Some(&movie_ts));
         assert_eq!(vfs.timestamps.get("Shows"), Some(&show_ts));
+    }
+
+    #[test]
+    fn show_duplicate_torrents_deduplicated() {
+        // When two torrents for the same show have identical episode filenames
+        // (e.g. after repair creates a replacement torrent), the VFS should
+        // keep only one copy per episode, not create (1)/(2) duplicates.
+        let metadata = MediaMetadata {
+            title: "Mr. Mercedes".to_string(),
+            year: Some("2017".to_string()),
+            media_type: MediaType::Show,
+            external_id: Some("tmdb:70485".to_string()),
+        };
+
+        let torrents = vec![
+            (
+                TorrentInfo {
+                    id: "old_torrent".to_string(),
+                    filename: "Mr.Mercedes.S03".to_string(),
+                    original_filename: "Mr.Mercedes.S03".to_string(),
+                    hash: "h1".to_string(),
+                    bytes: 5000,
+                    original_bytes: 5000,
+                    host: "h".to_string(),
+                    split: 1,
+                    progress: 100.0,
+                    status: "downloaded".to_string(),
+                    added: "2023-01-01".to_string(),
+                    files: vec![
+                        TorrentFile { id: 1, path: "/Mr.Mercedes.S03E01.mkv".to_string(), bytes: 2500, selected: 1 },
+                        TorrentFile { id: 2, path: "/Mr.Mercedes.S03E02.mkv".to_string(), bytes: 2500, selected: 1 },
+                    ],
+                    links: vec!["http://old_link1".to_string(), "http://old_link2".to_string()],
+                    ended: Some("2023".to_string()),
+                },
+                metadata.clone(),
+            ),
+            (
+                TorrentInfo {
+                    id: "new_torrent".to_string(),
+                    filename: "Mr.Mercedes.S03".to_string(),
+                    original_filename: "Mr.Mercedes.S03".to_string(),
+                    hash: "h1".to_string(),
+                    bytes: 5000,
+                    original_bytes: 5000,
+                    host: "h".to_string(),
+                    split: 1,
+                    progress: 100.0,
+                    status: "downloaded".to_string(),
+                    added: "2023-01-02".to_string(),
+                    files: vec![
+                        TorrentFile { id: 1, path: "/Mr.Mercedes.S03E01.mkv".to_string(), bytes: 2500, selected: 1 },
+                        TorrentFile { id: 2, path: "/Mr.Mercedes.S03E02.mkv".to_string(), bytes: 2500, selected: 1 },
+                    ],
+                    links: vec!["http://new_link1".to_string(), "http://new_link2".to_string()],
+                    ended: Some("2023".to_string()),
+                },
+                metadata,
+            ),
+        ];
+
+        let vfs = DebridVfs::build(torrents);
+
+        if let VfsNode::Directory { children } = &vfs.root {
+            let shows = children.get("Shows").unwrap();
+            if let VfsNode::Directory { children: show_children } = shows {
+                let show_folder = show_children.get("Mr. Mercedes [tmdbid-70485]").expect("Show folder missing");
+                if let VfsNode::Directory { children: show_dirs } = show_folder {
+                    let season = show_dirs.get("Season 03").expect("Season 03 missing");
+                    if let VfsNode::Directory { children: episodes } = season {
+                        // Should have exactly 2 episodes, no (1)/(2) duplicates
+                        assert_eq!(
+                            episodes.len(), 2,
+                            "Expected 2 episodes but got {}: {:?}",
+                            episodes.len(), episodes.keys().collect::<Vec<_>>()
+                        );
+                        assert!(episodes.contains_key("Mr.Mercedes.S03E01.mkv"));
+                        assert!(episodes.contains_key("Mr.Mercedes.S03E02.mkv"));
+                    } else { panic!("Season 03 should be a directory"); }
+                } else { panic!("Show folder should be a directory"); }
+            } else { panic!("Shows should be a directory"); }
+        } else { panic!("Root should be a directory"); }
     }
 
     #[test]

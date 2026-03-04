@@ -233,7 +233,28 @@ pub async fn run_scan_loop(
 
                 let current_ids: std::collections::HashSet<String> =
                     torrents.iter().map(|t| t.id.clone()).collect();
+                // Collect stale IDs before retain so we can clean up redb
+                let stale_ids: Vec<String> = seen_torrents.keys()
+                    .filter(|id| !current_ids.contains(*id))
+                    .cloned()
+                    .collect();
                 seen_torrents.retain(|id, _| current_ids.contains(id));
+                // Remove stale entries from redb to prevent them from reloading on restart
+                if !stale_ids.is_empty() {
+                    info!("Removing {} stale entries from database", stale_ids.len());
+                    let db_clone = db.clone();
+                    let _ = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+                        let write_txn = db_clone.begin_write()?;
+                        {
+                            let mut table = write_txn.open_table(MATCHES_TABLE)?;
+                            for id in &stale_ids {
+                                table.remove(id.as_str())?;
+                            }
+                        }
+                        write_txn.commit()?;
+                        Ok(())
+                    }).await;
+                }
                 info!("VFS update complete.");
             }
             Err(e) => error!("Failed to get torrents: {}", e),
