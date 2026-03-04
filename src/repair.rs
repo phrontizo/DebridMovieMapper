@@ -32,6 +32,9 @@ pub struct TorrentHealth {
 pub struct RepairManager {
     health_status: Arc<RwLock<HashMap<String, TorrentHealth>>>,
     rd_client: Arc<RealDebridClient>,
+    /// Maps new_torrent_id → old_torrent_id for successful repairs.
+    /// The scan loop consumes this to reuse old TMDB identifications.
+    repair_replacements: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl RepairManager {
@@ -39,7 +42,15 @@ impl RepairManager {
         Self {
             health_status: Arc::new(RwLock::new(HashMap::new())),
             rd_client,
+            repair_replacements: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Drains and returns the repair replacements map (new_id → old_id).
+    /// After calling this, the internal map is empty.
+    pub async fn take_repair_replacements(&self) -> HashMap<String, String> {
+        let mut map = self.repair_replacements.write().await;
+        std::mem::take(&mut *map)
     }
 
     pub fn health_status(&self) -> Arc<RwLock<HashMap<String, TorrentHealth>>> {
@@ -187,6 +198,10 @@ impl RepairManager {
                                         repair_attempts: 0,
                                         last_repair_trigger: None,
                                     });
+
+                                    // Record replacement so scan loop reuses old identification
+                                    self.repair_replacements.write().await
+                                        .insert(add_response.id.clone(), torrent_info.id.clone());
 
                                     info!("========================================");
                                     info!("REPAIR COMPLETE: Torrent '{}' successfully repaired!", torrent_info.filename);
@@ -397,6 +412,10 @@ impl RepairManager {
                 last_repair_trigger: None,
             });
 
+            // Record replacement so scan loop reuses old identification
+            self.repair_replacements.write().await
+                .insert(add_response.id.clone(), torrent_id.to_string());
+
             info!("Instant repair SUCCEEDED for torrent {} → new ID {} with link at index {}",
                 torrent_id, add_response.id, link_index);
 
@@ -575,6 +594,39 @@ mod tests {
         let result = manager.try_instant_repair("torrent3", "some_link").await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Repair already in progress");
+    }
+
+    #[tokio::test]
+    async fn repair_replacements_records_and_returns() {
+        let manager = make_test_manager();
+
+        // Manually insert replacements (simulating successful repairs)
+        {
+            let mut map = manager.repair_replacements.write().await;
+            map.insert("new_id_1".to_string(), "old_id_1".to_string());
+            map.insert("new_id_2".to_string(), "old_id_2".to_string());
+        }
+
+        let replacements = manager.take_repair_replacements().await;
+        assert_eq!(replacements.len(), 2);
+        assert_eq!(replacements.get("new_id_1").unwrap(), "old_id_1");
+        assert_eq!(replacements.get("new_id_2").unwrap(), "old_id_2");
+    }
+
+    #[tokio::test]
+    async fn take_repair_replacements_drains_map() {
+        let manager = make_test_manager();
+
+        {
+            let mut map = manager.repair_replacements.write().await;
+            map.insert("new_id".to_string(), "old_id".to_string());
+        }
+
+        let first_call = manager.take_repair_replacements().await;
+        assert_eq!(first_call.len(), 1);
+
+        let second_call = manager.take_repair_replacements().await;
+        assert!(second_call.is_empty());
     }
 
     #[tokio::test]

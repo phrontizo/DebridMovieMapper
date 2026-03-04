@@ -71,6 +71,12 @@ pub async fn run_scan_loop(
             info!("Scan task: shutdown requested, exiting");
             return;
         }
+        // Consume repair replacements (new_id → old_id) before processing torrents
+        let repair_replacements = repair_manager.take_repair_replacements().await;
+        if !repair_replacements.is_empty() {
+            info!("Processing {} repair replacement(s)", repair_replacements.len());
+        }
+
         info!("Refreshing torrent list...");
         match rd_client.get_torrents().await {
             Ok(torrents) => {
@@ -83,6 +89,46 @@ pub async fn run_scan_loop(
                     if torrent.status == "downloaded" {
                         if let Some(data) = seen_torrents.get(&torrent.id) {
                             current_data.push(data.clone());
+                        } else if let Some(old_id) = repair_replacements.get(&torrent.id) {
+                            // This torrent is a repair replacement — reuse old identification
+                            if let Some((old_info, old_metadata)) = seen_torrents.get(old_id) {
+                                info!("Reusing identification for repair replacement {} → {} ({})",
+                                    old_id, torrent.id, old_info.filename);
+                                // Use old metadata but we need fresh TorrentInfo for the new torrent
+                                let metadata = old_metadata.clone();
+                                // Get fresh torrent info for the new ID
+                                match rd_client.get_torrent_info(&torrent.id).await {
+                                    Ok(new_info) => {
+                                        let data = (new_info.clone(), metadata.clone());
+                                        seen_torrents.insert(torrent.id.clone(), data.clone());
+                                        // Update redb: delete old entry, insert new entry
+                                        if let Ok(data_bytes) = serde_json::to_vec(&data) {
+                                            let db_clone = db.clone();
+                                            let new_id = torrent.id.clone();
+                                            let old_id = old_id.clone();
+                                            let _ = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+                                                let write_txn = db_clone.begin_write()?;
+                                                {
+                                                    let mut table = write_txn.open_table(MATCHES_TABLE)?;
+                                                    table.remove(old_id.as_str())?;
+                                                    table.insert(new_id.as_str(), data_bytes.as_slice())?;
+                                                }
+                                                write_txn.commit()?;
+                                                Ok(())
+                                            }).await;
+                                        }
+                                        current_data.push((new_info, metadata));
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to get info for repair replacement {}: {}, falling back to re-identification", torrent.id, e);
+                                        to_identify.push(torrent.clone());
+                                    }
+                                }
+                            } else {
+                                // Old ID not in seen_torrents (edge case), fall back to normal identification
+                                info!("Repair replacement old_id {} not found in seen_torrents, re-identifying {}", old_id, torrent.id);
+                                to_identify.push(torrent.clone());
+                            }
                         } else {
                             let db_clone = db.clone();
                             let torrent_id = torrent.id.clone();
