@@ -15,7 +15,7 @@ services:
     volumes:
       - metadata:/data
     healthcheck:
-      test: ["/debridmoviemapper", "--healthcheck"]
+      test: ["CMD", "/debridmoviemapper", "--healthcheck"]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -53,7 +53,7 @@ services:
       --dir-cache-time 10s
       --poll-interval 15s
     healthcheck:
-      test: ["CMD", "grep", "-q", "fuse", "/proc/self/mountinfo"]
+      test: ["CMD-SHELL", "grep -q fuse /proc/self/mountinfo"]
       interval: 5s
       timeout: 3s
       start_period: 10s
