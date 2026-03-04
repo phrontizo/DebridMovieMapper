@@ -78,7 +78,7 @@ docker run -d \
   -e RD_API_TOKEN=your_token \
   -e TMDB_API_KEY=your_api_key \
   -e SCAN_INTERVAL_SECS=60 \
-  -v $(pwd)/metadata.db:/metadata.db \
+  -v debridmoviemapper-metadata:/data \
   ghcr.io/phrontizo/debridmoviemapper:latest
 ```
 
@@ -92,9 +92,11 @@ Or build locally for your current architecture:
 docker build -t debridmoviemapper .
 ```
 
-*Note: Mounting `metadata.db` ensures your media identification cache is preserved across container recreations.*
+*Note: The named volume ensures your media identification cache is preserved across container recreations.*
 
-**Upgrading from sled (pre-redb):** If you previously ran an older version that used sled, your `metadata.db` will be a directory. Remove it before starting the new version: `rm -rf metadata.db`. The redb database will be recreated automatically (TMDB identifications will be re-fetched on the first scan).
+**Upgrading from a bind-mounted `metadata.db`:** If you previously used `-v $(pwd)/metadata.db:/metadata.db`, switch to a named volume. You can let the database regenerate automatically (TMDB identifications will be re-fetched on the first scan), or copy your existing file into the volume.
+
+**Upgrading from sled (pre-redb):** If you previously ran an older version that used sled, your `metadata.db` will be a directory. Remove it before starting the new version: `rm -rf metadata.db`. The redb database will be recreated automatically.
 
 ## Docker Compose Setup with Jellyfin
 
@@ -107,9 +109,8 @@ A complete [`compose.yml`](compose.yml) file is provided in the repository that 
 
 ### Setup Steps
 
-1. Create required files and directories:
+1. Create the rclone mount directory:
    ```bash
-   touch metadata.db
    mkdir -p rclone && chown 65534:65534 rclone
    ```
 
@@ -127,7 +128,8 @@ A complete [`compose.yml`](compose.yml) file is provided in the repository that 
 ### Notes
 
 - The WebDAV server runs on port 8080 (mapped to 8080 on the host)
-- rclone mounts the WebDAV endpoint to `./rclone` on the host via a bind mount
+- Media identifications are persisted in a named Docker volume (`metadata`)
+- rclone mounts the WebDAV endpoint to `./rclone` on the host via a bind mount with `rshared` propagation (required for FUSE mounts to be visible to other containers)
 - Jellyfin reads from `/media` which is bind-mounted from `./rclone`
 - Files appear as real media files (`.mkv`, `.mp4`, etc.) with correct file sizes — media bytes are proxied from Real-Debrid's CDN on demand
 - Jellyfin probes and plays content normally as if the files were local

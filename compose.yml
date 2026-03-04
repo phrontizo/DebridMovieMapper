@@ -3,7 +3,6 @@ services:
     image: ghcr.io/phrontizo/debridmoviemapper:latest
     container_name: debridmoviemapper
     restart: unless-stopped
-    user: "65534:65534"
     ports:
       - "8080:8080"
     environment:
@@ -14,7 +13,7 @@ services:
       - JELLYFIN_API_KEY=your_jellyfin_api_key
       - JELLYFIN_RCLONE_MOUNT_PATH=/media
     volumes:
-      - ./metadata.db:/metadata.db
+      - metadata:/data
     deploy:
       resources:
         limits:
@@ -65,5 +64,6 @@ services:
       - /dev/dri:/dev/dri  # Optional: for hardware transcoding
 
 volumes:
+  metadata: {}
   jellyfin-cache: {}
   jellyfin-config: {}

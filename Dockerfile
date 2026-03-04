@@ -40,9 +40,6 @@ COPY --from=builder /app/debridmoviemapper /debridmoviemapper
 EXPOSE 8080
 
 USER 65534:65534
-
-# The application requires RD_API_TOKEN and TMDB_API_KEY environment variables.
-# It uses 'metadata.db' in the current directory for persistence.
-# It is recommended to mount a volume for 'metadata.db' if persistence across container recreations is desired.
+WORKDIR /data
 
 ENTRYPOINT ["/debridmoviemapper"]
