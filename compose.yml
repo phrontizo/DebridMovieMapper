@@ -52,6 +52,12 @@ services:
       --allow-non-empty
       --dir-cache-time 10s
       --poll-interval 15s
+    healthcheck:
+      test: ["CMD", "grep", "-q", "fuse", "/proc/self/mountinfo"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
 
   jellyfin:
     image: jellyfin/jellyfin:latest
@@ -59,7 +65,8 @@ services:
     restart: unless-stopped
     user: "65534:65534"
     depends_on:
-      - rclone
+      rclone:
+        condition: service_healthy
     ports:
       - "8096:8096"
     volumes:
