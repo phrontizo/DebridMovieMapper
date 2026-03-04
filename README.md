@@ -128,6 +128,7 @@ A complete [`compose.yml`](compose.yml) file is provided in the repository that 
 ### Notes
 
 - The WebDAV server runs on port 8080 (mapped to 8080 on the host)
+- A Docker healthcheck ensures rclone only starts after the WebDAV server is ready (prevents empty mount on startup)
 - Media identifications are persisted in a named Docker volume (`metadata`)
 - rclone mounts the WebDAV endpoint to `./rclone` on the host via a bind mount with `rshared` propagation (required for FUSE mounts to be visible to other containers)
 - Jellyfin reads from `/media` which is bind-mounted from `./rclone`

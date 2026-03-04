@@ -62,7 +62,7 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 
 | File | Purpose |
 |------|---------|
-| `main.rs` | Initializes shared state, spawns scan task, starts WebDAV server on port 8080 |
+| `main.rs` | Initializes shared state, spawns scan task, starts WebDAV server on port 8080; `--healthcheck` mode for Docker |
 | `tasks.rs` | `run_scan_loop` — polls Real-Debrid, identifies new torrents, updates VFS |
 | `rd_client.rs` | Real-Debrid API client with adaptive token bucket rate limiter, 1-hour response cache |
 | `identification.rs` | Filename cleaning, camelCase splitting, TMDB scoring to identify movies/shows |

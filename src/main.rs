@@ -20,6 +20,13 @@ const MATCHES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("matche
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Healthcheck mode: verify the WebDAV server is listening, then exit
+    if std::env::args().any(|a| a == "--healthcheck") {
+        std::process::exit(
+            if std::net::TcpStream::connect("127.0.0.1:8080").is_ok() { 0 } else { 1 }
+        );
+    }
+
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 

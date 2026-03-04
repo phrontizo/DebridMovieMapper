@@ -14,6 +14,11 @@ services:
       - JELLYFIN_RCLONE_MOUNT_PATH=/media
     volumes:
       - metadata:/data
+    healthcheck:
+      test: ["/debridmoviemapper", "--healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
     deploy:
       resources:
         limits:
@@ -26,7 +31,8 @@ services:
     restart: unless-stopped
     user: "65534:65534"
     depends_on:
-      - debridmoviemapper
+      debridmoviemapper:
+        condition: service_healthy
     devices:
       - /dev/fuse
     cap_add:
