@@ -35,12 +35,13 @@ services:
     security_opt:
       - apparmor:unconfined
     volumes:
-      - ./rclone.conf:/config/rclone/rclone.conf
       - ./rclone:/data:rshared
     environment:
       - TZ=Europe/London
     command: >
-      mount debrid: /data
+      mount :webdav: /data
+      --webdav-url http://debridmoviemapper:8080
+      --webdav-vendor other
       --vfs-cache-mode off
       --allow-other
       --allow-non-empty

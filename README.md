@@ -105,37 +105,24 @@ A complete [`compose.yml`](compose.yml) file is provided in the repository that 
 - rclone for mounting the WebDAV endpoint
 - Jellyfin for media playback
 
-### rclone.conf
-
-Create an `rclone.conf` file in the same directory with the following content:
-
-```ini
-[debrid]
-type = webdav
-url = http://debridmoviemapper:8080
-vendor = other
-```
-
 ### Setup Steps
 
 1. Create required files and directories:
    ```bash
-   touch metadata.db rclone.conf
+   touch metadata.db
    mkdir -p rclone && chown 65534:65534 rclone
    ```
 
 2. Add your Real-Debrid and TMDB credentials to the `compose.yml` file
 
-3. Add the rclone configuration to `rclone.conf` (see above)
-
-4. Start the services:
+3. Start the services:
    ```bash
    docker compose up -d
    ```
 
-5. Access Jellyfin at `http://localhost:8096` and add `/media` as a library path
+4. Access Jellyfin at `http://localhost:8096` and add `/media` as a library path
 
-6. (Optional) To enable instant library updates, set `JELLYFIN_API_KEY` in `compose.yml` to your Jellyfin API key
+5. (Optional) To enable instant library updates, set `JELLYFIN_API_KEY` in `compose.yml` to your Jellyfin API key
 
 ### Notes
 

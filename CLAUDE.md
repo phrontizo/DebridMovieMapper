@@ -34,7 +34,7 @@ docker build -t debridmoviemapper .
 ./build.sh
 
 # Start full stack (WebDAV + rclone + Jellyfin)
-touch metadata.db rclone.conf
+touch metadata.db
 mkdir -p rclone && chown 65534:65534 rclone
 docker compose up -d
 ```
