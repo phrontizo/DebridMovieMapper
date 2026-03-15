@@ -127,6 +127,40 @@ impl TmdbClient {
             }
         }
 
-        Err(last_error.expect("retry loop completed without recording an error"))
+        if let Some(e) = last_error {
+            Err(e)
+        } else {
+            // All attempts exhausted without a reqwest::Error being recorded.
+            // This happens when every attempt returned a retryable status code
+            // (429/503/502/504) and the loop never fell through to error_for_status().
+            // Build a synthetic error to avoid panicking.
+            error!("TMDB fetch_with_retry: all {} attempts exhausted (retryable status codes)", max_attempts);
+            let synthetic = reqwest::Response::from(
+                hyper::Response::builder()
+                    .status(reqwest::StatusCode::BAD_GATEWAY)
+                    .body(hyper::body::Bytes::from_static(b"all attempts exhausted: retryable status codes"))
+                    .unwrap()
+            );
+            Err(synthetic.error_for_status().unwrap_err())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fetch_with_retry_no_panic_on_exhausted_retries() {
+        // Verify that the old `.expect()` panic path has been replaced with
+        // a synthetic error. If someone reintroduces the pattern in the retry
+        // loop fallback, this test will fail.
+        // Split the search string so this test doesn't self-match.
+        let needle = ["last_error", ".expect("].concat();
+        let source = include_str!("tmdb_client.rs");
+        assert!(
+            !source.contains(&needle),
+            "tmdb_client.rs fetch_with_retry must not use .expect() on last_error — \
+             use a synthetic error response instead to avoid panicking when all \
+             attempts are exhausted by retryable status codes"
+        );
     }
 }

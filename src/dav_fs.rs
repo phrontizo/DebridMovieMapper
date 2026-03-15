@@ -275,19 +275,32 @@ impl ProxiedMediaFile {
         let fetch_size = std::cmp::max(len, BUFFER_SIZE) as u64;
         let range_end = std::cmp::min(pos + fetch_size - 1, self.file_size - 1);
 
-        let resp = self.http_client
+        let resp = match self.http_client
             .get(&cdn_url)
             .header("Range", format!("bytes={}-{}", pos, range_end))
             .send()
             .await
-            .map_err(|e| {
-                tracing::warn!("CDN fetch failed for {}: {}", self.name, e);
-                FsError::GeneralFailure
-            })?;
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!("CDN fetch failed for {}: {} — clearing cached CDN URL", self.name, e);
+                // Clear cached CDN URL so the next read re-resolves via unrestrict_link.
+                // This handles expired CDN URLs (which cause connection/TLS errors).
+                self.cdn_url = None;
+                // Also invalidate the unrestrict cache so re-resolve fetches a fresh URL.
+                self.rd_client.invalidate_unrestrict_cache(&self.rd_link).await;
+                return Err(FsError::GeneralFailure);
+            }
+        };
 
         let status = resp.status();
         if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-            tracing::warn!("CDN returned {} for {}", status, self.name);
+            tracing::warn!("CDN returned {} for {} — clearing cached CDN URL", status, self.name);
+            // Clear cached CDN URL so the next read re-resolves via unrestrict_link.
+            // CDN URLs expire after ~1h; a 403/410 here means the URL is stale.
+            self.cdn_url = None;
+            // Also invalidate the unrestrict cache so re-resolve fetches a fresh URL.
+            self.rd_client.invalidate_unrestrict_cache(&self.rd_link).await;
             return Err(FsError::GeneralFailure);
         }
 
@@ -415,6 +428,40 @@ mod tests {
 
         // Network errors (no status code) should NOT trigger repair
         assert!(!should_repair_on_unrestrict_error(None));
+    }
+
+    #[test]
+    fn fetch_bytes_clears_cdn_url_on_failure() {
+        // Verify that fetch_bytes clears cdn_url when CDN returns an error,
+        // so the next read re-resolves via unrestrict_link (getting a fresh CDN URL).
+        // Without this, expired CDN URLs would cause all subsequent reads to fail
+        // permanently for the lifetime of the open file handle.
+        let source = include_str!("dav_fs.rs");
+
+        // The fn fetch_bytes body should set self.cdn_url = None on CDN failure
+        // We check for the pattern appearing after "fn fetch_bytes" to ensure
+        // it's in the right function
+        let fetch_bytes_start = source.find("fn fetch_bytes").expect("fetch_bytes function must exist");
+        let fetch_bytes_body = &source[fetch_bytes_start..];
+        // Find the next function boundary (next "fn " or end)
+        let fetch_bytes_end = fetch_bytes_body[1..].find("\n    fn ").map(|i| i + 1).unwrap_or(fetch_bytes_body.len());
+        let fetch_bytes_source = &fetch_bytes_body[..fetch_bytes_end];
+
+        // Must clear cdn_url on failure
+        let cdn_url_none_count = fetch_bytes_source.matches("self.cdn_url = None").count();
+        assert!(
+            cdn_url_none_count >= 2,
+            "fetch_bytes must clear self.cdn_url = None on both connection errors and HTTP error status \
+             (found {} occurrences, expected >= 2)", cdn_url_none_count
+        );
+
+        // Must also invalidate the unrestrict cache so re-resolve gets a fresh URL
+        let cache_invalidate_count = fetch_bytes_source.matches("invalidate_unrestrict_cache").count();
+        assert!(
+            cache_invalidate_count >= 2,
+            "fetch_bytes must invalidate unrestrict cache on both connection errors and HTTP error status \
+             (found {} occurrences, expected >= 2)", cache_invalidate_count
+        );
     }
 
     #[test]

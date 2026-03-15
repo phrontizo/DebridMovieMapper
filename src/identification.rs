@@ -327,6 +327,30 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
     None
 }
 
+/// Case-insensitive search for an ASCII `needle` in `haystack`, returning
+/// the byte offset in `haystack` (safe for slicing). This avoids the
+/// `to_lowercase()` byte-offset mismatch that can cause panics with
+/// multi-byte UTF-8 characters.
+fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    debug_assert!(needle.is_ascii(), "needle must be ASCII");
+    let needle_len = needle.len();
+    if haystack.len() < needle_len { return None; }
+    let needle_bytes: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
+    // Walk byte-by-byte; since needle is all ASCII, a match means all bytes
+    // in the range are ASCII too, so `i` and `i + needle_len` are both valid
+    // char boundaries.
+    for i in 0..=(haystack.len() - needle_len) {
+        let matches = haystack.as_bytes()[i..i + needle_len]
+            .iter()
+            .zip(&needle_bytes)
+            .all(|(h, n)| h.to_ascii_lowercase() == *n);
+        if matches {
+            return Some(i);
+        }
+    }
+    None
+}
+
 pub fn clean_name(name: &str) -> (String, Option<String>) {
     let mut title = name.to_string();
     
@@ -349,9 +373,12 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     title = title.replace(['.', '_'], " ");
 
     // 3. Handle "aka" - usually title aka alternative title
-    if let Some(pos) = title.to_lowercase().find(" aka ") {
-        // Prefer the part after "aka" as it's often the English title in non-English releases
-        let after_aka = &title[pos + 5..];
+    // Search case-insensitively by finding " aka " on the original title using
+    // a regex-free approach that respects UTF-8 boundaries. We scan for the
+    // pattern in the lowercased version but use char_indices on the original
+    // to find a byte-boundary-safe offset.
+    if let Some(aka_pos) = find_case_insensitive(&title, " aka ") {
+        let after_aka = &title[aka_pos + 5..];
         if !after_aka.trim().is_empty() {
             title = after_aka.to_string();
         }
@@ -572,6 +599,34 @@ mod tests {
         assert!(!is_generic_title("Inception"));
         assert!(!is_generic_title("2012")); // 4 digits, but not < 10
         assert!(!is_generic_title("The Episode"));
+    }
+
+    #[test]
+    fn find_case_insensitive_basic() {
+        assert_eq!(find_case_insensitive("Hello AKA World", " aka "), Some(5));
+        assert_eq!(find_case_insensitive("Hello Aka World", " aka "), Some(5));
+        assert_eq!(find_case_insensitive("Hello aka World", " aka "), Some(5));
+        assert_eq!(find_case_insensitive("No match here", " aka "), None);
+        assert_eq!(find_case_insensitive("aka", " aka "), None); // too short
+    }
+
+    #[test]
+    fn find_case_insensitive_unicode_safe() {
+        // Multi-byte UTF-8 characters before the pattern must not cause a panic.
+        // 'Ü' is 2 bytes in UTF-8, so "Üntersuchung" is 13 bytes, not 12.
+        assert_eq!(find_case_insensitive("Üntersuchung aka Study", " aka "), Some(13));
+        // Multi-byte char right before " aka " - the 'ü' is 2 bytes,
+        // so "Tü" is 3 bytes and the space before "aka" is at byte offset 3.
+        assert_eq!(find_case_insensitive("Tü aka X", " aka "), Some(3));
+        // Only multi-byte chars, no match
+        assert_eq!(find_case_insensitive("日本語テスト", " aka "), None);
+    }
+
+    #[test]
+    fn clean_name_handles_aka_with_unicode() {
+        // Verify that clean_name's "aka" handling doesn't panic on multi-byte UTF-8
+        let (name, _year) = clean_name("Üntersuchung aka Study 2024 1080p");
+        assert_eq!(name, "Study");
     }
 
     #[tokio::test]

@@ -17,8 +17,15 @@ const ARCHIVE_EXTENSIONS: &[&str] = &[
 fn is_archive_part(path: &str) -> bool {
     let lower = path.to_lowercase();
     // .r00-.r99, .s00-.s99 (split RAR volumes)
-    if lower.len() >= 4 {
-        let ext = &lower[lower.len().saturating_sub(4)..];
+    // Use char_indices to safely find the last 4 characters, avoiding
+    // panics from slicing at non-UTF-8 boundaries.
+    let char_count = lower.chars().count();
+    if char_count >= 4 {
+        let byte_offset = lower.char_indices()
+            .nth(char_count - 4)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let ext = &lower[byte_offset..];
         if ext.starts_with(".r") || ext.starts_with(".s") {
             return ext[2..].chars().all(|c| c.is_ascii_digit());
         }
@@ -485,11 +492,17 @@ fn sanitize_filename(name: &str) -> String {
     replaced.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Regex matching filenames that should be excluded from the VFS.
+/// Uses word boundaries (`\b`) to avoid false positives on substrings
+/// (e.g. "extraordinary.mkv" should NOT be filtered out by "extra").
+static EXCLUDED_VIDEO_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(sample|trailer|extras?|bonus|featurette)\b").unwrap()
+});
+
 pub fn is_video_file(path: &str) -> bool {
     let lower = path.to_lowercase();
     let filename = lower.rsplit('/').next().unwrap_or(&lower);
-    if filename.contains("sample") || filename.contains("trailer") || filename.contains("extra") ||
-       filename.contains("bonus") || filename.contains("featurette") {
+    if EXCLUDED_VIDEO_RE.is_match(filename) {
         return false;
     }
     VIDEO_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
@@ -941,6 +954,93 @@ mod tests {
         assert!(!is_archive_file("movie.mkv"));
         assert!(!is_archive_file("movie.nfo"));
         assert!(!is_archive_file("movie.srt"));
+    }
+
+    #[test]
+    fn is_archive_part_handles_unicode_filenames() {
+        // Filenames with multi-byte UTF-8 characters must not panic
+        // when is_archive_part slices to find the last 4 characters.
+        assert!(!is_archive_part("ö.r0")); // 2-byte char followed by 3 ASCII chars
+        assert!(is_archive_part("café.r00")); // multi-byte in prefix, valid archive ext
+        assert!(!is_archive_part("über.mkv")); // multi-byte, not archive
+        assert!(!is_archive_part("日本語.mp4")); // 3-byte chars, not archive
+        assert!(is_archive_part("データ.s01")); // 3-byte chars with valid archive ext
+    }
+
+    // --- is_video_file word-boundary filtering ---
+
+    #[test]
+    fn is_video_file_accepts_normal_video() {
+        assert!(is_video_file("Movie.2023.1080p.mkv"));
+        assert!(is_video_file("/path/to/Movie.mp4"));
+        assert!(is_video_file("Show.S01E01.avi"));
+    }
+
+    #[test]
+    fn is_video_file_rejects_sample() {
+        assert!(!is_video_file("sample.mkv"));
+        assert!(!is_video_file("Movie-sample.mkv"));
+        assert!(!is_video_file("/path/Sample.mp4"));
+    }
+
+    #[test]
+    fn is_video_file_rejects_trailer() {
+        assert!(!is_video_file("trailer.mkv"));
+        assert!(!is_video_file("Movie-trailer.mkv"));
+    }
+
+    #[test]
+    fn is_video_file_rejects_extras() {
+        assert!(!is_video_file("extras.mkv"));
+        assert!(!is_video_file("extra.mkv"));
+        assert!(!is_video_file("Movie.Extra.Feature.mkv"));
+        // Note: directory-level filtering (e.g. /path/Extras/deleted_scene.mkv)
+        // is not handled by is_video_file, which only checks the filename portion.
+    }
+
+    #[test]
+    fn is_video_file_rejects_bonus() {
+        assert!(!is_video_file("bonus.mkv"));
+        assert!(!is_video_file("Movie-Bonus.mkv"));
+    }
+
+    #[test]
+    fn is_video_file_rejects_featurette() {
+        assert!(!is_video_file("featurette.mkv"));
+        assert!(!is_video_file("Making.Of.Featurette.mkv"));
+    }
+
+    #[test]
+    fn is_video_file_no_false_positive_on_extra_substring() {
+        // "extraordinary" contains "extra" as a substring but should NOT be filtered
+        assert!(is_video_file("extraordinary.mkv"));
+        assert!(is_video_file("Extraordinary.Attorney.Woo.S01E01.mkv"));
+    }
+
+    #[test]
+    fn is_video_file_no_false_positive_on_bonus_substring() {
+        // "The.Bonus.Army.2024" has "Bonus" as a word, so it WOULD be filtered.
+        // But a movie like "Bonusville" should not be filtered.
+        assert!(is_video_file("Bonusville.2024.mkv"));
+    }
+
+    #[test]
+    fn is_video_file_no_false_positive_on_sample_substring() {
+        // "Sampler" contains "sample" as a substring but should NOT be filtered
+        assert!(is_video_file("The.Sampler.2024.mkv"));
+    }
+
+    #[test]
+    fn is_video_file_no_false_positive_on_trailer_substring() {
+        // "Trailerman" contains "trailer" as a substring but should NOT be filtered
+        assert!(is_video_file("Trailerman.2024.mkv"));
+    }
+
+    #[test]
+    fn is_video_file_rejects_non_video_extensions() {
+        assert!(!is_video_file("movie.srt"));
+        assert!(!is_video_file("movie.nfo"));
+        assert!(!is_video_file("movie.txt"));
     }
 
     #[test]

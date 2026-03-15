@@ -170,18 +170,6 @@ pub struct AddMagnetResponse {
     pub uri: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct AvailableHost {
-    pub host: String,
-    pub max_file_size: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct InstantAvailability {
-    #[serde(flatten)]
-    pub files: HashMap<String, Vec<HashMap<String, serde_json::Value>>>,
-}
-
 #[derive(Debug, Clone)]
 struct CachedUnrestrictResponse {
     response: UnrestrictResponse,
@@ -460,7 +448,18 @@ impl RealDebridClient {
         if let Some(e) = last_error {
             Err(e)
         } else {
-            unreachable!("fetch_with_retry: all attempts exhausted without a recorded error")
+            // All attempts exhausted without a reqwest::Error being recorded.
+            // This happens when every attempt returned HTTP 200 but the response
+            // body failed to deserialize (e.g. unexpected JSON schema). Build a
+            // synthetic error response to surface a proper error instead of panicking.
+            error!("fetch_with_retry: all {} attempts exhausted due to deserialization failures", max_attempts);
+            let synthetic = reqwest::Response::from(
+                hyper::Response::builder()
+                    .status(reqwest::StatusCode::BAD_GATEWAY)
+                    .body(hyper::body::Bytes::from_static(b"all attempts exhausted: deserialization failures"))
+                    .unwrap()
+            );
+            Err(synthetic.error_for_status().unwrap_err())
         }
     }
 

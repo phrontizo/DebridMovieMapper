@@ -107,7 +107,11 @@ impl RepairManager {
                 health.state = RepairState::Failed;
                 return Err("Maximum repair attempts exceeded".to_string());
             }
-            // Double-check state hasn't changed (another task might have started repairing)
+            // Double-check state hasn't changed (another task might have started repairing
+            // or marked this torrent as failed between the read and write locks)
+            if health.state == RepairState::Failed {
+                return Err("Torrent permanently failed".to_string());
+            }
             if health.state == RepairState::Repairing {
                 return Err("Repair already in progress".to_string());
             }
@@ -551,6 +555,27 @@ mod tests {
 
         let second_call = manager.take_repair_replacements().await;
         assert!(second_call.is_empty());
+    }
+
+    #[test]
+    fn check_and_begin_repair_write_side_rechecks_failed_state() {
+        // The check_and_begin_repair method has a TOCTOU window between its read
+        // lock (fast rejection) and write lock (state transition). Between the two,
+        // another task could mark the torrent as Failed. The write-side MUST re-check
+        // for Failed state before proceeding.
+        let source = include_str!("repair.rs");
+        let fn_start = source.find("async fn check_and_begin_repair").expect("function must exist");
+        let fn_body = &source[fn_start..];
+        // Find the write-side section (after "Write-side")
+        let write_side_start = fn_body.find("Write-side").expect("must have Write-side comment");
+        let write_side = &fn_body[write_side_start..];
+        // The write-side must check for Failed state before setting Repairing
+        assert!(
+            write_side.contains("RepairState::Failed"),
+            "check_and_begin_repair write-side must re-check for Failed state to prevent \
+             TOCTOU race where another task marks the torrent as failed between the read \
+             and write lock acquisitions"
+        );
     }
 
     #[tokio::test]
