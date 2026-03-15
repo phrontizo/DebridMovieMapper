@@ -810,4 +810,173 @@ mod tests {
         assert_eq!(metadata.title, "Goldfinger");
         assert_eq!(metadata.media_type, MediaType::Movie);
     }
+
+    // --- Helper for best_scored_result / select_best_match tests ---
+
+    fn make_result(id: u32, title: &str, release_date: Option<&str>, popularity: f64, vote_avg: Option<f64>, vote_count: Option<u32>) -> TmdbSearchResult {
+        TmdbSearchResult {
+            id,
+            title: title.to_string(),
+            original_title: None,
+            release_date: release_date.map(|s| s.to_string()),
+            popularity,
+            vote_average: vote_avg,
+            vote_count,
+        }
+    }
+
+    // --- Tests for best_scored_result ---
+
+    #[test]
+    fn best_scored_result_empty_returns_none() {
+        let results: Vec<TmdbSearchResult> = vec![];
+        let got = best_scored_result(&results, "anything", &None, false);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn best_scored_result_single_result() {
+        let results = vec![make_result(1, "Inception", Some("2010-07-16"), 80.0, Some(8.4), Some(30000))];
+        let got = best_scored_result(&results, &normalize_title("Inception"), &Some("2010".to_string()), false);
+        assert_eq!(got.unwrap().id, 1);
+    }
+
+    #[test]
+    fn best_scored_result_exact_title_wins() {
+        // "Flow" exact match with low popularity should beat a partial/non-match with higher popularity
+        let results = vec![
+            make_result(1, "Overflow", Some("2020-01-01"), 200.0, Some(7.0), Some(500)),
+            make_result(2, "Flow", Some("2024-01-01"), 10.0, Some(7.5), Some(100)),
+        ];
+        let nq = normalize_title("Flow");
+        let got = best_scored_result(&results, &nq, &None, false);
+        assert_eq!(got.unwrap().id, 2);
+    }
+
+    #[test]
+    fn best_scored_result_year_match_boosts() {
+        let results = vec![
+            make_result(1, "Dune", Some("2021-10-22"), 50.0, Some(7.8), Some(8000)),
+            make_result(2, "Dune", Some("1984-12-14"), 20.0, Some(6.3), Some(2000)),
+        ];
+        let nq = normalize_title("Dune");
+        let got = best_scored_result(&results, &nq, &Some("1984".to_string()), false);
+        assert_eq!(got.unwrap().id, 2);
+    }
+
+    #[test]
+    fn best_scored_result_short_title_requires_exact_and_year() {
+        // Short title "IT" — only the result with exact title AND matching year should qualify
+        let results = vec![
+            make_result(1, "It", Some("2017-09-06"), 100.0, Some(7.3), Some(15000)),
+            make_result(2, "It", Some("1990-11-18"), 30.0, Some(6.9), Some(2000)),
+            make_result(3, "Italy", Some("2017-05-01"), 5.0, Some(5.0), Some(50)),
+        ];
+        let nq = normalize_title("IT");
+        let got = best_scored_result(&results, &nq, &Some("1990".to_string()), true);
+        // Only id=2 has exact title "it" AND year 1990
+        assert_eq!(got.unwrap().id, 2);
+    }
+
+    #[test]
+    fn best_scored_result_short_title_no_match_returns_none() {
+        // Short title "UC" with no exact+year match should return None
+        let results = vec![
+            make_result(1, "Gundam Unicorn", Some("2010-02-20"), 50.0, Some(7.0), Some(200)),
+            make_result(2, "UC Browser", None, 10.0, None, None),
+        ];
+        let nq = normalize_title("UC");
+        let got = best_scored_result(&results, &nq, &Some("2023".to_string()), true);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn best_scored_result_higher_votes_breaks_tie() {
+        // Two exact title matches, same year — higher vote count should win
+        let results = vec![
+            make_result(1, "Flow", Some("2024-08-30"), 50.0, Some(8.0), Some(5000)),
+            make_result(2, "Flow", Some("2024-03-15"), 40.0, Some(7.5), Some(20)),
+        ];
+        let nq = normalize_title("Flow");
+        let got = best_scored_result(&results, &nq, &Some("2024".to_string()), false);
+        assert_eq!(got.unwrap().id, 1);
+    }
+
+    // --- Tests for select_best_match ---
+
+    #[test]
+    fn select_best_match_both_none() {
+        let got = select_best_match(None, None, "anything", &None, false);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn select_best_match_only_tv() {
+        let tv = make_result(100, "Breaking Bad", Some("2008-01-20"), 200.0, Some(8.9), Some(10000));
+        let got = select_best_match(Some(&tv), None, &normalize_title("Breaking Bad"), &None, true);
+        let (title, _date, id, _source, media_type) = got.unwrap();
+        assert_eq!(title, "Breaking Bad");
+        assert_eq!(id, "100");
+        assert_eq!(media_type, MediaType::Show);
+    }
+
+    #[test]
+    fn select_best_match_only_movie() {
+        let movie = make_result(200, "Inception", Some("2010-07-16"), 100.0, Some(8.4), Some(30000));
+        let got = select_best_match(None, Some(&movie), &normalize_title("Inception"), &None, false);
+        let (title, _date, id, _source, media_type) = got.unwrap();
+        assert_eq!(title, "Inception");
+        assert_eq!(id, "200");
+        assert_eq!(media_type, MediaType::Movie);
+    }
+
+    #[test]
+    fn select_best_match_tv_exact_year_wins() {
+        // TV has exact title + year match; movie has exact title but wrong year
+        let tv = make_result(10, "Dune", Some("2000-12-03"), 30.0, Some(7.0), Some(500));
+        let movie = make_result(20, "Dune", Some("2021-10-22"), 80.0, Some(7.8), Some(8000));
+        let nq = normalize_title("Dune");
+        let year = Some("2000".to_string());
+        let got = select_best_match(Some(&tv), Some(&movie), &nq, &year, false);
+        let (_title, _date, id, _source, media_type) = got.unwrap();
+        assert_eq!(id, "10");
+        assert_eq!(media_type, MediaType::Show);
+    }
+
+    #[test]
+    fn select_best_match_movie_exact_year_wins() {
+        // Movie has exact title + year match; TV has exact title but wrong year
+        let tv = make_result(10, "Don", Some("2006-10-20"), 30.0, Some(6.5), Some(200));
+        let movie = make_result(20, "Don", Some("2022-05-13"), 50.0, Some(7.2), Some(1000));
+        let nq = normalize_title("Don");
+        let year = Some("2022".to_string());
+        let got = select_best_match(Some(&tv), Some(&movie), &nq, &year, true);
+        let (_title, _date, id, _source, media_type) = got.unwrap();
+        assert_eq!(id, "20");
+        assert_eq!(media_type, MediaType::Movie);
+    }
+
+    #[test]
+    fn select_best_match_show_guess_prefers_tv() {
+        // Both have exact title, no year info — is_show_guess=true should prefer TV
+        let tv = make_result(10, "Sherwood", Some("2022-06-13"), 40.0, Some(7.0), Some(300));
+        let movie = make_result(20, "Sherwood", Some("2019-11-22"), 20.0, Some(6.5), Some(100));
+        let nq = normalize_title("Sherwood");
+        let got = select_best_match(Some(&tv), Some(&movie), &nq, &None, true);
+        let (_title, _date, id, _source, media_type) = got.unwrap();
+        assert_eq!(id, "10");
+        assert_eq!(media_type, MediaType::Show);
+    }
+
+    #[test]
+    fn select_best_match_no_show_guess_prefers_movie() {
+        // Both have exact title, no year info — is_show_guess=false should prefer movie
+        let tv = make_result(10, "Sherwood", Some("2022-06-13"), 40.0, Some(7.0), Some(300));
+        let movie = make_result(20, "Sherwood", Some("2019-11-22"), 20.0, Some(6.5), Some(100));
+        let nq = normalize_title("Sherwood");
+        let got = select_best_match(Some(&tv), Some(&movie), &nq, &None, false);
+        let (_title, _date, id, _source, media_type) = got.unwrap();
+        assert_eq!(id, "20");
+        assert_eq!(media_type, MediaType::Movie);
+    }
 }

@@ -221,8 +221,12 @@ impl ProxiedMediaFile {
                     match self.repair_manager.try_instant_repair(&self.rd_torrent_id, &self.rd_link).await {
                         Ok(result) => {
                             tracing::info!("Instant repair succeeded for {} — new torrent {}", self.name, result.new_torrent_id);
+                            let old_rd_link = std::mem::replace(&mut self.rd_link, result.new_rd_link);
                             self.rd_torrent_id = result.new_torrent_id;
-                            self.rd_link = result.new_rd_link;
+                            // Invalidate the cached unrestrict response for the old (broken) link
+                            // so other ProxiedMediaFile instances don't get stale data before
+                            // the next VFS rebuild.
+                            self.rd_client.invalidate_unrestrict_cache(&old_rd_link).await;
                             // Unrestrict the new link immediately
                             match self.rd_client.unrestrict_link(&self.rd_link).await {
                                 Ok(response) => {

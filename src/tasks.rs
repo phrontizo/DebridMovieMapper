@@ -11,18 +11,31 @@ use crate::vfs::{DebridVfs, MediaMetadata};
 use crate::identification::identify_torrent;
 use crate::repair::RepairManager;
 
-const MATCHES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("matches");
+pub const MATCHES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("matches");
+
+pub struct ScanConfig {
+    pub rd_client: Arc<RealDebridClient>,
+    pub tmdb_client: Arc<TmdbClient>,
+    pub vfs: Arc<RwLock<DebridVfs>>,
+    pub db: Arc<redb::Database>,
+    pub repair_manager: Arc<RepairManager>,
+    pub interval_secs: u64,
+    pub jellyfin_client: Option<Arc<crate::jellyfin_client::JellyfinClient>>,
+}
 
 pub async fn run_scan_loop(
-    rd_client: Arc<RealDebridClient>,
-    tmdb_client: Arc<TmdbClient>,
-    vfs: Arc<RwLock<DebridVfs>>,
-    db: Arc<redb::Database>,
-    repair_manager: Arc<RepairManager>,
-    interval_secs: u64,
-    jellyfin_client: Option<Arc<crate::jellyfin_client::JellyfinClient>>,
+    config: ScanConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let ScanConfig {
+        rd_client,
+        tmdb_client,
+        vfs,
+        db,
+        repair_manager,
+        interval_secs,
+        jellyfin_client,
+    } = config;
     // Load persisted matches from DB on startup
     let db_clone = db.clone();
     let persisted: HashMap<String, (crate::rd_client::TorrentInfo, MediaMetadata)> =
@@ -345,7 +358,16 @@ mod tests {
         repair_manager: Arc<RepairManager>,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
-        run_scan_loop(rd_client, tmdb_client, vfs, db, repair_manager, 60, None, shutdown).await;
+        let config = ScanConfig {
+            rd_client,
+            tmdb_client,
+            vfs,
+            db,
+            repair_manager,
+            interval_secs: 60,
+            jellyfin_client: None,
+        };
+        run_scan_loop(config, shutdown).await;
     }
 
 }

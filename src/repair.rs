@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{info, warn, error, debug};
 use crate::rd_client::{RealDebridClient, TorrentInfo};
@@ -32,7 +33,7 @@ pub struct TorrentHealth {
 pub struct RepairManager {
     health_status: Arc<RwLock<HashMap<String, TorrentHealth>>>,
     rd_client: Arc<RealDebridClient>,
-    /// Maps new_torrent_id → old_torrent_id for successful repairs.
+    /// Maps new_torrent_id -> old_torrent_id for successful repairs.
     /// The scan loop consumes this to reuse old TMDB identifications.
     repair_replacements: Arc<RwLock<HashMap<String, String>>>,
 }
@@ -46,7 +47,7 @@ impl RepairManager {
         }
     }
 
-    /// Drains and returns the repair replacements map (new_id → old_id).
+    /// Drains and returns the repair replacements map (new_id -> old_id).
     /// After calling this, the internal map is empty.
     pub async fn take_repair_replacements(&self) -> HashMap<String, String> {
         let mut map = self.repair_replacements.write().await;
@@ -73,65 +74,50 @@ impl RepairManager {
         }
     }
 
-    /// Attempt to repair a broken torrent by re-adding it
-    pub async fn repair_torrent(&self, torrent_info: &TorrentInfo) -> Result<(), String> {
-        // Check if repair is already in progress, recently triggered, or permanently failed
+    /// Check pre-repair guards (Failed/Repairing/rate-limited) and transition to Repairing state.
+    /// Returns the attempt number on success, or Err with the reason why repair cannot proceed.
+    async fn check_and_begin_repair(&self, torrent_id: &str) -> Result<u32, String> {
+        // Read-side guard: check state without holding write lock
         {
             let health_map = self.health_status.read().await;
-            if let Some(health) = health_map.get(&torrent_info.id) {
-                // If already failed permanently, skip
+            if let Some(health) = health_map.get(torrent_id) {
                 if health.state == RepairState::Failed {
-                    debug!("Torrent '{}' has permanently failed repair, skipping", torrent_info.filename);
+                    debug!("Torrent {} has permanently failed repair, skipping", torrent_id);
                     return Err("Torrent permanently failed".to_string());
                 }
-
-                // If already repairing, skip
                 if health.state == RepairState::Repairing {
-                    debug!("Repair already in progress for torrent '{}', skipping duplicate", torrent_info.filename);
+                    debug!("Repair already in progress for torrent {}, skipping", torrent_id);
                     return Err("Repair already in progress".to_string());
                 }
-
-                // If repair triggered within last 30 seconds, skip (rate limiting)
                 if let Some(last_trigger) = health.last_repair_trigger {
                     if last_trigger.elapsed().as_secs() < 30 {
-                        debug!("Repair recently triggered for torrent '{}' ({}s ago), skipping",
-                            torrent_info.filename, last_trigger.elapsed().as_secs());
+                        debug!("Repair recently triggered for torrent {} ({}s ago), skipping",
+                            torrent_id, last_trigger.elapsed().as_secs());
                         return Err("Repair rate limited".to_string());
                     }
                 }
             }
         }
 
-        info!("========================================");
-        info!("REPAIR STARTED: Torrent '{}' ({})", torrent_info.filename, torrent_info.id);
-        info!("========================================");
-
+        // Write-side: set state to Repairing and increment attempt count
         let mut health_map = self.health_status.write().await;
-        let attempt_num = if let Some(health) = health_map.get_mut(&torrent_info.id) {
-            // Check if already failed 3 times BEFORE incrementing
+        let attempt_num = if let Some(health) = health_map.get_mut(torrent_id) {
             if health.repair_attempts >= 3 {
-                error!("Torrent '{}' ({}) has failed repair 3 times, marking as permanently FAILED",
-                    torrent_info.filename, torrent_info.id);
+                error!("Torrent {} has failed repair 3 times, marking as permanently FAILED", torrent_id);
                 health.state = RepairState::Failed;
-                drop(health_map);
                 return Err("Maximum repair attempts exceeded".to_string());
             }
-
             // Double-check state hasn't changed (another task might have started repairing)
             if health.state == RepairState::Repairing {
-                debug!("Repair already in progress (race condition detected), skipping");
-                drop(health_map);
                 return Err("Repair already in progress".to_string());
             }
-
             health.state = RepairState::Repairing;
             health.repair_attempts += 1;
             health.last_repair_trigger = Some(std::time::Instant::now());
             health.repair_attempts
         } else {
-            // First time seeing this torrent
-            health_map.insert(torrent_info.id.clone(), TorrentHealth {
-                torrent_id: torrent_info.id.clone(),
+            health_map.insert(torrent_id.to_string(), TorrentHealth {
+                torrent_id: torrent_id.to_string(),
                 state: RepairState::Repairing,
                 failed_links: HashSet::new(),
                 last_check: std::time::Instant::now(),
@@ -140,113 +126,143 @@ impl RepairManager {
             });
             1
         };
+
+        Ok(attempt_num)
+    }
+
+    /// Add magnet, wait for RD to process, get new torrent info, match files by path, select them.
+    /// Returns (new_torrent_id, new_torrent_info) on success.
+    /// On failure, cleans up the leaked torrent and marks the old torrent as failed.
+    async fn add_and_select_files(
+        &self,
+        old_torrent_id: &str,
+        old_info: &TorrentInfo,
+        wait_duration: Duration,
+    ) -> Result<(String, TorrentInfo), String> {
+        let magnet = format!("magnet:?xt=urn:btih:{}", old_info.hash);
+
+        // Add magnet
+        let add_response = match self.rd_client.add_magnet(&magnet).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.set_repair_failed(old_torrent_id).await;
+                return Err(format!("Failed to add magnet: {}", e));
+            }
+        };
+        let new_torrent_id = add_response.id;
+
+        // Wait for RD to process the magnet
+        tokio::time::sleep(wait_duration).await;
+
+        // Get new torrent info for file matching
+        let new_info = match self.rd_client.get_torrent_info(&new_torrent_id).await {
+            Ok(info) => info,
+            Err(e) => {
+                self.cleanup_leaked_torrent(&new_torrent_id).await;
+                self.set_repair_failed(old_torrent_id).await;
+                return Err(format!("Failed to get new torrent info: {}", e));
+            }
+        };
+
+        // Match files by path: find new file IDs that correspond to old selected files
+        let selected_file_ids: Vec<String> = old_info.files.iter()
+            .filter(|f| f.selected == 1)
+            .filter_map(|original_file| {
+                new_info.files.iter()
+                    .find(|new_file| new_file.path == original_file.path)
+                    .map(|new_file| new_file.id.to_string())
+            })
+            .collect();
+
+        if selected_file_ids.is_empty() {
+            self.cleanup_leaked_torrent(&new_torrent_id).await;
+            self.set_repair_failed(old_torrent_id).await;
+            return Err("No matching files found in new torrent".to_string());
+        }
+
+        let file_ids_str = selected_file_ids.join(",");
+        if let Err(e) = self.rd_client.select_files(&new_torrent_id, &file_ids_str).await {
+            self.cleanup_leaked_torrent(&new_torrent_id).await;
+            self.set_repair_failed(old_torrent_id).await;
+            return Err(format!("Failed to select files: {}", e));
+        }
+
+        Ok((new_torrent_id, new_info))
+    }
+
+    /// Delete old torrent, update health_map (remove old, insert new as Healthy), record replacement.
+    async fn complete_repair(&self, old_torrent_id: &str, new_torrent_id: &str) {
+        // Delete old broken torrent
+        if let Err(e) = self.rd_client.delete_torrent(old_torrent_id).await {
+            warn!("Failed to delete old torrent {}: {}", old_torrent_id, e);
+        }
+
+        // Update health status: remove old, add new as Healthy
+        let mut health_map = self.health_status.write().await;
+        health_map.remove(old_torrent_id);
+        health_map.insert(new_torrent_id.to_string(), TorrentHealth {
+            torrent_id: new_torrent_id.to_string(),
+            state: RepairState::Healthy,
+            failed_links: HashSet::new(),
+            last_check: std::time::Instant::now(),
+            repair_attempts: 0,
+            last_repair_trigger: None,
+        });
         drop(health_map);
 
+        // Record replacement so scan loop reuses old identification
+        self.repair_replacements.write().await
+            .insert(new_torrent_id.to_string(), old_torrent_id.to_string());
+    }
+
+    /// Attempt to repair a broken torrent by re-adding it
+    pub async fn repair_torrent(&self, torrent_info: &TorrentInfo) -> Result<(), String> {
+        let attempt_num = self.check_and_begin_repair(&torrent_info.id).await?;
+
+        info!("========================================");
+        info!("REPAIR STARTED: Torrent '{}' ({})", torrent_info.filename, torrent_info.id);
+        info!("========================================");
         info!("Repair attempt #{} for torrent '{}'", attempt_num, torrent_info.filename);
 
-        // Build magnet link from hash
-        let magnet = format!("magnet:?xt=urn:btih:{}", torrent_info.hash);
         info!("Using magnet link: magnet:?xt=urn:btih:{}", torrent_info.hash);
 
-        // Try to re-add the torrent
         info!("Step 1: Adding magnet to Real-Debrid...");
-        match self.rd_client.add_magnet(&magnet).await {
-            Ok(add_response) => {
-                info!("✓ Step 1 complete: Re-added torrent with new ID: {}", add_response.id);
-
-                // Wait a moment for RD to process the torrent
-                info!("Step 2: Waiting 2 seconds for RD to process torrent...");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                info!("✓ Step 2 complete");
-
-                info!("Step 3: Fetching new torrent info...");
-
-                // Get the new torrent info to find file IDs
-                match self.rd_client.get_torrent_info(&add_response.id).await {
-                    Ok(new_info) => {
-                        info!("✓ Step 3 complete: Retrieved new torrent info");
-
-                        // Build file selection string (comma-separated IDs of selected files)
-                        info!("Step 4: Matching and selecting files...");
-                        let original_selected_count = torrent_info.files.iter().filter(|f| f.selected == 1).count();
-                        let selected_file_ids: Vec<String> = torrent_info.files.iter()
-                            .filter(|f| f.selected == 1)
-                            .filter_map(|original_file| {
-                                // Match by path to find the corresponding file in new torrent
-                                new_info.files.iter()
-                                    .find(|new_file| new_file.path == original_file.path)
-                                    .map(|new_file| new_file.id.to_string())
-                            })
-                            .collect();
-
-                        info!("Matched {}/{} files from original torrent", selected_file_ids.len(), original_selected_count);
-
-                        if !selected_file_ids.is_empty() {
-                            let file_ids_str = selected_file_ids.join(",");
-                            info!("Selecting file IDs: {}", file_ids_str);
-                            match self.rd_client.select_files(&add_response.id, &file_ids_str).await {
-                                Ok(_) => {
-                                    info!("✓ Step 4 complete: Selected {} files for repaired torrent", selected_file_ids.len());
-
-                                    // Try to delete the old broken torrent
-                                    info!("Step 5: Cleaning up old broken torrent...");
-                                    if let Err(e) = self.rd_client.delete_torrent(&torrent_info.id).await {
-                                        warn!("✗ Failed to delete old torrent {}: {}", torrent_info.id, e);
-                                    } else {
-                                        info!("✓ Step 5 complete: Deleted old broken torrent {}", torrent_info.id);
-                                    }
-
-                                    // Update health status - mark old as repaired, add new as healthy
-                                    let mut health_map = self.health_status.write().await;
-                                    health_map.remove(&torrent_info.id);
-                                    health_map.insert(add_response.id.clone(), TorrentHealth {
-                                        torrent_id: add_response.id.clone(),
-                                        state: RepairState::Healthy,
-                                        failed_links: HashSet::new(),
-                                        last_check: std::time::Instant::now(),
-                                        repair_attempts: 0,
-                                        last_repair_trigger: None,
-                                    });
-
-                                    // Record replacement so scan loop reuses old identification
-                                    self.repair_replacements.write().await
-                                        .insert(add_response.id.clone(), torrent_info.id.clone());
-
-                                    info!("========================================");
-                                    info!("REPAIR COMPLETE: Torrent '{}' successfully repaired!", torrent_info.filename);
-                                    info!("Old ID: {} → New ID: {}", torrent_info.id, add_response.id);
-                                    info!("========================================");
-
-                                    Ok(())
-                                }
-                                Err(e) => {
-                                    error!("Failed to select files for repaired torrent {}: {}", add_response.id, e);
-                                    self.cleanup_leaked_torrent(&add_response.id).await;
-                                    self.set_repair_failed(&torrent_info.id).await;
-                                    Err(format!("Failed to select files: {}", e))
-                                }
-                            }
-                        } else {
-                            error!("No matching files found in repaired torrent {}", add_response.id);
-                            self.cleanup_leaked_torrent(&add_response.id).await;
-                            self.set_repair_failed(&torrent_info.id).await;
-                            Err("No matching files found".to_string())
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to get info for repaired torrent {}: {}", add_response.id, e);
-                        self.cleanup_leaked_torrent(&add_response.id).await;
-                        self.set_repair_failed(&torrent_info.id).await;
-                        Err(format!("Failed to get torrent info: {}", e))
-                    }
-                }
+        let (new_torrent_id, _new_info) = match self.add_and_select_files(
+            &torrent_info.id,
+            torrent_info,
+            Duration::from_secs(2),
+        ).await {
+            Ok((new_id, new_info)) => {
+                info!("Step 1 complete: Re-added torrent with new ID: {}", new_id);
+                info!("Step 2: Waiting 2 seconds for RD to process torrent... complete");
+                info!("Step 3: Fetching new torrent info... complete");
+                let original_selected_count = torrent_info.files.iter().filter(|f| f.selected == 1).count();
+                let matched_count = torrent_info.files.iter()
+                    .filter(|f| f.selected == 1)
+                    .filter(|original_file| {
+                        new_info.files.iter().any(|new_file| new_file.path == original_file.path)
+                    })
+                    .count();
+                info!("Step 4: Matching and selecting files...");
+                info!("Matched {}/{} files from original torrent", matched_count, original_selected_count);
+                info!("Step 4 complete: Selected {} files for repaired torrent", matched_count);
+                (new_id, new_info)
             }
             Err(e) => {
-                error!("Failed to re-add torrent {}: {}", torrent_info.id, e);
-                self.set_repair_failed(&torrent_info.id).await;
-                Err(format!("Failed to add magnet: {}", e))
+                return Err(e);
             }
-        }
+        };
+
+        info!("Step 5: Cleaning up old broken torrent...");
+        self.complete_repair(&torrent_info.id, &new_torrent_id).await;
+        info!("Step 5 complete: Deleted old broken torrent {}", torrent_info.id);
+
+        info!("========================================");
+        info!("REPAIR COMPLETE: Torrent '{}' successfully repaired!", torrent_info.filename);
+        info!("Old ID: {} -> New ID: {}", torrent_info.id, new_torrent_id);
+        info!("========================================");
+
+        Ok(())
     }
 
     /// Fetch torrent info fresh and attempt repair. Called on-demand when a broken
@@ -266,57 +282,8 @@ impl RepairManager {
         torrent_id: &str,
         failed_link: &str,
     ) -> Result<InstantRepairResult, String> {
-        // Check rate limits and repair state (same guards as repair_torrent)
-        {
-            let health_map = self.health_status.read().await;
-            if let Some(health) = health_map.get(torrent_id) {
-                if health.state == RepairState::Failed {
-                    debug!("Torrent {} has permanently failed repair, skipping instant repair", torrent_id);
-                    return Err("Torrent permanently failed".to_string());
-                }
-                if health.state == RepairState::Repairing {
-                    debug!("Repair already in progress for torrent {}, skipping instant repair", torrent_id);
-                    return Err("Repair already in progress".to_string());
-                }
-                if let Some(last_trigger) = health.last_repair_trigger {
-                    if last_trigger.elapsed().as_secs() < 30 {
-                        debug!("Repair recently triggered for torrent {} ({}s ago), skipping instant repair",
-                            torrent_id, last_trigger.elapsed().as_secs());
-                        return Err("Repair rate limited".to_string());
-                    }
-                }
-            }
-        }
-
-        // Set state to Repairing and increment attempt count
-        {
-            let mut health_map = self.health_status.write().await;
-            let attempt_num = if let Some(health) = health_map.get_mut(torrent_id) {
-                if health.repair_attempts >= 3 {
-                    error!("Torrent {} has failed repair 3 times, marking as permanently FAILED", torrent_id);
-                    health.state = RepairState::Failed;
-                    return Err("Maximum repair attempts exceeded".to_string());
-                }
-                if health.state == RepairState::Repairing {
-                    return Err("Repair already in progress".to_string());
-                }
-                health.state = RepairState::Repairing;
-                health.repair_attempts += 1;
-                health.last_repair_trigger = Some(std::time::Instant::now());
-                health.repair_attempts
-            } else {
-                health_map.insert(torrent_id.to_string(), TorrentHealth {
-                    torrent_id: torrent_id.to_string(),
-                    state: RepairState::Repairing,
-                    failed_links: HashSet::new(),
-                    last_check: std::time::Instant::now(),
-                    repair_attempts: 1,
-                    last_repair_trigger: Some(std::time::Instant::now()),
-                });
-                1
-            };
-            info!("Instant repair attempt #{} for torrent {}", attempt_num, torrent_id);
-        }
+        let attempt_num = self.check_and_begin_repair(torrent_id).await?;
+        info!("Instant repair attempt #{} for torrent {}", attempt_num, torrent_id);
 
         // Get old torrent info to find hash and file selection
         let old_info = match self.rd_client.get_torrent_info(torrent_id).await {
@@ -336,63 +303,22 @@ impl RepairManager {
             }
         };
 
-        // Add magnet
-        let magnet = format!("magnet:?xt=urn:btih:{}", old_info.hash);
         info!("Instant repair: adding magnet for hash {}", old_info.hash);
-        let add_response = match self.rd_client.add_magnet(&magnet).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                self.set_repair_failed(torrent_id).await;
-                return Err(format!("Failed to add magnet: {}", e));
-            }
-        };
-        info!("Instant repair: new torrent ID {}", add_response.id);
-
-        // Brief wait for RD to process the magnet
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Get new torrent info for file matching
-        let new_info = match self.rd_client.get_torrent_info(&add_response.id).await {
-            Ok(info) => info,
-            Err(e) => {
-                self.cleanup_leaked_torrent(&add_response.id).await;
-                self.set_repair_failed(torrent_id).await;
-                return Err(format!("Failed to get new torrent info: {}", e));
-            }
-        };
-
-        // Match and select files (same logic as repair_torrent)
-        let selected_file_ids: Vec<String> = old_info.files.iter()
-            .filter(|f| f.selected == 1)
-            .filter_map(|original_file| {
-                new_info.files.iter()
-                    .find(|new_file| new_file.path == original_file.path)
-                    .map(|new_file| new_file.id.to_string())
-            })
-            .collect();
-
-        if selected_file_ids.is_empty() {
-            self.cleanup_leaked_torrent(&add_response.id).await;
-            self.set_repair_failed(torrent_id).await;
-            return Err("No matching files found in new torrent".to_string());
-        }
-
-        let file_ids_str = selected_file_ids.join(",");
-        info!("Instant repair: selecting files {} on torrent {}", file_ids_str, add_response.id);
-        if let Err(e) = self.rd_client.select_files(&add_response.id, &file_ids_str).await {
-            self.cleanup_leaked_torrent(&add_response.id).await;
-            self.set_repair_failed(torrent_id).await;
-            return Err(format!("Failed to select files: {}", e));
-        }
+        let (new_torrent_id, _new_info) = self.add_and_select_files(
+            torrent_id,
+            &old_info,
+            Duration::from_millis(500),
+        ).await?;
+        info!("Instant repair: new torrent ID {}", new_torrent_id);
 
         // Brief wait for RD to process file selection
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Check if torrent is cached (status "downloaded" with links populated)
-        let final_info = match self.rd_client.get_torrent_info(&add_response.id).await {
+        let final_info = match self.rd_client.get_torrent_info(&new_torrent_id).await {
             Ok(info) => info,
             Err(e) => {
-                self.cleanup_leaked_torrent(&add_response.id).await;
+                self.cleanup_leaked_torrent(&new_torrent_id).await;
                 self.set_repair_failed(torrent_id).await;
                 return Err(format!("Failed to get final torrent info: {}", e));
             }
@@ -403,7 +329,7 @@ impl RepairManager {
             let new_link = match final_info.links.get(link_index) {
                 Some(link) => link.clone(),
                 None => {
-                    self.cleanup_leaked_torrent(&add_response.id).await;
+                    self.cleanup_leaked_torrent(&new_torrent_id).await;
                     self.set_repair_failed(torrent_id).await;
                     return Err(format!(
                         "Link index {} out of bounds (new torrent has {} links)",
@@ -412,38 +338,19 @@ impl RepairManager {
                 }
             };
 
-            // Delete old broken torrent
-            if let Err(e) = self.rd_client.delete_torrent(torrent_id).await {
-                warn!("Failed to delete old torrent {}: {}", torrent_id, e);
-            }
+            self.complete_repair(torrent_id, &new_torrent_id).await;
 
-            // Update health status: remove old, add new as Healthy
-            let mut health_map = self.health_status.write().await;
-            health_map.remove(torrent_id);
-            health_map.insert(add_response.id.clone(), TorrentHealth {
-                torrent_id: add_response.id.clone(),
-                state: RepairState::Healthy,
-                failed_links: HashSet::new(),
-                last_check: std::time::Instant::now(),
-                repair_attempts: 0,
-                last_repair_trigger: None,
-            });
-
-            // Record replacement so scan loop reuses old identification
-            self.repair_replacements.write().await
-                .insert(add_response.id.clone(), torrent_id.to_string());
-
-            info!("Instant repair SUCCEEDED for torrent {} → new ID {} with link at index {}",
-                torrent_id, add_response.id, link_index);
+            info!("Instant repair SUCCEEDED for torrent {} -> new ID {} with link at index {}",
+                torrent_id, new_torrent_id, link_index);
 
             Ok(InstantRepairResult {
-                new_torrent_id: add_response.id,
+                new_torrent_id,
                 new_rd_link: new_link,
             })
         } else {
-            // Not cached — torrent needs actual download
+            // Not cached -- torrent needs actual download
             info!("Torrent {} not cached (status: {}), leaving new torrent {} to download",
-                torrent_id, final_info.status, add_response.id);
+                torrent_id, final_info.status, new_torrent_id);
 
             // Delete old broken torrent
             if let Err(e) = self.rd_client.delete_torrent(torrent_id).await {

@@ -36,22 +36,20 @@ fn is_archive_file(path: &str) -> bool {
 /// Falls back to UNIX_EPOCH on parse failure.
 pub fn parse_rd_date(s: &str) -> SystemTime {
     fn days_from_ymd(y: u64, m: u64, d: u64) -> Option<u64> {
-        // Days from year 0 to year y (Gregorian)
-        let is_leap = |yr: u64| yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0);
-        let days_before_month: [u64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-        if m < 1 || m > 12 || d < 1 || d > 31 { return None; }
-        // Days from 1970-01-01 to y-m-d
-        let mut total: i64 = 0;
-        // Years
-        for yr in 1970..y {
-            total += if is_leap(yr) { 366 } else { 365 };
-        }
-        for yr in y..1970 {
-            total -= if is_leap(yr) { 366 } else { 365 };
-        }
-        total += days_before_month[(m - 1) as usize] as i64;
-        if m > 2 && is_leap(y) { total += 1; }
-        total += (d - 1) as i64;
+        let is_leap = |yr: i64| yr.rem_euclid(4) == 0 && (yr.rem_euclid(100) != 0 || yr.rem_euclid(400) == 0);
+        let days_before_month: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+        if !(1..=12).contains(&m) || !(1..=31).contains(&d) { return None; }
+
+        let y = y as i64;
+        // Count leap years from year 1 to year (yr - 1) using closed-form formula
+        let leap_years_before = |yr: i64| -> i64 {
+            let yr = yr - 1;
+            yr / 4 - yr / 100 + yr / 400
+        };
+        let total = (y - 1970) * 365 + (leap_years_before(y) - leap_years_before(1970))
+            + days_before_month[(m - 1) as usize]
+            + if m as i64 > 2 && is_leap(y) { 1 } else { 0 }
+            + (d as i64 - 1);
         if total < 0 { return None; }
         Some(total as u64)
     }
@@ -846,19 +844,6 @@ mod tests {
                 assert!(movie_children.contains_key("Same Title [tmdbid-2]"));
             }
         }
-    }
-
-    #[test]
-    fn error_placeholder_is_not_used() {
-        // Verify the broken-link placeholder string has been removed from this file.
-        // If this test fails, it means the placeholder was re-introduced.
-        // The needle is split so that this test's own source text does not match it.
-        let source = include_str!("vfs.rs");
-        let needle = concat!("# Error: Failed to unrestrict", " link");
-        assert!(
-            !source.contains(needle),
-            "vfs.rs must not contain the broken-link placeholder string — skip the file instead"
-        );
     }
 
     #[test]

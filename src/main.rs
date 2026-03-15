@@ -8,15 +8,15 @@ use debridmoviemapper::vfs::DebridVfs;
 use debridmoviemapper::dav_fs::DebridFileSystem;
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::repair::RepairManager;
+use debridmoviemapper::tasks::{MATCHES_TABLE, ScanConfig};
 use dav_server::DavHandler;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
-use redb::{Database, TableDefinition};
+use redb::Database;
 
 const MAX_CONNECTIONS: usize = 256;
-const MATCHES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("matches");
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -72,17 +72,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let scan_handle = tokio::spawn(debridmoviemapper::tasks::run_scan_loop(
-        rd_client.clone(),
-        tmdb_client.clone(),
-        vfs.clone(),
-        db.clone(),
-        repair_manager.clone(),
-        scan_interval_secs,
-        jellyfin_client,
+        ScanConfig {
+            rd_client: rd_client.clone(),
+            tmdb_client: tmdb_client.clone(),
+            vfs: vfs.clone(),
+            db: db.clone(),
+            repair_manager: repair_manager.clone(),
+            interval_secs: scan_interval_secs,
+            jellyfin_client,
+        },
         shutdown_rx,
     ));
 
-    let http_client = reqwest::Client::new();
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("Failed to build CDN HTTP client");
     let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone(), repair_manager.clone(), http_client);
     let dav_handler = DavHandler::builder()
         .filesystem(Box::new(dav_fs))

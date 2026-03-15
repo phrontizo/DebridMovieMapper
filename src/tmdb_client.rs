@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use reqwest::{Client, RequestBuilder};
+use rand::Rng;
 use tracing::{error, warn};
 use std::time::Duration;
 
@@ -86,7 +87,7 @@ impl TmdbClient {
         for attempt in 1..=max_attempts {
             if attempt > 1 {
                 let backoff = 2u64.pow(attempt as u32 - 2) * 1000;
-                let jitter = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() % 500) as u64;
+                let jitter = rand::thread_rng().gen_range(0..500);
                 tokio::time::sleep(Duration::from_millis(backoff + jitter)).await;
             }
 

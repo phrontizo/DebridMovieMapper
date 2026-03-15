@@ -270,7 +270,7 @@ impl RealDebridClient {
             info!("Fetching torrents page {}...", page);
             let url = format!("https://api.real-debrid.com/rest/1.0/torrents?page={}&limit=50", page);
             let res: Result<Vec<Torrent>, reqwest::Error> = self.fetch_with_retry(|| self.client.get(&url), &[]).await;
-            
+
             match res {
                 Ok(torrents) => {
                     if torrents.is_empty() {
@@ -297,6 +297,12 @@ impl RealDebridClient {
         self.fetch_with_retry(|| self.client.get(&url), &[reqwest::StatusCode::NOT_FOUND]).await
     }
 
+    /// Unrestrict a link, caching the result for 1 hour.
+    ///
+    /// NOTE: The cache check-then-act is not atomic. Two concurrent calls
+    /// for the same link may both miss the cache and call the API. This is
+    /// intentional: per-key locking would add complexity with negligible
+    /// benefit since duplicate calls are idempotent and rare in practice.
     pub async fn unrestrict_link(&self, link: &str) -> Result<UnrestrictResponse, reqwest::Error> {
         // Check cache first
         {
@@ -349,7 +355,9 @@ impl RealDebridClient {
     /// Select files for a torrent
     pub async fn select_files(&self, torrent_id: &str, file_ids: &str) -> Result<(), reqwest::Error> {
         let url = format!("https://api.real-debrid.com/rest/1.0/torrents/selectFiles/{}", torrent_id);
-        // Use empty type for no response body expected
+        // RD returns 204 No Content on success. We deserialize as
+        // serde_json::Value which accepts the "[]" empty-body fallback
+        // in fetch_with_retry.
         let _: serde_json::Value = self.fetch_with_retry(|| {
             self.client.post(&url).form(&[("files", file_ids)])
         }, &[]).await?;
@@ -413,6 +421,9 @@ impl RealDebridClient {
                     match resp.error_for_status() {
                         Ok(resp) => {
                             let text = resp.text().await?;
+                            // 204 No Content or empty body: try deserializing from "[]".
+                            // This succeeds for Vec<T> and serde_json::Value, allowing
+                            // callers like select_files (which gets 204) to work transparently.
                             if text.trim().is_empty() || status.as_u16() == 204 {
                                 if let Ok(val) = serde_json::from_str::<T>("[]") {
                                     self.rate_limiter.record_success().await;
@@ -453,8 +464,6 @@ impl RealDebridClient {
         }
     }
 
-
-
     /// Evict expired entries from the unrestrict cache, and if still over
     /// MAX_CACHE_SIZE, remove the oldest entries.
     pub async fn evict_expired_cache(&self) {
@@ -469,6 +478,14 @@ impl RealDebridClient {
                 cache.remove(&key);
             }
         }
+    }
+
+    /// Remove a specific link from the unrestrict cache.
+    /// Called after instant repair replaces a broken torrent so that stale
+    /// cached responses for the old link do not trigger a second repair.
+    pub async fn invalidate_unrestrict_cache(&self, link: &str) {
+        let mut cache = self.unrestrict_cache.write().await;
+        cache.remove(link);
     }
 }
 
@@ -651,5 +668,31 @@ mod tests {
     #[test]
     fn retry_after_cap_constant() {
         assert_eq!(MAX_RETRY_AFTER_SECS, 300);
+    }
+
+    #[tokio::test]
+    async fn invalidate_unrestrict_cache_removes_entry() {
+        let client = RealDebridClient::new("fake-token".to_string()).unwrap();
+        {
+            let mut cache = client.unrestrict_cache.write().await;
+            cache.insert("test-link".to_string(), CachedUnrestrictResponse {
+                response: UnrestrictResponse {
+                    id: "test".to_string(),
+                    filename: "test.mkv".to_string(),
+                    mime_type: None,
+                    filesize: 0,
+                    link: "test-link".to_string(),
+                    host: String::new(),
+                    chunks: 0,
+                    crc: 0,
+                    download: "http://test".to_string(),
+                    streamable: 0,
+                },
+                cached_at: std::time::Instant::now(),
+            });
+        }
+        assert!(client.unrestrict_cache.read().await.contains_key("test-link"));
+        client.invalidate_unrestrict_cache("test-link").await;
+        assert!(!client.unrestrict_cache.read().await.contains_key("test-link"));
     }
 }
