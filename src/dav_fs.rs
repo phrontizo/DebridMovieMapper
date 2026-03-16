@@ -35,12 +35,13 @@ impl DebridFileSystem {
         }
     }
 
-    fn find_node_in(vfs: &DebridVfs, path: &DavPath) -> Option<VfsNode> {
+    /// Resolve a path to a VfsNode reference without cloning.
+    fn find_node_ref<'v>(vfs: &'v DebridVfs, path: &DavPath) -> Option<&'v VfsNode> {
         let mut current = &vfs.root;
         let path_osstr = path.as_rel_ospath();
         let path_str = path_osstr.to_str()?;
         if path_str == "." || path_str.is_empty() {
-            return Some(current.clone());
+            return Some(current);
         }
         for component in path_str.split('/') {
             if component.is_empty() || component == "." {
@@ -55,7 +56,11 @@ impl DebridFileSystem {
                 return None;
             }
         }
-        Some(current.clone())
+        Some(current)
+    }
+
+    fn find_node_in(vfs: &DebridVfs, path: &DavPath) -> Option<VfsNode> {
+        Self::find_node_ref(vfs, path).cloned()
     }
 
     async fn find_node(&self, path: &DavPath) -> Option<VfsNode> {
@@ -84,7 +89,7 @@ impl DavFileSystem for DebridFileSystem {
                         http_client: self.http_client.clone(),
                         pos: 0,
                         cdn_url: None,
-                        buffer: Vec::new(),
+                        buffer: Bytes::new(),
                         buffer_start: 0,
                     }) as Box<dyn DavFile>)
                 }
@@ -102,7 +107,7 @@ impl DavFileSystem for DebridFileSystem {
     fn read_dir<'a>(&'a self, path: &'a DavPath, _meta: ReadDirMeta) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         async move {
             let vfs = self.vfs.read().await;
-            let node = Self::find_node_in(&vfs, path).ok_or(FsError::NotFound)?;
+            let node = Self::find_node_ref(&vfs, path).ok_or(FsError::NotFound)?;
             let path_str = path.as_rel_ospath().to_str().unwrap_or("").trim_matches('/').trim_start_matches("./");
             if let VfsNode::Directory { children } = node {
                 let mut entries: Vec<Box<dyn DavDirEntry>> = Vec::new();
@@ -114,9 +119,8 @@ impl DavFileSystem for DebridFileSystem {
                     };
                     let modified_time = vfs.timestamps.get(&child_path).copied().unwrap_or(UNIX_EPOCH);
                     entries.push(Box::new(DebridDirEntry {
-                        name,
-                        node: child.clone(),
-                        modified_time,
+                        name: name.clone(),
+                        metadata: DebridMetaData::from_node(child, modified_time),
                     }));
                 }
                 let stream = futures_util::stream::iter(entries.into_iter().map(Ok));
@@ -130,40 +134,47 @@ impl DavFileSystem for DebridFileSystem {
     fn metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, Box<dyn DavMetaData>> {
         async move {
             let vfs = self.vfs.read().await;
-            let node = Self::find_node_in(&vfs, path).ok_or(FsError::NotFound)?;
+            let node = Self::find_node_ref(&vfs, path).ok_or(FsError::NotFound)?;
             let path_str = path.as_rel_ospath().to_str().unwrap_or("").trim_matches('/').trim_start_matches("./");
             let modified_time = vfs.timestamps.get(path_str).copied().unwrap_or(UNIX_EPOCH);
-            Ok(Box::new(DebridMetaData { node, modified_time }) as Box<dyn DavMetaData>)
+            Ok(Box::new(DebridMetaData::from_node(node, modified_time)) as Box<dyn DavMetaData>)
         }.boxed()
     }
 }
 
 #[derive(Debug, Clone)]
 struct DebridMetaData {
-    node: VfsNode,
+    is_directory: bool,
+    size: u64,
     modified_time: SystemTime,
+}
+
+impl DebridMetaData {
+    fn from_node(node: &VfsNode, modified_time: SystemTime) -> Self {
+        let (is_directory, size) = match node {
+            VfsNode::MediaFile { file_size, .. } => (false, *file_size),
+            VfsNode::VirtualFile { content, .. } => (false, content.len() as u64),
+            VfsNode::Directory { .. } => (true, 0),
+        };
+        Self { is_directory, size, modified_time }
+    }
 }
 
 impl DavMetaData for DebridMetaData {
     fn len(&self) -> u64 {
-        match &self.node {
-            VfsNode::MediaFile { file_size, .. } => *file_size,
-            VfsNode::VirtualFile { content, .. } => content.len() as u64,
-            VfsNode::Directory { .. } => 0,
-        }
+        self.size
     }
     fn modified(&self) -> FsResult<SystemTime> {
         Ok(self.modified_time)
     }
     fn is_dir(&self) -> bool {
-        matches!(self.node, VfsNode::Directory { .. })
+        self.is_directory
     }
 }
 
 struct DebridDirEntry {
     name: String,
-    node: VfsNode,
-    modified_time: SystemTime,
+    metadata: DebridMetaData,
 }
 
 impl DavDirEntry for DebridDirEntry {
@@ -171,8 +182,9 @@ impl DavDirEntry for DebridDirEntry {
         self.name.as_bytes().to_vec()
     }
     fn metadata(&self) -> FsFuture<'_, Box<dyn DavMetaData>> {
+        let meta = self.metadata.clone();
         async move {
-            Ok(Box::new(DebridMetaData { node: self.node.clone(), modified_time: self.modified_time }) as Box<dyn DavMetaData>)
+            Ok(Box::new(meta) as Box<dyn DavMetaData>)
         }.boxed()
     }
 }
@@ -198,7 +210,7 @@ struct ProxiedMediaFile {
     http_client: reqwest::Client,
     pos: u64,
     cdn_url: Option<String>,
-    buffer: Vec<u8>,
+    buffer: Bytes,
     buffer_start: u64,
 }
 
@@ -265,7 +277,7 @@ impl ProxiedMediaFile {
             let offset = (pos - self.buffer_start) as usize;
             let available = self.buffer.len() - offset;
             let to_read = std::cmp::min(len, available);
-            let data = Bytes::copy_from_slice(&self.buffer[offset..offset + to_read]);
+            let data = self.buffer.slice(offset..offset + to_read);
             self.pos += to_read as u64;
             return Ok(data);
         }
@@ -309,12 +321,12 @@ impl ProxiedMediaFile {
             FsError::GeneralFailure
         })?;
 
-        // Store in buffer
-        self.buffer = body.to_vec();
+        // Store in buffer (Bytes is reference-counted, no copy needed)
+        self.buffer = body;
         self.buffer_start = pos;
 
         let to_read = std::cmp::min(len, self.buffer.len());
-        let data = Bytes::copy_from_slice(&self.buffer[..to_read]);
+        let data = self.buffer.slice(..to_read);
         self.pos += to_read as u64;
         Ok(data)
     }
@@ -325,17 +337,15 @@ impl DavFile for ProxiedMediaFile {
         async move {
             if self.repair_manager.should_hide_torrent(&self.rd_torrent_id).await {
                 return Ok(Box::new(DebridMetaData {
-                    node: VfsNode::VirtualFile { content: vec![] },
+                    is_directory: false,
+                    size: 0,
                     modified_time: SystemTime::UNIX_EPOCH,
                 }) as Box<dyn DavMetaData>);
             }
 
             Ok(Box::new(DebridMetaData {
-                node: VfsNode::MediaFile {
-                    file_size: self.file_size,
-                    rd_link: self.rd_link.clone(),
-                    rd_torrent_id: self.rd_torrent_id.clone(),
-                },
+                is_directory: false,
+                size: self.file_size,
                 modified_time: SystemTime::UNIX_EPOCH,
             }) as Box<dyn DavMetaData>)
         }.boxed()
@@ -409,9 +419,37 @@ mod tests {
             http_client: reqwest::Client::new(),
             pos: 0,
             cdn_url: None,
-            buffer: Vec::new(),
+            buffer: Bytes::new(),
             buffer_start: 0,
         };
+    }
+
+    #[test]
+    fn debrid_metadata_from_node_extracts_correct_fields() {
+        let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+
+        // Directory
+        let dir_node = VfsNode::Directory { children: std::collections::BTreeMap::new() };
+        let meta = DebridMetaData::from_node(&dir_node, modified);
+        assert!(meta.is_directory);
+        assert_eq!(meta.size, 0);
+        assert_eq!(meta.modified_time, modified);
+
+        // MediaFile
+        let media_node = VfsNode::MediaFile {
+            file_size: 42000,
+            rd_link: "link".to_string(),
+            rd_torrent_id: "tid".to_string(),
+        };
+        let meta = DebridMetaData::from_node(&media_node, modified);
+        assert!(!meta.is_directory);
+        assert_eq!(meta.size, 42000);
+
+        // VirtualFile
+        let vf_node = VfsNode::VirtualFile { content: vec![1, 2, 3, 4, 5] };
+        let meta = DebridMetaData::from_node(&vf_node, modified);
+        assert!(!meta.is_directory);
+        assert_eq!(meta.size, 5);
     }
 
     #[test]
@@ -483,6 +521,130 @@ mod tests {
             "find_node_in must contain the .. traversal guard"
         );
     }
+
+    #[test]
+    fn find_node_in_resolves_root() {
+        let vfs = DebridVfs::new();
+        // Root path "/" maps to rel_ospath "." or ""
+        let path = DavPath::new("/").unwrap();
+        let result = DebridFileSystem::find_node_in(&vfs, &path);
+        assert!(result.is_some(), "Root path should resolve");
+        assert!(matches!(result, Some(VfsNode::Directory { .. })));
+    }
+
+    #[test]
+    fn find_node_in_returns_none_for_missing_path() {
+        let vfs = DebridVfs::new();
+        let path = DavPath::new("/NonExistent/Folder").unwrap();
+        let result = DebridFileSystem::find_node_in(&vfs, &path);
+        assert!(result.is_none(), "Missing path should return None");
+    }
+
+    #[test]
+    fn find_node_in_resolves_deep_path() {
+        // Build a VFS with a known movie file and verify it can be found
+        let torrents = vec![(
+            crate::rd_client::TorrentInfo {
+                id: "t1".to_string(),
+                filename: "Test.mkv".to_string(),
+                original_filename: "Test.mkv".to_string(),
+                hash: "h".to_string(),
+                bytes: 1000,
+                original_bytes: 1000,
+                host: "h".to_string(),
+                split: 1,
+                progress: 100.0,
+                status: "downloaded".to_string(),
+                added: "2023-01-01".to_string(),
+                files: vec![crate::rd_client::TorrentFile {
+                    id: 1,
+                    path: "/Test.mkv".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                }],
+                links: vec!["http://link".to_string()],
+                ended: None,
+            },
+            crate::vfs::MediaMetadata {
+                title: "Test Movie".to_string(),
+                year: None,
+                media_type: crate::vfs::MediaType::Movie,
+                external_id: Some("tmdb:123".to_string()),
+            },
+        )];
+
+        let vfs = DebridVfs::build(torrents);
+        let path = DavPath::new("/Movies/Test Movie [tmdbid-123]/Test.mkv").unwrap();
+        let result = DebridFileSystem::find_node_in(&vfs, &path);
+        assert!(result.is_some(), "Deep path to media file should resolve");
+        assert!(matches!(result, Some(VfsNode::MediaFile { .. })));
+    }
+
+    #[tokio::test]
+    async fn virtual_file_seek_and_read() {
+        use dav_server::fs::DavFile;
+
+        let content = b"Hello, World! This is test content.";
+        let mut file = VirtualFile {
+            content: Bytes::from(&content[..]),
+            pos: 0,
+        };
+
+        // Read first 5 bytes
+        let data = file.read_bytes(5).await.unwrap();
+        assert_eq!(&data[..], b"Hello");
+        assert_eq!(file.pos, 5);
+
+        // Seek to position 7
+        let pos = file.seek(std::io::SeekFrom::Start(7)).await.unwrap();
+        assert_eq!(pos, 7);
+
+        // Read from new position
+        let data = file.read_bytes(6).await.unwrap();
+        assert_eq!(&data[..], b"World!");
+        assert_eq!(file.pos, 13);
+
+        // Seek from current (+2)
+        let pos = file.seek(std::io::SeekFrom::Current(2)).await.unwrap();
+        assert_eq!(pos, 15);
+
+        // Seek from end (-8)
+        let pos = file.seek(std::io::SeekFrom::End(-8)).await.unwrap();
+        assert_eq!(pos, (content.len() - 8) as u64);
+
+        // Read past end returns empty
+        file.seek(std::io::SeekFrom::Start(content.len() as u64)).await.unwrap();
+        let data = file.read_bytes(10).await.unwrap();
+        assert!(data.is_empty(), "Reading at EOF should return empty bytes");
+    }
+
+    #[tokio::test]
+    async fn virtual_file_seek_negative_current_errors() {
+        use dav_server::fs::DavFile;
+
+        let mut file = VirtualFile {
+            content: Bytes::from(&b"Hello"[..]),
+            pos: 2,
+        };
+
+        // SeekFrom::Current(-10) from pos=2 should be negative => error
+        let result = file.seek(std::io::SeekFrom::Current(-10)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn virtual_file_seek_negative_end_errors() {
+        use dav_server::fs::DavFile;
+
+        let mut file = VirtualFile {
+            content: Bytes::from(&b"Hi"[..]),
+            pos: 0,
+        };
+
+        // SeekFrom::End(-10) on 2-byte file would be negative => error
+        let result = file.seek(std::io::SeekFrom::End(-10)).await;
+        assert!(result.is_err());
+    }
 }
 
 /// Simple virtual file (NFO files, etc)
@@ -494,11 +656,13 @@ struct VirtualFile {
 
 impl DavFile for VirtualFile {
     fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
-        let node = VfsNode::VirtualFile {
-            content: self.content.to_vec(),
+        let meta = DebridMetaData {
+            is_directory: false,
+            size: self.content.len() as u64,
+            modified_time: SystemTime::UNIX_EPOCH,
         };
         async move {
-            Ok(Box::new(DebridMetaData { node, modified_time: SystemTime::UNIX_EPOCH }) as Box<dyn DavMetaData>)
+            Ok(Box::new(meta) as Box<dyn DavMetaData>)
         }.boxed()
     }
 

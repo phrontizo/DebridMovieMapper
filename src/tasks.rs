@@ -137,15 +137,12 @@ pub async fn run_scan_loop(
                             if let Some((old_info, old_metadata)) = seen_torrents.get(old_id) {
                                 info!("Reusing identification for repair replacement {} → {} ({})",
                                     old_id, torrent.id, old_info.filename);
-                                // Use old metadata but we need fresh TorrentInfo for the new torrent
                                 let metadata = old_metadata.clone();
                                 // Get fresh torrent info for the new ID
                                 match rd_client.get_torrent_info(&torrent.id).await {
                                     Ok(new_info) => {
-                                        let data = (new_info.clone(), metadata.clone());
-                                        seen_torrents.insert(torrent.id.clone(), data.clone());
-                                        // Update redb: delete old entry, insert new entry
-                                        if let Ok(data_bytes) = serde_json::to_vec(&data) {
+                                        // Serialize from references before cloning for owned storage
+                                        if let Ok(data_bytes) = serde_json::to_vec(&(&new_info, &metadata)) {
                                             let db_clone = db.clone();
                                             let new_id = torrent.id.clone();
                                             let old_id = old_id.clone();
@@ -160,6 +157,7 @@ pub async fn run_scan_loop(
                                                 Ok(())
                                             }).await;
                                         }
+                                        seen_torrents.insert(torrent.id.clone(), (new_info.clone(), metadata.clone()));
                                         current_data.push((new_info, metadata));
                                     }
                                     Err(e) => {
@@ -242,9 +240,8 @@ pub async fn run_scan_loop(
                         processed_new += 1;
                         match result {
                             Ok((id, info, metadata)) => {
-                                seen_torrents.insert(id.clone(), (info.clone(), metadata.clone()));
                                 if let Ok(data_bytes) =
-                                    serde_json::to_vec(&(info.clone(), metadata.clone()))
+                                    serde_json::to_vec(&(&info, &metadata))
                                 {
                                     let db_clone = db.clone();
                                     let id_clone = id.clone();
@@ -258,6 +255,7 @@ pub async fn run_scan_loop(
                                         Ok(())
                                     }).await;
                                 }
+                                seen_torrents.insert(id, (info.clone(), metadata.clone()));
                                 current_data.push((info, metadata));
                             }
                             Err(e) => error!("Failed to identify torrent: {}", e),
@@ -274,14 +272,16 @@ pub async fn run_scan_loop(
                     update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client).await;
                 }
 
-                let current_ids: std::collections::HashSet<String> =
-                    deduped_torrents.iter().map(|t| t.id.clone()).collect();
+                let current_ids: std::collections::HashSet<&str> =
+                    deduped_torrents.iter().map(|t| t.id.as_str()).collect();
                 // Collect stale IDs before retain so we can clean up redb
                 let stale_ids: Vec<String> = seen_torrents.keys()
-                    .filter(|id| !current_ids.contains(*id))
+                    .filter(|id| !current_ids.contains(id.as_str()))
                     .cloned()
                     .collect();
-                seen_torrents.retain(|id, _| current_ids.contains(id));
+                seen_torrents.retain(|id, _| current_ids.contains(id.as_str()));
+                // Prune health_status entries for torrents that no longer exist
+                repair_manager.prune_health_status(&current_ids).await;
                 // Remove stale entries from redb to prevent them from reloading on restart
                 if !stale_ids.is_empty() {
                     info!("Removing {} stale entries from database", stale_ids.len());
@@ -320,12 +320,11 @@ async fn update_vfs(
     repair_manager: &Arc<RepairManager>,
     jellyfin_client: &Option<Arc<crate::jellyfin_client::JellyfinClient>>,
 ) {
-    let mut filtered = Vec::new();
-    for (torrent_info, metadata) in current_data {
-        if !repair_manager.should_hide_torrent(&torrent_info.id).await {
-            filtered.push((torrent_info.clone(), metadata.clone()));
-        }
-    }
+    let hidden_ids = repair_manager.hidden_torrent_ids().await;
+    let filtered: Vec<_> = current_data.iter()
+        .filter(|(torrent_info, _)| !hidden_ids.contains(&torrent_info.id))
+        .map(|(torrent_info, metadata)| (torrent_info.clone(), metadata.clone()))
+        .collect();
     // Build VFS without holding the lock to avoid blocking WebDAV reads during scans
     let new_vfs = DebridVfs::build(filtered);
     // Diff old vs new, then swap

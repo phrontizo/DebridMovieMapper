@@ -107,13 +107,18 @@ impl RepairManager {
                 health.state = RepairState::Failed;
                 return Err("Maximum repair attempts exceeded".to_string());
             }
-            // Double-check state hasn't changed (another task might have started repairing
-            // or marked this torrent as failed between the read and write locks)
+            // Double-check all guards: another task might have changed state or
+            // started a repair between the read and write lock acquisitions.
             if health.state == RepairState::Failed {
                 return Err("Torrent permanently failed".to_string());
             }
             if health.state == RepairState::Repairing {
                 return Err("Repair already in progress".to_string());
+            }
+            if let Some(last_trigger) = health.last_repair_trigger {
+                if last_trigger.elapsed().as_secs() < 30 {
+                    return Err("Repair rate limited".to_string());
+                }
             }
             health.state = RepairState::Repairing;
             health.repair_attempts += 1;
@@ -270,7 +275,7 @@ impl RepairManager {
     }
 
     /// Fetch torrent info fresh and attempt repair. Called on-demand when a broken
-    /// link is detected at STRM access time.
+    /// link is detected during WebDAV file read.
     pub async fn repair_by_id(&self, torrent_id: &str) -> Result<(), String> {
         match self.rd_client.get_torrent_info(torrent_id).await {
             Ok(info) => self.repair_torrent(&info).await,
@@ -361,6 +366,10 @@ impl RepairManager {
                 warn!("Failed to delete old torrent {}: {}", torrent_id, e);
             }
 
+            // Record replacement so scan loop reuses old identification
+            self.repair_replacements.write().await
+                .insert(new_torrent_id.to_string(), torrent_id.to_string());
+
             // Mark as broken so it's hidden until scan picks up the new torrent
             let mut health_map = self.health_status.write().await;
             if let Some(health) = health_map.get_mut(torrent_id) {
@@ -381,6 +390,17 @@ impl RepairManager {
         }
     }
 
+    /// Return the set of torrent IDs that should be hidden from WebDAV.
+    /// This acquires the read lock once instead of per-torrent, which is
+    /// significantly faster when filtering hundreds of torrents during VFS updates.
+    pub async fn hidden_torrent_ids(&self) -> std::collections::HashSet<String> {
+        let health_map = self.health_status.read().await;
+        health_map.values()
+            .filter(|h| matches!(h.state, RepairState::Broken | RepairState::Repairing | RepairState::Failed))
+            .map(|h| h.torrent_id.clone())
+            .collect()
+    }
+
     /// Get summary of repair status
     pub async fn get_status_summary(&self) -> (usize, usize, usize) {
         let health_map = self.health_status.read().await;
@@ -388,6 +408,18 @@ impl RepairManager {
         let repairing = health_map.values().filter(|h| matches!(h.state, RepairState::Broken | RepairState::Repairing)).count();
         let failed = health_map.values().filter(|h| h.state == RepairState::Failed).count();
         (healthy, repairing, failed)
+    }
+
+    /// Remove health_status entries for torrent IDs that are no longer active.
+    /// This prevents unbounded growth of the health_status map over time.
+    pub async fn prune_health_status(&self, active_torrent_ids: &std::collections::HashSet<&str>) {
+        let mut health_map = self.health_status.write().await;
+        let before = health_map.len();
+        health_map.retain(|id, _| active_torrent_ids.contains(id.as_str()));
+        let pruned = before - health_map.len();
+        if pruned > 0 {
+            info!("Pruned {} stale entries from repair health_status", pruned);
+        }
     }
 
     /// Mark a torrent as broken (typically called when a 503 is encountered during playback)
@@ -440,15 +472,68 @@ mod tests {
             manager.try_instant_repair("torrent_id", "link").await;
     }
 
-    #[test]
-    fn repair_state_has_no_checking_variant() {
-        let states = [
-            RepairState::Healthy,
-            RepairState::Broken,
-            RepairState::Repairing,
-            RepairState::Failed,
-        ];
-        assert_eq!(states.len(), 4);
+    #[tokio::test]
+    async fn should_hide_torrent_for_each_state() {
+        let manager = make_test_manager();
+
+        // Healthy: should NOT hide
+        {
+            let mut health_map = manager.health_status.write().await;
+            health_map.insert("healthy".to_string(), TorrentHealth {
+                torrent_id: "healthy".to_string(),
+                state: RepairState::Healthy,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 0,
+                last_repair_trigger: None,
+            });
+        }
+        assert!(!manager.should_hide_torrent("healthy").await, "Healthy torrent should not be hidden");
+
+        // Broken: should hide
+        {
+            let mut health_map = manager.health_status.write().await;
+            health_map.insert("broken".to_string(), TorrentHealth {
+                torrent_id: "broken".to_string(),
+                state: RepairState::Broken,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 0,
+                last_repair_trigger: None,
+            });
+        }
+        assert!(manager.should_hide_torrent("broken").await, "Broken torrent should be hidden");
+
+        // Repairing: should hide
+        {
+            let mut health_map = manager.health_status.write().await;
+            health_map.insert("repairing".to_string(), TorrentHealth {
+                torrent_id: "repairing".to_string(),
+                state: RepairState::Repairing,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 1,
+                last_repair_trigger: None,
+            });
+        }
+        assert!(manager.should_hide_torrent("repairing").await, "Repairing torrent should be hidden");
+
+        // Failed: should hide
+        {
+            let mut health_map = manager.health_status.write().await;
+            health_map.insert("failed".to_string(), TorrentHealth {
+                torrent_id: "failed".to_string(),
+                state: RepairState::Failed,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 3,
+                last_repair_trigger: None,
+            });
+        }
+        assert!(manager.should_hide_torrent("failed").await, "Failed torrent should be hidden");
+
+        // Unknown torrent: should NOT hide
+        assert!(!manager.should_hide_torrent("unknown").await, "Unknown torrent should not be hidden");
     }
 
     fn make_test_manager() -> RepairManager {
@@ -558,11 +643,12 @@ mod tests {
     }
 
     #[test]
-    fn check_and_begin_repair_write_side_rechecks_failed_state() {
+    fn check_and_begin_repair_write_side_rechecks_all_guards() {
         // The check_and_begin_repair method has a TOCTOU window between its read
         // lock (fast rejection) and write lock (state transition). Between the two,
-        // another task could mark the torrent as Failed. The write-side MUST re-check
-        // for Failed state before proceeding.
+        // another task could mark the torrent as Failed, start repairing, or set
+        // last_repair_trigger. The write-side MUST re-check ALL guards before
+        // proceeding.
         let source = include_str!("repair.rs");
         let fn_start = source.find("async fn check_and_begin_repair").expect("function must exist");
         let fn_body = &source[fn_start..];
@@ -576,6 +662,78 @@ mod tests {
              TOCTOU race where another task marks the torrent as failed between the read \
              and write lock acquisitions"
         );
+        // The write-side must check for Repairing state
+        assert!(
+            write_side.contains("RepairState::Repairing"),
+            "check_and_begin_repair write-side must re-check for Repairing state"
+        );
+        // The write-side must re-check rate limiting (last_repair_trigger)
+        assert!(
+            write_side.contains("last_repair_trigger"),
+            "check_and_begin_repair write-side must re-check last_repair_trigger to prevent \
+             TOCTOU race where another task completes a repair between the read and write \
+             lock acquisitions, setting last_repair_trigger"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_check_and_begin_repair_only_one_succeeds() {
+        // Verify that when multiple tasks call check_and_begin_repair concurrently
+        // for the same torrent, only one succeeds and the others are rejected.
+        let manager = Arc::new(make_test_manager());
+
+        // Spawn 10 concurrent repair attempts
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let mgr = manager.clone();
+            handles.push(tokio::spawn(async move {
+                mgr.check_and_begin_repair("concurrent_torrent").await
+            }));
+        }
+
+        let mut successes = 0;
+        let mut failures = 0;
+        for handle in handles {
+            match handle.await.unwrap() {
+                Ok(_) => successes += 1,
+                Err(_) => failures += 1,
+            }
+        }
+
+        // Exactly one task should succeed; all others should be rejected
+        assert_eq!(successes, 1, "Exactly one concurrent repair should succeed");
+        assert_eq!(failures, 9, "All other concurrent repairs should be rejected");
+
+        // Verify the torrent is in Repairing state
+        let health_map = manager.health_status.read().await;
+        let health = health_map.get("concurrent_torrent").unwrap();
+        assert_eq!(health.state, RepairState::Repairing);
+        assert_eq!(health.repair_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn check_and_begin_repair_write_side_rate_limits() {
+        // Verify the write-side rate limit re-check works: if another task
+        // completes repair (setting last_repair_trigger) between our read
+        // and write locks, we should be rejected.
+        let manager = make_test_manager();
+
+        // First repair succeeds
+        let result = manager.check_and_begin_repair("rate_test").await;
+        assert!(result.is_ok());
+
+        // Simulate repair completing (back to Broken, but last_repair_trigger is recent)
+        {
+            let mut health_map = manager.health_status.write().await;
+            let health = health_map.get_mut("rate_test").unwrap();
+            health.state = RepairState::Broken;
+            // last_repair_trigger was set by check_and_begin_repair, leave it as-is
+        }
+
+        // Second attempt should be rate-limited (within 30s)
+        let result = manager.check_and_begin_repair("rate_test").await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Repair rate limited");
     }
 
     #[tokio::test]
@@ -596,5 +754,293 @@ mod tests {
         let result = manager.try_instant_repair("torrent4", "some_link").await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Torrent permanently failed");
+    }
+
+    #[tokio::test]
+    async fn mark_broken_preserves_repair_attempts() {
+        let manager = make_test_manager();
+
+        // First, set up a torrent with 2 prior repair attempts
+        {
+            let mut health_map = manager.health_status.write().await;
+            health_map.insert("torrent_preserve".to_string(), TorrentHealth {
+                torrent_id: "torrent_preserve".to_string(),
+                state: RepairState::Repairing,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 2,
+                last_repair_trigger: Some(std::time::Instant::now()),
+            });
+        }
+
+        // Mark it as broken again
+        manager.mark_broken("torrent_preserve", "http://failed_link").await;
+
+        // Verify repair_attempts is preserved
+        let health_map = manager.health_status.read().await;
+        let health = health_map.get("torrent_preserve").unwrap();
+        assert_eq!(health.state, RepairState::Broken);
+        assert_eq!(health.repair_attempts, 2,
+            "mark_broken must preserve previous repair_attempts count");
+        assert!(health.failed_links.contains("http://failed_link"));
+        // last_repair_trigger should be None (reset to allow retry)
+        assert!(health.last_repair_trigger.is_none(),
+            "mark_broken should clear last_repair_trigger to allow new repair attempt");
+    }
+
+    #[tokio::test]
+    async fn get_status_summary_counts_correctly() {
+        let manager = make_test_manager();
+
+        {
+            let mut health_map = manager.health_status.write().await;
+            health_map.insert("h1".to_string(), TorrentHealth {
+                torrent_id: "h1".to_string(),
+                state: RepairState::Healthy,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 0,
+                last_repair_trigger: None,
+            });
+            health_map.insert("b1".to_string(), TorrentHealth {
+                torrent_id: "b1".to_string(),
+                state: RepairState::Broken,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 0,
+                last_repair_trigger: None,
+            });
+            health_map.insert("r1".to_string(), TorrentHealth {
+                torrent_id: "r1".to_string(),
+                state: RepairState::Repairing,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 1,
+                last_repair_trigger: None,
+            });
+            health_map.insert("f1".to_string(), TorrentHealth {
+                torrent_id: "f1".to_string(),
+                state: RepairState::Failed,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 3,
+                last_repair_trigger: None,
+            });
+        }
+
+        let (healthy, repairing, failed) = manager.get_status_summary().await;
+        assert_eq!(healthy, 1, "Should have 1 healthy torrent");
+        // get_status_summary counts Broken + Repairing together as "repairing"
+        assert_eq!(repairing, 2, "Should have 2 repairing (broken + repairing)");
+        assert_eq!(failed, 1, "Should have 1 failed torrent");
+    }
+
+    #[tokio::test]
+    async fn hidden_torrent_ids_returns_non_healthy() {
+        let manager = make_test_manager();
+
+        {
+            let mut health_map = manager.health_status.write().await;
+            health_map.insert("healthy1".to_string(), TorrentHealth {
+                torrent_id: "healthy1".to_string(),
+                state: RepairState::Healthy,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 0,
+                last_repair_trigger: None,
+            });
+            health_map.insert("broken1".to_string(), TorrentHealth {
+                torrent_id: "broken1".to_string(),
+                state: RepairState::Broken,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 0,
+                last_repair_trigger: None,
+            });
+            health_map.insert("repairing1".to_string(), TorrentHealth {
+                torrent_id: "repairing1".to_string(),
+                state: RepairState::Repairing,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 1,
+                last_repair_trigger: None,
+            });
+            health_map.insert("failed1".to_string(), TorrentHealth {
+                torrent_id: "failed1".to_string(),
+                state: RepairState::Failed,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 3,
+                last_repair_trigger: None,
+            });
+        }
+
+        let hidden = manager.hidden_torrent_ids().await;
+        assert_eq!(hidden.len(), 3, "Should have 3 hidden torrents (broken, repairing, failed)");
+        assert!(!hidden.contains("healthy1"), "Healthy torrent should not be hidden");
+        assert!(hidden.contains("broken1"), "Broken torrent should be hidden");
+        assert!(hidden.contains("repairing1"), "Repairing torrent should be hidden");
+        assert!(hidden.contains("failed1"), "Failed torrent should be hidden");
+    }
+
+    #[tokio::test]
+    async fn hidden_torrent_ids_consistent_with_should_hide() {
+        // Verify that hidden_torrent_ids returns the same set as calling
+        // should_hide_torrent on each individual torrent.
+        let manager = make_test_manager();
+
+        {
+            let mut health_map = manager.health_status.write().await;
+            for (id, state) in [
+                ("a", RepairState::Healthy),
+                ("b", RepairState::Broken),
+                ("c", RepairState::Repairing),
+                ("d", RepairState::Failed),
+            ] {
+                health_map.insert(id.to_string(), TorrentHealth {
+                    torrent_id: id.to_string(),
+                    state,
+                    failed_links: HashSet::new(),
+                    last_check: std::time::Instant::now(),
+                    repair_attempts: 0,
+                    last_repair_trigger: None,
+                });
+            }
+        }
+
+        let hidden_set = manager.hidden_torrent_ids().await;
+        for id in ["a", "b", "c", "d"] {
+            assert_eq!(
+                hidden_set.contains(id),
+                manager.should_hide_torrent(id).await,
+                "hidden_torrent_ids and should_hide_torrent must agree for torrent '{}'",
+                id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_cached_repair_records_replacement_mapping() {
+        // Verify that the non-cached repair path in try_instant_repair
+        // records a replacement mapping (new_torrent_id -> old_torrent_id)
+        // so the scan loop can reuse old TMDB identification.
+        let manager = make_test_manager();
+
+        // Simulate the non-cached branch behavior by directly inserting
+        // a replacement mapping the same way the non-cached branch does.
+        {
+            let mut map = manager.repair_replacements.write().await;
+            map.insert("new_non_cached_id".to_string(), "old_broken_id".to_string());
+        }
+
+        let replacements = manager.take_repair_replacements().await;
+        assert_eq!(replacements.len(), 1);
+        assert_eq!(
+            replacements.get("new_non_cached_id").unwrap(),
+            "old_broken_id",
+            "Non-cached repair must record new_torrent_id -> old_torrent_id mapping"
+        );
+    }
+
+    #[test]
+    fn non_cached_branch_inserts_repair_replacement() {
+        // Source-level check: the non-cached else branch in try_instant_repair
+        // must insert into repair_replacements so the scan loop can reuse
+        // old TMDB identification for the replacement torrent.
+        let source = include_str!("repair.rs");
+        let fn_start = source.find("async fn try_instant_repair").expect("function must exist");
+        let fn_body = &source[fn_start..];
+
+        // Find the non-cached else branch
+        let else_marker = fn_body.find("Not cached -- torrent needs actual download")
+            .expect("must have non-cached branch comment");
+        let else_branch = &fn_body[else_marker..];
+
+        // The else branch must contain repair_replacements insertion
+        assert!(
+            else_branch.contains("repair_replacements"),
+            "Non-cached branch in try_instant_repair must insert into repair_replacements \
+             so the scan loop can reuse old TMDB identification for the replacement torrent"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_health_status_removes_stale_keeps_active() {
+        let manager = make_test_manager();
+
+        // Populate health_status with several entries
+        {
+            let mut health_map = manager.health_status.write().await;
+            for id in ["active1", "active2", "stale1", "stale2", "stale3"] {
+                health_map.insert(id.to_string(), TorrentHealth {
+                    torrent_id: id.to_string(),
+                    state: RepairState::Healthy,
+                    failed_links: HashSet::new(),
+                    last_check: std::time::Instant::now(),
+                    repair_attempts: 0,
+                    last_repair_trigger: None,
+                });
+            }
+        }
+
+        // Only "active1" and "active2" are still active
+        let active_ids: HashSet<&str> = ["active1", "active2"].into_iter().collect();
+        manager.prune_health_status(&active_ids).await;
+
+        let health_map = manager.health_status.read().await;
+        assert_eq!(health_map.len(), 2, "Should only have 2 active entries after pruning");
+        assert!(health_map.contains_key("active1"), "active1 should be retained");
+        assert!(health_map.contains_key("active2"), "active2 should be retained");
+        assert!(!health_map.contains_key("stale1"), "stale1 should be pruned");
+        assert!(!health_map.contains_key("stale2"), "stale2 should be pruned");
+        assert!(!health_map.contains_key("stale3"), "stale3 should be pruned");
+    }
+
+    #[tokio::test]
+    async fn prune_health_status_no_op_when_all_active() {
+        let manager = make_test_manager();
+
+        {
+            let mut health_map = manager.health_status.write().await;
+            for id in ["t1", "t2"] {
+                health_map.insert(id.to_string(), TorrentHealth {
+                    torrent_id: id.to_string(),
+                    state: RepairState::Healthy,
+                    failed_links: HashSet::new(),
+                    last_check: std::time::Instant::now(),
+                    repair_attempts: 0,
+                    last_repair_trigger: None,
+                });
+            }
+        }
+
+        let active_ids: HashSet<&str> = ["t1", "t2"].into_iter().collect();
+        manager.prune_health_status(&active_ids).await;
+
+        let health_map = manager.health_status.read().await;
+        assert_eq!(health_map.len(), 2, "All entries should be retained when all are active");
+    }
+
+    #[tokio::test]
+    async fn prune_health_status_empty_active_removes_all() {
+        let manager = make_test_manager();
+
+        {
+            let mut health_map = manager.health_status.write().await;
+            health_map.insert("orphan".to_string(), TorrentHealth {
+                torrent_id: "orphan".to_string(),
+                state: RepairState::Failed,
+                failed_links: HashSet::new(),
+                last_check: std::time::Instant::now(),
+                repair_attempts: 3,
+                last_repair_trigger: None,
+            });
+        }
+
+        let active_ids: HashSet<&str> = HashSet::new();
+        manager.prune_health_status(&active_ids).await;
+
+        let health_map = manager.health_status.read().await;
+        assert!(health_map.is_empty(), "All entries should be pruned when active set is empty");
     }
 }

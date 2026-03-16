@@ -1,4 +1,5 @@
 use std::sync::LazyLock;
+use chrono::Datelike;
 use regex::Regex;
 use tracing::{info, warn, debug};
 use crate::rd_client;
@@ -199,10 +200,7 @@ fn score_result(result: &TmdbSearchResult, normalized_query: &str, year: &Option
         if let Some(release_date) = &result.release_date {
             if let Some(year_str) = release_date.get(0..4) {
                 if let Ok(release_year) = year_str.parse::<i32>() {
-                    let current_year = (std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() / 31_557_600) as i32 + 1970;
+                    let current_year = chrono::Utc::now().year();
                     let age = (current_year - release_year).max(0) as f64;
                     score += (80.0 - age * 8.0).max(0.0);
                 }
@@ -226,12 +224,10 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
     let normalized_cleaned = normalize_title(&cleaned_name);
 
     // Try TMDB first
-    let (tv_initial, movie_initial) = tokio::join!(
+    let (mut tv_results, mut movie_results) = tokio::join!(
         tmdb.search_tv(&cleaned_name, year.as_deref()),
         tmdb.search_movie(&cleaned_name, year.as_deref())
     );
-    let mut tv_results = tv_initial.clone();
-    let mut movie_results = movie_initial.clone();
 
     // If no results found, try CamelCase splitting as a fallback
     if tv_results.is_empty() && movie_results.is_empty() {
@@ -820,7 +816,9 @@ mod tests {
 
         let metadata = identify_torrent(&info, &tmdb_client).await;
 
-        // Should identify as the 2022 Tamil movie "Don" (895033)
+        // Should identify as the 2022 Tamil movie "Don" (TMDB 895033)
+        // Filename contains Hindi+Tamil audio tracks; this is the same Tamil film
+        // tested in tests/test_short_titles.rs with a generic filename.
         // NOT "Makoto Kitano: Don't You Guys Go..." (1266372)
         assert_eq!(metadata.external_id, Some("tmdb:895033".to_string()));
         assert_eq!(metadata.title, "Don");

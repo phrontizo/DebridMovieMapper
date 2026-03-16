@@ -18,16 +18,20 @@ pub struct JellyfinClient {
 }
 
 impl JellyfinClient {
-    pub fn new(url: String, api_key: String, mount_path: String) -> Self {
+    pub fn new(url: String, api_key: String, mount_path: String) -> Result<Self, String> {
         let mut api_key_header = HeaderValue::from_str(&api_key)
-            .expect("Jellyfin API key contains characters invalid for an HTTP header value");
+            .map_err(|e| format!("Jellyfin API key contains invalid HTTP header characters: {}", e))?;
         api_key_header.set_sensitive(true);
-        Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("Failed to build Jellyfin HTTP client: {}", e))?;
+        Ok(Self {
             url: url.trim_end_matches('/').to_string(),
             api_key_header,
             mount_path: mount_path.trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
-        }
+            http,
+        })
     }
 
     fn build_request_body(&self, changes: &[VfsChange]) -> serde_json::Value {
@@ -123,7 +127,7 @@ impl JellyfinClient {
     }
 
     /// Try to create a JellyfinClient from environment variables.
-    /// Returns None if any of the required env vars are missing.
+    /// Returns None if any of the required env vars are missing or invalid.
     pub fn from_env() -> Option<Self> {
         let url = std::env::var("JELLYFIN_URL").ok()?;
         let api_key = std::env::var("JELLYFIN_API_KEY").ok()?;
@@ -133,7 +137,13 @@ impl JellyfinClient {
             return None;
         }
 
-        Some(Self::new(url, api_key, mount_path))
+        match Self::new(url, api_key, mount_path) {
+            Ok(client) => Some(client),
+            Err(e) => {
+                tracing::warn!("Failed to create Jellyfin client: {}", e);
+                None
+            }
+        }
     }
 }
 
@@ -147,7 +157,7 @@ mod tests {
             "http://jellyfin:8096".to_string(),
             "test-key".to_string(),
             "/mnt/debrid".to_string(),
-        );
+        ).unwrap();
         let changes = vec![VfsChange {
             path: "Shows/Breaking Bad/Season 03".to_string(),
             update_type: UpdateType::Created,
@@ -165,7 +175,7 @@ mod tests {
             "http://jellyfin:8096".to_string(),
             "test-key".to_string(),
             "/mnt/debrid".to_string(),
-        );
+        ).unwrap();
         let changes = vec![
             VfsChange {
                 path: "Movies/Old Movie".to_string(),
@@ -194,7 +204,7 @@ mod tests {
             "http://jellyfin:8096/".to_string(),
             "test-key".to_string(),
             "/mnt/debrid/".to_string(),
-        );
+        ).unwrap();
         let changes = vec![VfsChange {
             path: "Movies/Test".to_string(),
             update_type: UpdateType::Created,
@@ -211,9 +221,30 @@ mod tests {
             "http://jellyfin:8096".to_string(),
             "test-key".to_string(),
             "/mnt/debrid".to_string(),
-        );
+        ).unwrap();
         let body = client.build_request_body(&[]);
         let updates = body["Updates"].as_array().unwrap();
         assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn new_returns_error_for_invalid_api_key() {
+        // HeaderValue rejects control characters (e.g. newlines)
+        let result = JellyfinClient::new(
+            "http://jellyfin:8096".to_string(),
+            "bad\nkey".to_string(),
+            "/mnt/debrid".to_string(),
+        );
+        assert!(result.is_err(), "API key with control characters should return Err");
+    }
+
+    #[test]
+    fn new_succeeds_for_valid_api_key() {
+        let result = JellyfinClient::new(
+            "http://jellyfin:8096".to_string(),
+            "abc123def456".to_string(),
+            "/mnt/debrid".to_string(),
+        );
+        assert!(result.is_ok());
     }
 }

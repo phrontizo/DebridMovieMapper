@@ -27,11 +27,11 @@ cargo test -- --ignored
 # Run integration tests with subset (fast feedback)
 INTEGRATION_TEST_LIMIT=10 cargo test -- --ignored
 
-# Docker (single platform)
+# Docker (single platform, local)
 docker build -t debridmoviemapper .
 
-# Docker multi-platform push
-./build.sh
+# Release: push a semver tag to trigger GitHub Actions build + push to ghcr.io
+git tag v1.0.0 && git push origin v1.0.0
 
 # Start full stack (WebDAV + rclone + Jellyfin)
 mkdir -p rclone && chown 65534:65534 rclone
@@ -44,6 +44,8 @@ docker compose up -d
 
 **Optional:**
 - `SCAN_INTERVAL_SECS` (default: 60) — how often to poll Real-Debrid
+- `DB_PATH` (default: `metadata.db`) — path to the redb database file
+- `PORT` (default: 8080) — WebDAV server listen port
 - `JELLYFIN_URL` — Jellyfin server URL (e.g. `http://jellyfin:8096`)
 - `JELLYFIN_API_KEY` — Jellyfin API key
 - `JELLYFIN_RCLONE_MOUNT_PATH` — rclone mount path as seen by Jellyfin (e.g. `/media`)

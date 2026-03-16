@@ -43,6 +43,8 @@ TMDB_API_KEY=your_tmdb_api_key
 
 # Optional
 SCAN_INTERVAL_SECS=60       # How often to scan for new torrents (default: 60)
+DB_PATH=metadata.db         # Path to the redb database file (default: metadata.db)
+PORT=8080                   # WebDAV server listen port (default: 8080)
 
 # Optional: Jellyfin integration (all three required to enable)
 JELLYFIN_URL=http://jellyfin:8096
@@ -54,12 +56,14 @@ JELLYFIN_RCLONE_MOUNT_PATH=/media
 
 | Variable                     | Required | Default | Description                                                          |
 |------------------------------|----------|---------|----------------------------------------------------------------------|
-| `RD_API_TOKEN`               | Yes      | -       | Your Real-Debrid API token                                           |
-| `TMDB_API_KEY`               | Yes      | -       | Your TMDB (The Movie Database) API key                               |
-| `SCAN_INTERVAL_SECS`         | No       | 60      | Interval between torrent library scans (runs immediately on startup) |
-| `JELLYFIN_URL`               | No       | -       | Jellyfin server URL for library update notifications                 |
-| `JELLYFIN_API_KEY`           | No       | -       | Jellyfin API key for authentication                                  |
-| `JELLYFIN_RCLONE_MOUNT_PATH` | No       | -       | rclone mount path as seen by Jellyfin (e.g. `/media`)                |
+| `RD_API_TOKEN`               | Yes      | -              | Your Real-Debrid API token                                           |
+| `TMDB_API_KEY`               | Yes      | -              | Your TMDB (The Movie Database) API key                               |
+| `SCAN_INTERVAL_SECS`         | No       | 60             | Interval between torrent library scans (runs immediately on startup) |
+| `DB_PATH`                    | No       | `metadata.db`  | Path to the redb database file                                       |
+| `PORT`                       | No       | 8080           | WebDAV server listen port                                            |
+| `JELLYFIN_URL`               | No       | -              | Jellyfin server URL for library update notifications                 |
+| `JELLYFIN_API_KEY`           | No       | -              | Jellyfin API key for authentication                                  |
+| `JELLYFIN_RCLONE_MOUNT_PATH` | No       | -              | rclone mount path as seen by Jellyfin (e.g. `/media`)                |
 
 ## Running with Docker
 
@@ -83,14 +87,12 @@ docker run -d \
 ```
 
 ### Building from source (Optional)
-If you prefer to build the image yourself, you can use the provided `build.sh` script for multi-platform builds:
-```bash
-./build.sh
-```
-Or build locally for your current architecture:
+Build locally for your current architecture:
 ```bash
 docker build -t debridmoviemapper .
 ```
+
+Multi-platform images are built and pushed to ghcr.io automatically by GitHub Actions when a version tag is pushed (e.g. `git tag v1.0.0 && git push origin v1.0.0`).
 
 *Note: The named volume ensures your media identification cache is preserved across container recreations.*
 

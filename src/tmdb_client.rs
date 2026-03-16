@@ -3,6 +3,8 @@ use reqwest::{Client, RequestBuilder};
 use rand::Rng;
 use tracing::{error, warn};
 use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 const MAX_RETRY_AFTER_SECS: u64 = 300; // Cap Retry-After to 5 minutes
 
@@ -23,12 +25,17 @@ pub struct TmdbSearchResult {
 
 #[derive(Debug, Deserialize)]
 struct TmdbResponse {
+    #[serde(default)]
     pub results: Vec<TmdbSearchResult>,
 }
+
+/// Minimum interval between TMDB requests (TMDB allows ~40 req/s; 100ms is conservative).
+const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct TmdbClient {
     client: Client,
     api_key: String,
+    last_request: Mutex<Instant>,
 }
 
 impl TmdbClient {
@@ -39,6 +46,8 @@ impl TmdbClient {
                 .build()
                 .unwrap_or_default(),
             api_key,
+            // Start in the past so the first request fires immediately.
+            last_request: Mutex::new(Instant::now() - MIN_REQUEST_INTERVAL),
         }
     }
 
@@ -86,9 +95,19 @@ impl TmdbClient {
 
         for attempt in 1..=max_attempts {
             if attempt > 1 {
-                let backoff = 2u64.pow(attempt as u32 - 2) * 1000;
+                let backoff = (2u64.pow(attempt as u32 - 2) * 1000).min(30_000);
                 let jitter = rand::thread_rng().gen_range(0..500);
                 tokio::time::sleep(Duration::from_millis(backoff + jitter)).await;
+            }
+
+            // Proactive rate limiting: wait until MIN_REQUEST_INTERVAL since last request
+            {
+                let mut last = self.last_request.lock().await;
+                let elapsed = last.elapsed();
+                if elapsed < MIN_REQUEST_INTERVAL {
+                    tokio::time::sleep(MIN_REQUEST_INTERVAL - elapsed).await;
+                }
+                *last = Instant::now();
             }
 
             match make_request().send().await {
@@ -162,5 +181,53 @@ mod tests {
              use a synthetic error response instead to avoid panicking when all \
              attempts are exhausted by retryable status codes"
         );
+    }
+
+    #[test]
+    fn tmdb_response_deserializes_without_results_field() {
+        // TMDB might return a response without a results key (e.g., error responses
+        // that happen to return 200, or API format changes). With #[serde(default)],
+        // this deserializes with an empty results vec instead of failing.
+        let json = r#"{}"#;
+        let resp: super::TmdbResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.results.is_empty());
+    }
+
+    #[test]
+    fn tmdb_response_deserializes_with_results() {
+        let json = r#"{"results": [{"id": 123, "title": "Test Movie", "popularity": 50.0}]}"#;
+        let resp: super::TmdbResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.results.len(), 1);
+        assert_eq!(resp.results[0].id, 123);
+        assert_eq!(resp.results[0].title, "Test Movie");
+    }
+
+    #[test]
+    fn tmdb_search_result_handles_missing_optional_fields() {
+        // TMDB results may have null or missing optional fields
+        let json = r#"{"id": 456, "title": "Minimal"}"#;
+        let result: super::TmdbSearchResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.id, 456);
+        assert_eq!(result.title, "Minimal");
+        assert!(result.original_title.is_none());
+        assert!(result.release_date.is_none());
+        assert_eq!(result.popularity, 0.0);
+        assert!(result.vote_average.is_none());
+        assert!(result.vote_count.is_none());
+    }
+
+    #[test]
+    fn tmdb_search_result_ignores_unknown_fields() {
+        // TMDB may add new fields. Verify serde ignores them.
+        let json = r#"{
+            "id": 789,
+            "title": "Test",
+            "adult": false,
+            "genre_ids": [28, 12],
+            "backdrop_path": "/some/path.jpg"
+        }"#;
+        let result: super::TmdbSearchResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.id, 789);
+        assert_eq!(result.title, "Test");
     }
 }

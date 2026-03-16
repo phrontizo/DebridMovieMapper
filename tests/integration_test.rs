@@ -245,11 +245,13 @@ async fn test_vfs_completeness() {
     for (info, _) in data {
         let mut link_idx = 0;
         for file in &info.files {
-            if file.selected == 1 && is_video_file(&file.path) {
-                total_video_files += 1;
-                if let Some(link) = info.links.get(link_idx) {
-                    if !vfs_links.contains(link) {
-                        missing.push(format!("Torrent: {}, File: {}", info.filename, file.path));
+            if file.selected == 1 {
+                if is_video_file(&file.path) {
+                    total_video_files += 1;
+                    if let Some(link) = info.links.get(link_idx) {
+                        if !vfs_links.contains(link) {
+                            missing.push(format!("Torrent: {}, File: {}", info.filename, file.path));
+                        }
                     }
                 }
                 link_idx += 1;

@@ -127,6 +127,7 @@ pub struct TorrentInfo {
     pub status: String,
     #[serde(default)]
     pub added: String,
+    #[serde(default)]
     pub files: Vec<TorrentFile>,
     #[serde(default)]
     pub links: Vec<String>,
@@ -135,7 +136,9 @@ pub struct TorrentInfo {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TorrentFile {
+    #[serde(default)]
     pub id: u32,
+    #[serde(default)]
     pub path: String,
     #[serde(default)]
     pub bytes: u64,
@@ -693,5 +696,84 @@ mod tests {
         assert!(client.unrestrict_cache.read().await.contains_key("test-link"));
         client.invalidate_unrestrict_cache("test-link").await;
         assert!(!client.unrestrict_cache.read().await.contains_key("test-link"));
+    }
+
+    // --- Serde deserialization robustness ---
+
+    #[test]
+    fn torrent_info_deserializes_without_files_field() {
+        // RD could return torrent info without a files array (e.g., magnet not yet processed).
+        // With #[serde(default)], this should deserialize with an empty files vec.
+        let json = r#"{"id":"abc123"}"#;
+        let info: TorrentInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.id, "abc123");
+        assert!(info.files.is_empty());
+        assert!(info.links.is_empty());
+        assert_eq!(info.filename, "");
+        assert_eq!(info.hash, "");
+        assert_eq!(info.bytes, 0);
+        assert_eq!(info.status, "");
+    }
+
+    #[test]
+    fn torrent_info_deserializes_with_all_fields() {
+        let json = r#"{
+            "id": "abc123",
+            "filename": "test.mkv",
+            "original_filename": "test.mkv",
+            "hash": "deadbeef",
+            "bytes": 1000,
+            "original_bytes": 1000,
+            "host": "real-debrid.com",
+            "split": 1,
+            "progress": 100.0,
+            "status": "downloaded",
+            "added": "2023-01-01",
+            "files": [{"id": 1, "path": "/test.mkv", "bytes": 1000, "selected": 1}],
+            "links": ["https://link1"],
+            "ended": "2023-01-01"
+        }"#;
+        let info: TorrentInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.id, "abc123");
+        assert_eq!(info.files.len(), 1);
+        assert_eq!(info.files[0].path, "/test.mkv");
+        assert_eq!(info.links.len(), 1);
+    }
+
+    #[test]
+    fn torrent_file_deserializes_with_minimal_fields() {
+        // TorrentFile with only default values should work
+        let json = r#"{}"#;
+        let file: TorrentFile = serde_json::from_str(json).unwrap();
+        assert_eq!(file.id, 0);
+        assert_eq!(file.path, "");
+        assert_eq!(file.bytes, 0);
+        assert_eq!(file.selected, 0);
+    }
+
+    #[test]
+    fn torrent_deserializes_with_only_id() {
+        // The list endpoint might return minimal data for some torrents
+        let json = r#"{"id":"xyz"}"#;
+        let torrent: Torrent = serde_json::from_str(json).unwrap();
+        assert_eq!(torrent.id, "xyz");
+        assert_eq!(torrent.filename, "");
+        assert_eq!(torrent.status, "");
+        assert!(torrent.links.is_empty());
+    }
+
+    #[test]
+    fn torrent_info_ignores_unknown_fields() {
+        // RD may add new fields to their API responses. serde's default behavior
+        // is to ignore unknown fields, but this test verifies it explicitly.
+        let json = r#"{
+            "id": "abc123",
+            "filename": "test.mkv",
+            "some_new_field": "unexpected_value",
+            "another_field": 42
+        }"#;
+        let info: TorrentInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.id, "abc123");
+        assert_eq!(info.filename, "test.mkv");
     }
 }

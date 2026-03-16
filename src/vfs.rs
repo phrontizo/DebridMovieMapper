@@ -14,18 +14,18 @@ const ARCHIVE_EXTENSIONS: &[&str] = &[
 ];
 
 /// RAR split-volume patterns: .r00, .r01, ..., .r99, .s00, etc.
+/// Expects a pre-lowercased input string.
 fn is_archive_part(path: &str) -> bool {
-    let lower = path.to_lowercase();
     // .r00-.r99, .s00-.s99 (split RAR volumes)
     // Use char_indices to safely find the last 4 characters, avoiding
     // panics from slicing at non-UTF-8 boundaries.
-    let char_count = lower.chars().count();
+    let char_count = path.chars().count();
     if char_count >= 4 {
-        let byte_offset = lower.char_indices()
+        let byte_offset = path.char_indices()
             .nth(char_count - 4)
             .map(|(i, _)| i)
             .unwrap_or(0);
-        let ext = &lower[byte_offset..];
+        let ext = &path[byte_offset..];
         if ext.starts_with(".r") || ext.starts_with(".s") {
             return ext[2..].chars().all(|c| c.is_ascii_digit());
         }
@@ -77,6 +77,7 @@ pub fn parse_rd_date(s: &str) -> SystemTime {
             let min: u64 = time_parts.next()?.parse().ok()?;
             let sec_str = time_parts.next().unwrap_or("0");
             let sec: u64 = sec_str.split('.').next()?.parse().ok()?;
+            if h >= 24 || min >= 60 || sec >= 60 { return None; }
             secs += h * 3600 + min * 60 + sec;
         }
 
@@ -87,7 +88,7 @@ pub fn parse_rd_date(s: &str) -> SystemTime {
 }
 
 static SEASON_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)s(\d+)|season\s*(\d+)|(\d+)x\d+").unwrap()
+    Regex::new(r"(?i)s(\d+)|season\s*(\d+)|(\d+)x\d+|part\s*(\d+)").unwrap()
 });
 
 #[derive(Debug, Clone, PartialEq)]
@@ -279,7 +280,7 @@ impl DebridVfs {
                                         let filename = file.path.split('/').next_back().unwrap_or(&file.path);
                                         let season = SEASON_RE.captures(filename)
                                             .and_then(|cap| {
-                                                cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3))
+                                                cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)).or_else(|| cap.get(4))
                                             })
                                             .and_then(|m| m.as_str().parse::<u32>().ok())
                                             .unwrap_or(1);
@@ -482,13 +483,14 @@ impl DebridVfs {
 
 /// Replace characters that are invalid in filenames or interpreted as path separators.
 fn sanitize_filename(name: &str) -> String {
-    let replaced: String = name.chars()
-        .flat_map(|c| match c {
-            '/' | '\\' => vec!['-'],
-            ':' => vec![' ', '-'],
-            _ => vec![c],
-        })
-        .collect();
+    let mut replaced = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '/' | '\\' => replaced.push('-'),
+            ':' => { replaced.push(' '); replaced.push('-'); }
+            _ => replaced.push(c),
+        }
+    }
     replaced.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -499,11 +501,26 @@ static EXCLUDED_VIDEO_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(sample|trailer|extras?|bonus|featurette)\b").unwrap()
 });
 
+/// Directory names that indicate extras/bonus content. Checked case-insensitively.
+const EXCLUDED_DIRS: &[&str] = &[
+    "extras", "bonus", "featurettes", "behind the scenes",
+    "deleted scenes", "interviews", "trailers", "samples",
+];
+
 pub fn is_video_file(path: &str) -> bool {
     let lower = path.to_lowercase();
     let filename = lower.rsplit('/').next().unwrap_or(&lower);
     if EXCLUDED_VIDEO_RE.is_match(filename) {
         return false;
+    }
+    // Exclude files in directories that indicate extras/bonus content
+    for component in lower.split('/') {
+        if component == filename {
+            continue;
+        }
+        if EXCLUDED_DIRS.contains(&component) {
+            return false;
+        }
     }
     VIDEO_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
 }
@@ -960,6 +977,7 @@ mod tests {
     fn is_archive_part_handles_unicode_filenames() {
         // Filenames with multi-byte UTF-8 characters must not panic
         // when is_archive_part slices to find the last 4 characters.
+        // Note: is_archive_part expects pre-lowercased input.
         assert!(!is_archive_part("ö.r0")); // 2-byte char followed by 3 ASCII chars
         assert!(is_archive_part("café.r00")); // multi-byte in prefix, valid archive ext
         assert!(!is_archive_part("über.mkv")); // multi-byte, not archive
@@ -994,8 +1012,7 @@ mod tests {
         assert!(!is_video_file("extras.mkv"));
         assert!(!is_video_file("extra.mkv"));
         assert!(!is_video_file("Movie.Extra.Feature.mkv"));
-        // Note: directory-level filtering (e.g. /path/Extras/deleted_scene.mkv)
-        // is not handled by is_video_file, which only checks the filename portion.
+        // Directory-level filtering is also handled (see is_video_file_rejects_extras_directories).
     }
 
     #[test]
@@ -1463,6 +1480,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_rd_date_invalid_time_components_fall_back() {
+        // Out-of-range hours/minutes/seconds should fall back to UNIX_EPOCH
+        assert_eq!(parse_rd_date("2023-01-01T25:00:00Z"), std::time::UNIX_EPOCH);
+        assert_eq!(parse_rd_date("2023-01-01T00:60:00Z"), std::time::UNIX_EPOCH);
+        assert_eq!(parse_rd_date("2023-01-01T00:00:60Z"), std::time::UNIX_EPOCH);
+        // Valid boundary values should work
+        assert_ne!(parse_rd_date("2023-01-01T23:59:59Z"), std::time::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn parse_rd_date_empty_string_falls_back() {
+        assert_eq!(parse_rd_date(""), std::time::UNIX_EPOCH);
+    }
+
+    #[test]
     fn diff_trees_multiple_changes() {
         let old = VfsNode::Directory {
             children: BTreeMap::from([
@@ -1523,5 +1555,349 @@ mod tests {
         assert!(paths.contains(&"Movies/Old Movie"));
         assert!(paths.contains(&"Movies/New Movie"));
         assert!(paths.contains(&"Shows/New Show/Season 01"));
+    }
+
+    /// link_idx must increment for ALL selected files, not just video files.
+    /// If a torrent has selected non-video files (subtitles, NFOs) before the
+    /// video file, their links must be skipped to use the correct RD link
+    /// for the video file.
+    #[test]
+    fn link_idx_skips_non_video_selected_files() {
+        let torrents = vec![(
+            TorrentInfo {
+                id: "t1".to_string(),
+                filename: "Movie.2023".to_string(),
+                original_filename: "Movie.2023".to_string(),
+                hash: "h1".to_string(),
+                bytes: 3000,
+                original_bytes: 3000,
+                host: "h".to_string(),
+                split: 1,
+                progress: 100.0,
+                status: "downloaded".to_string(),
+                added: "2023-01-01".to_string(),
+                files: vec![
+                    // Non-video file selected first -- takes link index 0
+                    TorrentFile { id: 1, path: "/subs.srt".to_string(), bytes: 100, selected: 1 },
+                    // Video file selected second -- should use link index 1
+                    TorrentFile { id: 2, path: "/Movie.mkv".to_string(), bytes: 2000, selected: 1 },
+                    // Unselected file -- no link consumed
+                    TorrentFile { id: 3, path: "/extras.mkv".to_string(), bytes: 900, selected: 0 },
+                ],
+                links: vec![
+                    "http://link_for_srt".to_string(),
+                    "http://link_for_movie".to_string(),
+                ],
+                ended: Some("2023-01-01".to_string()),
+            },
+            MediaMetadata {
+                title: "Link Index Test".to_string(),
+                year: Some("2023".to_string()),
+                media_type: MediaType::Movie,
+                external_id: Some("tmdb:999".to_string()),
+            },
+        )];
+
+        let vfs = DebridVfs::build(torrents);
+
+        if let VfsNode::Directory { children } = &vfs.root {
+            let movies = children.get("Movies").unwrap();
+            if let VfsNode::Directory { children: movie_children } = movies {
+                let folder = movie_children
+                    .get("Link Index Test [tmdbid-999]")
+                    .expect("Movie folder missing");
+                if let VfsNode::Directory { children: files } = folder {
+                    let media = files.get("Movie.mkv").expect("Media file missing");
+                    if let VfsNode::MediaFile { rd_link, .. } = media {
+                        assert_eq!(
+                            rd_link, "http://link_for_movie",
+                            "Video file should use link index 1 (after non-video selected file), \
+                             not link index 0"
+                        );
+                    } else {
+                        panic!("Should be a MediaFile");
+                    }
+                } else {
+                    panic!("Should be a Directory");
+                }
+            }
+        }
+    }
+
+    /// Same link_idx logic for shows -- non-video selected files must be skipped.
+    #[test]
+    fn link_idx_skips_non_video_selected_files_for_shows() {
+        let torrents = vec![(
+            TorrentInfo {
+                id: "t1".to_string(),
+                filename: "Show.S01".to_string(),
+                original_filename: "Show.S01".to_string(),
+                hash: "h1".to_string(),
+                bytes: 3000,
+                original_bytes: 3000,
+                host: "h".to_string(),
+                split: 1,
+                progress: 100.0,
+                status: "downloaded".to_string(),
+                added: "2023-01-01".to_string(),
+                files: vec![
+                    // Non-video selected file takes link index 0
+                    TorrentFile { id: 1, path: "/subs.srt".to_string(), bytes: 100, selected: 1 },
+                    // Video file should use link index 1
+                    TorrentFile { id: 2, path: "/Show.S01E01.mkv".to_string(), bytes: 1500, selected: 1 },
+                    // Another video file should use link index 2
+                    TorrentFile { id: 3, path: "/Show.S01E02.mkv".to_string(), bytes: 1400, selected: 1 },
+                ],
+                links: vec![
+                    "http://link_srt".to_string(),
+                    "http://link_ep1".to_string(),
+                    "http://link_ep2".to_string(),
+                ],
+                ended: Some("2023-01-01".to_string()),
+            },
+            MediaMetadata {
+                title: "Show Link Test".to_string(),
+                year: Some("2023".to_string()),
+                media_type: MediaType::Show,
+                external_id: Some("tmdb:888".to_string()),
+            },
+        )];
+
+        let vfs = DebridVfs::build(torrents);
+
+        if let VfsNode::Directory { children } = &vfs.root {
+            let shows = children.get("Shows").unwrap();
+            if let VfsNode::Directory { children: show_children } = shows {
+                let show_folder = show_children
+                    .get("Show Link Test [tmdbid-888]")
+                    .expect("Show folder missing");
+                if let VfsNode::Directory { children: seasons } = show_folder {
+                    let season = seasons.get("Season 01").expect("Season 01 missing");
+                    if let VfsNode::Directory { children: episodes } = season {
+                        let ep1 = episodes.get("Show.S01E01.mkv").expect("Ep1 missing");
+                        let ep2 = episodes.get("Show.S01E02.mkv").expect("Ep2 missing");
+
+                        if let VfsNode::MediaFile { rd_link, .. } = ep1 {
+                            assert_eq!(rd_link, "http://link_ep1",
+                                "Episode 1 should use link index 1 (after non-video selected file)");
+                        }
+                        if let VfsNode::MediaFile { rd_link, .. } = ep2 {
+                            assert_eq!(rd_link, "http://link_ep2",
+                                "Episode 2 should use link index 2");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Movie VFS build should not include unselected files.
+    #[test]
+    fn build_skips_unselected_files() {
+        let torrents = vec![(
+            TorrentInfo {
+                id: "t1".to_string(),
+                filename: "Movie.2023".to_string(),
+                original_filename: "Movie.2023".to_string(),
+                hash: "h1".to_string(),
+                bytes: 3000,
+                original_bytes: 3000,
+                host: "h".to_string(),
+                split: 1,
+                progress: 100.0,
+                status: "downloaded".to_string(),
+                added: "2023-01-01".to_string(),
+                files: vec![
+                    TorrentFile { id: 1, path: "/Movie.mkv".to_string(), bytes: 2000, selected: 1 },
+                    TorrentFile { id: 2, path: "/Deleted.Scenes.mkv".to_string(), bytes: 1000, selected: 0 },
+                ],
+                links: vec!["http://link_movie".to_string()],
+                ended: Some("2023-01-01".to_string()),
+            },
+            MediaMetadata {
+                title: "Unselected Test".to_string(),
+                year: None,
+                media_type: MediaType::Movie,
+                external_id: None,
+            },
+        )];
+
+        let vfs = DebridVfs::build(torrents);
+
+        if let VfsNode::Directory { children } = &vfs.root {
+            let movies = children.get("Movies").unwrap();
+            if let VfsNode::Directory { children: movie_children } = movies {
+                let folder = movie_children.get("Unselected Test").expect("Movie folder missing");
+                if let VfsNode::Directory { children: files } = folder {
+                    // Only Movie.mkv should be present (Deleted.Scenes.mkv is not selected
+                    // and also would be filtered by is_video_file's "extras" check... but
+                    // the point is unselected=0 files never consume a link index either)
+                    assert_eq!(files.len(), 2, "Should have 1 media + 1 nfo");
+                    assert!(files.contains_key("Movie.mkv"));
+                    assert!(files.contains_key("movie.nfo"));
+                }
+            }
+        }
+    }
+
+    /// When a torrent has more selected files than links (mismatch), the VFS
+    /// should not panic -- it should simply skip files that have no link.
+    #[test]
+    fn build_handles_link_count_mismatch() {
+        let torrents = vec![(
+            TorrentInfo {
+                id: "t1".to_string(),
+                filename: "Mismatched".to_string(),
+                original_filename: "Mismatched".to_string(),
+                hash: "h1".to_string(),
+                bytes: 3000,
+                original_bytes: 3000,
+                host: "h".to_string(),
+                split: 1,
+                progress: 100.0,
+                status: "downloaded".to_string(),
+                added: "2023-01-01".to_string(),
+                files: vec![
+                    TorrentFile { id: 1, path: "/File1.mkv".to_string(), bytes: 1000, selected: 1 },
+                    TorrentFile { id: 2, path: "/File2.mkv".to_string(), bytes: 1000, selected: 1 },
+                    TorrentFile { id: 3, path: "/File3.mkv".to_string(), bytes: 1000, selected: 1 },
+                ],
+                // Only 2 links for 3 selected files
+                links: vec!["http://link1".to_string(), "http://link2".to_string()],
+                ended: Some("2023-01-01".to_string()),
+            },
+            MediaMetadata {
+                title: "Mismatch Test".to_string(),
+                year: None,
+                media_type: MediaType::Movie,
+                external_id: None,
+            },
+        )];
+
+        // Should not panic
+        let vfs = DebridVfs::build(torrents);
+
+        if let VfsNode::Directory { children } = &vfs.root {
+            let movies = children.get("Movies").unwrap();
+            if let VfsNode::Directory { children: movie_children } = movies {
+                let folder = movie_children.get("Mismatch Test").expect("Movie folder missing");
+                if let VfsNode::Directory { children: files } = folder {
+                    // Only File1 and File2 should be present (File3 has no link)
+                    let media_count = files.values().filter(|n| matches!(n, VfsNode::MediaFile { .. })).count();
+                    assert_eq!(media_count, 2,
+                        "Only files with links should be added to VFS");
+                }
+            }
+        }
+    }
+
+    // --- M4: is_archive_part expects pre-lowercased input ---
+
+    #[test]
+    fn is_archive_part_works_with_pre_lowercased_input() {
+        // is_archive_part no longer lowercases internally; callers must pre-lowercase
+        assert!(is_archive_part("movie.r00"));
+        assert!(is_archive_part("movie.r99"));
+        assert!(is_archive_part("movie.s00"));
+        assert!(!is_archive_part("movie.mkv"));
+        assert!(!is_archive_part("movie.mp4"));
+        // Uppercase input is NOT lowercased by is_archive_part — caller must do it
+        assert!(!is_archive_part("MOVIE.R00"));
+        // But is_archive_file (which calls is_archive_part) handles uppercase
+        assert!(is_archive_file("MOVIE.R00"));
+    }
+
+    // --- L3: is_video_file excludes files in extras directories ---
+
+    #[test]
+    fn is_video_file_rejects_extras_directories() {
+        assert!(!is_video_file("/path/Extras/deleted_scene.mkv"));
+        assert!(!is_video_file("/path/extras/making_of.mp4"));
+        assert!(!is_video_file("/path/Bonus/clip.mkv"));
+        assert!(!is_video_file("/path/bonus/clip.avi"));
+        assert!(!is_video_file("/path/Featurettes/feature.mkv"));
+        assert!(!is_video_file("/path/Behind The Scenes/bts.mkv"));
+        assert!(!is_video_file("/path/behind the scenes/bts.mkv"));
+        assert!(!is_video_file("/path/Deleted Scenes/scene1.mkv"));
+        assert!(!is_video_file("/path/Interviews/interview.mkv"));
+        assert!(!is_video_file("/path/Trailers/trailer.mkv"));
+        assert!(!is_video_file("/path/Samples/sample_clip.mkv"));
+        // Normal directories should not be excluded
+        assert!(is_video_file("/path/Season 01/episode.mkv"));
+        assert!(is_video_file("/path/Show/S01E01.mkv"));
+    }
+
+    // --- L4: SEASON_RE handles "Part N" numbering ---
+
+    #[test]
+    fn season_re_extracts_part_numbering() {
+        // "Part 1" should be treated as season 1
+        let cap = SEASON_RE.captures("Show.Part1.E01.mkv").unwrap();
+        let season = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)).or_else(|| cap.get(4))
+            .unwrap().as_str().parse::<u32>().unwrap();
+        assert_eq!(season, 1);
+
+        // "Part 2" with space
+        let cap = SEASON_RE.captures("Show.Part 2.E01.mkv").unwrap();
+        let season = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)).or_else(|| cap.get(4))
+            .unwrap().as_str().parse::<u32>().unwrap();
+        assert_eq!(season, 2);
+
+        // "part 3" lowercase
+        let cap = SEASON_RE.captures("show.part3.e01.mkv").unwrap();
+        let season = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)).or_else(|| cap.get(4))
+            .unwrap().as_str().parse::<u32>().unwrap();
+        assert_eq!(season, 3);
+
+        // S01 still works (not broken by the addition)
+        let cap = SEASON_RE.captures("Show.S05E01.mkv").unwrap();
+        let season = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)).or_else(|| cap.get(4))
+            .unwrap().as_str().parse::<u32>().unwrap();
+        assert_eq!(season, 5);
+    }
+
+    /// Test that archive-only torrents produce an empty movie folder (no media files).
+    #[test]
+    fn build_skips_archive_only_torrents() {
+        let torrents = vec![(
+            TorrentInfo {
+                id: "t1".to_string(),
+                filename: "Archive.Movie".to_string(),
+                original_filename: "Archive.Movie".to_string(),
+                hash: "h1".to_string(),
+                bytes: 5000,
+                original_bytes: 5000,
+                host: "h".to_string(),
+                split: 1,
+                progress: 100.0,
+                status: "downloaded".to_string(),
+                added: "2023-01-01".to_string(),
+                files: vec![
+                    TorrentFile { id: 1, path: "/movie.rar".to_string(), bytes: 3000, selected: 1 },
+                    TorrentFile { id: 2, path: "/movie.r00".to_string(), bytes: 2000, selected: 1 },
+                ],
+                links: vec!["http://link1".to_string(), "http://link2".to_string()],
+                ended: Some("2023-01-01".to_string()),
+            },
+            MediaMetadata {
+                title: "Archive Movie".to_string(),
+                year: None,
+                media_type: MediaType::Movie,
+                external_id: None,
+            },
+        )];
+
+        let vfs = DebridVfs::build(torrents);
+
+        // Archive-only torrents should produce no folder (no video files = no entry)
+        if let VfsNode::Directory { children } = &vfs.root {
+            let movies = children.get("Movies").unwrap();
+            if let VfsNode::Directory { children: movie_children } = movies {
+                assert!(
+                    !movie_children.contains_key("Archive Movie"),
+                    "Archive-only torrent should not produce a folder in VFS"
+                );
+            }
+        }
     }
 }

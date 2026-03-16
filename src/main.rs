@@ -22,8 +22,12 @@ const MAX_CONNECTIONS: usize = 256;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Healthcheck mode: verify the WebDAV server is listening, then exit
     if std::env::args().any(|a| a == "--healthcheck") {
+        let port: u16 = std::env::var("PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8080);
         std::process::exit(
-            if std::net::TcpStream::connect("127.0.0.1:8080").is_ok() { 0 } else { 1 }
+            if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() { 0 } else { 1 }
         );
     }
 
@@ -60,7 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Jellyfin notification disabled (set JELLYFIN_URL, JELLYFIN_API_KEY, JELLYFIN_RCLONE_MOUNT_PATH to enable)");
     }
 
-    let db = Arc::new(Database::create("metadata.db").expect("Failed to open database"));
+    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "metadata.db".to_string());
+    let db = Arc::new(Database::create(&db_path).expect("Failed to open database"));
 
     // Ensure table exists on fresh databases
     {
@@ -94,7 +99,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .locksystem(dav_server::fakels::FakeLs::new())
         .build_handler();
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
     info!("WebDAV server listening on http://{}", addr);
 

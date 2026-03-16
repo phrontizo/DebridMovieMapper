@@ -20,6 +20,7 @@ dotenvy = "0.15"
 rand = "0.8"
 redb = "3.1"
 thiserror = "2"
+chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 urlencoding = "2"
