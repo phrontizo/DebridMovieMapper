@@ -42,7 +42,7 @@ RD_API_TOKEN=your_real_debrid_token
 TMDB_API_KEY=your_tmdb_api_key
 
 # Optional
-SCAN_INTERVAL_SECS=60       # How often to scan for new torrents (default: 60)
+SCAN_INTERVAL_SECS=60       # How often to scan for new torrents (default: 60, minimum: 10)
 DB_PATH=metadata.db         # Path to the redb database file (default: metadata.db)
 PORT=8080                   # WebDAV server listen port (default: 8080)
 
