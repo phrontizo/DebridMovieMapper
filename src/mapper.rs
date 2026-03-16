@@ -1,9 +1,9 @@
-pub mod error;
-pub mod rd_client;
-pub mod vfs;
 pub mod dav_fs;
-pub mod tmdb_client;
+pub mod error;
 pub mod identification;
 pub mod jellyfin_client;
+pub mod rd_client;
 pub mod repair;
 pub mod tasks;
+pub mod tmdb_client;
+pub mod vfs;

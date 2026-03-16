@@ -1,20 +1,20 @@
-use std::sync::Arc;
-use std::net::SocketAddr;
-use tokio::sync::{RwLock, Semaphore};
-use tokio::net::TcpListener;
-use tracing::info;
-use debridmoviemapper::rd_client::RealDebridClient;
-use debridmoviemapper::vfs::DebridVfs;
-use debridmoviemapper::dav_fs::DebridFileSystem;
-use debridmoviemapper::tmdb_client::TmdbClient;
-use debridmoviemapper::repair::RepairManager;
-use debridmoviemapper::tasks::{MATCHES_TABLE, ScanConfig};
 use dav_server::DavHandler;
+use debridmoviemapper::dav_fs::DebridFileSystem;
+use debridmoviemapper::rd_client::RealDebridClient;
+use debridmoviemapper::repair::RepairManager;
+use debridmoviemapper::tasks::{ScanConfig, MATCHES_TABLE};
+use debridmoviemapper::tmdb_client::TmdbClient;
+use debridmoviemapper::vfs::DebridVfs;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 use redb::Database;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use tokio::sync::{RwLock, Semaphore};
+use tracing::info;
 
 const MAX_CONNECTIONS: usize = 256;
 
@@ -27,7 +27,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(8080);
         std::process::exit(
-            if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() { 0 } else { 1 }
+            if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+                0
+            } else {
+                1
+            },
         );
     }
 
@@ -55,8 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
     let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
 
-    let jellyfin_client = debridmoviemapper::jellyfin_client::JellyfinClient::from_env()
-        .map(Arc::new);
+    let jellyfin_client =
+        debridmoviemapper::jellyfin_client::JellyfinClient::from_env().map(Arc::new);
 
     if jellyfin_client.is_some() {
         info!("Jellyfin notification enabled");
@@ -70,7 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure table exists on fresh databases
     {
         let write_txn = db.begin_write().expect("Failed to begin write transaction");
-        write_txn.open_table(MATCHES_TABLE).expect("Failed to create matches table");
+        write_txn
+            .open_table(MATCHES_TABLE)
+            .expect("Failed to create matches table");
         write_txn.commit().expect("Failed to commit table creation");
     }
 
@@ -93,7 +99,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("Failed to build CDN HTTP client");
-    let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone(), repair_manager.clone(), http_client);
+    let dav_fs = DebridFileSystem::new(
+        rd_client.clone(),
+        vfs.clone(),
+        repair_manager.clone(),
+        http_client,
+    );
     let dav_handler = DavHandler::builder()
         .filesystem(Box::new(dav_fs))
         .locksystem(dav_server::fakels::FakeLs::new())
@@ -114,8 +125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
         {
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("Failed to register SIGTERM handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("Failed to register SIGTERM handler");
             tokio::select! {
                 _ = ctrl_c => info!("Received SIGINT, shutting down..."),
                 _ = sigterm.recv() => info!("Received SIGTERM, shutting down..."),

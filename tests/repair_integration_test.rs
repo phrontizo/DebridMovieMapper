@@ -1,7 +1,7 @@
-use debridmoviemapper::rd_client::RealDebridClient;
-use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::identification::identify_torrent;
+use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::repair::RepairManager;
+use debridmoviemapper::tmdb_client::TmdbClient;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
@@ -41,7 +41,10 @@ async fn test_repair_process_integration() {
         return;
     }
 
-    println!("Found {} downloaded torrents (using first 5)", downloaded.len());
+    println!(
+        "Found {} downloaded torrents (using first 5)",
+        downloaded.len()
+    );
 
     // Prepare data with metadata for health check (skip torrents deleted by prior repair runs)
     let mut torrent_data = Vec::new();
@@ -95,8 +98,11 @@ async fn test_repair_process_integration() {
 
     // Test 4: Verify status summary works
     println!("\n=== Test 4: Status Summary ===");
-    let (healthy, broken, repairing) = repair_manager.get_status_summary().await;
-    println!("  Healthy: {}, Broken: {}, Repairing: {}", healthy, broken, repairing);
+    let (healthy, repairing, failed) = repair_manager.get_status_summary().await;
+    println!(
+        "  Healthy: {}, Repairing/Broken: {}, Failed: {}",
+        healthy, repairing, failed
+    );
     println!("  ✓ Status summary retrieved successfully");
 
     // Test 5: Verify torrents can be retrieved
@@ -105,8 +111,14 @@ async fn test_repair_process_integration() {
         .get_torrents()
         .await
         .expect("Failed to get torrents after repair");
-    println!("  Retrieved {} torrents after repair operations", all_torrents.len());
-    assert!(!all_torrents.is_empty(), "Should have torrents after repair");
+    println!(
+        "  Retrieved {} torrents after repair operations",
+        all_torrents.len()
+    );
+    assert!(
+        !all_torrents.is_empty(),
+        "Should have torrents after repair"
+    );
     println!("  ✓ Torrents still accessible after repair");
 
     println!("\n=== All Tests Passed ===");
@@ -170,7 +182,9 @@ async fn test_503_triggers_immediate_repair() {
     // Simulate a 503 error by marking as broken (this is what happens in WebDAV on 503)
     if let Some(first_link) = info.links.first() {
         println!("Simulating 503 error during playback...");
-        repair_manager.mark_broken(&test_torrent.id, first_link).await;
+        repair_manager
+            .mark_broken(&test_torrent.id, first_link)
+            .await;
 
         // Check immediately
         sleep(Duration::from_millis(100)).await;
@@ -194,8 +208,11 @@ async fn test_503_triggers_immediate_repair() {
         }
 
         // Check status summary
-        let (_, broken, repairing) = repair_manager.get_status_summary().await;
-        println!("Status after repair: Broken: {}, Repairing: {}", broken, repairing);
+        let (_, repairing, failed) = repair_manager.get_status_summary().await;
+        println!(
+            "Status after repair: Repairing/Broken: {}, Failed: {}",
+            repairing, failed
+        );
     }
 
     println!("\n=== Test Passed: 503 Triggers Immediate Repair ===");
@@ -255,7 +272,11 @@ async fn test_broken_torrents_hidden_from_webdav() {
         };
 
         if let Some(link) = info.links.first() {
-            println!("Marking torrent {} as broken: {}", marked_ids.len() + 1, info.filename);
+            println!(
+                "Marking torrent {} as broken: {}",
+                marked_ids.len() + 1,
+                info.filename
+            );
             repair_manager.mark_broken(&torrent.id, link).await;
             marked_ids.push(torrent.id.clone());
         }
@@ -283,7 +304,10 @@ async fn test_broken_torrents_hidden_from_webdav() {
         "Should have at least 2 hidden torrents, found {}",
         hidden_count
     );
-    println!("\n  ✓ Successfully verified {} broken torrents are hidden", hidden_count);
+    println!(
+        "\n  ✓ Successfully verified {} broken torrents are hidden",
+        hidden_count
+    );
 
     println!("\n=== Test Passed: Broken Torrents Hidden ===");
 }

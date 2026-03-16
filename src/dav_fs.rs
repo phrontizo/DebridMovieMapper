@@ -1,13 +1,13 @@
-use dav_server::fs::*;
-use dav_server::davpath::DavPath;
-use futures_util::FutureExt;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use crate::vfs::{DebridVfs, VfsNode};
 use crate::rd_client::RealDebridClient;
 use crate::repair::RepairManager;
+use crate::vfs::{DebridVfs, VfsNode};
 use bytes::Bytes;
+use dav_server::davpath::DavPath;
+use dav_server::fs::*;
+use futures_util::FutureExt;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
 
 /// 2 MB read-ahead buffer per open file
 const BUFFER_SIZE: usize = 2 * 1024 * 1024;
@@ -70,45 +70,61 @@ impl DebridFileSystem {
 }
 
 impl DavFileSystem for DebridFileSystem {
-    fn open<'a>(&'a self, path: &'a DavPath, _options: OpenOptions) -> FsFuture<'a, Box<dyn DavFile>> {
+    fn open<'a>(
+        &'a self,
+        path: &'a DavPath,
+        _options: OpenOptions,
+    ) -> FsFuture<'a, Box<dyn DavFile>> {
         async move {
             let node = self.find_node(path).await.ok_or(FsError::NotFound)?;
-            let name = path.as_rel_ospath().to_str()
+            let name = path
+                .as_rel_ospath()
+                .to_str()
                 .and_then(|s| s.rsplit('/').next())
                 .unwrap_or("")
                 .to_string();
             match node {
-                VfsNode::MediaFile { file_size, rd_link, rd_torrent_id } => {
-                    Ok(Box::new(ProxiedMediaFile {
-                        name,
-                        rd_link,
-                        rd_torrent_id,
-                        file_size,
-                        repair_manager: self.repair_manager.clone(),
-                        rd_client: self.rd_client.clone(),
-                        http_client: self.http_client.clone(),
-                        pos: 0,
-                        cdn_url: None,
-                        buffer: Bytes::new(),
-                        buffer_start: 0,
-                    }) as Box<dyn DavFile>)
-                }
-                VfsNode::VirtualFile { content } => {
-                    Ok(Box::new(VirtualFile {
-                        content: Bytes::from(content),
-                        pos: 0,
-                    }) as Box<dyn DavFile>)
-                }
+                VfsNode::MediaFile {
+                    file_size,
+                    rd_link,
+                    rd_torrent_id,
+                } => Ok(Box::new(ProxiedMediaFile {
+                    name,
+                    rd_link,
+                    rd_torrent_id,
+                    file_size,
+                    repair_manager: self.repair_manager.clone(),
+                    rd_client: self.rd_client.clone(),
+                    http_client: self.http_client.clone(),
+                    pos: 0,
+                    cdn_url: None,
+                    buffer: Bytes::new(),
+                    buffer_start: 0,
+                }) as Box<dyn DavFile>),
+                VfsNode::VirtualFile { content } => Ok(Box::new(VirtualFile {
+                    content: Bytes::from(content),
+                    pos: 0,
+                }) as Box<dyn DavFile>),
                 VfsNode::Directory { .. } => Err(FsError::Forbidden),
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
-    fn read_dir<'a>(&'a self, path: &'a DavPath, _meta: ReadDirMeta) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
+    fn read_dir<'a>(
+        &'a self,
+        path: &'a DavPath,
+        _meta: ReadDirMeta,
+    ) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         async move {
             let vfs = self.vfs.read().await;
             let node = Self::find_node_ref(&vfs, path).ok_or(FsError::NotFound)?;
-            let path_str = path.as_rel_ospath().to_str().unwrap_or("").trim_matches('/').trim_start_matches("./");
+            let path_str = path
+                .as_rel_ospath()
+                .to_str()
+                .unwrap_or("")
+                .trim_matches('/')
+                .trim_start_matches("./");
             if let VfsNode::Directory { children } = node {
                 let mut entries: Vec<Box<dyn DavDirEntry>> = Vec::new();
                 for (name, child) in children {
@@ -117,7 +133,11 @@ impl DavFileSystem for DebridFileSystem {
                     } else {
                         format!("{}/{}", path_str, name)
                     };
-                    let modified_time = vfs.timestamps.get(&child_path).copied().unwrap_or(UNIX_EPOCH);
+                    let modified_time = vfs
+                        .timestamps
+                        .get(&child_path)
+                        .copied()
+                        .unwrap_or(UNIX_EPOCH);
                     entries.push(Box::new(DebridDirEntry {
                         name: name.clone(),
                         metadata: DebridMetaData::from_node(child, modified_time),
@@ -128,17 +148,24 @@ impl DavFileSystem for DebridFileSystem {
             } else {
                 Err(FsError::Forbidden)
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, Box<dyn DavMetaData>> {
         async move {
             let vfs = self.vfs.read().await;
             let node = Self::find_node_ref(&vfs, path).ok_or(FsError::NotFound)?;
-            let path_str = path.as_rel_ospath().to_str().unwrap_or("").trim_matches('/').trim_start_matches("./");
+            let path_str = path
+                .as_rel_ospath()
+                .to_str()
+                .unwrap_or("")
+                .trim_matches('/')
+                .trim_start_matches("./");
             let modified_time = vfs.timestamps.get(path_str).copied().unwrap_or(UNIX_EPOCH);
             Ok(Box::new(DebridMetaData::from_node(node, modified_time)) as Box<dyn DavMetaData>)
-        }.boxed()
+        }
+        .boxed()
     }
 }
 
@@ -156,7 +183,11 @@ impl DebridMetaData {
             VfsNode::VirtualFile { content, .. } => (false, content.len() as u64),
             VfsNode::Directory { .. } => (true, 0),
         };
-        Self { is_directory, size, modified_time }
+        Self {
+            is_directory,
+            size,
+            modified_time,
+        }
     }
 }
 
@@ -183,9 +214,7 @@ impl DavDirEntry for DebridDirEntry {
     }
     fn metadata(&self) -> FsFuture<'_, Box<dyn DavMetaData>> {
         let meta = self.metadata.clone();
-        async move {
-            Ok(Box::new(meta) as Box<dyn DavMetaData>)
-        }.boxed()
+        async move { Ok(Box::new(meta) as Box<dyn DavMetaData>) }.boxed()
     }
 }
 
@@ -229,16 +258,30 @@ impl ProxiedMediaFile {
             }
             Err(e) => {
                 if should_repair_on_unrestrict_error(e.status()) {
-                    tracing::warn!("Unrestrict returned 503 for {} — attempting instant repair", self.name);
-                    match self.repair_manager.try_instant_repair(&self.rd_torrent_id, &self.rd_link).await {
+                    tracing::warn!(
+                        "Unrestrict returned 503 for {} — attempting instant repair",
+                        self.name
+                    );
+                    match self
+                        .repair_manager
+                        .try_instant_repair(&self.rd_torrent_id, &self.rd_link)
+                        .await
+                    {
                         Ok(result) => {
-                            tracing::info!("Instant repair succeeded for {} — new torrent {}", self.name, result.new_torrent_id);
-                            let old_rd_link = std::mem::replace(&mut self.rd_link, result.new_rd_link);
+                            tracing::info!(
+                                "Instant repair succeeded for {} — new torrent {}",
+                                self.name,
+                                result.new_torrent_id
+                            );
+                            let old_rd_link =
+                                std::mem::replace(&mut self.rd_link, result.new_rd_link);
                             self.rd_torrent_id = result.new_torrent_id;
                             // Invalidate the cached unrestrict response for the old (broken) link
                             // so other ProxiedMediaFile instances don't get stale data before
                             // the next VFS rebuild.
-                            self.rd_client.invalidate_unrestrict_cache(&old_rd_link).await;
+                            self.rd_client
+                                .invalidate_unrestrict_cache(&old_rd_link)
+                                .await;
                             // Unrestrict the new link immediately
                             match self.rd_client.unrestrict_link(&self.rd_link).await {
                                 Ok(response) => {
@@ -247,12 +290,20 @@ impl ProxiedMediaFile {
                                     return Ok(url);
                                 }
                                 Err(e2) => {
-                                    tracing::error!("Failed to unrestrict repaired link for {}: {}", self.name, e2);
+                                    tracing::error!(
+                                        "Failed to unrestrict repaired link for {}: {}",
+                                        self.name,
+                                        e2
+                                    );
                                 }
                             }
                         }
                         Err(reason) => {
-                            tracing::error!("Instant repair failed for {}: {} — file unavailable", self.name, reason);
+                            tracing::error!(
+                                "Instant repair failed for {}: {} — file unavailable",
+                                self.name,
+                                reason
+                            );
                         }
                     }
                 } else {
@@ -287,7 +338,8 @@ impl ProxiedMediaFile {
         let fetch_size = std::cmp::max(len, BUFFER_SIZE) as u64;
         let range_end = std::cmp::min(pos + fetch_size - 1, self.file_size - 1);
 
-        let resp = match self.http_client
+        let resp = match self
+            .http_client
             .get(&cdn_url)
             .header("Range", format!("bytes={}-{}", pos, range_end))
             .send()
@@ -295,24 +347,36 @@ impl ProxiedMediaFile {
         {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::warn!("CDN fetch failed for {}: {} — clearing cached CDN URL", self.name, e);
+                tracing::warn!(
+                    "CDN fetch failed for {}: {} — clearing cached CDN URL",
+                    self.name,
+                    e
+                );
                 // Clear cached CDN URL so the next read re-resolves via unrestrict_link.
                 // This handles expired CDN URLs (which cause connection/TLS errors).
                 self.cdn_url = None;
                 // Also invalidate the unrestrict cache so re-resolve fetches a fresh URL.
-                self.rd_client.invalidate_unrestrict_cache(&self.rd_link).await;
+                self.rd_client
+                    .invalidate_unrestrict_cache(&self.rd_link)
+                    .await;
                 return Err(FsError::GeneralFailure);
             }
         };
 
         let status = resp.status();
         if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-            tracing::warn!("CDN returned {} for {} — clearing cached CDN URL", status, self.name);
+            tracing::warn!(
+                "CDN returned {} for {} — clearing cached CDN URL",
+                status,
+                self.name
+            );
             // Clear cached CDN URL so the next read re-resolves via unrestrict_link.
             // CDN URLs expire after ~1h; a 403/410 here means the URL is stale.
             self.cdn_url = None;
             // Also invalidate the unrestrict cache so re-resolve fetches a fresh URL.
-            self.rd_client.invalidate_unrestrict_cache(&self.rd_link).await;
+            self.rd_client
+                .invalidate_unrestrict_cache(&self.rd_link)
+                .await;
             return Err(FsError::GeneralFailure);
         }
 
@@ -335,7 +399,11 @@ impl ProxiedMediaFile {
 impl DavFile for ProxiedMediaFile {
     fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
         async move {
-            if self.repair_manager.should_hide_torrent(&self.rd_torrent_id).await {
+            if self
+                .repair_manager
+                .should_hide_torrent(&self.rd_torrent_id)
+                .await
+            {
                 return Ok(Box::new(DebridMetaData {
                     is_directory: false,
                     size: 0,
@@ -348,7 +416,8 @@ impl DavFile for ProxiedMediaFile {
                 size: self.file_size,
                 modified_time: SystemTime::UNIX_EPOCH,
             }) as Box<dyn DavMetaData>)
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn write_buf(&mut self, _buf: Box<dyn bytes::Buf + Send>) -> FsFuture<'_, ()> {
@@ -361,12 +430,17 @@ impl DavFile for ProxiedMediaFile {
 
     fn read_bytes(&mut self, len: usize) -> FsFuture<'_, Bytes> {
         async move {
-            if self.repair_manager.should_hide_torrent(&self.rd_torrent_id).await {
+            if self
+                .repair_manager
+                .should_hide_torrent(&self.rd_torrent_id)
+                .await
+            {
                 return Err(FsError::GeneralFailure);
             }
 
             self.fetch_bytes(len).await
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn seek(&mut self, pos: std::io::SeekFrom) -> FsFuture<'_, u64> {
@@ -375,14 +449,16 @@ impl DavFile for ProxiedMediaFile {
                 std::io::SeekFrom::Start(p) => p,
                 std::io::SeekFrom::Current(p) => {
                     let base = self.pos as i64;
-                    let result = base.checked_add(p)
+                    let result = base
+                        .checked_add(p)
                         .filter(|&n| n >= 0)
                         .ok_or(FsError::GeneralFailure)?;
                     result as u64
                 }
                 std::io::SeekFrom::End(p) => {
                     let size = self.file_size as i64;
-                    let result = size.checked_add(p)
+                    let result = size
+                        .checked_add(p)
                         .filter(|&n| n >= 0)
                         .ok_or(FsError::GeneralFailure)?;
                     result as u64
@@ -390,7 +466,8 @@ impl DavFile for ProxiedMediaFile {
             };
             self.pos = new_pos;
             Ok(new_pos)
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn flush(&mut self) -> FsFuture<'_, ()> {
@@ -429,7 +506,9 @@ mod tests {
         let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
 
         // Directory
-        let dir_node = VfsNode::Directory { children: std::collections::BTreeMap::new() };
+        let dir_node = VfsNode::Directory {
+            children: std::collections::BTreeMap::new(),
+        };
         let meta = DebridMetaData::from_node(&dir_node, modified);
         assert!(meta.is_directory);
         assert_eq!(meta.size, 0);
@@ -446,7 +525,9 @@ mod tests {
         assert_eq!(meta.size, 42000);
 
         // VirtualFile
-        let vf_node = VfsNode::VirtualFile { content: vec![1, 2, 3, 4, 5] };
+        let vf_node = VfsNode::VirtualFile {
+            content: vec![1, 2, 3, 4, 5],
+        };
         let meta = DebridMetaData::from_node(&vf_node, modified);
         assert!(!meta.is_directory);
         assert_eq!(meta.size, 5);
@@ -455,14 +536,26 @@ mod tests {
     #[test]
     fn should_repair_only_on_503() {
         // Only 503 (Service Unavailable) means broken torrent → trigger repair
-        assert!(should_repair_on_unrestrict_error(Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)));
+        assert!(should_repair_on_unrestrict_error(Some(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        )));
 
         // Other status codes should NOT trigger repair
-        assert!(!should_repair_on_unrestrict_error(Some(reqwest::StatusCode::NOT_FOUND)));
-        assert!(!should_repair_on_unrestrict_error(Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)));
-        assert!(!should_repair_on_unrestrict_error(Some(reqwest::StatusCode::BAD_GATEWAY)));
-        assert!(!should_repair_on_unrestrict_error(Some(reqwest::StatusCode::GATEWAY_TIMEOUT)));
-        assert!(!should_repair_on_unrestrict_error(Some(reqwest::StatusCode::FORBIDDEN)));
+        assert!(!should_repair_on_unrestrict_error(Some(
+            reqwest::StatusCode::NOT_FOUND
+        )));
+        assert!(!should_repair_on_unrestrict_error(Some(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        )));
+        assert!(!should_repair_on_unrestrict_error(Some(
+            reqwest::StatusCode::BAD_GATEWAY
+        )));
+        assert!(!should_repair_on_unrestrict_error(Some(
+            reqwest::StatusCode::GATEWAY_TIMEOUT
+        )));
+        assert!(!should_repair_on_unrestrict_error(Some(
+            reqwest::StatusCode::FORBIDDEN
+        )));
 
         // Network errors (no status code) should NOT trigger repair
         assert!(!should_repair_on_unrestrict_error(None));
@@ -479,10 +572,15 @@ mod tests {
         // The fn fetch_bytes body should set self.cdn_url = None on CDN failure
         // We check for the pattern appearing after "fn fetch_bytes" to ensure
         // it's in the right function
-        let fetch_bytes_start = source.find("fn fetch_bytes").expect("fetch_bytes function must exist");
+        let fetch_bytes_start = source
+            .find("fn fetch_bytes")
+            .expect("fetch_bytes function must exist");
         let fetch_bytes_body = &source[fetch_bytes_start..];
         // Find the next function boundary (next "fn " or end)
-        let fetch_bytes_end = fetch_bytes_body[1..].find("\n    fn ").map(|i| i + 1).unwrap_or(fetch_bytes_body.len());
+        let fetch_bytes_end = fetch_bytes_body[1..]
+            .find("\n    fn ")
+            .map(|i| i + 1)
+            .unwrap_or(fetch_bytes_body.len());
         let fetch_bytes_source = &fetch_bytes_body[..fetch_bytes_end];
 
         // Must clear cdn_url on failure
@@ -494,7 +592,9 @@ mod tests {
         );
 
         // Must also invalidate the unrestrict cache so re-resolve gets a fresh URL
-        let cache_invalidate_count = fetch_bytes_source.matches("invalidate_unrestrict_cache").count();
+        let cache_invalidate_count = fetch_bytes_source
+            .matches("invalidate_unrestrict_cache")
+            .count();
         assert!(
             cache_invalidate_count >= 2,
             "fetch_bytes must invalidate unrestrict cache on both connection errors and HTTP error status \
@@ -613,7 +713,9 @@ mod tests {
         assert_eq!(pos, (content.len() - 8) as u64);
 
         // Read past end returns empty
-        file.seek(std::io::SeekFrom::Start(content.len() as u64)).await.unwrap();
+        file.seek(std::io::SeekFrom::Start(content.len() as u64))
+            .await
+            .unwrap();
         let data = file.read_bytes(10).await.unwrap();
         assert!(data.is_empty(), "Reading at EOF should return empty bytes");
     }
@@ -661,9 +763,7 @@ impl DavFile for VirtualFile {
             size: self.content.len() as u64,
             modified_time: SystemTime::UNIX_EPOCH,
         };
-        async move {
-            Ok(Box::new(meta) as Box<dyn DavMetaData>)
-        }.boxed()
+        async move { Ok(Box::new(meta) as Box<dyn DavMetaData>) }.boxed()
     }
 
     fn write_buf(&mut self, _buf: Box<dyn bytes::Buf + Send>) -> FsFuture<'_, ()> {
@@ -686,7 +786,8 @@ impl DavFile for VirtualFile {
 
             self.pos += data.len() as u64;
             Ok(data)
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn seek(&mut self, pos: std::io::SeekFrom) -> FsFuture<'_, u64> {
@@ -695,14 +796,16 @@ impl DavFile for VirtualFile {
                 std::io::SeekFrom::Start(p) => p,
                 std::io::SeekFrom::Current(p) => {
                     let base = self.pos as i64;
-                    let result = base.checked_add(p)
+                    let result = base
+                        .checked_add(p)
                         .filter(|&n| n >= 0)
                         .ok_or(FsError::GeneralFailure)?;
                     result as u64
                 }
                 std::io::SeekFrom::End(p) => {
                     let size = self.content.len() as i64;
-                    let result = size.checked_add(p)
+                    let result = size
+                        .checked_add(p)
                         .filter(|&n| n >= 0)
                         .ok_or(FsError::GeneralFailure)?;
                     result as u64
@@ -710,7 +813,8 @@ impl DavFile for VirtualFile {
             };
             self.pos = new_pos;
             Ok(new_pos)
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn flush(&mut self) -> FsFuture<'_, ()> {

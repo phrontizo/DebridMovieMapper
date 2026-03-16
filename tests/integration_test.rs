@@ -1,18 +1,17 @@
+use debridmoviemapper::identification::identify_torrent;
 use debridmoviemapper::rd_client::{RealDebridClient, TorrentInfo};
 use debridmoviemapper::tmdb_client::TmdbClient;
-use debridmoviemapper::vfs::{DebridVfs, MediaMetadata, VfsNode, is_video_file};
-use debridmoviemapper::identification::identify_torrent;
-use std::sync::{Arc, LazyLock};
-use tokio::sync::{OnceCell, RwLock};
+use debridmoviemapper::vfs::{is_video_file, DebridVfs, MediaMetadata, VfsNode};
 use futures_util::StreamExt;
 use redb::{Database, ReadableDatabase, TableDefinition};
+use std::sync::{Arc, LazyLock};
+use tokio::sync::{OnceCell, RwLock};
 
 const MATCHES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("matches");
 
 /// Shared redb Database instance — redb only allows one open handle per path.
-static DB: LazyLock<Database> = LazyLock::new(|| {
-    Database::create("metadata.db").expect("Failed to open database")
-});
+static DB: LazyLock<Database> =
+    LazyLock::new(|| Database::create("metadata.db").expect("Failed to open database"));
 
 /// Shared identified data — fetched and identified exactly once, reused by all tests.
 static IDENTIFIED_DATA: OnceCell<(Arc<RealDebridClient>, Vec<(TorrentInfo, MediaMetadata)>)> =
@@ -49,7 +48,10 @@ async fn fetch_and_identify(
     db: &Database,
 ) -> Vec<(TorrentInfo, MediaMetadata)> {
     println!("Fetching torrents...");
-    let torrents = rd_client.get_torrents().await.expect("Failed to get torrents");
+    let torrents = rd_client
+        .get_torrents()
+        .await
+        .expect("Failed to get torrents");
     let downloaded: Vec<_> = torrents
         .into_iter()
         .filter(|t| t.status == "downloaded")
@@ -61,7 +63,10 @@ async fn fetch_and_identify(
         .and_then(|v| v.parse::<usize>().ok());
 
     let to_process: Vec<_> = if let Some(limit) = limit {
-        println!("INTEGRATION_TEST_LIMIT={}, processing first {} torrents", limit, limit);
+        println!(
+            "INTEGRATION_TEST_LIMIT={}, processing first {} torrents",
+            limit, limit
+        );
         downloaded.into_iter().take(limit).collect()
     } else {
         downloaded
@@ -88,7 +93,11 @@ async fn fetch_and_identify(
     }
 
     if !to_identify.is_empty() {
-        println!("Identifying {} new torrents ({} cached)...", to_identify.len(), current_data.len());
+        println!(
+            "Identifying {} new torrents ({} cached)...",
+            to_identify.len(),
+            current_data.len()
+        );
         let mut stream = futures_util::stream::iter(to_identify)
             .map(|torrent| {
                 let rd_client = rd_client.clone();
@@ -133,10 +142,7 @@ async fn fetch_and_identify(
 async fn test_identification() {
     let (_, data) = get_shared_data().await;
 
-    let identified = data
-        .iter()
-        .filter(|(_, m)| m.external_id.is_some())
-        .count();
+    let identified = data.iter().filter(|(_, m)| m.external_id.is_some()).count();
     let unidentified = data.len() - identified;
 
     println!("\n=== Identification Summary ===");
@@ -151,7 +157,10 @@ async fn test_identification() {
         }
     }
 
-    assert!(!data.is_empty(), "Should have at least one downloaded torrent");
+    assert!(
+        !data.is_empty(),
+        "Should have at least one downloaded torrent"
+    );
     assert!(identified > 0, "Should identify at least one torrent");
 }
 
@@ -160,7 +169,10 @@ async fn test_identification() {
 #[ignore]
 async fn test_vfs_structure() {
     let (_, data) = get_shared_data().await;
-    assert!(!data.is_empty(), "Need identified torrents to test VFS structure");
+    assert!(
+        !data.is_empty(),
+        "Need identified torrents to test VFS structure"
+    );
 
     println!("Building VFS...");
     let new_vfs = DebridVfs::build(data.clone());
@@ -194,7 +206,9 @@ async fn test_vfs_structure() {
         println!("\nMovies/ contains {} entries", movies.len());
         for (name, node) in movies.iter().take(5) {
             match node {
-                VfsNode::Directory { children: movie_files } => {
+                VfsNode::Directory {
+                    children: movie_files,
+                } => {
                     let media_count = movie_files
                         .values()
                         .filter(|n| matches!(n, VfsNode::MediaFile { .. }))
@@ -212,10 +226,7 @@ async fn test_vfs_structure() {
         for (name, node) in shows.iter().take(5) {
             match node {
                 VfsNode::Directory { children: seasons } => {
-                    let season_count = seasons
-                        .keys()
-                        .filter(|k| k.starts_with("Season"))
-                        .count();
+                    let season_count = seasons.keys().filter(|k| k.starts_with("Season")).count();
                     println!("  {}: {} seasons", name, season_count);
                 }
                 _ => println!("  {} (not a directory)", name),
@@ -229,7 +240,10 @@ async fn test_vfs_structure() {
 #[ignore]
 async fn test_vfs_completeness() {
     let (_, data) = get_shared_data().await;
-    assert!(!data.is_empty(), "Need identified torrents to test VFS completeness");
+    assert!(
+        !data.is_empty(),
+        "Need identified torrents to test VFS completeness"
+    );
 
     println!("Building VFS...");
     let new_vfs = DebridVfs::build(data.clone());
@@ -250,7 +264,8 @@ async fn test_vfs_completeness() {
                     total_video_files += 1;
                     if let Some(link) = info.links.get(link_idx) {
                         if !vfs_links.contains(link) {
-                            missing.push(format!("Torrent: {}, File: {}", info.filename, file.path));
+                            missing
+                                .push(format!("Torrent: {}, File: {}", info.filename, file.path));
                         }
                     }
                 }
@@ -308,7 +323,10 @@ async fn test_vfs_completeness() {
 #[ignore]
 async fn test_vfs_timestamps_stable() {
     let (_, data) = get_shared_data().await;
-    assert!(!data.is_empty(), "Need identified torrents to test timestamps");
+    assert!(
+        !data.is_empty(),
+        "Need identified torrents to test timestamps"
+    );
 
     let vfs1 = DebridVfs::build(data.clone());
     let vfs2 = DebridVfs::build(data.clone());
@@ -336,14 +354,18 @@ async fn test_vfs_timestamps_stable() {
         "Timestamps must be stable across VFS rebuilds"
     );
 
-    // No timestamp should be UNIX_EPOCH (all RD torrents have a valid added date)
+    // No timestamp should be UNIX_EPOCH, except for empty top-level directories
+    // (e.g. "Movies" when INTEGRATION_TEST_LIMIT only picks up shows)
     let epoch = std::time::UNIX_EPOCH;
     for (path, ts) in &vfs1.timestamps {
-        assert_ne!(
-            *ts, epoch,
-            "Timestamp for '{}' should not be UNIX_EPOCH — RD added date not parsed?",
-            path
-        );
+        if *ts == epoch {
+            // Only top-level dirs ("Movies", "Shows") are allowed to be EPOCH when empty
+            assert!(
+                path == "Movies" || path == "Shows",
+                "Timestamp for '{}' should not be UNIX_EPOCH — RD added date not parsed?",
+                path
+            );
+        }
     }
 
     println!("\n=== VFS Timestamps ===");

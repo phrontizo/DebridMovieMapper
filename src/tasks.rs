@@ -1,15 +1,15 @@
+use crate::identification::identify_torrent;
+use crate::rd_client::RealDebridClient;
+use crate::repair::RepairManager;
+use crate::tmdb_client::TmdbClient;
+use crate::vfs::{DebridVfs, MediaMetadata};
+use futures_util::StreamExt;
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{info, warn, error};
-use futures_util::StreamExt;
-use redb::{ReadableTable, ReadableDatabase, TableDefinition};
-use crate::rd_client::RealDebridClient;
-use crate::tmdb_client::TmdbClient;
-use crate::vfs::{DebridVfs, MediaMetadata};
-use crate::identification::identify_torrent;
-use crate::repair::RepairManager;
+use tracing::{error, info, warn};
 
 pub const MATCHES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("matches");
 
@@ -23,10 +23,7 @@ pub struct ScanConfig {
     pub jellyfin_client: Option<Arc<crate::jellyfin_client::JellyfinClient>>,
 }
 
-pub async fn run_scan_loop(
-    config: ScanConfig,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
+pub async fn run_scan_loop(config: ScanConfig, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let ScanConfig {
         rd_client,
         tmdb_client,
@@ -50,9 +47,8 @@ pub async fn run_scan_loop(
                             if let Ok(data) = serde_json::from_slice::<(
                                 crate::rd_client::TorrentInfo,
                                 MediaMetadata,
-                            )>(
-                                value.value()
-                            ) {
+                            )>(value.value())
+                            {
                                 map.insert(id, data);
                             }
                         }
@@ -66,7 +62,10 @@ pub async fn run_scan_loop(
 
     let mut seen_torrents = persisted;
     if !seen_torrents.is_empty() {
-        info!("Loaded {} persistent matches from database.", seen_torrents.len());
+        info!(
+            "Loaded {} persistent matches from database.",
+            seen_torrents.len()
+        );
     }
 
     // Pre-populate the VFS from persisted data so the first scan's diff
@@ -74,7 +73,10 @@ pub async fn run_scan_loop(
     if !seen_torrents.is_empty() {
         let persisted_data: Vec<_> = seen_torrents.values().cloned().collect();
         update_vfs(&vfs, &persisted_data, &repair_manager, &None).await;
-        info!("Pre-populated VFS with {} persisted entries", persisted_data.len());
+        info!(
+            "Pre-populated VFS with {} persisted entries",
+            persisted_data.len()
+        );
     }
 
     info!("Scan task: running initial scan immediately");
@@ -87,7 +89,10 @@ pub async fn run_scan_loop(
         // Consume repair replacements (new_id → old_id) before processing torrents
         let repair_replacements = repair_manager.take_repair_replacements().await;
         if !repair_replacements.is_empty() {
-            info!("Processing {} repair replacement(s)", repair_replacements.len());
+            info!(
+                "Processing {} repair replacement(s)",
+                repair_replacements.len()
+            );
         }
 
         info!("Refreshing torrent list...");
@@ -117,7 +122,11 @@ pub async fn run_scan_loop(
                         let dup_id = torrent.id.clone();
                         tokio::spawn(async move {
                             if let Err(e) = rd.delete_torrent(&dup_id).await {
-                                tracing::error!("Failed to delete duplicate torrent {}: {}", dup_id, e);
+                                tracing::error!(
+                                    "Failed to delete duplicate torrent {}: {}",
+                                    dup_id,
+                                    e
+                                );
                             }
                         });
                     } else {
@@ -135,29 +144,46 @@ pub async fn run_scan_loop(
                         } else if let Some(old_id) = repair_replacements.get(&torrent.id) {
                             // This torrent is a repair replacement — reuse old identification
                             if let Some((old_info, old_metadata)) = seen_torrents.get(old_id) {
-                                info!("Reusing identification for repair replacement {} → {} ({})",
-                                    old_id, torrent.id, old_info.filename);
+                                info!(
+                                    "Reusing identification for repair replacement {} → {} ({})",
+                                    old_id, torrent.id, old_info.filename
+                                );
                                 let metadata = old_metadata.clone();
                                 // Get fresh torrent info for the new ID
                                 match rd_client.get_torrent_info(&torrent.id).await {
                                     Ok(new_info) => {
                                         // Serialize from references before cloning for owned storage
-                                        if let Ok(data_bytes) = serde_json::to_vec(&(&new_info, &metadata)) {
+                                        if let Ok(data_bytes) =
+                                            serde_json::to_vec(&(&new_info, &metadata))
+                                        {
                                             let db_clone = db.clone();
                                             let new_id = torrent.id.clone();
                                             let old_id = old_id.clone();
-                                            let _ = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-                                                let write_txn = db_clone.begin_write()?;
-                                                {
-                                                    let mut table = write_txn.open_table(MATCHES_TABLE)?;
-                                                    table.remove(old_id.as_str())?;
-                                                    table.insert(new_id.as_str(), data_bytes.as_slice())?;
-                                                }
-                                                write_txn.commit()?;
-                                                Ok(())
-                                            }).await;
+                                            if let Err(e) = tokio::task::spawn_blocking(
+                                                move || -> Result<(), redb::Error> {
+                                                    let write_txn = db_clone.begin_write()?;
+                                                    {
+                                                        let mut table =
+                                                            write_txn.open_table(MATCHES_TABLE)?;
+                                                        table.remove(old_id.as_str())?;
+                                                        table.insert(
+                                                            new_id.as_str(),
+                                                            data_bytes.as_slice(),
+                                                        )?;
+                                                    }
+                                                    write_txn.commit()?;
+                                                    Ok(())
+                                                },
+                                            )
+                                            .await
+                                            {
+                                                error!("Failed to persist repair replacement to database: {:?}", e);
+                                            }
                                         }
-                                        seen_torrents.insert(torrent.id.clone(), (new_info.clone(), metadata.clone()));
+                                        seen_torrents.insert(
+                                            torrent.id.clone(),
+                                            (new_info.clone(), metadata.clone()),
+                                        );
                                         current_data.push((new_info, metadata));
                                     }
                                     Err(e) => {
@@ -198,7 +224,8 @@ pub async fn run_scan_loop(
                 }
 
                 if !to_identify.is_empty() {
-                    info!("Identifying {} new torrents...", to_identify.len());
+                    let new_total = to_identify.len();
+                    info!("Identifying {} new torrents...", new_total);
                     let mut stream = futures_util::stream::iter(to_identify)
                         .map(|torrent| {
                             let rd_client = rd_client.clone();
@@ -206,16 +233,13 @@ pub async fn run_scan_loop(
                             async move {
                                 match rd_client.get_torrent_info(&torrent.id).await {
                                     Ok(info) => {
-                                        let metadata =
-                                            identify_torrent(&info, &tmdb_client).await;
+                                        let metadata = identify_torrent(&info, &tmdb_client).await;
                                         Ok::<
-                                            (
-                                                String,
-                                                crate::rd_client::TorrentInfo,
-                                                MediaMetadata,
-                                            ),
+                                            (String, crate::rd_client::TorrentInfo, MediaMetadata),
                                             reqwest::Error,
-                                        >((torrent.id, info, metadata))
+                                        >((
+                                            torrent.id, info, metadata,
+                                        ))
                                     }
                                     Err(e) => Err(e),
                                 }
@@ -223,16 +247,18 @@ pub async fn run_scan_loop(
                         })
                         .buffer_unordered(1);
 
-                    let new_total = deduped_torrents
-                        .iter()
-                        .filter(|t| t.status == "downloaded" && !seen_torrents.contains_key(&t.id))
-                        .count();
                     let mut processed_new = 0;
+                    // Batch pending DB writes: (id, serialized_bytes)
+                    let mut pending_db_writes: Vec<(String, Vec<u8>)> = Vec::new();
 
                     while let Some(result) = tokio::select! {
                         result = stream.next() => result,
                         _ = shutdown.changed() => {
                             info!("Scan task: shutdown during identification, saving progress");
+                            // Flush pending writes before shutting down
+                            if !pending_db_writes.is_empty() {
+                                flush_db_writes(&db, &mut pending_db_writes).await;
+                            }
                             update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client).await;
                             return;
                         }
@@ -240,20 +266,8 @@ pub async fn run_scan_loop(
                         processed_new += 1;
                         match result {
                             Ok((id, info, metadata)) => {
-                                if let Ok(data_bytes) =
-                                    serde_json::to_vec(&(&info, &metadata))
-                                {
-                                    let db_clone = db.clone();
-                                    let id_clone = id.clone();
-                                    let _ = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-                                        let write_txn = db_clone.begin_write()?;
-                                        {
-                                            let mut table = write_txn.open_table(MATCHES_TABLE)?;
-                                            table.insert(id_clone.as_str(), data_bytes.as_slice())?;
-                                        }
-                                        write_txn.commit()?;
-                                        Ok(())
-                                    }).await;
+                                if let Ok(data_bytes) = serde_json::to_vec(&(&info, &metadata)) {
+                                    pending_db_writes.push((id.clone(), data_bytes));
                                 }
                                 seen_torrents.insert(id, (info.clone(), metadata.clone()));
                                 current_data.push((info, metadata));
@@ -261,11 +275,16 @@ pub async fn run_scan_loop(
                             Err(e) => error!("Failed to identify torrent: {}", e),
                         }
                         if processed_new % 10 == 0 || processed_new == new_total {
+                            // Flush batched DB writes at each progress checkpoint
+                            if !pending_db_writes.is_empty() {
+                                flush_db_writes(&db, &mut pending_db_writes).await;
+                            }
                             info!(
                                 "Progress: {}/{} new torrents identified",
                                 processed_new, new_total
                             );
-                            update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client).await;
+                            update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client)
+                                .await;
                         }
                     }
                 } else {
@@ -275,7 +294,8 @@ pub async fn run_scan_loop(
                 let current_ids: std::collections::HashSet<&str> =
                     deduped_torrents.iter().map(|t| t.id.as_str()).collect();
                 // Collect stale IDs before retain so we can clean up redb
-                let stale_ids: Vec<String> = seen_torrents.keys()
+                let stale_ids: Vec<String> = seen_torrents
+                    .keys()
                     .filter(|id| !current_ids.contains(id.as_str()))
                     .cloned()
                     .collect();
@@ -286,17 +306,22 @@ pub async fn run_scan_loop(
                 if !stale_ids.is_empty() {
                     info!("Removing {} stale entries from database", stale_ids.len());
                     let db_clone = db.clone();
-                    let _ = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-                        let write_txn = db_clone.begin_write()?;
-                        {
-                            let mut table = write_txn.open_table(MATCHES_TABLE)?;
-                            for id in &stale_ids {
-                                table.remove(id.as_str())?;
+                    if let Err(e) =
+                        tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+                            let write_txn = db_clone.begin_write()?;
+                            {
+                                let mut table = write_txn.open_table(MATCHES_TABLE)?;
+                                for id in &stale_ids {
+                                    table.remove(id.as_str())?;
+                                }
                             }
-                        }
-                        write_txn.commit()?;
-                        Ok(())
-                    }).await;
+                            write_txn.commit()?;
+                            Ok(())
+                        })
+                        .await
+                    {
+                        error!("Failed to remove stale entries from database: {:?}", e);
+                    }
                 }
                 info!("VFS update complete.");
             }
@@ -314,6 +339,32 @@ pub async fn run_scan_loop(
     }
 }
 
+/// Flush a batch of pending DB writes in a single transaction.
+/// Clears `pending_writes` on success or failure.
+async fn flush_db_writes(db: &Arc<redb::Database>, pending_writes: &mut Vec<(String, Vec<u8>)>) {
+    let writes = std::mem::take(pending_writes);
+    let count = writes.len();
+    let db_clone = db.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+        let write_txn = db_clone.begin_write()?;
+        {
+            let mut table = write_txn.open_table(MATCHES_TABLE)?;
+            for (id, data_bytes) in &writes {
+                table.insert(id.as_str(), data_bytes.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    })
+    .await
+    {
+        error!(
+            "Failed to persist {} torrent identifications to database: {:?}",
+            count, e
+        );
+    }
+}
+
 async fn update_vfs(
     vfs: &Arc<RwLock<DebridVfs>>,
     current_data: &[(crate::rd_client::TorrentInfo, MediaMetadata)],
@@ -321,7 +372,8 @@ async fn update_vfs(
     jellyfin_client: &Option<Arc<crate::jellyfin_client::JellyfinClient>>,
 ) {
     let hidden_ids = repair_manager.hidden_torrent_ids().await;
-    let filtered: Vec<_> = current_data.iter()
+    let filtered: Vec<_> = current_data
+        .iter()
         .filter(|(torrent_info, _)| !hidden_ids.contains(&torrent_info.id))
         .map(|(torrent_info, metadata)| (torrent_info.clone(), metadata.clone()))
         .collect();
@@ -368,5 +420,4 @@ mod tests {
         };
         run_scan_loop(config, shutdown).await;
     }
-
 }

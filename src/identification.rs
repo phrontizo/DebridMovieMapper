@@ -1,27 +1,36 @@
-use std::sync::LazyLock;
-use chrono::Datelike;
-use regex::Regex;
-use tracing::{info, warn, debug};
 use crate::rd_client;
 use crate::tmdb_client::{TmdbClient, TmdbSearchResult};
-use crate::vfs::{MediaMetadata, MediaType, is_video_file, VIDEO_EXTENSIONS};
+use crate::vfs::{is_video_file, MediaMetadata, MediaType, VIDEO_EXTENSIONS};
+use chrono::Datelike;
+use regex::Regex;
+use std::sync::LazyLock;
+use tracing::{debug, info, warn};
 
 static CAMEL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([a-z])([A-Z])").unwrap());
 
-static PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(\[.*?\]|\(.*?\)|[\w.-]+\.[a-z]{2,6}\s+-\s+)\s*").unwrap());
+static PREFIX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(\[.*?\]|\(.*?\)|[\w.-]+\.[a-z]{2,6}\s+-\s+)\s*").unwrap());
 
 static YEAR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(19|20)\d{2}\b").unwrap());
 
-static STOP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(1080p|720p|2160p|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d+x\d+|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web-dl|h264|h265|x264|x265|remux|multi|vff|custom|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack|completa|complete|pol|eng|ita|ger|fra|spa|esp|rus|ukr)\b").unwrap());
+static STOP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(1080p|720p|2160p|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d+x\d+|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web-dl|h264|h265|x264|x265|remux|multi|vff|custom|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack|completa|complete|pol|eng|ita|ger|fra|spa|esp|rus|ukr)\b").unwrap()
+});
 
-static YEAR_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(19|20)\d{2}[\s-]+(19|20)\d{2}\b").unwrap());
+static YEAR_RANGE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(19|20)\d{2}[\s-]+(19|20)\d{2}\b").unwrap());
 
-static SHOW_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)s(\d+)\.?e(\d+)|s(\d+)|(\d+)x(\d+)|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|e\d+").unwrap());
+static SHOW_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)s(\d+)\.?e(\d+)|s(\d+)|(\d+)x(\d+)|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|e\d+").unwrap()
+});
 
-static GENERIC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(episode|season|part|volume|vol)\s*(\d+|[a-z])?$").unwrap());
+static GENERIC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(episode|season|part|volume|vol)\s*(\d+|[a-z])?$").unwrap());
 
 pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) -> MediaMetadata {
-    let representative_name = info.files.iter()
+    let representative_name = info
+        .files
+        .iter()
         .filter(|f| is_video_file(&f.path))
         .max_by_key(|f| f.bytes)
         .map(|f| f.path.split('/').next_back().unwrap_or(&f.path))
@@ -34,30 +43,48 @@ pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) 
     }
 
     if representative_name != info.filename {
-        debug!("Filename '{}' was generic or no match found. Trying torrent name: '{}'", representative_name, info.filename);
+        debug!(
+            "Filename '{}' was generic or no match found. Trying torrent name: '{}'",
+            representative_name, info.filename
+        );
         if let Some(metadata) = identify_name(&info.filename, &info.files, tmdb).await {
             return metadata;
         }
     }
 
-    warn!("Could not identify torrent: {}. Filename: {}.", info.filename, representative_name);
+    warn!(
+        "Could not identify torrent: {}. Filename: {}.",
+        info.filename, representative_name
+    );
     let (cleaned_torrent, year_t) = clean_name(&info.filename);
     if !cleaned_torrent.is_empty() {
         return MediaMetadata {
             title: cleaned_torrent,
             year: year_t,
-            media_type: if is_show_guess(&info.files) { MediaType::Show } else { MediaType::Movie },
+            media_type: if is_show_guess(&info.files) {
+                MediaType::Show
+            } else {
+                MediaType::Movie
+            },
             external_id: None,
         };
     }
 
     let (cleaned_file, year_f) = clean_name(representative_name);
-    let final_title = if !cleaned_file.is_empty() { cleaned_file } else { representative_name.to_string() };
-    
+    let final_title = if !cleaned_file.is_empty() {
+        cleaned_file
+    } else {
+        representative_name.to_string()
+    };
+
     MediaMetadata {
         title: final_title,
         year: year_f,
-        media_type: if is_show_guess(&info.files) { MediaType::Show } else { MediaType::Movie },
+        media_type: if is_show_guess(&info.files) {
+            MediaType::Show
+        } else {
+            MediaType::Movie
+        },
         external_id: None,
     }
 }
@@ -72,12 +99,19 @@ fn best_scored_result<'a>(
         return None;
     }
     if is_short_title {
-        results.iter()
+        results
+            .iter()
             .filter(|r| {
                 let normalized_title = normalize_title(&r.title);
                 let title_matches = normalized_title == normalized_query;
-                let year_matches = year.as_ref()
-                    .map(|y| r.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false))
+                let year_matches = year
+                    .as_ref()
+                    .map(|y| {
+                        r.release_date
+                            .as_ref()
+                            .map(|rd| rd.starts_with(y))
+                            .unwrap_or(false)
+                    })
                     .unwrap_or(false);
                 title_matches && year_matches
             })
@@ -103,12 +137,20 @@ fn select_best_match(
     is_show_guess: bool,
 ) -> Option<(String, Option<String>, String, &'static str, MediaType)> {
     let is_exact = |r: &TmdbSearchResult| -> bool {
-        normalize_title(&r.title) == normalized_query ||
-        r.original_title.as_ref().map(|t| normalize_title(t) == normalized_query).unwrap_or(false)
+        normalize_title(&r.title) == normalized_query
+            || r.original_title
+                .as_ref()
+                .map(|t| normalize_title(t) == normalized_query)
+                .unwrap_or(false)
     };
     let has_year_match = |r: &TmdbSearchResult| -> bool {
         year.as_ref()
-            .map(|y| r.release_date.as_ref().map(|rd| rd.starts_with(y)).unwrap_or(false))
+            .map(|y| {
+                r.release_date
+                    .as_ref()
+                    .map(|rd| rd.starts_with(y))
+                    .unwrap_or(false)
+            })
             .unwrap_or(false)
     };
 
@@ -142,10 +184,28 @@ fn select_best_match(
             } else {
                 (movie, MediaType::Movie)
             };
-            Some((selected.title.clone(), selected.release_date.clone(), selected.id.to_string(), "tmdb", media_type))
+            Some((
+                selected.title.clone(),
+                selected.release_date.clone(),
+                selected.id.to_string(),
+                "tmdb",
+                media_type,
+            ))
         }
-        (Some(tv), None) => Some((tv.title.clone(), tv.release_date.clone(), tv.id.to_string(), "tmdb", MediaType::Show)),
-        (None, Some(movie)) => Some((movie.title.clone(), movie.release_date.clone(), movie.id.to_string(), "tmdb", MediaType::Movie)),
+        (Some(tv), None) => Some((
+            tv.title.clone(),
+            tv.release_date.clone(),
+            tv.id.to_string(),
+            "tmdb",
+            MediaType::Show,
+        )),
+        (None, Some(movie)) => Some((
+            movie.title.clone(),
+            movie.release_date.clone(),
+            movie.id.to_string(),
+            "tmdb",
+            MediaType::Movie,
+        )),
         (None, None) => None,
     }
 }
@@ -159,9 +219,19 @@ fn score_result(result: &TmdbSearchResult, normalized_query: &str, year: &Option
     let normalized_title = normalize_title(&result.title);
     let normalized_original = result.original_title.as_ref().map(|t| normalize_title(t));
 
-    if normalized_title == normalized_query || normalized_original.as_ref().map(|t| t == normalized_query).unwrap_or(false) {
+    if normalized_title == normalized_query
+        || normalized_original
+            .as_ref()
+            .map(|t| t == normalized_query)
+            .unwrap_or(false)
+    {
         score += 1000.0; // Exact title match
-    } else if normalized_title.contains(normalized_query) || normalized_original.as_ref().map(|t| t.contains(normalized_query)).unwrap_or(false) {
+    } else if normalized_title.contains(normalized_query)
+        || normalized_original
+            .as_ref()
+            .map(|t| t.contains(normalized_query))
+            .unwrap_or(false)
+    {
         score += 100.0; // Partial title match
     }
 
@@ -214,7 +284,11 @@ fn score_result(result: &TmdbSearchResult, normalized_query: &str, year: &Option
     score
 }
 
-pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &TmdbClient) -> Option<MediaMetadata> {
+pub async fn identify_name(
+    name: &str,
+    files: &[rd_client::TorrentFile],
+    tmdb: &TmdbClient,
+) -> Option<MediaMetadata> {
     let (cleaned_name, year) = clean_name(name);
     if cleaned_name.is_empty() || is_generic_title(&cleaned_name) {
         return None;
@@ -233,7 +307,10 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
     if tv_results.is_empty() && movie_results.is_empty() {
         let split_name = CAMEL_RE.replace_all(&cleaned_name, "$1 $2").to_string();
         if split_name != cleaned_name {
-            debug!("No results for '{}', trying CamelCase split: '{}'", cleaned_name, split_name);
+            debug!(
+                "No results for '{}', trying CamelCase split: '{}'",
+                cleaned_name, split_name
+            );
             let (tv_extra, movie_extra) = tokio::join!(
                 tmdb.search_tv(&split_name, year.as_deref()),
                 tmdb.search_movie(&split_name, year.as_deref())
@@ -248,8 +325,13 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
         let words: Vec<&str> = cleaned_name.split_whitespace().collect();
         for start in 1..words.len() {
             let stripped = words[start..].join(" ");
-            if stripped.is_empty() || is_generic_title(&stripped) { continue; }
-            debug!("No results for '{}', trying stripped: '{}'", cleaned_name, stripped);
+            if stripped.is_empty() || is_generic_title(&stripped) {
+                continue;
+            }
+            debug!(
+                "No results for '{}', trying stripped: '{}'",
+                cleaned_name, stripped
+            );
             let (tv_extra, movie_extra) = tokio::join!(
                 tmdb.search_tv(&stripped, year.as_deref()),
                 tmdb.search_movie(&stripped, year.as_deref())
@@ -268,7 +350,10 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
         if let Some(pos) = cleaned_name.find('-') {
             let after_dash = cleaned_name[pos + 1..].trim();
             if !after_dash.is_empty() && !is_generic_title(after_dash) {
-                debug!("No results for '{}', trying after dash: '{}'", cleaned_name, after_dash);
+                debug!(
+                    "No results for '{}', trying after dash: '{}'",
+                    cleaned_name, after_dash
+                );
                 let (tv_extra, movie_extra) = tokio::join!(
                     tmdb.search_tv(after_dash, year.as_deref()),
                     tmdb.search_movie(after_dash, year.as_deref())
@@ -282,8 +367,11 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
     // Helper to check if results contain exact title match
     let has_exact_match = |results: &[TmdbSearchResult]| -> bool {
         results.iter().any(|r| {
-            normalize_title(&r.title) == normalized_cleaned ||
-            r.original_title.as_ref().map(|t| normalize_title(t) == normalized_cleaned).unwrap_or(false)
+            normalize_title(&r.title) == normalized_cleaned
+                || r.original_title
+                    .as_ref()
+                    .map(|t| normalize_title(t) == normalized_cleaned)
+                    .unwrap_or(false)
         })
     };
 
@@ -307,11 +395,21 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
     let best_tv = best_scored_result(&tv_results, &normalized_cleaned, &year, is_short_title);
     let best_movie = best_scored_result(&movie_results, &normalized_cleaned, &year, is_short_title);
 
-    let selected = select_best_match(best_tv, best_movie, &normalized_cleaned, &year, is_show_guess);
+    let selected = select_best_match(
+        best_tv,
+        best_movie,
+        &normalized_cleaned,
+        &year,
+        is_show_guess,
+    );
 
     if let Some((title, release_date, id, source, mtype)) = selected {
-        let year_val = release_date.map(|d| d.chars().filter(|c| c.is_ascii_digit()).take(4).collect());
-        info!("Identified {} ({:?}) as {:?} via TMDB (ID: {})", title, year_val, mtype, id);
+        let year_val =
+            release_date.map(|d| d.chars().filter(|c| c.is_ascii_digit()).take(4).collect());
+        info!(
+            "Identified {} ({:?}) as {:?} via TMDB (ID: {})",
+            title, year_val, mtype, id
+        );
         return Some(MediaMetadata {
             title,
             year: year_val,
@@ -330,7 +428,9 @@ pub async fn identify_name(name: &str, files: &[rd_client::TorrentFile], tmdb: &
 fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
     debug_assert!(needle.is_ascii(), "needle must be ASCII");
     let needle_len = needle.len();
-    if haystack.len() < needle_len { return None; }
+    if haystack.len() < needle_len {
+        return None;
+    }
     let needle_bytes: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
     // Walk byte-by-byte; since needle is all ASCII, a match means all bytes
     // in the range are ASCII too, so `i` and `i + needle_len` are both valid
@@ -349,7 +449,7 @@ fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
 
 pub fn clean_name(name: &str) -> (String, Option<String>) {
     let mut title = name.to_string();
-    
+
     // 0. Remove file extension if present
     if let Some(pos) = title.rfind('.') {
         let ext = &title[pos..].to_lowercase();
@@ -362,7 +462,9 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     // Patterns like "[ site ] ", "( site )", "site.com - ", "d3us-", "m-", "Bond.50."
     if let Some(m) = PREFIX_RE.find(&title) {
         // Only strip if it's followed by a separator (dot, space, dash) or it's a known prefix
-        title = title[m.end()..].trim_start_matches(|c: char| !c.is_alphanumeric()).to_string();
+        title = title[m.end()..]
+            .trim_start_matches(|c: char| !c.is_alphanumeric())
+            .to_string();
     }
 
     // 2. Initial cleanup: replace dots and underscores with spaces
@@ -388,8 +490,12 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
         if m.start() == 0 {
             // Metadata at start, strip it
             title = title[m.end()..].to_string();
-            title = title.trim_start_matches(|c: char| !c.is_alphanumeric()).to_string();
-            if title.is_empty() { break; }
+            title = title
+                .trim_start_matches(|c: char| !c.is_alphanumeric())
+                .to_string();
+            if title.is_empty() {
+                break;
+            }
         } else {
             // Metadata in middle/end, truncate
             title.truncate(m.start());
@@ -408,7 +514,9 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     }
 
     // 7. Final cleanup: remove trailing non-alphanumeric characters and trim
-    title = title.trim_end_matches(|c: char| !c.is_alphanumeric() && c != ')' && c != ']').to_string();
+    title = title
+        .trim_end_matches(|c: char| !c.is_alphanumeric() && c != ')' && c != ']')
+        .to_string();
 
     (title.trim().to_string(), year)
 }
@@ -417,8 +525,7 @@ pub fn is_show_guess(files: &[rd_client::TorrentFile]) -> bool {
     files.iter().any(|f| {
         let filename = f.path.split('/').next_back().unwrap_or(&f.path);
         SHOW_RE.is_match(filename)
-    }) ||
-    files.iter().filter(|f| is_video_file(&f.path)).count() > 1
+    }) || files.iter().filter(|f| is_video_file(&f.path)).count() > 1
 }
 
 pub fn normalize_title(s: &str) -> String {
@@ -441,7 +548,9 @@ pub fn normalize_title(s: &str) -> String {
 
 fn is_generic_title(s: &str) -> bool {
     let lower = s.to_lowercase();
-    if lower.is_empty() { return true; }
+    if lower.is_empty() {
+        return true;
+    }
 
     // Check if it's just a sequence of 5 or more digits (like BDMV 00000.m2ts)
     // or if it's a very small number like 0, 1, 2
@@ -467,7 +576,7 @@ fn is_generic_title(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rd_client::{TorrentInfo, TorrentFile};
+    use crate::rd_client::{TorrentFile, TorrentInfo};
 
     #[tokio::test]
     #[ignore]
@@ -488,20 +597,18 @@ mod tests {
             progress: 100.0,
             status: "downloaded".to_string(),
             added: "2023-01-01".to_string(),
-            files: vec![
-                TorrentFile {
-                    id: 1,
-                    path: "BDMV/STREAM/00000.m2ts".to_string(),
-                    bytes: 25000000000,
-                    selected: 1,
-                }
-            ],
+            files: vec![TorrentFile {
+                id: 1,
+                path: "BDMV/STREAM/00000.m2ts".to_string(),
+                bytes: 25000000000,
+                selected: 1,
+            }],
             links: vec!["http://link1".to_string()],
             ended: Some("2023-01-01".to_string()),
         };
 
         let metadata = identify_torrent(&info, &tmdb_client).await;
-        
+
         // It should NOT be identified as "00000" [id=tmdb:886864]
         assert_ne!(metadata.external_id, Some("tmdb:886864".to_string()));
         assert_eq!(metadata.title, "Inception");
@@ -526,14 +633,12 @@ mod tests {
             progress: 100.0,
             status: "downloaded".to_string(),
             added: "2023-01-01".to_string(),
-            files: vec![
-                TorrentFile {
-                    id: 1,
-                    path: "2012.mkv".to_string(),
-                    bytes: 1000000000,
-                    selected: 1,
-                }
-            ],
+            files: vec![TorrentFile {
+                id: 1,
+                path: "2012.mkv".to_string(),
+                bytes: 1000000000,
+                selected: 1,
+            }],
             links: vec!["http://link1".to_string()],
             ended: Some("2023-01-01".to_string()),
         };
@@ -561,20 +666,18 @@ mod tests {
             progress: 100.0,
             status: "downloaded".to_string(),
             added: "2023-01-01".to_string(),
-            files: vec![
-                TorrentFile {
-                    id: 1,
-                    path: "1x05 Episode 5.mkv".to_string(),
-                    bytes: 2000000000,
-                    selected: 1,
-                }
-            ],
+            files: vec![TorrentFile {
+                id: 1,
+                path: "1x05 Episode 5.mkv".to_string(),
+                bytes: 2000000000,
+                selected: 1,
+            }],
             links: vec!["http://link1".to_string()],
             ended: Some("2023-01-01".to_string()),
         };
 
         let metadata = identify_torrent(&info, &tmdb_client).await;
-        
+
         assert_eq!(metadata.media_type, MediaType::Show);
         assert_eq!(metadata.title, "Peaky Blinders");
         assert_eq!(metadata.external_id, Some("tmdb:60574".to_string()));
@@ -591,7 +694,7 @@ mod tests {
         assert!(is_generic_title("Vol 3"));
         assert!(is_generic_title("Episode"));
         assert!(is_generic_title("Part A"));
-        
+
         assert!(!is_generic_title("Inception"));
         assert!(!is_generic_title("2012")); // 4 digits, but not < 10
         assert!(!is_generic_title("The Episode"));
@@ -610,7 +713,10 @@ mod tests {
     fn find_case_insensitive_unicode_safe() {
         // Multi-byte UTF-8 characters before the pattern must not cause a panic.
         // 'Ü' is 2 bytes in UTF-8, so "Üntersuchung" is 13 bytes, not 12.
-        assert_eq!(find_case_insensitive("Üntersuchung aka Study", " aka "), Some(13));
+        assert_eq!(
+            find_case_insensitive("Üntersuchung aka Study", " aka "),
+            Some(13)
+        );
         // Multi-byte char right before " aka " - the 'ü' is 2 bytes,
         // so "Tü" is 3 bytes and the space before "aka" is at byte offset 3.
         assert_eq!(find_case_insensitive("Tü aka X", " aka "), Some(3));
@@ -645,20 +751,18 @@ mod tests {
             progress: 100.0,
             status: "downloaded".to_string(),
             added: "2023-01-01".to_string(),
-            files: vec![
-                TorrentFile {
-                    id: 1,
-                    path: "UC.S01E01.mkv".to_string(),
-                    bytes: 1000000000,
-                    selected: 1,
-                }
-            ],
+            files: vec![TorrentFile {
+                id: 1,
+                path: "UC.S01E01.mkv".to_string(),
+                bytes: 1000000000,
+                selected: 1,
+            }],
             links: vec!["http://link1".to_string()],
             ended: Some("2023-01-01".to_string()),
         };
 
         let metadata = identify_torrent(&info, &tmdb_client).await;
-        
+
         // It should NOT be identified as Gundam Unicorn (45500) because "UC" is too short for a broad match fallback
         assert_ne!(metadata.external_id, Some("tmdb:45500".to_string()));
         // It should fallback to cleaned name "UC"
@@ -685,14 +789,12 @@ mod tests {
             progress: 100.0,
             status: "downloaded".to_string(),
             added: "2024-01-01".to_string(),
-            files: vec![
-                TorrentFile {
-                    id: 1,
-                    path: "Flow.2024.1080p.BluRay.x264.mkv".to_string(),
-                    bytes: 5000000000,
-                    selected: 1,
-                }
-            ],
+            files: vec![TorrentFile {
+                id: 1,
+                path: "Flow.2024.1080p.BluRay.x264.mkv".to_string(),
+                bytes: 5000000000,
+                selected: 1,
+            }],
             links: vec!["http://link1".to_string()],
             ended: Some("2024-01-01".to_string()),
         };
@@ -725,14 +827,12 @@ mod tests {
             progress: 100.0,
             status: "downloaded".to_string(),
             added: "2025-01-01".to_string(),
-            files: vec![
-                TorrentFile {
-                    id: 1,
-                    path: "Sherwood.S02E01.1080p.WEB.H264-DiMEPiECE.mkv".to_string(),
-                    bytes: 2000000000,
-                    selected: 1,
-                },
-            ],
+            files: vec![TorrentFile {
+                id: 1,
+                path: "Sherwood.S02E01.1080p.WEB.H264-DiMEPiECE.mkv".to_string(),
+                bytes: 2000000000,
+                selected: 1,
+            }],
             links: vec!["http://link1".to_string()],
             ended: Some("2025-01-01".to_string()),
         };
@@ -762,14 +862,12 @@ mod tests {
             progress: 100.0,
             status: "downloaded".to_string(),
             added: "2000-01-01".to_string(),
-            files: vec![
-                TorrentFile {
-                    id: 1,
-                    path: "Dune.2000.S01E01.1080p.BluRay.x264-PFa.mkv".to_string(),
-                    bytes: 3000000000,
-                    selected: 1,
-                }
-            ],
+            files: vec![TorrentFile {
+                id: 1,
+                path: "Dune.2000.S01E01.1080p.BluRay.x264-PFa.mkv".to_string(),
+                bytes: 3000000000,
+                selected: 1,
+            }],
             links: vec!["http://link1".to_string()],
             ended: Some("2000-01-01".to_string()),
         };
@@ -844,14 +942,12 @@ mod tests {
             progress: 100.0,
             status: "downloaded".to_string(),
             added: "1964-01-01".to_string(),
-            files: vec![
-                TorrentFile {
-                    id: 1,
-                    path: "Bond.50.Goldfinger.1964.1080p.BluRay.x264.mkv".to_string(),
-                    bytes: 5000000000,
-                    selected: 1,
-                }
-            ],
+            files: vec![TorrentFile {
+                id: 1,
+                path: "Bond.50.Goldfinger.1964.1080p.BluRay.x264.mkv".to_string(),
+                bytes: 5000000000,
+                selected: 1,
+            }],
             links: vec!["http://link1".to_string()],
             ended: Some("1964-01-01".to_string()),
         };
@@ -866,7 +962,14 @@ mod tests {
 
     // --- Helper for best_scored_result / select_best_match tests ---
 
-    fn make_result(id: u32, title: &str, release_date: Option<&str>, popularity: f64, vote_avg: Option<f64>, vote_count: Option<u32>) -> TmdbSearchResult {
+    fn make_result(
+        id: u32,
+        title: &str,
+        release_date: Option<&str>,
+        popularity: f64,
+        vote_avg: Option<f64>,
+        vote_count: Option<u32>,
+    ) -> TmdbSearchResult {
         TmdbSearchResult {
             id,
             title: title.to_string(),
@@ -889,8 +992,20 @@ mod tests {
 
     #[test]
     fn best_scored_result_single_result() {
-        let results = vec![make_result(1, "Inception", Some("2010-07-16"), 80.0, Some(8.4), Some(30000))];
-        let got = best_scored_result(&results, &normalize_title("Inception"), &Some("2010".to_string()), false);
+        let results = vec![make_result(
+            1,
+            "Inception",
+            Some("2010-07-16"),
+            80.0,
+            Some(8.4),
+            Some(30000),
+        )];
+        let got = best_scored_result(
+            &results,
+            &normalize_title("Inception"),
+            &Some("2010".to_string()),
+            false,
+        );
         assert_eq!(got.unwrap().id, 1);
     }
 
@@ -898,7 +1013,14 @@ mod tests {
     fn best_scored_result_exact_title_wins() {
         // "Flow" exact match with low popularity should beat a partial/non-match with higher popularity
         let results = vec![
-            make_result(1, "Overflow", Some("2020-01-01"), 200.0, Some(7.0), Some(500)),
+            make_result(
+                1,
+                "Overflow",
+                Some("2020-01-01"),
+                200.0,
+                Some(7.0),
+                Some(500),
+            ),
             make_result(2, "Flow", Some("2024-01-01"), 10.0, Some(7.5), Some(100)),
         ];
         let nq = normalize_title("Flow");
@@ -935,7 +1057,14 @@ mod tests {
     fn best_scored_result_short_title_no_match_returns_none() {
         // Short title "UC" with no exact+year match should return None
         let results = vec![
-            make_result(1, "Gundam Unicorn", Some("2010-02-20"), 50.0, Some(7.0), Some(200)),
+            make_result(
+                1,
+                "Gundam Unicorn",
+                Some("2010-02-20"),
+                50.0,
+                Some(7.0),
+                Some(200),
+            ),
             make_result(2, "UC Browser", None, 10.0, None, None),
         ];
         let nq = normalize_title("UC");
@@ -965,8 +1094,21 @@ mod tests {
 
     #[test]
     fn select_best_match_only_tv() {
-        let tv = make_result(100, "Breaking Bad", Some("2008-01-20"), 200.0, Some(8.9), Some(10000));
-        let got = select_best_match(Some(&tv), None, &normalize_title("Breaking Bad"), &None, true);
+        let tv = make_result(
+            100,
+            "Breaking Bad",
+            Some("2008-01-20"),
+            200.0,
+            Some(8.9),
+            Some(10000),
+        );
+        let got = select_best_match(
+            Some(&tv),
+            None,
+            &normalize_title("Breaking Bad"),
+            &None,
+            true,
+        );
         let (title, _date, id, _source, media_type) = got.unwrap();
         assert_eq!(title, "Breaking Bad");
         assert_eq!(id, "100");
@@ -975,8 +1117,21 @@ mod tests {
 
     #[test]
     fn select_best_match_only_movie() {
-        let movie = make_result(200, "Inception", Some("2010-07-16"), 100.0, Some(8.4), Some(30000));
-        let got = select_best_match(None, Some(&movie), &normalize_title("Inception"), &None, false);
+        let movie = make_result(
+            200,
+            "Inception",
+            Some("2010-07-16"),
+            100.0,
+            Some(8.4),
+            Some(30000),
+        );
+        let got = select_best_match(
+            None,
+            Some(&movie),
+            &normalize_title("Inception"),
+            &None,
+            false,
+        );
         let (title, _date, id, _source, media_type) = got.unwrap();
         assert_eq!(title, "Inception");
         assert_eq!(id, "200");
@@ -1012,8 +1167,22 @@ mod tests {
     #[test]
     fn select_best_match_show_guess_prefers_tv() {
         // Both have exact title, no year info — is_show_guess=true should prefer TV
-        let tv = make_result(10, "Sherwood", Some("2022-06-13"), 40.0, Some(7.0), Some(300));
-        let movie = make_result(20, "Sherwood", Some("2019-11-22"), 20.0, Some(6.5), Some(100));
+        let tv = make_result(
+            10,
+            "Sherwood",
+            Some("2022-06-13"),
+            40.0,
+            Some(7.0),
+            Some(300),
+        );
+        let movie = make_result(
+            20,
+            "Sherwood",
+            Some("2019-11-22"),
+            20.0,
+            Some(6.5),
+            Some(100),
+        );
         let nq = normalize_title("Sherwood");
         let got = select_best_match(Some(&tv), Some(&movie), &nq, &None, true);
         let (_title, _date, id, _source, media_type) = got.unwrap();
@@ -1024,8 +1193,22 @@ mod tests {
     #[test]
     fn select_best_match_no_show_guess_prefers_movie() {
         // Both have exact title, no year info — is_show_guess=false should prefer movie
-        let tv = make_result(10, "Sherwood", Some("2022-06-13"), 40.0, Some(7.0), Some(300));
-        let movie = make_result(20, "Sherwood", Some("2019-11-22"), 20.0, Some(6.5), Some(100));
+        let tv = make_result(
+            10,
+            "Sherwood",
+            Some("2022-06-13"),
+            40.0,
+            Some(7.0),
+            Some(300),
+        );
+        let movie = make_result(
+            20,
+            "Sherwood",
+            Some("2019-11-22"),
+            20.0,
+            Some(6.5),
+            Some(100),
+        );
         let nq = normalize_title("Sherwood");
         let got = select_best_match(Some(&tv), Some(&movie), &nq, &None, false);
         let (_title, _date, id, _source, media_type) = got.unwrap();

@@ -27,14 +27,23 @@ RUN mkdir -p /app/.cargo && \
 
 WORKDIR /app
 
-# Copy dependency manifests and source code
+# Cache dependency build: copy manifests, create dummy source, build deps only
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+RUN mkdir src && \
+    echo 'fn main() {}' > src/main.rs && \
+    echo '' > src/mapper.rs && \
+    TARGET=$(cat /target_triple) && \
+    cargo build --release --target $TARGET && \
+    rm -rf src
 
-# Build the application statically for the determined target
+# Copy real source and build the application
+COPY src ./src
 RUN TARGET=$(cat /target_triple) && \
     cargo build --release --target $TARGET && \
     cp target/$TARGET/release/debridmoviemapper .
+
+# Create empty data directory owned by nobody for the scratch stage
+RUN mkdir -p /empty-data && chown 65534:65534 /empty-data
 
 # Stage 2: Final runtime image (minimal 'scratch' image)
 FROM scratch
@@ -46,7 +55,13 @@ COPY --from=builder /app/debridmoviemapper /debridmoviemapper
 # Expose the WebDAV port (default 8080)
 EXPOSE 8080
 
-USER 65534:65534
+# Create /data owned by nobody (65534) for the redb database.
+# On scratch there is no mkdir/chown, so we COPY an empty dir from the builder.
+COPY --from=builder --chown=65534:65534 /empty-data /data
 WORKDIR /data
+USER 65534:65534
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/debridmoviemapper", "--healthcheck"]
 
 ENTRYPOINT ["/debridmoviemapper"]

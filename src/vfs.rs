@@ -1,17 +1,15 @@
-use std::collections::{BTreeMap, HashMap};
-use std::sync::LazyLock;
-use std::time::{SystemTime, Duration, UNIX_EPOCH};
-use serde::{Deserialize, Serialize};
 use crate::rd_client::TorrentInfo;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::LazyLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     ".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
 ];
 
-const ARCHIVE_EXTENSIONS: &[&str] = &[
-    ".rar", ".zip", ".7z", ".tar", ".gz", ".bz2",
-];
+const ARCHIVE_EXTENSIONS: &[&str] = &[".rar", ".zip", ".7z", ".tar", ".gz", ".bz2"];
 
 /// RAR split-volume patterns: .r00, .r01, ..., .r99, .s00, etc.
 /// Expects a pre-lowercased input string.
@@ -21,7 +19,8 @@ fn is_archive_part(path: &str) -> bool {
     // panics from slicing at non-UTF-8 boundaries.
     let char_count = path.chars().count();
     if char_count >= 4 {
-        let byte_offset = path.char_indices()
+        let byte_offset = path
+            .char_indices()
             .nth(char_count - 4)
             .map(|(i, _)| i)
             .unwrap_or(0);
@@ -43,9 +42,12 @@ fn is_archive_file(path: &str) -> bool {
 /// Falls back to UNIX_EPOCH on parse failure.
 pub fn parse_rd_date(s: &str) -> SystemTime {
     fn days_from_ymd(y: u64, m: u64, d: u64) -> Option<u64> {
-        let is_leap = |yr: i64| yr.rem_euclid(4) == 0 && (yr.rem_euclid(100) != 0 || yr.rem_euclid(400) == 0);
+        let is_leap =
+            |yr: i64| yr.rem_euclid(4) == 0 && (yr.rem_euclid(100) != 0 || yr.rem_euclid(400) == 0);
         let days_before_month: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-        if !(1..=12).contains(&m) || !(1..=31).contains(&d) { return None; }
+        if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+            return None;
+        }
 
         let y = y as i64;
         // Count leap years from year 1 to year (yr - 1) using closed-form formula
@@ -53,11 +55,14 @@ pub fn parse_rd_date(s: &str) -> SystemTime {
             let yr = yr - 1;
             yr / 4 - yr / 100 + yr / 400
         };
-        let total = (y - 1970) * 365 + (leap_years_before(y) - leap_years_before(1970))
+        let total = (y - 1970) * 365
+            + (leap_years_before(y) - leap_years_before(1970))
             + days_before_month[(m - 1) as usize]
             + if m as i64 > 2 && is_leap(y) { 1 } else { 0 }
             + (d as i64 - 1);
-        if total < 0 { return None; }
+        if total < 0 {
+            return None;
+        }
         Some(total as u64)
     }
 
@@ -77,7 +82,9 @@ pub fn parse_rd_date(s: &str) -> SystemTime {
             let min: u64 = time_parts.next()?.parse().ok()?;
             let sec_str = time_parts.next().unwrap_or("0");
             let sec: u64 = sec_str.split('.').next()?.parse().ok()?;
-            if h >= 24 || min >= 60 || sec >= 60 { return None; }
+            if h >= 24 || min >= 60 || sec >= 60 {
+                return None;
+            }
             secs += h * 3600 + min * 60 + sec;
         }
 
@@ -87,9 +94,8 @@ pub fn parse_rd_date(s: &str) -> SystemTime {
     parse().unwrap_or(UNIX_EPOCH)
 }
 
-static SEASON_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)s(\d+)|season\s*(\d+)|(\d+)x\d+|part\s*(\d+)").unwrap()
-});
+static SEASON_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)s(\d+)|season\s*(\d+)|(\d+)x\d+|part\s*(\d+)").unwrap());
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum VfsNode {
@@ -99,8 +105,8 @@ pub enum VfsNode {
     /// Media file proxied from Real-Debrid CDN.
     /// WebDAV serves the actual media bytes (not a .strm URL).
     MediaFile {
-        file_size: u64,       // actual media file size from TorrentFile::bytes
-        rd_link: String,      // restricted RD link for on-demand unrestricting
+        file_size: u64,  // actual media file size from TorrentFile::bytes
+        rd_link: String, // restricted RD link for on-demand unrestricting
         rd_torrent_id: String,
     },
     VirtualFile {
@@ -149,17 +155,21 @@ impl Default for DebridVfs {
 impl DebridVfs {
     pub fn new() -> Self {
         let mut children = BTreeMap::new();
-        children.insert("Movies".to_string(), VfsNode::Directory {
-            children: BTreeMap::new(),
-        });
-        children.insert("Shows".to_string(), VfsNode::Directory {
-            children: BTreeMap::new(),
-        });
+        children.insert(
+            "Movies".to_string(),
+            VfsNode::Directory {
+                children: BTreeMap::new(),
+            },
+        );
+        children.insert(
+            "Shows".to_string(),
+            VfsNode::Directory {
+                children: BTreeMap::new(),
+            },
+        );
 
         Self {
-            root: VfsNode::Directory {
-                children,
-            },
+            root: VfsNode::Directory { children },
             timestamps: HashMap::new(),
         }
     }
@@ -178,7 +188,8 @@ impl DebridVfs {
         // Sort groups to ensure deterministic naming for conflicts
         let mut sorted_metadata: Vec<_> = media_groups.keys().cloned().collect();
         sorted_metadata.sort_by(|a, b| {
-            a.title.cmp(&b.title)
+            a.title
+                .cmp(&b.title)
                 .then_with(|| a.year.cmp(&b.year))
                 .then_with(|| a.external_id.cmp(&b.external_id))
         });
@@ -192,7 +203,7 @@ impl DebridVfs {
             torrents.sort_by_key(|t| std::cmp::Reverse(t.bytes));
 
             let base_name = sanitize_filename(&metadata.title);
-            
+
             let (used_names, nodes) = match metadata.media_type {
                 MediaType::Movie => (&mut used_movie_names, &mut movies_nodes),
                 MediaType::Show => (&mut used_show_names, &mut shows_nodes),
@@ -217,9 +228,15 @@ impl DebridVfs {
 
             // Warn about archive-only torrents that can't be streamed
             for torrent in &torrents {
-                let has_video = torrent.files.iter().any(|f| f.selected == 1 && is_video_file(&f.path));
+                let has_video = torrent
+                    .files
+                    .iter()
+                    .any(|f| f.selected == 1 && is_video_file(&f.path));
                 if !has_video {
-                    let has_archive = torrent.files.iter().any(|f| f.selected == 1 && is_archive_file(&f.path));
+                    let has_archive = torrent
+                        .files
+                        .iter()
+                        .any(|f| f.selected == 1 && is_archive_file(&f.path));
                     if has_archive {
                         tracing::warn!(
                             "Torrent '{}' contains only archive files (RAR/ZIP) and cannot be streamed — \
@@ -243,13 +260,14 @@ impl DebridVfs {
                                 timestamps.insert(format!("{}/{}", prefix, name), torrent_ts);
                             }
                             let nfo_content = Self::generate_nfo(&metadata);
-                            children.insert("movie.nfo".to_string(), VfsNode::VirtualFile {
-                                content: nfo_content,
-                            });
+                            children.insert(
+                                "movie.nfo".to_string(),
+                                VfsNode::VirtualFile {
+                                    content: nfo_content,
+                                },
+                            );
                             timestamps.insert(format!("{}/movie.nfo", prefix), torrent_ts);
-                            nodes.insert(folder_name, VfsNode::Directory {
-                                children,
-                            });
+                            nodes.insert(folder_name, VfsNode::Directory { children });
                         }
                     }
                 }
@@ -264,12 +282,17 @@ impl DebridVfs {
                     // directory, skip it to avoid creating (1)/(2) duplicates from repair replacements.
                     for torrent in torrents {
                         let torrent_ts = parse_rd_date(&torrent.added);
-                        if torrent_ts > show_max_ts { show_max_ts = torrent_ts; }
-                        let selected_count = torrent.files.iter().filter(|f| f.selected == 1).count();
+                        if torrent_ts > show_max_ts {
+                            show_max_ts = torrent_ts;
+                        }
+                        let selected_count =
+                            torrent.files.iter().filter(|f| f.selected == 1).count();
                         if selected_count != torrent.links.len() {
                             tracing::warn!(
                                 "Torrent '{}': selected file count ({}) != link count ({})",
-                                torrent.filename, selected_count, torrent.links.len()
+                                torrent.filename,
+                                selected_count,
+                                torrent.links.len()
                             );
                         }
                         let mut link_idx = 0;
@@ -277,27 +300,49 @@ impl DebridVfs {
                             if file.selected == 1 {
                                 if is_video_file(&file.path) {
                                     if let Some(link) = torrent.links.get(link_idx) {
-                                        let filename = file.path.split('/').next_back().unwrap_or(&file.path);
-                                        let season = SEASON_RE.captures(filename)
+                                        let filename =
+                                            file.path.split('/').next_back().unwrap_or(&file.path);
+                                        let season = SEASON_RE
+                                            .captures(filename)
                                             .and_then(|cap| {
-                                                cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)).or_else(|| cap.get(4))
+                                                cap.get(1)
+                                                    .or_else(|| cap.get(2))
+                                                    .or_else(|| cap.get(3))
+                                                    .or_else(|| cap.get(4))
                                             })
                                             .and_then(|m| m.as_str().parse::<u32>().ok())
                                             .unwrap_or(1);
 
                                         let season_name = format!("Season {:02}", season);
-                                        let season_dir = show_children.entry(season_name.clone()).or_insert_with(|| VfsNode::Directory {
-                                            children: BTreeMap::new(),
-                                        });
+                                        let season_dir = show_children
+                                            .entry(season_name.clone())
+                                            .or_insert_with(|| VfsNode::Directory {
+                                                children: BTreeMap::new(),
+                                            });
 
-                                        if let VfsNode::Directory { children: season_children } = season_dir {
+                                        if let VfsNode::Directory {
+                                            children: season_children,
+                                        } = season_dir
+                                        {
                                             // Skip if this episode already exists (from a larger/earlier torrent)
                                             if season_children.contains_key(filename) {
                                                 link_idx += 1;
                                                 continue;
                                             }
-                                            let strm_name = Self::add_path_to_tree(season_children, filename, file.bytes, torrent.id.clone(), link.clone());
-                                            timestamps.insert(format!("{}/{}/{}", show_prefix, season_name, strm_name), torrent_ts);
+                                            let strm_name = Self::add_path_to_tree(
+                                                season_children,
+                                                filename,
+                                                file.bytes,
+                                                torrent.id.clone(),
+                                                link.clone(),
+                                            );
+                                            timestamps.insert(
+                                                format!(
+                                                    "{}/{}/{}",
+                                                    show_prefix, season_name, strm_name
+                                                ),
+                                                torrent_ts,
+                                            );
                                         }
                                     }
                                 }
@@ -307,26 +352,40 @@ impl DebridVfs {
                     }
                     if !show_children.is_empty() {
                         let nfo_content = Self::generate_nfo(&metadata);
-                        show_children.insert("tvshow.nfo".to_string(), VfsNode::VirtualFile {
-                            content: nfo_content,
-                        });
+                        show_children.insert(
+                            "tvshow.nfo".to_string(),
+                            VfsNode::VirtualFile {
+                                content: nfo_content,
+                            },
+                        );
                         timestamps.insert(format!("{}/tvshow.nfo", show_prefix), show_max_ts);
-                        nodes.insert(folder_name, VfsNode::Directory {
-                            children: show_children,
-                        });
+                        nodes.insert(
+                            folder_name,
+                            VfsNode::Directory {
+                                children: show_children,
+                            },
+                        );
                     }
                 }
             }
         }
 
         let mut root_children = BTreeMap::new();
-        root_children.insert("Movies".to_string(), VfsNode::Directory {
-            children: movies_nodes,
-        });
-        root_children.insert("Shows".to_string(), VfsNode::Directory {
-            children: shows_nodes,
-        });
-        let root = VfsNode::Directory { children: root_children };
+        root_children.insert(
+            "Movies".to_string(),
+            VfsNode::Directory {
+                children: movies_nodes,
+            },
+        );
+        root_children.insert(
+            "Shows".to_string(),
+            VfsNode::Directory {
+                children: shows_nodes,
+            },
+        );
+        let root = VfsNode::Directory {
+            children: root_children,
+        };
 
         // Compute directory timestamps bottom-up (max of children)
         Self::compute_dir_timestamps(&root, "", &mut timestamps);
@@ -335,7 +394,11 @@ impl DebridVfs {
     }
 
     /// Walk the tree and insert directory timestamps as the max of their children.
-    fn compute_dir_timestamps(node: &VfsNode, prefix: &str, timestamps: &mut HashMap<String, SystemTime>) -> SystemTime {
+    fn compute_dir_timestamps(
+        node: &VfsNode,
+        prefix: &str,
+        timestamps: &mut HashMap<String, SystemTime>,
+    ) -> SystemTime {
         match node {
             VfsNode::Directory { children } => {
                 let mut max_ts = UNIX_EPOCH;
@@ -346,9 +409,13 @@ impl DebridVfs {
                         format!("{}/{}", prefix, name)
                     };
                     let child_ts = Self::compute_dir_timestamps(child, &child_path, timestamps);
-                    if child_ts > max_ts { max_ts = child_ts; }
+                    if child_ts > max_ts {
+                        max_ts = child_ts;
+                    }
                 }
-                if !prefix.is_empty() && max_ts > UNIX_EPOCH {
+                if !prefix.is_empty() {
+                    // Always insert a timestamp for directories, even empty ones.
+                    // Empty directories (e.g. "Movies" when only shows exist) get UNIX_EPOCH.
                     timestamps.insert(prefix.to_string(), max_ts);
                 }
                 max_ts
@@ -366,32 +433,52 @@ impl DebridVfs {
             MediaType::Show => "tvshow",
         };
 
-        let mut nfo = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" ?>\n<{}>\n", tag);
+        let mut nfo = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" ?>\n<{}>\n",
+            tag
+        );
 
         // Title
-        nfo.push_str(&format!("  <title>{}</title>\n", xml_escape(&metadata.title)));
+        nfo.push_str(&format!(
+            "  <title>{}</title>\n",
+            xml_escape(&metadata.title)
+        ));
 
         // Original title (same as title for now)
-        nfo.push_str(&format!("  <originaltitle>{}</originaltitle>\n", xml_escape(&metadata.title)));
+        nfo.push_str(&format!(
+            "  <originaltitle>{}</originaltitle>\n",
+            xml_escape(&metadata.title)
+        ));
 
         // Year
         if let Some(year) = &metadata.year {
             nfo.push_str(&format!("  <year>{}</year>\n", xml_escape(year)));
             // Add full date for better compatibility
-            nfo.push_str(&format!("  <premiered>{}-01-01</premiered>\n", xml_escape(year)));
+            nfo.push_str(&format!(
+                "  <premiered>{}-01-01</premiered>\n",
+                xml_escape(year)
+            ));
         }
 
         // External IDs
         if let Some(external_id) = &metadata.external_id {
             if let Some((source, id)) = external_id.split_once(':') {
-                nfo.push_str(&format!("  <uniqueid type=\"{}\" default=\"true\">{}</uniqueid>\n", xml_escape(source), xml_escape(id)));
+                nfo.push_str(&format!(
+                    "  <uniqueid type=\"{}\" default=\"true\">{}</uniqueid>\n",
+                    xml_escape(source),
+                    xml_escape(id)
+                ));
                 if source == "tmdb" {
                     let path = match metadata.media_type {
                         MediaType::Movie => "movie",
                         MediaType::Show => "tv",
                     };
                     nfo.push_str(&format!("  <tmdbid>{}</tmdbid>\n", xml_escape(id)));
-                    nfo.push_str(&format!("  <url>https://www.themoviedb.org/{}/{}</url>\n", xml_escape(path), xml_escape(id)));
+                    nfo.push_str(&format!(
+                        "  <url>https://www.themoviedb.org/{}/{}</url>\n",
+                        xml_escape(path),
+                        xml_escape(id)
+                    ));
                 }
             }
         }
@@ -409,12 +496,18 @@ impl DebridVfs {
         nfo.into_bytes()
     }
 
-    fn add_torrent_files(destination: &mut BTreeMap<String, VfsNode>, torrent: &TorrentInfo, path_prefix: Option<&str>) {
+    fn add_torrent_files(
+        destination: &mut BTreeMap<String, VfsNode>,
+        torrent: &TorrentInfo,
+        path_prefix: Option<&str>,
+    ) {
         let selected_count = torrent.files.iter().filter(|f| f.selected == 1).count();
         if selected_count != torrent.links.len() {
             tracing::warn!(
                 "Torrent '{}': selected file count ({}) != link count ({})",
-                torrent.filename, selected_count, torrent.links.len()
+                torrent.filename,
+                selected_count,
+                torrent.links.len()
             );
         }
         let mut link_idx = 0;
@@ -428,7 +521,13 @@ impl DebridVfs {
                         } else {
                             filename.to_string()
                         };
-                        Self::add_path_to_tree(destination, &path, file.bytes, torrent.id.clone(), link.clone());
+                        Self::add_path_to_tree(
+                            destination,
+                            &path,
+                            file.bytes,
+                            torrent.id.clone(),
+                            link.clone(),
+                        );
                     }
                 }
                 link_idx += 1;
@@ -437,7 +536,13 @@ impl DebridVfs {
     }
 
     /// Insert a video file into the tree as a MediaFile node. Returns the final filename.
-    fn add_path_to_tree(root: &mut BTreeMap<String, VfsNode>, path: &str, size: u64, torrent_id: String, link: String) -> String {
+    fn add_path_to_tree(
+        root: &mut BTreeMap<String, VfsNode>,
+        path: &str,
+        size: u64,
+        torrent_id: String,
+        link: String,
+    ) -> String {
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         let mut current_children = root;
 
@@ -459,16 +564,21 @@ impl DebridVfs {
                 }
 
                 let ret = final_name.clone();
-                current_children.insert(final_name, VfsNode::MediaFile {
-                    file_size: size,
-                    rd_link: link.clone(),
-                    rd_torrent_id: torrent_id.clone(),
-                });
+                current_children.insert(
+                    final_name,
+                    VfsNode::MediaFile {
+                        file_size: size,
+                        rd_link: link.clone(),
+                        rd_torrent_id: torrent_id.clone(),
+                    },
+                );
                 return ret;
             } else {
-                let entry = current_children.entry(part).or_insert_with(|| VfsNode::Directory {
-                    children: BTreeMap::new(),
-                });
+                let entry = current_children
+                    .entry(part)
+                    .or_insert_with(|| VfsNode::Directory {
+                        children: BTreeMap::new(),
+                    });
                 if let VfsNode::Directory { children } = entry {
                     current_children = children;
                 } else {
@@ -487,7 +597,10 @@ fn sanitize_filename(name: &str) -> String {
     for c in name.chars() {
         match c {
             '/' | '\\' => replaced.push('-'),
-            ':' => { replaced.push(' '); replaced.push('-'); }
+            ':' => {
+                replaced.push(' ');
+                replaced.push('-');
+            }
             _ => replaced.push(c),
         }
     }
@@ -497,14 +610,19 @@ fn sanitize_filename(name: &str) -> String {
 /// Regex matching filenames that should be excluded from the VFS.
 /// Uses word boundaries (`\b`) to avoid false positives on substrings
 /// (e.g. "extraordinary.mkv" should NOT be filtered out by "extra").
-static EXCLUDED_VIDEO_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(sample|trailer|extras?|bonus|featurette)\b").unwrap()
-});
+static EXCLUDED_VIDEO_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(sample|trailer|extras?|bonus|featurette)\b").unwrap());
 
 /// Directory names that indicate extras/bonus content. Checked case-insensitively.
 const EXCLUDED_DIRS: &[&str] = &[
-    "extras", "bonus", "featurettes", "behind the scenes",
-    "deleted scenes", "interviews", "trailers", "samples",
+    "extras",
+    "bonus",
+    "featurettes",
+    "behind the scenes",
+    "deleted scenes",
+    "interviews",
+    "trailers",
+    "samples",
 ];
 
 pub fn is_video_file(path: &str) -> bool {
@@ -673,7 +791,7 @@ fn find_deepest_new_dir(path: &str, children: &BTreeMap<String, VfsNode>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rd_client::{TorrentInfo, TorrentFile};
+    use crate::rd_client::{TorrentFile, TorrentInfo};
 
     #[test]
     fn broken_link_placeholder_not_present() {
@@ -718,7 +836,7 @@ mod tests {
                     year: Some("2023".to_string()),
                     media_type: MediaType::Movie,
                     external_id: None,
-                }
+                },
             ),
             (
                 TorrentInfo {
@@ -747,7 +865,7 @@ mod tests {
                     year: Some("2023".to_string()),
                     media_type: MediaType::Show,
                     external_id: None,
-                }
+                },
             ),
         ];
 
@@ -757,18 +875,30 @@ mod tests {
             let movies = children.get("Movies").expect("Movies directory missing");
             let shows = children.get("Shows").expect("Shows directory missing");
 
-            if let VfsNode::Directory { children: movie_children } = movies {
-                assert!(movie_children.contains_key("Movie"), "Movie folder not found");
+            if let VfsNode::Directory {
+                children: movie_children,
+            } = movies
+            {
+                assert!(
+                    movie_children.contains_key("Movie"),
+                    "Movie folder not found"
+                );
                 let movie_dir = movie_children.get("Movie").unwrap();
                 if let VfsNode::Directory { children: files } = movie_dir {
-                    assert!(files.contains_key("Movie.2023.1080p.mkv"), "Movie media file not found");
+                    assert!(
+                        files.contains_key("Movie.2023.1080p.mkv"),
+                        "Movie media file not found"
+                    );
                     assert!(files.contains_key("movie.nfo"), "movie.nfo not found");
                 }
             } else {
                 panic!("Movies should be a directory");
             }
 
-            if let VfsNode::Directory { children: show_children } = shows {
+            if let VfsNode::Directory {
+                children: show_children,
+            } = shows
+            {
                 assert!(show_children.contains_key("Show"), "Show folder not found");
                 let show_dir = show_children.get("Show").unwrap();
                 if let VfsNode::Directory { children: seasons } = show_dir {
@@ -832,7 +962,7 @@ mod tests {
                     year: Some("2023".to_string()),
                     media_type: MediaType::Movie,
                     external_id: Some("tmdb:1".to_string()),
-                }
+                },
             ),
             (
                 TorrentInfo {
@@ -861,7 +991,7 @@ mod tests {
                     year: Some("2024".to_string()),
                     media_type: MediaType::Movie,
                     external_id: Some("tmdb:2".to_string()),
-                }
+                },
             ),
         ];
 
@@ -869,7 +999,10 @@ mod tests {
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory { children: movie_children } = movies {
+            if let VfsNode::Directory {
+                children: movie_children,
+            } = movies
+            {
                 assert!(movie_children.contains_key("Same Title [tmdbid-1]"));
                 assert!(movie_children.contains_key("Same Title [tmdbid-2]"));
             }
@@ -885,10 +1018,19 @@ mod tests {
             external_id: Some("tmdb:123".to_string()),
         };
         let content = String::from_utf8(DebridVfs::generate_nfo(&metadata)).unwrap();
-        assert!(content.contains("<title>Test &amp; &lt;Movie&gt;</title>"), "Title should be XML-escaped");
-        assert!(content.contains("<originaltitle>Test &amp; &lt;Movie&gt;</originaltitle>"), "Original title should be XML-escaped");
+        assert!(
+            content.contains("<title>Test &amp; &lt;Movie&gt;</title>"),
+            "Title should be XML-escaped"
+        );
+        assert!(
+            content.contains("<originaltitle>Test &amp; &lt;Movie&gt;</originaltitle>"),
+            "Original title should be XML-escaped"
+        );
         // Year and IDs should also be escaped (even if unlikely to contain special chars)
-        assert!(!content.contains("&<"), "No unescaped special characters should appear");
+        assert!(
+            !content.contains("&<"),
+            "No unescaped special characters should appear"
+        );
     }
 
     #[test]
@@ -914,11 +1056,16 @@ mod tests {
                     progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2023-01-01".to_string(),
-                    files: vec![TorrentFile { id: 1, path: "/Movie.mkv".to_string(), bytes: 1000, selected: 1 }],
+                    files: vec![TorrentFile {
+                        id: 1,
+                        path: "/Movie.mkv".to_string(),
+                        bytes: 1000,
+                        selected: 1,
+                    }],
                     links: vec!["http://small".to_string()],
                     ended: Some("2023".to_string()),
                 },
-                metadata.clone()
+                metadata.clone(),
             ),
             (
                 TorrentInfo {
@@ -933,11 +1080,16 @@ mod tests {
                     progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2023-01-01".to_string(),
-                    files: vec![TorrentFile { id: 1, path: "/Movie.mkv".to_string(), bytes: 5000, selected: 1 }],
+                    files: vec![TorrentFile {
+                        id: 1,
+                        path: "/Movie.mkv".to_string(),
+                        bytes: 5000,
+                        selected: 1,
+                    }],
                     links: vec!["http://large".to_string()],
                     ended: Some("2023".to_string()),
                 },
-                metadata
+                metadata,
             ),
         ];
 
@@ -945,12 +1097,20 @@ mod tests {
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory { children: movie_children } = movies {
-                let folder = movie_children.get("Duplicate Movie [tmdbid-123]").expect("Folder missing");
+            if let VfsNode::Directory {
+                children: movie_children,
+            } = movies
+            {
+                let folder = movie_children
+                    .get("Duplicate Movie [tmdbid-123]")
+                    .expect("Folder missing");
                 if let VfsNode::Directory { children: files } = folder {
                     let file = files.get("Movie.mkv").expect("Media file missing");
                     if let VfsNode::MediaFile { rd_torrent_id, .. } = file {
-                        assert_eq!(rd_torrent_id, "large", "Should have picked the large torrent");
+                        assert_eq!(
+                            rd_torrent_id, "large",
+                            "Should have picked the large torrent"
+                        );
                     } else {
                         panic!("Should be a MediaFile");
                     }
@@ -1083,7 +1243,12 @@ mod tests {
                 progress: 100.0,
                 status: "downloaded".to_string(),
                 added: "2023-01-01".to_string(),
-                files: vec![TorrentFile { id: 1, path: "/Alex.October.mkv".to_string(), bytes: 1000, selected: 1 }],
+                files: vec![TorrentFile {
+                    id: 1,
+                    path: "/Alex.October.mkv".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                }],
                 links: vec!["http://link1".to_string()],
                 ended: Some("2023-01-01".to_string()),
             },
@@ -1098,7 +1263,10 @@ mod tests {
         let vfs = DebridVfs::build(torrents);
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory { children: movie_children } = movies {
+            if let VfsNode::Directory {
+                children: movie_children,
+            } = movies
+            {
                 assert!(
                     movie_children.contains_key("Alex-October [tmdbid-856721]"),
                     "Expected sanitized folder name, got: {:?}",
@@ -1176,9 +1344,18 @@ mod tests {
         let show_ts = parse_rd_date("2024-03-10T08:00:00.000Z");
 
         // Leaf files get the torrent's added timestamp
-        assert_eq!(vfs.timestamps.get("Movies/Movie/Movie.2023.1080p.mkv"), Some(&movie_ts));
-        assert_eq!(vfs.timestamps.get("Movies/Movie/movie.nfo"), Some(&movie_ts));
-        assert_eq!(vfs.timestamps.get("Shows/Show/Season 01/Show.S01E01.mkv"), Some(&show_ts));
+        assert_eq!(
+            vfs.timestamps.get("Movies/Movie/Movie.2023.1080p.mkv"),
+            Some(&movie_ts)
+        );
+        assert_eq!(
+            vfs.timestamps.get("Movies/Movie/movie.nfo"),
+            Some(&movie_ts)
+        );
+        assert_eq!(
+            vfs.timestamps.get("Shows/Show/Season 01/Show.S01E01.mkv"),
+            Some(&show_ts)
+        );
         assert_eq!(vfs.timestamps.get("Shows/Show/tvshow.nfo"), Some(&show_ts));
 
         // Directories get the max timestamp of their children
@@ -1217,10 +1394,23 @@ mod tests {
                     status: "downloaded".to_string(),
                     added: "2023-01-01".to_string(),
                     files: vec![
-                        TorrentFile { id: 1, path: "/Mr.Mercedes.S03E01.mkv".to_string(), bytes: 2500, selected: 1 },
-                        TorrentFile { id: 2, path: "/Mr.Mercedes.S03E02.mkv".to_string(), bytes: 2500, selected: 1 },
+                        TorrentFile {
+                            id: 1,
+                            path: "/Mr.Mercedes.S03E01.mkv".to_string(),
+                            bytes: 2500,
+                            selected: 1,
+                        },
+                        TorrentFile {
+                            id: 2,
+                            path: "/Mr.Mercedes.S03E02.mkv".to_string(),
+                            bytes: 2500,
+                            selected: 1,
+                        },
                     ],
-                    links: vec!["http://old_link1".to_string(), "http://old_link2".to_string()],
+                    links: vec![
+                        "http://old_link1".to_string(),
+                        "http://old_link2".to_string(),
+                    ],
                     ended: Some("2023".to_string()),
                 },
                 metadata.clone(),
@@ -1239,10 +1429,23 @@ mod tests {
                     status: "downloaded".to_string(),
                     added: "2023-01-02".to_string(),
                     files: vec![
-                        TorrentFile { id: 1, path: "/Mr.Mercedes.S03E01.mkv".to_string(), bytes: 2500, selected: 1 },
-                        TorrentFile { id: 2, path: "/Mr.Mercedes.S03E02.mkv".to_string(), bytes: 2500, selected: 1 },
+                        TorrentFile {
+                            id: 1,
+                            path: "/Mr.Mercedes.S03E01.mkv".to_string(),
+                            bytes: 2500,
+                            selected: 1,
+                        },
+                        TorrentFile {
+                            id: 2,
+                            path: "/Mr.Mercedes.S03E02.mkv".to_string(),
+                            bytes: 2500,
+                            selected: 1,
+                        },
                     ],
-                    links: vec!["http://new_link1".to_string(), "http://new_link2".to_string()],
+                    links: vec![
+                        "http://new_link1".to_string(),
+                        "http://new_link2".to_string(),
+                    ],
                     ended: Some("2023".to_string()),
                 },
                 metadata,
@@ -1253,75 +1456,106 @@ mod tests {
 
         if let VfsNode::Directory { children } = &vfs.root {
             let shows = children.get("Shows").unwrap();
-            if let VfsNode::Directory { children: show_children } = shows {
-                let show_folder = show_children.get("Mr. Mercedes [tmdbid-70485]").expect("Show folder missing");
-                if let VfsNode::Directory { children: show_dirs } = show_folder {
+            if let VfsNode::Directory {
+                children: show_children,
+            } = shows
+            {
+                let show_folder = show_children
+                    .get("Mr. Mercedes [tmdbid-70485]")
+                    .expect("Show folder missing");
+                if let VfsNode::Directory {
+                    children: show_dirs,
+                } = show_folder
+                {
                     let season = show_dirs.get("Season 03").expect("Season 03 missing");
                     if let VfsNode::Directory { children: episodes } = season {
                         // Should have exactly 2 episodes, no (1)/(2) duplicates
                         assert_eq!(
-                            episodes.len(), 2,
+                            episodes.len(),
+                            2,
                             "Expected 2 episodes but got {}: {:?}",
-                            episodes.len(), episodes.keys().collect::<Vec<_>>()
+                            episodes.len(),
+                            episodes.keys().collect::<Vec<_>>()
                         );
                         assert!(episodes.contains_key("Mr.Mercedes.S03E01.mkv"));
                         assert!(episodes.contains_key("Mr.Mercedes.S03E02.mkv"));
-                    } else { panic!("Season 03 should be a directory"); }
-                } else { panic!("Show folder should be a directory"); }
-            } else { panic!("Shows should be a directory"); }
-        } else { panic!("Root should be a directory"); }
+                    } else {
+                        panic!("Season 03 should be a directory");
+                    }
+                } else {
+                    panic!("Show folder should be a directory");
+                }
+            } else {
+                panic!("Shows should be a directory");
+            }
+        } else {
+            panic!("Root should be a directory");
+        }
     }
 
     #[test]
     fn diff_trees_identical_trees_no_changes() {
         let old = VfsNode::Directory {
-            children: BTreeMap::from([
-                ("Movies".to_string(), VfsNode::Directory {
-                    children: BTreeMap::from([
-                        ("Inception".to_string(), VfsNode::Directory {
-                            children: BTreeMap::from([
-                                ("Inception.mkv".to_string(), VfsNode::MediaFile {
+            children: BTreeMap::from([(
+                "Movies".to_string(),
+                VfsNode::Directory {
+                    children: BTreeMap::from([(
+                        "Inception".to_string(),
+                        VfsNode::Directory {
+                            children: BTreeMap::from([(
+                                "Inception.mkv".to_string(),
+                                VfsNode::MediaFile {
                                     file_size: 1000,
                                     rd_link: "http://link1".to_string(),
                                     rd_torrent_id: "t1".to_string(),
-                                }),
-                            ]),
-                        }),
-                    ]),
-                }),
-            ]),
+                                },
+                            )]),
+                        },
+                    )]),
+                },
+            )]),
         };
         let changes = diff_trees(&old, &old, "");
-        assert!(changes.is_empty(), "Identical trees should produce no changes");
+        assert!(
+            changes.is_empty(),
+            "Identical trees should produce no changes"
+        );
     }
 
     #[test]
     fn diff_trees_new_directory_created() {
         let old = VfsNode::Directory {
-            children: BTreeMap::from([
-                ("Shows".to_string(), VfsNode::Directory { children: BTreeMap::new() }),
-            ]),
+            children: BTreeMap::from([(
+                "Shows".to_string(),
+                VfsNode::Directory {
+                    children: BTreeMap::new(),
+                },
+            )]),
         };
         let new = VfsNode::Directory {
-            children: BTreeMap::from([
-                ("Shows".to_string(), VfsNode::Directory {
-                    children: BTreeMap::from([
-                        ("Breaking Bad".to_string(), VfsNode::Directory {
-                            children: BTreeMap::from([
-                                ("Season 01".to_string(), VfsNode::Directory {
-                                    children: BTreeMap::from([
-                                        ("S01E01.mkv".to_string(), VfsNode::MediaFile {
+            children: BTreeMap::from([(
+                "Shows".to_string(),
+                VfsNode::Directory {
+                    children: BTreeMap::from([(
+                        "Breaking Bad".to_string(),
+                        VfsNode::Directory {
+                            children: BTreeMap::from([(
+                                "Season 01".to_string(),
+                                VfsNode::Directory {
+                                    children: BTreeMap::from([(
+                                        "S01E01.mkv".to_string(),
+                                        VfsNode::MediaFile {
                                             file_size: 1000,
                                             rd_link: "http://link".to_string(),
                                             rd_torrent_id: "t1".to_string(),
-                                        }),
-                                    ]),
-                                }),
-                            ]),
-                        }),
-                    ]),
-                }),
-            ]),
+                                        },
+                                    )]),
+                                },
+                            )]),
+                        },
+                    )]),
+                },
+            )]),
         };
         let changes = diff_trees(&old, &new, "");
         assert_eq!(changes.len(), 1);
@@ -1332,26 +1566,32 @@ mod tests {
     #[test]
     fn diff_trees_directory_deleted() {
         let old = VfsNode::Directory {
-            children: BTreeMap::from([
-                ("Movies".to_string(), VfsNode::Directory {
-                    children: BTreeMap::from([
-                        ("Inception".to_string(), VfsNode::Directory {
-                            children: BTreeMap::from([
-                                ("Inception.mkv".to_string(), VfsNode::MediaFile {
+            children: BTreeMap::from([(
+                "Movies".to_string(),
+                VfsNode::Directory {
+                    children: BTreeMap::from([(
+                        "Inception".to_string(),
+                        VfsNode::Directory {
+                            children: BTreeMap::from([(
+                                "Inception.mkv".to_string(),
+                                VfsNode::MediaFile {
                                     file_size: 1000,
                                     rd_link: "http://link".to_string(),
                                     rd_torrent_id: "t1".to_string(),
-                                }),
-                            ]),
-                        }),
-                    ]),
-                }),
-            ]),
+                                },
+                            )]),
+                        },
+                    )]),
+                },
+            )]),
         };
         let new = VfsNode::Directory {
-            children: BTreeMap::from([
-                ("Movies".to_string(), VfsNode::Directory { children: BTreeMap::new() }),
-            ]),
+            children: BTreeMap::from([(
+                "Movies".to_string(),
+                VfsNode::Directory {
+                    children: BTreeMap::new(),
+                },
+            )]),
         };
         let changes = diff_trees(&old, &new, "");
         assert_eq!(changes.len(), 1);
@@ -1362,38 +1602,44 @@ mod tests {
     #[test]
     fn diff_trees_file_modified() {
         let old = VfsNode::Directory {
-            children: BTreeMap::from([
-                ("Movies".to_string(), VfsNode::Directory {
-                    children: BTreeMap::from([
-                        ("Inception".to_string(), VfsNode::Directory {
-                            children: BTreeMap::from([
-                                ("Inception.mkv".to_string(), VfsNode::MediaFile {
+            children: BTreeMap::from([(
+                "Movies".to_string(),
+                VfsNode::Directory {
+                    children: BTreeMap::from([(
+                        "Inception".to_string(),
+                        VfsNode::Directory {
+                            children: BTreeMap::from([(
+                                "Inception.mkv".to_string(),
+                                VfsNode::MediaFile {
                                     file_size: 1000,
                                     rd_link: "http://old-link".to_string(),
                                     rd_torrent_id: "t1".to_string(),
-                                }),
-                            ]),
-                        }),
-                    ]),
-                }),
-            ]),
+                                },
+                            )]),
+                        },
+                    )]),
+                },
+            )]),
         };
         let new = VfsNode::Directory {
-            children: BTreeMap::from([
-                ("Movies".to_string(), VfsNode::Directory {
-                    children: BTreeMap::from([
-                        ("Inception".to_string(), VfsNode::Directory {
-                            children: BTreeMap::from([
-                                ("Inception.mkv".to_string(), VfsNode::MediaFile {
+            children: BTreeMap::from([(
+                "Movies".to_string(),
+                VfsNode::Directory {
+                    children: BTreeMap::from([(
+                        "Inception".to_string(),
+                        VfsNode::Directory {
+                            children: BTreeMap::from([(
+                                "Inception.mkv".to_string(),
+                                VfsNode::MediaFile {
                                     file_size: 1000,
                                     rd_link: "http://new-link".to_string(),
                                     rd_torrent_id: "t2".to_string(),
-                                }),
-                            ]),
-                        }),
-                    ]),
-                }),
-            ]),
+                                },
+                            )]),
+                        },
+                    )]),
+                },
+            )]),
         };
         let changes = diff_trees(&old, &new, "");
         assert_eq!(changes.len(), 1);
@@ -1404,51 +1650,64 @@ mod tests {
     #[test]
     fn diff_trees_new_episode_in_existing_show() {
         let old = VfsNode::Directory {
-            children: BTreeMap::from([
-                ("Shows".to_string(), VfsNode::Directory {
-                    children: BTreeMap::from([
-                        ("Breaking Bad".to_string(), VfsNode::Directory {
-                            children: BTreeMap::from([
-                                ("Season 01".to_string(), VfsNode::Directory {
-                                    children: BTreeMap::from([
-                                        ("S01E01.mkv".to_string(), VfsNode::MediaFile {
+            children: BTreeMap::from([(
+                "Shows".to_string(),
+                VfsNode::Directory {
+                    children: BTreeMap::from([(
+                        "Breaking Bad".to_string(),
+                        VfsNode::Directory {
+                            children: BTreeMap::from([(
+                                "Season 01".to_string(),
+                                VfsNode::Directory {
+                                    children: BTreeMap::from([(
+                                        "S01E01.mkv".to_string(),
+                                        VfsNode::MediaFile {
                                             file_size: 1000,
                                             rd_link: "http://link1".to_string(),
                                             rd_torrent_id: "t1".to_string(),
-                                        }),
-                                    ]),
-                                }),
-                            ]),
-                        }),
-                    ]),
-                }),
-            ]),
+                                        },
+                                    )]),
+                                },
+                            )]),
+                        },
+                    )]),
+                },
+            )]),
         };
         let new = VfsNode::Directory {
-            children: BTreeMap::from([
-                ("Shows".to_string(), VfsNode::Directory {
-                    children: BTreeMap::from([
-                        ("Breaking Bad".to_string(), VfsNode::Directory {
-                            children: BTreeMap::from([
-                                ("Season 01".to_string(), VfsNode::Directory {
+            children: BTreeMap::from([(
+                "Shows".to_string(),
+                VfsNode::Directory {
+                    children: BTreeMap::from([(
+                        "Breaking Bad".to_string(),
+                        VfsNode::Directory {
+                            children: BTreeMap::from([(
+                                "Season 01".to_string(),
+                                VfsNode::Directory {
                                     children: BTreeMap::from([
-                                        ("S01E01.mkv".to_string(), VfsNode::MediaFile {
-                                            file_size: 1000,
-                                            rd_link: "http://link1".to_string(),
-                                            rd_torrent_id: "t1".to_string(),
-                                        }),
-                                        ("S01E02.mkv".to_string(), VfsNode::MediaFile {
-                                            file_size: 1000,
-                                            rd_link: "http://link2".to_string(),
-                                            rd_torrent_id: "t2".to_string(),
-                                        }),
+                                        (
+                                            "S01E01.mkv".to_string(),
+                                            VfsNode::MediaFile {
+                                                file_size: 1000,
+                                                rd_link: "http://link1".to_string(),
+                                                rd_torrent_id: "t1".to_string(),
+                                            },
+                                        ),
+                                        (
+                                            "S01E02.mkv".to_string(),
+                                            VfsNode::MediaFile {
+                                                file_size: 1000,
+                                                rd_link: "http://link2".to_string(),
+                                                rd_torrent_id: "t2".to_string(),
+                                            },
+                                        ),
                                     ]),
-                                }),
-                            ]),
-                        }),
-                    ]),
-                }),
-            ]),
+                                },
+                            )]),
+                        },
+                    )]),
+                },
+            )]),
         };
         let changes = diff_trees(&old, &new, "");
         assert_eq!(changes.len(), 1);
@@ -1498,54 +1757,75 @@ mod tests {
     fn diff_trees_multiple_changes() {
         let old = VfsNode::Directory {
             children: BTreeMap::from([
-                ("Movies".to_string(), VfsNode::Directory {
-                    children: BTreeMap::from([
-                        ("Old Movie".to_string(), VfsNode::Directory {
-                            children: BTreeMap::from([
-                                ("old.mkv".to_string(), VfsNode::MediaFile {
-                                    file_size: 1000,
-                                    rd_link: "http://old".to_string(),
-                                    rd_torrent_id: "t1".to_string(),
-                                }),
-                            ]),
-                        }),
-                    ]),
-                }),
-                ("Shows".to_string(), VfsNode::Directory { children: BTreeMap::new() }),
+                (
+                    "Movies".to_string(),
+                    VfsNode::Directory {
+                        children: BTreeMap::from([(
+                            "Old Movie".to_string(),
+                            VfsNode::Directory {
+                                children: BTreeMap::from([(
+                                    "old.mkv".to_string(),
+                                    VfsNode::MediaFile {
+                                        file_size: 1000,
+                                        rd_link: "http://old".to_string(),
+                                        rd_torrent_id: "t1".to_string(),
+                                    },
+                                )]),
+                            },
+                        )]),
+                    },
+                ),
+                (
+                    "Shows".to_string(),
+                    VfsNode::Directory {
+                        children: BTreeMap::new(),
+                    },
+                ),
             ]),
         };
         let new = VfsNode::Directory {
             children: BTreeMap::from([
-                ("Movies".to_string(), VfsNode::Directory {
-                    children: BTreeMap::from([
-                        ("New Movie".to_string(), VfsNode::Directory {
-                            children: BTreeMap::from([
-                                ("new.mkv".to_string(), VfsNode::MediaFile {
-                                    file_size: 1000,
-                                    rd_link: "http://new".to_string(),
-                                    rd_torrent_id: "t2".to_string(),
-                                }),
-                            ]),
-                        }),
-                    ]),
-                }),
-                ("Shows".to_string(), VfsNode::Directory {
-                    children: BTreeMap::from([
-                        ("New Show".to_string(), VfsNode::Directory {
-                            children: BTreeMap::from([
-                                ("Season 01".to_string(), VfsNode::Directory {
-                                    children: BTreeMap::from([
-                                        ("S01E01.mkv".to_string(), VfsNode::MediaFile {
-                                            file_size: 1000,
-                                            rd_link: "http://ep".to_string(),
-                                            rd_torrent_id: "t3".to_string(),
-                                        }),
-                                    ]),
-                                }),
-                            ]),
-                        }),
-                    ]),
-                }),
+                (
+                    "Movies".to_string(),
+                    VfsNode::Directory {
+                        children: BTreeMap::from([(
+                            "New Movie".to_string(),
+                            VfsNode::Directory {
+                                children: BTreeMap::from([(
+                                    "new.mkv".to_string(),
+                                    VfsNode::MediaFile {
+                                        file_size: 1000,
+                                        rd_link: "http://new".to_string(),
+                                        rd_torrent_id: "t2".to_string(),
+                                    },
+                                )]),
+                            },
+                        )]),
+                    },
+                ),
+                (
+                    "Shows".to_string(),
+                    VfsNode::Directory {
+                        children: BTreeMap::from([(
+                            "New Show".to_string(),
+                            VfsNode::Directory {
+                                children: BTreeMap::from([(
+                                    "Season 01".to_string(),
+                                    VfsNode::Directory {
+                                        children: BTreeMap::from([(
+                                            "S01E01.mkv".to_string(),
+                                            VfsNode::MediaFile {
+                                                file_size: 1000,
+                                                rd_link: "http://ep".to_string(),
+                                                rd_torrent_id: "t3".to_string(),
+                                            },
+                                        )]),
+                                    },
+                                )]),
+                            },
+                        )]),
+                    },
+                ),
             ]),
         };
         let changes = diff_trees(&old, &new, "");
@@ -1578,11 +1858,26 @@ mod tests {
                 added: "2023-01-01".to_string(),
                 files: vec![
                     // Non-video file selected first -- takes link index 0
-                    TorrentFile { id: 1, path: "/subs.srt".to_string(), bytes: 100, selected: 1 },
+                    TorrentFile {
+                        id: 1,
+                        path: "/subs.srt".to_string(),
+                        bytes: 100,
+                        selected: 1,
+                    },
                     // Video file selected second -- should use link index 1
-                    TorrentFile { id: 2, path: "/Movie.mkv".to_string(), bytes: 2000, selected: 1 },
+                    TorrentFile {
+                        id: 2,
+                        path: "/Movie.mkv".to_string(),
+                        bytes: 2000,
+                        selected: 1,
+                    },
                     // Unselected file -- no link consumed
-                    TorrentFile { id: 3, path: "/extras.mkv".to_string(), bytes: 900, selected: 0 },
+                    TorrentFile {
+                        id: 3,
+                        path: "/extras.mkv".to_string(),
+                        bytes: 900,
+                        selected: 0,
+                    },
                 ],
                 links: vec![
                     "http://link_for_srt".to_string(),
@@ -1602,7 +1897,10 @@ mod tests {
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory { children: movie_children } = movies {
+            if let VfsNode::Directory {
+                children: movie_children,
+            } = movies
+            {
                 let folder = movie_children
                     .get("Link Index Test [tmdbid-999]")
                     .expect("Movie folder missing");
@@ -1642,11 +1940,26 @@ mod tests {
                 added: "2023-01-01".to_string(),
                 files: vec![
                     // Non-video selected file takes link index 0
-                    TorrentFile { id: 1, path: "/subs.srt".to_string(), bytes: 100, selected: 1 },
+                    TorrentFile {
+                        id: 1,
+                        path: "/subs.srt".to_string(),
+                        bytes: 100,
+                        selected: 1,
+                    },
                     // Video file should use link index 1
-                    TorrentFile { id: 2, path: "/Show.S01E01.mkv".to_string(), bytes: 1500, selected: 1 },
+                    TorrentFile {
+                        id: 2,
+                        path: "/Show.S01E01.mkv".to_string(),
+                        bytes: 1500,
+                        selected: 1,
+                    },
                     // Another video file should use link index 2
-                    TorrentFile { id: 3, path: "/Show.S01E02.mkv".to_string(), bytes: 1400, selected: 1 },
+                    TorrentFile {
+                        id: 3,
+                        path: "/Show.S01E02.mkv".to_string(),
+                        bytes: 1400,
+                        selected: 1,
+                    },
                 ],
                 links: vec![
                     "http://link_srt".to_string(),
@@ -1667,7 +1980,10 @@ mod tests {
 
         if let VfsNode::Directory { children } = &vfs.root {
             let shows = children.get("Shows").unwrap();
-            if let VfsNode::Directory { children: show_children } = shows {
+            if let VfsNode::Directory {
+                children: show_children,
+            } = shows
+            {
                 let show_folder = show_children
                     .get("Show Link Test [tmdbid-888]")
                     .expect("Show folder missing");
@@ -1678,12 +1994,16 @@ mod tests {
                         let ep2 = episodes.get("Show.S01E02.mkv").expect("Ep2 missing");
 
                         if let VfsNode::MediaFile { rd_link, .. } = ep1 {
-                            assert_eq!(rd_link, "http://link_ep1",
-                                "Episode 1 should use link index 1 (after non-video selected file)");
+                            assert_eq!(
+                                rd_link, "http://link_ep1",
+                                "Episode 1 should use link index 1 (after non-video selected file)"
+                            );
                         }
                         if let VfsNode::MediaFile { rd_link, .. } = ep2 {
-                            assert_eq!(rd_link, "http://link_ep2",
-                                "Episode 2 should use link index 2");
+                            assert_eq!(
+                                rd_link, "http://link_ep2",
+                                "Episode 2 should use link index 2"
+                            );
                         }
                     }
                 }
@@ -1708,8 +2028,18 @@ mod tests {
                 status: "downloaded".to_string(),
                 added: "2023-01-01".to_string(),
                 files: vec![
-                    TorrentFile { id: 1, path: "/Movie.mkv".to_string(), bytes: 2000, selected: 1 },
-                    TorrentFile { id: 2, path: "/Deleted.Scenes.mkv".to_string(), bytes: 1000, selected: 0 },
+                    TorrentFile {
+                        id: 1,
+                        path: "/Movie.mkv".to_string(),
+                        bytes: 2000,
+                        selected: 1,
+                    },
+                    TorrentFile {
+                        id: 2,
+                        path: "/Deleted.Scenes.mkv".to_string(),
+                        bytes: 1000,
+                        selected: 0,
+                    },
                 ],
                 links: vec!["http://link_movie".to_string()],
                 ended: Some("2023-01-01".to_string()),
@@ -1726,8 +2056,13 @@ mod tests {
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory { children: movie_children } = movies {
-                let folder = movie_children.get("Unselected Test").expect("Movie folder missing");
+            if let VfsNode::Directory {
+                children: movie_children,
+            } = movies
+            {
+                let folder = movie_children
+                    .get("Unselected Test")
+                    .expect("Movie folder missing");
                 if let VfsNode::Directory { children: files } = folder {
                     // Only Movie.mkv should be present (Deleted.Scenes.mkv is not selected
                     // and also would be filtered by is_video_file's "extras" check... but
@@ -1758,9 +2093,24 @@ mod tests {
                 status: "downloaded".to_string(),
                 added: "2023-01-01".to_string(),
                 files: vec![
-                    TorrentFile { id: 1, path: "/File1.mkv".to_string(), bytes: 1000, selected: 1 },
-                    TorrentFile { id: 2, path: "/File2.mkv".to_string(), bytes: 1000, selected: 1 },
-                    TorrentFile { id: 3, path: "/File3.mkv".to_string(), bytes: 1000, selected: 1 },
+                    TorrentFile {
+                        id: 1,
+                        path: "/File1.mkv".to_string(),
+                        bytes: 1000,
+                        selected: 1,
+                    },
+                    TorrentFile {
+                        id: 2,
+                        path: "/File2.mkv".to_string(),
+                        bytes: 1000,
+                        selected: 1,
+                    },
+                    TorrentFile {
+                        id: 3,
+                        path: "/File3.mkv".to_string(),
+                        bytes: 1000,
+                        selected: 1,
+                    },
                 ],
                 // Only 2 links for 3 selected files
                 links: vec!["http://link1".to_string(), "http://link2".to_string()],
@@ -1779,13 +2129,23 @@ mod tests {
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory { children: movie_children } = movies {
-                let folder = movie_children.get("Mismatch Test").expect("Movie folder missing");
+            if let VfsNode::Directory {
+                children: movie_children,
+            } = movies
+            {
+                let folder = movie_children
+                    .get("Mismatch Test")
+                    .expect("Movie folder missing");
                 if let VfsNode::Directory { children: files } = folder {
                     // Only File1 and File2 should be present (File3 has no link)
-                    let media_count = files.values().filter(|n| matches!(n, VfsNode::MediaFile { .. })).count();
-                    assert_eq!(media_count, 2,
-                        "Only files with links should be added to VFS");
+                    let media_count = files
+                        .values()
+                        .filter(|n| matches!(n, VfsNode::MediaFile { .. }))
+                        .count();
+                    assert_eq!(
+                        media_count, 2,
+                        "Only files with links should be added to VFS"
+                    );
                 }
             }
         }
@@ -1833,26 +2193,54 @@ mod tests {
     fn season_re_extracts_part_numbering() {
         // "Part 1" should be treated as season 1
         let cap = SEASON_RE.captures("Show.Part1.E01.mkv").unwrap();
-        let season = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)).or_else(|| cap.get(4))
-            .unwrap().as_str().parse::<u32>().unwrap();
+        let season = cap
+            .get(1)
+            .or_else(|| cap.get(2))
+            .or_else(|| cap.get(3))
+            .or_else(|| cap.get(4))
+            .unwrap()
+            .as_str()
+            .parse::<u32>()
+            .unwrap();
         assert_eq!(season, 1);
 
         // "Part 2" with space
         let cap = SEASON_RE.captures("Show.Part 2.E01.mkv").unwrap();
-        let season = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)).or_else(|| cap.get(4))
-            .unwrap().as_str().parse::<u32>().unwrap();
+        let season = cap
+            .get(1)
+            .or_else(|| cap.get(2))
+            .or_else(|| cap.get(3))
+            .or_else(|| cap.get(4))
+            .unwrap()
+            .as_str()
+            .parse::<u32>()
+            .unwrap();
         assert_eq!(season, 2);
 
         // "part 3" lowercase
         let cap = SEASON_RE.captures("show.part3.e01.mkv").unwrap();
-        let season = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)).or_else(|| cap.get(4))
-            .unwrap().as_str().parse::<u32>().unwrap();
+        let season = cap
+            .get(1)
+            .or_else(|| cap.get(2))
+            .or_else(|| cap.get(3))
+            .or_else(|| cap.get(4))
+            .unwrap()
+            .as_str()
+            .parse::<u32>()
+            .unwrap();
         assert_eq!(season, 3);
 
         // S01 still works (not broken by the addition)
         let cap = SEASON_RE.captures("Show.S05E01.mkv").unwrap();
-        let season = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)).or_else(|| cap.get(4))
-            .unwrap().as_str().parse::<u32>().unwrap();
+        let season = cap
+            .get(1)
+            .or_else(|| cap.get(2))
+            .or_else(|| cap.get(3))
+            .or_else(|| cap.get(4))
+            .unwrap()
+            .as_str()
+            .parse::<u32>()
+            .unwrap();
         assert_eq!(season, 5);
     }
 
@@ -1873,8 +2261,18 @@ mod tests {
                 status: "downloaded".to_string(),
                 added: "2023-01-01".to_string(),
                 files: vec![
-                    TorrentFile { id: 1, path: "/movie.rar".to_string(), bytes: 3000, selected: 1 },
-                    TorrentFile { id: 2, path: "/movie.r00".to_string(), bytes: 2000, selected: 1 },
+                    TorrentFile {
+                        id: 1,
+                        path: "/movie.rar".to_string(),
+                        bytes: 3000,
+                        selected: 1,
+                    },
+                    TorrentFile {
+                        id: 2,
+                        path: "/movie.r00".to_string(),
+                        bytes: 2000,
+                        selected: 1,
+                    },
                 ],
                 links: vec!["http://link1".to_string(), "http://link2".to_string()],
                 ended: Some("2023-01-01".to_string()),
@@ -1892,7 +2290,10 @@ mod tests {
         // Archive-only torrents should produce no folder (no video files = no entry)
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory { children: movie_children } = movies {
+            if let VfsNode::Directory {
+                children: movie_children,
+            } = movies
+            {
                 assert!(
                     !movie_children.contains_key("Archive Movie"),
                     "Archive-only torrent should not produce a folder in VFS"

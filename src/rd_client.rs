@@ -1,15 +1,15 @@
-use serde::{Deserialize, Serialize};
+use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-use tracing::{info, error, warn};
-use std::time::Duration;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
-use rand::Rng;
+use tracing::{error, info, warn};
 
-const MIN_INTERVAL_MS: u64 = 100;   // 10 req/s max (baseline)
-const MAX_INTERVAL_MS: u64 = 2000;  // 0.5 req/s min (under heavy throttling)
-const RECOVERY_MS: u64 = 10;        // Decrease interval by 10ms per success
+const MIN_INTERVAL_MS: u64 = 100; // 10 req/s max (baseline)
+const MAX_INTERVAL_MS: u64 = 2000; // 0.5 req/s min (under heavy throttling)
+const RECOVERY_MS: u64 = 10; // Decrease interval by 10ms per success
 const MAX_RETRY_AFTER_SECS: u64 = 300; // Cap Retry-After to 5 minutes
 
 const MAX_CACHE_SIZE: usize = 10_000;
@@ -63,7 +63,10 @@ impl AdaptiveRateLimiter {
     /// Record a successful request — gradually decrease interval toward baseline.
     async fn record_success(&self) {
         let mut state = self.state.lock().await;
-        state.interval_ms = state.interval_ms.saturating_sub(RECOVERY_MS).max(MIN_INTERVAL_MS);
+        state.interval_ms = state
+            .interval_ms
+            .saturating_sub(RECOVERY_MS)
+            .max(MIN_INTERVAL_MS);
     }
 
     /// Record a 429 throttle — double the interval and optionally respect Retry-After.
@@ -190,18 +193,24 @@ impl RealDebridClient {
     pub fn new(api_token: String) -> Result<Self, crate::error::AppError> {
         let mut headers = HeaderMap::new();
         let auth_val = format!("Bearer {}", api_token);
-        let mut auth_header = HeaderValue::from_str(&auth_val)
-            .map_err(|e| crate::error::AppError::Config(format!("Invalid API token for HTTP header: {}", e)))?;
+        let mut auth_header = HeaderValue::from_str(&auth_val).map_err(|e| {
+            crate::error::AppError::Config(format!("Invalid API token for HTTP header: {}", e))
+        })?;
         auth_header.set_sensitive(true);
         headers.insert(AUTHORIZATION, auth_header);
-        headers.insert(reqwest::header::ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
-            .user_agent("DebridMovieMapper/0.1.0")
+            .user_agent(format!("DebridMovieMapper/{}", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(60))
             .build()
-            .map_err(|e| crate::error::AppError::Config(format!("Failed to build HTTP client: {}", e)))?;
+            .map_err(|e| {
+                crate::error::AppError::Config(format!("Failed to build HTTP client: {}", e))
+            })?;
 
         Ok(Self {
             client,
@@ -255,12 +264,25 @@ impl RealDebridClient {
     }
 
     pub async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
+        const MAX_PAGES: u32 = 200; // Safety limit to prevent infinite loops
         let mut all_torrents = Vec::new();
-        let mut page = 1;
+        let mut page = 1u32;
         loop {
+            if page > MAX_PAGES {
+                warn!(
+                    "Reached maximum page limit ({}), stopping pagination with {} torrents",
+                    MAX_PAGES,
+                    all_torrents.len()
+                );
+                break;
+            }
             info!("Fetching torrents page {}...", page);
-            let url = format!("https://api.real-debrid.com/rest/1.0/torrents?page={}&limit=50", page);
-            let res: Result<Vec<Torrent>, reqwest::Error> = self.fetch_with_retry(|| self.client.get(&url), &[]).await;
+            let url = format!(
+                "https://api.real-debrid.com/rest/1.0/torrents?page={}&limit=50",
+                page
+            );
+            let res: Result<Vec<Torrent>, reqwest::Error> =
+                self.fetch_with_retry(|| self.client.get(&url), &[]).await;
 
             match res {
                 Ok(torrents) => {
@@ -285,7 +307,8 @@ impl RealDebridClient {
 
     pub async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
         let url = format!("https://api.real-debrid.com/rest/1.0/torrents/info/{}", id);
-        self.fetch_with_retry(|| self.client.get(&url), &[reqwest::StatusCode::NOT_FOUND]).await
+        self.fetch_with_retry(|| self.client.get(&url), &[reqwest::StatusCode::NOT_FOUND])
+            .await
     }
 
     /// Unrestrict a link, caching the result for 1 hour.
@@ -309,18 +332,23 @@ impl RealDebridClient {
         // Not in cache or expired, fetch from API
         // Special handling: 503 on unrestrict means broken torrent, no retries
         let url = "https://api.real-debrid.com/rest/1.0/unrestrict/link";
-        let response: UnrestrictResponse = self.fetch_with_retry(
-            || self.client.post(url).form(&[("link", link)]),
-            &[reqwest::StatusCode::SERVICE_UNAVAILABLE],
-        ).await?;
+        let response: UnrestrictResponse = self
+            .fetch_with_retry(
+                || self.client.post(url).form(&[("link", link)]),
+                &[reqwest::StatusCode::SERVICE_UNAVAILABLE],
+            )
+            .await?;
 
         // Store in cache
         {
             let mut cache = self.unrestrict_cache.write().await;
-            cache.insert(link.to_string(), CachedUnrestrictResponse {
-                response: response.clone(),
-                cached_at: std::time::Instant::now(),
-            });
+            cache.insert(
+                link.to_string(),
+                CachedUnrestrictResponse {
+                    response: response.clone(),
+                    cached_at: std::time::Instant::now(),
+                },
+            );
         }
 
         // Evict if cache is too large
@@ -338,31 +366,42 @@ impl RealDebridClient {
     /// Add a magnet link to Real-Debrid
     pub async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
         let url = "https://api.real-debrid.com/rest/1.0/torrents/addMagnet";
-        self.fetch_with_retry(|| {
-            self.client.post(url).form(&[("magnet", magnet)])
-        }, &[]).await
+        self.fetch_with_retry(|| self.client.post(url).form(&[("magnet", magnet)]), &[])
+            .await
     }
 
     /// Select files for a torrent
-    pub async fn select_files(&self, torrent_id: &str, file_ids: &str) -> Result<(), reqwest::Error> {
-        let url = format!("https://api.real-debrid.com/rest/1.0/torrents/selectFiles/{}", torrent_id);
+    pub async fn select_files(
+        &self,
+        torrent_id: &str,
+        file_ids: &str,
+    ) -> Result<(), reqwest::Error> {
+        let url = format!(
+            "https://api.real-debrid.com/rest/1.0/torrents/selectFiles/{}",
+            torrent_id
+        );
         // RD returns 204 No Content on success. We deserialize as
         // serde_json::Value which accepts the "[]" empty-body fallback
         // in fetch_with_retry.
-        let _: serde_json::Value = self.fetch_with_retry(|| {
-            self.client.post(&url).form(&[("files", file_ids)])
-        }, &[]).await?;
+        let _: serde_json::Value = self
+            .fetch_with_retry(|| self.client.post(&url).form(&[("files", file_ids)]), &[])
+            .await?;
         Ok(())
     }
 
     /// Delete a torrent from Real-Debrid
     /// Returns Ok(()) even if torrent doesn't exist (404), as the end state is the same
     pub async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error> {
-        let url = format!("https://api.real-debrid.com/rest/1.0/torrents/delete/{}", torrent_id);
-        let result: Result<serde_json::Value, _> = self.fetch_with_retry(
-            || self.client.delete(&url),
-            &[reqwest::StatusCode::NOT_FOUND],
-        ).await;
+        let url = format!(
+            "https://api.real-debrid.com/rest/1.0/torrents/delete/{}",
+            torrent_id
+        );
+        let result: Result<serde_json::Value, _> = self
+            .fetch_with_retry(
+                || self.client.delete(&url),
+                &[reqwest::StatusCode::NOT_FOUND],
+            )
+            .await;
         match result {
             Ok(_) => Ok(()),
             Err(e) if e.status() == Some(reqwest::StatusCode::NOT_FOUND) => Ok(()),
@@ -381,6 +420,7 @@ impl RealDebridClient {
     {
         let mut last_error: Option<reqwest::Error> = None;
         let max_attempts = 10;
+        let mut deserialization_failures = 0u32;
 
         for attempt in 1..=max_attempts {
             self.rate_limiter.wait_for_token().await;
@@ -390,17 +430,24 @@ impl RealDebridClient {
                     let status = resp.status();
 
                     if terminal_statuses.contains(&status) {
-                        warn!("RD API returned terminal status {} — not retrying (attempt {}/{})", status, attempt, max_attempts);
+                        warn!(
+                            "RD API returned terminal status {} — not retrying (attempt {}/{})",
+                            status, attempt, max_attempts
+                        );
                         return Err(resp.error_for_status().unwrap_err());
                     }
 
                     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        let retry_after = resp.headers()
+                        let retry_after = resp
+                            .headers()
                             .get(reqwest::header::RETRY_AFTER)
                             .and_then(|h| h.to_str().ok())
                             .and_then(|s| s.parse::<u64>().ok());
                         self.rate_limiter.record_throttle(retry_after).await;
-                        warn!("RD API returned 429 (attempt {}/{}). Adaptive limiter adjusted.", attempt, max_attempts);
+                        warn!(
+                            "RD API returned 429 (attempt {}/{}). Adaptive limiter adjusted.",
+                            attempt, max_attempts
+                        );
                         continue;
                     }
 
@@ -420,8 +467,10 @@ impl RealDebridClient {
                                     self.rate_limiter.record_success().await;
                                     return Ok(val);
                                 }
-                                warn!("RD API empty body or 204 (attempt {}/{}). Status: {}",
-                                    attempt, max_attempts, status);
+                                warn!(
+                                    "RD API empty body or 204 (attempt {}/{}). Status: {}",
+                                    attempt, max_attempts, status
+                                );
                                 continue;
                             }
                             match serde_json::from_str::<T>(&text) {
@@ -430,19 +479,32 @@ impl RealDebridClient {
                                     return Ok(val);
                                 }
                                 Err(e) => {
+                                    deserialization_failures += 1;
                                     error!("Failed to decode RD response: {}. Status: {}, Body: {:.200}",
                                         e, status, text);
+                                    // A schema change won't fix itself on retry — bail after 2 failures
+                                    // to avoid wasting API calls on a permanently changed response format.
+                                    if deserialization_failures >= 2 {
+                                        error!("Aborting after {} deserialization failures on HTTP 200 — likely a schema change", deserialization_failures);
+                                        break;
+                                    }
                                 }
                             }
                         }
                         Err(e) => {
-                            warn!("RD API error (attempt {}/{}): {}. Status: {}", attempt, max_attempts, e, status);
+                            warn!(
+                                "RD API error (attempt {}/{}): {}. Status: {}",
+                                attempt, max_attempts, e, status
+                            );
                             last_error = Some(e);
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("RD API request failed (attempt {}/{}): {}", attempt, max_attempts, e);
+                    warn!(
+                        "RD API request failed (attempt {}/{}): {}",
+                        attempt, max_attempts, e
+                    );
                     last_error = Some(e);
                 }
             }
@@ -455,12 +517,17 @@ impl RealDebridClient {
             // This happens when every attempt returned HTTP 200 but the response
             // body failed to deserialize (e.g. unexpected JSON schema). Build a
             // synthetic error response to surface a proper error instead of panicking.
-            error!("fetch_with_retry: all {} attempts exhausted due to deserialization failures", max_attempts);
+            error!(
+                "fetch_with_retry: all {} attempts exhausted due to deserialization failures",
+                max_attempts
+            );
             let synthetic = reqwest::Response::from(
                 hyper::Response::builder()
                     .status(reqwest::StatusCode::BAD_GATEWAY)
-                    .body(hyper::body::Bytes::from_static(b"all attempts exhausted: deserialization failures"))
-                    .unwrap()
+                    .body(hyper::body::Bytes::from_static(
+                        b"all attempts exhausted: deserialization failures",
+                    ))
+                    .unwrap(),
             );
             Err(synthetic.error_for_status().unwrap_err())
         }
@@ -473,7 +540,10 @@ impl RealDebridClient {
         cache.retain(|_, v| v.cached_at.elapsed() < CACHE_TTL);
         // If still over max size, remove oldest entries
         if cache.len() > MAX_CACHE_SIZE {
-            let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), v.cached_at)).collect();
+            let mut entries: Vec<_> = cache
+                .iter()
+                .map(|(k, v)| (k.clone(), v.cached_at))
+                .collect();
             entries.sort_by_key(|(_, t)| *t);
             let to_remove = cache.len() - MAX_CACHE_SIZE;
             for (key, _) in entries.into_iter().take(to_remove) {
@@ -499,37 +569,51 @@ mod tests {
 
     #[test]
     fn should_retry_status_retries_429() {
-        assert!(RealDebridClient::should_retry_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(RealDebridClient::should_retry_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
     }
 
     #[test]
     fn should_retry_status_retries_503() {
-        assert!(RealDebridClient::should_retry_status(reqwest::StatusCode::SERVICE_UNAVAILABLE));
+        assert!(RealDebridClient::should_retry_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
     }
 
     #[test]
     fn should_retry_status_retries_502() {
-        assert!(RealDebridClient::should_retry_status(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(RealDebridClient::should_retry_status(
+            reqwest::StatusCode::BAD_GATEWAY
+        ));
     }
 
     #[test]
     fn should_retry_status_retries_504() {
-        assert!(RealDebridClient::should_retry_status(reqwest::StatusCode::GATEWAY_TIMEOUT));
+        assert!(RealDebridClient::should_retry_status(
+            reqwest::StatusCode::GATEWAY_TIMEOUT
+        ));
     }
 
     #[test]
     fn should_retry_status_does_not_retry_200() {
-        assert!(!RealDebridClient::should_retry_status(reqwest::StatusCode::OK));
+        assert!(!RealDebridClient::should_retry_status(
+            reqwest::StatusCode::OK
+        ));
     }
 
     #[test]
     fn should_retry_status_does_not_retry_404() {
-        assert!(!RealDebridClient::should_retry_status(reqwest::StatusCode::NOT_FOUND));
+        assert!(!RealDebridClient::should_retry_status(
+            reqwest::StatusCode::NOT_FOUND
+        ));
     }
 
     #[test]
     fn should_retry_status_does_not_retry_500() {
-        assert!(!RealDebridClient::should_retry_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!RealDebridClient::should_retry_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
     }
 
     // --- Compile-time signature checks for the unified fetch_with_retry ---
@@ -543,7 +627,10 @@ mod tests {
         let _: Result<serde_json::Value, _> = client
             .fetch_with_retry(
                 || client.client.get("http://example.com"),
-                &[reqwest::StatusCode::NOT_FOUND, reqwest::StatusCode::SERVICE_UNAVAILABLE],
+                &[
+                    reqwest::StatusCode::NOT_FOUND,
+                    reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                ],
             )
             .await;
     }
@@ -624,41 +711,53 @@ mod tests {
         {
             let mut cache = client.unrestrict_cache.write().await;
             // Insert an "old" entry with a manually backdated timestamp
-            cache.insert("old-link".to_string(), CachedUnrestrictResponse {
-                response: UnrestrictResponse {
-                    id: "old".to_string(),
-                    filename: "old.mkv".to_string(),
-                    mime_type: None,
-                    filesize: 0,
-                    link: "old-link".to_string(),
-                    host: String::new(),
-                    chunks: 0,
-                    crc: 0,
-                    download: "http://old".to_string(),
-                    streamable: 0,
+            cache.insert(
+                "old-link".to_string(),
+                CachedUnrestrictResponse {
+                    response: UnrestrictResponse {
+                        id: "old".to_string(),
+                        filename: "old.mkv".to_string(),
+                        mime_type: None,
+                        filesize: 0,
+                        link: "old-link".to_string(),
+                        host: String::new(),
+                        chunks: 0,
+                        crc: 0,
+                        download: "http://old".to_string(),
+                        streamable: 0,
+                    },
+                    cached_at: std::time::Instant::now() - Duration::from_secs(7200), // 2 hours ago
                 },
-                cached_at: std::time::Instant::now() - Duration::from_secs(7200), // 2 hours ago
-            });
-            cache.insert("new-link".to_string(), CachedUnrestrictResponse {
-                response: UnrestrictResponse {
-                    id: "new".to_string(),
-                    filename: "new.mkv".to_string(),
-                    mime_type: None,
-                    filesize: 0,
-                    link: "new-link".to_string(),
-                    host: String::new(),
-                    chunks: 0,
-                    crc: 0,
-                    download: "http://new".to_string(),
-                    streamable: 0,
+            );
+            cache.insert(
+                "new-link".to_string(),
+                CachedUnrestrictResponse {
+                    response: UnrestrictResponse {
+                        id: "new".to_string(),
+                        filename: "new.mkv".to_string(),
+                        mime_type: None,
+                        filesize: 0,
+                        link: "new-link".to_string(),
+                        host: String::new(),
+                        chunks: 0,
+                        crc: 0,
+                        download: "http://new".to_string(),
+                        streamable: 0,
+                    },
+                    cached_at: std::time::Instant::now(),
                 },
-                cached_at: std::time::Instant::now(),
-            });
+            );
         }
         client.evict_expired_cache().await;
         let cache = client.unrestrict_cache.read().await;
-        assert!(!cache.contains_key("old-link"), "Expired entry should be evicted");
-        assert!(cache.contains_key("new-link"), "Fresh entry should be retained");
+        assert!(
+            !cache.contains_key("old-link"),
+            "Expired entry should be evicted"
+        );
+        assert!(
+            cache.contains_key("new-link"),
+            "Fresh entry should be retained"
+        );
     }
 
     #[test]
@@ -677,25 +776,36 @@ mod tests {
         let client = RealDebridClient::new("fake-token".to_string()).unwrap();
         {
             let mut cache = client.unrestrict_cache.write().await;
-            cache.insert("test-link".to_string(), CachedUnrestrictResponse {
-                response: UnrestrictResponse {
-                    id: "test".to_string(),
-                    filename: "test.mkv".to_string(),
-                    mime_type: None,
-                    filesize: 0,
-                    link: "test-link".to_string(),
-                    host: String::new(),
-                    chunks: 0,
-                    crc: 0,
-                    download: "http://test".to_string(),
-                    streamable: 0,
+            cache.insert(
+                "test-link".to_string(),
+                CachedUnrestrictResponse {
+                    response: UnrestrictResponse {
+                        id: "test".to_string(),
+                        filename: "test.mkv".to_string(),
+                        mime_type: None,
+                        filesize: 0,
+                        link: "test-link".to_string(),
+                        host: String::new(),
+                        chunks: 0,
+                        crc: 0,
+                        download: "http://test".to_string(),
+                        streamable: 0,
+                    },
+                    cached_at: std::time::Instant::now(),
                 },
-                cached_at: std::time::Instant::now(),
-            });
+            );
         }
-        assert!(client.unrestrict_cache.read().await.contains_key("test-link"));
+        assert!(client
+            .unrestrict_cache
+            .read()
+            .await
+            .contains_key("test-link"));
         client.invalidate_unrestrict_cache("test-link").await;
-        assert!(!client.unrestrict_cache.read().await.contains_key("test-link"));
+        assert!(!client
+            .unrestrict_cache
+            .read()
+            .await
+            .contains_key("test-link"));
     }
 
     // --- Serde deserialization robustness ---

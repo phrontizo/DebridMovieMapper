@@ -1,14 +1,14 @@
+use dav_server::davpath::DavPath;
+use dav_server::fs::{DavFileSystem as DavFsTrait, OpenOptions};
+use debridmoviemapper::dav_fs::DebridFileSystem;
+use debridmoviemapper::identification::identify_torrent;
 use debridmoviemapper::rd_client::RealDebridClient;
+use debridmoviemapper::repair::RepairManager;
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::vfs::{DebridVfs, VfsNode, VIDEO_EXTENSIONS};
-use debridmoviemapper::identification::identify_torrent;
-use debridmoviemapper::dav_fs::DebridFileSystem;
-use debridmoviemapper::repair::RepairManager;
-use dav_server::fs::{DavFileSystem as DavFsTrait, OpenOptions};
-use dav_server::davpath::DavPath;
+use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use futures_util::StreamExt;
 
 /// Test that media files are correctly generated with valid Real-Debrid links
 #[tokio::test]
@@ -31,7 +31,10 @@ async fn test_media_file_generation() {
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 
     println!("Fetching torrents...");
-    let torrents = rd_client.get_torrents().await.expect("Failed to get torrents");
+    let torrents = rd_client
+        .get_torrents()
+        .await
+        .expect("Failed to get torrents");
     let downloaded = torrents
         .into_iter()
         .filter(|t| t.status == "downloaded")
@@ -108,10 +111,16 @@ async fn test_media_file_generation() {
 
         // Verify metadata returns the correct file size
         let meta = file.metadata().await.expect("Failed to get file metadata");
-        assert_eq!(meta.len(), *file_size, "Metadata size should match actual file size");
+        assert_eq!(
+            meta.len(),
+            *file_size,
+            "Metadata size should match actual file size"
+        );
 
         // Verify it has a video file extension
-        let has_video_ext = VIDEO_EXTENSIONS.iter().any(|ext| path_str.to_lowercase().ends_with(ext));
+        let has_video_ext = VIDEO_EXTENSIONS
+            .iter()
+            .any(|ext| path_str.to_lowercase().ends_with(ext));
         assert!(
             has_video_ext,
             "File should have a video extension, got: {}",
@@ -151,7 +160,10 @@ async fn test_media_filename_keeps_original_extension() {
     let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 
-    let torrents = rd_client.get_torrents().await.expect("Failed to get torrents");
+    let torrents = rd_client
+        .get_torrents()
+        .await
+        .expect("Failed to get torrents");
     let downloaded = torrents
         .into_iter()
         .filter(|t| t.status == "downloaded")
@@ -186,7 +198,10 @@ async fn test_media_filename_keeps_original_extension() {
         collect_media_files(&vfs_lock.root, "", String::new(), &mut media_files);
     }
 
-    println!("Checking {} media files for proper naming", media_files.len());
+    println!(
+        "Checking {} media files for proper naming",
+        media_files.len()
+    );
 
     for (path, _, _) in &media_files {
         // Should NOT end with .strm
@@ -197,7 +212,9 @@ async fn test_media_filename_keeps_original_extension() {
         );
 
         // Should end with a video extension
-        let has_video_ext = VIDEO_EXTENSIONS.iter().any(|ext| path.to_lowercase().ends_with(ext));
+        let has_video_ext = VIDEO_EXTENSIONS
+            .iter()
+            .any(|ext| path.to_lowercase().ends_with(ext));
         assert!(
             has_video_ext,
             "File should have a video extension: {}",
@@ -230,7 +247,10 @@ async fn test_nfo_generation_with_media() {
     let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 
-    let torrents = rd_client.get_torrents().await.expect("Failed to get torrents");
+    let torrents = rd_client
+        .get_torrents()
+        .await
+        .expect("Failed to get torrents");
     let downloaded = torrents
         .into_iter()
         .filter(|t| t.status == "downloaded")
@@ -298,7 +318,9 @@ fn collect_media_files(
                 collect_media_files(child, child_name, next_path.clone(), files);
             }
         }
-        VfsNode::MediaFile { rd_link, file_size, .. } => {
+        VfsNode::MediaFile {
+            rd_link, file_size, ..
+        } => {
             let full_path = if current_path.is_empty() {
                 name.to_string()
             } else {
@@ -321,9 +343,7 @@ fn count_nfo_and_folders(
             let has_media = children
                 .values()
                 .any(|child| matches!(child, VfsNode::MediaFile { .. }));
-            let has_nfo = children
-                .keys()
-                .any(|k| k.ends_with(".nfo"));
+            let has_nfo = children.keys().any(|k| k.ends_with(".nfo"));
 
             if has_media {
                 media_folders.insert(name.to_string());

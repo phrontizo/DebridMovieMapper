@@ -1,32 +1,48 @@
+use dav_server::davpath::DavPath;
+use dav_server::fs::{DavFileSystem, OpenOptions};
+use debridmoviemapper::dav_fs::DebridFileSystem;
+use debridmoviemapper::identification::identify_torrent;
 use debridmoviemapper::rd_client::RealDebridClient;
+use debridmoviemapper::repair::RepairManager;
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::vfs::{DebridVfs, VfsNode};
-use debridmoviemapper::identification::identify_torrent;
-use debridmoviemapper::dav_fs::DebridFileSystem;
-use debridmoviemapper::repair::RepairManager;
-use dav_server::fs::{DavFileSystem, OpenOptions};
-use dav_server::davpath::DavPath;
+use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use futures_util::StreamExt;
 
 #[tokio::test]
 #[ignore]
 async fn test_video_player_simulation() {
-    tracing_subscriber::fmt::init();
+    let _ = tracing_subscriber::fmt::try_init();
     dotenvy::dotenv().ok();
 
-    let api_token = std::env::var("RD_API_TOKEN").expect("RD_API_TOKEN must be set").trim().to_string();
-    let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set").trim().to_string();
+    let api_token = std::env::var("RD_API_TOKEN")
+        .expect("RD_API_TOKEN must be set")
+        .trim()
+        .to_string();
+    let tmdb_api_key = std::env::var("TMDB_API_KEY")
+        .expect("TMDB_API_KEY must be set")
+        .trim()
+        .to_string();
 
     let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
     let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 
     println!("Fetching torrents...");
-    let torrents = rd_client.get_torrents().await.expect("Failed to get torrents");
-    let downloaded = torrents.into_iter().filter(|t| t.status == "downloaded").take(20).collect::<Vec<_>>();
-    println!("Found {} downloaded torrents (sampled first 20)", downloaded.len());
+    let torrents = rd_client
+        .get_torrents()
+        .await
+        .expect("Failed to get torrents");
+    let downloaded = torrents
+        .into_iter()
+        .filter(|t| t.status == "downloaded")
+        .take(20)
+        .collect::<Vec<_>>();
+    println!(
+        "Found {} downloaded torrents (sampled first 20)",
+        downloaded.len()
+    );
 
     let mut current_data = Vec::new();
     let mut stream = futures_util::stream::iter(downloaded)
@@ -34,7 +50,10 @@ async fn test_video_player_simulation() {
             let rd_client = rd_client.clone();
             let tmdb_client = tmdb_client.clone();
             async move {
-                let info = rd_client.get_torrent_info(&torrent.id).await.expect("Failed to get torrent info");
+                let info = rd_client
+                    .get_torrent_info(&torrent.id)
+                    .await
+                    .expect("Failed to get torrent info");
                 let metadata = identify_torrent(&info, &tmdb_client).await;
                 (info, metadata)
             }
@@ -71,8 +90,14 @@ async fn test_video_player_simulation() {
     use rand::seq::SliceRandom;
     let mut rng = rand::thread_rng();
 
-    let movies: Vec<_> = video_files.iter().filter(|(p, _)| p.starts_with("Movies/")).collect();
-    let shows: Vec<_> = video_files.iter().filter(|(p, _)| p.starts_with("Shows/")).collect();
+    let movies: Vec<_> = video_files
+        .iter()
+        .filter(|(p, _)| p.starts_with("Movies/"))
+        .collect();
+    let shows: Vec<_> = video_files
+        .iter()
+        .filter(|(p, _)| p.starts_with("Shows/"))
+        .collect();
 
     let mut selected = Vec::new();
     if let Some(m) = movies.choose(&mut rng) {
@@ -101,17 +126,31 @@ async fn test_video_player_simulation() {
             read: true,
             ..Default::default()
         };
-        let mut file = dav_fs.open(&path, opts).await.expect("Failed to open media file");
+        let mut file = dav_fs
+            .open(&path, opts)
+            .await
+            .expect("Failed to open media file");
 
         // Verify metadata returns correct size
         let meta = file.metadata().await.expect("Failed to get file metadata");
         println!("  Metadata size: {} bytes", meta.len());
-        assert_eq!(meta.len(), *size, "Metadata size should match VFS file size");
+        assert_eq!(
+            meta.len(),
+            *size,
+            "Metadata size should match VFS file size"
+        );
 
         // Read first 64KB to simulate player probing the file header
         println!("  Reading first 64KB (simulating ffprobe)...");
-        let probe_bytes = file.read_bytes(65536).await.expect("Failed to read media file");
-        assert!(!probe_bytes.is_empty(), "Read 0 bytes from media file {}", path_str);
+        let probe_bytes = file
+            .read_bytes(65536)
+            .await
+            .expect("Failed to read media file");
+        assert!(
+            !probe_bytes.is_empty(),
+            "Read 0 bytes from media file {}",
+            path_str
+        );
         println!("    Read {} bytes", probe_bytes.len());
         println!("    ✓ Successfully read media bytes from CDN proxy");
     }
@@ -136,8 +175,14 @@ async fn test_video_player_simulation() {
                 read: true,
                 ..Default::default()
             };
-            let mut file = dav_fs.open(&path, opts).await.expect("Failed to open NFO file");
-            let bytes = file.read_bytes(*size as usize).await.expect("Failed to read NFO file");
+            let mut file = dav_fs
+                .open(&path, opts)
+                .await
+                .expect("Failed to open NFO file");
+            let bytes = file
+                .read_bytes(*size as usize)
+                .await
+                .expect("Failed to read NFO file");
             assert_eq!(bytes.len() as u64, *size);
             let content = String::from_utf8_lossy(&bytes);
             assert!(content.starts_with("<?xml"));
@@ -157,16 +202,32 @@ async fn test_media_file_size_consistency() {
     let _ = tracing_subscriber::fmt::try_init();
     dotenvy::dotenv().ok();
 
-    let api_token = std::env::var("RD_API_TOKEN").expect("RD_API_TOKEN must be set").trim().to_string();
-    let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set").trim().to_string();
+    let api_token = std::env::var("RD_API_TOKEN")
+        .expect("RD_API_TOKEN must be set")
+        .trim()
+        .to_string();
+    let tmdb_api_key = std::env::var("TMDB_API_KEY")
+        .expect("TMDB_API_KEY must be set")
+        .trim()
+        .to_string();
 
     let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
     let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
 
     // Fetch just 2 torrents — enough to get at least one media file
-    let torrents = rd_client.get_torrents().await.expect("Failed to get torrents");
-    let downloaded: Vec<_> = torrents.into_iter().filter(|t| t.status == "downloaded").take(2).collect();
-    assert!(!downloaded.is_empty(), "Need at least one downloaded torrent");
+    let torrents = rd_client
+        .get_torrents()
+        .await
+        .expect("Failed to get torrents");
+    let downloaded: Vec<_> = torrents
+        .into_iter()
+        .filter(|t| t.status == "downloaded")
+        .take(2)
+        .collect();
+    assert!(
+        !downloaded.is_empty(),
+        "Need at least one downloaded torrent"
+    );
 
     let mut current_data = Vec::new();
     let mut stream = futures_util::stream::iter(downloaded)
@@ -174,7 +235,10 @@ async fn test_media_file_size_consistency() {
             let rd_client = rd_client.clone();
             let tmdb_client = tmdb_client.clone();
             async move {
-                let info = rd_client.get_torrent_info(&torrent.id).await.expect("Failed to get torrent info");
+                let info = rd_client
+                    .get_torrent_info(&torrent.id)
+                    .await
+                    .expect("Failed to get torrent info");
                 let metadata = identify_torrent(&info, &tmdb_client).await;
                 (info, metadata)
             }
@@ -204,7 +268,10 @@ async fn test_media_file_size_consistency() {
     let dav_path = DavPath::new(&encoded_path).unwrap();
 
     // Step 1: Verify DavFileSystem::metadata() reports actual file size
-    let fs_meta = dav_fs.metadata(&dav_path).await.expect("DavFileSystem::metadata failed");
+    let fs_meta = dav_fs
+        .metadata(&dav_path)
+        .await
+        .expect("DavFileSystem::metadata failed");
     let fs_meta_size = fs_meta.len();
     println!("  DavFileSystem::metadata() size: {} bytes", fs_meta_size);
     assert_eq!(
@@ -213,8 +280,14 @@ async fn test_media_file_size_consistency() {
     );
 
     // Step 2: Open file and verify DavFile::metadata() matches
-    let opts = OpenOptions { read: true, ..Default::default() };
-    let mut file = dav_fs.open(&dav_path, opts).await.expect("Failed to open media file");
+    let opts = OpenOptions {
+        read: true,
+        ..Default::default()
+    };
+    let mut file = dav_fs
+        .open(&dav_path, opts)
+        .await
+        .expect("Failed to open media file");
     let file_meta = file.metadata().await.expect("DavFile::metadata failed");
     let file_meta_size = file_meta.len();
     println!("  DavFile::metadata() size: {} bytes", file_meta_size);
@@ -240,7 +313,12 @@ fn encode_path_preserve_slashes(p: &str) -> String {
         .join("/")
 }
 
-fn find_video_files(node: &VfsNode, name: &str, current_path: String, files: &mut Vec<(String, u64)>) {
+fn find_video_files(
+    node: &VfsNode,
+    name: &str,
+    current_path: String,
+    files: &mut Vec<(String, u64)>,
+) {
     match node {
         VfsNode::Directory { children } => {
             let next_path = if current_path.is_empty() {
@@ -266,7 +344,12 @@ fn find_video_files(node: &VfsNode, name: &str, current_path: String, files: &mu
     }
 }
 
-fn find_nfo_files(node: &VfsNode, name: &str, current_path: String, files: &mut Vec<(String, u64)>) {
+fn find_nfo_files(
+    node: &VfsNode,
+    name: &str,
+    current_path: String,
+    files: &mut Vec<(String, u64)>,
+) {
     match node {
         VfsNode::Directory { children } => {
             let next_path = if current_path.is_empty() {

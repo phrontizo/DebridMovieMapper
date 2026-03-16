@@ -43,7 +43,7 @@ docker compose up -d
 - `TMDB_API_KEY` — TMDB API key
 
 **Optional:**
-- `SCAN_INTERVAL_SECS` (default: 60) — how often to poll Real-Debrid
+- `SCAN_INTERVAL_SECS` (default: 60, minimum: 10) — how often to poll Real-Debrid
 - `DB_PATH` (default: `metadata.db`) — path to the redb database file
 - `PORT` (default: 8080) — WebDAV server listen port
 - `JELLYFIN_URL` — Jellyfin server URL (e.g. `http://jellyfin:8096`)

@@ -8,6 +8,7 @@ services:
     environment:
       - RD_API_TOKEN=your_real_debrid_token
       - TMDB_API_KEY=your_tmdb_api_key
+      - DB_PATH=/data/metadata.db
       # - PORT=8080  # WebDAV server port (must match ports mapping above)
       # Jellyfin notifications (all three required to enable)
       - JELLYFIN_URL=http://jellyfin:8096
@@ -15,6 +16,7 @@ services:
       - JELLYFIN_RCLONE_MOUNT_PATH=/media
     volumes:
       - metadata:/data
+    # Overrides Dockerfile HEALTHCHECK with faster intervals for depends_on startup ordering
     healthcheck:
       test: ["CMD", "/debridmoviemapper", "--healthcheck"]
       interval: 5s

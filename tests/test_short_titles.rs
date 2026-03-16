@@ -1,6 +1,6 @@
-use debridmoviemapper::rd_client::{TorrentInfo, TorrentFile};
-use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::identification::identify_torrent;
+use debridmoviemapper::rd_client::{TorrentFile, TorrentInfo};
+use debridmoviemapper::tmdb_client::TmdbClient;
 
 #[tokio::test]
 #[ignore]
@@ -16,10 +16,10 @@ async fn test_short_title_identification() {
 
     // Test cases: the 4 unidentified films
     let test_cases = vec![
-        ("Us", 2019, 458156),      // Us (2019) by Jordan Peele
-        ("Don", 2022, 895033),     // Don (2022) - Tamil film (TMDB 895033); previous ID 940721 was Godzilla Minus One
-        ("Ran", 1985, 11645),      // Ran (1985) by Akira Kurosawa
-        ("Amy", 2015, 318034),     // Amy (2015) - Amy Winehouse documentary
+        ("Us", 2019, 458156),  // Us (2019) by Jordan Peele
+        ("Don", 2022, 895033), // Don (2022) - Tamil film (TMDB 895033); previous ID 940721 was Godzilla Minus One
+        ("Ran", 1985, 11645),  // Ran (1985) by Akira Kurosawa
+        ("Amy", 2015, 318034), // Amy (2015) - Amy Winehouse documentary
     ];
 
     for (title, year, expected_tmdb_id) in test_cases {
@@ -41,14 +41,12 @@ async fn test_short_title_identification() {
             progress: 100.0,
             status: "downloaded".to_string(),
             added: "2020-01-01".to_string(),
-            files: vec![
-                TorrentFile {
-                    id: 1,
-                    path: format!("{}.{}.1080p.BluRay.x264.mkv", title, year),
-                    bytes: 3000000000,
-                    selected: 1,
-                }
-            ],
+            files: vec![TorrentFile {
+                id: 1,
+                path: format!("{}.{}.1080p.BluRay.x264.mkv", title, year),
+                bytes: 3000000000,
+                selected: 1,
+            }],
             links: vec!["http://link1".to_string()],
             ended: Some("2020-01-01".to_string()),
         };

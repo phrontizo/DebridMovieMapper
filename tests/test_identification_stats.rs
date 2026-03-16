@@ -1,6 +1,6 @@
+use debridmoviemapper::identification::identify_torrent;
 use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::tmdb_client::TmdbClient;
-use debridmoviemapper::identification::identify_torrent;
 
 #[tokio::test]
 #[ignore]
@@ -27,6 +27,11 @@ async fn test_identification_statistics() {
     };
 
     println!("Total torrents: {}\n", torrents.len());
+
+    if torrents.is_empty() {
+        println!("No torrents found.");
+        return;
+    }
 
     let mut identified = 0;
     let mut unidentified = Vec::new();
@@ -62,8 +67,16 @@ async fn test_identification_statistics() {
     println!("RESULTS");
     println!("========================================");
     println!("Total: {}", torrents.len());
-    println!("Identified: {} ({:.1}%)", identified, (identified as f64 / torrents.len() as f64) * 100.0);
-    println!("Unidentified: {} ({:.1}%)", unidentified.len(), (unidentified.len() as f64 / torrents.len() as f64) * 100.0);
+    println!(
+        "Identified: {} ({:.1}%)",
+        identified,
+        (identified as f64 / torrents.len() as f64) * 100.0
+    );
+    println!(
+        "Unidentified: {} ({:.1}%)",
+        unidentified.len(),
+        (unidentified.len() as f64 / torrents.len() as f64) * 100.0
+    );
 
     if !unidentified.is_empty() {
         println!("\n========================================");

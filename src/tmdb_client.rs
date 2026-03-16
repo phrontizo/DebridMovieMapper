@@ -1,10 +1,10 @@
-use serde::Deserialize;
-use reqwest::{Client, RequestBuilder};
 use rand::Rng;
-use tracing::{error, warn};
+use reqwest::{Client, RequestBuilder};
+use serde::Deserialize;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+use tracing::{error, warn};
 
 const MAX_RETRY_AFTER_SECS: u64 = 300; // Cap Retry-After to 5 minutes
 
@@ -44,7 +44,7 @@ impl TmdbClient {
             client: Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
-                .unwrap_or_default(),
+                .expect("Failed to build TMDB HTTP client"),
             api_key,
             // Start in the past so the first request fires immediately.
             last_request: Mutex::new(Instant::now() - MIN_REQUEST_INTERVAL),
@@ -53,10 +53,7 @@ impl TmdbClient {
 
     pub async fn search_movie(&self, query: &str, year: Option<&str>) -> Vec<TmdbSearchResult> {
         let url = "https://api.themoviedb.org/3/search/movie";
-        let mut params = vec![
-            ("api_key", self.api_key.as_str()),
-            ("query", query),
-        ];
+        let mut params = vec![("api_key", self.api_key.as_str()), ("query", query)];
         let year_string;
         if let Some(y) = year {
             year_string = y.to_string();
@@ -67,10 +64,7 @@ impl TmdbClient {
 
     pub async fn search_tv(&self, query: &str, year: Option<&str>) -> Vec<TmdbSearchResult> {
         let url = "https://api.themoviedb.org/3/search/tv";
-        let mut params = vec![
-            ("api_key", self.api_key.as_str()),
-            ("query", query),
-        ];
+        let mut params = vec![("api_key", self.api_key.as_str()), ("query", query)];
         let year_string;
         if let Some(y) = year {
             year_string = y.to_string();
@@ -80,7 +74,10 @@ impl TmdbClient {
     }
 
     async fn search(&self, url: &str, params: Vec<(&str, &str)>) -> Vec<TmdbSearchResult> {
-        match self.fetch_with_retry(|| self.client.get(url).query(&params)).await {
+        match self
+            .fetch_with_retry(|| self.client.get(url).query(&params))
+            .await
+        {
             Ok(resp) => resp.results,
             Err(e) => {
                 error!("TMDB search failed: {}", e.without_url());
@@ -89,7 +86,10 @@ impl TmdbClient {
         }
     }
 
-    async fn fetch_with_retry(&self, make_request: impl Fn() -> RequestBuilder) -> Result<TmdbResponse, reqwest::Error> {
+    async fn fetch_with_retry(
+        &self,
+        make_request: impl Fn() -> RequestBuilder,
+    ) -> Result<TmdbResponse, reqwest::Error> {
         let mut last_error: Option<reqwest::Error> = None;
         let max_attempts = 10;
 
@@ -114,33 +114,43 @@ impl TmdbClient {
                 Ok(resp) => {
                     let status = resp.status();
                     if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                       || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                       || status == reqwest::StatusCode::BAD_GATEWAY
-                       || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+                        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                        || status == reqwest::StatusCode::BAD_GATEWAY
+                        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
                     {
-                        let retry_after = resp.headers()
+                        let retry_after = resp
+                            .headers()
                             .get(reqwest::header::RETRY_AFTER)
                             .and_then(|h| h.to_str().ok())
                             .and_then(|s| s.parse::<u64>().ok())
                             .unwrap_or(1);
                         let capped = std::cmp::min(retry_after, MAX_RETRY_AFTER_SECS);
-                        warn!("TMDB API returned {} (attempt {}/{}). Waiting {}s", status, attempt, max_attempts, capped);
+                        warn!(
+                            "TMDB API returned {} (attempt {}/{}). Waiting {}s",
+                            status, attempt, max_attempts, capped
+                        );
                         tokio::time::sleep(Duration::from_secs(capped)).await;
-                        continue;  // Without this, the same error response falls through to error_for_status
+                        continue; // Without this, the same error response falls through to error_for_status
                     }
 
                     match resp.error_for_status() {
                         Ok(resp) => return resp.json::<TmdbResponse>().await,
                         Err(e) => {
                             let e = e.without_url();
-                            warn!("TMDB API error (attempt {}/{}): {}", attempt, max_attempts, e);
+                            warn!(
+                                "TMDB API error (attempt {}/{}): {}",
+                                attempt, max_attempts, e
+                            );
                             last_error = Some(e);
                         }
                     }
                 }
                 Err(e) => {
                     let e = e.without_url();
-                    warn!("TMDB request failed (attempt {}/{}): {}", attempt, max_attempts, e);
+                    warn!(
+                        "TMDB request failed (attempt {}/{}): {}",
+                        attempt, max_attempts, e
+                    );
                     last_error = Some(e);
                 }
             }
@@ -153,12 +163,17 @@ impl TmdbClient {
             // This happens when every attempt returned a retryable status code
             // (429/503/502/504) and the loop never fell through to error_for_status().
             // Build a synthetic error to avoid panicking.
-            error!("TMDB fetch_with_retry: all {} attempts exhausted (retryable status codes)", max_attempts);
+            error!(
+                "TMDB fetch_with_retry: all {} attempts exhausted (retryable status codes)",
+                max_attempts
+            );
             let synthetic = reqwest::Response::from(
                 hyper::Response::builder()
                     .status(reqwest::StatusCode::BAD_GATEWAY)
-                    .body(hyper::body::Bytes::from_static(b"all attempts exhausted: retryable status codes"))
-                    .unwrap()
+                    .body(hyper::body::Bytes::from_static(
+                        b"all attempts exhausted: retryable status codes",
+                    ))
+                    .unwrap(),
             );
             Err(synthetic.error_for_status().unwrap_err())
         }

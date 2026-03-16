@@ -1,6 +1,6 @@
-use crate::vfs::{VfsChange, UpdateType};
-use std::time::Duration;
+use crate::vfs::{UpdateType, VfsChange};
 use reqwest::header::HeaderValue;
+use std::time::Duration;
 use tracing::info;
 
 const MAX_RETRIES: u32 = 10;
@@ -19,8 +19,12 @@ pub struct JellyfinClient {
 
 impl JellyfinClient {
     pub fn new(url: String, api_key: String, mount_path: String) -> Result<Self, String> {
-        let mut api_key_header = HeaderValue::from_str(&api_key)
-            .map_err(|e| format!("Jellyfin API key contains invalid HTTP header characters: {}", e))?;
+        let mut api_key_header = HeaderValue::from_str(&api_key).map_err(|e| {
+            format!(
+                "Jellyfin API key contains invalid HTTP header characters: {}",
+                e
+            )
+        })?;
         api_key_header.set_sensitive(true);
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -66,7 +70,11 @@ impl JellyfinClient {
             "Notifying Jellyfin of {} change(s) in {}s: {}",
             changes.len(),
             NOTIFICATION_DELAY.as_secs(),
-            changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>().join(", ")
+            changes
+                .iter()
+                .map(|c| c.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
 
         // Wait for rclone's directory cache to expire so Jellyfin sees fresh data
@@ -78,7 +86,8 @@ impl JellyfinClient {
                 tokio::time::sleep(RETRY_DELAY).await;
             }
 
-            let result = self.http
+            let result = self
+                .http
                 .post(&url)
                 .header("X-Emby-Token", self.api_key_header.clone())
                 .json(&body)
@@ -157,7 +166,8 @@ mod tests {
             "http://jellyfin:8096".to_string(),
             "test-key".to_string(),
             "/mnt/debrid".to_string(),
-        ).unwrap();
+        )
+        .unwrap();
         let changes = vec![VfsChange {
             path: "Shows/Breaking Bad/Season 03".to_string(),
             update_type: UpdateType::Created,
@@ -165,7 +175,10 @@ mod tests {
         let body = client.build_request_body(&changes);
         let updates = body["Updates"].as_array().unwrap();
         assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0]["Path"], "/mnt/debrid/Shows/Breaking Bad/Season 03");
+        assert_eq!(
+            updates[0]["Path"],
+            "/mnt/debrid/Shows/Breaking Bad/Season 03"
+        );
         assert_eq!(updates[0]["UpdateType"], "Created");
     }
 
@@ -175,7 +188,8 @@ mod tests {
             "http://jellyfin:8096".to_string(),
             "test-key".to_string(),
             "/mnt/debrid".to_string(),
-        ).unwrap();
+        )
+        .unwrap();
         let changes = vec![
             VfsChange {
                 path: "Movies/Old Movie".to_string(),
@@ -195,7 +209,10 @@ mod tests {
         assert_eq!(updates.len(), 3);
         assert_eq!(updates[0]["UpdateType"], "Deleted");
         assert_eq!(updates[1]["UpdateType"], "Created");
-        assert_eq!(updates[2]["Path"], "/mnt/debrid/Shows/Breaking Bad/Season 01");
+        assert_eq!(
+            updates[2]["Path"],
+            "/mnt/debrid/Shows/Breaking Bad/Season 01"
+        );
     }
 
     #[test]
@@ -204,7 +221,8 @@ mod tests {
             "http://jellyfin:8096/".to_string(),
             "test-key".to_string(),
             "/mnt/debrid/".to_string(),
-        ).unwrap();
+        )
+        .unwrap();
         let changes = vec![VfsChange {
             path: "Movies/Test".to_string(),
             update_type: UpdateType::Created,
@@ -221,7 +239,8 @@ mod tests {
             "http://jellyfin:8096".to_string(),
             "test-key".to_string(),
             "/mnt/debrid".to_string(),
-        ).unwrap();
+        )
+        .unwrap();
         let body = client.build_request_body(&[]);
         let updates = body["Updates"].as_array().unwrap();
         assert!(updates.is_empty());
@@ -235,7 +254,10 @@ mod tests {
             "bad\nkey".to_string(),
             "/mnt/debrid".to_string(),
         );
-        assert!(result.is_err(), "API key with control characters should return Err");
+        assert!(
+            result.is_err(),
+            "API key with control characters should return Err"
+        );
     }
 
     #[test]

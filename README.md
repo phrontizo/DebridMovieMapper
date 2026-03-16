@@ -58,7 +58,7 @@ JELLYFIN_RCLONE_MOUNT_PATH=/media
 |------------------------------|----------|---------|----------------------------------------------------------------------|
 | `RD_API_TOKEN`               | Yes      | -              | Your Real-Debrid API token                                           |
 | `TMDB_API_KEY`               | Yes      | -              | Your TMDB (The Movie Database) API key                               |
-| `SCAN_INTERVAL_SECS`         | No       | 60             | Interval between torrent library scans (runs immediately on startup) |
+| `SCAN_INTERVAL_SECS`         | No       | 60             | Interval between torrent library scans in seconds (minimum: 10, runs immediately on startup) |
 | `DB_PATH`                    | No       | `metadata.db`  | Path to the redb database file                                       |
 | `PORT`                       | No       | 8080           | WebDAV server listen port                                            |
 | `JELLYFIN_URL`               | No       | -              | Jellyfin server URL for library update notifications                 |
