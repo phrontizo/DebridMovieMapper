@@ -525,7 +525,11 @@ pub fn is_show_guess(files: &[rd_client::TorrentFile]) -> bool {
     files.iter().any(|f| {
         let filename = f.path.split('/').next_back().unwrap_or(&f.path);
         SHOW_RE.is_match(filename)
-    }) || files.iter().filter(|f| is_video_file(&f.path)).count() > 1
+    }) || files
+        .iter()
+        .filter(|f| f.selected != 0 && is_video_file(&f.path))
+        .count()
+        > 1
 }
 
 pub fn normalize_title(s: &str) -> String {
@@ -1214,5 +1218,72 @@ mod tests {
         let (_title, _date, id, _source, media_type) = got.unwrap();
         assert_eq!(id, "20");
         assert_eq!(media_type, MediaType::Movie);
+    }
+
+    #[test]
+    fn is_show_guess_single_selected_video_is_movie() {
+        // A movie torrent with one selected video and unselected extras
+        // should NOT be classified as a show
+        let files = vec![
+            TorrentFile {
+                id: 1,
+                path: "/Movie.2023.mkv".to_string(),
+                bytes: 10_000_000_000,
+                selected: 1,
+            },
+            TorrentFile {
+                id: 2,
+                path: "/Making.Of.mkv".to_string(),
+                bytes: 500_000_000,
+                selected: 0,
+            },
+            TorrentFile {
+                id: 3,
+                path: "/Commentary.mkv".to_string(),
+                bytes: 8_000_000_000,
+                selected: 0,
+            },
+        ];
+        assert!(
+            !is_show_guess(&files),
+            "Movie with unselected extras should not be guessed as show"
+        );
+    }
+
+    #[test]
+    fn is_show_guess_multiple_selected_videos_is_show() {
+        // A show torrent with multiple selected video files
+        let files = vec![
+            TorrentFile {
+                id: 1,
+                path: "/Episode1.mkv".to_string(),
+                bytes: 1_000_000_000,
+                selected: 1,
+            },
+            TorrentFile {
+                id: 2,
+                path: "/Episode2.mkv".to_string(),
+                bytes: 1_000_000_000,
+                selected: 1,
+            },
+        ];
+        assert!(
+            is_show_guess(&files),
+            "Multiple selected video files should be guessed as show"
+        );
+    }
+
+    #[test]
+    fn is_show_guess_episode_pattern_detected() {
+        let files = vec![TorrentFile {
+            id: 1,
+            path: "/Show.S01E01.mkv".to_string(),
+            bytes: 1_000_000_000,
+            selected: 1,
+        }];
+        assert!(
+            is_show_guess(&files),
+            "Episode pattern in filename should be guessed as show"
+        );
     }
 }

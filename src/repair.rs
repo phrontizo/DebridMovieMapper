@@ -54,10 +54,6 @@ impl RepairManager {
         std::mem::take(&mut *map)
     }
 
-    pub fn health_status(&self) -> Arc<RwLock<HashMap<String, TorrentHealth>>> {
-        self.health_status.clone()
-    }
-
     /// Delete a torrent that was created by add_magnet but whose repair failed.
     /// Prevents duplicate torrents from accumulating in Real-Debrid.
     async fn cleanup_leaked_torrent(&self, new_torrent_id: &str) {
