@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, Semaphore};
-use tracing::info;
+use tracing::{info, warn};
 
 const MAX_CONNECTIONS: usize = 256;
 
@@ -110,10 +110,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .locksystem(dav_server::fakels::FakeLs::new())
         .build_handler();
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8080);
+    let port: u16 = match std::env::var("PORT") {
+        Ok(s) => s.parse().unwrap_or_else(|_| {
+            warn!("Invalid PORT value '{}', falling back to 8080", s);
+            8080
+        }),
+        Err(_) => 8080,
+    };
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
     info!("WebDAV server listening on http://{}", addr);

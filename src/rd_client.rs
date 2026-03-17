@@ -240,7 +240,7 @@ impl RealDebridClient {
             tokio::time::sleep(Duration::from_secs(capped)).await;
         } else if attempt < max_attempts {
             // Extended exponential backoff for 503/502/504, capped at 30s
-            let backoff_secs = 2u64.pow(attempt);
+            let backoff_secs = 2u64.saturating_pow(attempt);
             let delay = Duration::from_secs(std::cmp::min(backoff_secs, 30));
             let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..1000));
             let total_delay = delay + jitter;

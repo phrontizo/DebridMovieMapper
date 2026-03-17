@@ -592,6 +592,8 @@ impl DebridVfs {
 }
 
 /// Replace characters that are invalid in filenames or interpreted as path separators.
+/// Covers POSIX path separators and Windows-reserved characters (important for
+/// WebDAV clients accessing via rclone on Windows/SMB).
 fn sanitize_filename(name: &str) -> String {
     let mut replaced = String::with_capacity(name.len());
     for c in name.chars() {
@@ -601,6 +603,7 @@ fn sanitize_filename(name: &str) -> String {
                 replaced.push(' ');
                 replaced.push('-');
             }
+            '*' | '?' | '<' | '>' | '|' | '"' => {}
             _ => replaced.push(c),
         }
     }
@@ -1226,6 +1229,8 @@ mod tests {
         assert_eq!(sanitize_filename("Back\\Slash"), "Back-Slash");
         assert_eq!(sanitize_filename("Title: Subtitle"), "Title - Subtitle");
         assert_eq!(sanitize_filename("Normal Title"), "Normal Title");
+        assert_eq!(sanitize_filename("What? *Really*"), "What Really");
+        assert_eq!(sanitize_filename("A<B>C|D\"E"), "ABCDE");
     }
 
     #[test]
