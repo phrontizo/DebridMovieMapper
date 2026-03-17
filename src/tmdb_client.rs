@@ -95,7 +95,7 @@ impl TmdbClient {
 
         for attempt in 1..=max_attempts {
             if attempt > 1 {
-                let backoff = (2u64.pow(attempt as u32 - 2) * 1000).min(30_000);
+                let backoff = (2u64.saturating_pow(attempt as u32 - 2) * 1000).min(30_000);
                 let jitter = rand::thread_rng().gen_range(0..500);
                 tokio::time::sleep(Duration::from_millis(backoff + jitter)).await;
             }
