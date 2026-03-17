@@ -162,7 +162,7 @@ pub async fn run_scan_loop(config: ScanConfig, mut shutdown: tokio::sync::watch:
                                             let db_clone = db.clone();
                                             let new_id = torrent.id.clone();
                                             let old_id = old_id.clone();
-                                            if let Err(e) = tokio::task::spawn_blocking(
+                                            match tokio::task::spawn_blocking(
                                                 move || -> Result<(), redb::Error> {
                                                     let write_txn = db_clone.begin_write()?;
                                                     {
@@ -180,7 +180,9 @@ pub async fn run_scan_loop(config: ScanConfig, mut shutdown: tokio::sync::watch:
                                             )
                                             .await
                                             {
-                                                error!("Failed to persist repair replacement to database: {:?}", e);
+                                                Ok(Ok(())) => {}
+                                                Ok(Err(e)) => error!("Failed to persist repair replacement to database: {}", e),
+                                                Err(e) => error!("Failed to persist repair replacement to database: {:?}", e),
                                             }
                                         }
                                         seen_torrents.insert(
@@ -309,21 +311,26 @@ pub async fn run_scan_loop(config: ScanConfig, mut shutdown: tokio::sync::watch:
                 if !stale_ids.is_empty() {
                     info!("Removing {} stale entries from database", stale_ids.len());
                     let db_clone = db.clone();
-                    if let Err(e) =
-                        tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-                            let write_txn = db_clone.begin_write()?;
-                            {
-                                let mut table = write_txn.open_table(MATCHES_TABLE)?;
-                                for id in &stale_ids {
-                                    table.remove(id.as_str())?;
-                                }
+                    match tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+                        let write_txn = db_clone.begin_write()?;
+                        {
+                            let mut table = write_txn.open_table(MATCHES_TABLE)?;
+                            for id in &stale_ids {
+                                table.remove(id.as_str())?;
                             }
-                            write_txn.commit()?;
-                            Ok(())
-                        })
-                        .await
+                        }
+                        write_txn.commit()?;
+                        Ok(())
+                    })
+                    .await
                     {
-                        error!("Failed to remove stale entries from database: {:?}", e);
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            error!("Failed to remove stale entries from database: {}", e)
+                        }
+                        Err(e) => {
+                            error!("Failed to remove stale entries from database: {:?}", e)
+                        }
                     }
                 }
                 info!("VFS update complete.");
@@ -348,7 +355,7 @@ async fn flush_db_writes(db: &Arc<redb::Database>, pending_writes: &mut Vec<(Str
     let writes = std::mem::take(pending_writes);
     let count = writes.len();
     let db_clone = db.clone();
-    if let Err(e) = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+    match tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
         let write_txn = db_clone.begin_write()?;
         {
             let mut table = write_txn.open_table(MATCHES_TABLE)?;
@@ -361,10 +368,19 @@ async fn flush_db_writes(db: &Arc<redb::Database>, pending_writes: &mut Vec<(Str
     })
     .await
     {
-        error!(
-            "Failed to persist {} torrent identifications to database: {:?}",
-            count, e
-        );
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            error!(
+                "Failed to persist {} torrent identifications to database: {}",
+                count, e
+            );
+        }
+        Err(e) => {
+            error!(
+                "Failed to persist {} torrent identifications to database: {:?}",
+                count, e
+            );
+        }
     }
 }
 

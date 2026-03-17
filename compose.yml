@@ -21,6 +21,7 @@ services:
       test: ["CMD", "/debridmoviemapper", "--healthcheck"]
       interval: 5s
       timeout: 3s
+      start_period: 10s
       retries: 3
     deploy:
       resources:
