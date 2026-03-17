@@ -1,4 +1,5 @@
 target/
+metadata.db
 metadata.db/
 .env
 .git/

@@ -255,7 +255,9 @@ impl RealDebridClient {
         }
     }
 
-    /// Helper to check if a status code should trigger a retry
+    /// Helper to check if a status code should trigger a retry.
+    /// Note: callers can override this via `terminal_statuses` in `fetch_with_retry`,
+    /// which are checked first and abort without retrying (e.g. 503 for unrestrict_link).
     fn should_retry_status(status: reqwest::StatusCode) -> bool {
         status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE

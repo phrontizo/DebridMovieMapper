@@ -76,8 +76,8 @@ services:
       - jellyfin-config:/config
       - jellyfin-cache:/cache
       - ./rclone:/media:ro
-    devices:
-      - /dev/dri:/dev/dri  # Optional: for hardware transcoding
+    # devices:
+    #   - /dev/dri:/dev/dri  # Uncomment for hardware transcoding (requires GPU)
 
 volumes:
   metadata: {}

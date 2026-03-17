@@ -12,6 +12,9 @@ use tokio::sync::RwLock;
 /// 2 MB read-ahead buffer per open file
 const BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
+/// Maximum single CDN fetch to prevent unbounded memory growth (16 MB)
+const MAX_FETCH_SIZE: usize = 16 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct DebridFileSystem {
     vfs: Arc<RwLock<DebridVfs>>,
@@ -335,7 +338,7 @@ impl ProxiedMediaFile {
 
         // Buffer miss — fetch from CDN
         let cdn_url = self.resolve_cdn_url().await?;
-        let fetch_size = std::cmp::max(len, BUFFER_SIZE) as u64;
+        let fetch_size = len.clamp(BUFFER_SIZE, MAX_FETCH_SIZE) as u64;
         let range_end = std::cmp::min(pos + fetch_size - 1, self.file_size - 1);
 
         let resp = match self

@@ -58,7 +58,10 @@ pub async fn run_scan_loop(config: ScanConfig, mut shutdown: tokio::sync::watch:
             map
         })
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to load persisted matches: {:?}", e);
+            HashMap::new()
+        });
 
     let mut seen_torrents = persisted;
     if !seen_torrents.is_empty() {
