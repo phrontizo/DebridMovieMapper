@@ -193,7 +193,7 @@ impl DebridVfs {
         let mut used_show_names: HashMap<String, u32> = HashMap::new();
 
         for metadata in sorted_metadata {
-            let mut torrents = media_groups.get(&metadata).unwrap().clone();
+            let mut torrents = media_groups.remove(&metadata).unwrap();
             // Sort torrents by size descending to pick the best/largest one
             torrents.sort_by_key(|t| std::cmp::Reverse(t.bytes));
 
