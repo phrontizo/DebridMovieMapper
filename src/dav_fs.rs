@@ -279,6 +279,10 @@ impl ProxiedMediaFile {
                             let old_rd_link =
                                 std::mem::replace(&mut self.rd_link, result.new_rd_link);
                             self.rd_torrent_id = result.new_torrent_id;
+                            // Clear the read-ahead buffer so subsequent reads fetch from the
+                            // new CDN URL instead of serving stale bytes from the old one.
+                            self.buffer = Bytes::new();
+                            self.buffer_start = 0;
                             // Invalidate the cached unrestrict response for the old (broken) link
                             // so other ProxiedMediaFile instances don't get stale data before
                             // the next VFS rebuild.
