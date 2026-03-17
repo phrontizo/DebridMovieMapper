@@ -46,11 +46,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("TMDB_API_KEY must be set")
         .trim()
         .to_string();
-    let scan_interval_secs = std::env::var("SCAN_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(60)
-        .max(10); // Enforce minimum 10s to prevent hammering the Real-Debrid API
+    let scan_interval_secs = match std::env::var("SCAN_INTERVAL_SECS") {
+        Ok(s) => s.parse::<u64>().unwrap_or_else(|_| {
+            warn!(
+                "Invalid SCAN_INTERVAL_SECS value '{}', falling back to 60",
+                s
+            );
+            60
+        }),
+        Err(_) => 60,
+    }
+    .max(10); // Enforce minimum 10s to prevent hammering the Real-Debrid API
 
     info!("Scan interval: {}s", scan_interval_secs);
 

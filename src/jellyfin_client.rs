@@ -101,9 +101,13 @@ impl JellyfinClient {
                         return;
                     }
                     let status = response.status();
-                    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                        || status == reqwest::StatusCode::BAD_GATEWAY
+                        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+                    {
                         tracing::warn!(
-                            "Jellyfin returned 503 (still starting?), retry {}/{}",
+                            "Jellyfin returned {} (transient), retry {}/{}",
+                            status,
                             attempt + 1,
                             MAX_RETRIES
                         );
