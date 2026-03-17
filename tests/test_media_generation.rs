@@ -338,25 +338,22 @@ fn count_nfo_and_folders(
     nfo_count: &mut usize,
     media_folders: &mut std::collections::HashSet<String>,
 ) {
-    match node {
-        VfsNode::Directory { children } => {
-            let has_media = children
-                .values()
-                .any(|child| matches!(child, VfsNode::MediaFile { .. }));
-            let has_nfo = children.keys().any(|k| k.ends_with(".nfo"));
+    if let VfsNode::Directory { children } = node {
+        let has_media = children
+            .values()
+            .any(|child| matches!(child, VfsNode::MediaFile { .. }));
+        let has_nfo = children.keys().any(|k| k.ends_with(".nfo"));
 
-            if has_media {
-                media_folders.insert(name.to_string());
-            }
-            if has_nfo {
-                *nfo_count += 1;
-            }
-
-            for (child_name, child) in children {
-                count_nfo_and_folders(child, child_name, nfo_count, media_folders);
-            }
+        if has_media {
+            media_folders.insert(name.to_string());
         }
-        _ => {}
+        if has_nfo {
+            *nfo_count += 1;
+        }
+
+        for (child_name, child) in children {
+            count_nfo_and_folders(child, child_name, nfo_count, media_folders);
+        }
     }
 }
 

@@ -116,7 +116,12 @@ A complete [`compose.yml`](compose.yml) file is provided in the repository that 
    mkdir -p rclone && chown 65534:65534 rclone
    ```
 
-2. Add your Real-Debrid and TMDB credentials to the `compose.yml` file
+2. Create a `.env` file with your credentials (or export them in your environment):
+   ```bash
+   RD_API_TOKEN=your_real_debrid_token
+   TMDB_API_KEY=your_tmdb_api_key
+   JELLYFIN_API_KEY=your_jellyfin_api_key  # optional
+   ```
 
 3. Start the services:
    ```bash
@@ -125,7 +130,7 @@ A complete [`compose.yml`](compose.yml) file is provided in the repository that 
 
 4. Access Jellyfin at `http://localhost:8096` and add `/media` as a library path
 
-5. (Optional) To enable instant library updates, set `JELLYFIN_API_KEY` in `compose.yml` to your Jellyfin API key
+5. (Optional) To enable instant library updates, set `JELLYFIN_API_KEY` in your `.env` file
 
 ### Notes
 

@@ -14,6 +14,7 @@ static DB: LazyLock<Database> =
     LazyLock::new(|| Database::create("metadata.db").expect("Failed to open database"));
 
 /// Shared identified data — fetched and identified exactly once, reused by all tests.
+#[allow(clippy::type_complexity)]
 static IDENTIFIED_DATA: OnceCell<(Arc<RealDebridClient>, Vec<(TorrentInfo, MediaMetadata)>)> =
     OnceCell::const_new();
 
@@ -34,7 +35,7 @@ async fn get_shared_data() -> &'static (Arc<RealDebridClient>, Vec<(TorrentInfo,
             let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
             let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
 
-            let data = fetch_and_identify(&rd_client, &tmdb_client, &*DB).await;
+            let data = fetch_and_identify(&rd_client, &tmdb_client, &DB).await;
             (rd_client, data)
         })
         .await

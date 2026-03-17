@@ -6,13 +6,13 @@ services:
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
     environment:
-      - RD_API_TOKEN=your_real_debrid_token
-      - TMDB_API_KEY=your_tmdb_api_key
+      - RD_API_TOKEN=${RD_API_TOKEN:?Set RD_API_TOKEN in .env or environment}
+      - TMDB_API_KEY=${TMDB_API_KEY:?Set TMDB_API_KEY in .env or environment}
       - DB_PATH=/data/metadata.db
       # - PORT=8080  # WebDAV server port (must match ports mapping above)
       # Jellyfin notifications (all three required to enable)
       - JELLYFIN_URL=http://jellyfin:8096
-      - JELLYFIN_API_KEY=your_jellyfin_api_key
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:-}
       - JELLYFIN_RCLONE_MOUNT_PATH=/media
     volumes:
       - metadata:/data
