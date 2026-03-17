@@ -70,9 +70,20 @@ JELLYFIN_RCLONE_MOUNT_PATH=/media
 The easiest way to run DebridMovieMapper is using Docker. Pre-built multi-platform images are available via the GitHub Container Registry.
 
 ### 1. Pull the image
+
+Images are available from both GitHub Container Registry and Docker Hub:
 ```bash
+# GitHub Container Registry
 docker pull ghcr.io/phrontizo/debridmoviemapper:latest
+
+# Docker Hub
+docker pull phrontizo/debridmoviemapper:latest
 ```
+
+**Available tags:**
+- `:latest` — latest stable release (updated on version tags like `v1.0.2`)
+- `:edge` — latest build from `main` branch (may be unstable)
+- `:1.0.2`, `:1.0`, `:1` — pinned to a specific release version
 
 ### 2. Run the container
 ```bash
@@ -92,7 +103,7 @@ Build locally for your current architecture:
 docker build -t debridmoviemapper .
 ```
 
-Multi-platform images are built and pushed to ghcr.io automatically by GitHub Actions when a version tag is pushed (e.g. `git tag v1.0.0 && git push origin v1.0.0`).
+Multi-platform images are built and pushed automatically by GitHub Actions. Release tags (e.g. `git tag v1.0.2 && git push origin v1.0.2`) update `:latest` and semver tags; pushes to `main` update `:edge`.
 
 *Note: The named volume ensures your media identification cache is preserved across container recreations.*
 
