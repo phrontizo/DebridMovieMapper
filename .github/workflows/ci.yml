@@ -76,7 +76,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ env.GHCR_IMAGE }}:latest
-            ${{ env.DOCKERHUB_IMAGE }}:latest
+            ${{ env.GHCR_IMAGE }}:edge
+            ${{ env.DOCKERHUB_IMAGE }}:edge
           cache-from: type=gha
           cache-to: type=gha,mode=max
