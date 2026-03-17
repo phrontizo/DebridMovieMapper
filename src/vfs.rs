@@ -15,21 +15,16 @@ const ARCHIVE_EXTENSIONS: &[&str] = &[".rar", ".zip", ".7z", ".tar", ".gz", ".bz
 /// Expects a pre-lowercased input string.
 fn is_archive_part(path: &str) -> bool {
     // .r00-.r99, .s00-.s99 (split RAR volumes)
-    // Use char_indices to safely find the last 4 characters, avoiding
-    // panics from slicing at non-UTF-8 boundaries.
-    let char_count = path.chars().count();
-    if char_count >= 4 {
-        let byte_offset = path
-            .char_indices()
-            .nth(char_count - 4)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let ext = &path[byte_offset..];
-        if ext.starts_with(".r") || ext.starts_with(".s") {
-            return ext[2..].chars().all(|c| c.is_ascii_digit());
-        }
+    // Safe to use bytes directly: the pattern is ASCII-only, and multi-byte
+    // UTF-8 continuation bytes (0x80-0xBF) can never match '.', 'r', or 's'.
+    let b = path.as_bytes();
+    b.len() >= 4 && {
+        let t = &b[b.len() - 4..];
+        t[0] == b'.'
+            && (t[1] == b'r' || t[1] == b's')
+            && t[2].is_ascii_digit()
+            && t[3].is_ascii_digit()
     }
-    false
 }
 
 fn is_archive_file(path: &str) -> bool {
@@ -647,11 +642,20 @@ pub fn is_video_file(path: &str) -> bool {
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => result.push_str("&amp;"),
+            '<' => result.push_str("&lt;"),
+            '>' => result.push_str("&gt;"),
+            '"' => result.push_str("&quot;"),
+            '\'' => result.push_str("&apos;"),
+            // Strip XML 1.0 invalid control chars (keep tab, newline, carriage return)
+            '\u{0000}'..='\u{0008}' | '\u{000B}' | '\u{000C}' | '\u{000E}'..='\u{001F}' => {}
+            _ => result.push(c),
+        }
+    }
+    result
 }
 
 /// Diff two VFS trees and return the list of changed paths at the deepest
@@ -1034,6 +1038,23 @@ mod tests {
             !content.contains("&<"),
             "No unescaped special characters should appear"
         );
+    }
+
+    #[test]
+    fn test_nfo_strips_control_characters() {
+        let metadata = MediaMetadata {
+            title: "Movie\x00With\x07Control\x1FChars".to_string(),
+            year: Some("2024".to_string()),
+            media_type: MediaType::Movie,
+            external_id: Some("tmdb:123".to_string()),
+        };
+        let content = String::from_utf8(DebridVfs::generate_nfo(&metadata)).unwrap();
+        assert!(
+            content.contains("<title>MovieWithControlChars</title>"),
+            "Control characters should be stripped from NFO XML"
+        );
+        // Tab, newline, carriage return are valid XML and should be preserved
+        assert_eq!(xml_escape("a\tb\nc\rd"), "a\tb\nc\rd");
     }
 
     #[test]
