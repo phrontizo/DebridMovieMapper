@@ -13,7 +13,7 @@ Note that this is still a work in progress and is provided as-is for educational
 Future work:
 * Test with Kodi 
 * Add a web-ui to track progress and correct mismatches
-* Automatically populate Read Debrid with watchlist content from Trakt and newly released episodes from already tracked shows
+* Automatically populate Real-Debrid with watchlist content from Trakt and newly released episodes from already tracked shows
 
 This was 100% vibe coded using a mix of Claude and Junie as further AI experimentation.
 ## Features

@@ -4,7 +4,7 @@ services:
     container_name: debridmoviemapper
     restart: unless-stopped
     ports:
-      - "${PORT:-8080}:${PORT:-8080}"
+      - "${PORT:-8080}:8080"
     environment:
       - RD_API_TOKEN=${RD_API_TOKEN:?Set RD_API_TOKEN in .env or environment}
       - TMDB_API_KEY=${TMDB_API_KEY:?Set TMDB_API_KEY in .env or environment}
