@@ -38,7 +38,10 @@ RUN mkdir src && \
 
 # Copy real source and build the application
 COPY src ./src
-RUN TARGET=$(cat /target_triple) && \
+# Touch source files so cargo detects them as newer than the dummy-build fingerprints
+# (COPY preserves mtimes from the build context, which predate the dummy build above)
+RUN touch src/*.rs && \
+    TARGET=$(cat /target_triple) && \
     cargo build --release --target $TARGET && \
     cp target/$TARGET/release/debridmoviemapper .
 
