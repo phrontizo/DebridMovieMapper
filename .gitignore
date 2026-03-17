@@ -9,3 +9,5 @@ output.log
 test_debug.log
 test_output.log
 .worktrees/
+.claude/
+.ralph-memory.md
