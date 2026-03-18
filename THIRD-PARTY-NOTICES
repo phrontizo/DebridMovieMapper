@@ -1,0 +1,202 @@
+Third-Party Notices
+====================
+
+DebridMovieMapper includes third-party software components under the
+licences listed below. Where a dependency is available under multiple
+licences, we use it under the most permissive option.
+
+--------------------------------------------------------------------------------
+
+Apache-2.0
+----------
+
+dav-server v0.11.0 — Miquel van Smoorenburg, messense
+sync_wrapper v1.0.2 — Actyx AG
+
+Licensed under the Apache License, Version 2.0. You may obtain a copy at
+<https://www.apache.org/licenses/LICENSE-2.0>.
+
+--------------------------------------------------------------------------------
+
+Apache-2.0 AND ISC
+-------------------
+
+ring v0.17.14
+
+Licensed under both the Apache License, Version 2.0 and the ISC licence.
+
+--------------------------------------------------------------------------------
+
+Apache-2.0 OR MIT
+------------------
+
+Used under the MIT licence:
+
+android_system_properties, atomic-waker, autocfg, base64, bitflags,
+block-buffer, bumpalo, cc, cfg-if, chrono, core-foundation,
+core-foundation-sys, cpufeatures, crypto-common, derive-where, digest,
+displaydoc, dyn-clone, equivalent, errno, find-msvc-tools, fnv,
+form_urlencoded, futures-channel, futures-core, futures-macro, futures-sink,
+futures-task, futures-util, getrandom, hashbrown, http, httparse, httpdate,
+iana-time-zone, iana-time-zone-haiku, idna, idna_adapter, indexmap, ipnet,
+iri-string, itoa, js-sys, lazy_static, libc, log, mime, num-traits,
+once_cell, percent-encoding, pin-project-lite, pin-utils, ppv-lite86,
+proc-macro2, quinn, quinn-proto, quinn-udp, quote, rand, rand_chacha,
+rand_core, redb, regex, regex-automata, regex-syntax, reqwest, rustc-hash,
+rustls-pki-types, rustversion, serde, serde_core, serde_derive, serde_json,
+serde_urlencoded, sha1, shlex, signal-hook-registry, smallvec, socket2,
+stable_deref_trait, syn, system-configuration, system-configuration-sys,
+thiserror, thiserror-impl, thread_local, tokio-rustls, typenum, unicase,
+url, utf8_iter, uuid, version_check, wasm-bindgen, wasm-bindgen-futures,
+wasm-bindgen-macro, wasm-bindgen-macro-support, wasm-bindgen-shared,
+web-sys, web-time, windows-core, windows-implement, windows-interface,
+windows-link, windows-registry, windows-result, windows-strings,
+windows-sys, windows-targets, windows_aarch64_gnullvm, windows_aarch64_msvc,
+windows_i686_gnu, windows_i686_gnullvm, windows_i686_msvc,
+windows_x86_64_gnu, windows_x86_64_gnullvm, windows_x86_64_msvc, zeroize
+
+--------------------------------------------------------------------------------
+
+(Apache-2.0 OR MIT) AND Unicode-3.0
+------------------------------------
+
+unicode-ident v1.0.22 — David Tolnay
+
+--------------------------------------------------------------------------------
+
+Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT
+----------------------------------------------------
+
+Used under the MIT licence:
+
+wasi, wasip2, wit-bindgen
+
+--------------------------------------------------------------------------------
+
+Apache-2.0 OR BSD-2-Clause OR MIT
+----------------------------------
+
+Used under the MIT licence:
+
+zerocopy, zerocopy-derive
+
+--------------------------------------------------------------------------------
+
+Apache-2.0 OR BSL-1.0
+----------------------
+
+ryu v1.0.22 — David Tolnay
+
+Used under the Boost Software Licence 1.0.
+
+--------------------------------------------------------------------------------
+
+Apache-2.0 OR ISC OR MIT
+-------------------------
+
+Used under the MIT licence:
+
+hyper-rustls, rustls
+
+--------------------------------------------------------------------------------
+
+Apache-2.0 OR LGPL-2.1-or-later OR MIT
+---------------------------------------
+
+Used under the MIT licence:
+
+r-efi
+
+--------------------------------------------------------------------------------
+
+Apache-2.0 OR MIT OR MPL-2.0
+-----------------------------
+
+Used under the MIT licence:
+
+htmlescape v0.3.1 — Viktor Dahl
+
+--------------------------------------------------------------------------------
+
+Apache-2.0 OR MIT OR Zlib
+--------------------------
+
+Used under the MIT licence:
+
+lru-slab, tinyvec, tinyvec_macros
+
+--------------------------------------------------------------------------------
+
+BSD-3-Clause
+------------
+
+subtle v2.6.1 — Isis Lovecruft, Henry de Valence
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the conditions of the BSD
+3-Clause licence are met. See <https://opensource.org/licenses/BSD-3-Clause>.
+
+--------------------------------------------------------------------------------
+
+CDLA-Permissive-2.0
+--------------------
+
+webpki-roots v1.0.6
+
+Licensed under the Community Data License Agreement – Permissive, Version 2.0.
+See <https://cdla.dev/permissive-2-0/>.
+
+--------------------------------------------------------------------------------
+
+ISC
+---
+
+rustls-webpki v0.103.9
+untrusted v0.9.0 — Brian Smith
+
+Licensed under the ISC licence.
+See <https://opensource.org/licenses/ISC>.
+
+--------------------------------------------------------------------------------
+
+MIT
+---
+
+bytes, cfg_aliases, dotenvy, generic-array, h2, headers, headers-core,
+http-body, http-body-util, hyper, hyper-util, mime_guess, mio, nu-ansi-term,
+sharded-slab, slab, synstructure, tokio, tokio-macros, tokio-util, tower,
+tower-http, tower-layer, tower-service, tracing, tracing-attributes,
+tracing-core, tracing-log, tracing-subscriber, try-lock, urlencoding,
+valuable, want, xml, xml-rs, xmltree, zmij
+
+Licensed under the MIT licence.
+See <https://opensource.org/licenses/MIT>.
+
+--------------------------------------------------------------------------------
+
+MIT OR Unlicense
+----------------
+
+Used under the MIT licence:
+
+aho-corasick, memchr — Andrew Gallant
+
+--------------------------------------------------------------------------------
+
+Unicode-3.0
+-----------
+
+icu_collections, icu_locale_core, icu_normalizer, icu_normalizer_data,
+icu_properties, icu_properties_data, icu_provider, litemap, potential_utf,
+tinystr, writeable, yoke, yoke-derive, zerofrom, zerofrom-derive, zerotrie,
+zerovec, zerovec-derive
+
+Licensed under the Unicode Licence Agreement – Data Files and Software.
+See <https://www.unicode.org/license.txt>.
+
+--------------------------------------------------------------------------------
+
+Full licence texts for MIT and Apache-2.0 are available in the
+respective crate repositories and at:
+  MIT:        https://opensource.org/licenses/MIT
+  Apache-2.0: https://www.apache.org/licenses/LICENSE-2.0

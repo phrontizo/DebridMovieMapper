@@ -234,6 +234,6 @@ To fix this, delete the torrent from Real-Debrid and find an alternative release
 - **Unrestrict responses**: Cached for 1 hour to reduce API load
 - **TMDB metadata**: Persisted to embedded database (`metadata.db`) indefinitely
 
-## License
+## Licence
 
 MIT

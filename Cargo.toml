@@ -2,6 +2,7 @@
 name = "debridmoviemapper"
 version = "1.0.2"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }

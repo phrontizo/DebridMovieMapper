@@ -54,6 +54,7 @@ FROM scratch
 # Copy system CA certificates so that the app can make HTTPS requests
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /app/debridmoviemapper /debridmoviemapper
+COPY LICENCE THIRD-PARTY-NOTICES /
 
 # Expose the WebDAV port (default 8080)
 EXPOSE 8080
