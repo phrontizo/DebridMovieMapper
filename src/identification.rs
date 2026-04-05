@@ -977,8 +977,7 @@ mod tests {
             filename: "ted.S02E01.Talk.Dirty.to.Me.1080p.AMZN.WEB-DL.DDP5.1.H.264-RAWR.mkv"
                 .to_string(),
             original_filename:
-                "ted.S02E01.Talk.Dirty.to.Me.1080p.AMZN.WEB-DL.DDP5.1.H.264-RAWR.mkv"
-                    .to_string(),
+                "ted.S02E01.Talk.Dirty.to.Me.1080p.AMZN.WEB-DL.DDP5.1.H.264-RAWR.mkv".to_string(),
             hash: "hash_ted".to_string(),
             bytes: 3_000_000_000,
             original_bytes: 3_000_000_000,
@@ -1119,7 +1118,10 @@ mod tests {
         // year = None (no year in filename)
         let got = best_scored_result(&results, &nq, &None, true);
         // Should pick id=1 (exact title match "Ted" == "ted"), not None
-        assert!(got.is_some(), "short title with no year should still match exact title");
+        assert!(
+            got.is_some(),
+            "short title with no year should still match exact title"
+        );
         assert_eq!(got.unwrap().id, 1);
     }
 
@@ -1139,7 +1141,10 @@ mod tests {
         ];
         let nq = normalize_title("UC");
         let got = best_scored_result(&results, &nq, &None, true);
-        assert!(got.is_none(), "short title with no exact match should still return None");
+        assert!(
+            got.is_none(),
+            "short title with no exact match should still return None"
+        );
     }
 
     #[test]
