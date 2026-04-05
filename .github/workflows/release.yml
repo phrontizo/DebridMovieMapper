@@ -4,6 +4,8 @@ on:
   push:
     tags: ["v*"]
 
+permissions: {}
+
 env:
   GHCR_IMAGE: ghcr.io/phrontizo/debridmoviemapper
   DOCKERHUB_IMAGE: phrontizo/debridmoviemapper
@@ -11,6 +13,8 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
 
@@ -29,6 +33,8 @@ jobs:
   test:
     needs: lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
 

@@ -628,7 +628,7 @@ mod tests {
         // If the signature changes this will not compile.
         let _: Result<serde_json::Value, _> = client
             .fetch_with_retry(
-                || client.client.get("http://example.com"),
+                || client.client.get("https://example.com"),
                 &[
                     reqwest::StatusCode::NOT_FOUND,
                     reqwest::StatusCode::SERVICE_UNAVAILABLE,
@@ -640,7 +640,7 @@ mod tests {
     #[allow(dead_code)]
     async fn _assert_fetch_with_retry_accepts_empty_terminal_statuses(client: &RealDebridClient) {
         let _: Result<serde_json::Value, _> = client
-            .fetch_with_retry(|| client.client.get("http://example.com"), &[])
+            .fetch_with_retry(|| client.client.get("https://example.com"), &[])
             .await;
     }
 
