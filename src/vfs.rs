@@ -2,6 +2,7 @@ use crate::rd_client::TorrentInfo;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -128,12 +129,45 @@ pub enum MediaType {
     Show,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MediaMetadata {
     pub title: String,
     pub year: Option<String>,
     pub media_type: MediaType,
     pub external_id: Option<String>,
+}
+
+impl PartialEq for MediaMetadata {
+    fn eq(&self, other: &Self) -> bool {
+        if self.media_type != other.media_type {
+            return false;
+        }
+        match (&self.external_id, &other.external_id) {
+            // Same external ID → same media, regardless of title/year differences
+            (Some(a), Some(b)) => a == b,
+            // Both unidentified → compare title case-insensitively + year
+            (None, None) => {
+                self.title.eq_ignore_ascii_case(&other.title) && self.year == other.year
+            }
+            // One identified, one not → different
+            _ => false,
+        }
+    }
+}
+
+impl Eq for MediaMetadata {}
+
+impl Hash for MediaMetadata {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.media_type.hash(state);
+        match &self.external_id {
+            Some(id) => id.hash(state),
+            None => {
+                self.title.to_ascii_lowercase().hash(state);
+                self.year.hash(state);
+            }
+        }
+    }
 }
 
 pub struct DebridVfs {
@@ -1012,6 +1046,190 @@ mod tests {
             {
                 assert!(movie_children.contains_key("Same Title [tmdbid-1]"));
                 assert!(movie_children.contains_key("Same Title [tmdbid-2]"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_show_case_insensitive_grouping() {
+        // Bug: "ted" and "Ted" (different casing, no TMDB ID) created separate
+        // show folders instead of being merged into one.
+        let torrents = vec![
+            (
+                TorrentInfo {
+                    id: "s1".to_string(),
+                    filename: "Ted.S01E01.Just.Say.Yes.1080p.mkv".to_string(),
+                    original_filename: "Ted.S01E01.Just.Say.Yes.1080p.mkv".to_string(),
+                    hash: "h_s1".to_string(),
+                    bytes: 2000,
+                    original_bytes: 2000,
+                    host: "host".to_string(),
+                    split: 1,
+                    progress: 100.0,
+                    status: "downloaded".to_string(),
+                    added: "2024-01-01".to_string(),
+                    files: vec![TorrentFile {
+                        id: 1,
+                        path: "/Ted.S01E01.Just.Say.Yes.1080p.mkv".to_string(),
+                        bytes: 2000,
+                        selected: 1,
+                    }],
+                    links: vec!["http://link_s1".to_string()],
+                    ended: Some("2024-01-01".to_string()),
+                },
+                MediaMetadata {
+                    title: "Ted".to_string(),
+                    year: Some("2024".to_string()),
+                    media_type: MediaType::Show,
+                    external_id: None,
+                },
+            ),
+            (
+                TorrentInfo {
+                    id: "s2".to_string(),
+                    filename: "ted.S02E01.Talk.Dirty.to.Me.1080p.mkv".to_string(),
+                    original_filename: "ted.S02E01.Talk.Dirty.to.Me.1080p.mkv".to_string(),
+                    hash: "h_s2".to_string(),
+                    bytes: 2500,
+                    original_bytes: 2500,
+                    host: "host".to_string(),
+                    split: 1,
+                    progress: 100.0,
+                    status: "downloaded".to_string(),
+                    added: "2024-06-01".to_string(),
+                    files: vec![TorrentFile {
+                        id: 1,
+                        path: "/ted.S02E01.Talk.Dirty.to.Me.1080p.mkv".to_string(),
+                        bytes: 2500,
+                        selected: 1,
+                    }],
+                    links: vec!["http://link_s2".to_string()],
+                    ended: Some("2024-06-01".to_string()),
+                },
+                MediaMetadata {
+                    title: "ted".to_string(),
+                    year: Some("2024".to_string()),
+                    media_type: MediaType::Show,
+                    external_id: None,
+                },
+            ),
+        ];
+
+        let vfs = DebridVfs::build(torrents);
+
+        if let VfsNode::Directory { children } = &vfs.root {
+            let shows = children.get("Shows").unwrap();
+            if let VfsNode::Directory {
+                children: show_children,
+            } = shows
+            {
+                // Should be exactly ONE show folder, not two
+                assert_eq!(
+                    show_children.len(),
+                    1,
+                    "Expected 1 show folder but got {}: {:?}",
+                    show_children.len(),
+                    show_children.keys().collect::<Vec<_>>()
+                );
+                // That single folder should contain both seasons
+                let show_dir = show_children.values().next().unwrap();
+                if let VfsNode::Directory { children: seasons } = show_dir {
+                    assert!(
+                        seasons.contains_key("Season 01"),
+                        "Season 01 missing: {:?}",
+                        seasons.keys().collect::<Vec<_>>()
+                    );
+                    assert!(
+                        seasons.contains_key("Season 02"),
+                        "Season 02 missing: {:?}",
+                        seasons.keys().collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_show_same_tmdb_id_different_title_case() {
+        // When two torrents have the same TMDB external_id but different title
+        // casing (e.g. TMDB returned "Ted" one time and "ted" another), they
+        // should be grouped into a single folder.
+        let torrents = vec![
+            (
+                TorrentInfo {
+                    id: "t1".to_string(),
+                    filename: "Ted.S01E01.mkv".to_string(),
+                    original_filename: "Ted.S01E01.mkv".to_string(),
+                    hash: "ht1".to_string(),
+                    bytes: 2000,
+                    original_bytes: 2000,
+                    host: "host".to_string(),
+                    split: 1,
+                    progress: 100.0,
+                    status: "downloaded".to_string(),
+                    added: "2024-01-01".to_string(),
+                    files: vec![TorrentFile {
+                        id: 1,
+                        path: "/Ted.S01E01.mkv".to_string(),
+                        bytes: 2000,
+                        selected: 1,
+                    }],
+                    links: vec!["http://link_t1".to_string()],
+                    ended: Some("2024-01-01".to_string()),
+                },
+                MediaMetadata {
+                    title: "Ted".to_string(),
+                    year: Some("2024".to_string()),
+                    media_type: MediaType::Show,
+                    external_id: Some("tmdb:253472".to_string()),
+                },
+            ),
+            (
+                TorrentInfo {
+                    id: "t2".to_string(),
+                    filename: "ted.S02E01.mkv".to_string(),
+                    original_filename: "ted.S02E01.mkv".to_string(),
+                    hash: "ht2".to_string(),
+                    bytes: 2500,
+                    original_bytes: 2500,
+                    host: "host".to_string(),
+                    split: 1,
+                    progress: 100.0,
+                    status: "downloaded".to_string(),
+                    added: "2024-06-01".to_string(),
+                    files: vec![TorrentFile {
+                        id: 1,
+                        path: "/ted.S02E01.mkv".to_string(),
+                        bytes: 2500,
+                        selected: 1,
+                    }],
+                    links: vec!["http://link_t2".to_string()],
+                    ended: Some("2024-06-01".to_string()),
+                },
+                MediaMetadata {
+                    title: "ted".to_string(),
+                    year: Some("2024".to_string()),
+                    media_type: MediaType::Show,
+                    external_id: Some("tmdb:253472".to_string()),
+                },
+            ),
+        ];
+
+        let vfs = DebridVfs::build(torrents);
+
+        if let VfsNode::Directory { children } = &vfs.root {
+            let shows = children.get("Shows").unwrap();
+            if let VfsNode::Directory {
+                children: show_children,
+            } = shows
+            {
+                assert_eq!(
+                    show_children.len(),
+                    1,
+                    "Same TMDB ID should produce 1 folder, got {}: {:?}",
+                    show_children.len(),
+                    show_children.keys().collect::<Vec<_>>()
+                );
             }
         }
     }

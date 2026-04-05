@@ -112,7 +112,7 @@ fn best_scored_result<'a>(
                             .map(|rd| rd.starts_with(y))
                             .unwrap_or(false)
                     })
-                    .unwrap_or(false);
+                    .unwrap_or(true); // No year in filename → exact title alone is sufficient
                 title_matches && year_matches
             })
             .max_by(|a, b| {
@@ -964,6 +964,49 @@ mod tests {
         assert_eq!(metadata.media_type, MediaType::Movie);
     }
 
+    #[tokio::test]
+    #[ignore]
+    async fn test_short_title_ted_identified() {
+        dotenvy::dotenv().ok();
+        let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
+        let tmdb_client = TmdbClient::new(tmdb_api_key);
+
+        // "ted" is a 3-char title with no year — should still identify via TMDB
+        let info = TorrentInfo {
+            id: "ted_id".to_string(),
+            filename: "ted.S02E01.Talk.Dirty.to.Me.1080p.AMZN.WEB-DL.DDP5.1.H.264-RAWR.mkv"
+                .to_string(),
+            original_filename:
+                "ted.S02E01.Talk.Dirty.to.Me.1080p.AMZN.WEB-DL.DDP5.1.H.264-RAWR.mkv"
+                    .to_string(),
+            hash: "hash_ted".to_string(),
+            bytes: 3_000_000_000,
+            original_bytes: 3_000_000_000,
+            host: "host".to_string(),
+            split: 1,
+            progress: 100.0,
+            status: "downloaded".to_string(),
+            added: "2024-06-01".to_string(),
+            files: vec![TorrentFile {
+                id: 1,
+                path: "ted.S02E01.Talk.Dirty.to.Me.1080p.AMZN.WEB-DL.DDP5.1.H.264-RAWR.mkv"
+                    .to_string(),
+                bytes: 3_000_000_000,
+                selected: 1,
+            }],
+            links: vec!["http://link_ted".to_string()],
+            ended: Some("2024-06-01".to_string()),
+        };
+
+        let metadata = identify_torrent(&info, &tmdb_client).await;
+
+        assert_eq!(metadata.media_type, MediaType::Show);
+        assert!(
+            metadata.external_id.is_some(),
+            "Short title 'ted' should be identified via TMDB, got external_id=None"
+        );
+    }
+
     // --- Helper for best_scored_result / select_best_match tests ---
 
     fn make_result(
@@ -1055,6 +1098,48 @@ mod tests {
         let got = best_scored_result(&results, &nq, &Some("1990".to_string()), true);
         // Only id=2 has exact title "it" AND year 1990
         assert_eq!(got.unwrap().id, 2);
+    }
+
+    #[test]
+    fn best_scored_result_short_title_no_year_allows_exact_match() {
+        // Short title "ted" with NO year in the filename should still match
+        // an exact TMDB result rather than failing identification entirely.
+        let results = vec![
+            make_result(1, "Ted", Some("2024-01-11"), 80.0, Some(6.5), Some(500)),
+            make_result(
+                2,
+                "Ted Lasso",
+                Some("2020-08-14"),
+                90.0,
+                Some(8.0),
+                Some(3000),
+            ),
+        ];
+        let nq = normalize_title("ted");
+        // year = None (no year in filename)
+        let got = best_scored_result(&results, &nq, &None, true);
+        // Should pick id=1 (exact title match "Ted" == "ted"), not None
+        assert!(got.is_some(), "short title with no year should still match exact title");
+        assert_eq!(got.unwrap().id, 1);
+    }
+
+    #[test]
+    fn best_scored_result_short_title_no_year_rejects_partial() {
+        // Short title "UC" with NO year — no exact title match exists, should still return None
+        let results = vec![
+            make_result(
+                1,
+                "Gundam Unicorn",
+                Some("2010-02-20"),
+                50.0,
+                Some(7.0),
+                Some(200),
+            ),
+            make_result(2, "UC Browser", None, 10.0, None, None),
+        ];
+        let nq = normalize_title("UC");
+        let got = best_scored_result(&results, &nq, &None, true);
+        assert!(got.is_none(), "short title with no exact match should still return None");
     }
 
     #[test]
