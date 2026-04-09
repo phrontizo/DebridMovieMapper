@@ -103,8 +103,6 @@ impl DavFileSystem for DebridFileSystem {
                     cdn_url: None,
                     buffer: Bytes::new(),
                     buffer_start: 0,
-                    prefetch: None,
-                    prefetch_start: 0,
                 }) as Box<dyn DavFile>),
                 VfsNode::VirtualFile { content } => Ok(Box::new(VirtualFile {
                     content: Bytes::from(content),
@@ -232,9 +230,7 @@ fn should_repair_on_unrestrict_error(status: Option<reqwest::StatusCode>) -> boo
 }
 
 /// A media file that lazily unrestricts its RD link and proxies CDN bytes.
-/// The CDN URL is cached per open instance. Reads use a 2MB read-ahead buffer.
-/// After each buffer fill a background prefetch is kicked off for the next chunk
-/// so that sequential playback rarely blocks on a CDN round-trip.
+/// The CDN URL is cached per open instance. Reads use a 2 MB read-ahead buffer.
 #[derive(Debug)]
 struct ProxiedMediaFile {
     name: String,
@@ -248,12 +244,6 @@ struct ProxiedMediaFile {
     cdn_url: Option<String>,
     buffer: Bytes,
     buffer_start: u64,
-    /// Background task pre-fetching the next buffer chunk for zero-latency sequential reads.
-    /// Dropping the handle **detaches** the task (Tokio behaviour) — it does not abort it.
-    /// Explicit abort is called on seek and on CDN URL expiry via `abort_prefetch()`.
-    prefetch: Option<tokio::task::JoinHandle<Option<Bytes>>>,
-    /// CDN byte offset where the in-flight prefetch starts.
-    prefetch_start: u64,
 }
 
 impl ProxiedMediaFile {
@@ -331,7 +321,7 @@ impl ProxiedMediaFile {
         }
     }
 
-    /// Fetch bytes from CDN, using the read-ahead buffer and background prefetch.
+    /// Fetch bytes from CDN, using the read-ahead buffer.
     async fn fetch_bytes(&mut self, len: usize) -> Result<Bytes, FsError> {
         if self.pos >= self.file_size {
             return Ok(Bytes::new());
@@ -350,41 +340,13 @@ impl ProxiedMediaFile {
             return Ok(data);
         }
 
-        // Buffer miss — try the in-flight prefetch first before hitting the CDN.
-        if let Some(handle) = self.prefetch.take() {
-            if self.prefetch_start == pos {
-                match handle.await {
-                    Ok(Some(body)) => {
-                        self.buffer = body;
-                        self.buffer_start = pos;
-                        self.start_prefetch();
-                        let to_read = std::cmp::min(len, self.buffer.len());
-                        let data = self.buffer.slice(..to_read);
-                        self.pos += to_read as u64;
-                        return Ok(data);
-                    }
-                    _ => {
-                        // The prefetch task already completed with a None result (network
-                        // error inside the spawned task) or was cancelled by the runtime.
-                        // The handle is consumed by `.take()` above; dropping it here
-                        // does not detach a live task — it was already done.
-                        // Fall through to a direct CDN fetch.
-                    }
-                }
-            } else {
-                // A seek moved us away from where the prefetch was headed.
-                handle.abort();
-            }
-        }
-
-        // Direct CDN fetch (with retry on expired URL).
+        // Buffer miss — fetch from CDN (with retry on expired URL).
         let fetch_size = len.clamp(BUFFER_SIZE, MAX_FETCH_SIZE) as u64;
         let range_end = std::cmp::min(pos + fetch_size - 1, self.file_size - 1);
         let body = self.fetch_cdn_range(pos, range_end).await?;
 
         self.buffer = body;
         self.buffer_start = pos;
-        self.start_prefetch();
 
         let to_read = std::cmp::min(len, self.buffer.len());
         let data = self.buffer.slice(..to_read);
@@ -424,7 +386,6 @@ impl ProxiedMediaFile {
                     self.rd_client
                         .invalidate_unrestrict_cache(&self.rd_link)
                         .await;
-                    self.abort_prefetch();
                     if attempt == 0 {
                         continue;
                     }
@@ -444,7 +405,6 @@ impl ProxiedMediaFile {
                 self.rd_client
                     .invalidate_unrestrict_cache(&self.rd_link)
                     .await;
-                self.abort_prefetch();
                 if attempt == 0 {
                     continue;
                 }
@@ -462,55 +422,6 @@ impl ProxiedMediaFile {
         Err(FsError::GeneralFailure)
     }
 
-    /// Abort any in-flight prefetch task.  A no-op when no prefetch is running.
-    fn abort_prefetch(&mut self) {
-        if let Some(handle) = self.prefetch.take() {
-            handle.abort();
-        }
-    }
-
-    /// Kick off a background task to fetch the chunk immediately following the
-    /// current buffer.  Called after every successful buffer fill so that the
-    /// next sequential read can be served from memory without waiting for a CDN
-    /// round-trip.
-    ///
-    /// The prefetch always fetches exactly `BUFFER_SIZE` bytes regardless of what
-    /// the next `read_bytes(len)` call will request.  If the caller requests more
-    /// than `BUFFER_SIZE`, the prefetch covers only part of the next read and a
-    /// second CDN round-trip will still be needed for the remainder.
-    ///
-    /// No-ops when: we are already at EOF, or the CDN URL is not yet resolved
-    /// (it will be resolved on the next explicit read).
-    fn start_prefetch(&mut self) {
-        let next_start = self.buffer_start + self.buffer.len() as u64;
-        if next_start >= self.file_size {
-            return;
-        }
-        let cdn_url = match &self.cdn_url {
-            Some(url) => url.clone(),
-            None => return,
-        };
-        let client = self.http_client.clone();
-        let file_size = self.file_size;
-        let range_end = std::cmp::min(next_start + BUFFER_SIZE as u64 - 1, file_size - 1);
-
-        let handle = tokio::spawn(async move {
-            let resp = client
-                .get(&cdn_url)
-                .header("Range", format!("bytes={}-{}", next_start, range_end))
-                .send()
-                .await
-                .ok()?;
-            let status = resp.status();
-            if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-                return None;
-            }
-            resp.bytes().await.ok()
-        });
-
-        self.prefetch = Some(handle);
-        self.prefetch_start = next_start;
-    }
 }
 
 impl DavFile for ProxiedMediaFile {
@@ -562,8 +473,6 @@ impl DavFile for ProxiedMediaFile {
 
     fn seek(&mut self, pos: std::io::SeekFrom) -> FsFuture<'_, u64> {
         async move {
-            // Abort any background prefetch — it was fetching for the old position.
-            self.abort_prefetch();
             let new_pos = match pos {
                 std::io::SeekFrom::Start(p) => p,
                 std::io::SeekFrom::Current(p) => {
@@ -617,8 +526,6 @@ mod tests {
             cdn_url: None,
             buffer: Bytes::new(),
             buffer_start: 0,
-            prefetch: None,
-            prefetch_start: 0,
         };
     }
 
@@ -748,63 +655,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fetch_bytes_starts_prefetch_after_buffer_fill() {
-        // Verify that after loading a buffer chunk from the CDN, fetch_bytes
-        // kicks off a background prefetch for the next chunk so that the next
-        // buffer miss has zero (or near-zero) latency.
-        let source = include_str!("dav_fs.rs");
-
-        assert!(
-            source.contains("fn start_prefetch"),
-            "start_prefetch function must exist for concurrent prefetching"
-        );
-
-        let fn_start = source
-            .find("fn fetch_bytes")
-            .expect("fetch_bytes function must exist");
-        let fn_body = &source[fn_start..];
-        let fn_end = fn_body[1..]
-            .find("\n    async fn ")
-            .map(|i| i + 1)
-            .unwrap_or(fn_body.len());
-        let fn_source = &fn_body[..fn_end];
-
-        assert!(
-            fn_source.contains("start_prefetch"),
-            "fetch_bytes must call start_prefetch after loading the buffer"
-        );
-    }
-
-    #[test]
-    fn seek_aborts_prefetch_on_proxied_media_file() {
-        // Verify that seeking a ProxiedMediaFile aborts any in-flight prefetch.
-        // Without this, a seek would leave a stale background task running that
-        // fetches bytes from the wrong position, wasting bandwidth and memory.
-        let source = include_str!("dav_fs.rs");
-
-        // Find the ProxiedMediaFile's seek impl (it follows the DavFile impl for
-        // ProxiedMediaFile, which starts after "impl DavFile for ProxiedMediaFile")
-        let impl_start = source
-            .find("impl DavFile for ProxiedMediaFile")
-            .expect("DavFile impl for ProxiedMediaFile must exist");
-        let impl_body = &source[impl_start..];
-        let seek_start = impl_body
-            .find("fn seek")
-            .expect("seek must be in DavFile impl for ProxiedMediaFile");
-        let seek_body = &impl_body[seek_start..];
-        let seek_end = seek_body[1..]
-            .find("\n    fn ")
-            .map(|i| i + 1)
-            .unwrap_or(seek_body.len());
-        let seek_source = &seek_body[..seek_end];
-
-        assert!(
-            seek_source.contains("abort") || seek_source.contains("prefetch.take"),
-            "ProxiedMediaFile::seek must abort any in-flight prefetch (found neither \
-             `.abort()` nor `prefetch.take`)"
-        );
-    }
 
     #[test]
     fn find_node_in_rejects_dotdot_traversal() {
