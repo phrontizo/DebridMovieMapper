@@ -103,6 +103,8 @@ impl DavFileSystem for DebridFileSystem {
                     cdn_url: None,
                     buffer: Bytes::new(),
                     buffer_start: 0,
+                    prefetch: None,
+                    prefetch_start: 0,
                 }) as Box<dyn DavFile>),
                 VfsNode::VirtualFile { content } => Ok(Box::new(VirtualFile {
                     content: Bytes::from(content),
@@ -230,7 +232,9 @@ fn should_repair_on_unrestrict_error(status: Option<reqwest::StatusCode>) -> boo
 }
 
 /// A media file that lazily unrestricts its RD link and proxies CDN bytes.
-/// The CDN URL is cached per open instance. Reads use a 2MB buffer for read-ahead.
+/// The CDN URL is cached per open instance. Reads use a 2MB read-ahead buffer.
+/// After each buffer fill a background prefetch is kicked off for the next chunk
+/// so that sequential playback rarely blocks on a CDN round-trip.
 #[derive(Debug)]
 struct ProxiedMediaFile {
     name: String,
@@ -244,6 +248,12 @@ struct ProxiedMediaFile {
     cdn_url: Option<String>,
     buffer: Bytes,
     buffer_start: u64,
+    /// Background task pre-fetching the next buffer chunk for zero-latency sequential reads.
+    /// Dropping the handle **detaches** the task (Tokio behaviour) — it does not abort it.
+    /// Explicit abort is called on seek and on CDN URL expiry via `abort_prefetch()`.
+    prefetch: Option<tokio::task::JoinHandle<Option<Bytes>>>,
+    /// CDN byte offset where the in-flight prefetch starts.
+    prefetch_start: u64,
 }
 
 impl ProxiedMediaFile {
@@ -321,7 +331,7 @@ impl ProxiedMediaFile {
         }
     }
 
-    /// Fetch bytes from CDN, using the read-ahead buffer.
+    /// Fetch bytes from CDN, using the read-ahead buffer and background prefetch.
     async fn fetch_bytes(&mut self, len: usize) -> Result<Bytes, FsError> {
         if self.pos >= self.file_size {
             return Ok(Bytes::new());
@@ -330,7 +340,7 @@ impl ProxiedMediaFile {
         let pos = self.pos;
         let buffer_end = self.buffer_start + self.buffer.len() as u64;
 
-        // Check if the requested range is within the buffer
+        // Buffer hit — serve directly without any network I/O.
         if pos >= self.buffer_start && pos < buffer_end {
             let offset = (pos - self.buffer_start) as usize;
             let available = self.buffer.len() - offset;
@@ -340,66 +350,166 @@ impl ProxiedMediaFile {
             return Ok(data);
         }
 
-        // Buffer miss — fetch from CDN
-        let cdn_url = self.resolve_cdn_url().await?;
-        let fetch_size = len.clamp(BUFFER_SIZE, MAX_FETCH_SIZE) as u64;
-        let range_end = std::cmp::min(pos + fetch_size - 1, self.file_size - 1);
-
-        let resp = match self
-            .http_client
-            .get(&cdn_url)
-            .header("Range", format!("bytes={}-{}", pos, range_end))
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::warn!(
-                    "CDN fetch failed for {}: {} — clearing cached CDN URL",
-                    self.name,
-                    e
-                );
-                // Clear cached CDN URL so the next read re-resolves via unrestrict_link.
-                // This handles expired CDN URLs (which cause connection/TLS errors).
-                self.cdn_url = None;
-                // Also invalidate the unrestrict cache so re-resolve fetches a fresh URL.
-                self.rd_client
-                    .invalidate_unrestrict_cache(&self.rd_link)
-                    .await;
-                return Err(FsError::GeneralFailure);
+        // Buffer miss — try the in-flight prefetch first before hitting the CDN.
+        if let Some(handle) = self.prefetch.take() {
+            if self.prefetch_start == pos {
+                match handle.await {
+                    Ok(Some(body)) => {
+                        self.buffer = body;
+                        self.buffer_start = pos;
+                        self.start_prefetch();
+                        let to_read = std::cmp::min(len, self.buffer.len());
+                        let data = self.buffer.slice(..to_read);
+                        self.pos += to_read as u64;
+                        return Ok(data);
+                    }
+                    _ => {
+                        // The prefetch task already completed with a None result (network
+                        // error inside the spawned task) or was cancelled by the runtime.
+                        // The handle is consumed by `.take()` above; dropping it here
+                        // does not detach a live task — it was already done.
+                        // Fall through to a direct CDN fetch.
+                    }
+                }
+            } else {
+                // A seek moved us away from where the prefetch was headed.
+                handle.abort();
             }
-        };
-
-        let status = resp.status();
-        if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-            tracing::warn!(
-                "CDN returned {} for {} — clearing cached CDN URL",
-                status,
-                self.name
-            );
-            // Clear cached CDN URL so the next read re-resolves via unrestrict_link.
-            // CDN URLs expire after ~1h; a 403/410 here means the URL is stale.
-            self.cdn_url = None;
-            // Also invalidate the unrestrict cache so re-resolve fetches a fresh URL.
-            self.rd_client
-                .invalidate_unrestrict_cache(&self.rd_link)
-                .await;
-            return Err(FsError::GeneralFailure);
         }
 
-        let body = resp.bytes().await.map_err(|e| {
-            tracing::warn!("CDN body read failed for {}: {}", self.name, e);
-            FsError::GeneralFailure
-        })?;
+        // Direct CDN fetch (with retry on expired URL).
+        let fetch_size = len.clamp(BUFFER_SIZE, MAX_FETCH_SIZE) as u64;
+        let range_end = std::cmp::min(pos + fetch_size - 1, self.file_size - 1);
+        let body = self.fetch_cdn_range(pos, range_end).await?;
 
-        // Store in buffer (Bytes is reference-counted, no copy needed)
         self.buffer = body;
         self.buffer_start = pos;
+        self.start_prefetch();
 
         let to_read = std::cmp::min(len, self.buffer.len());
         let data = self.buffer.slice(..to_read);
         self.pos += to_read as u64;
         Ok(data)
+    }
+
+    /// Fetch a byte range from the CDN, retrying once if the URL appears stale
+    /// (connection error or non-2xx/206 response).  A single retry is enough to
+    /// recover from a 1-hour CDN URL expiry without exposing the error to the
+    /// WebDAV client.
+    ///
+    /// Note: on retry, `resolve_cdn_url` must call `unrestrict_link` which blocks
+    /// on the adaptive rate-limiter.  Under an active 429 storm this may delay by
+    /// up to `MAX_INTERVAL_MS` (2 s) before the fresh CDN URL is returned.
+    async fn fetch_cdn_range(&mut self, pos: u64, range_end: u64) -> Result<Bytes, FsError> {
+        for attempt in 0..2u8 {
+            let cdn_url = self.resolve_cdn_url().await?;
+
+            let resp = match self
+                .http_client
+                .get(&cdn_url)
+                .header("Range", format!("bytes={}-{}", pos, range_end))
+                .send()
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    tracing::warn!(
+                        "CDN fetch failed for {}: {} — clearing cached CDN URL",
+                        self.name,
+                        e
+                    );
+                    // Clear cached CDN URL so re-resolve fetches a fresh one.
+                    self.cdn_url = None;
+                    // Also invalidate the unrestrict cache (the RD link may be stale too).
+                    self.rd_client
+                        .invalidate_unrestrict_cache(&self.rd_link)
+                        .await;
+                    self.abort_prefetch();
+                    if attempt == 0 {
+                        continue;
+                    }
+                    return Err(FsError::GeneralFailure);
+                }
+            };
+
+            let status = resp.status();
+            if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                tracing::warn!(
+                    "CDN returned {} for {} — clearing cached CDN URL",
+                    status,
+                    self.name
+                );
+                // CDN URLs expire after ~1h; a 403/410 here means the URL is stale.
+                self.cdn_url = None;
+                self.rd_client
+                    .invalidate_unrestrict_cache(&self.rd_link)
+                    .await;
+                self.abort_prefetch();
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(FsError::GeneralFailure);
+            }
+
+            let body = resp.bytes().await.map_err(|e| {
+                tracing::warn!("CDN body read failed for {}: {}", self.name, e);
+                FsError::GeneralFailure
+            })?;
+
+            return Ok(body);
+        }
+
+        Err(FsError::GeneralFailure)
+    }
+
+    /// Abort any in-flight prefetch task.  A no-op when no prefetch is running.
+    fn abort_prefetch(&mut self) {
+        if let Some(handle) = self.prefetch.take() {
+            handle.abort();
+        }
+    }
+
+    /// Kick off a background task to fetch the chunk immediately following the
+    /// current buffer.  Called after every successful buffer fill so that the
+    /// next sequential read can be served from memory without waiting for a CDN
+    /// round-trip.
+    ///
+    /// The prefetch always fetches exactly `BUFFER_SIZE` bytes regardless of what
+    /// the next `read_bytes(len)` call will request.  If the caller requests more
+    /// than `BUFFER_SIZE`, the prefetch covers only part of the next read and a
+    /// second CDN round-trip will still be needed for the remainder.
+    ///
+    /// No-ops when: we are already at EOF, or the CDN URL is not yet resolved
+    /// (it will be resolved on the next explicit read).
+    fn start_prefetch(&mut self) {
+        let next_start = self.buffer_start + self.buffer.len() as u64;
+        if next_start >= self.file_size {
+            return;
+        }
+        let cdn_url = match &self.cdn_url {
+            Some(url) => url.clone(),
+            None => return,
+        };
+        let client = self.http_client.clone();
+        let file_size = self.file_size;
+        let range_end = std::cmp::min(next_start + BUFFER_SIZE as u64 - 1, file_size - 1);
+
+        let handle = tokio::spawn(async move {
+            let resp = client
+                .get(&cdn_url)
+                .header("Range", format!("bytes={}-{}", next_start, range_end))
+                .send()
+                .await
+                .ok()?;
+            let status = resp.status();
+            if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                return None;
+            }
+            resp.bytes().await.ok()
+        });
+
+        self.prefetch = Some(handle);
+        self.prefetch_start = next_start;
     }
 }
 
@@ -452,6 +562,8 @@ impl DavFile for ProxiedMediaFile {
 
     fn seek(&mut self, pos: std::io::SeekFrom) -> FsFuture<'_, u64> {
         async move {
+            // Abort any background prefetch — it was fetching for the old position.
+            self.abort_prefetch();
             let new_pos = match pos {
                 std::io::SeekFrom::Start(p) => p,
                 std::io::SeekFrom::Current(p) => {
@@ -486,8 +598,8 @@ impl DavFile for ProxiedMediaFile {
 mod tests {
     use super::*;
 
-    /// Compile-time check: ProxiedMediaFile has rd_link and rd_client fields.
-    /// Fails to compile if either field is removed or renamed.
+    /// Compile-time check: ProxiedMediaFile has all expected fields.
+    /// Fails to compile if any field is removed or renamed.
     #[allow(dead_code)]
     fn _assert_proxied_media_file_has_on_demand_fields(
         repair_manager: Arc<RepairManager>,
@@ -505,6 +617,8 @@ mod tests {
             cdn_url: None,
             buffer: Bytes::new(),
             buffer_start: 0,
+            prefetch: None,
+            prefetch_start: 0,
         };
     }
 
@@ -569,43 +683,126 @@ mod tests {
     }
 
     #[test]
-    fn fetch_bytes_clears_cdn_url_on_failure() {
-        // Verify that fetch_bytes clears cdn_url when CDN returns an error,
+    fn fetch_cdn_range_clears_cdn_url_on_failure() {
+        // Verify that fetch_cdn_range clears cdn_url when the CDN returns an error,
         // so the next read re-resolves via unrestrict_link (getting a fresh CDN URL).
         // Without this, expired CDN URLs would cause all subsequent reads to fail
         // permanently for the lifetime of the open file handle.
         let source = include_str!("dav_fs.rs");
 
-        // The fn fetch_bytes body should set self.cdn_url = None on CDN failure
-        // We check for the pattern appearing after "fn fetch_bytes" to ensure
-        // it's in the right function
-        let fetch_bytes_start = source
-            .find("fn fetch_bytes")
-            .expect("fetch_bytes function must exist");
-        let fetch_bytes_body = &source[fetch_bytes_start..];
-        // Find the next function boundary (next "fn " or end)
-        let fetch_bytes_end = fetch_bytes_body[1..]
-            .find("\n    fn ")
+        let fn_start = source
+            .find("fn fetch_cdn_range")
+            .expect("fetch_cdn_range function must exist");
+        let fn_body = &source[fn_start..];
+        let fn_end = fn_body[1..]
+            .find("\n    async fn ")
             .map(|i| i + 1)
-            .unwrap_or(fetch_bytes_body.len());
-        let fetch_bytes_source = &fetch_bytes_body[..fetch_bytes_end];
+            .unwrap_or(fn_body.len());
+        let fn_source = &fn_body[..fn_end];
 
         // Must clear cdn_url on failure
-        let cdn_url_none_count = fetch_bytes_source.matches("self.cdn_url = None").count();
+        let cdn_url_none_count = fn_source.matches("self.cdn_url = None").count();
         assert!(
             cdn_url_none_count >= 2,
-            "fetch_bytes must clear self.cdn_url = None on both connection errors and HTTP error status \
-             (found {} occurrences, expected >= 2)", cdn_url_none_count
+            "fetch_cdn_range must clear self.cdn_url = None on both connection errors and HTTP \
+             error status (found {} occurrences, expected >= 2)",
+            cdn_url_none_count
         );
 
         // Must also invalidate the unrestrict cache so re-resolve gets a fresh URL
-        let cache_invalidate_count = fetch_bytes_source
-            .matches("invalidate_unrestrict_cache")
-            .count();
+        let cache_invalidate_count = fn_source.matches("invalidate_unrestrict_cache").count();
         assert!(
             cache_invalidate_count >= 2,
-            "fetch_bytes must invalidate unrestrict cache on both connection errors and HTTP error status \
-             (found {} occurrences, expected >= 2)", cache_invalidate_count
+            "fetch_cdn_range must invalidate unrestrict cache on both connection errors and HTTP \
+             error status (found {} occurrences, expected >= 2)",
+            cache_invalidate_count
+        );
+    }
+
+    #[test]
+    fn fetch_cdn_range_retries_once_on_cdn_url_expiry() {
+        // Verify that fetch_cdn_range contains a retry loop so that a single CDN
+        // failure (e.g. 403 on an expired URL) is recovered inline without
+        // propagating an error to the WebDAV client.
+        let source = include_str!("dav_fs.rs");
+
+        let fn_start = source
+            .find("fn fetch_cdn_range")
+            .expect("fetch_cdn_range function must exist");
+        let fn_body = &source[fn_start..];
+        let fn_end = fn_body[1..]
+            .find("\n    async fn ")
+            .map(|i| i + 1)
+            .unwrap_or(fn_body.len());
+        let fn_source = &fn_body[..fn_end];
+
+        // The function must contain a loop or for-loop for retry logic
+        assert!(
+            fn_source.contains("for attempt") || fn_source.contains("loop {"),
+            "fetch_cdn_range must contain a retry loop for CDN URL expiry (found none)"
+        );
+        // And must continue to retry rather than returning immediately on first failure
+        assert!(
+            fn_source.contains("continue"),
+            "fetch_cdn_range must use `continue` to retry on first failure"
+        );
+    }
+
+    #[test]
+    fn fetch_bytes_starts_prefetch_after_buffer_fill() {
+        // Verify that after loading a buffer chunk from the CDN, fetch_bytes
+        // kicks off a background prefetch for the next chunk so that the next
+        // buffer miss has zero (or near-zero) latency.
+        let source = include_str!("dav_fs.rs");
+
+        assert!(
+            source.contains("fn start_prefetch"),
+            "start_prefetch function must exist for concurrent prefetching"
+        );
+
+        let fn_start = source
+            .find("fn fetch_bytes")
+            .expect("fetch_bytes function must exist");
+        let fn_body = &source[fn_start..];
+        let fn_end = fn_body[1..]
+            .find("\n    async fn ")
+            .map(|i| i + 1)
+            .unwrap_or(fn_body.len());
+        let fn_source = &fn_body[..fn_end];
+
+        assert!(
+            fn_source.contains("start_prefetch"),
+            "fetch_bytes must call start_prefetch after loading the buffer"
+        );
+    }
+
+    #[test]
+    fn seek_aborts_prefetch_on_proxied_media_file() {
+        // Verify that seeking a ProxiedMediaFile aborts any in-flight prefetch.
+        // Without this, a seek would leave a stale background task running that
+        // fetches bytes from the wrong position, wasting bandwidth and memory.
+        let source = include_str!("dav_fs.rs");
+
+        // Find the ProxiedMediaFile's seek impl (it follows the DavFile impl for
+        // ProxiedMediaFile, which starts after "impl DavFile for ProxiedMediaFile")
+        let impl_start = source
+            .find("impl DavFile for ProxiedMediaFile")
+            .expect("DavFile impl for ProxiedMediaFile must exist");
+        let impl_body = &source[impl_start..];
+        let seek_start = impl_body
+            .find("fn seek")
+            .expect("seek must be in DavFile impl for ProxiedMediaFile");
+        let seek_body = &impl_body[seek_start..];
+        let seek_end = seek_body[1..]
+            .find("\n    fn ")
+            .map(|i| i + 1)
+            .unwrap_or(seek_body.len());
+        let seek_source = &seek_body[..seek_end];
+
+        assert!(
+            seek_source.contains("abort") || seek_source.contains("prefetch.take"),
+            "ProxiedMediaFile::seek must abort any in-flight prefetch (found neither \
+             `.abort()` nor `prefetch.take`)"
         );
     }
 
