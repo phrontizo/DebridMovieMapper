@@ -421,7 +421,6 @@ impl ProxiedMediaFile {
 
         Err(FsError::GeneralFailure)
     }
-
 }
 
 impl DavFile for ProxiedMediaFile {
@@ -654,7 +653,6 @@ mod tests {
             "fetch_cdn_range must use `continue` to retry on first failure"
         );
     }
-
 
     #[test]
     fn find_node_in_rejects_dotdot_traversal() {
