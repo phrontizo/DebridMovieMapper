@@ -354,14 +354,17 @@ impl ProxiedMediaFile {
         Ok(data)
     }
 
-    /// Fetch a byte range from the CDN, retrying once if the URL appears stale
-    /// (connection error or non-2xx/206 response).  A single retry is enough to
-    /// recover from a 1-hour CDN URL expiry without exposing the error to the
-    /// WebDAV client.
+    /// Fetch a byte range from the CDN with one retry per error type:
     ///
-    /// Note: on retry, `resolve_cdn_url` must call `unrestrict_link` which blocks
-    /// on the adaptive rate-limiter.  Under an active 429 storm this may delay by
-    /// up to `MAX_INTERVAL_MS` (2 s) before the fresh CDN URL is returned.
+    /// - **Connection error** (TCP failure, timeout): retry immediately with the
+    ///   same CDN URL — the URL is still valid, the error is transient.  The cache
+    ///   is intentionally left intact so concurrent readers do not all re-call
+    ///   `unrestrict_link` through the rate-limiter at once.
+    ///
+    /// - **HTTP error** (non-2xx/206): the CDN URL has likely expired (~1 h TTL).
+    ///   Clear `cdn_url` and invalidate the unrestrict cache, then retry to get a
+    ///   fresh URL.  `resolve_cdn_url` will call `unrestrict_link`, which blocks on
+    ///   the adaptive rate-limiter (up to `MAX_INTERVAL_MS` / 2 s under 429 storm).
     async fn fetch_cdn_range(&mut self, pos: u64, range_end: u64) -> Result<Bytes, FsError> {
         for attempt in 0..2u8 {
             let cdn_url = self.resolve_cdn_url().await?;
@@ -375,17 +378,18 @@ impl ProxiedMediaFile {
             {
                 Ok(resp) => resp,
                 Err(e) => {
+                    // Connection error (TCP failure, timeout) — the CDN URL itself is
+                    // still valid; this is a transient network issue.  Do NOT clear
+                    // cdn_url or invalidate the unrestrict cache: with many concurrent
+                    // ProxiedMediaFile instances (one per rclone read-ahead), all
+                    // invalidating simultaneously forces every caller through the
+                    // rate-limited unrestrict_link API and serialises them through the
+                    // adaptive rate-limiter (~90 callers × 700 ms ≈ 63 s hang).
                     tracing::warn!(
-                        "CDN fetch failed for {}: {} — clearing cached CDN URL",
+                        "CDN fetch failed for {}: {} — retrying with same URL",
                         self.name,
                         e
                     );
-                    // Clear cached CDN URL so re-resolve fetches a fresh one.
-                    self.cdn_url = None;
-                    // Also invalidate the unrestrict cache (the RD link may be stale too).
-                    self.rd_client
-                        .invalidate_unrestrict_cache(&self.rd_link)
-                        .await;
                     if attempt == 0 {
                         continue;
                     }
@@ -589,39 +593,60 @@ mod tests {
     }
 
     #[test]
-    fn fetch_cdn_range_clears_cdn_url_on_failure() {
-        // Verify that fetch_cdn_range clears cdn_url when the CDN returns an error,
-        // so the next read re-resolves via unrestrict_link (getting a fresh CDN URL).
-        // Without this, expired CDN URLs would cause all subsequent reads to fail
-        // permanently for the lifetime of the open file handle.
+    fn fetch_cdn_range_clears_cdn_url_on_http_failure_only() {
+        // fetch_cdn_range must behave differently for connection errors vs HTTP errors:
+        //
+        // - HTTP error (4xx/5xx status): the CDN URL itself is stale (expired after ~1h),
+        //   so clear cdn_url AND invalidate the unrestrict cache so the next attempt
+        //   fetches a fresh URL from Real-Debrid.
+        //
+        // - Connection error (TCP failure, timeout): the CDN URL is still valid — it is
+        //   a transient network issue.  Must NOT call invalidate_unrestrict_cache here.
+        //   With many concurrent ProxiedMediaFile instances (one per rclone read-ahead),
+        //   all invalidating on a transient error forces all of them through the
+        //   rate-limited unrestrict_link API simultaneously, serialising them through
+        //   the adaptive rate-limiter and causing a multi-minute hang (~90 callers ×
+        //   700 ms backoff ≈ 63 s observed).
         let source = include_str!("dav_fs.rs");
 
         let fn_start = source
-            .find("fn fetch_cdn_range")
+            .find("async fn fetch_cdn_range")
             .expect("fetch_cdn_range function must exist");
         let fn_body = &source[fn_start..];
-        let fn_end = fn_body[1..]
-            .find("\n    async fn ")
-            .map(|i| i + 1)
-            .unwrap_or(fn_body.len());
-        let fn_source = &fn_body[..fn_end];
 
-        // Must clear cdn_url on failure
-        let cdn_url_none_count = fn_source.matches("self.cdn_url = None").count();
+        // The connection-error arm ends before the HTTP-status check.
+        // Use the status check line as a delimiter to isolate the two sections.
+        let status_check = "let status = resp.status()";
+        let split_pos = fn_body
+            .find(status_check)
+            .expect("fetch_cdn_range must contain a status check after the send() call");
+
+        let connection_error_section = &fn_body[..split_pos];
+        let http_error_section = &fn_body[split_pos..];
+
+        // Connection-error branch must NOT call invalidate_unrestrict_cache —
+        // doing so triggers a rate-limiter serialisation storm when many readers fail
+        // concurrently due to a transient network issue.
         assert!(
-            cdn_url_none_count >= 2,
-            "fetch_cdn_range must clear self.cdn_url = None on both connection errors and HTTP \
-             error status (found {} occurrences, expected >= 2)",
-            cdn_url_none_count
+            !connection_error_section.contains("invalidate_unrestrict_cache"),
+            "connection-error branch of fetch_cdn_range must not call \
+             invalidate_unrestrict_cache (the CDN URL is still valid for transient TCP \
+             failures; invalidating it causes a mass unrestrict_link storm)"
         );
 
-        // Must also invalidate the unrestrict cache so re-resolve gets a fresh URL
-        let cache_invalidate_count = fn_source.matches("invalidate_unrestrict_cache").count();
+        // HTTP-error branch MUST call invalidate_unrestrict_cache so a stale CDN URL
+        // (expired after ~1h) is replaced with a fresh one on retry.
         assert!(
-            cache_invalidate_count >= 2,
-            "fetch_cdn_range must invalidate unrestrict cache on both connection errors and HTTP \
-             error status (found {} occurrences, expected >= 2)",
-            cache_invalidate_count
+            http_error_section.contains("invalidate_unrestrict_cache"),
+            "HTTP-error branch of fetch_cdn_range must call invalidate_unrestrict_cache \
+             so that an expired CDN URL is refreshed on retry"
+        );
+
+        // HTTP-error branch must also clear the instance-level cdn_url cache.
+        assert!(
+            http_error_section.contains("self.cdn_url = None"),
+            "HTTP-error branch of fetch_cdn_range must clear self.cdn_url = None \
+             so resolve_cdn_url re-fetches a fresh URL"
         );
     }
 
