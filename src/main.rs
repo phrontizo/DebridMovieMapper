@@ -1,5 +1,6 @@
 use dav_server::DavHandler;
 use debridmoviemapper::dav_fs::DebridFileSystem;
+use debridmoviemapper::provider::{choose_provider, DebridProvider, ProviderKind};
 use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::repair::RepairManager;
 use debridmoviemapper::tasks::{ScanConfig, MATCHES_TABLE};
@@ -38,10 +39,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
-    let api_token = std::env::var("RD_API_TOKEN")
-        .expect("RD_API_TOKEN must be set")
-        .trim()
-        .to_string();
+    let (provider_kind, provider_token) = choose_provider(
+        std::env::var("RD_API_TOKEN").ok(),
+        std::env::var("TORBOX_API_KEY").ok(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Configuration error: {}", e);
+        std::process::exit(1);
+    });
     let tmdb_api_key = std::env::var("TMDB_API_KEY")
         .expect("TMDB_API_KEY must be set")
         .trim()
@@ -60,10 +65,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Scan interval: {}s", scan_interval_secs);
 
-    let rd_client = Arc::new(RealDebridClient::new(api_token)?);
+    let provider: Arc<dyn DebridProvider> = match provider_kind {
+        ProviderKind::RealDebrid => Arc::new(RealDebridClient::new(provider_token)?),
+        ProviderKind::TorBox => {
+            eprintln!("TorBox support is not yet available in this build");
+            std::process::exit(1);
+        }
+    };
     let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
-    let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
+    let repair_manager = Arc::new(RepairManager::new(provider.clone()));
 
     let jellyfin_client =
         debridmoviemapper::jellyfin_client::JellyfinClient::from_env().map(Arc::new);
@@ -90,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let scan_handle = tokio::spawn(debridmoviemapper::tasks::run_scan_loop(
         ScanConfig {
-            rd_client: rd_client.clone(),
+            rd_client: provider.clone(),
             tmdb_client: tmdb_client.clone(),
             vfs: vfs.clone(),
             db: db.clone(),
@@ -106,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .expect("Failed to build CDN HTTP client");
     let dav_fs = DebridFileSystem::new(
-        rd_client.clone(),
+        provider.clone(),
         vfs.clone(),
         repair_manager.clone(),
         http_client,
