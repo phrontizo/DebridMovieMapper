@@ -47,6 +47,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Configuration error: {}", e);
         std::process::exit(1);
     });
+
+    // Decide and construct the provider before reading other config, so selecting
+    // TorBox exits with a clear message rather than tripping a later panic (e.g. a
+    // TorBox-only deployment that hasn't set TMDB_API_KEY).
+    let provider: Arc<dyn DebridProvider> = match provider_kind {
+        ProviderKind::RealDebrid => Arc::new(RealDebridClient::new(provider_token)?),
+        ProviderKind::TorBox => {
+            eprintln!("TorBox support is not yet available in this build");
+            std::process::exit(1);
+        }
+    };
+
     let tmdb_api_key = std::env::var("TMDB_API_KEY")
         .expect("TMDB_API_KEY must be set")
         .trim()
@@ -65,13 +77,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Scan interval: {}s", scan_interval_secs);
 
-    let provider: Arc<dyn DebridProvider> = match provider_kind {
-        ProviderKind::RealDebrid => Arc::new(RealDebridClient::new(provider_token)?),
-        ProviderKind::TorBox => {
-            eprintln!("TorBox support is not yet available in this build");
-            std::process::exit(1);
-        }
-    };
     let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
     let repair_manager = Arc::new(RepairManager::new(provider.clone()));
