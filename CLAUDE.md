@@ -39,7 +39,11 @@ docker compose up -d
 ```
 
 **Required environment variables:**
-- `RD_API_TOKEN` — Real-Debrid API token
+- A debrid provider token — exactly one of:
+  - `RD_API_TOKEN` — Real-Debrid API token
+  - `TORBOX_API_KEY` — TorBox API token (recognised at startup, but TorBox is **not yet functional** in this build; selecting it exits with "TorBox support is not yet available in this build". Full TorBox support lands in a later phase.)
+
+  Set one or the other, not both. Setting **both** is a startup error; setting **neither** is a startup error.
 - `TMDB_API_KEY` — TMDB API key
 
 **Optional:**
@@ -66,6 +70,7 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 |------|---------|
 | `main.rs` | Initializes shared state, spawns scan task, starts WebDAV server on port 8080; `--healthcheck` mode for Docker |
 | `tasks.rs` | `run_scan_loop` — polls Real-Debrid, identifies new torrents, updates VFS |
+| `provider.rs` | `DebridProvider` trait abstracting the debrid backend; startup provider selection (`choose_provider`); test-only `MockProvider` |
 | `rd_client.rs` | Real-Debrid API client with adaptive token bucket rate limiter, 1-hour response cache |
 | `identification.rs` | Filename cleaning, camelCase splitting, TMDB scoring to identify movies/shows |
 | `vfs.rs` | In-memory virtual filesystem: creates `Movies/`+`Shows/` hierarchy with media files and NFO metadata |
@@ -85,6 +90,7 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 
 ## Key Design Decisions
 
+- **Provider abstraction:** All components depend on `Arc<dyn DebridProvider>` (defined in `provider.rs`) rather than a concrete client. `RealDebridClient` is one implementation; exactly one provider is active per deployment, chosen at startup by `choose_provider` based on which token (`RD_API_TOKEN` or `TORBOX_API_KEY`) is set. TorBox is selection-only for now and exits before serving; a TorBox implementation lands in a later phase.
 - **Static linking / scratch Docker image:** The Dockerfile builds with musl targets (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) producing a minimal final image on `scratch`.
 - **Adaptive rate limiting:** An `AdaptiveRateLimiter` (token bucket, capacity 1) is shared across all Real-Debrid API calls. Baseline: 10 req/s (100ms interval). On 429: interval doubles (max 2000ms / 0.5 req/s) and Retry-After header is respected. On success: interval decreases by 10ms (min 100ms). This prevents 429 cascades by slowing all requests globally. 503 on `unrestrict/link` is a terminal status (no retry) — it signals a broken torrent and triggers on-demand repair.
 - **Single retry method:** `rd_client.rs` has one `fetch_with_retry(make_request, terminal_statuses)` — callers pass the status codes that should abort without retrying (e.g. 404 for `get_torrent_info`, 503 for `unrestrict_link`).

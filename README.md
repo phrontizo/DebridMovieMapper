@@ -38,7 +38,9 @@ This was 100% vibe coded using a mix of Claude and Junie as further AI experimen
 The service is configured via environment variables. You can use a `.env` file in the project root:
 
 ```env
+# Debrid provider — set exactly one of RD_API_TOKEN or TORBOX_API_KEY (not both)
 RD_API_TOKEN=your_real_debrid_token
+# TORBOX_API_KEY=your_torbox_token   # recognised but NOT yet functional in this build
 TMDB_API_KEY=your_tmdb_api_key
 
 # Optional
@@ -54,9 +56,12 @@ JELLYFIN_RCLONE_MOUNT_PATH=/media
 
 ### Environment Variables
 
+A debrid provider token is required: set **exactly one** of `RD_API_TOKEN` or `TORBOX_API_KEY` (setting both, or neither, is a startup error). TorBox is recognised but **not yet functional** in this build — selecting it exits with "TorBox support is not yet available in this build"; full TorBox support lands in a later release.
+
 | Variable                     | Required | Default | Description                                                          |
 |------------------------------|----------|---------|----------------------------------------------------------------------|
-| `RD_API_TOKEN`               | Yes      | -              | Your Real-Debrid API token                                           |
+| `RD_API_TOKEN`               | One of\* | -              | Your Real-Debrid API token                                           |
+| `TORBOX_API_KEY`             | One of\* | -              | Your TorBox API token (recognised but not yet functional)            |
 | `TMDB_API_KEY`               | Yes      | -              | Your TMDB (The Movie Database) API key                               |
 | `SCAN_INTERVAL_SECS`         | No       | 60             | Interval between torrent library scans in seconds (minimum: 10, runs immediately on startup) |
 | `DB_PATH`                    | No       | `metadata.db`  | Path to the redb database file                                       |
@@ -64,6 +69,8 @@ JELLYFIN_RCLONE_MOUNT_PATH=/media
 | `JELLYFIN_URL`               | No       | -              | Jellyfin server URL for library update notifications                 |
 | `JELLYFIN_API_KEY`           | No       | -              | Jellyfin API key for authentication                                  |
 | `JELLYFIN_RCLONE_MOUNT_PATH` | No       | -              | rclone mount path as seen by Jellyfin (e.g. `/media`)                |
+
+\* Exactly one of `RD_API_TOKEN` / `TORBOX_API_KEY` must be set — not both, and not neither.
 
 ## Running with Docker
 
