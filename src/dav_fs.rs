@@ -1,4 +1,4 @@
-use crate::rd_client::RealDebridClient;
+use crate::provider::DebridProvider;
 use crate::repair::RepairManager;
 use crate::vfs::{DebridVfs, VfsNode};
 use bytes::Bytes;
@@ -18,14 +18,14 @@ const MAX_FETCH_SIZE: usize = 16 * 1024 * 1024;
 #[derive(Clone)]
 pub struct DebridFileSystem {
     vfs: Arc<RwLock<DebridVfs>>,
-    rd_client: Arc<RealDebridClient>,
+    rd_client: Arc<dyn DebridProvider>,
     repair_manager: Arc<RepairManager>,
     http_client: reqwest::Client,
 }
 
 impl DebridFileSystem {
     pub fn new(
-        rd_client: Arc<RealDebridClient>,
+        rd_client: Arc<dyn DebridProvider>,
         vfs: Arc<RwLock<DebridVfs>>,
         repair_manager: Arc<RepairManager>,
         http_client: reqwest::Client,
@@ -238,7 +238,7 @@ struct ProxiedMediaFile {
     rd_torrent_id: String,
     file_size: u64,
     repair_manager: Arc<RepairManager>,
-    rd_client: Arc<RealDebridClient>,
+    rd_client: Arc<dyn DebridProvider>,
     http_client: reqwest::Client,
     pos: u64,
     cdn_url: Option<String>,
@@ -515,7 +515,7 @@ mod tests {
     #[allow(dead_code)]
     fn _assert_proxied_media_file_has_on_demand_fields(
         repair_manager: Arc<RepairManager>,
-        rd_client: Arc<RealDebridClient>,
+        rd_client: Arc<dyn crate::provider::DebridProvider>,
     ) {
         let _ = ProxiedMediaFile {
             name: String::new(),
@@ -896,5 +896,24 @@ impl DavFile for VirtualFile {
 
     fn flush(&mut self) -> FsFuture<'_, ()> {
         async move { Ok(()) }.boxed()
+    }
+}
+
+#[cfg(test)]
+mod provider_abstraction_tests {
+    use super::*;
+    use crate::provider::{DebridProvider, MockProvider};
+    use crate::repair::RepairManager;
+    use crate::vfs::DebridVfs;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[test]
+    fn debrid_filesystem_accepts_trait_object() {
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
+        let vfs = Arc::new(RwLock::new(DebridVfs::new()));
+        let repair = Arc::new(RepairManager::new(provider.clone()));
+        let http = reqwest::Client::new();
+        let _fs = DebridFileSystem::new(provider, vfs, repair, http);
     }
 }
