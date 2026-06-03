@@ -1,3 +1,4 @@
+use crate::error::AppError;
 use crate::rd_client::{AddMagnetResponse, Torrent, TorrentInfo, UnrestrictResponse};
 
 /// Abstraction over a debrid provider (Real-Debrid today, TorBox in a later phase).
@@ -23,6 +24,37 @@ pub trait DebridProvider: Send + Sync + std::fmt::Debug {
     async fn invalidate_unrestrict_cache(&self, link: &str);
     /// Evict expired cached resolutions.
     async fn evict_expired_cache(&self);
+}
+
+/// Which provider the service should run against this deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    RealDebrid,
+    TorBox,
+}
+
+/// Decide the active provider from the two optional tokens. Exactly one must be
+/// set (non-blank). Both-set or neither-set is a configuration error.
+pub fn choose_provider(
+    rd_token: Option<String>,
+    torbox_token: Option<String>,
+) -> Result<(ProviderKind, String), AppError> {
+    let rd = rd_token
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let tb = torbox_token
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    match (rd, tb) {
+        (Some(_), Some(_)) => Err(AppError::Config(
+            "Set only one of RD_API_TOKEN or TORBOX_API_KEY, not both".to_string(),
+        )),
+        (Some(token), None) => Ok((ProviderKind::RealDebrid, token)),
+        (None, Some(token)) => Ok((ProviderKind::TorBox, token)),
+        (None, None) => Err(AppError::Config(
+            "Set one of RD_API_TOKEN or TORBOX_API_KEY".to_string(),
+        )),
+    }
 }
 
 /// Test-only in-memory provider. Returns configured canned values; unconfigured
@@ -95,5 +127,40 @@ mod tests {
         assert_eq!(provider.get_torrent_info("x").await.unwrap().id, "");
         provider.invalidate_unrestrict_cache("x").await;
         provider.evict_expired_cache().await;
+    }
+
+    #[test]
+    fn choose_provider_rd_only() {
+        let (kind, token) =
+            choose_provider(Some("rd-token".to_string()), None).unwrap();
+        assert_eq!(kind, ProviderKind::RealDebrid);
+        assert_eq!(token, "rd-token");
+    }
+
+    #[test]
+    fn choose_provider_torbox_only() {
+        let (kind, token) =
+            choose_provider(None, Some("tb-token".to_string())).unwrap();
+        assert_eq!(kind, ProviderKind::TorBox);
+        assert_eq!(token, "tb-token");
+    }
+
+    #[test]
+    fn choose_provider_both_set_is_error() {
+        let err = choose_provider(Some("a".to_string()), Some("b".to_string()));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn choose_provider_neither_set_is_error() {
+        assert!(choose_provider(None, None).is_err());
+    }
+
+    #[test]
+    fn choose_provider_treats_blank_token_as_unset() {
+        // Whitespace-only RD token + real TorBox token → TorBox, not "both set".
+        let (kind, _) =
+            choose_provider(Some("   ".to_string()), Some("tb".to_string())).unwrap();
+        assert_eq!(kind, ProviderKind::TorBox);
     }
 }
