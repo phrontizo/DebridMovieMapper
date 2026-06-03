@@ -2,6 +2,7 @@ pub mod dav_fs;
 pub mod error;
 pub mod identification;
 pub mod jellyfin_client;
+pub mod provider;
 pub mod rd_client;
 pub mod repair;
 pub mod tasks;

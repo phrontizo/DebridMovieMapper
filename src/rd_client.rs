@@ -563,6 +563,41 @@ impl RealDebridClient {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::provider::DebridProvider for RealDebridClient {
+    fn name(&self) -> &'static str {
+        "real-debrid"
+    }
+
+    // Each call uses method-call syntax on `&RealDebridClient`, which resolves to
+    // the inherent method (inherent methods take priority over trait methods),
+    // so these delegate rather than recurse.
+    async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
+        self.get_torrents().await
+    }
+    async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
+        self.get_torrent_info(id).await
+    }
+    async fn unrestrict_link(&self, link: &str) -> Result<UnrestrictResponse, reqwest::Error> {
+        self.unrestrict_link(link).await
+    }
+    async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+        self.add_magnet(magnet).await
+    }
+    async fn select_files(&self, torrent_id: &str, file_ids: &str) -> Result<(), reqwest::Error> {
+        self.select_files(torrent_id, file_ids).await
+    }
+    async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error> {
+        self.delete_torrent(torrent_id).await
+    }
+    async fn invalidate_unrestrict_cache(&self, link: &str) {
+        self.invalidate_unrestrict_cache(link).await
+    }
+    async fn evict_expired_cache(&self) {
+        self.evict_expired_cache().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
