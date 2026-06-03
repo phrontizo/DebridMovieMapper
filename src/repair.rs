@@ -1,4 +1,5 @@
-use crate::rd_client::{RealDebridClient, TorrentInfo};
+use crate::provider::DebridProvider;
+use crate::rd_client::TorrentInfo;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,14 +33,14 @@ pub struct TorrentHealth {
 #[derive(Debug)]
 pub struct RepairManager {
     health_status: Arc<RwLock<HashMap<String, TorrentHealth>>>,
-    rd_client: Arc<RealDebridClient>,
+    rd_client: Arc<dyn DebridProvider>,
     /// Maps new_torrent_id -> old_torrent_id for successful repairs.
     /// The scan loop consumes this to reuse old TMDB identifications.
     repair_replacements: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl RepairManager {
-    pub fn new(rd_client: Arc<RealDebridClient>) -> Self {
+    pub fn new(rd_client: Arc<dyn DebridProvider>) -> Self {
         Self {
             health_status: Arc::new(RwLock::new(HashMap::new())),
             rd_client,
@@ -567,6 +568,14 @@ impl RepairManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_manager_accepts_trait_object() {
+        use crate::provider::{DebridProvider, MockProvider};
+        let provider: std::sync::Arc<dyn DebridProvider> =
+            std::sync::Arc::new(MockProvider::default());
+        let _manager = RepairManager::new(provider);
+    }
 
     /// Compile-time check: repair_by_id exists with the correct signature.
     #[allow(dead_code)]
