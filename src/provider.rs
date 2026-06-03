@@ -1,14 +1,13 @@
 use crate::rd_client::{AddMagnetResponse, Torrent, TorrentInfo, UnrestrictResponse};
-use async_trait::async_trait;
 
 /// Abstraction over a debrid provider (Real-Debrid today, TorBox in a later phase).
 ///
 /// The method set mirrors the Real-Debrid operations the codebase calls today so
 /// this phase is a pure refactor. It is widened/reshaped in later phases.
 ///
-/// `Debug` is a supertrait because `RepairManager` derives `Debug` while holding
-/// an `Arc<dyn DebridProvider>`.
-#[async_trait]
+/// `Debug` is a supertrait so a future `Arc<dyn DebridProvider>` can live inside
+/// `Debug`-deriving structs like `RepairManager` (migrated in a later phase).
+#[async_trait::async_trait]
 pub trait DebridProvider: Send + Sync + std::fmt::Debug {
     /// Stable, human-readable provider identifier (e.g. "real-debrid").
     fn name(&self) -> &'static str;
