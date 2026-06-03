@@ -83,7 +83,7 @@ impl AdaptiveRateLimiter {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Torrent {
     pub id: String,
     #[serde(default)]
@@ -107,7 +107,7 @@ pub struct Torrent {
     pub ended: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TorrentInfo {
     pub id: String,
     #[serde(default)]
@@ -137,7 +137,7 @@ pub struct TorrentInfo {
     pub ended: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TorrentFile {
     #[serde(default)]
     pub id: u32,
@@ -149,7 +149,7 @@ pub struct TorrentFile {
     pub selected: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct UnrestrictResponse {
     pub id: String,
     #[serde(default)]
@@ -170,7 +170,7 @@ pub struct UnrestrictResponse {
     pub streamable: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct AddMagnetResponse {
     pub id: String,
     pub uri: String,
@@ -887,5 +887,19 @@ mod tests {
         let info: TorrentInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.id, "abc123");
         assert_eq!(info.filename, "test.mkv");
+    }
+
+    #[test]
+    fn rd_structs_have_default() {
+        let t = Torrent::default();
+        assert_eq!(t.id, "");
+        let info = TorrentInfo::default();
+        assert!(info.files.is_empty());
+        let f = TorrentFile::default();
+        assert_eq!(f.selected, 0);
+        let u = UnrestrictResponse::default();
+        assert_eq!(u.download, "");
+        let m = AddMagnetResponse::default();
+        assert_eq!(m.id, "");
     }
 }
