@@ -1,5 +1,5 @@
 use crate::identification::identify_torrent;
-use crate::rd_client::RealDebridClient;
+use crate::provider::DebridProvider;
 use crate::repair::RepairManager;
 use crate::tmdb_client::TmdbClient;
 use crate::vfs::{DebridVfs, MediaMetadata};
@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 pub const MATCHES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("matches");
 
 pub struct ScanConfig {
-    pub rd_client: Arc<RealDebridClient>,
+    pub rd_client: Arc<dyn DebridProvider>,
     pub tmdb_client: Arc<TmdbClient>,
     pub vfs: Arc<RwLock<DebridVfs>>,
     pub db: Arc<redb::Database>,
@@ -421,7 +421,7 @@ mod tests {
     /// Compile-time check: run_scan_loop has the expected signature.
     #[allow(dead_code)]
     async fn _assert_run_scan_loop_signature(
-        rd_client: Arc<RealDebridClient>,
+        rd_client: Arc<dyn DebridProvider>,
         tmdb_client: Arc<TmdbClient>,
         vfs: Arc<RwLock<DebridVfs>>,
         db: Arc<redb::Database>,
@@ -438,5 +438,35 @@ mod tests {
             jellyfin_client: None,
         };
         run_scan_loop(config, shutdown).await;
+    }
+}
+
+#[cfg(test)]
+mod provider_abstraction_tests {
+    use super::*;
+    use crate::provider::{DebridProvider, MockProvider};
+    use crate::repair::RepairManager;
+    use crate::tmdb_client::TmdbClient;
+    use crate::vfs::DebridVfs;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[test]
+    fn scan_config_holds_trait_object() {
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
+        let db = Arc::new(
+            redb::Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        );
+        let _config = ScanConfig {
+            rd_client: provider.clone(),
+            tmdb_client: Arc::new(TmdbClient::new("k".to_string())),
+            vfs: Arc::new(RwLock::new(DebridVfs::new())),
+            db,
+            repair_manager: Arc::new(RepairManager::new(provider)),
+            interval_secs: 60,
+            jellyfin_client: None,
+        };
     }
 }
