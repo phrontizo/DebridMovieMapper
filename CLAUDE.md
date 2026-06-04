@@ -41,7 +41,7 @@ docker compose up -d
 **Required environment variables:**
 - A debrid provider token — exactly one of:
   - `RD_API_TOKEN` — Real-Debrid API token
-  - `TORBOX_API_KEY` — TorBox API token (recognised at startup, but TorBox is **not yet functional** in this build; selecting it exits with "TorBox support is not yet available in this build". Full TorBox support lands in a later phase.)
+  - `TORBOX_API_KEY` — TorBox API token
 
   Set one or the other, not both. Setting **both** is a startup error; setting **neither** is a startup error.
 - `TMDB_API_KEY` — TMDB API key
@@ -71,7 +71,9 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 | `main.rs` | Initializes shared state, spawns scan task, starts WebDAV server on port 8080; `--healthcheck` mode for Docker |
 | `tasks.rs` | `run_scan_loop` — polls Real-Debrid, identifies new torrents, updates VFS |
 | `provider.rs` | `DebridProvider` trait abstracting the debrid backend; `FileLocator` (the provider-neutral handle for a media file) and its `resolve_url`/`invalidate` primitives; startup provider selection (`choose_provider`); test-only `MockProvider` |
-| `rd_client.rs` | Real-Debrid API client with adaptive token bucket rate limiter, 1-hour response cache |
+| `rd_client.rs` | Real-Debrid implementation of `DebridProvider`; shared adaptive rate limiter, 1-hour unrestrict cache |
+| `torbox_client.rs` | TorBox implementation of `DebridProvider` (`mylist`/`requestdl`/`createtorrent`/`controltorrent`); resolves by `(torrent_id, file_id)`, ~3h URL cache |
+| `ratelimit.rs` | Shared `AdaptiveRateLimiter` (token bucket) used by both provider clients |
 | `identification.rs` | Filename cleaning, camelCase splitting, TMDB scoring to identify movies/shows |
 | `vfs.rs` | In-memory virtual filesystem: creates `Movies/`+`Shows/` hierarchy with media files and NFO metadata |
 | `dav_fs.rs` | Maps VFS to WebDAV; on read resolves a `FileLocator` to a CDN URL via `provider.resolve_url` (cached 1h), attempts synchronous instant repair on `AppError::Unavailable` |
@@ -83,15 +85,16 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 
 **Data flow for playback:**
 1. Jellyfin/player opens a media file via WebDAV
-2. `dav_fs.rs` resolves the file's `FileLocator` to a CDN URL via `provider.resolve_url(&FileLocator)` (cached for 1 hour). Real-Debrid resolves via the locator's restricted `link`; the model also supports resolving by `(torrent_id, file_id)` for providers without per-file links.
+2. `dav_fs.rs` resolves the file's `FileLocator` to a CDN URL via `provider.resolve_url(&FileLocator)` (cached). Real-Debrid resolves via the locator's restricted `link` (1h cache); TorBox resolves by `(torrent_id, file_id)` via `requestdl` (no per-file link; ~3h cache).
 3. `ProxiedMediaFile` fetches bytes from the CDN URL with a 2MB read-ahead buffer and serves them to the player
 
 **Persistence:** Embedded `redb` database (`metadata.db`) caches TMDB identifications. The file is created automatically on first run.
 
 ## Key Design Decisions
 
-- **Provider abstraction:** All components depend on `Arc<dyn DebridProvider>` (defined in `provider.rs`) rather than a concrete client. `RealDebridClient` is one implementation; exactly one provider is active per deployment, chosen at startup by `choose_provider` based on which token (`RD_API_TOKEN` or `TORBOX_API_KEY`) is set. TorBox is selection-only for now and exits before serving; a TorBox implementation lands in a later phase.
-- **Provider-neutral file resolution:** The VFS stores a `FileLocator { hash, torrent_id, file_id, file_path, link }` per media file rather than a raw RD link. `resolve_url(&FileLocator) -> Result<String, AppError>` is the single resolution primitive (and `invalidate(&FileLocator)` drops a cached resolution); RD resolves via the locator's restricted `link` (keeping its old unrestrict/cache logic as private inherent methods), while `(torrent_id, file_id)` is reserved for providers without per-file links (TorBox, a later phase). `AppError::Unavailable` is the provider-neutral "bytes not currently available → re-acquire/repair" signal — RD maps a 503 on unrestrict to it, and `dav_fs` drives instant repair off `Unavailable` rather than inspecting an HTTP status. Real-Debrid behaviour is unchanged.
+- **Provider abstraction:** All components depend on `Arc<dyn DebridProvider>` (defined in `provider.rs`) rather than a concrete client. `RealDebridClient` and `TorBoxClient` are the two implementations; exactly one provider is active per deployment, chosen at startup by `choose_provider` based on which token (`RD_API_TOKEN` or `TORBOX_API_KEY`) is set.
+- **TorBox specifics:** TorBox lists torrents (with files inline) via `mylist`, resolves a file by `(torrent_id, file_id)` via `requestdl` (so `FileLocator.link` is `None`), re-adds by hash via `createtorrent`, deletes via `controltorrent`, and treats `select_files` as a no-op (TorBox auto-selects). A finished download is normalised to `status = "downloaded"` even when its cache has lapsed (TorBox keeps such entries listed as Inactive), so owned-but-uncached films still appear in the library and re-acquire on playback.
+- **Provider-neutral file resolution:** The VFS stores a `FileLocator { hash, torrent_id, file_id, file_path, link }` per media file rather than a raw RD link. `resolve_url(&FileLocator) -> Result<String, AppError>` is the single resolution primitive (and `invalidate(&FileLocator)` drops a cached resolution); RD resolves via the locator's restricted `link` (keeping its old unrestrict/cache logic as private inherent methods), while `(torrent_id, file_id)` is used by providers without per-file links (TorBox). `AppError::Unavailable` is the provider-neutral "bytes not currently available → re-acquire/repair" signal — RD maps a 503 on unrestrict to it, and `dav_fs` drives instant repair off `Unavailable` rather than inspecting an HTTP status. Real-Debrid behaviour is unchanged.
 - **Static linking / scratch Docker image:** The Dockerfile builds with musl targets (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) producing a minimal final image on `scratch`.
 - **Adaptive rate limiting:** An `AdaptiveRateLimiter` (token bucket, capacity 1) is shared across all Real-Debrid API calls. Baseline: 10 req/s (100ms interval). On 429: interval doubles (max 2000ms / 0.5 req/s) and Retry-After header is respected. On success: interval decreases by 10ms (min 100ms). This prevents 429 cascades by slowing all requests globally. 503 on `unrestrict/link` is a terminal status (no retry) — it signals a broken torrent and triggers on-demand repair.
 - **Single retry method:** `rd_client.rs` has one `fetch_with_retry(make_request, terminal_statuses)` — callers pass the status codes that should abort without retrying (e.g. 404 for `get_torrent_info`, 503 for `unrestrict_link`).
