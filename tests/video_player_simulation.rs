@@ -2,35 +2,67 @@ use dav_server::davpath::DavPath;
 use dav_server::fs::{DavFileSystem, OpenOptions};
 use debridmoviemapper::dav_fs::DebridFileSystem;
 use debridmoviemapper::identification::identify_torrent;
+use debridmoviemapper::provider::DebridProvider;
 use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::repair::RepairManager;
 use debridmoviemapper::tmdb_client::TmdbClient;
+use debridmoviemapper::torbox_client::TorBoxClient;
 use debridmoviemapper::vfs::{DebridVfs, VfsNode};
 use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-#[tokio::test]
-#[ignore]
-async fn test_video_player_simulation() {
-    let _ = tracing_subscriber::fmt::try_init();
-    dotenvy::dotenv().ok();
-
-    let api_token = std::env::var("RD_API_TOKEN")
-        .expect("RD_API_TOKEN must be set")
-        .trim()
-        .to_string();
-    let tmdb_api_key = std::env::var("TMDB_API_KEY")
+fn tmdb_client() -> Arc<TmdbClient> {
+    let key = std::env::var("TMDB_API_KEY")
         .expect("TMDB_API_KEY must be set")
         .trim()
         .to_string();
+    Arc::new(TmdbClient::new(key).unwrap())
+}
 
-    let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key).unwrap());
+/// A trimmed, non-empty env var, or None — so a provider's test skips when its token is unset.
+fn token(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+// --- Player simulation: open media files via WebDAV and read real CDN bytes (per provider) ---
+
+#[tokio::test]
+#[ignore]
+async fn test_video_player_simulation_real_debrid() {
+    let _ = tracing_subscriber::fmt::try_init();
+    dotenvy::dotenv().ok();
+    let Some(t) = token("RD_API_TOKEN") else {
+        println!("skipping test_video_player_simulation_real_debrid: RD_API_TOKEN not set");
+        return;
+    };
+    run_player_simulation(Arc::new(RealDebridClient::new(t).unwrap()), "real-debrid").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_video_player_simulation_torbox() {
+    let _ = tracing_subscriber::fmt::try_init();
+    dotenvy::dotenv().ok();
+    let Some(t) = token("TORBOX_API_KEY") else {
+        println!("skipping test_video_player_simulation_torbox: TORBOX_API_KEY not set");
+        return;
+    };
+    run_player_simulation(Arc::new(TorBoxClient::new(t).unwrap()), "torbox").await;
+}
+
+/// Build a small VFS from the account, then open a couple of media files through the WebDAV
+/// filesystem and read their first bytes — exercising the full provider `resolve_url` → CDN
+/// fetch path (for TorBox this is `requestdl` → the selected CDN).
+async fn run_player_simulation(provider: Arc<dyn DebridProvider>, label: &str) {
+    let tmdb_client = tmdb_client();
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 
-    println!("Fetching torrents...");
-    let torrents = rd_client
+    println!("[{label}] Fetching torrents...");
+    let torrents = provider
         .get_torrents()
         .await
         .expect("Failed to get torrents");
@@ -40,17 +72,17 @@ async fn test_video_player_simulation() {
         .take(20)
         .collect::<Vec<_>>();
     println!(
-        "Found {} downloaded torrents (sampled first 20)",
+        "[{label}] Found {} downloaded torrents (sampled first 20)",
         downloaded.len()
     );
 
     let mut current_data = Vec::new();
     let mut stream = futures_util::stream::iter(downloaded)
         .map(|torrent| {
-            let rd_client = rd_client.clone();
+            let provider = provider.clone();
             let tmdb_client = tmdb_client.clone();
             async move {
-                let info = rd_client
+                let info = provider
                     .get_torrent_info(&torrent.id)
                     .await
                     .expect("Failed to get torrent info");
@@ -59,21 +91,20 @@ async fn test_video_player_simulation() {
             }
         })
         .buffer_unordered(1);
-
     while let Some(result) = stream.next().await {
         current_data.push(result);
     }
 
-    println!("Updating VFS...");
+    println!("[{label}] Updating VFS...");
     {
         let new_vfs = DebridVfs::build(current_data);
         let mut vfs_lock = vfs.write().await;
         *vfs_lock = new_vfs;
     }
 
-    let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
+    let repair_manager = Arc::new(RepairManager::new(provider.clone()));
     let http_client = reqwest::Client::new();
-    let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone(), repair_manager, http_client);
+    let dav_fs = DebridFileSystem::new(provider.clone(), vfs.clone(), repair_manager, http_client);
 
     let mut video_files = Vec::new();
     {
@@ -82,7 +113,7 @@ async fn test_video_player_simulation() {
     }
 
     if video_files.is_empty() {
-        println!("No video files found in VFS, skipping simulation.");
+        println!("[{label}] No video files found in VFS, skipping simulation.");
         return;
     }
 
@@ -119,7 +150,10 @@ async fn test_video_player_simulation() {
     }
 
     for (path_str, size) in selected {
-        println!("Testing media file: {} (size: {} bytes)", path_str, size);
+        println!(
+            "[{label}] Testing media file: {} (size: {} bytes)",
+            path_str, size
+        );
         let encoded_path = encode_path_preserve_slashes(&format!("/{}", path_str));
         let path = DavPath::new(&encoded_path).unwrap();
         let opts = OpenOptions {
@@ -140,7 +174,8 @@ async fn test_video_player_simulation() {
             "Metadata size should match VFS file size"
         );
 
-        // Read first 64KB to simulate player probing the file header
+        // Read first 64KB to simulate player probing the file header — this is the
+        // real provider resolve + CDN byte fetch.
         println!("  Reading first 64KB (simulating ffprobe)...");
         let probe_bytes = file
             .read_bytes(65536)
@@ -152,11 +187,11 @@ async fn test_video_player_simulation() {
             path_str
         );
         println!("    Read {} bytes", probe_bytes.len());
-        println!("    ✓ Successfully read media bytes from CDN proxy");
+        println!("    ✓ [{label}] Successfully read media bytes from the CDN proxy");
     }
 
     // 4. Verify NFO files
-    println!("Verifying NFO files...");
+    println!("[{label}] Verifying NFO files...");
     let mut nfo_files = Vec::new();
     {
         let vfs_lock = vfs.read().await;
@@ -164,9 +199,9 @@ async fn test_video_player_simulation() {
     }
 
     if nfo_files.is_empty() {
-        println!("No NFO files found in VFS, skipping verification.");
+        println!("[{label}] No NFO files found in VFS, skipping verification.");
     } else {
-        println!("Found {} NFO files", nfo_files.len());
+        println!("[{label}] Found {} NFO files", nfo_files.len());
         for (path_str, size) in nfo_files.iter().take(5) {
             println!("  Checking NFO: {} (size: {})", path_str, size);
             let encoded_path = encode_path_preserve_slashes(&format!("/{}", path_str));
@@ -191,31 +226,39 @@ async fn test_video_player_simulation() {
     }
 }
 
-/// Test that media file metadata sizes are consistent across all WebDAV paths.
-/// Verifies:
-/// - DavFileSystem::metadata() (PROPFIND / GET Content-Length)
-/// - DavFile::metadata() (opened file metadata)
-/// - Both report the actual file size from TorrentFile::bytes
+// --- Metadata size consistency across WebDAV paths (per provider) ---
+
 #[tokio::test]
 #[ignore]
-async fn test_media_file_size_consistency() {
+async fn test_media_file_size_consistency_real_debrid() {
     let _ = tracing_subscriber::fmt::try_init();
     dotenvy::dotenv().ok();
+    let Some(t) = token("RD_API_TOKEN") else {
+        println!("skipping test_media_file_size_consistency_real_debrid: RD_API_TOKEN not set");
+        return;
+    };
+    run_size_consistency(Arc::new(RealDebridClient::new(t).unwrap()), "real-debrid").await;
+}
 
-    let api_token = std::env::var("RD_API_TOKEN")
-        .expect("RD_API_TOKEN must be set")
-        .trim()
-        .to_string();
-    let tmdb_api_key = std::env::var("TMDB_API_KEY")
-        .expect("TMDB_API_KEY must be set")
-        .trim()
-        .to_string();
+#[tokio::test]
+#[ignore]
+async fn test_media_file_size_consistency_torbox() {
+    let _ = tracing_subscriber::fmt::try_init();
+    dotenvy::dotenv().ok();
+    let Some(t) = token("TORBOX_API_KEY") else {
+        println!("skipping test_media_file_size_consistency_torbox: TORBOX_API_KEY not set");
+        return;
+    };
+    run_size_consistency(Arc::new(TorBoxClient::new(t).unwrap()), "torbox").await;
+}
 
-    let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key).unwrap());
+/// Verify a media file's size is reported consistently by both `DavFileSystem::metadata()`
+/// (PROPFIND / GET Content-Length) and the opened `DavFile::metadata()`.
+async fn run_size_consistency(provider: Arc<dyn DebridProvider>, label: &str) {
+    let tmdb_client = tmdb_client();
 
     // Fetch just 2 torrents — enough to get at least one media file
-    let torrents = rd_client
+    let torrents = provider
         .get_torrents()
         .await
         .expect("Failed to get torrents");
@@ -232,10 +275,10 @@ async fn test_media_file_size_consistency() {
     let mut current_data = Vec::new();
     let mut stream = futures_util::stream::iter(downloaded)
         .map(|torrent| {
-            let rd_client = rd_client.clone();
+            let provider = provider.clone();
             let tmdb_client = tmdb_client.clone();
             async move {
-                let info = rd_client
+                let info = provider
                     .get_torrent_info(&torrent.id)
                     .await
                     .expect("Failed to get torrent info");
@@ -249,9 +292,9 @@ async fn test_media_file_size_consistency() {
     }
 
     let vfs = Arc::new(RwLock::new(DebridVfs::build(current_data)));
-    let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
+    let repair_manager = Arc::new(RepairManager::new(provider.clone()));
     let http_client = reqwest::Client::new();
-    let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone(), repair_manager, http_client);
+    let dav_fs = DebridFileSystem::new(provider.clone(), vfs.clone(), repair_manager, http_client);
 
     // Find a media file
     let mut media_files = Vec::new();
@@ -262,7 +305,7 @@ async fn test_media_file_size_consistency() {
     assert!(!media_files.is_empty(), "No media files found in VFS");
 
     let (path_str, expected_size) = &media_files[0];
-    println!("Testing media file: {}", path_str);
+    println!("[{label}] Testing media file: {}", path_str);
 
     let encoded_path = encode_path_preserve_slashes(&format!("/{}", path_str));
     let dav_path = DavPath::new(&encoded_path).unwrap();
@@ -303,7 +346,7 @@ async fn test_media_file_size_consistency() {
         file_meta_size
     );
 
-    println!("  ✓ Media file sizes are consistent across all metadata paths");
+    println!("  ✓ [{label}] Media file sizes are consistent across all metadata paths");
 }
 
 fn encode_path_preserve_slashes(p: &str) -> String {
