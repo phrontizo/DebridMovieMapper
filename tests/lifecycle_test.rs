@@ -30,12 +30,8 @@ fn sintel_magnet() -> String {
 /// Recursively search the VFS for a `MediaFile` whose path ends with `suffix`.
 fn vfs_has_media_file(node: &VfsNode, suffix: &str) -> bool {
     match node {
-        VfsNode::Directory { children } => {
-            children.values().any(|c| vfs_has_media_file(c, suffix))
-        }
-        VfsNode::MediaFile { locator, .. } => {
-            locator.file_path.to_lowercase().ends_with(suffix)
-        }
+        VfsNode::Directory { children } => children.values().any(|c| vfs_has_media_file(c, suffix)),
+        VfsNode::MediaFile { locator, .. } => locator.file_path.to_lowercase().ends_with(suffix),
         VfsNode::VirtualFile { .. } => false,
     }
 }
@@ -57,7 +53,10 @@ async fn run_lifecycle(provider: Arc<dyn DebridProvider>, tmdb: Arc<TmdbClient>,
     cleanup(&provider, SINTEL_HASH).await;
 
     // 1. Add by magnet.
-    let added = provider.add_magnet(&sintel_magnet()).await.expect("add_magnet");
+    let added = provider
+        .add_magnet(&sintel_magnet())
+        .await
+        .expect("add_magnet");
     let id = added.id.clone();
     println!("[{label}] add_magnet -> id={id}");
 
@@ -82,7 +81,10 @@ async fn run_lifecycle(provider: Arc<dyn DebridProvider>, tmdb: Arc<TmdbClient>,
         .filter(|f| is_video_file(&f.path))
         .map(|f| f.id.to_string())
         .collect();
-    assert!(!video_ids.is_empty(), "[{label}] torrent should contain a video file");
+    assert!(
+        !video_ids.is_empty(),
+        "[{label}] torrent should contain a video file"
+    );
     provider
         .select_files(&id, &video_ids.join(","))
         .await
