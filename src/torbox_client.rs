@@ -301,7 +301,10 @@ impl TorBoxClient {
     }
 
     pub async fn torrent_info_raw(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
-        let url = format!("{}/torrents/mylist?id={}&bypass_cache=true", TORBOX_BASE, id);
+        let url = format!(
+            "{}/torrents/mylist?id={}&bypass_cache=true",
+            TORBOX_BASE, id
+        );
         let raw: TbTorrent = self.send_data(|| self.client.get(&url)).await?;
         Ok(to_torrent_info(&raw))
     }
@@ -403,7 +406,10 @@ mod tests {
             ..Default::default()
         };
         client.cache_put(&loc, "https://cdn/x".to_string()).await;
-        assert_eq!(client.cache_get(&loc).await.as_deref(), Some("https://cdn/x"));
+        assert_eq!(
+            client.cache_get(&loc).await.as_deref(),
+            Some("https://cdn/x")
+        );
         client.invalidate_locator(&loc).await;
         assert!(client.cache_get(&loc).await.is_none());
     }
@@ -444,7 +450,11 @@ mod tests {
         assert_eq!(info.bytes, 129302391);
         assert!(info.links.is_empty());
         assert_eq!(info.files.len(), 2);
-        let mp4 = info.files.iter().find(|f| f.path.ends_with(".mp4")).unwrap();
+        let mp4 = info
+            .files
+            .iter()
+            .find(|f| f.path.ends_with(".mp4"))
+            .unwrap();
         assert_eq!(mp4.id, 10);
         assert_eq!(mp4.path, "Sintel/Sintel.mp4");
         assert_eq!(mp4.selected, 1);
@@ -468,8 +478,11 @@ mod tests {
 
     #[test]
     fn envelope_parses_array_and_object() {
-        let arr: Envelope<Vec<TbTorrent>> =
-            serde_json::from_str(&format!(r#"{{"success":true,"detail":"ok","data":[{}]}}"#, MYLIST_ITEM)).unwrap();
+        let arr: Envelope<Vec<TbTorrent>> = serde_json::from_str(&format!(
+            r#"{{"success":true,"detail":"ok","data":[{}]}}"#,
+            MYLIST_ITEM
+        ))
+        .unwrap();
         assert!(arr.success);
         assert_eq!(arr.data.unwrap().len(), 1);
         let obj: Envelope<TbTorrent> =

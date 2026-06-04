@@ -87,10 +87,7 @@ impl DavFileSystem for DebridFileSystem {
                 .unwrap_or("")
                 .to_string();
             match node {
-                VfsNode::MediaFile {
-                    file_size,
-                    locator,
-                } => Ok(Box::new(ProxiedMediaFile {
+                VfsNode::MediaFile { file_size, locator } => Ok(Box::new(ProxiedMediaFile {
                     name,
                     locator,
                     file_size,
@@ -101,7 +98,8 @@ impl DavFileSystem for DebridFileSystem {
                     cdn_url: None,
                     buffer: Bytes::new(),
                     buffer_start: 0,
-                }) as Box<dyn DavFile>),
+                })
+                    as Box<dyn DavFile>),
                 VfsNode::VirtualFile { content } => Ok(Box::new(VirtualFile {
                     content: Bytes::from(content),
                     pos: 0,

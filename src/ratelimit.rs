@@ -24,6 +24,12 @@ impl std::fmt::Debug for AdaptiveRateLimiter {
     }
 }
 
+impl Default for AdaptiveRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AdaptiveRateLimiter {
     pub fn new() -> Self {
         Self {

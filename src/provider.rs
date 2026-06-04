@@ -168,16 +168,14 @@ mod tests {
 
     #[test]
     fn choose_provider_rd_only() {
-        let (kind, token) =
-            choose_provider(Some("rd-token".to_string()), None).unwrap();
+        let (kind, token) = choose_provider(Some("rd-token".to_string()), None).unwrap();
         assert_eq!(kind, ProviderKind::RealDebrid);
         assert_eq!(token, "rd-token");
     }
 
     #[test]
     fn choose_provider_torbox_only() {
-        let (kind, token) =
-            choose_provider(None, Some("tb-token".to_string())).unwrap();
+        let (kind, token) = choose_provider(None, Some("tb-token".to_string())).unwrap();
         assert_eq!(kind, ProviderKind::TorBox);
         assert_eq!(token, "tb-token");
     }
@@ -196,8 +194,7 @@ mod tests {
     #[test]
     fn choose_provider_treats_blank_token_as_unset() {
         // Whitespace-only RD token + real TorBox token → TorBox, not "both set".
-        let (kind, _) =
-            choose_provider(Some("   ".to_string()), Some("tb".to_string())).unwrap();
+        let (kind, _) = choose_provider(Some("   ".to_string()), Some("tb".to_string())).unwrap();
         assert_eq!(kind, ProviderKind::TorBox);
     }
 
@@ -215,7 +212,10 @@ mod tests {
             file_path: "f.mkv".to_string(),
             link: None,
         };
-        assert_eq!(provider.resolve_url(&loc).await.unwrap(), "https://cdn/file");
+        assert_eq!(
+            provider.resolve_url(&loc).await.unwrap(),
+            "https://cdn/file"
+        );
         provider.invalidate(&loc).await; // no-op, must not panic
     }
 
