@@ -5,6 +5,7 @@ use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::repair::RepairManager;
 use debridmoviemapper::tasks::{ScanConfig, MATCHES_TABLE};
 use debridmoviemapper::tmdb_client::TmdbClient;
+use debridmoviemapper::torbox_client::TorBoxClient;
 use debridmoviemapper::vfs::DebridVfs;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -48,15 +49,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     });
 
-    // Decide and construct the provider before reading other config, so selecting
-    // TorBox exits with a clear message rather than tripping a later panic (e.g. a
-    // TorBox-only deployment that hasn't set TMDB_API_KEY).
+    // Construct the selected provider from the chosen token. Either client surfaces
+    // a clear configuration error here (via `?`) rather than tripping a later panic.
     let provider: Arc<dyn DebridProvider> = match provider_kind {
         ProviderKind::RealDebrid => Arc::new(RealDebridClient::new(provider_token)?),
-        ProviderKind::TorBox => {
-            eprintln!("TorBox support is not yet available in this build");
-            std::process::exit(1);
-        }
+        ProviderKind::TorBox => Arc::new(TorBoxClient::new(provider_token)?),
     };
 
     let tmdb_api_key = std::env::var("TMDB_API_KEY")
