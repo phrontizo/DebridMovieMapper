@@ -179,15 +179,13 @@ impl TorBoxClient {
         );
     }
 
-    // Wired into the `DebridProvider::invalidate` impl in Task 4; only used by tests until then.
-    #[allow(dead_code)]
+    // Wired into the `DebridProvider::invalidate` impl.
     async fn invalidate_locator(&self, loc: &FileLocator) {
         let key = (loc.torrent_id.clone(), loc.file_id);
         self.resolve_cache.write().await.remove(&key);
     }
 
-    // Wired into the `DebridProvider::evict_expired_cache` impl in Task 4; unused until then.
-    #[allow(dead_code)]
+    // Wired into the `DebridProvider::evict_expired_cache` impl.
     async fn evict_expired(&self) {
         let mut cache = self.resolve_cache.write().await;
         cache.retain(|_, c| c.at.elapsed() < RESOLVE_CACHE_TTL);
@@ -357,6 +355,41 @@ impl TorBoxClient {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::provider::DebridProvider for TorBoxClient {
+    fn name(&self) -> &'static str {
+        "torbox"
+    }
+    async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
+        self.list_torrents_raw().await
+    }
+    async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
+        self.torrent_info_raw(id).await
+    }
+    async fn add_magnet(
+        &self,
+        magnet: &str,
+    ) -> Result<crate::rd_client::AddMagnetResponse, reqwest::Error> {
+        self.add_magnet_raw(magnet).await
+    }
+    async fn select_files(&self, _torrent_id: &str, _file_ids: &str) -> Result<(), reqwest::Error> {
+        // TorBox auto-selects all files on createtorrent; nothing to do.
+        Ok(())
+    }
+    async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error> {
+        self.delete_torrent_raw(torrent_id).await
+    }
+    async fn resolve_url(&self, loc: &FileLocator) -> Result<String, AppError> {
+        self.resolve_locator(loc).await
+    }
+    async fn invalidate(&self, loc: &FileLocator) {
+        self.invalidate_locator(loc).await
+    }
+    async fn evict_expired_cache(&self) {
+        self.evict_expired().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +412,14 @@ mod tests {
     fn torbox_client_constructs() {
         let c = TorBoxClient::new("fake".to_string()).unwrap();
         assert_eq!(c.provider_name(), "torbox");
+    }
+
+    #[test]
+    fn torbox_client_is_a_debrid_provider() {
+        use crate::provider::DebridProvider;
+        let c = TorBoxClient::new("fake".to_string()).unwrap();
+        let p: std::sync::Arc<dyn DebridProvider> = std::sync::Arc::new(c);
+        assert_eq!(p.name(), "torbox");
     }
 
     // Real shapes captured live from the TorBox API (Sintel).
