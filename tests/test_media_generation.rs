@@ -319,14 +319,18 @@ fn collect_media_files(
             }
         }
         VfsNode::MediaFile {
-            rd_link, file_size, ..
+            locator, file_size, ..
         } => {
             let full_path = if current_path.is_empty() {
                 name.to_string()
             } else {
                 format!("{}/{}", current_path, name)
             };
-            files.push((full_path, rd_link.clone(), *file_size));
+            files.push((
+                full_path,
+                locator.link.clone().unwrap_or_default(),
+                *file_size,
+            ));
         }
         VfsNode::VirtualFile { .. } => {}
     }

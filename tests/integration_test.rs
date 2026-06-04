@@ -396,8 +396,10 @@ fn collect_links(node: &VfsNode, links: &mut std::collections::HashSet<String>) 
                 collect_links(child, links);
             }
         }
-        VfsNode::MediaFile { rd_link, .. } => {
-            links.insert(rd_link.clone());
+        VfsNode::MediaFile { locator, .. } => {
+            if let Some(link) = &locator.link {
+                links.insert(link.clone());
+            }
         }
         VfsNode::VirtualFile { .. } => {}
     }
