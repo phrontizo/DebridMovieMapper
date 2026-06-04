@@ -590,6 +590,28 @@ impl crate::provider::DebridProvider for RealDebridClient {
     async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error> {
         self.delete_torrent(torrent_id).await
     }
+    async fn resolve_url(
+        &self,
+        loc: &crate::provider::FileLocator,
+    ) -> Result<String, crate::error::AppError> {
+        let link = loc
+            .link
+            .as_deref()
+            .ok_or(crate::error::AppError::Unavailable)?;
+        match self.unrestrict_link(link).await {
+            Ok(resp) => Ok(resp.download),
+            Err(e) if e.status() == Some(reqwest::StatusCode::SERVICE_UNAVAILABLE) => {
+                Err(crate::error::AppError::Unavailable)
+            }
+            Err(e) => Err(crate::error::AppError::Http(e)),
+        }
+    }
+
+    async fn invalidate(&self, loc: &crate::provider::FileLocator) {
+        if let Some(link) = loc.link.as_deref() {
+            self.invalidate_unrestrict_cache(link).await;
+        }
+    }
     async fn invalidate_unrestrict_cache(&self, link: &str) {
         self.invalidate_unrestrict_cache(link).await
     }

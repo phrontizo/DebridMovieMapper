@@ -34,6 +34,14 @@ pub trait DebridProvider: Send + Sync + std::fmt::Debug {
     async fn select_files(&self, torrent_id: &str, file_ids: &str) -> Result<(), reqwest::Error>;
     async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error>;
 
+    /// Resolve a file to a streamable CDN URL. Returns `AppError::Unavailable` when the
+    /// file's bytes are not currently available (RD: 503 on a broken torrent) so callers
+    /// can trigger re-acquire/repair.
+    async fn resolve_url(&self, loc: &FileLocator) -> Result<String, crate::error::AppError>;
+
+    /// Drop any cached resolution for `loc` (RD: the unrestrict-cache entry for its link).
+    async fn invalidate(&self, loc: &FileLocator);
+
     /// Remove a single cached resolution (RD: the unrestrict cache entry for `link`).
     async fn invalidate_unrestrict_cache(&self, link: &str);
     /// Evict expired cached resolutions.
@@ -80,6 +88,7 @@ pub struct MockProvider {
     pub torrent_info: Option<TorrentInfo>,
     pub unrestrict: Option<UnrestrictResponse>,
     pub add_magnet: Option<AddMagnetResponse>,
+    pub resolved_url: Option<String>,
 }
 
 #[cfg(test)]
@@ -106,6 +115,13 @@ impl DebridProvider for MockProvider {
     async fn delete_torrent(&self, _torrent_id: &str) -> Result<(), reqwest::Error> {
         Ok(())
     }
+    async fn resolve_url(&self, _loc: &FileLocator) -> Result<String, crate::error::AppError> {
+        match &self.resolved_url {
+            Some(u) => Ok(u.clone()),
+            None => Err(crate::error::AppError::Unavailable),
+        }
+    }
+    async fn invalidate(&self, _loc: &FileLocator) {}
     async fn invalidate_unrestrict_cache(&self, _link: &str) {}
     async fn evict_expired_cache(&self) {}
 }
@@ -191,5 +207,33 @@ mod tests {
         let (kind, _) =
             choose_provider(Some("   ".to_string()), Some("tb".to_string())).unwrap();
         assert_eq!(kind, ProviderKind::TorBox);
+    }
+
+    #[tokio::test]
+    async fn mock_resolve_url_returns_configured_value() {
+        let mock = MockProvider {
+            resolved_url: Some("https://cdn/file".to_string()),
+            ..Default::default()
+        };
+        let provider: Arc<dyn DebridProvider> = Arc::new(mock);
+        let loc = FileLocator {
+            hash: "h".to_string(),
+            torrent_id: "t".to_string(),
+            file_id: 1,
+            file_path: "f.mkv".to_string(),
+            link: None,
+        };
+        assert_eq!(provider.resolve_url(&loc).await.unwrap(), "https://cdn/file");
+        provider.invalidate(&loc).await; // no-op, must not panic
+    }
+
+    #[tokio::test]
+    async fn mock_resolve_url_unavailable_by_default() {
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
+        let loc = FileLocator::default();
+        assert!(matches!(
+            provider.resolve_url(&loc).await,
+            Err(crate::error::AppError::Unavailable)
+        ));
     }
 }
