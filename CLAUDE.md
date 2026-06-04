@@ -111,9 +111,13 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
   4. Run `cargo test` after every change to confirm nothing is broken.
 - **Before every commit, run all unit and integration tests:**
   ```bash
-  cargo test && INTEGRATION_TEST_LIMIT=10 cargo test --test integration_test -- --ignored && INTEGRATION_TEST_LIMIT=10 cargo test --test repair_integration_test -- --ignored
+  cargo test \
+    && INTEGRATION_TEST_LIMIT=10 cargo test --test integration_test -- --ignored \
+    && INTEGRATION_TEST_LIMIT=10 cargo test --test repair_integration_test -- --ignored \
+    && cargo test --test lifecycle_test -- --ignored
   ```
   Integration test binaries must run sequentially (not `-- --ignored` on all at once) because they share the redb database lock and the Real-Debrid API rate limit. Do not commit if any test fails.
+  - `lifecycle_test` is the cross-provider add→appears→delete→disappears check. It runs against **both** Real-Debrid and TorBox, **modifying the live account** (adds and deletes a Creative-Commons *Sintel* torrent, cleaning up after itself). Each provider's sub-test **skips** if its token (`RD_API_TOKEN` / `TORBOX_API_KEY`) is unset, so it is safe to run with only one provider configured.
 - **Integration tests must be updated for new functionality.** When adding or changing features, update the integration tests to cover the new behavior. Integration tests are the final gate before committing.
 - **Additional integration test files** (all `#[ignore]`, require API tokens): `test_all_rd_torrents.rs`, `test_identification_stats.rs`, `test_short_titles.rs`, `test_media_generation.rs`, `video_player_simulation.rs`. These are supplementary and not part of the pre-commit gate.
 - **Before every commit, validate that `CLAUDE.md` and `README.md` are up-to-date.** If the commit introduces new features, env vars, modules, architectural changes, or modifies existing behavior, update both files to reflect the changes. Documentation must stay in sync with code at all times.

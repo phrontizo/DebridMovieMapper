@@ -143,16 +143,25 @@ fn tmdb_client() -> Arc<TmdbClient> {
     Arc::new(TmdbClient::new(key))
 }
 
+/// Read a non-empty, trimmed env var, or `None` if unset/blank (so a test can skip when
+/// that provider's token isn't configured).
+fn token(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[tokio::test]
 #[ignore]
 async fn lifecycle_real_debrid() {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::try_init().ok();
-    let token = std::env::var("RD_API_TOKEN")
-        .expect("RD_API_TOKEN must be set")
-        .trim()
-        .to_string();
-    let provider: Arc<dyn DebridProvider> = Arc::new(RealDebridClient::new(token).unwrap());
+    let Some(rd) = token("RD_API_TOKEN") else {
+        println!("skipping lifecycle_real_debrid: RD_API_TOKEN not set");
+        return;
+    };
+    let provider: Arc<dyn DebridProvider> = Arc::new(RealDebridClient::new(rd).unwrap());
     run_lifecycle(provider, tmdb_client(), "real-debrid").await;
 }
 
@@ -161,10 +170,10 @@ async fn lifecycle_real_debrid() {
 async fn lifecycle_torbox() {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::try_init().ok();
-    let token = std::env::var("TORBOX_API_KEY")
-        .expect("TORBOX_API_KEY must be set")
-        .trim()
-        .to_string();
-    let provider: Arc<dyn DebridProvider> = Arc::new(TorBoxClient::new(token).unwrap());
+    let Some(tb) = token("TORBOX_API_KEY") else {
+        println!("skipping lifecycle_torbox: TORBOX_API_KEY not set");
+        return;
+    };
+    let provider: Arc<dyn DebridProvider> = Arc::new(TorBoxClient::new(tb).unwrap());
     run_lifecycle(provider, tmdb_client(), "torbox").await;
 }

@@ -40,7 +40,7 @@ The service is configured via environment variables. You can use a `.env` file i
 ```env
 # Debrid provider — set exactly one of RD_API_TOKEN or TORBOX_API_KEY (not both)
 RD_API_TOKEN=your_real_debrid_token
-# TORBOX_API_KEY=your_torbox_token   # recognised but NOT yet functional in this build
+# TORBOX_API_KEY=your_torbox_token   # ...or use TorBox instead of Real-Debrid
 TMDB_API_KEY=your_tmdb_api_key
 
 # Optional
@@ -56,12 +56,12 @@ JELLYFIN_RCLONE_MOUNT_PATH=/media
 
 ### Environment Variables
 
-A debrid provider token is required: set **exactly one** of `RD_API_TOKEN` or `TORBOX_API_KEY` (setting both, or neither, is a startup error). TorBox is recognised but **not yet functional** in this build — selecting it exits with "TorBox support is not yet available in this build"; full TorBox support lands in a later release.
+A debrid provider token is required: set **exactly one** of `RD_API_TOKEN` or `TORBOX_API_KEY` (setting both, or neither, is a startup error). Whichever token is set selects the active provider for that deployment — both Real-Debrid and TorBox are fully supported.
 
 | Variable                     | Required | Default | Description                                                          |
 |------------------------------|----------|---------|----------------------------------------------------------------------|
 | `RD_API_TOKEN`               | One of\* | -              | Your Real-Debrid API token                                           |
-| `TORBOX_API_KEY`             | One of\* | -              | Your TorBox API token (recognised but not yet functional)            |
+| `TORBOX_API_KEY`             | One of\* | -              | Your TorBox API token                                                |
 | `TMDB_API_KEY`               | Yes      | -              | Your TMDB (The Movie Database) API key                               |
 | `SCAN_INTERVAL_SECS`         | No       | 60             | Interval between torrent library scans in seconds (minimum: 10, runs immediately on startup) |
 | `DB_PATH`                    | No       | `metadata.db`  | Path to the redb database file                                       |
