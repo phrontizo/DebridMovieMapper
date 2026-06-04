@@ -89,21 +89,23 @@ docker pull phrontizo/debridmoviemapper:latest
 ```
 
 **Available tags:**
-- `:latest` — latest stable release (updated on version tags like `v1.0.2`)
+- `:latest` — latest stable release (updated on version tags like `v1.0.5`)
 - `:edge` — latest build from `main` branch (may be unstable)
-- `:1.0.2`, `:1.0`, `:1` — pinned to a specific release version
+- `:1.0.5`, `:1.0`, `:1` — pinned to a specific release version
 
 ### 2. Run the container
 ```bash
 docker run -d \
   --name debridmoviemapper \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   -e RD_API_TOKEN=your_token \
   -e TMDB_API_KEY=your_api_key \
   -e SCAN_INTERVAL_SECS=60 \
   -v debridmoviemapper-metadata:/data \
   ghcr.io/phrontizo/debridmoviemapper:latest
 ```
+
+> ⚠️ The WebDAV endpoint is **unauthenticated** and proxies media fetches, so the example binds it to `127.0.0.1` (host-local only). Do not expose it to an untrusted network — if a remote consumer needs access, put it behind a reverse proxy with authentication, or restrict it to a private network.
 
 > To run against TorBox instead, use `-e TORBOX_API_KEY=your_token` in place of `-e RD_API_TOKEN=your_token` (set exactly one).
 
@@ -113,7 +115,7 @@ Build locally for your current architecture:
 docker build -t debridmoviemapper .
 ```
 
-Multi-platform images are built and pushed automatically by GitHub Actions. Release tags (e.g. `git tag v1.0.2 && git push origin v1.0.2`) update `:latest` and semver tags; pushes to `main` update `:edge`.
+Multi-platform images are built and pushed automatically by GitHub Actions. Release tags (e.g. `git tag v1.0.5 && git push origin v1.0.5`) update `:latest` and semver tags; pushes to `main` update `:edge`.
 
 *Note: The named volume ensures your media identification cache is preserved across container recreations.*
 

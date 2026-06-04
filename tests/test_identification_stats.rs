@@ -11,20 +11,17 @@ async fn test_identification_statistics() {
     let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
 
     let rd_client = RealDebridClient::new(rd_token).unwrap();
-    let tmdb_client = TmdbClient::new(tmdb_api_key);
+    let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
     println!("\n========================================");
     println!("IDENTIFICATION STATISTICS");
     println!("========================================\n");
 
-    // Fetch all torrents
-    let torrents = match rd_client.get_torrents().await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Failed to fetch torrents: {}", e);
-            return;
-        }
-    };
+    // Fetch all torrents — a fetch failure is a real failure, not a silent pass.
+    let torrents = rd_client
+        .get_torrents()
+        .await
+        .expect("Failed to fetch torrents");
 
     println!("Total torrents: {}\n", torrents.len());
 
@@ -88,4 +85,14 @@ async fn test_identification_statistics() {
     } else {
         println!("\n🎉 100% IDENTIFICATION ACHIEVED! 🎉");
     }
+
+    // Sanity floor for a supplementary diagnostic: across a non-empty account,
+    // identification must produce at least one match. A zero result means
+    // identify_torrent regressed wholesale (e.g. always returns external_id = None),
+    // which this otherwise print-only test would have silently passed through.
+    assert!(
+        identified > 0,
+        "identification produced zero matches across {} torrents — identify_torrent is likely broken",
+        torrents.len()
+    );
 }

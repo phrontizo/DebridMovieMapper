@@ -21,7 +21,7 @@ async fn test_repair_process_integration() {
         .to_string();
 
     let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
+    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key).unwrap());
     let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
 
     println!("Fetching torrents...");

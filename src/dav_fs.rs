@@ -369,13 +369,31 @@ impl ProxiedMediaFile {
             };
 
             let status = resp.status();
-            if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            // A ranged request should yield 206 Partial Content. A plain 200 means the CDN
+            // ignored the Range header and is returning the whole object starting at byte 0.
+            // That is only safe to buffer when we asked for offset 0 — for any seek (pos > 0)
+            // it would buffer bytes [0, n) at `buffer_start = pos`, silently serving the wrong
+            // bytes. Treat such a response as unusable (like an expired URL) rather than
+            // corrupting the read.
+            let acceptable = status == reqwest::StatusCode::PARTIAL_CONTENT
+                || (status == reqwest::StatusCode::OK && pos == 0);
+            // A 200 ignored the Range and is returning the whole object. Even at offset 0
+            // (where the bytes line up), refuse it unless Content-Length confirms it fits
+            // the fetch window — otherwise a Range-ignoring CDN would make us buffer a
+            // multi-GB body into memory. An absent Content-Length is treated as oversized.
+            let oversized_whole_object = status == reqwest::StatusCode::OK
+                && resp
+                    .content_length()
+                    .is_none_or(|cl| cl > MAX_FETCH_SIZE as u64);
+            if !acceptable || oversized_whole_object {
                 tracing::warn!(
-                    "CDN returned {} for {} — clearing cached CDN URL",
+                    "CDN returned {} for {} at offset {} — clearing cached CDN URL",
                     status,
-                    self.name
+                    self.name,
+                    pos
                 );
-                // CDN URLs expire after ~1h; a 403/410 here means the URL is stale.
+                // Expired URL (403/410/5xx) or a Range-ignoring 200 on a seek: drop the cached
+                // URL and resolution so the next attempt fetches a fresh one.
                 self.cdn_url = None;
                 self.rd_client.invalidate(&self.locator).await;
                 if attempt == 0 {
@@ -536,93 +554,6 @@ mod tests {
         let meta = DebridMetaData::from_node(&vf_node, modified);
         assert!(!meta.is_directory);
         assert_eq!(meta.size, 5);
-    }
-
-    #[test]
-    fn fetch_cdn_range_clears_cdn_url_on_http_failure_only() {
-        // fetch_cdn_range must behave differently for connection errors vs HTTP errors:
-        //
-        // - HTTP error (4xx/5xx status): the CDN URL itself is stale (expired after ~1h),
-        //   so clear cdn_url AND invalidate the provider's cached resolution so the next
-        //   attempt fetches a fresh URL.
-        //
-        // - Connection error (TCP failure, timeout): the CDN URL is still valid — it is
-        //   a transient network issue.  Must NOT call invalidate here.
-        //   With many concurrent ProxiedMediaFile instances (one per rclone read-ahead),
-        //   all invalidating on a transient error forces all of them through the
-        //   rate-limited resolve API simultaneously, serialising them through
-        //   the adaptive rate-limiter and causing a multi-minute hang (~90 callers ×
-        //   700 ms backoff ≈ 63 s observed).
-        let source = include_str!("dav_fs.rs");
-
-        let fn_start = source
-            .find("async fn fetch_cdn_range")
-            .expect("fetch_cdn_range function must exist");
-        let fn_body = &source[fn_start..];
-
-        // The connection-error arm ends before the HTTP-status check.
-        // Use the status check line as a delimiter to isolate the two sections.
-        let status_check = "let status = resp.status()";
-        let split_pos = fn_body
-            .find(status_check)
-            .expect("fetch_cdn_range must contain a status check after the send() call");
-
-        let connection_error_section = &fn_body[..split_pos];
-        let http_error_section = &fn_body[split_pos..];
-
-        // Connection-error branch must NOT invalidate the cached resolution —
-        // doing so triggers a rate-limiter serialisation storm when many readers fail
-        // concurrently due to a transient network issue.
-        assert!(
-            !connection_error_section.contains("invalidate(&self.locator)"),
-            "connection-error branch of fetch_cdn_range must not call \
-             invalidate(&self.locator) (the CDN URL is still valid for transient TCP \
-             failures; invalidating it causes a mass resolve storm)"
-        );
-
-        // HTTP-error branch MUST invalidate the cached resolution so a stale CDN URL
-        // (expired after ~1h) is replaced with a fresh one on retry.
-        assert!(
-            http_error_section.contains("invalidate(&self.locator)"),
-            "HTTP-error branch of fetch_cdn_range must call invalidate(&self.locator) \
-             so that an expired CDN URL is refreshed on retry"
-        );
-
-        // HTTP-error branch must also clear the instance-level cdn_url cache.
-        assert!(
-            http_error_section.contains("self.cdn_url = None"),
-            "HTTP-error branch of fetch_cdn_range must clear self.cdn_url = None \
-             so resolve_cdn_url re-fetches a fresh URL"
-        );
-    }
-
-    #[test]
-    fn fetch_cdn_range_retries_once_on_cdn_url_expiry() {
-        // Verify that fetch_cdn_range contains a retry loop so that a single CDN
-        // failure (e.g. 403 on an expired URL) is recovered inline without
-        // propagating an error to the WebDAV client.
-        let source = include_str!("dav_fs.rs");
-
-        let fn_start = source
-            .find("fn fetch_cdn_range")
-            .expect("fetch_cdn_range function must exist");
-        let fn_body = &source[fn_start..];
-        let fn_end = fn_body[1..]
-            .find("\n    async fn ")
-            .map(|i| i + 1)
-            .unwrap_or(fn_body.len());
-        let fn_source = &fn_body[..fn_end];
-
-        // The function must contain a loop or for-loop for retry logic
-        assert!(
-            fn_source.contains("for attempt") || fn_source.contains("loop {"),
-            "fetch_cdn_range must contain a retry loop for CDN URL expiry (found none)"
-        );
-        // And must continue to retry rather than returning immediately on first failure
-        assert!(
-            fn_source.contains("continue"),
-            "fetch_cdn_range must use `continue` to retry on first failure"
-        );
     }
 
     #[test]
@@ -891,5 +822,339 @@ mod provider_abstraction_tests {
             buffer_start: 0,
         };
         assert_eq!(f.locator.file_id, 3);
+    }
+
+    #[tokio::test]
+    async fn fetch_bytes_rejects_range_ignoring_200_after_seek() {
+        use crate::provider::FileLocator;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A CDN that ignores the Range header and always replies 200 OK with the
+        // object from byte 0. Serves a couple of connections (the retry attempt too).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let body = b"BYTES-FROM-ZERO";
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let url = format!("http://{}/", addr);
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            resolved_url: Some(url.clone()),
+            ..Default::default()
+        });
+        let repair = Arc::new(RepairManager::new(provider.clone()));
+        let mut f = ProxiedMediaFile {
+            name: "Movie.mkv".to_string(),
+            locator: FileLocator::default(),
+            file_size: 1000,
+            repair_manager: repair,
+            rd_client: provider,
+            http_client: reqwest::Client::new(),
+            pos: 500, // a seek to a non-zero offset
+            cdn_url: Some(url),
+            buffer: bytes::Bytes::new(),
+            buffer_start: 0,
+        };
+
+        // The 200 carries the file from offset 0, not from 500 — serving it would hand the
+        // reader the wrong bytes. It must error instead.
+        let result = f.fetch_bytes(8).await;
+        assert!(
+            result.is_err(),
+            "a Range-ignoring 200 at a non-zero offset must be rejected, not mis-served"
+        );
+    }
+
+    /// Spawn a local server that replies `200 OK` with the given Content-Length header and
+    /// body, ignoring the Range header. Returns the base URL.
+    async fn spawn_range_ignoring_200(content_length: u64, body: &'static [u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    content_length
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{}/", addr)
+    }
+
+    fn proxied_for(url: String, pos: u64, file_size: u64) -> ProxiedMediaFile {
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            resolved_url: Some(url.clone()),
+            ..Default::default()
+        });
+        let repair = Arc::new(RepairManager::new(provider.clone()));
+        ProxiedMediaFile {
+            name: "Movie.mkv".to_string(),
+            locator: crate::provider::FileLocator::default(),
+            file_size,
+            repair_manager: repair,
+            rd_client: provider,
+            http_client: reqwest::Client::new(),
+            pos,
+            cdn_url: Some(url),
+            buffer: bytes::Bytes::new(),
+            buffer_start: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_bytes_rejects_whole_object_200_at_offset_zero() {
+        // A 200 whose Content-Length exceeds the fetch window (whole multi-GB object) must
+        // be refused even at offset 0, rather than buffered into memory.
+        let url = spawn_range_ignoring_200(999_999_999, b"only-headers-matter").await;
+        let mut f = proxied_for(url, 0, 5_000_000_000);
+        let result = f.fetch_bytes(8).await;
+        assert!(
+            result.is_err(),
+            "a whole-object 200 larger than the fetch window must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_bytes_accepts_small_200_at_offset_zero() {
+        // A small whole-object 200 at offset 0 (Content-Length within the fetch window) is
+        // legitimate (the bytes start at 0 = pos) and must be served.
+        let body: &[u8] = b"ZEROBYTES1234567"; // 16 bytes
+        let url = spawn_range_ignoring_200(body.len() as u64, body).await;
+        let mut f = proxied_for(url, 0, body.len() as u64);
+        let data = f
+            .fetch_bytes(8)
+            .await
+            .expect("small 200 at offset 0 is valid");
+        assert_eq!(&data[..], b"ZEROBYTE");
+    }
+
+    // --- Behavioural replacements for the former source-string fetch_cdn_range tests ---
+
+    /// Server that always replies with `status` (a status line like "403 Forbidden") and no body.
+    async fn spawn_always_status(status: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = format!("HTTP/1.1 {}\r\nContent-Length: 0\r\n\r\n", status);
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{}/", addr)
+    }
+
+    /// Server whose first response is `first_status` (no body) and whose later responses are
+    /// `206 Partial Content` with `body` — simulates an expired URL recovering on retry.
+    async fn spawn_first_status_then_206(
+        first_status: &'static str,
+        body: &'static [u8],
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut first = true;
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                if first {
+                    first = false;
+                    let head = format!("HTTP/1.1 {}\r\nContent-Length: 0\r\n\r\n", first_status);
+                    let _ = sock.write_all(head.as_bytes()).await;
+                } else {
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                }
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{}/", addr)
+    }
+
+    /// Server that accepts then immediately closes each connection, producing a transport
+    /// (connection) error on the client rather than an HTTP status.
+    async fn spawn_connection_closing() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                match listener.accept().await {
+                    Ok((sock, _)) => drop(sock),
+                    Err(_) => break,
+                }
+            }
+        });
+        format!("http://{}/", addr)
+    }
+
+    /// Build a ProxiedMediaFile plus a handle to the provider's invalidate-call counter.
+    fn proxied_with_counter(
+        url: String,
+        pos: u64,
+        file_size: u64,
+    ) -> (
+        ProxiedMediaFile,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            resolved_url: Some(url.clone()),
+            invalidate_calls: counter.clone(),
+            ..Default::default()
+        });
+        let repair = Arc::new(RepairManager::new(provider.clone()));
+        let f = ProxiedMediaFile {
+            name: "Movie.mkv".to_string(),
+            locator: crate::provider::FileLocator::default(),
+            file_size,
+            repair_manager: repair,
+            rd_client: provider,
+            http_client: reqwest::Client::new(),
+            pos,
+            cdn_url: Some(url),
+            buffer: bytes::Bytes::new(),
+            buffer_start: 0,
+        };
+        (f, counter)
+    }
+
+    #[tokio::test]
+    async fn fetch_cdn_range_invalidates_on_http_error() {
+        // A 4xx/5xx means the CDN URL has expired — drop the cached resolution so a fresh
+        // URL is fetched on retry.
+        let url = spawn_always_status("403 Forbidden").await;
+        let (mut f, invalidate_calls) = proxied_with_counter(url, 0, 1000);
+        let _ = f.fetch_bytes(8).await; // errors after retries
+        assert!(
+            invalidate_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "an HTTP error must invalidate the cached resolution"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_cdn_range_does_not_invalidate_on_connection_error() {
+        // A transient TCP failure must NOT invalidate — the URL is still valid, and many
+        // readers invalidating at once would stampede the rate-limited resolve path.
+        let url = spawn_connection_closing().await;
+        let (mut f, invalidate_calls) = proxied_with_counter(url, 0, 1000);
+        let _ = f.fetch_bytes(8).await; // errors after retries
+        assert_eq!(
+            invalidate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a connection error must not invalidate the cached resolution"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_cdn_range_recovers_from_expired_url() {
+        // First request fails with 403 (expired URL); the retry fetches a fresh 206 and the
+        // read succeeds inline without surfacing an error to the client.
+        let body: &[u8] = b"FRESHBYTES123456"; // 16 bytes
+        let url = spawn_first_status_then_206("403 Forbidden", body).await;
+        let mut f = proxied_for(url, 0, body.len() as u64);
+        let data = f
+            .fetch_bytes(8)
+            .await
+            .expect("a 403 then 206 must recover and serve bytes");
+        assert_eq!(&data[..], b"FRESHBYT");
+    }
+
+    #[tokio::test]
+    async fn resolve_cdn_url_repairs_and_swaps_locator_on_unavailable() {
+        // The headline repair-on-playback flow: resolving the broken torrent returns
+        // Unavailable, instant repair produces a fresh locator, the file swaps to it,
+        // invalidates the old resolution, and re-resolves to a working URL.
+        use crate::provider::FileLocator;
+        use crate::rd_client::{AddMagnetResponse, TorrentFile, TorrentInfo};
+
+        let invalidate_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mock = MockProvider {
+            // Only the original (broken) torrent resolves to Unavailable; the repaired one resolves.
+            unavailable_torrent_ids: ["old_tid".to_string()].into_iter().collect(),
+            resolved_url: Some("https://cdn/fresh".to_string()),
+            add_magnet: Some(AddMagnetResponse {
+                id: "new_tid".to_string(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "new_tid".to_string(),
+                hash: "H".to_string(),
+                status: "downloaded".to_string(),
+                files: vec![TorrentFile {
+                    id: 5,
+                    path: "/Movie.mkv".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                }],
+                links: vec!["https://rd/newlink".to_string()],
+                ..Default::default()
+            }),
+            invalidate_calls: invalidate_calls.clone(),
+            ..Default::default()
+        };
+        let provider: Arc<dyn DebridProvider> = Arc::new(mock);
+        let repair = Arc::new(RepairManager::new(provider.clone()));
+        let mut f = ProxiedMediaFile {
+            name: "Movie.mkv".to_string(),
+            locator: FileLocator {
+                hash: "H".to_string(),
+                torrent_id: "old_tid".to_string(),
+                file_id: 1,
+                file_path: "/Movie.mkv".to_string(),
+                link: Some("https://rd/oldlink".to_string()),
+            },
+            file_size: 1000,
+            repair_manager: repair,
+            rd_client: provider,
+            http_client: reqwest::Client::new(),
+            pos: 0,
+            cdn_url: None,
+            buffer: bytes::Bytes::new(),
+            buffer_start: 0,
+        };
+
+        let url = f
+            .resolve_cdn_url()
+            .await
+            .expect("repair + swap must yield a fresh CDN URL");
+        assert_eq!(url, "https://cdn/fresh");
+        // The file now points at the repaired torrent...
+        assert_eq!(f.locator.torrent_id, "new_tid");
+        // ...and the stale resolution for the old locator was invalidated.
+        assert!(invalidate_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     }
 }

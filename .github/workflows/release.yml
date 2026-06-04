@@ -55,6 +55,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # `secrets` cannot be used in `if:` conditions, so resolve availability into a step
+      # output here (secrets ARE allowed in `env`/`run`) and gate later steps on it.
+      - name: Check Docker Hub availability
+        id: dockerhub
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
         with:
@@ -62,8 +75,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Docker Hub is optional: only log in and tag for it when the secret is set,
+      # so releases still publish to GHCR on forks without the Docker Hub secret.
       - name: Log in to Docker Hub
-        continue-on-error: true
+        if: ${{ steps.dockerhub.outputs.enabled == 'true' }}
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -72,13 +87,25 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Compute target images
+        id: images
+        env:
+          HAS_DOCKERHUB: ${{ steps.dockerhub.outputs.enabled }}
+        run: |
+          {
+            echo "value<<EOF"
+            echo "${GHCR_IMAGE}"
+            if [ "$HAS_DOCKERHUB" = "true" ]; then
+              echo "${DOCKERHUB_IMAGE}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Extract version tags
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: |
-            ${{ env.GHCR_IMAGE }}
-            ${{ env.DOCKERHUB_IMAGE }}
+          images: ${{ steps.images.outputs.value }}
           tags: |
             type=raw,value=latest
             type=semver,pattern={{version}}

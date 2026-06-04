@@ -26,6 +26,9 @@ chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 urlencoding = "2"
+# Enables tokio's paused-clock test harness (#[tokio::test(start_paused = true)]).
+# Dev-only: with the edition-2021 feature resolver this does not reach release builds.
+tokio = { version = "1", features = ["test-util"] }
 
 [lib]
 name = "debridmoviemapper"

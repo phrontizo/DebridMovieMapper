@@ -57,7 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let tmdb_api_key = std::env::var("TMDB_API_KEY")
-        .expect("TMDB_API_KEY must be set")
+        .unwrap_or_else(|_| {
+            eprintln!("Configuration error: TMDB_API_KEY must be set");
+            std::process::exit(1);
+        })
         .trim()
         .to_string();
     let scan_interval_secs = match std::env::var("SCAN_INTERVAL_SECS") {
@@ -74,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Scan interval: {}s", scan_interval_secs);
 
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
+    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key)?);
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
     let repair_manager = Arc::new(RepairManager::new(provider.clone()));
 
@@ -88,15 +91,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "metadata.db".to_string());
-    let db = Arc::new(Database::create(&db_path).expect("Failed to open database"));
+    // Surface a recoverable, user-fixable failure (locked DB, read-only volume) as a
+    // clean error exit rather than a panic with a backtrace.
+    let db = Arc::new(Database::create(&db_path)?);
 
     // Ensure table exists on fresh databases
     {
-        let write_txn = db.begin_write().expect("Failed to begin write transaction");
-        write_txn
-            .open_table(MATCHES_TABLE)
-            .expect("Failed to create matches table");
-        write_txn.commit().expect("Failed to commit table creation");
+        let write_txn = db.begin_write()?;
+        write_txn.open_table(MATCHES_TABLE)?;
+        write_txn.commit()?;
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

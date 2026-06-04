@@ -85,6 +85,11 @@ pub struct MockProvider {
     pub torrent_info: Option<TorrentInfo>,
     pub add_magnet: Option<AddMagnetResponse>,
     pub resolved_url: Option<String>,
+    /// Counts `invalidate` calls so tests can assert whether the cached resolution was dropped.
+    pub invalidate_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Torrent ids whose `resolve_url` should return `Unavailable` (simulates a broken torrent),
+    /// letting tests exercise the repair-on-`Unavailable` path while other ids resolve normally.
+    pub unavailable_torrent_ids: std::collections::HashSet<String>,
 }
 
 #[cfg(test)]
@@ -108,13 +113,19 @@ impl DebridProvider for MockProvider {
     async fn delete_torrent(&self, _torrent_id: &str) -> Result<(), reqwest::Error> {
         Ok(())
     }
-    async fn resolve_url(&self, _loc: &FileLocator) -> Result<String, crate::error::AppError> {
+    async fn resolve_url(&self, loc: &FileLocator) -> Result<String, crate::error::AppError> {
+        if self.unavailable_torrent_ids.contains(&loc.torrent_id) {
+            return Err(crate::error::AppError::Unavailable);
+        }
         match &self.resolved_url {
             Some(u) => Ok(u.clone()),
             None => Err(crate::error::AppError::Unavailable),
         }
     }
-    async fn invalidate(&self, _loc: &FileLocator) {}
+    async fn invalidate(&self, _loc: &FileLocator) {
+        self.invalidate_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     async fn evict_expired_cache(&self) {}
 }
 

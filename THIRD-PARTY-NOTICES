@@ -32,7 +32,7 @@ Apache-2.0 OR MIT
 
 Used under the MIT licence:
 
-android_system_properties, atomic-waker, autocfg, base64, bitflags,
+android_system_properties, async-trait, atomic-waker, autocfg, base64, bitflags,
 block-buffer, bumpalo, cc, cfg-if, chrono, core-foundation,
 core-foundation-sys, cpufeatures, crypto-common, derive-where, digest,
 displaydoc, dyn-clone, equivalent, errno, find-msvc-tools, fnv,

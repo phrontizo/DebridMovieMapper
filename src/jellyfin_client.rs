@@ -9,6 +9,34 @@ const RETRY_DELAY: Duration = Duration::from_secs(5);
 /// Must be longer than rclone's --dir-cache-time (default 10s in compose.yml).
 const NOTIFICATION_DELAY: Duration = Duration::from_secs(15);
 
+/// What to do with a Jellyfin notification response, by HTTP status.
+#[derive(Debug, PartialEq, Eq)]
+enum NotifyOutcome {
+    /// 2xx — notification accepted; stop.
+    Done,
+    /// Transient server error (502/503/504) — retry.
+    Retry,
+    /// Any other status (4xx, 500, …) — a retry won't help; stop.
+    GiveUp,
+}
+
+/// Classify a Jellyfin notification response status. Note 500 is NOT retried (it usually
+/// signals a genuine error), whereas 502/503/504 are transient and worth retrying.
+fn classify_status(status: reqwest::StatusCode) -> NotifyOutcome {
+    if status.is_success() {
+        NotifyOutcome::Done
+    } else if matches!(
+        status,
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    ) {
+        NotifyOutcome::Retry
+    } else {
+        NotifyOutcome::GiveUp
+    }
+}
+
 pub struct JellyfinClient {
     url: String,
     /// Pre-built sensitive header value so the key is never printed in debug output.
@@ -96,30 +124,31 @@ impl JellyfinClient {
 
             match result {
                 Ok(response) => {
-                    if response.status().is_success() {
-                        info!("Jellyfin notified successfully");
-                        return;
-                    }
                     let status = response.status();
-                    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                        || status == reqwest::StatusCode::BAD_GATEWAY
-                        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
-                    {
-                        tracing::warn!(
-                            "Jellyfin returned {} (transient), retry {}/{}",
-                            status,
-                            attempt + 1,
-                            MAX_RETRIES
-                        );
-                        continue;
+                    match classify_status(status) {
+                        NotifyOutcome::Done => {
+                            info!("Jellyfin notified successfully");
+                            return;
+                        }
+                        NotifyOutcome::Retry => {
+                            tracing::warn!(
+                                "Jellyfin returned {} (transient), retry {}/{}",
+                                status,
+                                attempt + 1,
+                                MAX_RETRIES
+                            );
+                            continue;
+                        }
+                        NotifyOutcome::GiveUp => {
+                            let body = response.text().await.unwrap_or_default();
+                            tracing::warn!(
+                                "Jellyfin notification returned status {}: {:.200}",
+                                status,
+                                body
+                            );
+                            return;
+                        }
                     }
-                    let body = response.text().await.unwrap_or_default();
-                    tracing::warn!(
-                        "Jellyfin notification returned status {}: {:.200}",
-                        status,
-                        body
-                    );
-                    return;
                 }
                 Err(e) if e.is_connect() => {
                     tracing::warn!(
@@ -163,6 +192,40 @@ impl JellyfinClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_status_distinguishes_done_retry_giveup() {
+        use reqwest::StatusCode;
+        // 2xx → Done
+        assert_eq!(classify_status(StatusCode::OK), NotifyOutcome::Done);
+        assert_eq!(classify_status(StatusCode::NO_CONTENT), NotifyOutcome::Done);
+        // Transient 5xx → Retry
+        assert_eq!(
+            classify_status(StatusCode::SERVICE_UNAVAILABLE),
+            NotifyOutcome::Retry
+        );
+        assert_eq!(
+            classify_status(StatusCode::BAD_GATEWAY),
+            NotifyOutcome::Retry
+        );
+        assert_eq!(
+            classify_status(StatusCode::GATEWAY_TIMEOUT),
+            NotifyOutcome::Retry
+        );
+        // 500 and 4xx are NOT retried → GiveUp
+        assert_eq!(
+            classify_status(StatusCode::INTERNAL_SERVER_ERROR),
+            NotifyOutcome::GiveUp
+        );
+        assert_eq!(
+            classify_status(StatusCode::NOT_FOUND),
+            NotifyOutcome::GiveUp
+        );
+        assert_eq!(
+            classify_status(StatusCode::UNAUTHORIZED),
+            NotifyOutcome::GiveUp
+        );
+    }
 
     #[test]
     fn build_request_body_single_created() {

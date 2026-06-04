@@ -47,6 +47,18 @@ pub fn parse_rd_date(s: &str) -> SystemTime {
         }
 
         let y = y as i64;
+        // Reject impossible days for the given month (e.g. 2023-02-30, 2023-04-31)
+        // rather than silently rolling over into the following month.
+        let month_lengths: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let max_day = if m == 2 && is_leap(y) {
+            29
+        } else {
+            month_lengths[(m - 1) as usize]
+        };
+        if d > max_day {
+            return None;
+        }
+
         // Count leap years from year 1 to year (yr - 1) using closed-form formula
         let leap_years_before = |yr: i64| -> i64 {
             let yr = yr - 1;
@@ -91,8 +103,11 @@ pub fn parse_rd_date(s: &str) -> SystemTime {
     parse().unwrap_or(UNIX_EPOCH)
 }
 
-static SEASON_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)s(\d+)|season\s*(\d+)|(\d+)x\d+|part\s*(\d+)").unwrap());
+static SEASON_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // The `NxNN` arm is bounded to a 1-2 digit season so a "WIDTHxHEIGHT" pixel
+    // resolution (e.g. 1920x1080) is not mistaken for a season number.
+    Regex::new(r"(?i)s(\d+)|season\s*(\d+)|\b(\d{1,2})x\d{1,3}\b|part\s*(\d+)").unwrap()
+});
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum VfsNode {
@@ -254,6 +269,10 @@ impl DebridVfs {
                 *count += 1;
                 name
             };
+            // Sanitize the whole folder name: the `[<source>id-<id>]` suffix is derived from
+            // `external_id`, so a crafted/cached value containing a path separator must not be
+            // able to introduce one into the directory path. Idempotent for normal ids.
+            let folder_name = sanitize_filename(&folder_name);
 
             // Warn about archive-only torrents that can't be streamed
             for torrent in &torrents {
@@ -488,11 +507,12 @@ impl DebridVfs {
         // Year
         if let Some(year) = &metadata.year {
             nfo.push_str(&format!("  <year>{}</year>\n", xml_escape(year)));
-            // Add full date for better compatibility
-            nfo.push_str(&format!(
-                "  <premiered>{}-01-01</premiered>\n",
-                xml_escape(year)
-            ));
+            // `<premiered>` must be a valid date. Only emit it for a clean 4-digit year;
+            // a malformed value (e.g. fewer digits or stray characters from a cached entry)
+            // would otherwise produce an invalid date that media servers may reject.
+            if year.len() == 4 && year.bytes().all(|b| b.is_ascii_digit()) {
+                nfo.push_str(&format!("  <premiered>{}-01-01</premiered>\n", year));
+            }
         }
 
         // External IDs
@@ -830,7 +850,11 @@ fn find_deepest_new_dir(path: &str, children: &BTreeMap<String, VfsNode>) -> Str
         })
         .collect();
 
-    if dir_children.len() == 1 {
+    // Only descend when the sole child is a single subdirectory. If there are also
+    // leaf files at this level (e.g. a movie file alongside a `Subs/` folder), this
+    // is the directory worth reporting — descending into the subdirectory would
+    // notify the media server of the wrong path and the file could go unscanned.
+    if children.len() == 1 && dir_children.len() == 1 {
         let (name, sub_children) = dir_children[0];
         let sub_path = format!("{}/{}", path, name);
         find_deepest_new_dir(&sub_path, sub_children)
@@ -844,18 +868,9 @@ mod tests {
     use super::*;
     use crate::rd_client::{TorrentFile, TorrentInfo};
 
-    #[test]
-    fn broken_link_placeholder_not_present() {
-        // Verify the broken-link error placeholder was removed from this file.
-        // On unrestrict failure we skip the file rather than inserting a fake entry.
-        // The search string is split so this test does not self-match.
-        let placeholder = ["# Error: Failed", " to unrestrict link"].concat();
-        let source = include_str!("vfs.rs");
-        assert!(
-            !source.contains(&placeholder),
-            "vfs.rs must not contain the broken-link placeholder — skip the file on error instead"
-        );
-    }
+    // The "skip the file on a missing link rather than inserting a broken-link placeholder"
+    // behaviour is verified by `build_handles_link_count_mismatch` (which asserts no
+    // placeholder node appears), not by grepping this file's source text.
 
     #[test]
     fn build_stores_file_locator_on_media_node() {
@@ -1086,6 +1101,83 @@ mod tests {
         assert!(content.contains("<url>https://www.themoviedb.org/movie/12345</url>"));
         assert!(content.contains("<lockdata>false</lockdata>"));
         assert!(content.contains("<source>debridmoviemapper</source>"));
+    }
+
+    #[test]
+    fn nfo_premiered_only_emitted_for_valid_four_digit_year() {
+        // A clean 4-digit year emits <premiered>.
+        let good = MediaMetadata {
+            title: "Movie".to_string(),
+            year: Some("2024".to_string()),
+            media_type: MediaType::Movie,
+            external_id: None,
+        };
+        let good_nfo = String::from_utf8(DebridVfs::generate_nfo(&good)).unwrap();
+        assert!(good_nfo.contains("<premiered>2024-01-01</premiered>"));
+
+        // A malformed year still emits <year> (best-effort) but NOT an invalid <premiered>.
+        for bad_year in ["20", "abcd", "2024 ", "20245"] {
+            let bad = MediaMetadata {
+                title: "Movie".to_string(),
+                year: Some(bad_year.to_string()),
+                media_type: MediaType::Movie,
+                external_id: None,
+            };
+            let nfo = String::from_utf8(DebridVfs::generate_nfo(&bad)).unwrap();
+            assert!(
+                !nfo.contains("<premiered>"),
+                "year {:?} must not produce a <premiered> tag",
+                bad_year
+            );
+        }
+    }
+
+    #[test]
+    fn build_sanitizes_path_separator_in_external_id() {
+        // A crafted external_id with a path separator must not leak into the folder path.
+        let torrents = vec![(
+            TorrentInfo {
+                id: "1".to_string(),
+                filename: "Movie.mkv".to_string(),
+                original_filename: "Movie.mkv".to_string(),
+                hash: "h".to_string(),
+                bytes: 1000,
+                original_bytes: 1000,
+                host: "h".to_string(),
+                split: 1,
+                progress: 100.0,
+                status: "downloaded".to_string(),
+                added: "2023-01-01".to_string(),
+                files: vec![TorrentFile {
+                    id: 1,
+                    path: "/Movie.mkv".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                }],
+                links: vec!["http://link1".to_string()],
+                ended: Some("2023-01-01".to_string()),
+            },
+            MediaMetadata {
+                title: "Movie".to_string(),
+                year: None,
+                media_type: MediaType::Movie,
+                external_id: Some("tmdb:12/34".to_string()),
+            },
+        )];
+        let vfs = DebridVfs::build(torrents);
+        if let VfsNode::Directory { children } = &vfs.root {
+            if let Some(VfsNode::Directory {
+                children: movie_children,
+            }) = children.get("Movies")
+            {
+                let key = movie_children.keys().next().expect("a movie folder");
+                assert!(
+                    !key.contains('/'),
+                    "folder name must not contain '/': {key}"
+                );
+                assert_eq!(key, "Movie [tmdbid-12-34]");
+            }
+        }
     }
 
     #[test]
@@ -2137,6 +2229,65 @@ mod tests {
     }
 
     #[test]
+    fn parse_rd_date_impossible_day_falls_back() {
+        // Days that cannot exist in the given month must fall back to UNIX_EPOCH
+        // rather than silently rolling into the following month.
+        assert_eq!(parse_rd_date("2023-02-30"), std::time::UNIX_EPOCH);
+        assert_eq!(parse_rd_date("2023-04-31"), std::time::UNIX_EPOCH);
+        assert_eq!(parse_rd_date("2023-02-29"), std::time::UNIX_EPOCH); // 2023 not a leap year
+                                                                        // A genuine leap day must still parse.
+        assert_ne!(parse_rd_date("2024-02-29"), std::time::UNIX_EPOCH);
+        // Last valid day of a 30-day month must still parse.
+        assert_ne!(parse_rd_date("2023-04-30"), std::time::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn find_deepest_new_dir_stops_at_level_with_leaf_files() {
+        // A directory containing a media file alongside a single subdirectory should
+        // report itself, not descend into the subdirectory (which would mis-notify
+        // the media server of the wrong path).
+        let children = BTreeMap::from([
+            (
+                "Movie.mkv".to_string(),
+                VfsNode::MediaFile {
+                    file_size: 1,
+                    locator: Default::default(),
+                },
+            ),
+            (
+                "Subs".to_string(),
+                VfsNode::Directory {
+                    children: BTreeMap::new(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            find_deepest_new_dir("Movies/Title", &children),
+            "Movies/Title"
+        );
+    }
+
+    #[test]
+    fn find_deepest_new_dir_descends_single_subdirectory_chain() {
+        // A pure single-subdirectory chain (e.g. a show season) descends to the leaf level.
+        let season = BTreeMap::from([(
+            "S01E01.mkv".to_string(),
+            VfsNode::MediaFile {
+                file_size: 1,
+                locator: Default::default(),
+            },
+        )]);
+        let show = BTreeMap::from([(
+            "Season 01".to_string(),
+            VfsNode::Directory { children: season },
+        )]);
+        assert_eq!(
+            find_deepest_new_dir("Shows/Breaking Bad", &show),
+            "Shows/Breaking Bad/Season 01"
+        );
+    }
+
+    #[test]
     fn diff_trees_multiple_changes() {
         let old = VfsNode::Directory {
             children: BTreeMap::from([
@@ -2541,6 +2692,15 @@ mod tests {
                         media_count, 2,
                         "Only files with links should be added to VFS"
                     );
+                    // A missing link must SKIP the file, never insert a broken-link
+                    // placeholder node (behavioural replacement for the former source-text check).
+                    assert!(
+                        files.keys().all(|name| {
+                            !name.contains("Error") && !name.to_lowercase().contains("unrestrict")
+                        }),
+                        "missing links must be skipped, not placeholdered: {:?}",
+                        files.keys().collect::<Vec<_>>()
+                    );
                 }
             }
         }
@@ -2637,6 +2797,30 @@ mod tests {
             .parse::<u32>()
             .unwrap();
         assert_eq!(season, 5);
+    }
+
+    #[test]
+    fn season_re_ignores_pixel_resolution() {
+        // Extract the season number exactly as the build path does.
+        let extract = |name: &str| -> Option<u32> {
+            SEASON_RE
+                .captures(name)
+                .and_then(|cap| {
+                    cap.get(1)
+                        .or_else(|| cap.get(2))
+                        .or_else(|| cap.get(3))
+                        .or_else(|| cap.get(4))
+                })
+                .and_then(|m| m.as_str().parse::<u32>().ok())
+        };
+        // A "WIDTHxHEIGHT" pixel resolution must NOT be read as a season number.
+        assert_eq!(extract("Show.Episode.5.1920x1080.mkv"), None);
+        assert_eq!(extract("Show.720x480.mkv"), None);
+        // The "NxNN" episode-numbering convention is still detected.
+        assert_eq!(extract("Show.1x05.mkv"), Some(1));
+        assert_eq!(extract("Show.12x05.mkv"), Some(12));
+        // An explicit SxxExx marker still wins even when a resolution is present.
+        assert_eq!(extract("Show.S03E05.1920x1080.mkv"), Some(3));
     }
 
     /// Test that archive-only torrents produce an empty movie folder (no media files).

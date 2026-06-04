@@ -99,34 +99,38 @@ fn best_scored_result<'a>(
         return None;
     }
     if is_short_title {
-        results
-            .iter()
-            .filter(|r| {
-                let normalized_title = normalize_title(&r.title);
-                let title_matches = normalized_title == normalized_query;
-                let year_matches = year
-                    .as_ref()
-                    .map(|y| {
-                        r.release_date
-                            .as_ref()
-                            .map(|rd| rd.starts_with(y))
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(true); // No year in filename → exact title alone is sufficient
-                title_matches && year_matches
-            })
-            .max_by(|a, b| {
-                score_result(a, normalized_query, year)
-                    .partial_cmp(&score_result(b, normalized_query, year))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+        let candidates = results.iter().filter(|r| {
+            let normalized_title = normalize_title(&r.title);
+            let title_matches = normalized_title == normalized_query;
+            let year_matches = year
+                .as_ref()
+                .map(|y| {
+                    r.release_date
+                        .as_ref()
+                        .map(|rd| rd.starts_with(y))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true); // No year in filename → exact title alone is sufficient
+            title_matches && year_matches
+        });
+        pick_highest_scored(candidates, normalized_query, year)
     } else {
-        results.iter().max_by(|a, b| {
-            score_result(a, normalized_query, year)
-                .partial_cmp(&score_result(b, normalized_query, year))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        pick_highest_scored(results.iter(), normalized_query, year)
     }
+}
+
+/// Pick the highest-scoring result, computing each candidate's score exactly once (the
+/// previous `max_by(|a, b| score(a).cmp(score(b)))` recomputed and re-allocated per
+/// comparison). Ties resolve to the last candidate, matching `Iterator::max_by`.
+fn pick_highest_scored<'a>(
+    candidates: impl Iterator<Item = &'a TmdbSearchResult>,
+    normalized_query: &str,
+    year: &Option<String>,
+) -> Option<&'a TmdbSearchResult> {
+    candidates
+        .map(|r| (score_result(r, normalized_query, year), r))
+        .max_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, r)| r)
 }
 
 fn select_best_match(
@@ -390,7 +394,7 @@ pub async fn identify_name(
 
     // Score all results and pick the best TV and movie matches
     // For short titles (≤3 chars), require exact match + year match
-    let is_short_title = cleaned_name.len() <= 3;
+    let is_short_title = is_short_title(&cleaned_name);
 
     let best_tv = best_scored_result(&tv_results, &normalized_cleaned, &year, is_short_title);
     let best_movie = best_scored_result(&movie_results, &normalized_cleaned, &year, is_short_title);
@@ -419,6 +423,13 @@ pub async fn identify_name(
     }
 
     None
+}
+
+/// A title is "short" (≤3 characters) if it has at most 3 Unicode scalar values.
+/// Counting characters rather than bytes keeps the safeguard consistent for
+/// non-ASCII titles (e.g. a 2-character CJK title is 6 bytes but still short).
+fn is_short_title(name: &str) -> bool {
+    name.chars().count() <= 3
 }
 
 /// Case-insensitive search for an ASCII `needle` in `haystack`, returning
@@ -486,6 +497,7 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     let year = YEAR_RE.find(&title).map(|m| m.as_str().to_string());
 
     // 5. Handle stop words (technical metadata, quality, codecs, season info)
+    let title_before_stopwords = title.clone();
     while let Some(m) = STOP_RE.find(&title) {
         if m.start() == 0 {
             // Metadata at start, strip it
@@ -501,6 +513,12 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
             title.truncate(m.start());
             break;
         }
+    }
+    // If stripping consumed the whole title, the leading "stop word" was actually the title
+    // itself (e.g. a film literally named "Multi"/"Custom"/"Complete"). Restore it rather
+    // than emit an empty title that cannot be searched.
+    if title.is_empty() {
+        title = title_before_stopwords;
     }
 
     // 6. Truncate at year if it appears in title (and is not at the very start)
@@ -587,7 +605,7 @@ mod tests {
     async fn test_repro_00000_issue() {
         dotenvy::dotenv().ok();
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
-        let tmdb_client = TmdbClient::new(tmdb_api_key);
+        let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
         let info = TorrentInfo {
             id: "test_id".to_string(),
@@ -623,7 +641,7 @@ mod tests {
     async fn test_2012_is_not_generic() {
         dotenvy::dotenv().ok();
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
-        let tmdb_client = TmdbClient::new(tmdb_api_key);
+        let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
         let info = TorrentInfo {
             id: "test_id_2012".to_string(),
@@ -656,7 +674,7 @@ mod tests {
     async fn test_peaky_blinders_identification() {
         dotenvy::dotenv().ok();
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
-        let tmdb_client = TmdbClient::new(tmdb_api_key);
+        let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
         let info = TorrentInfo {
             id: "peaky_id".to_string(),
@@ -714,6 +732,18 @@ mod tests {
     }
 
     #[test]
+    fn is_short_title_counts_characters_not_bytes() {
+        // ASCII short titles
+        assert!(is_short_title("Us"));
+        assert!(is_short_title("Don"));
+        assert!(!is_short_title("Drive"));
+        // Multi-byte titles must be measured in characters, not bytes:
+        // "日本" is 2 characters (6 bytes) -> short; "東京物語" is 4 characters -> not short.
+        assert!(is_short_title("日本"));
+        assert!(!is_short_title("東京物語"));
+    }
+
+    #[test]
     fn find_case_insensitive_unicode_safe() {
         // Multi-byte UTF-8 characters before the pattern must not cause a panic.
         // 'Ü' is 2 bytes in UTF-8, so "Üntersuchung" is 13 bytes, not 12.
@@ -735,12 +765,22 @@ mod tests {
         assert_eq!(name, "Study");
     }
 
+    #[test]
+    fn clean_name_preserves_title_that_is_entirely_a_stopword() {
+        // A film literally named after a metadata word must not clean to an empty title.
+        assert_eq!(clean_name("Complete").0, "Complete");
+        assert_eq!(clean_name("Multi").0, "Multi");
+        assert_eq!(clean_name("Custom").0, "Custom");
+        // Normal trailing-metadata stripping is unaffected.
+        assert_eq!(clean_name("The Matrix 1080p").0, "The Matrix");
+    }
+
     #[tokio::test]
     #[ignore]
     async fn test_short_name_no_random_match() {
         dotenvy::dotenv().ok();
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
-        let tmdb_client = TmdbClient::new(tmdb_api_key);
+        let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
         // "UC" cleans to "UC"
         let info = TorrentInfo {
@@ -779,7 +819,7 @@ mod tests {
     async fn test_flow_2024_prefers_popular() {
         dotenvy::dotenv().ok();
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
-        let tmdb_client = TmdbClient::new(tmdb_api_key);
+        let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
         let info = TorrentInfo {
             id: "flow_id".to_string(),
@@ -817,7 +857,7 @@ mod tests {
     async fn test_sherwood_s02_disambiguation() {
         dotenvy::dotenv().ok();
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
-        let tmdb_client = TmdbClient::new(tmdb_api_key);
+        let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
         let info = TorrentInfo {
             id: "sherwood_id".to_string(),
@@ -852,7 +892,7 @@ mod tests {
     async fn test_dune_2000_identification() {
         dotenvy::dotenv().ok();
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
-        let tmdb_client = TmdbClient::new(tmdb_api_key);
+        let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
         let info = TorrentInfo {
             id: "dune_id".to_string(),
@@ -890,7 +930,7 @@ mod tests {
     async fn test_don_2022_tamil_identification() {
         dotenvy::dotenv().ok();
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
-        let tmdb_client = TmdbClient::new(tmdb_api_key);
+        let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
         let info = TorrentInfo {
             id: "don_id".to_string(),
@@ -932,7 +972,7 @@ mod tests {
     async fn test_bond_collection_prefix_stripped_generically() {
         dotenvy::dotenv().ok();
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
-        let tmdb_client = TmdbClient::new(tmdb_api_key);
+        let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
         let info = TorrentInfo {
             id: "bond_id".to_string(),
@@ -969,7 +1009,7 @@ mod tests {
     async fn test_short_title_ted_identified() {
         dotenvy::dotenv().ok();
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
-        let tmdb_client = TmdbClient::new(tmdb_api_key);
+        let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
         // "ted" is a 3-char title with no year — should still identify via TMDB
         let info = TorrentInfo {

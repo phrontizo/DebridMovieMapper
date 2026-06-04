@@ -68,7 +68,7 @@ impl AdaptiveRateLimiter {
     /// Record a 429 throttle — double the interval and optionally respect Retry-After.
     pub async fn record_throttle(&self, retry_after: Option<u64>) {
         let mut state = self.state.lock().await;
-        state.interval_ms = (state.interval_ms * 2).min(MAX_INTERVAL_MS);
+        state.interval_ms = state.interval_ms.saturating_mul(2).min(MAX_INTERVAL_MS);
         if let Some(seconds) = retry_after {
             let capped_seconds = seconds.min(MAX_RETRY_AFTER_SECS);
             let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(capped_seconds);
@@ -144,5 +144,40 @@ mod tests {
     #[test]
     fn retry_after_cap_constant() {
         assert_eq!(MAX_RETRY_AFTER_SECS, 300);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_token_serializes_concurrent_callers() {
+        use std::sync::Arc;
+        // The whole point of the limiter: concurrent callers are serialised to distinct
+        // slots at least `interval` apart, rather than all firing at once.
+        let limiter = Arc::new(AdaptiveRateLimiter::new());
+        let start = tokio::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let l = limiter.clone();
+            handles.push(tokio::spawn(async move {
+                l.wait_for_token().await;
+                tokio::time::Instant::now().duration_since(start)
+            }));
+        }
+        let mut elapsed = Vec::new();
+        for h in handles {
+            elapsed.push(h.await.unwrap());
+        }
+        elapsed.sort();
+        let interval = Duration::from_millis(MIN_INTERVAL_MS);
+        // The k-th caller (sorted) cannot have completed before k*interval.
+        for (k, e) in elapsed.iter().enumerate() {
+            assert!(
+                *e >= interval * k as u32,
+                "caller {} completed at {:?}, before its {:?} slot",
+                k,
+                e,
+                interval * k as u32
+            );
+        }
+        // And the last of four is spaced a full 3 intervals out.
+        assert!(*elapsed.last().unwrap() >= interval * 3);
     }
 }
