@@ -1,6 +1,20 @@
 use crate::error::AppError;
 use crate::rd_client::{AddMagnetResponse, Torrent, TorrentInfo, UnrestrictResponse};
 
+/// Identifies a single media file for resolution. Stable identity is
+/// `(hash, file_path)`; `torrent_id`/`file_id`/`link` are re-derivable (e.g. after
+/// a re-acquire). `link` is the provider's per-file restricted link when it has
+/// one (Real-Debrid); `None` for providers that resolve by `(torrent_id, file_id)`
+/// (TorBox).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileLocator {
+    pub hash: String,
+    pub torrent_id: String,
+    pub file_id: u32,
+    pub file_path: String,
+    pub link: Option<String>,
+}
+
 /// Abstraction over a debrid provider (Real-Debrid today, TorBox in a later phase).
 ///
 /// The method set mirrors the Real-Debrid operations the codebase calls today so
@@ -127,6 +141,21 @@ mod tests {
         assert_eq!(provider.get_torrent_info("x").await.unwrap().id, "");
         provider.invalidate_unrestrict_cache("x").await;
         provider.evict_expired_cache().await;
+    }
+
+    #[test]
+    fn file_locator_constructs_and_clones() {
+        let loc = FileLocator {
+            hash: "abc".to_string(),
+            torrent_id: "t1".to_string(),
+            file_id: 10,
+            file_path: "Movie/Movie.mkv".to_string(),
+            link: Some("https://rd/restricted".to_string()),
+        };
+        let cloned = loc.clone();
+        assert_eq!(cloned, loc);
+        assert_eq!(cloned.file_id, 10);
+        assert_eq!(cloned.link.as_deref(), Some("https://rd/restricted"));
     }
 
     #[test]
