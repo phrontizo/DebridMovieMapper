@@ -13,4 +13,18 @@ pub enum AppError {
 
     #[error("Invalid configuration: {0}")]
     Config(String),
+
+    #[error("Debrid resource temporarily unavailable")]
+    Unavailable,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_variant_displays() {
+        let e = AppError::Unavailable;
+        assert_eq!(e.to_string(), "Debrid resource temporarily unavailable");
+    }
 }
