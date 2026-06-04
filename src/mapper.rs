@@ -8,4 +8,5 @@ pub mod rd_client;
 pub mod repair;
 pub mod tasks;
 pub mod tmdb_client;
+pub mod torbox_client;
 pub mod vfs;
