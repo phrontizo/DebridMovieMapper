@@ -1,7 +1,14 @@
 # TorBox Support via Provider Abstraction
 
 - **Created:** 2026-06-03
-- **Status:** Phase 1 complete (merged to `main`). Phases 2–5 revised — see below.
+- **Status:** Phases 1–2 complete (merged to `main`). Phases 3–5 below.
+  - **2026-06-04 — v3 note.** Phase 2 (FileLocator resolution) merged. Phase 3 refined: the
+    reshaped trait does **not** gain `check_cached`/`add_by_hash` — `try_instant_repair` is
+    generalised by matching the re-acquired file by `file_path` and reusing the existing
+    trait methods. The `resolve_url`/`check_cached`/`add_by_hash` sketch in "Architecture →
+    The reshaped `DebridProvider` trait" is aspirational; the implemented trait is
+    `list_torrents`/`get_torrents`/`get_torrent_info`/`resolve_url`/`invalidate`/`add_magnet`/
+    `select_files`/`delete_torrent`.
 
 ## Revision history
 
@@ -210,7 +217,13 @@ Phase 1 is complete and merged. Remaining phases each land test-green with no re
    reshape the trait to `list_torrents`/`resolve_url`/`check_cached`/`add_by_hash`/`invalidate`;
    RD implements them; the VFS `MediaFile` node stores a `FileLocator`; `dav_fs` resolves via
    `resolve_url`. List-driven persistence unchanged. **No durable catalogue, no migration.**
-3. **Generalised re-acquire.** Refactor `repair.rs` to the reshaped trait.
+3. **Generalised re-acquire.** Make `try_instant_repair` provider-neutral: match the
+   re-acquired file by `file_path` (not RD's positional link index) and return a fresh
+   `FileLocator`. Uses the existing trait methods (`add_magnet`/`get_torrent_info`/
+   `select_files`/`delete_torrent`); the speculative `check_cached`/`add_by_hash` proved
+   **unnecessary** — TorBox implements `select_files` as a no-op and normalises its status
+   to `"downloaded"`, so the existing flow generalises. (Path matching is also safer than the
+   old positional index.)
 4. **TorBox client.** Implement `DebridProvider` for TorBox; include uncached/expired items in
    the library; unit + integration tests.
 5. **Docs.** Update `CLAUDE.md` and `README.md`; TorBox integration tests in the pre-commit gate.
