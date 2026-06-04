@@ -1983,8 +1983,11 @@ mod tests {
                                         "S01E01.mkv".to_string(),
                                         VfsNode::MediaFile {
                                             file_size: 1000,
-                                            rd_link: "http://link1".to_string(),
-                                            rd_torrent_id: "t1".to_string(),
+                                            locator: FileLocator {
+                                                link: Some("http://link1".to_string()),
+                                                torrent_id: "t1".to_string(),
+                                                ..Default::default()
+                                            },
                                         },
                                     )]),
                                 },
