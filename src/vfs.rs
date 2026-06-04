@@ -1,3 +1,4 @@
+use crate::provider::FileLocator;
 use crate::rd_client::TorrentInfo;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -101,9 +102,8 @@ pub enum VfsNode {
     /// Media file proxied from Real-Debrid CDN.
     /// WebDAV serves the actual media bytes (not a .strm URL).
     MediaFile {
-        file_size: u64,  // actual media file size from TorrentFile::bytes
-        rd_link: String, // restricted RD link for on-demand unrestricting
-        rd_torrent_id: String,
+        file_size: u64,
+        locator: FileLocator,
     },
     VirtualFile {
         content: Vec<u8>,
@@ -362,8 +362,13 @@ impl DebridVfs {
                                                 season_children,
                                                 filename,
                                                 file.bytes,
-                                                torrent.id.clone(),
-                                                link.clone(),
+                                                FileLocator {
+                                                    hash: torrent.hash.clone(),
+                                                    torrent_id: torrent.id.clone(),
+                                                    file_id: file.id,
+                                                    file_path: file.path.clone(),
+                                                    link: Some(link.clone()),
+                                                },
                                             );
                                             timestamps.insert(
                                                 format!(
@@ -554,8 +559,13 @@ impl DebridVfs {
                             destination,
                             &path,
                             file.bytes,
-                            torrent.id.clone(),
-                            link.clone(),
+                            FileLocator {
+                                hash: torrent.hash.clone(),
+                                torrent_id: torrent.id.clone(),
+                                file_id: file.id,
+                                file_path: file.path.clone(),
+                                link: Some(link.clone()),
+                            },
                         );
                     }
                 }
@@ -569,8 +579,7 @@ impl DebridVfs {
         root: &mut BTreeMap<String, VfsNode>,
         path: &str,
         size: u64,
-        torrent_id: String,
-        link: String,
+        locator: FileLocator,
     ) -> String {
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         let mut current_children = root;
@@ -597,8 +606,7 @@ impl DebridVfs {
                     final_name,
                     VfsNode::MediaFile {
                         file_size: size,
-                        rd_link: link.clone(),
-                        rd_torrent_id: torrent_id.clone(),
+                        locator: locator.clone(),
                     },
                 );
                 return ret;
@@ -845,6 +853,59 @@ mod tests {
             !source.contains(&placeholder),
             "vfs.rs must not contain the broken-link placeholder — skip the file on error instead"
         );
+    }
+
+    #[test]
+    fn build_stores_file_locator_on_media_node() {
+        let torrents = vec![(
+            TorrentInfo {
+                id: "tid".to_string(),
+                filename: "Movie.2023.mkv".to_string(),
+                original_filename: "Movie.2023.mkv".to_string(),
+                hash: "deadbeef".to_string(),
+                bytes: 1000,
+                original_bytes: 1000,
+                host: "h".to_string(),
+                split: 1,
+                progress: 100.0,
+                status: "downloaded".to_string(),
+                added: "2023-01-01".to_string(),
+                files: vec![TorrentFile {
+                    id: 7,
+                    path: "/Movie.2023.mkv".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                }],
+                links: vec!["https://rd/restricted".to_string()],
+                ended: None,
+            },
+            MediaMetadata {
+                title: "Movie".to_string(),
+                year: Some("2023".to_string()),
+                media_type: MediaType::Movie,
+                external_id: None,
+            },
+        )];
+        let vfs = DebridVfs::build(torrents);
+        if let VfsNode::Directory { children } = &vfs.root {
+            let movies = children.get("Movies").unwrap();
+            if let VfsNode::Directory { children: mc } = movies {
+                let folder = mc.get("Movie").unwrap();
+                if let VfsNode::Directory { children: files } = folder {
+                    let file = files.get("Movie.2023.mkv").expect("media file missing");
+                    if let VfsNode::MediaFile { locator, file_size } = file {
+                        assert_eq!(*file_size, 1000);
+                        assert_eq!(locator.hash, "deadbeef");
+                        assert_eq!(locator.torrent_id, "tid");
+                        assert_eq!(locator.file_id, 7);
+                        assert_eq!(locator.file_path, "/Movie.2023.mkv");
+                        assert_eq!(locator.link.as_deref(), Some("https://rd/restricted"));
+                    } else {
+                        panic!("expected MediaFile");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1348,9 +1409,9 @@ mod tests {
                     .expect("Folder missing");
                 if let VfsNode::Directory { children: files } = folder {
                     let file = files.get("Movie.mkv").expect("Media file missing");
-                    if let VfsNode::MediaFile { rd_torrent_id, .. } = file {
+                    if let VfsNode::MediaFile { locator, .. } = file {
                         assert_eq!(
-                            rd_torrent_id, "large",
+                            locator.torrent_id, "large",
                             "Should have picked the large torrent"
                         );
                     } else {
@@ -1750,8 +1811,11 @@ mod tests {
                                 "Inception.mkv".to_string(),
                                 VfsNode::MediaFile {
                                     file_size: 1000,
-                                    rd_link: "http://link1".to_string(),
-                                    rd_torrent_id: "t1".to_string(),
+                                    locator: FileLocator {
+                                        link: Some("http://link1".to_string()),
+                                        torrent_id: "t1".to_string(),
+                                        ..Default::default()
+                                    },
                                 },
                             )]),
                         },
@@ -1790,8 +1854,11 @@ mod tests {
                                         "S01E01.mkv".to_string(),
                                         VfsNode::MediaFile {
                                             file_size: 1000,
-                                            rd_link: "http://link".to_string(),
-                                            rd_torrent_id: "t1".to_string(),
+                                            locator: FileLocator {
+                                                link: Some("http://link".to_string()),
+                                                torrent_id: "t1".to_string(),
+                                                ..Default::default()
+                                            },
                                         },
                                     )]),
                                 },
@@ -1820,8 +1887,11 @@ mod tests {
                                 "Inception.mkv".to_string(),
                                 VfsNode::MediaFile {
                                     file_size: 1000,
-                                    rd_link: "http://link".to_string(),
-                                    rd_torrent_id: "t1".to_string(),
+                                    locator: FileLocator {
+                                        link: Some("http://link".to_string()),
+                                        torrent_id: "t1".to_string(),
+                                        ..Default::default()
+                                    },
                                 },
                             )]),
                         },
@@ -1856,8 +1926,11 @@ mod tests {
                                 "Inception.mkv".to_string(),
                                 VfsNode::MediaFile {
                                     file_size: 1000,
-                                    rd_link: "http://old-link".to_string(),
-                                    rd_torrent_id: "t1".to_string(),
+                                    locator: FileLocator {
+                                        link: Some("http://old-link".to_string()),
+                                        torrent_id: "t1".to_string(),
+                                        ..Default::default()
+                                    },
                                 },
                             )]),
                         },
@@ -1876,8 +1949,11 @@ mod tests {
                                 "Inception.mkv".to_string(),
                                 VfsNode::MediaFile {
                                     file_size: 1000,
-                                    rd_link: "http://new-link".to_string(),
-                                    rd_torrent_id: "t2".to_string(),
+                                    locator: FileLocator {
+                                        link: Some("http://new-link".to_string()),
+                                        torrent_id: "t2".to_string(),
+                                        ..Default::default()
+                                    },
                                 },
                             )]),
                         },
@@ -1933,16 +2009,22 @@ mod tests {
                                             "S01E01.mkv".to_string(),
                                             VfsNode::MediaFile {
                                                 file_size: 1000,
-                                                rd_link: "http://link1".to_string(),
-                                                rd_torrent_id: "t1".to_string(),
+                                                locator: FileLocator {
+                                                    link: Some("http://link1".to_string()),
+                                                    torrent_id: "t1".to_string(),
+                                                    ..Default::default()
+                                                },
                                             },
                                         ),
                                         (
                                             "S01E02.mkv".to_string(),
                                             VfsNode::MediaFile {
                                                 file_size: 1000,
-                                                rd_link: "http://link2".to_string(),
-                                                rd_torrent_id: "t2".to_string(),
+                                                locator: FileLocator {
+                                                    link: Some("http://link2".to_string()),
+                                                    torrent_id: "t2".to_string(),
+                                                    ..Default::default()
+                                                },
                                             },
                                         ),
                                     ]),
@@ -2011,8 +2093,11 @@ mod tests {
                                     "old.mkv".to_string(),
                                     VfsNode::MediaFile {
                                         file_size: 1000,
-                                        rd_link: "http://old".to_string(),
-                                        rd_torrent_id: "t1".to_string(),
+                                        locator: FileLocator {
+                                            link: Some("http://old".to_string()),
+                                            torrent_id: "t1".to_string(),
+                                            ..Default::default()
+                                        },
                                     },
                                 )]),
                             },
@@ -2039,8 +2124,11 @@ mod tests {
                                     "new.mkv".to_string(),
                                     VfsNode::MediaFile {
                                         file_size: 1000,
-                                        rd_link: "http://new".to_string(),
-                                        rd_torrent_id: "t2".to_string(),
+                                        locator: FileLocator {
+                                            link: Some("http://new".to_string()),
+                                            torrent_id: "t2".to_string(),
+                                            ..Default::default()
+                                        },
                                     },
                                 )]),
                             },
@@ -2060,8 +2148,11 @@ mod tests {
                                             "S01E01.mkv".to_string(),
                                             VfsNode::MediaFile {
                                                 file_size: 1000,
-                                                rd_link: "http://ep".to_string(),
-                                                rd_torrent_id: "t3".to_string(),
+                                                locator: FileLocator {
+                                                    link: Some("http://ep".to_string()),
+                                                    torrent_id: "t3".to_string(),
+                                                    ..Default::default()
+                                                },
                                             },
                                         )]),
                                     },
@@ -2150,9 +2241,10 @@ mod tests {
                     .expect("Movie folder missing");
                 if let VfsNode::Directory { children: files } = folder {
                     let media = files.get("Movie.mkv").expect("Media file missing");
-                    if let VfsNode::MediaFile { rd_link, .. } = media {
+                    if let VfsNode::MediaFile { locator, .. } = media {
                         assert_eq!(
-                            rd_link, "http://link_for_movie",
+                            locator.link.as_deref(),
+                            Some("http://link_for_movie"),
                             "Video file should use link index 1 (after non-video selected file), \
                              not link index 0"
                         );
@@ -2237,15 +2329,17 @@ mod tests {
                         let ep1 = episodes.get("Show.S01E01.mkv").expect("Ep1 missing");
                         let ep2 = episodes.get("Show.S01E02.mkv").expect("Ep2 missing");
 
-                        if let VfsNode::MediaFile { rd_link, .. } = ep1 {
+                        if let VfsNode::MediaFile { locator, .. } = ep1 {
                             assert_eq!(
-                                rd_link, "http://link_ep1",
+                                locator.link.as_deref(),
+                                Some("http://link_ep1"),
                                 "Episode 1 should use link index 1 (after non-video selected file)"
                             );
                         }
-                        if let VfsNode::MediaFile { rd_link, .. } = ep2 {
+                        if let VfsNode::MediaFile { locator, .. } = ep2 {
                             assert_eq!(
-                                rd_link, "http://link_ep2",
+                                locator.link.as_deref(),
+                                Some("http://link_ep2"),
                                 "Episode 2 should use link index 2"
                             );
                         }
