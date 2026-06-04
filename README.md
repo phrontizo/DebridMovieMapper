@@ -89,9 +89,9 @@ docker pull phrontizo/debridmoviemapper:latest
 ```
 
 **Available tags:**
-- `:latest` — latest stable release (updated on version tags like `v1.0.5`)
+- `:latest` — latest stable release (updated on version tags like `v1.0.6`)
 - `:edge` — latest build from `main` branch (may be unstable)
-- `:1.0.5`, `:1.0`, `:1` — pinned to a specific release version
+- `:1.0.6`, `:1.0`, `:1` — pinned to a specific release version
 
 ### 2. Run the container
 ```bash
@@ -115,7 +115,7 @@ Build locally for your current architecture:
 docker build -t debridmoviemapper .
 ```
 
-Multi-platform images are built and pushed automatically by GitHub Actions. Release tags (e.g. `git tag v1.0.5 && git push origin v1.0.5`) update `:latest` and semver tags; pushes to `main` update `:edge`.
+Multi-platform images are built and pushed automatically by GitHub Actions. Release tags (e.g. `git tag v1.0.6 && git push origin v1.0.6`) update `:latest` and semver tags; pushes to `main` update `:edge`.
 
 *Note: The named volume ensures your media identification cache is preserved across container recreations.*
 
