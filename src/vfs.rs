@@ -316,7 +316,7 @@ impl DebridVfs {
                         }
                         let selected_count =
                             torrent.files.iter().filter(|f| f.selected == 1).count();
-                        if selected_count != torrent.links.len() {
+                        if !torrent.links.is_empty() && selected_count != torrent.links.len() {
                             tracing::warn!(
                                 "Torrent '{}': selected file count ({}) != link count ({})",
                                 torrent.filename,
@@ -328,7 +328,8 @@ impl DebridVfs {
                         for file in &torrent.files {
                             if file.selected == 1 {
                                 if is_video_file(&file.path) {
-                                    if let Some(link) = torrent.links.get(link_idx) {
+                                    let link = torrent.links.get(link_idx).cloned();
+                                    if link.is_some() || torrent.links.is_empty() {
                                         let filename =
                                             file.path.split('/').next_back().unwrap_or(&file.path);
                                         let season = SEASON_RE
@@ -367,7 +368,7 @@ impl DebridVfs {
                                                     torrent_id: torrent.id.clone(),
                                                     file_id: file.id,
                                                     file_path: file.path.clone(),
-                                                    link: Some(link.clone()),
+                                                    link,
                                                 },
                                             );
                                             timestamps.insert(
@@ -536,7 +537,7 @@ impl DebridVfs {
         path_prefix: Option<&str>,
     ) {
         let selected_count = torrent.files.iter().filter(|f| f.selected == 1).count();
-        if selected_count != torrent.links.len() {
+        if !torrent.links.is_empty() && selected_count != torrent.links.len() {
             tracing::warn!(
                 "Torrent '{}': selected file count ({}) != link count ({})",
                 torrent.filename,
@@ -548,7 +549,8 @@ impl DebridVfs {
         for file in &torrent.files {
             if file.selected == 1 {
                 if is_video_file(&file.path) {
-                    if let Some(link) = torrent.links.get(link_idx) {
+                    let link = torrent.links.get(link_idx).cloned();
+                    if link.is_some() || torrent.links.is_empty() {
                         let filename = file.path.split('/').next_back().unwrap_or(&file.path);
                         let path = if let Some(prefix) = path_prefix {
                             format!("{}/{}", prefix, filename.trim_start_matches('/'))
@@ -564,7 +566,7 @@ impl DebridVfs {
                                 torrent_id: torrent.id.clone(),
                                 file_id: file.id,
                                 file_path: file.path.clone(),
-                                link: Some(link.clone()),
+                                link,
                             },
                         );
                     }
@@ -903,6 +905,58 @@ mod tests {
                     } else {
                         panic!("expected MediaFile");
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_includes_linkless_torbox_file() {
+        // A TorBox-style movie torrent: files present, but no per-file links array.
+        let torrents = vec![(
+            TorrentInfo {
+                id: "99".to_string(),
+                filename: "Sintel".to_string(),
+                hash: "deadbeef".to_string(),
+                status: "downloaded".to_string(),
+                added: "2024-01-01".to_string(),
+                files: vec![TorrentFile {
+                    id: 10,
+                    path: "Sintel/Sintel.mp4".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                }],
+                links: vec![], // TorBox has no per-file links
+                ..Default::default()
+            },
+            MediaMetadata {
+                title: "Sintel".to_string(),
+                year: None,
+                media_type: MediaType::Movie,
+                external_id: None,
+            },
+        )];
+        let vfs = DebridVfs::build(torrents);
+        if let VfsNode::Directory { children } = &vfs.root {
+            let movies = children.get("Movies").expect("Movies dir");
+            if let VfsNode::Directory { children: mc } = movies {
+                let folder = mc
+                    .get("Sintel")
+                    .expect("movie folder should exist even without links");
+                if let VfsNode::Directory { children: files } = folder {
+                    let f = files
+                        .get("Sintel.mp4")
+                        .expect("media file should appear even without a link");
+                    if let VfsNode::MediaFile { locator, .. } = f {
+                        assert_eq!(locator.link, None);
+                        assert_eq!(locator.torrent_id, "99");
+                        assert_eq!(locator.file_id, 10);
+                        assert_eq!(locator.hash, "deadbeef");
+                    } else {
+                        panic!("expected MediaFile");
+                    }
+                } else {
+                    panic!("expected folder dir");
                 }
             }
         }
