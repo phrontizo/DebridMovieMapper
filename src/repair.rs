@@ -6,12 +6,6 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-#[derive(Debug)]
-pub struct InstantRepairResult {
-    pub new_torrent_id: String,
-    pub new_rd_link: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepairState {
     Healthy,
@@ -344,35 +338,55 @@ impl RepairManager {
         }
     }
 
-    /// Attempt instant repair for cached torrents. Returns the new restricted RD link
-    /// if the torrent is cached (status "downloaded" immediately after select_files).
-    /// Returns Err if the torrent needs actual downloading or repair fails.
+    /// Build a `FileLocator` for the file at `file_path` within `info`. The per-file
+    /// restricted link is paired by position among selected files (Real-Debrid); for
+    /// providers with no per-file link array (TorBox) `links` is empty so `link` is
+    /// `None` and the file is addressed by `(torrent_id, file_id)`. Returns `None` if
+    /// no selected file matches `file_path`.
+    fn locator_for_file(
+        info: &TorrentInfo,
+        hash: &str,
+        file_path: &str,
+    ) -> Option<crate::provider::FileLocator> {
+        let mut link_idx = 0;
+        for file in &info.files {
+            if file.selected == 1 {
+                if file.path == file_path {
+                    return Some(crate::provider::FileLocator {
+                        hash: hash.to_string(),
+                        torrent_id: info.id.clone(),
+                        file_id: file.id,
+                        file_path: file_path.to_string(),
+                        link: info.links.get(link_idx).cloned(),
+                    });
+                }
+                link_idx += 1;
+            }
+        }
+        None
+    }
+
+    /// Attempt instant repair (re-acquire) for a broken/uncached file. Re-adds the
+    /// torrent by hash; if the replacement is immediately available, returns a fresh
+    /// `FileLocator` for the SAME file (matched by `file_path`). Returns `Err` if the
+    /// torrent needs downloading or the repair fails.
     pub async fn try_instant_repair(
         &self,
-        torrent_id: &str,
-        failed_link: &str,
-    ) -> Result<InstantRepairResult, String> {
+        locator: &crate::provider::FileLocator,
+    ) -> Result<crate::provider::FileLocator, String> {
+        let torrent_id = locator.torrent_id.as_str();
         let attempt_num = self.check_and_begin_repair(torrent_id).await?;
         info!(
             "Instant repair attempt #{} for torrent {}",
             attempt_num, torrent_id
         );
 
-        // Get old torrent info to find hash and file selection
+        // Fetch old torrent info to know which files were selected (for re-selection).
         let old_info = match self.rd_client.get_torrent_info(torrent_id).await {
             Ok(info) => info,
             Err(e) => {
                 self.set_repair_failed(torrent_id).await;
                 return Err(format!("Failed to get torrent info: {}", e));
-            }
-        };
-
-        // Find which link index corresponds to the failed link
-        let link_index = match old_info.links.iter().position(|l| l == failed_link) {
-            Some(idx) => idx,
-            None => {
-                self.set_repair_failed(torrent_id).await;
-                return Err("Failed link not found in torrent links".to_string());
             }
         };
 
@@ -382,10 +396,9 @@ impl RepairManager {
             .await?;
         info!("Instant repair: new torrent ID {}", new_torrent_id);
 
-        // Brief wait for RD to process file selection
+        // Brief wait for the provider to process file selection.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Check if torrent is cached (status "downloaded" with links populated)
         let final_info = match self.rd_client.get_torrent_info(&new_torrent_id).await {
             Ok(info) => info,
             Err(e) => {
@@ -395,71 +408,42 @@ impl RepairManager {
             }
         };
 
-        if final_info.status == "downloaded" && !final_info.links.is_empty() {
-            // Validate link count matches before using positional index.
-            // If RD reordered or changed file selection, the index would point
-            // to a different file. Fail-safe: abort if counts diverge.
-            if final_info.links.len() != old_info.links.len() {
-                warn!(
-                    "Instant repair: link count mismatch for torrent {} (old: {}, new: {}). \
-                     Aborting to avoid serving wrong file.",
-                    torrent_id,
-                    old_info.links.len(),
-                    final_info.links.len()
-                );
-                self.cleanup_leaked_torrent(&new_torrent_id).await;
-                self.set_repair_failed(torrent_id).await;
-                return Err(format!(
-                    "Link count mismatch: old torrent had {} links, new has {}",
-                    old_info.links.len(),
-                    final_info.links.len()
-                ));
-            }
-
-            // Cached! Get the new link at the same index
-            let new_link = match final_info.links.get(link_index) {
-                Some(link) => link.clone(),
+        if final_info.status == "downloaded" {
+            // Match the SAME file by path (provider-neutral; no positional link index).
+            match Self::locator_for_file(&final_info, &locator.hash, &locator.file_path) {
+                Some(new_locator) => {
+                    self.complete_repair(torrent_id, &new_torrent_id).await;
+                    info!(
+                        "Instant repair SUCCEEDED for torrent {} -> new ID {} (file {})",
+                        torrent_id, new_torrent_id, locator.file_path
+                    );
+                    Ok(new_locator)
+                }
                 None => {
                     self.cleanup_leaked_torrent(&new_torrent_id).await;
                     self.set_repair_failed(torrent_id).await;
-                    return Err(format!(
-                        "Link index {} out of bounds (new torrent has {} links)",
-                        link_index,
-                        final_info.links.len()
-                    ));
+                    Err(format!(
+                        "Repaired torrent missing file path {}",
+                        locator.file_path
+                    ))
                 }
-            };
-
-            self.complete_repair(torrent_id, &new_torrent_id).await;
-
-            info!(
-                "Instant repair SUCCEEDED for torrent {} -> new ID {} with link at index {}",
-                torrent_id, new_torrent_id, link_index
-            );
-
-            Ok(InstantRepairResult {
-                new_torrent_id,
-                new_rd_link: new_link,
-            })
+            }
         } else {
-            // Not cached -- torrent needs actual download
+            // Not cached -- torrent needs actual download.
             info!(
                 "Torrent {} not cached (status: {}), leaving new torrent {} to download",
                 torrent_id, final_info.status, new_torrent_id
             );
 
-            // Delete old broken torrent
             if let Err(e) = self.rd_client.delete_torrent(torrent_id).await {
                 warn!("Failed to delete old torrent {}: {}", torrent_id, e);
             }
 
-            // Record replacement so scan loop reuses old identification
             self.repair_replacements
                 .write()
                 .await
                 .insert(new_torrent_id.to_string(), torrent_id.to_string());
 
-            // Mark as broken so it's hidden until scan picks up the new torrent
             let mut health_map = self.health_status.write().await;
             if let Some(health) = health_map.get_mut(torrent_id) {
                 health.state = RepairState::Broken;
@@ -568,6 +552,7 @@ impl RepairManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::FileLocator;
 
     #[test]
     fn repair_manager_accepts_trait_object() {
@@ -583,22 +568,11 @@ mod tests {
         let _: Result<(), String> = manager.repair_by_id("some_id").await;
     }
 
-    /// Compile-time check: InstantRepairResult struct has the expected fields.
-    #[allow(dead_code)]
-    fn _assert_instant_repair_result_fields() {
-        let result = InstantRepairResult {
-            new_torrent_id: String::new(),
-            new_rd_link: String::new(),
-        };
-        let _: String = result.new_torrent_id;
-        let _: String = result.new_rd_link;
-    }
-
     /// Compile-time check: try_instant_repair exists with the correct signature.
     #[allow(dead_code)]
     async fn _assert_try_instant_repair_signature(manager: &RepairManager) {
-        let _: Result<InstantRepairResult, String> =
-            manager.try_instant_repair("torrent_id", "link").await;
+        let _: Result<crate::provider::FileLocator, String> =
+            manager.try_instant_repair(&FileLocator::default()).await;
     }
 
     #[tokio::test]
@@ -699,6 +673,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_instant_repair_cached_returns_new_locator() {
+        use crate::provider::FileLocator;
+        use crate::rd_client::{AddMagnetResponse, TorrentFile, TorrentInfo};
+
+        // MockProvider returns a "downloaded" torrent containing the target file with a link.
+        let mock = crate::provider::MockProvider {
+            add_magnet: Some(AddMagnetResponse {
+                id: "new_tid".to_string(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "new_tid".to_string(),
+                hash: "H".to_string(),
+                status: "downloaded".to_string(),
+                files: vec![TorrentFile {
+                    id: 5,
+                    path: "/Movie.mkv".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                }],
+                links: vec!["https://rd/newlink".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let manager = RepairManager::new(std::sync::Arc::new(mock));
+
+        let old = FileLocator {
+            hash: "H".to_string(),
+            torrent_id: "old_tid".to_string(),
+            file_id: 1,
+            file_path: "/Movie.mkv".to_string(),
+            link: Some("https://rd/oldlink".to_string()),
+        };
+        let new = manager
+            .try_instant_repair(&old)
+            .await
+            .expect("repair should succeed");
+        assert_eq!(new.torrent_id, "new_tid");
+        assert_eq!(new.file_id, 5);
+        assert_eq!(new.file_path, "/Movie.mkv");
+        assert_eq!(new.link.as_deref(), Some("https://rd/newlink"));
+        assert_eq!(new.hash, "H");
+    }
+
+    #[tokio::test]
     async fn try_instant_repair_rate_limited_within_30s() {
         let manager = make_test_manager();
         // Pre-populate health with a recent repair trigger
@@ -717,7 +737,13 @@ mod tests {
             );
         }
 
-        let result = manager.try_instant_repair("torrent1", "some_link").await;
+        let result = manager
+            .try_instant_repair(&FileLocator {
+                torrent_id: "torrent1".to_string(),
+                link: Some("some_link".to_string()),
+                ..Default::default()
+            })
+            .await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Repair rate limited");
     }
@@ -741,7 +767,13 @@ mod tests {
             );
         }
 
-        let result = manager.try_instant_repair("torrent2", "some_link").await;
+        let result = manager
+            .try_instant_repair(&FileLocator {
+                torrent_id: "torrent2".to_string(),
+                link: Some("some_link".to_string()),
+                ..Default::default()
+            })
+            .await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Maximum repair attempts exceeded");
 
@@ -771,7 +803,13 @@ mod tests {
             );
         }
 
-        let result = manager.try_instant_repair("torrent3", "some_link").await;
+        let result = manager
+            .try_instant_repair(&FileLocator {
+                torrent_id: "torrent3".to_string(),
+                link: Some("some_link".to_string()),
+                ..Default::default()
+            })
+            .await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Repair already in progress");
     }
@@ -928,7 +966,13 @@ mod tests {
             );
         }
 
-        let result = manager.try_instant_repair("torrent4", "some_link").await;
+        let result = manager
+            .try_instant_repair(&FileLocator {
+                torrent_id: "torrent4".to_string(),
+                link: Some("some_link".to_string()),
+                ..Default::default()
+            })
+            .await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Torrent permanently failed");
     }

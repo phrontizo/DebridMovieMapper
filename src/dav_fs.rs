@@ -252,23 +252,14 @@ impl ProxiedMediaFile {
                     "Resolve unavailable for {} — attempting instant repair",
                     self.name
                 );
-                let failed_link = self.locator.link.clone().unwrap_or_default();
-                match self
-                    .repair_manager
-                    .try_instant_repair(&self.locator.torrent_id, &failed_link)
-                    .await
-                {
-                    Ok(result) => {
+                match self.repair_manager.try_instant_repair(&self.locator).await {
+                    Ok(new_locator) => {
                         tracing::info!(
                             "Instant repair succeeded for {} — new torrent {}",
                             self.name,
-                            result.new_torrent_id
+                            new_locator.torrent_id
                         );
-                        // Identity (hash, file_path, file_id) is unchanged; only the
-                        // torrent_id and link are replaced by the repair result.
-                        let old_locator = self.locator.clone();
-                        self.locator.torrent_id = result.new_torrent_id;
-                        self.locator.link = Some(result.new_rd_link);
+                        let old_locator = std::mem::replace(&mut self.locator, new_locator);
                         self.buffer = Bytes::new();
                         self.buffer_start = 0;
                         self.rd_client.invalidate(&old_locator).await;
