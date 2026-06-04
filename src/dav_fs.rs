@@ -89,12 +89,10 @@ impl DavFileSystem for DebridFileSystem {
             match node {
                 VfsNode::MediaFile {
                     file_size,
-                    rd_link,
-                    rd_torrent_id,
+                    locator,
                 } => Ok(Box::new(ProxiedMediaFile {
                     name,
-                    rd_link,
-                    rd_torrent_id,
+                    locator,
                     file_size,
                     repair_manager: self.repair_manager.clone(),
                     rd_client: self.rd_client.clone(),
@@ -221,21 +219,12 @@ impl DavDirEntry for DebridDirEntry {
     }
 }
 
-/// Returns true if the error from unrestrict_link indicates a broken torrent
-/// that should trigger the repair process. Only 503 (Service Unavailable)
-/// means a broken torrent — other errors (network, 404, etc.) should not
-/// trigger repair as they may be transient or indicate intentional deletion.
-fn should_repair_on_unrestrict_error(status: Option<reqwest::StatusCode>) -> bool {
-    status == Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
-}
-
 /// A media file that lazily unrestricts its RD link and proxies CDN bytes.
 /// The CDN URL is cached per open instance. Reads use a 2 MB read-ahead buffer.
 #[derive(Debug)]
 struct ProxiedMediaFile {
     name: String,
-    rd_link: String,
-    rd_torrent_id: String,
+    locator: crate::provider::FileLocator,
     file_size: u64,
     repair_manager: Arc<RepairManager>,
     rd_client: Arc<dyn DebridProvider>,
@@ -253,69 +242,62 @@ impl ProxiedMediaFile {
             return Ok(url.clone());
         }
 
-        match self.rd_client.unrestrict_link(&self.rd_link).await {
-            Ok(response) => {
-                let url = response.download;
+        match self.rd_client.resolve_url(&self.locator).await {
+            Ok(url) => {
                 self.cdn_url = Some(url.clone());
                 Ok(url)
             }
-            Err(e) => {
-                if should_repair_on_unrestrict_error(e.status()) {
-                    tracing::warn!(
-                        "Unrestrict returned 503 for {} — attempting instant repair",
-                        self.name
-                    );
-                    match self
-                        .repair_manager
-                        .try_instant_repair(&self.rd_torrent_id, &self.rd_link)
-                        .await
-                    {
-                        Ok(result) => {
-                            tracing::info!(
-                                "Instant repair succeeded for {} — new torrent {}",
-                                self.name,
-                                result.new_torrent_id
-                            );
-                            let old_rd_link =
-                                std::mem::replace(&mut self.rd_link, result.new_rd_link);
-                            self.rd_torrent_id = result.new_torrent_id;
-                            // Clear the read-ahead buffer so subsequent reads fetch from the
-                            // new CDN URL instead of serving stale bytes from the old one.
-                            self.buffer = Bytes::new();
-                            self.buffer_start = 0;
-                            // Invalidate the cached unrestrict response for the old (broken) link
-                            // so other ProxiedMediaFile instances don't get stale data before
-                            // the next VFS rebuild.
-                            self.rd_client
-                                .invalidate_unrestrict_cache(&old_rd_link)
-                                .await;
-                            // Unrestrict the new link immediately
-                            match self.rd_client.unrestrict_link(&self.rd_link).await {
-                                Ok(response) => {
-                                    let url = response.download;
-                                    self.cdn_url = Some(url.clone());
-                                    return Ok(url);
-                                }
-                                Err(e2) => {
-                                    tracing::error!(
-                                        "Failed to unrestrict repaired link for {}: {}",
-                                        self.name,
-                                        e2
-                                    );
-                                }
+            Err(crate::error::AppError::Unavailable) => {
+                tracing::warn!(
+                    "Resolve unavailable for {} — attempting instant repair",
+                    self.name
+                );
+                let failed_link = self.locator.link.clone().unwrap_or_default();
+                match self
+                    .repair_manager
+                    .try_instant_repair(&self.locator.torrent_id, &failed_link)
+                    .await
+                {
+                    Ok(result) => {
+                        tracing::info!(
+                            "Instant repair succeeded for {} — new torrent {}",
+                            self.name,
+                            result.new_torrent_id
+                        );
+                        // Identity (hash, file_path, file_id) is unchanged; only the
+                        // torrent_id and link are replaced by the repair result.
+                        let old_locator = self.locator.clone();
+                        self.locator.torrent_id = result.new_torrent_id;
+                        self.locator.link = Some(result.new_rd_link);
+                        self.buffer = Bytes::new();
+                        self.buffer_start = 0;
+                        self.rd_client.invalidate(&old_locator).await;
+                        match self.rd_client.resolve_url(&self.locator).await {
+                            Ok(url) => {
+                                self.cdn_url = Some(url.clone());
+                                return Ok(url);
+                            }
+                            Err(e2) => {
+                                tracing::error!(
+                                    "Failed to resolve repaired locator for {}: {}",
+                                    self.name,
+                                    e2
+                                );
                             }
                         }
-                        Err(reason) => {
-                            tracing::error!(
-                                "Instant repair failed for {}: {} — file unavailable",
-                                self.name,
-                                reason
-                            );
-                        }
                     }
-                } else {
-                    tracing::warn!("Unrestrict failed for {} (not repairing): {}", self.name, e);
+                    Err(reason) => {
+                        tracing::error!(
+                            "Instant repair failed for {}: {} — file unavailable",
+                            self.name,
+                            reason
+                        );
+                    }
                 }
+                Err(FsError::GeneralFailure)
+            }
+            Err(e) => {
+                tracing::warn!("Resolve failed for {} (not repairing): {}", self.name, e);
                 Err(FsError::GeneralFailure)
             }
         }
@@ -406,9 +388,7 @@ impl ProxiedMediaFile {
                 );
                 // CDN URLs expire after ~1h; a 403/410 here means the URL is stale.
                 self.cdn_url = None;
-                self.rd_client
-                    .invalidate_unrestrict_cache(&self.rd_link)
-                    .await;
+                self.rd_client.invalidate(&self.locator).await;
                 if attempt == 0 {
                     continue;
                 }
@@ -432,7 +412,7 @@ impl DavFile for ProxiedMediaFile {
         async move {
             if self
                 .repair_manager
-                .should_hide_torrent(&self.rd_torrent_id)
+                .should_hide_torrent(&self.locator.torrent_id)
                 .await
             {
                 return Ok(Box::new(DebridMetaData {
@@ -463,7 +443,7 @@ impl DavFile for ProxiedMediaFile {
         async move {
             if self
                 .repair_manager
-                .should_hide_torrent(&self.rd_torrent_id)
+                .should_hide_torrent(&self.locator.torrent_id)
                 .await
             {
                 return Err(FsError::GeneralFailure);
@@ -517,10 +497,12 @@ mod tests {
         repair_manager: Arc<RepairManager>,
         rd_client: Arc<dyn crate::provider::DebridProvider>,
     ) {
+        use crate::provider::FileLocator;
         let _ = ProxiedMediaFile {
             name: String::new(),
-            rd_link: String::new(),
-            rd_torrent_id: String::new(),
+            locator: FileLocator {
+                ..Default::default()
+            },
             file_size: 0,
             repair_manager,
             rd_client,
@@ -548,8 +530,11 @@ mod tests {
         // MediaFile
         let media_node = VfsNode::MediaFile {
             file_size: 42000,
-            rd_link: "link".to_string(),
-            rd_torrent_id: "tid".to_string(),
+            locator: crate::provider::FileLocator {
+                link: Some("link".to_string()),
+                torrent_id: "tid".to_string(),
+                ..Default::default()
+            },
         };
         let meta = DebridMetaData::from_node(&media_node, modified);
         assert!(!meta.is_directory);
@@ -565,46 +550,18 @@ mod tests {
     }
 
     #[test]
-    fn should_repair_only_on_503() {
-        // Only 503 (Service Unavailable) means broken torrent → trigger repair
-        assert!(should_repair_on_unrestrict_error(Some(
-            reqwest::StatusCode::SERVICE_UNAVAILABLE
-        )));
-
-        // Other status codes should NOT trigger repair
-        assert!(!should_repair_on_unrestrict_error(Some(
-            reqwest::StatusCode::NOT_FOUND
-        )));
-        assert!(!should_repair_on_unrestrict_error(Some(
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        )));
-        assert!(!should_repair_on_unrestrict_error(Some(
-            reqwest::StatusCode::BAD_GATEWAY
-        )));
-        assert!(!should_repair_on_unrestrict_error(Some(
-            reqwest::StatusCode::GATEWAY_TIMEOUT
-        )));
-        assert!(!should_repair_on_unrestrict_error(Some(
-            reqwest::StatusCode::FORBIDDEN
-        )));
-
-        // Network errors (no status code) should NOT trigger repair
-        assert!(!should_repair_on_unrestrict_error(None));
-    }
-
-    #[test]
     fn fetch_cdn_range_clears_cdn_url_on_http_failure_only() {
         // fetch_cdn_range must behave differently for connection errors vs HTTP errors:
         //
         // - HTTP error (4xx/5xx status): the CDN URL itself is stale (expired after ~1h),
-        //   so clear cdn_url AND invalidate the unrestrict cache so the next attempt
-        //   fetches a fresh URL from Real-Debrid.
+        //   so clear cdn_url AND invalidate the provider's cached resolution so the next
+        //   attempt fetches a fresh URL.
         //
         // - Connection error (TCP failure, timeout): the CDN URL is still valid — it is
-        //   a transient network issue.  Must NOT call invalidate_unrestrict_cache here.
+        //   a transient network issue.  Must NOT call invalidate here.
         //   With many concurrent ProxiedMediaFile instances (one per rclone read-ahead),
         //   all invalidating on a transient error forces all of them through the
-        //   rate-limited unrestrict_link API simultaneously, serialising them through
+        //   rate-limited resolve API simultaneously, serialising them through
         //   the adaptive rate-limiter and causing a multi-minute hang (~90 callers ×
         //   700 ms backoff ≈ 63 s observed).
         let source = include_str!("dav_fs.rs");
@@ -624,21 +581,21 @@ mod tests {
         let connection_error_section = &fn_body[..split_pos];
         let http_error_section = &fn_body[split_pos..];
 
-        // Connection-error branch must NOT call invalidate_unrestrict_cache —
+        // Connection-error branch must NOT invalidate the cached resolution —
         // doing so triggers a rate-limiter serialisation storm when many readers fail
         // concurrently due to a transient network issue.
         assert!(
-            !connection_error_section.contains("invalidate_unrestrict_cache"),
+            !connection_error_section.contains("invalidate(&self.locator)"),
             "connection-error branch of fetch_cdn_range must not call \
-             invalidate_unrestrict_cache (the CDN URL is still valid for transient TCP \
-             failures; invalidating it causes a mass unrestrict_link storm)"
+             invalidate(&self.locator) (the CDN URL is still valid for transient TCP \
+             failures; invalidating it causes a mass resolve storm)"
         );
 
-        // HTTP-error branch MUST call invalidate_unrestrict_cache so a stale CDN URL
+        // HTTP-error branch MUST invalidate the cached resolution so a stale CDN URL
         // (expired after ~1h) is replaced with a fresh one on retry.
         assert!(
-            http_error_section.contains("invalidate_unrestrict_cache"),
-            "HTTP-error branch of fetch_cdn_range must call invalidate_unrestrict_cache \
+            http_error_section.contains("invalidate(&self.locator)"),
+            "HTTP-error branch of fetch_cdn_range must call invalidate(&self.locator) \
              so that an expired CDN URL is refreshed on retry"
         );
 
@@ -915,5 +872,35 @@ mod provider_abstraction_tests {
         let repair = Arc::new(RepairManager::new(provider.clone()));
         let http = reqwest::Client::new();
         let _fs = DebridFileSystem::new(provider, vfs, repair, http);
+    }
+
+    #[test]
+    fn proxied_media_file_holds_locator() {
+        use crate::provider::FileLocator;
+        let loc = FileLocator {
+            hash: "h".to_string(),
+            torrent_id: "t".to_string(),
+            file_id: 3,
+            file_path: "Movie/Movie.mkv".to_string(),
+            link: Some("https://rd/x".to_string()),
+        };
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            resolved_url: Some("https://cdn/movie".to_string()),
+            ..Default::default()
+        });
+        let repair = Arc::new(RepairManager::new(provider.clone()));
+        let f = ProxiedMediaFile {
+            name: "Movie.mkv".to_string(),
+            locator: loc.clone(),
+            file_size: 10,
+            repair_manager: repair,
+            rd_client: provider,
+            http_client: reqwest::Client::new(),
+            pos: 0,
+            cdn_url: None,
+            buffer: bytes::Bytes::new(),
+            buffer_start: 0,
+        };
+        assert_eq!(f.locator.file_id, 3);
     }
 }
