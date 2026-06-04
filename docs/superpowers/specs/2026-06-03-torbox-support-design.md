@@ -1,81 +1,125 @@
-# TorBox Support via Provider Abstraction + Durable Catalogue
+# TorBox Support via Provider Abstraction
 
-- **Date:** 2026-06-03
-- **Status:** Approved (design)
-- **Author:** Kiril Dunn (with Claude Code)
+- **Created:** 2026-06-03
+- **Status:** Phase 1 complete (merged to `main`). Phases 2–5 revised — see below.
+
+## Revision history
+
+- **2026-06-03 — v1.** Initial design: provider abstraction + a **durable hash-keyed
+  catalogue** decoupled from the provider's live list (with a redb migration) +
+  on-demand re-acquire + a TorBox client. Premise: TorBox *removes* purged torrents
+  from `mylist` after 30 days, so a list-driven design would make films vanish.
+- **2026-06-04 — v2 (this document).** Phase 1 (provider abstraction) implemented and
+  merged. **Live TorBox API verification disproved the v1 premise:** TorBox does *not*
+  remove purged torrents from `mylist` — it keeps the entry listed and flips it to an
+  *uncached/expired* state (`cached:false`, `download_state` changes; an `expires_at`
+  field exists). This mirrors Real-Debrid, which keeps a torrent in its list even when
+  its links break (503). Consequently:
+  - The **durable hash-keyed catalogue and its redb migration are dropped** — they were
+    unnecessary, and a never-remove catalogue would have broken the user's frequent
+    *delete-a-bad-torrent-and-add-a-different-one* workflow (the deleted torrent would
+    linger and, for a movie, the largest copy wins — possibly the dead one).
+  - The library stays **list-driven** (as today). Durability for "watch it a year later"
+    comes from the provider *retaining the entry* plus **on-demand re-acquire/re-cache on
+    playback**.
+  - Remaining phases reorganised (trait reshape → re-acquire → TorBox client → docs).
 
 ## Summary
 
-Add TorBox as an alternative debrid provider alongside Real-Debrid (RD). Exactly
-one provider is active per deployment, selected at startup by which API token is
-set. Introduce a `DebridProvider` trait so the rest of the system is
-provider-agnostic, and make the media library **durable**: once a film is
-identified it remains in the library indefinitely and is re-acquired from the
-provider on demand if its cached copy has been purged.
+Add TorBox as an alternative debrid provider alongside Real-Debrid (RD). Exactly one
+provider is active per deployment, selected at startup by which API token is set
+(**done in Phase 1**). The rest of the system depends on a `DebridProvider` trait
+(**done in Phase 1**). The remaining work reshapes that trait to a provider-neutral
+file-resolution model, generalises the existing repair machinery into on-demand
+re-acquire, and adds the TorBox implementation.
 
-Full TorBox parity with RD is the goal — including on-demand re-acquisition.
+Full TorBox parity with RD is the goal — including on-demand re-acquisition so an
+owned-but-uncached film plays after a brief re-cache.
 
-## Background & Motivation
+## Background & motivation
 
-DebridMovieMapper currently bridges Real-Debrid to media servers (Jellyfin/Plex)
-over WebDAV. `RealDebridClient` is used **concretely** throughout — `main.rs`,
-`tasks.rs`, `repair.rs`, and `dav_fs.rs` all hold `Arc<RealDebridClient>`; there
-is no provider abstraction.
+DebridMovieMapper bridges a debrid account to media servers (Jellyfin/Plex) over
+WebDAV. After Phase 1, all components depend on `Arc<dyn DebridProvider>`; `RealDebridClient`
+is the sole implementation and is selected at startup.
 
-Two facts drive this design:
+Two facts drive the remaining work:
 
-1. **TorBox's API model differs from RD's.** TorBox lists torrents with their
-   files inline (`/torrents/mylist`), and resolves a streamable URL by
-   addressing a file as `(torrent_id, file_id)` via `/torrents/requestdl` — there
-   is **no two-step "unrestrict"** of a restricted link string. It also exposes a
-   real cached-availability endpoint (`/torrents/checkcached`).
+1. **TorBox's resolution model differs from RD's.** TorBox lists torrents with their
+   files inline (`/torrents/mylist`) and resolves a streamable URL by addressing a file
+   as `(torrent_id, file_id)` via `/torrents/requestdl` — there is **no two-step
+   "unrestrict"** of a per-file restricted link. File ids are arbitrary integers (not a
+   positional index). It also exposes a real cached-availability endpoint
+   (`/torrents/checkcached`).
 
-2. **RD gives library durability by accident; TorBox does not.** RD keeps
-   torrents in the account list even when their links break, so a
-   scan-loop-mirrors-provider design never loses library entries. TorBox
-   **removes** purged items from `mylist` after 30 days of inactivity (any access
-   resets the 30-day timer). A naive port would make films silently disappear
-   from the library over time. The requirement is that a film, once shown in
-   Jellyfin, remains playable a year later.
+2. **Both providers retain entries until the user deletes them (corrected).** RD keeps a
+   torrent in its list even when its links break (503 on `unrestrict`). TorBox keeps a
+   torrent in `mylist` even after its cache expires — the entry persists with
+   `cached:false`/`download_present:false` and an updated `download_state`. So for both
+   providers, *absent from the live list ⇒ the user deleted it*. The current list-driven
+   design therefore already gives durability and correctly handles deliberate
+   delete-and-replace. What's missing for TorBox is (a) showing owned-but-uncached items
+   and (b) re-caching them on playback.
 
-## Requirements & Decisions
+## Requirements & decisions
 
-Captured from the brainstorming session:
-
-1. **One provider active per deployment.** `RD_API_TOKEN` → Real-Debrid;
-   `TORBOX_API_KEY` → TorBox.
-   - Both tokens set → **hard error at startup**, refuse to run.
-   - Neither set → error (as today).
-   - Exactly one set → run that provider.
-   - Consequence: no cross-provider deduplication is needed (only one provider
-     ever runs).
-2. **Provider abstraction** via a `DebridProvider` trait; a single implementation
-   is selected at startup and passed everywhere as `Arc<dyn DebridProvider>`.
-   Chosen over enum dispatch primarily because it enables a `MockProvider` for
-   the repo's mandated TDD, and gives cleaner module isolation. Adds the
-   `async_trait` crate.
-3. **Durable library.** The VFS is built from a **persistent catalogue** of
-   everything ever identified, *not* from the provider's live torrent list. The
-   library never shrinks automatically.
-4. **On-demand re-acquisition.** When a selected file's torrent is no longer
-   available/cached on the provider, re-add it by stored hash, re-cache/download,
-   and serve. This generalises the existing repair machinery across both
-   providers.
-5. **Full TorBox parity**, including re-acquisition (not a deferred/no-op).
+1. **One provider active per deployment** — `RD_API_TOKEN` → RD; `TORBOX_API_KEY` → TorBox;
+   both set → startup error; neither → error. *(Done in Phase 1.)*
+2. **Provider abstraction** via a `DebridProvider` trait; one implementation selected at
+   startup, passed everywhere as `Arc<dyn DebridProvider>`. *(Done in Phase 1.)*
+3. **List-driven library (unchanged).** The VFS is built from the provider's current list
+   plus cached TMDB identifications (redb, keyed by torrent id). Deleting a torrent on the
+   provider removes it from the library on the next scan; this preserves the user's
+   delete-a-bad-torrent-and-add-a-different-one workflow. **No durable catalogue, no redb
+   migration.**
+4. **Show owned-but-uncached items.** For TorBox, `list_torrents` returns downloaded *and*
+   expired/uncached-but-owned torrents, so a film the user owns still appears in Jellyfin
+   even when its cache has lapsed.
+5. **On-demand re-acquire/re-cache** is the durability mechanism. Playing an item whose
+   bytes aren't currently available (RD 503 / TorBox uncached or `requestdl` failure)
+   triggers a re-acquire: re-add by stored hash, `check_cached`, then resolve. This makes
+   "watch it a year later" work.
+6. **Full TorBox parity**, including re-acquisition.
 
 ### Known limitation (accepted)
 
-If a magnet has **no seeders** when the film is finally selected, no system can
-produce the bytes — the catalogue entry remains but cannot play until seeders
-return. For popular content (usually in TorBox's global cache) re-acquire is
-near-instant.
+If a magnet has **no seeders** when the film is finally selected, no system can produce the
+bytes — the entry remains in the library but cannot play until seeders return. For popular
+content (usually in TorBox's global cache) re-acquire is near-instant.
 
-## Architecture
+## Verified TorBox API facts (live, 2026-06-04)
 
-### 1. Canonical model — `src/provider.rs` (new)
+Captured by adding/removing a Creative-Commons test torrent (Sintel) against a real account.
 
-Provider-neutral types that both clients map into. The trait methods return
-these, never RD- or TorBox-specific shapes.
+- **Base / auth:** `https://api.torbox.app/v1/api`, header `Authorization: Bearer <API_KEY>`.
+- **`POST /torrents/createtorrent`** (multipart form, field `magnet`) →
+  `{ success, detail, data: { hash, torrent_id: <int>, auth_id } }`. A globally-cached magnet
+  returns instantly (`detail: "Found Cached Torrent. Using Cached Torrent."`). Rate limit
+  ~60/hour on creation endpoints.
+- **`GET /torrents/mylist?bypass_cache=true`** → `{ success, detail, data: [ Torrent ] }`.
+  Torrent fields include: `id` (int), `hash`, `name`, `magnet`, `size`, `files` (inline),
+  `cached` (bool), `download_present` (bool), `download_finished` (bool),
+  `download_state` (str, e.g. `"cached"`), `active` (bool — **means "currently transferring",
+  NOT availability**; a complete cached torrent is `active:false`), `expires_at`, `progress`,
+  `availability`, `download_path`, timestamps, etc.
+  File fields: `id` (int, **arbitrary, not path-ordered** — e.g. Sintel's `.mp4` is `id:10`),
+  `name` (full path, e.g. `"Sintel/Sintel.mp4"`), `short_name`, `size`, `mimetype`, `s3_path`,
+  `absolute_path`, `md5`, `infected`, `zipped`, `opensubtitles_hash`.
+- **`GET /torrents/checkcached?hash=<h>&format=object&list_files=true`** →
+  `{ data: { "<hash>": { name, size, hash, files: [ { id, name, short_name, size, mimetype } ] } } }`
+  (empty object/list if not cached).
+- **`GET /torrents/requestdl?token=<key>&torrent_id=<int>&file_id=<int>`** →
+  `{ success, detail, data: "<direct CDN URL string>" }`. URL valid ~3 hours. (`&redirect=true`
+  yields a 302 permalink instead.)
+- **`POST /torrents/controltorrent`** (JSON body `{ "torrent_id": <int>, "operation": "delete" }`) →
+  `{ success, detail }`. Operations also include reannounce/pause/resume.
+
+**Availability mapping:** a TorBox torrent is "in the library and playable now" when
+`download_present:true`/`cached:true`; "owned but needs re-cache" when those are false (expired);
+RD's equivalent of the latter is a 503 on `unrestrict`.
+
+## Architecture (remaining work)
+
+### 1. Canonical model — `src/provider.rs` (extend)
 
 ```rust
 pub struct TorrentInfo {
@@ -83,23 +127,22 @@ pub struct TorrentInfo {
     pub hash: String,
     pub filename: String,
     pub bytes: u64,
-    pub status: String,
+    pub status: String,        // normalized: "downloaded" (playable) or "uncached" (owned, needs re-cache)
     pub added: String,
     pub ended: Option<String>,
     pub files: Vec<TorrentFile>,
 }
 
 pub struct TorrentFile {
-    pub id: u32,                 // provider file id / index
+    pub id: u32,               // provider file id (RD: index/id; TorBox: arbitrary id)
     pub path: String,
     pub bytes: u64,
     pub selected: bool,
-    pub link: Option<String>,    // RD restricted link; None for TorBox
+    pub link: Option<String>,  // RD restricted link; None for TorBox
 }
 
-/// What the VFS stores for a media file and what the catalogue persists.
-/// Stable identity = (hash, file_path). torrent_id / file_id / link are
-/// mutable and re-derived on re-acquire.
+/// What the VFS stores for a media file. Stable identity = (hash, file_path);
+/// torrent_id / file_id / link are re-derived on re-acquire.
 pub struct FileLocator {
     pub hash: String,
     pub torrent_id: String,
@@ -109,165 +152,73 @@ pub struct FileLocator {
 }
 ```
 
-### 2. The `DebridProvider` trait — `src/provider.rs`
+### 2. Reshaped `DebridProvider` trait
+
+The Phase 1 trait mirrors RD's methods (`unrestrict_link`, etc.). Reshape it to be
+provider-neutral:
 
 ```rust
-#[async_trait]
-pub trait DebridProvider: Send + Sync {
+#[async_trait::async_trait]
+pub trait DebridProvider: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &'static str;
+    /// All library-relevant torrents WITH files (RD: list + per-torrent info, links paired
+    /// into files[].link; TorBox: mylist incl. uncached, files[].link = None).
     async fn list_torrents(&self) -> Result<Vec<TorrentInfo>, AppError>;
+    /// Resolve a file to a streamable CDN URL (RD: unrestrict link; TorBox: requestdl).
+    /// Returns a recoverable "needs re-acquire" error on 503 / uncached.
     async fn resolve_url(&self, loc: &FileLocator) -> Result<String, AppError>;
     async fn check_cached(&self, hash: &str) -> Result<bool, AppError>;
+    /// Re-add by hash (RD: addMagnet + selectFiles; TorBox: createtorrent), returns fresh info.
     async fn add_by_hash(&self, hash: &str) -> Result<TorrentInfo, AppError>;
     async fn delete_torrent(&self, id: &str) -> Result<(), AppError>;
     async fn invalidate(&self, loc: &FileLocator);
 }
 ```
 
-- `rd_client.rs` and the new `torbox_client.rs` each implement the trait.
-- `DavFs`, `RepairManager`, and `ScanConfig` swap their `Arc<RealDebridClient>`
-  field for `Arc<dyn DebridProvider>`.
-- A `MockProvider` (test-only) implements the trait for unit tests of scan / VFS
-  / re-acquire / dav_fs logic without network access.
-
-`resolve_url` must distinguish a **transient/recoverable failure** (signal
-"needs re-acquire": RD 503 on unrestrict, TorBox not-cached / 404) from other
-errors. This is surfaced via a dedicated `AppError` variant so the re-acquire
+`resolve_url` distinguishes a **recoverable** failure (RD 503, TorBox uncached/`requestdl`
+failure) from other errors via a dedicated `AppError` variant, so the re-acquire
 orchestration can trigger.
 
-### 3. Durable catalogue (redb)
+### 3. Persistence (unchanged) & VFS
 
-New table keyed by **hash**:
-
-```text
-catalogue: hash -> CatalogueEntry {
-    torrent_snapshot,     // file structure: paths, sizes, file ids (at identification)
-    media_metadata,       // TMDB identification (title, year, type, external_id)
-    current_torrent_id,   // mutable: provider's current torrent id for this hash
-}
-```
-
-- **The VFS is rebuilt from the catalogue (all entries) each scan**, not from the
-  live list.
-- Scan loop polls the live list and **upserts**: a hash not in the catalogue is
-  identified via TMDB and inserted; an existing hash refreshes
-  `current_torrent_id` and per-file links/ids.
-- **Entries absent from the live list are retained.** This is the durability
-  guarantee. On RD the catalogue ≈ the live list (no behaviour change); on TorBox
-  the library survives the 30-day purge.
-- **Migration:** the current store is keyed by `torrent_id` holding
-  `(TorrentInfo, MediaMetadata)`. Migrate to the hash-keyed catalogue (TorrentInfo
-  already carries `hash`). Approach: introduce the new table and backfill from the
-  old one on first run, then read exclusively from the new table. The migration
-  is the riskiest piece of the change and gets dedicated tests.
+Keep the existing list-driven scan loop and redb cache (TMDB identifications keyed by torrent
+id). The only VFS change: the `MediaFile` node stores a `FileLocator` instead of
+`(rd_link, rd_torrent_id)`, so `resolve_url` works for both providers and re-acquire can
+re-derive the locator. `vfs.rs::build` continues to take `Vec<(TorrentInfo, MediaMetadata)>`.
 
 ### 4. Generalised re-acquire — refactor `src/repair.rs`
 
-On a resolve failure that signals unavailability:
-
-1. `invalidate(loc)` — drop the cached resolution.
-2. `add_by_hash(hash)` — RD: `addMagnet` + `selectFiles`; TorBox: `createtorrent`.
-3. `check_cached(hash)` / inspect status for "downloaded".
-4. Match the file by `file_path` in the returned `TorrentInfo` → new
-   `file_id`/`link` → fresh `FileLocator`.
-5. `resolve_url(new_loc)`.
-6. Update the VFS node + catalogue entry (`current_torrent_id`, file ids/links);
-   delete the stale provider torrent.
-7. If not cached: fail this read; the torrent downloads and the next scan/read
-   picks it up (preserves RD's current non-cached semantics).
-
-The existing health state machine (Healthy→Broken→Repairing→Failed, 30s cooldown,
-max 3 attempts) is preserved but calls the trait rather than concrete RD methods.
-TorBox uses `check_cached` instead of RD's poll-and-guess.
+On a `resolve_url` recoverable failure: `invalidate` → `add_by_hash(hash)` →
+`check_cached`/status → match file by `file_path` → fresh `FileLocator` → `resolve_url` →
+update the VFS node → optionally delete the stale provider torrent. The existing health state
+machine (cooldown, max attempts) is preserved but calls the trait. RD behaviour is unchanged;
+TorBox uses `check_cached`.
 
 ### 5. TorBox client — `src/torbox_client.rs` (new)
 
-| Trait method | TorBox endpoint | Notes |
-|---|---|---|
-| `list_torrents` | `GET /torrents/mylist` | Files inline; no per-torrent fetch needed |
-| `resolve_url` | `GET /torrents/requestdl?token&torrent_id&file_id` | Returns direct URL (~3h TTL); cache keyed by `(torrent_id,file_id)` |
-| `check_cached` | `GET /torrents/checkcached?hash=` | Real cached-availability check |
-| `add_by_hash` | `POST /torrents/createtorrent` | Magnet built from hash; rate-limited 60/h |
-| `delete_torrent` | `POST /torrents/controltorrent` | Body `{ torrent_id, operation: "delete" }` |
-
-- Base URL `https://api.torbox.app/v1/api`; auth `Authorization: Bearer <API_KEY>`.
-- Reuses the adaptive token-bucket rate-limiter pattern from `rd_client.rs`.
-  `createtorrent` (60/h) needs a conservative cap distinct from read endpoints.
-- Resolution cache TTL ~3h (matching TorBox link expiry) vs RD's ~1h.
-- Integer `torrent_id`/`file_id` are stringified into the canonical model.
-
-### 6. Provider selection — `src/main.rs`
-
-```text
-rd  = env RD_API_TOKEN  (trimmed, non-empty?)
-tb  = env TORBOX_API_KEY (trimmed, non-empty?)
-match (rd, tb):
-    (Some, Some) -> error "Set only one of RD_API_TOKEN / TORBOX_API_KEY", exit
-    (Some, None) -> Arc<dyn DebridProvider> = RealDebridClient::new(rd)
-    (None, Some) -> Arc<dyn DebridProvider> = TorBoxClient::new(tb)
-    (None, None) -> error "Set RD_API_TOKEN or TORBOX_API_KEY", exit
-```
-
-### 7. Errors — `src/error.rs`
-
-Add `AppError` variants:
-- a config error (both tokens set / neither set),
-- a "provider resource unavailable / needs re-acquire" signal used by
-  `resolve_url` and consumed by the re-acquire orchestration.
-
-## Module changes
-
-| File | Change |
-|---|---|
-| `provider.rs` *(new)* | Canonical types, `FileLocator`, `DebridProvider` trait, `MockProvider` (test) |
-| `torbox_client.rs` *(new)* | TorBox implementation of the trait |
-| `rd_client.rs` | Implement the trait; map RD responses → canonical types |
-| `tasks.rs` | Build catalogue + VFS from the persistent store; provider-agnostic |
-| `dav_fs.rs` | Hold `Arc<dyn DebridProvider>`; resolve via trait; trigger re-acquire |
-| `repair.rs` | Generalised to the trait; provider-agnostic re-acquire |
-| `main.rs` | Provider selection (xor tokens) |
-| `mapper.rs` | Declare new modules |
-| `error.rs` | New variants (config, needs-re-acquire) |
-| redb schema | New hash-keyed catalogue table + migration |
-
-## Testing strategy (TDD)
-
-- **Unit:** `MockProvider` drives scan-loop, VFS-build-from-catalogue, and
-  re-acquire orchestration tests without network. TorBox client parse tests from
-  fixture JSON for `mylist`/`requestdl`/`checkcached`/`createtorrent`.
-- **Migration:** dedicated tests for torrent-id-keyed → hash-keyed redb migration.
-- **Integration:** TorBox integration tests mirroring the RD suite, gated on
-  `TORBOX_API_KEY`. Update the pre-commit gate to run the active provider's suite.
-- Run `cargo test` after every change; keep green.
-
-## Documentation
-
-Update `CLAUDE.md` and `README.md`:
-- New modules (`provider.rs`, `torbox_client.rs`), new env var `TORBOX_API_KEY`.
-- Single-provider selection rule (both-set is an error).
-- Durable catalogue (VFS from persistent store, not live list).
-- Generalised on-demand re-acquisition across providers.
+Implements the trait against the verified API (see the API facts above). `list_torrents`
+includes uncached/expired owned torrents (mapping `download_present`/`cached` →
+`status`). Reuses the adaptive rate-limiter pattern (creation endpoints ~60/h). Resolution
+cache TTL ~3h.
 
 ## Implementation phasing
 
-Each phase lands test-green with no regression to RD behaviour.
+Phase 1 is complete and merged. Remaining phases each land test-green with no regression to RD.
 
-1. **Abstraction (pure refactor):** canonical model + `DebridProvider` trait + RD
-   implements it + `MockProvider` + provider-selection (both-tokens error). No
-   behaviour change.
-2. **Durable catalogue:** hash-keyed catalogue table + migration + build VFS from
-   the catalogue. RD gains durability; no regression.
-3. **Generalised re-acquire:** refactor `repair.rs` to the trait.
-4. **TorBox client:** implement the trait against the TorBox API + unit and
-   integration tests.
-5. **Docs:** update `CLAUDE.md` and `README.md`.
+1. ~~**Provider abstraction + selection.**~~ **Done** (merged to `main`).
+2. **Trait reshape + `FileLocator`.** Introduce the canonical `FileLocator`/per-file `link`;
+   reshape the trait to `list_torrents`/`resolve_url`/`check_cached`/`add_by_hash`/`invalidate`;
+   RD implements them; the VFS `MediaFile` node stores a `FileLocator`; `dav_fs` resolves via
+   `resolve_url`. List-driven persistence unchanged. **No durable catalogue, no migration.**
+3. **Generalised re-acquire.** Refactor `repair.rs` to the reshaped trait.
+4. **TorBox client.** Implement `DebridProvider` for TorBox; include uncached/expired items in
+   the library; unit + integration tests.
+5. **Docs.** Update `CLAUDE.md` and `README.md`; TorBox integration tests in the pre-commit gate.
 
-## Open questions / risks
+## Risks
 
-- **redb migration** is the riskiest item; mitigated by phasing it separately
-  (phase 2) with dedicated tests and a backfill-then-read-new approach.
-- TorBox `createtorrent` file selection: confirm whether it auto-selects all
-  files or requires an explicit selection step during implementation (affects
-  `add_by_hash`).
-- Confirm exact TorBox JSON field names against the live API during phase 4
-  (captured as fixtures for parse tests).
+- **Trait reshape touches `vfs.rs` (node shape) and `dav_fs.rs` (resolution + repair trigger).**
+  Mitigated by phasing and the existing test suite; RD resolve path stays behaviourally identical.
+- **TorBox status mapping** (which `download_state`/`cached` combinations count as "owned but
+  uncached" vs "still downloading" vs "failed") — pin down during Phase 4 against live responses;
+  the verified field list above is the reference.
