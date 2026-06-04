@@ -7,7 +7,7 @@ license = "MIT"
 [dependencies]
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dav-server = { version = "0.11", default-features = false }
