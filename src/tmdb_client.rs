@@ -1,3 +1,4 @@
+use crate::error::AppError;
 use rand::Rng;
 use reqwest::{Client, RequestBuilder};
 use serde::Deserialize;
@@ -39,16 +40,19 @@ pub struct TmdbClient {
 }
 
 impl TmdbClient {
-    pub fn new(api_key: String) -> Self {
-        Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("Failed to build TMDB HTTP client"),
+    /// Construct a TMDB client. Returns a configuration error (rather than panicking) if the
+    /// HTTP client cannot be built, matching `RealDebridClient::new`/`TorBoxClient::new`.
+    pub fn new(api_key: String) -> Result<Self, AppError> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| AppError::Config(format!("Failed to build TMDB HTTP client: {}", e)))?;
+        Ok(Self {
+            client,
             api_key,
             // Start in the past so the first request fires immediately.
             last_request: Mutex::new(Instant::now() - MIN_REQUEST_INTERVAL),
-        }
+        })
     }
 
     pub async fn search_movie(&self, query: &str, year: Option<&str>) -> Vec<TmdbSearchResult> {
@@ -167,21 +171,40 @@ impl TmdbClient {
                 "TMDB fetch_with_retry: all {} attempts exhausted (retryable status codes)",
                 max_attempts
             );
-            let synthetic = reqwest::Response::from(
-                hyper::Response::builder()
-                    .status(reqwest::StatusCode::BAD_GATEWAY)
-                    .body(hyper::body::Bytes::from_static(
-                        b"all attempts exhausted: retryable status codes",
-                    ))
-                    .unwrap(),
-            );
-            Err(synthetic.error_for_status().unwrap_err())
+            Err(synthetic_exhausted_error())
         }
     }
 }
 
+/// Build the synthetic Bad Gateway error returned when every retry attempt hit a retryable
+/// status code, so the function surfaces an error instead of panicking. The construction is
+/// infallible by design (a fixed valid status and static body), hence the `expect`s.
+fn synthetic_exhausted_error() -> reqwest::Error {
+    reqwest::Response::from(
+        hyper::Response::builder()
+            .status(reqwest::StatusCode::BAD_GATEWAY)
+            .body(hyper::body::Bytes::from_static(
+                b"all attempts exhausted: retryable status codes",
+            ))
+            .expect("static BAD_GATEWAY response always builds"),
+    )
+    .error_for_status()
+    .expect_err("BAD_GATEWAY always yields an error status")
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_exhausted_error_is_a_bad_gateway_error_not_a_panic() {
+        // Actually executes the exhausted-retries fallback (the source-grep test below only
+        // checks the text). It must return an error carrying 502, never panic.
+        let err = synthetic_exhausted_error();
+        assert!(err.is_status());
+        assert_eq!(err.status(), Some(reqwest::StatusCode::BAD_GATEWAY));
+    }
+
     #[test]
     fn fetch_with_retry_no_panic_on_exhausted_retries() {
         // Verify that the old `.expect()` panic path has been replaced with

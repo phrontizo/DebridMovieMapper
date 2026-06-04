@@ -4,12 +4,17 @@ services:
     container_name: debridmoviemapper
     restart: unless-stopped
     ports:
-      - "${PORT:-8080}:8080"
+      # The WebDAV endpoint is UNAUTHENTICATED and proxies CDN fetches, so it is published
+      # to localhost only — never expose it to the network. rclone reaches it over the
+      # internal Docker network (debridmoviemapper:8080) regardless of this mapping, which
+      # exists only for host-local access/debugging. PORT (in .env) sets the published HOST
+      # port; the container always listens on 8080 (rclone and the healthcheck expect it), so
+      # do not set a PORT env var below — changing the in-container port breaks the mount.
+      - "127.0.0.1:${PORT:-8080}:8080"
     environment:
       - RD_API_TOKEN=${RD_API_TOKEN:?Set RD_API_TOKEN in .env or environment}
       - TMDB_API_KEY=${TMDB_API_KEY:?Set TMDB_API_KEY in .env or environment}
       - DB_PATH=/data/metadata.db
-      # - PORT=8080  # WebDAV server port (must match ports mapping above)
       # Jellyfin notifications (all three required to enable)
       - JELLYFIN_URL=http://jellyfin:8096
       - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:-}

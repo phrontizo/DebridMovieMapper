@@ -11,20 +11,17 @@ async fn test_all_real_debrid_torrents() {
     let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
 
     let rd_client = RealDebridClient::new(rd_token).unwrap();
-    let tmdb_client = TmdbClient::new(tmdb_api_key);
+    let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
     println!("\n========================================");
     println!("TESTING ALL REAL DEBRID TORRENTS");
     println!("========================================\n");
 
-    // Fetch all torrents
-    let torrents = match rd_client.get_torrents().await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Failed to fetch torrents: {}", e);
-            return;
-        }
-    };
+    // Fetch all torrents — a fetch failure is a real failure, not a silent pass.
+    let torrents = rd_client
+        .get_torrents()
+        .await
+        .expect("Failed to fetch torrents");
 
     println!("Found {} torrents in Real Debrid\n", torrents.len());
 
@@ -132,5 +129,16 @@ async fn test_all_real_debrid_torrents() {
                 id.as_ref().unwrap()
             );
         }
+    }
+
+    // Sanity floor for a supplementary diagnostic: across a non-empty account,
+    // identification must produce at least one match. Zero means identify_torrent
+    // regressed wholesale — which this otherwise print-only test would have passed.
+    if !torrents.is_empty() {
+        assert!(
+            identified > 0,
+            "identification produced zero matches across {} torrents — identify_torrent is likely broken",
+            total
+        );
     }
 }

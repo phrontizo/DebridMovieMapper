@@ -847,43 +847,11 @@ mod tests {
         assert!(second_call.is_empty());
     }
 
-    #[test]
-    fn check_and_begin_repair_write_side_rechecks_all_guards() {
-        // The check_and_begin_repair method has a TOCTOU window between its read
-        // lock (fast rejection) and write lock (state transition). Between the two,
-        // another task could mark the torrent as Failed, start repairing, or set
-        // last_repair_trigger. The write-side MUST re-check ALL guards before
-        // proceeding.
-        let source = include_str!("repair.rs");
-        let fn_start = source
-            .find("async fn check_and_begin_repair")
-            .expect("function must exist");
-        let fn_body = &source[fn_start..];
-        // Find the write-side section (after "Write-side")
-        let write_side_start = fn_body
-            .find("Write-side")
-            .expect("must have Write-side comment");
-        let write_side = &fn_body[write_side_start..];
-        // The write-side must check for Failed state before setting Repairing
-        assert!(
-            write_side.contains("RepairState::Failed"),
-            "check_and_begin_repair write-side must re-check for Failed state to prevent \
-             TOCTOU race where another task marks the torrent as failed between the read \
-             and write lock acquisitions"
-        );
-        // The write-side must check for Repairing state
-        assert!(
-            write_side.contains("RepairState::Repairing"),
-            "check_and_begin_repair write-side must re-check for Repairing state"
-        );
-        // The write-side must re-check rate limiting (last_repair_trigger)
-        assert!(
-            write_side.contains("last_repair_trigger"),
-            "check_and_begin_repair write-side must re-check last_repair_trigger to prevent \
-             TOCTOU race where another task completes a repair between the read and write \
-             lock acquisitions, setting last_repair_trigger"
-        );
-    }
+    // The TOCTOU guards in check_and_begin_repair (re-checking Failed / Repairing /
+    // last_repair_trigger on the write side) are covered behaviourally by
+    // `concurrent_check_and_begin_repair_only_one_succeeds` (only one of ten racers wins →
+    // Repairing guard) and `check_and_begin_repair_write_side_rate_limits` (the
+    // last_repair_trigger re-check rejects), rather than by asserting on source text.
 
     #[tokio::test]
     async fn concurrent_check_and_begin_repair_only_one_succeeds() {
@@ -1215,28 +1183,57 @@ mod tests {
         );
     }
 
-    #[test]
-    fn non_cached_branch_inserts_repair_replacement() {
-        // Source-level check: the non-cached else branch in try_instant_repair
-        // must insert into repair_replacements so the scan loop can reuse
-        // old TMDB identification for the replacement torrent.
-        let source = include_str!("repair.rs");
-        let fn_start = source
-            .find("async fn try_instant_repair")
-            .expect("function must exist");
-        let fn_body = &source[fn_start..];
+    #[tokio::test]
+    async fn non_cached_repair_marks_broken_and_records_replacement() {
+        use crate::provider::FileLocator;
+        use crate::rd_client::{AddMagnetResponse, TorrentFile, TorrentInfo};
 
-        // Find the non-cached else branch
-        let else_marker = fn_body
-            .find("Not cached -- torrent needs actual download")
-            .expect("must have non-cached branch comment");
-        let else_branch = &fn_body[else_marker..];
+        // MockProvider returns a re-added torrent that is NOT yet downloaded (cache lapsed),
+        // driving try_instant_repair into the non-cached branch.
+        let mock = crate::provider::MockProvider {
+            add_magnet: Some(AddMagnetResponse {
+                id: "new_tid".to_string(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "new_tid".to_string(),
+                hash: "H".to_string(),
+                status: "downloading".to_string(),
+                files: vec![TorrentFile {
+                    id: 5,
+                    path: "/Movie.mkv".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                }],
+                links: vec![],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let manager = RepairManager::new(std::sync::Arc::new(mock));
+        let old = FileLocator {
+            hash: "H".to_string(),
+            torrent_id: "old_tid".to_string(),
+            file_id: 1,
+            file_path: "/Movie.mkv".to_string(),
+            link: Some("https://rd/oldlink".to_string()),
+        };
 
-        // The else branch must contain repair_replacements insertion
+        // The non-cached branch returns an error (no fresh locator to serve).
+        assert!(manager.try_instant_repair(&old).await.is_err());
+
+        // It must record new_tid -> old_tid so the scan loop reuses the old identification.
+        let replacements = manager.take_repair_replacements().await;
+        assert_eq!(
+            replacements.get("new_tid").map(String::as_str),
+            Some("old_tid"),
+            "non-cached repair must record the new->old replacement mapping"
+        );
+
+        // And it must mark the old torrent Broken so it is hidden until the scan swaps it in.
         assert!(
-            else_branch.contains("repair_replacements"),
-            "Non-cached branch in try_instant_repair must insert into repair_replacements \
-             so the scan loop can reuse old TMDB identification for the replacement torrent"
+            manager.should_hide_torrent("old_tid").await,
+            "non-cached repair must mark the old torrent Broken"
         );
     }
 

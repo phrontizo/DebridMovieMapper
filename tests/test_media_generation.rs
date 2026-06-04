@@ -27,7 +27,7 @@ async fn test_media_file_generation() {
         .to_string();
 
     let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
+    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key).unwrap());
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 
     println!("Fetching torrents...");
@@ -157,7 +157,7 @@ async fn test_media_filename_keeps_original_extension() {
         .to_string();
 
     let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
+    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key).unwrap());
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 
     let torrents = rd_client
@@ -244,7 +244,7 @@ async fn test_nfo_generation_with_media() {
         .to_string();
 
     let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
+    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key).unwrap());
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 
     let torrents = rd_client

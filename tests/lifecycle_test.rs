@@ -142,7 +142,7 @@ fn tmdb_client() -> Arc<TmdbClient> {
         .expect("TMDB_API_KEY must be set")
         .trim()
         .to_string();
-    Arc::new(TmdbClient::new(key))
+    Arc::new(TmdbClient::new(key).unwrap())
 }
 
 /// Read a non-empty, trimmed env var, or `None` if unset/blank (so a test can skip when

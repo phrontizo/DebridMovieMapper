@@ -22,31 +22,46 @@ struct Envelope<T> {
     data: Option<T>,
 }
 
+/// Deserialize a field that TorBox may send as JSON `null` (or omit) into the type's
+/// default, instead of failing the whole response decode. TorBox's `mylist` is loose: a
+/// single torrent with e.g. `"files": null` or `"size": -1` (item still resolving metadata)
+/// must not be allowed to poison the decode and hide the entire library.
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 struct TbFile {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     id: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     name: String,
-    #[serde(default)]
-    size: u64,
+    // Signed: TorBox reports -1 for the size of an item whose metadata has not resolved yet,
+    // so a `u64` here would fail to decode the whole list.
+    #[serde(default, deserialize_with = "null_to_default")]
+    size: i64,
 }
 
 #[derive(Debug, Deserialize)]
 struct TbTorrent {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     id: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     hash: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     name: String,
-    #[serde(default)]
-    size: u64,
-    #[serde(default)]
+    // Signed for the same reason as `TbFile::size`: TorBox returns -1 before metadata resolves.
+    #[serde(default, deserialize_with = "null_to_default")]
+    size: i64,
+    #[serde(default, deserialize_with = "null_to_default")]
     download_finished: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     download_state: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     files: Vec<TbFile>,
 }
 
@@ -71,11 +86,16 @@ fn tb_status(t: &TbTorrent) -> String {
     }
 }
 
+/// Clamp a possibly-negative TorBox size (-1 = "not yet known") to a non-negative byte count.
+fn clamp_size(size: i64) -> u64 {
+    size.max(0) as u64
+}
+
 fn to_torrent_file(f: &TbFile) -> TorrentFile {
     TorrentFile {
         id: f.id,
         path: f.name.clone(),
-        bytes: f.size,
+        bytes: clamp_size(f.size),
         selected: 1,
     }
 }
@@ -86,7 +106,7 @@ fn to_torrent(t: &TbTorrent) -> Torrent {
         id: t.id.to_string(),
         filename: t.name.clone(),
         hash: t.hash.clone(),
-        bytes: t.size,
+        bytes: clamp_size(t.size),
         status: tb_status(t),
         added: String::new(),
         links: Vec::new(),
@@ -101,7 +121,7 @@ fn to_torrent_info(t: &TbTorrent) -> TorrentInfo {
         id: t.id.to_string(),
         filename: t.name.clone(),
         hash: t.hash.clone(),
-        bytes: t.size,
+        bytes: clamp_size(t.size),
         status: tb_status(t),
         added: String::new(),
         files: t.files.iter().map(to_torrent_file).collect(),
@@ -112,6 +132,47 @@ fn to_torrent_info(t: &TbTorrent) -> TorrentInfo {
 }
 
 const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(3 * 3600); // TorBox links last ~3h
+const RESOLVE_CACHE_MAX: usize = 10_000; // Bound the cache like the RD client does
+
+/// Enforce the resolve-cache bound: drop expired entries, then, if still over `max`,
+/// evict the oldest entries. Keeps the cache from growing without limit between the
+/// periodic `evict_expired_cache` sweeps.
+fn bound_cache(cache: &mut HashMap<(String, u32), CachedUrl>, max: usize) {
+    cache.retain(|_, c| c.at.elapsed() < RESOLVE_CACHE_TTL);
+    if cache.len() > max {
+        let mut entries: Vec<_> = cache.iter().map(|(k, c)| (k.clone(), c.at)).collect();
+        entries.sort_by_key(|(_, t)| *t);
+        for (key, _) in entries.into_iter().take(cache.len() - max) {
+            cache.remove(&key);
+        }
+    }
+}
+
+/// Transient server-side statuses worth retrying (mirrors the RD client). A 500 is NOT
+/// retried — it usually indicates a genuine error rather than a transient blip.
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+/// Build a synthetic Bad Gateway `reqwest::Error` for cases where we must return a
+/// `reqwest::Error` but have no live response — exhausted retries, or unparsable
+/// input we refuse to act on. Centralised so the fallible construction lives in one
+/// place rather than being duplicated (with `.unwrap()`) at every call site.
+fn synthetic_bad_gateway() -> reqwest::Error {
+    reqwest::Response::from(
+        hyper::Response::builder()
+            .status(reqwest::StatusCode::BAD_GATEWAY)
+            .body(hyper::body::Bytes::from_static(b"torbox request failed"))
+            .expect("static BAD_GATEWAY response always builds"),
+    )
+    .error_for_status()
+    .expect_err("BAD_GATEWAY always yields an error status")
+}
 
 struct CachedUrl {
     url: String,
@@ -170,13 +231,18 @@ impl TorBoxClient {
 
     async fn cache_put(&self, loc: &FileLocator, url: String) {
         let key = (loc.torrent_id.clone(), loc.file_id);
-        self.resolve_cache.write().await.insert(
+        let mut cache = self.resolve_cache.write().await;
+        cache.insert(
             key,
             CachedUrl {
                 url,
                 at: Instant::now(),
             },
         );
+        // Only pay the O(n) sweep when actually over the bound (rare).
+        if cache.len() > RESOLVE_CACHE_MAX {
+            bound_cache(&mut cache, RESOLVE_CACHE_MAX);
+        }
     }
 
     // Wired into the `DebridProvider::invalidate` impl.
@@ -188,7 +254,7 @@ impl TorBoxClient {
     // Wired into the `DebridProvider::evict_expired_cache` impl.
     async fn evict_expired(&self) {
         let mut cache = self.resolve_cache.write().await;
-        cache.retain(|_, c| c.at.elapsed() < RESOLVE_CACHE_TTL);
+        bound_cache(&mut cache, RESOLVE_CACHE_MAX);
     }
 
     /// Send a request, rate-limited with 429/transient retry, returning the envelope's `data`.
@@ -204,6 +270,9 @@ impl TorBoxClient {
             let resp = match make().send().await {
                 Ok(r) => r,
                 Err(e) => {
+                    // Scrub the URL: it may carry the API key as a query param
+                    // (`requestdl?token=...`), and reqwest errors embed the request URL.
+                    let e = e.without_url();
                     if attempt < max_attempts {
                         warn!("TorBox request error (attempt {}): {}", attempt, e);
                         continue;
@@ -221,11 +290,19 @@ impl TorBoxClient {
                 warn!("TorBox 429 (attempt {})", attempt);
                 continue;
             }
-            let resp = resp.error_for_status()?;
+            // Retry transient 5xx (502/503/504) with a short backoff before giving up.
+            if is_transient_status(resp.status()) && attempt < max_attempts {
+                warn!("TorBox {} (attempt {}), retrying", resp.status(), attempt);
+                tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                continue;
+            }
+            let resp = resp.error_for_status().map_err(|e| e.without_url())?;
             let text = resp.text().await?;
-            self.rate_limiter.record_success().await;
             match serde_json::from_str::<Envelope<T>>(&text) {
                 Ok(env) if env.success => {
+                    // Only a genuinely successful envelope counts as success for the
+                    // rate limiter — a 200 with `success:false` is a soft failure.
+                    self.rate_limiter.record_success().await;
                     if let Some(data) = env.data {
                         return Ok(data);
                     }
@@ -243,13 +320,7 @@ impl TorBoxClient {
             }
             break;
         }
-        let synthetic = reqwest::Response::from(
-            hyper::Response::builder()
-                .status(reqwest::StatusCode::BAD_GATEWAY)
-                .body(hyper::body::Bytes::from_static(b"torbox request failed"))
-                .unwrap(),
-        );
-        Err(synthetic.error_for_status().unwrap_err())
+        Err(synthetic_bad_gateway())
     }
 
     /// Like `send_data` but only checks `success` and ignores `data` (for endpoints with no
@@ -264,6 +335,8 @@ impl TorBoxClient {
             let resp = match make().send().await {
                 Ok(r) => r,
                 Err(e) => {
+                    // Scrub the URL in case it carries the API key as a query param.
+                    let e = e.without_url();
                     if attempt < max_attempts {
                         warn!("TorBox request error (attempt {}): {}", attempt, e);
                         continue;
@@ -280,18 +353,17 @@ impl TorBoxClient {
                 self.rate_limiter.record_throttle(retry_after).await;
                 continue;
             }
-            let resp = resp.error_for_status()?;
+            if is_transient_status(resp.status()) && attempt < max_attempts {
+                warn!("TorBox {} (attempt {}), retrying", resp.status(), attempt);
+                tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                continue;
+            }
+            let resp = resp.error_for_status().map_err(|e| e.without_url())?;
             let _ = resp.text().await?;
             self.rate_limiter.record_success().await;
             return Ok(());
         }
-        let synthetic = reqwest::Response::from(
-            hyper::Response::builder()
-                .status(reqwest::StatusCode::BAD_GATEWAY)
-                .body(hyper::body::Bytes::from_static(b"torbox request failed"))
-                .unwrap(),
-        );
-        Err(synthetic.error_for_status().unwrap_err())
+        Err(synthetic_bad_gateway())
     }
 
     pub async fn list_torrents_raw(&self) -> Result<Vec<Torrent>, reqwest::Error> {
@@ -329,7 +401,9 @@ impl TorBoxClient {
 
     pub async fn delete_torrent_raw(&self, id: &str) -> Result<(), reqwest::Error> {
         let url = format!("{}/torrents/controltorrent", TORBOX_BASE);
-        let torrent_id: i64 = id.parse().unwrap_or(0);
+        // Refuse to act on a malformed id rather than defaulting to 0, which would
+        // issue a delete against an unintended torrent and report success.
+        let torrent_id: i64 = id.parse().map_err(|_| synthetic_bad_gateway())?;
         let body = serde_json::json!({ "torrent_id": torrent_id, "operation": "delete" });
         self.send_ok(|| self.client.post(&url).json(&body)).await
     }
@@ -338,6 +412,10 @@ impl TorBoxClient {
         if let Some(url) = self.cache_get(loc).await {
             return Ok(url);
         }
+        // TorBox's requestdl requires the token as a query param (it is not honoured
+        // via the Authorization header on this endpoint). The token must therefore
+        // never reach a log: send_data/send_ok scrub the URL from any reqwest error,
+        // and the error below is mapped to AppError::Unavailable without logging the URL.
         let url = format!(
             "{}/torrents/requestdl?token={}&torrent_id={}&file_id={}",
             TORBOX_BASE, self.api_key, loc.torrent_id, loc.file_id
@@ -415,6 +493,64 @@ mod tests {
     }
 
     #[test]
+    fn is_transient_status_matches_retryable_5xx_only() {
+        assert!(is_transient_status(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(is_transient_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(is_transient_status(reqwest::StatusCode::GATEWAY_TIMEOUT));
+        // 500 is not transient; nor are success/client errors.
+        assert!(!is_transient_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(!is_transient_status(reqwest::StatusCode::OK));
+        assert!(!is_transient_status(reqwest::StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn bound_cache_evicts_oldest_over_capacity() {
+        let mut cache: HashMap<(String, u32), CachedUrl> = HashMap::new();
+        // Insert 5 entries with increasing age (i seconds old); all within TTL.
+        for i in 0..5u32 {
+            cache.insert(
+                (i.to_string(), i),
+                CachedUrl {
+                    url: format!("u{}", i),
+                    at: Instant::now() - Duration::from_secs(i as u64),
+                },
+            );
+        }
+        bound_cache(&mut cache, 3);
+        assert_eq!(cache.len(), 3);
+        // The three newest (ages 0,1,2 → keys "0","1","2") must remain.
+        assert!(cache.contains_key(&("0".to_string(), 0)));
+        assert!(cache.contains_key(&("1".to_string(), 1)));
+        assert!(cache.contains_key(&("2".to_string(), 2)));
+    }
+
+    #[test]
+    fn bound_cache_drops_expired_entries() {
+        let mut cache: HashMap<(String, u32), CachedUrl> = HashMap::new();
+        cache.insert(
+            ("fresh".to_string(), 1),
+            CachedUrl {
+                url: "u".to_string(),
+                at: Instant::now(),
+            },
+        );
+        cache.insert(
+            ("stale".to_string(), 2),
+            CachedUrl {
+                url: "u".to_string(),
+                at: Instant::now() - RESOLVE_CACHE_TTL - Duration::from_secs(1),
+            },
+        );
+        bound_cache(&mut cache, RESOLVE_CACHE_MAX);
+        assert!(cache.contains_key(&("fresh".to_string(), 1)));
+        assert!(!cache.contains_key(&("stale".to_string(), 2)));
+    }
+
+    #[test]
     fn torbox_client_constructs() {
         let c = TorBoxClient::new("fake".to_string()).unwrap();
         assert_eq!(c.provider_name(), "torbox");
@@ -467,6 +603,46 @@ mod tests {
         assert_eq!(lt.id, "35821241");
         assert_eq!(lt.status, "downloaded");
         assert!(lt.links.is_empty());
+    }
+
+    #[test]
+    fn negative_size_decodes_and_clamps_to_zero() {
+        // TorBox returns size -1 for items whose metadata has not resolved yet. A strict
+        // u64 would fail to decode the entire mylist response, hiding the whole library.
+        let json = r#"{
+            "id": 1, "hash": "h", "name": "Pending", "size": -1,
+            "download_finished": false, "download_state": "downloading",
+            "files": [{"id": 0, "name": "Pending/file.mkv", "size": -1}]
+        }"#;
+        let t: TbTorrent = serde_json::from_str(json).expect("size -1 must decode");
+        let info = to_torrent_info(&t);
+        assert_eq!(info.bytes, 0);
+        assert_eq!(info.files.len(), 1);
+        assert_eq!(info.files[0].bytes, 0);
+        // A mixed list (one valid, one pending) must decode as a whole.
+        let arr: Vec<TbTorrent> = serde_json::from_str(&format!("[{},{}]", MYLIST_ITEM, json))
+            .expect("a list containing a -1 size must still decode");
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn null_fields_decode_to_defaults() {
+        // TorBox's full mylist can send `files: null` (and other null fields) per torrent.
+        // `#[serde(default)]` alone does NOT cover an explicit null, so this would otherwise
+        // fail with "invalid type: null, expected a sequence" and hide the whole library.
+        let json = r#"{
+            "id": 35928498, "hash": "abc", "name": "Sintel", "size": 100,
+            "download_finished": true, "download_state": "cached", "files": null
+        }"#;
+        let t: TbTorrent = serde_json::from_str(json).expect("files: null must decode");
+        let info = to_torrent_info(&t);
+        assert_eq!(info.id, "35928498");
+        assert_eq!(info.status, "downloaded");
+        assert!(info.files.is_empty());
+        // A whole list where one entry has null files must still decode.
+        let arr: Vec<TbTorrent> = serde_json::from_str(&format!("[{},{}]", MYLIST_ITEM, json))
+            .expect("a list containing null files must still decode");
+        assert_eq!(arr.len(), 2);
     }
 
     #[test]

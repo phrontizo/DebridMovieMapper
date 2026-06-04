@@ -33,7 +33,7 @@ async fn get_shared_data() -> &'static (Arc<RealDebridClient>, Vec<(TorrentInfo,
                 .trim()
                 .to_string();
             let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-            let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
+            let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key).unwrap());
 
             let data = fetch_and_identify(&rd_client, &tmdb_client, &DB).await;
             (rd_client, data)

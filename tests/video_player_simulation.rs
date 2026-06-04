@@ -26,7 +26,7 @@ async fn test_video_player_simulation() {
         .to_string();
 
     let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
+    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key).unwrap());
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 
     println!("Fetching torrents...");
@@ -212,7 +212,7 @@ async fn test_media_file_size_consistency() {
         .to_string();
 
     let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key));
+    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key).unwrap());
 
     // Fetch just 2 torrents — enough to get at least one media file
     let torrents = rd_client

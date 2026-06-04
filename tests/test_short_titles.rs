@@ -8,7 +8,7 @@ async fn test_short_title_identification() {
     dotenvy::dotenv().ok();
 
     let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
-    let tmdb_client = TmdbClient::new(tmdb_api_key);
+    let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
     println!("\n========================================");
     println!("TESTING SHORT TITLE IDENTIFICATION");
@@ -21,6 +21,8 @@ async fn test_short_title_identification() {
         ("Ran", 1985, 11645),  // Ran (1985) by Akira Kurosawa
         ("Amy", 2015, 318034), // Amy (2015) - Amy Winehouse documentary
     ];
+
+    let mut failures: Vec<String> = Vec::new();
 
     for (title, year, expected_tmdb_id) in test_cases {
         println!("\n----------------------------------------");
@@ -59,17 +61,33 @@ async fn test_short_title_identification() {
         println!("  External ID: {:?}", metadata.external_id);
         println!("  Media Type: {:?}", metadata.media_type);
 
-        if let Some(external_id) = metadata.external_id {
-            if external_id == format!("tmdb:{}", expected_tmdb_id) {
-                println!("  ✓ CORRECT");
-            } else {
-                println!("  ✗ WRONG (expected tmdb:{})", expected_tmdb_id);
+        let expected = format!("tmdb:{}", expected_tmdb_id);
+        match metadata.external_id.as_deref() {
+            Some(id) if id == expected => println!("  ✓ CORRECT"),
+            Some(id) => {
+                println!("  ✗ WRONG (expected {})", expected);
+                failures.push(format!(
+                    "{} ({}): got {}, expected {}",
+                    title, year, id, expected
+                ));
             }
-        } else {
-            println!("  ✗ UNIDENTIFIED");
+            None => {
+                println!("  ✗ UNIDENTIFIED");
+                failures.push(format!(
+                    "{} ({}): UNIDENTIFIED, expected {}",
+                    title, year, expected
+                ));
+            }
         }
 
         // Small delay to avoid rate limiting
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
     }
+
+    assert!(
+        failures.is_empty(),
+        "Short-title identification regressed for {} case(s):\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
 }
