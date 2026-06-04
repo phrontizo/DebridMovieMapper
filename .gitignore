@@ -1,6 +1,9 @@
 /target
 metadata.db
 .env
+
+# macOS
+.DS_Store
 run.log
 .output.txt
 .idea/

@@ -99,7 +99,7 @@ pub enum VfsNode {
     Directory {
         children: BTreeMap<String, VfsNode>,
     },
-    /// Media file proxied from Real-Debrid CDN.
+    /// Media file proxied from the debrid provider's CDN.
     /// WebDAV serves the actual media bytes (not a .strm URL).
     MediaFile {
         file_size: u64,
@@ -269,7 +269,7 @@ impl DebridVfs {
                     if has_archive {
                         tracing::warn!(
                             "Torrent '{}' contains only archive files (RAR/ZIP) and cannot be streamed — \
-                             replace with a non-archive version on Real-Debrid",
+                             replace it with a non-archive version on your debrid service",
                             torrent.filename
                         );
                     }

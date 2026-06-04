@@ -1,6 +1,6 @@
 # DebridMovieMapper
 
-A Rust-based service that maps your Real-Debrid torrent library to a Jellyfin/Plex-compatible WebDAV endpoint with automatic media identification via TMDB.
+A Rust-based service that maps your debrid torrent library — **Real-Debrid or TorBox** — to a Jellyfin/Plex-compatible WebDAV endpoint with automatic media identification via TMDB.
 
 I created this project as:
 * I was using the various arrs, and found it cumbersome, plus I ran out of storage space, meaning I needed to use a Debrid service of some kind
@@ -21,8 +21,9 @@ This was 100% vibe coded using a mix of Claude and Junie as further AI experimen
 - **Media Identification**: Automatically identifies movies and TV shows using TMDB metadata based on torrent filenames.
 - **Jellyfin/Plex Structure**: Organizes your library into a clean `Movies/` and `Shows/` directory structure.
 - **Season Grouping**: Automatically groups TV show episodes into `Season XX` folders.
-- **WebDAV Endpoint**: Exposes a WebDAV server (port 8080) serving proxied media files with real file sizes and extensions. Media bytes are fetched on demand from Real-Debrid's CDN. Mount via rclone for use with Jellyfin/Plex.
-- **On-Demand Repair**: Detects broken links at playback time (503 from Real-Debrid) and attempts instant synchronous repair. For cached torrents, playback continues after a ~1-2s delay; for non-cached torrents, a new download is started automatically.
+- **Real-Debrid *and* TorBox**: One codebase, either provider. Set `RD_API_TOKEN` for Real-Debrid or `TORBOX_API_KEY` for TorBox (exactly one) — everything else works the same.
+- **WebDAV Endpoint**: Exposes a WebDAV server (port 8080) serving proxied media files with real file sizes and extensions. Media bytes are fetched on demand from the provider's CDN. Mount via rclone for use with Jellyfin/Plex.
+- **On-Demand Repair**: Detects unavailable files at playback time (a 503 from Real-Debrid, or an uncached/expired file on TorBox) and attempts instant synchronous repair by re-adding the torrent. For cached content, playback continues after a ~1-2s delay; otherwise a fresh download is started automatically.
 - **Persistent Cache**: Uses an embedded database (`redb`) to cache media identifications, reducing API calls and speeding up restarts.
 - **Configurable Scan Interval**: Customizable scan interval via environment variable.
 - **Robust Identification Logic**: Handles complex torrent naming conventions, including CamelCase splitting, technical metadata stripping, and multi-service fallback strategies.
@@ -30,7 +31,7 @@ This was 100% vibe coded using a mix of Claude and Junie as further AI experimen
 
 ## Prerequisites
 
-- A **Real-Debrid** account and API Token.
+- A **Real-Debrid** *or* **TorBox** account and API token (set exactly one).
 - A **TMDB** API Key (The Movie Database).
 
 ## Configuration
@@ -104,6 +105,8 @@ docker run -d \
   ghcr.io/phrontizo/debridmoviemapper:latest
 ```
 
+> To run against TorBox instead, use `-e TORBOX_API_KEY=your_token` in place of `-e RD_API_TOKEN=your_token` (set exactly one).
+
 ### Building from source (Optional)
 Build locally for your current architecture:
 ```bash
@@ -157,7 +160,7 @@ A complete [`compose.yml`](compose.yml) file is provided in the repository that 
 - Media identifications are persisted in a named Docker volume (`metadata`)
 - rclone mounts the WebDAV endpoint to `./rclone` on the host via a bind mount with `rshared` propagation (required for FUSE mounts to be visible to other containers)
 - Jellyfin reads from `/media` which is bind-mounted from `./rclone`
-- Files appear as real media files (`.mkv`, `.mp4`, etc.) with correct file sizes — media bytes are proxied from Real-Debrid's CDN on demand
+- Files appear as real media files (`.mkv`, `.mp4`, etc.) with correct file sizes — media bytes are proxied from the debrid provider's CDN on demand
 - Jellyfin probes and plays content normally as if the files were local
 
 ## Usage
@@ -182,13 +185,16 @@ Once running, the WebDAV server will be available at `http://localhost:8080`. Mo
 
 ## Project Structure
 
-- `src/main.rs`: Entry point — initialises shared state and starts the WebDAV server.
-- `src/tasks.rs`: Background scan loop — polls Real-Debrid, identifies new torrents, updates the VFS.
-- `src/rd_client.rs`: Real-Debrid API client with adaptive token bucket rate limiter and response caching.
+- `src/main.rs`: Entry point — selects the debrid provider, initialises shared state, starts the WebDAV server.
+- `src/provider.rs`: The `DebridProvider` trait and `FileLocator`; startup provider selection (`choose_provider`).
+- `src/tasks.rs`: Background scan loop — polls the active provider, identifies new torrents, updates the VFS.
+- `src/rd_client.rs`: Real-Debrid implementation of `DebridProvider` (1-hour unrestrict cache).
+- `src/torbox_client.rs`: TorBox implementation of `DebridProvider` (mylist / requestdl / createtorrent / controltorrent).
+- `src/ratelimit.rs`: Shared adaptive token-bucket rate limiter used by both clients.
 - `src/tmdb_client.rs`: TMDB API client for media metadata.
-- `src/repair.rs`: Torrent repair state machine with synchronous instant repair for cached torrents.
+- `src/repair.rs`: Torrent repair state machine with provider-neutral instant repair for cached content.
 - `src/vfs.rs`: Virtual File System logic for library organisation.
-- `src/dav_fs.rs`: WebDAV filesystem — re-unrestricts links on read, attempts instant repair on 503.
+- `src/dav_fs.rs`: WebDAV filesystem — resolves a `FileLocator` to a CDN URL via the provider; attempts instant repair when a file is unavailable.
 - `src/identification.rs`: Smart media identification and filename cleaning logic.
 - `src/error.rs`: Unified error type (`AppError`) using `thiserror`.
 - `src/jellyfin_client.rs`: Optional Jellyfin notification client for instant library updates.
@@ -200,19 +206,19 @@ Once running, the WebDAV server will be available at `http://localhost:8080`. Mo
 
 The service runs one background task:
 
-1. **Scan Task**: Polls Real-Debrid for new/updated torrents and updates the virtual filesystem
+1. **Scan Task**: Polls the active debrid provider for new/updated torrents and updates the virtual filesystem
    - Runs immediately on startup
    - Repeats every `SCAN_INTERVAL_SECS` (default: 60 seconds)
-   - Builds the VFS with restricted RD links; unrestriction happens lazily at read time
+   - Builds the VFS with a `FileLocator` per file; resolution to a CDN URL happens lazily at read time
 
 ### On-Demand Repair
 
 There is no background repair loop. Instead, repair is triggered synchronously at playback time:
 
-- When a media file is read, `dav_fs` re-calls `unrestrict_link` for a fresh URL (the 1-hour response cache makes this free when the torrent is healthy)
-- If `unrestrict_link` returns a 503, `try_instant_repair` is called synchronously: re-adds the torrent via magnet, selects the same files, and checks if the torrent is already cached on Real-Debrid's servers
-- **Cached torrents** (most common): repair completes in ~1-2 seconds and the new link is unrestricted inline — playback continues after a brief delay
-- **Non-cached torrents**: the file returns an error, the old torrent is deleted, and the new torrent is left to download (the scan loop picks it up automatically)
+- When a media file is read, `dav_fs` resolves it through the provider for a fresh CDN URL (a per-file resolution cache makes this free when the content is healthy)
+- If resolution reports the file is unavailable (a 503 from Real-Debrid, or an uncached/expired file on TorBox → `AppError::Unavailable`), `try_instant_repair` runs synchronously: re-adds the torrent by hash, matches the same file by path, and checks whether the replacement is already cached
+- **Cached content** (most common): repair completes in ~1-2 seconds and the replacement file is resolved inline — playback continues after a brief delay
+- **Non-cached content**: the file returns an error, the old torrent is deleted, and the new torrent is left to download (the scan loop picks it up automatically)
 - Non-cached/repairing torrents are hidden from WebDAV until healthy again
 
 ### Jellyfin Notifications
@@ -221,24 +227,24 @@ When `JELLYFIN_URL`, `JELLYFIN_API_KEY`, and `JELLYFIN_RCLONE_MOUNT_PATH` are al
 
 ### Archive-Only Torrents
 
-Some torrents contain RAR/ZIP archives instead of video files. Real-Debrid does not extract these archives, so they cannot be streamed. When such a torrent is detected, a warning is logged:
+Some torrents contain RAR/ZIP archives instead of video files. Debrid services do not extract these archives, so they cannot be streamed. When such a torrent is detected, a warning is logged:
 
 ```
-WARN Torrent 'Movie.Name.1080p.BluRay' contains only archive files (RAR/ZIP) and cannot be streamed — replace with a non-archive version on Real-Debrid
+WARN Torrent 'Movie.Name.1080p.BluRay' contains only archive files (RAR/ZIP) and cannot be streamed — replace it with a non-archive version on your debrid service
 ```
 
-To fix this, delete the torrent from Real-Debrid and find an alternative release that contains video files directly (`.mkv`, `.mp4`, etc.).
+To fix this, delete the torrent from your debrid account and find an alternative release that contains video files directly (`.mkv`, `.mp4`, etc.).
 
 ### Error Handling
 
-- **503 Service Unavailable**: Triggers synchronous instant repair — succeeds inline for cached torrents, fails for non-cached
-- **429 Rate Limit**: Adaptive token bucket rate limiter shared across all API calls — on 429, the global request interval doubles (max 2s between requests) and Retry-After headers are respected; on success, the interval gradually recovers toward the baseline of 10 req/s
+- **Unavailable file** (a 503 from Real-Debrid, or an uncached file on TorBox): Triggers synchronous instant repair — succeeds inline for cached content, fails for non-cached
+- **429 Rate Limit**: Adaptive token bucket rate limiter shared across the provider's API calls — on 429, the global request interval doubles (max 2s between requests) and Retry-After headers are respected; on success, the interval gradually recovers toward the baseline of 10 req/s
 - **404 Not Found**: Treated as success for delete operations (idempotent)
-- **Playback Errors**: WebDAV read failures on 503 trigger instant repair (rate-limited to 30s cooldown, max 3 attempts per torrent)
+- **Playback Errors**: WebDAV read failures on an unavailable file trigger instant repair (rate-limited to 30s cooldown, max 3 attempts per torrent)
 
 ### Caching
 
-- **Unrestrict responses**: Cached for 1 hour to reduce API load
+- **Resolved CDN URLs**: cached to reduce API load — ~1 hour for Real-Debrid, ~3 hours for TorBox (matching each provider's link lifetime)
 - **TMDB metadata**: Persisted to embedded database (`metadata.db`) indefinitely
 
 ## Licence
