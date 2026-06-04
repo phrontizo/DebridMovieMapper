@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use crate::rd_client::{AddMagnetResponse, Torrent, TorrentInfo, UnrestrictResponse};
+use crate::rd_client::{AddMagnetResponse, Torrent, TorrentInfo};
 
 /// Identifies a single media file for resolution. Stable identity is
 /// `(hash, file_path)`; `torrent_id`/`file_id`/`link` are re-derivable (e.g. after
@@ -29,7 +29,6 @@ pub trait DebridProvider: Send + Sync + std::fmt::Debug {
 
     async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error>;
     async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error>;
-    async fn unrestrict_link(&self, link: &str) -> Result<UnrestrictResponse, reqwest::Error>;
     async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error>;
     async fn select_files(&self, torrent_id: &str, file_ids: &str) -> Result<(), reqwest::Error>;
     async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error>;
@@ -42,8 +41,6 @@ pub trait DebridProvider: Send + Sync + std::fmt::Debug {
     /// Drop any cached resolution for `loc` (RD: the unrestrict-cache entry for its link).
     async fn invalidate(&self, loc: &FileLocator);
 
-    /// Remove a single cached resolution (RD: the unrestrict cache entry for `link`).
-    async fn invalidate_unrestrict_cache(&self, link: &str);
     /// Evict expired cached resolutions.
     async fn evict_expired_cache(&self);
 }
@@ -86,7 +83,6 @@ pub fn choose_provider(
 pub struct MockProvider {
     pub torrents: Vec<Torrent>,
     pub torrent_info: Option<TorrentInfo>,
-    pub unrestrict: Option<UnrestrictResponse>,
     pub add_magnet: Option<AddMagnetResponse>,
     pub resolved_url: Option<String>,
 }
@@ -102,9 +98,6 @@ impl DebridProvider for MockProvider {
     }
     async fn get_torrent_info(&self, _id: &str) -> Result<TorrentInfo, reqwest::Error> {
         Ok(self.torrent_info.clone().unwrap_or_default())
-    }
-    async fn unrestrict_link(&self, _link: &str) -> Result<UnrestrictResponse, reqwest::Error> {
-        Ok(self.unrestrict.clone().unwrap_or_default())
     }
     async fn add_magnet(&self, _magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
         Ok(self.add_magnet.clone().unwrap_or_default())
@@ -122,7 +115,6 @@ impl DebridProvider for MockProvider {
         }
     }
     async fn invalidate(&self, _loc: &FileLocator) {}
-    async fn invalidate_unrestrict_cache(&self, _link: &str) {}
     async fn evict_expired_cache(&self) {}
 }
 
@@ -155,7 +147,7 @@ mod tests {
         assert_eq!(torrents[0].id, "t1");
         // Methods with no canned value return defaults / no-ops.
         assert_eq!(provider.get_torrent_info("x").await.unwrap().id, "");
-        provider.invalidate_unrestrict_cache("x").await;
+        provider.invalidate(&FileLocator::default()).await;
         provider.evict_expired_cache().await;
     }
 

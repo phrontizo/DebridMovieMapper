@@ -578,9 +578,6 @@ impl crate::provider::DebridProvider for RealDebridClient {
     async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
         self.get_torrent_info(id).await
     }
-    async fn unrestrict_link(&self, link: &str) -> Result<UnrestrictResponse, reqwest::Error> {
-        self.unrestrict_link(link).await
-    }
     async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
         self.add_magnet(magnet).await
     }
@@ -611,9 +608,6 @@ impl crate::provider::DebridProvider for RealDebridClient {
         if let Some(link) = loc.link.as_deref() {
             self.invalidate_unrestrict_cache(link).await;
         }
-    }
-    async fn invalidate_unrestrict_cache(&self, link: &str) {
-        self.invalidate_unrestrict_cache(link).await
     }
     async fn evict_expired_cache(&self) {
         self.evict_expired_cache().await
