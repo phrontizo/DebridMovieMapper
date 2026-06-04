@@ -62,7 +62,7 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 - **Scan task** (every `SCAN_INTERVAL_SECS`): Polls Real-Debrid → identifies torrents via TMDB → updates the in-memory VFS. Implemented in `tasks.rs`.
 
 **On-demand (synchronous, during WebDAV file reads):**
-- **Repair:** Triggered when a media file is read and its RD link returns 503. For cached torrents, repair completes inline (~1-2s delay); for non-cached torrents, the file fails and a new torrent is left to download.
+- **Repair:** Triggered when a media file is read and `provider.resolve_url` returns `AppError::Unavailable` (RD maps a 503 on unrestrict to it). For cached torrents, repair completes inline (~1-2s delay); for non-cached torrents, the file fails and a new torrent is left to download.
 
 **Module responsibilities:**
 
@@ -70,11 +70,11 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 |------|---------|
 | `main.rs` | Initializes shared state, spawns scan task, starts WebDAV server on port 8080; `--healthcheck` mode for Docker |
 | `tasks.rs` | `run_scan_loop` — polls Real-Debrid, identifies new torrents, updates VFS |
-| `provider.rs` | `DebridProvider` trait abstracting the debrid backend; startup provider selection (`choose_provider`); test-only `MockProvider` |
+| `provider.rs` | `DebridProvider` trait abstracting the debrid backend; `FileLocator` (the provider-neutral handle for a media file) and its `resolve_url`/`invalidate` primitives; startup provider selection (`choose_provider`); test-only `MockProvider` |
 | `rd_client.rs` | Real-Debrid API client with adaptive token bucket rate limiter, 1-hour response cache |
 | `identification.rs` | Filename cleaning, camelCase splitting, TMDB scoring to identify movies/shows |
 | `vfs.rs` | In-memory virtual filesystem: creates `Movies/`+`Shows/` hierarchy with media files and NFO metadata |
-| `dav_fs.rs` | Maps VFS to WebDAV; lazily unrestricts links on read (cached 1h), attempts synchronous instant repair on 503 |
+| `dav_fs.rs` | Maps VFS to WebDAV; on read resolves a `FileLocator` to a CDN URL via `provider.resolve_url` (cached 1h), attempts synchronous instant repair on `AppError::Unavailable` |
 | `repair.rs` | Torrent repair state machine (Healthy→Broken→Repairing→Failed), instant repair for cached torrents (30s cooldown, max 3 attempts) |
 | `tmdb_client.rs` | TMDB search for movies and TV shows |
 | `error.rs` | Unified error type (`AppError`) using `thiserror` |
@@ -83,7 +83,7 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 
 **Data flow for playback:**
 1. Jellyfin/player opens a media file via WebDAV
-2. `dav_fs.rs` lazily unrestricts the RD link to get a CDN URL (cached for 1 hour)
+2. `dav_fs.rs` resolves the file's `FileLocator` to a CDN URL via `provider.resolve_url(&FileLocator)` (cached for 1 hour). Real-Debrid resolves via the locator's restricted `link`; the model also supports resolving by `(torrent_id, file_id)` for providers without per-file links.
 3. `ProxiedMediaFile` fetches bytes from the CDN URL with a 2MB read-ahead buffer and serves them to the player
 
 **Persistence:** Embedded `redb` database (`metadata.db`) caches TMDB identifications. The file is created automatically on first run.
@@ -91,11 +91,12 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 ## Key Design Decisions
 
 - **Provider abstraction:** All components depend on `Arc<dyn DebridProvider>` (defined in `provider.rs`) rather than a concrete client. `RealDebridClient` is one implementation; exactly one provider is active per deployment, chosen at startup by `choose_provider` based on which token (`RD_API_TOKEN` or `TORBOX_API_KEY`) is set. TorBox is selection-only for now and exits before serving; a TorBox implementation lands in a later phase.
+- **Provider-neutral file resolution:** The VFS stores a `FileLocator { hash, torrent_id, file_id, file_path, link }` per media file rather than a raw RD link. `resolve_url(&FileLocator) -> Result<String, AppError>` is the single resolution primitive (and `invalidate(&FileLocator)` drops a cached resolution); RD resolves via the locator's restricted `link` (keeping its old unrestrict/cache logic as private inherent methods), while `(torrent_id, file_id)` is reserved for providers without per-file links (TorBox, a later phase). `AppError::Unavailable` is the provider-neutral "bytes not currently available → re-acquire/repair" signal — RD maps a 503 on unrestrict to it, and `dav_fs` drives instant repair off `Unavailable` rather than inspecting an HTTP status. Real-Debrid behaviour is unchanged.
 - **Static linking / scratch Docker image:** The Dockerfile builds with musl targets (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) producing a minimal final image on `scratch`.
 - **Adaptive rate limiting:** An `AdaptiveRateLimiter` (token bucket, capacity 1) is shared across all Real-Debrid API calls. Baseline: 10 req/s (100ms interval). On 429: interval doubles (max 2000ms / 0.5 req/s) and Retry-After header is respected. On success: interval decreases by 10ms (min 100ms). This prevents 429 cascades by slowing all requests globally. 503 on `unrestrict/link` is a terminal status (no retry) — it signals a broken torrent and triggers on-demand repair.
 - **Single retry method:** `rd_client.rs` has one `fetch_with_retry(make_request, terminal_statuses)` — callers pass the status codes that should abort without retrying (e.g. 404 for `get_torrent_info`, 503 for `unrestrict_link`).
 - **Identification scoring:** `identification.rs` cleans filenames extensively before TMDB lookup. Shows vs. movies are detected by file structure (presence of multiple video files with episode patterns).
-- **Synchronous instant repair:** When a media file is read, `dav_fs.rs` re-unrestricts the link (cached, so free when healthy). On 503, it calls `repair_manager.try_instant_repair()` synchronously — re-adds the torrent via magnet, selects the same files, and checks if the torrent is already cached on RD. If cached (status "downloaded" within ~1s), the new link is unrestricted inline and playback continues after a brief delay. If not cached, the file fails and the new torrent is left to download (scan loop picks it up).
+- **Synchronous instant repair:** When a media file is read, `dav_fs.rs` resolves the locator via `provider.resolve_url` (cached, so free when healthy). On `AppError::Unavailable`, it calls `repair_manager.try_instant_repair()` synchronously — re-adds the torrent via magnet, selects the same files, and checks if the torrent is already cached on RD. If cached (status "downloaded" within ~1s), the locator's `torrent_id`/`link` are replaced and re-resolved inline (the old resolution is invalidated) and playback continues after a brief delay. If not cached, the file fails and the new torrent is left to download (scan loop picks it up).
 - **Repair hides broken torrents:** Non-cached torrents are marked Broken and hidden from WebDAV until the scan loop picks up the replacement torrent.
 
 ## Development Process
