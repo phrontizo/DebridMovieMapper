@@ -341,11 +341,11 @@ impl ProxiedMediaFile {
     /// - **Connection error** (TCP failure, timeout): retry immediately with the
     ///   same CDN URL — the URL is still valid, the error is transient.  The cache
     ///   is intentionally left intact so concurrent readers do not all re-call
-    ///   `unrestrict_link` through the rate-limiter at once.
+    ///   `resolve_url` through the rate-limiter at once.
     ///
     /// - **HTTP error** (non-2xx/206): the CDN URL has likely expired (~1 h TTL).
     ///   Clear `cdn_url` and invalidate the unrestrict cache, then retry to get a
-    ///   fresh URL.  `resolve_cdn_url` will call `unrestrict_link`, which blocks on
+    ///   fresh URL.  `resolve_cdn_url` will call `resolve_url`, which blocks on
     ///   the adaptive rate-limiter (up to `MAX_INTERVAL_MS` / 2 s under 429 storm).
     async fn fetch_cdn_range(&mut self, pos: u64, range_end: u64) -> Result<Bytes, FsError> {
         for attempt in 0..2u8 {
@@ -365,7 +365,7 @@ impl ProxiedMediaFile {
                     // cdn_url or invalidate the unrestrict cache: with many concurrent
                     // ProxiedMediaFile instances (one per rclone read-ahead), all
                     // invalidating simultaneously forces every caller through the
-                    // rate-limited unrestrict_link API and serialises them through the
+                    // rate-limited resolve_url path and serialises them through the
                     // adaptive rate-limiter (~90 callers × 700 ms ≈ 63 s hang).
                     tracing::warn!(
                         "CDN fetch failed for {}: {} — retrying with same URL",
