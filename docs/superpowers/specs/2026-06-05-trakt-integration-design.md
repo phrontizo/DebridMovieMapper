@@ -60,6 +60,7 @@ phase specs.
 | 14 | Web UI scope | Trakt enrolment (given) + activity dashboard + match correction + in-UI settings + ad-hoc TMDB search-and-add. **No** library browser / manual release pinning. |
 | 15 | Architecture | **Re-centre, not rewrite.** Add a desired-state reconciler beside the existing account-mirror projection. Keep `DebridProvider`, `FileLocator`, VFS-as-projection, `redb`, the proxy, and the repair machinery. |
 | 16 | Sequencing | **Minimal foundation first, then strangle.** A small behaviour-preserving pass (store + AppState + config shape), then fold the larger refactors into the phase that first needs them. |
+| 17 | DB upgrade/recovery | `metadata.db` must **never fail startup** on a format/schema change (incl. a future `redb` version bump). `Store` stamps a schema version and runs forward migrations; an unreadable / incompatible / corrupt / newer-than-binary database is **moved aside** (`<db_path>.corrupt`) and recreated rather than erroring. SP0's only table (`matches`) is a **regenerable cache** so recreation is harmless. From SP1, tables holding **authoritative** state (owned / blacklist / wanted / tokens / settings) are **migrated, never silently dropped**; if migration is impossible the old file is preserved (moved aside) so startup still succeeds without irrecoverable loss. The versioning + migration framework lands in SP0. |
 
 ## 3. Architecture assessment (why a re-centring is needed)
 
@@ -130,6 +131,14 @@ proof of behaviour-preservation.
 
 - New `Store` type wrapping `Arc<redb::Database>`, owning **all** table-definition
   constants and exposing typed, `spawn_blocking`-wrapped async accessors.
+- **`Store::open(path)` never fails on a bad database.** It stamps a schema
+  version (in a `meta` table), runs forward migrations, and on an unreadable /
+  incompatible / corrupt / newer-than-binary file **moves it aside**
+  (`<db_path>.corrupt`) and recreates a fresh one — replacing today's
+  `Database::create(&db_path)?` + inline table-creation, which crash-loops on a
+  format change. SP0 implements the framework with **zero migrations** (current
+  unversioned DBs are simply stamped at v1, keeping their `matches` rows); SP1+
+  add migration steps and the migrate-not-drop policy for authoritative tables.
 - Migrate the four existing `matches` operations out of `tasks.rs` into `Store`:
   - `load_all_matches() -> HashMap<String, (TorrentInfo, MediaMetadata)>`
   - `get_match(id) -> Option<(TorrentInfo, MediaMetadata)>`
@@ -344,6 +353,7 @@ feature. Three layers.
 | Phase | Test | Asserts |
 |-------|------|---------|
 | SP0 | `store_integration_test` | Full table round-trips on real `redb`; a DB written in the **old** inline encoding loads identically through `Store` (backward compatibility). |
+| SP0 | `store_recovery_test` | `Store::open` never panics/fails: a corrupt/garbage file is moved aside and recreated; an unversioned existing DB keeps its `matches` data and is stamped at the current version; a newer-than-binary version is recovered. |
 | SP0 | `config_test` | env → `Config` (defaults; both/neither provider token; missing TMDB key). |
 | SP1 | `acquire_integration_test` | `MockScraper` + `MockProvider`: best-candidate pick (cached-first, within ceiling); ownership + authoritative-id recorded; probe-fail / stall / dead → blacklist + promote next; idempotent re-acquire. |
 | SP1 | `probe_fixture_test` | Track languages parsed from committed MKV/MP4 header fixtures; MP4 `moov`-at-end handled; inconclusive parse → accept-with-warning, not blacklist; audio (`original`/lang) and independent subtitle (lang / `none`) rules enforced. |
