@@ -675,6 +675,19 @@ fn sanitize_filename(name: &str) -> String {
 static EXCLUDED_VIDEO_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(sample|trailer|extras?|bonus|featurette)\b").unwrap());
 
+/// Regex matching release-site / release-group advertisement clips that ship
+/// alongside the real media (e.g. `RARBG.com.mp4`, `www.YTS.MX.mp4`). Matched
+/// against the filename *stem* (extension stripped) and anchored end-to-end, so
+/// only a filename that is entirely a promo token — optionally a `www.` prefix
+/// and a single trailing domain segment — is excluded. A real title that merely
+/// contains the token (e.g. `RARBG.com.Mission.Impossible.2015.mkv`) is kept.
+static EXCLUDED_PROMO_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^(www\.)?(rarbg|rarbgt|yts|yify|eztv|ettv|etrg|torrentgalaxy|tgx)(\.[a-z]{2,6})?$",
+    )
+    .unwrap()
+});
+
 /// Directory names that indicate extras/bonus content. Checked case-insensitively.
 const EXCLUDED_DIRS: &[&str] = &[
     "extras",
@@ -691,6 +704,15 @@ pub fn is_video_file(path: &str) -> bool {
     let lower = path.to_lowercase();
     let filename = lower.rsplit('/').next().unwrap_or(&lower);
     if EXCLUDED_VIDEO_RE.is_match(filename) {
+        return false;
+    }
+    // Exclude release-site / release-group advertisement clips (e.g. "RARBG.com.mp4")
+    // by testing the filename with its video extension stripped.
+    let stem = VIDEO_EXTENSIONS
+        .iter()
+        .find_map(|ext| filename.strip_suffix(ext))
+        .unwrap_or(filename);
+    if EXCLUDED_PROMO_RE.is_match(stem) {
         return false;
     }
     // Exclude files in directories that indicate extras/bonus content
@@ -920,6 +942,85 @@ mod tests {
                     } else {
                         panic!("expected MediaFile");
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_excludes_release_site_promo_from_movie_folder() {
+        // A correctly-identified movie torrent that also ships a release-site
+        // advertisement clip ("RARBG.com.mp4") must expose only the real film,
+        // not the junk promo — and the promo must not consume a per-file link.
+        let torrents = vec![(
+            TorrentInfo {
+                id: "mi".to_string(),
+                filename: "Mission.Impossible.Rogue.Nation.2015.1080p.BluRay.x264-RARBG"
+                    .to_string(),
+                original_filename: "Mission.Impossible.Rogue.Nation.2015.1080p.BluRay.x264-RARBG"
+                    .to_string(),
+                hash: "h".to_string(),
+                bytes: 2_000_000_000,
+                original_bytes: 2_000_000_000,
+                host: "h".to_string(),
+                split: 1,
+                progress: 100.0,
+                status: "downloaded".to_string(),
+                added: "2015-01-01".to_string(),
+                files: vec![
+                    TorrentFile {
+                        id: 1,
+                        path: "Mission.Impossible.Rogue.Nation.2015.1080p.BluRay.x264-RARBG.mkv"
+                            .to_string(),
+                        bytes: 2_000_000_000,
+                        selected: 1,
+                    },
+                    TorrentFile {
+                        id: 2,
+                        path: "RARBG.com.mp4".to_string(),
+                        bytes: 1_000_000,
+                        selected: 1,
+                    },
+                ],
+                // Two selected files → two restricted links, in file order.
+                links: vec![
+                    "http://link_movie".to_string(),
+                    "http://link_promo".to_string(),
+                ],
+                ended: Some("2015-01-01".to_string()),
+            },
+            MediaMetadata {
+                title: "Mission: Impossible - Rogue Nation".to_string(),
+                year: Some("2015".to_string()),
+                media_type: MediaType::Movie,
+                external_id: Some("tmdb:177677".to_string()),
+            },
+        )];
+
+        let vfs = DebridVfs::build(torrents);
+        if let VfsNode::Directory { children } = &vfs.root {
+            let movies = children.get("Movies").unwrap();
+            if let VfsNode::Directory { children: mc } = movies {
+                let folder = mc
+                    .get("Mission - Impossible - Rogue Nation [tmdbid-177677]")
+                    .expect("movie folder missing");
+                if let VfsNode::Directory { children: files } = folder {
+                    assert!(
+                        !files.contains_key("RARBG.com.mp4"),
+                        "promo clip must be excluded, got: {:?}",
+                        files.keys().collect::<Vec<_>>()
+                    );
+                    let movie = files
+                        .get("Mission.Impossible.Rogue.Nation.2015.1080p.BluRay.x264-RARBG.mkv")
+                        .expect("real movie file missing");
+                    // The real film must still pair with its own (first) link, not the promo's.
+                    if let VfsNode::MediaFile { locator, .. } = movie {
+                        assert_eq!(locator.link.as_deref(), Some("http://link_movie"));
+                    } else {
+                        panic!("expected MediaFile");
+                    }
+                } else {
+                    panic!("expected folder dir");
                 }
             }
         }
@@ -1667,6 +1768,30 @@ mod tests {
         assert!(!is_video_file("movie.srt"));
         assert!(!is_video_file("movie.nfo"));
         assert!(!is_video_file("movie.txt"));
+    }
+
+    #[test]
+    fn is_video_file_rejects_release_site_promos() {
+        // Release-site/group advertisement clips that ship alongside the real media.
+        assert!(!is_video_file("RARBG.com.mp4"));
+        assert!(!is_video_file("RARBG.mp4"));
+        assert!(!is_video_file("RARBGT.mp4"));
+        assert!(!is_video_file("www.YTS.MX.mp4"));
+        assert!(!is_video_file("YTS.MX.mp4"));
+        assert!(!is_video_file("YIFY.mp4"));
+        // Still excluded when nested inside the torrent's folder.
+        assert!(!is_video_file(
+            "Mission.Impossible.Rogue.Nation.2015/RARBG.com.mp4"
+        ));
+    }
+
+    #[test]
+    fn is_video_file_no_false_positive_on_promo_substring() {
+        // A real title is only dropped when the *entire* stem is the promo token.
+        // A movie whose name merely contains the token (or extra words) must survive.
+        assert!(is_video_file("RARBG.com.Mission.Impossible.2015.mkv"));
+        assert!(is_video_file("The.Yify.Story.2024.mkv"));
+        assert!(is_video_file("Rarbgville.2024.mkv"));
     }
 
     #[test]
