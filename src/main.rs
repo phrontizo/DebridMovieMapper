@@ -4,7 +4,8 @@ use debridmoviemapper::config::Config;
 use debridmoviemapper::provider::{DebridProvider, ProviderKind};
 use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::repair::RepairManager;
-use debridmoviemapper::tasks::{ScanConfig, MATCHES_TABLE};
+use debridmoviemapper::app_state::AppState;
+use debridmoviemapper::tasks::ScanConfig;
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::torbox_client::TorBoxClient;
 use debridmoviemapper::vfs::DebridVfs;
@@ -12,7 +13,6 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
-use redb::Database;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -68,48 +68,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Jellyfin notification disabled (set JELLYFIN_URL, JELLYFIN_API_KEY, JELLYFIN_RCLONE_MOUNT_PATH to enable)");
     }
 
-    // Surface a recoverable, user-fixable failure (locked DB, read-only volume) as a
-    // clean error exit rather than a panic with a backtrace.
-    let db = Arc::new(Database::create(&config.db_path)?);
-
-    // Ensure table exists on fresh databases
-    {
-        let write_txn = db.begin_write()?;
-        write_txn.open_table(MATCHES_TABLE)?;
-        write_txn.commit()?;
-    }
+    // Open the metadata cache. Store::open never fails on an incompatible/corrupt
+    // database: it moves the old file aside (<db_path>.corrupt) and recreates it.
+    let store = debridmoviemapper::store::Store::open(&config.db_path)?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    let app_state = AppState {
+        provider: provider.clone(),
+        tmdb_client: tmdb_client.clone(),
+        vfs: vfs.clone(),
+        store: store.clone(),
+        repair_manager: repair_manager.clone(),
+        config: Arc::new(config),
+        jellyfin_client,
+        http_client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to build CDN HTTP client"),
+    };
+
     let scan_handle = tokio::spawn(debridmoviemapper::tasks::run_scan_loop(
         ScanConfig {
-            rd_client: provider.clone(),
-            tmdb_client: tmdb_client.clone(),
-            vfs: vfs.clone(),
-            db: db.clone(),
-            repair_manager: repair_manager.clone(),
-            interval_secs: config.scan_interval_secs,
-            jellyfin_client,
+            app: app_state.clone(),
         },
         shutdown_rx,
     ));
 
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("Failed to build CDN HTTP client");
     let dav_fs = DebridFileSystem::new(
-        provider.clone(),
-        vfs.clone(),
-        repair_manager.clone(),
-        http_client,
+        app_state.provider.clone(),
+        app_state.vfs.clone(),
+        app_state.repair_manager.clone(),
+        app_state.http_client.clone(),
     );
     let dav_handler = DavHandler::builder()
         .filesystem(Box::new(dav_fs))
         .locksystem(dav_server::fakels::FakeLs::new())
         .build_handler();
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], app_state.config.port));
     let listener = TcpListener::bind(addr).await?;
     info!("WebDAV server listening on http://{}", addr);
 
