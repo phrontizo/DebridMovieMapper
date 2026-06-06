@@ -1,3 +1,4 @@
+pub mod config;
 pub mod dav_fs;
 pub mod error;
 pub mod identification;
