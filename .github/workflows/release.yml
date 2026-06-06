@@ -11,7 +11,25 @@ env:
   DOCKERHUB_IMAGE: phrontizo/debridmoviemapper
 
 jobs:
+  version-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify Cargo.toml version matches the tag
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -1)"
+          echo "Tag ${GITHUB_REF_NAME} -> version ${tag_version}; Cargo.toml -> ${cargo_version}"
+          if [ "${tag_version}" != "${cargo_version}" ]; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}. Bump Cargo.toml (and Cargo.lock) to ${tag_version} before tagging."
+            exit 1
+          fi
+
   lint:
+    needs: version-check
     runs-on: ubuntu-latest
     permissions:
       contents: read
