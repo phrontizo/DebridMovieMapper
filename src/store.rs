@@ -223,18 +223,24 @@ impl Store {
         info: TorrentInfo,
         metadata: MediaMetadata,
     ) -> Result<(), AppError> {
+        // Serialise BEFORE opening the transaction: a serialisation failure must not
+        // leave the old entry removed with no replacement (partial-write data loss).
+        // This mirrors the pre-Store behaviour, where a to_vec failure skipped the
+        // whole remove+insert.
+        let bytes = match serde_json::to_vec(&(&info, &metadata)) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to serialise replacement match {}: {}", new_id, e);
+                return Ok(());
+            }
+        };
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let write_txn = db.begin_write()?;
             {
                 let mut table = write_txn.open_table(MATCHES_TABLE)?;
                 table.remove(old_id.as_str())?;
-                match serde_json::to_vec(&(&info, &metadata)) {
-                    Ok(bytes) => {
-                        table.insert(new_id.as_str(), bytes.as_slice())?;
-                    }
-                    Err(e) => error!("Failed to serialise replacement match {}: {}", new_id, e),
-                }
+                table.insert(new_id.as_str(), bytes.as_slice())?;
             }
             write_txn.commit()?;
             Ok(())
@@ -341,6 +347,20 @@ mod tests {
             .unwrap();
         assert!(store.get_match("old".to_string()).await.is_none());
         assert_eq!(store.get_match("new".to_string()).await.unwrap().0.id, "new");
+    }
+
+    #[tokio::test]
+    async fn replace_with_missing_old_id_still_inserts_new() {
+        // Removing a non-existent key is a no-op in redb; the insert must still happen.
+        let store = mem_store();
+        store
+            .replace_match("ghost".to_string(), "fresh".to_string(), info("fresh"), movie("Fresh"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_match("fresh".to_string()).await.unwrap().0.id,
+            "fresh"
+        );
     }
 
     #[tokio::test]
