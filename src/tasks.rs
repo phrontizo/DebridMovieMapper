@@ -16,7 +16,7 @@ pub struct ScanConfig {
 
 pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let AppState {
-        provider: rd_client,
+        provider,
         tmdb_client,
         vfs,
         store,
@@ -66,10 +66,10 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
         }
 
         info!("Refreshing torrent list...");
-        match rd_client.get_torrents().await {
+        match provider.get_torrents().await {
             Ok(torrents) => {
                 if torrents.is_empty() {
-                    warn!("No torrents found in {} account.", rd_client.name());
+                    warn!("No torrents found in {} account.", provider.name());
                 }
 
                 // Deduplicate torrents by hash — keep the newest "downloaded" entry per hash.
@@ -77,7 +77,7 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
                 // external tools (e.g. DebridMediaManager) re-add the same hash.
                 let (deduped_torrents, duplicate_ids) = dedup_torrents_by_hash(&torrents);
                 for dup_id in duplicate_ids {
-                    let rd = rd_client.clone();
+                    let rd = provider.clone();
                     tokio::spawn(async move {
                         if let Err(e) = rd.delete_torrent(&dup_id).await {
                             tracing::error!("Failed to delete duplicate torrent {}: {}", dup_id, e);
@@ -100,7 +100,7 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
                                 );
                                 let metadata = old_metadata.clone();
                                 // Get fresh torrent info for the new ID
-                                match rd_client.get_torrent_info(&torrent.id).await {
+                                match provider.get_torrent_info(&torrent.id).await {
                                     Ok(new_info) => {
                                         if let Err(e) = store
                                             .replace_match(
@@ -150,10 +150,10 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
                     info!("Identifying {} new torrents...", new_total);
                     let mut stream = futures_util::stream::iter(to_identify)
                         .map(|torrent| {
-                            let rd_client = rd_client.clone();
+                            let provider = provider.clone();
                             let tmdb_client = tmdb_client.clone();
                             async move {
-                                match rd_client.get_torrent_info(&torrent.id).await {
+                                match provider.get_torrent_info(&torrent.id).await {
                                     Ok(info) => {
                                         let metadata = identify_torrent(&info, &tmdb_client).await;
                                         Ok::<
