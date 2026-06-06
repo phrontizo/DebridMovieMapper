@@ -69,6 +69,8 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 | File | Purpose |
 |------|---------|
 | `main.rs` | Initializes shared state, spawns scan task, starts WebDAV server on port 8080; `--healthcheck` mode for Docker |
+| `config.rs` | `Config` — all startup env parsing/validation (`from_env`/`from_parts`); shaped for a future DB-override layer |
+| `app_state.rs` | `AppState` — `Clone` bundle of shared handles (provider, tmdb, vfs, store, repair, config, jellyfin, http) carried by the scan task |
 | `tasks.rs` | `run_scan_loop` — polls Real-Debrid, identifies new torrents, updates VFS |
 | `provider.rs` | `DebridProvider` trait abstracting the debrid backend; `FileLocator` (the provider-neutral handle for a media file) and its `resolve_url`/`invalidate` primitives; startup provider selection (`choose_provider`); test-only `MockProvider` |
 | `rd_client.rs` | Real-Debrid implementation of `DebridProvider`; shared adaptive rate limiter, 1-hour unrestrict cache |
@@ -79,6 +81,7 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 | `dav_fs.rs` | Maps VFS to WebDAV; on read resolves a `FileLocator` to a CDN URL via `provider.resolve_url` (cached 1h), attempts synchronous instant repair on `AppError::Unavailable` |
 | `repair.rs` | Torrent repair state machine (Healthy→Broken→Repairing→Failed); provider-neutral instant repair — `try_instant_repair(&FileLocator)` re-adds by hash and, if cached, returns a fresh `FileLocator` for the same file (matched by `file_path`) for `dav_fs` to swap in (30s cooldown, max 3 attempts) |
 | `tmdb_client.rs` | TMDB search for movies and TV shows |
+| `store.rs` | `Store` — owns all redb table definitions, schema version + migration hook, `open()` with auto-recovery (moves an unreadable/incompatible DB aside and recreates it), and typed async accessors for the `matches` cache |
 | `error.rs` | Unified error type (`AppError`) using `thiserror` |
 | `jellyfin_client.rs` | Optional Jellyfin notification client — notifies Jellyfin of changed paths via `POST /Library/Media/Updated` |
 | `mapper.rs` | Library root — module declarations |
@@ -88,7 +91,7 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 2. `dav_fs.rs` resolves the file's `FileLocator` to a CDN URL via `provider.resolve_url(&FileLocator)` (cached). Real-Debrid resolves via the locator's restricted `link` (1h cache); TorBox resolves by `(torrent_id, file_id)` via `requestdl` (no per-file link; ~3h cache).
 3. `ProxiedMediaFile` fetches bytes from the CDN URL with a 2MB read-ahead buffer and serves them to the player
 
-**Persistence:** Embedded `redb` database (`metadata.db`) caches TMDB identifications. The file is created automatically on first run.
+**Persistence:** Embedded `redb` database (`metadata.db`) caches TMDB identifications. The file is created automatically on first run. All `redb` access goes through `store.rs` (the `Store` type); modules never open transactions inline.
 
 ## Key Design Decisions
 
@@ -101,6 +104,7 @@ The project is structured as both a binary (`main.rs`) and a library (`mapper.rs
 - **Identification scoring:** `identification.rs` cleans filenames extensively before TMDB lookup. Shows vs. movies are detected by file structure (presence of multiple video files with episode patterns).
 - **Synchronous instant repair (provider-neutral):** When a media file is read, `dav_fs.rs` resolves the locator via `provider.resolve_url` (cached, so free when healthy). On `AppError::Unavailable`, it calls `repair_manager.try_instant_repair(&FileLocator) -> Result<FileLocator, _>` synchronously — re-adds the torrent by hash, selects the same files, and checks if the replacement is already cached. Success is decided by the new torrent reaching `status == "downloaded"` **plus** a `file_path` match for the same file (there is no `InstantRepairResult` type, and no RD-specific link-count check — path matching is inherently safe, and the replacement file is located by matching `file_path` rather than the old positional index into RD's `links` array). On success it returns a fresh `FileLocator` for that file — pairing the per-file restricted `link` by position among selected files for RD, or leaving `link: None` for providers that resolve by `(torrent_id, file_id)` (TorBox). `dav_fs` installs the returned locator (invalidating the old resolution) and re-resolves inline, so playback continues after a brief delay. If not cached, the file fails and the new torrent is left to download, the old torrent is marked Broken, and the replacement is recorded (scan loop picks it up). The health state machine (30s cooldown, max 3 attempts) is unchanged.
 - **Repair hides broken torrents:** Non-cached torrents are marked Broken and hidden from WebDAV until the scan loop picks up the replacement torrent.
+- **Database is self-healing:** `Store::open` stamps a schema version and runs forward migrations. An unreadable / incompatible / corrupt / newer-than-binary `metadata.db` (e.g. after a `redb` format change) is **moved aside** to `<db_path>.corrupt` and recreated rather than crashing the service. The `matches` table is a regenerable cache, so this is lossless in practice; authoritative tables added in later phases are migrated, never silently dropped.
 
 ## Development Process
 
