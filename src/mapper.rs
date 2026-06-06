@@ -7,6 +7,7 @@ pub mod provider;
 pub mod ratelimit;
 pub mod rd_client;
 pub mod repair;
+pub mod store;
 pub mod tasks;
 pub mod tmdb_client;
 pub mod torbox_client;
