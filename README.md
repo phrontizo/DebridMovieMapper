@@ -65,7 +65,7 @@ A debrid provider token is required: set **exactly one** of `RD_API_TOKEN` or `T
 | `TORBOX_API_KEY`             | One of\* | -              | Your TorBox API token                                                |
 | `TMDB_API_KEY`               | Yes      | -              | Your TMDB (The Movie Database) API key                               |
 | `SCAN_INTERVAL_SECS`         | No       | 60             | Interval between torrent library scans in seconds (minimum: 10, runs immediately on startup) |
-| `DB_PATH`                    | No       | `metadata.db`  | Path to the redb database file                                       |
+| `DB_PATH`                    | No       | `metadata.db`  | Path to the redb database file. If the file is unreadable, corrupt, or from an incompatible schema version, it is automatically moved to `<DB_PATH>.corrupt` and recreated — upgrades never crash-loop. |
 | `PORT`                       | No       | 8080           | WebDAV server listen port                                            |
 | `JELLYFIN_URL`               | No       | -              | Jellyfin server URL for library update notifications                 |
 | `JELLYFIN_API_KEY`           | No       | -              | Jellyfin API key for authentication                                  |

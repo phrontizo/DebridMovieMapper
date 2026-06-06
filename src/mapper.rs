@@ -1,3 +1,5 @@
+pub mod app_state;
+pub mod config;
 pub mod dav_fs;
 pub mod error;
 pub mod identification;
@@ -6,6 +8,7 @@ pub mod provider;
 pub mod ratelimit;
 pub mod rd_client;
 pub mod repair;
+pub mod store;
 pub mod tasks;
 pub mod tmdb_client;
 pub mod torbox_client;

@@ -1,9 +1,11 @@
 use dav_server::DavHandler;
 use debridmoviemapper::dav_fs::DebridFileSystem;
-use debridmoviemapper::provider::{choose_provider, DebridProvider, ProviderKind};
+use debridmoviemapper::config::Config;
+use debridmoviemapper::provider::{DebridProvider, ProviderKind};
 use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::repair::RepairManager;
-use debridmoviemapper::tasks::{ScanConfig, MATCHES_TABLE};
+use debridmoviemapper::app_state::AppState;
+use debridmoviemapper::tasks::ScanConfig;
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::torbox_client::TorBoxClient;
 use debridmoviemapper::vfs::DebridVfs;
@@ -11,12 +13,11 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
-use redb::Database;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, Semaphore};
-use tracing::{info, warn};
+use tracing::info;
 
 const MAX_CONNECTIONS: usize = 256;
 
@@ -40,44 +41,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
-    let (provider_kind, provider_token) = choose_provider(
-        std::env::var("RD_API_TOKEN").ok(),
-        std::env::var("TORBOX_API_KEY").ok(),
-    )
-    .unwrap_or_else(|e| {
+    let config = Config::from_env().unwrap_or_else(|e| {
         eprintln!("Configuration error: {}", e);
         std::process::exit(1);
     });
 
     // Construct the selected provider from the chosen token. Either client surfaces
     // a clear configuration error here (via `?`) rather than tripping a later panic.
-    let provider: Arc<dyn DebridProvider> = match provider_kind {
-        ProviderKind::RealDebrid => Arc::new(RealDebridClient::new(provider_token)?),
-        ProviderKind::TorBox => Arc::new(TorBoxClient::new(provider_token)?),
+    let provider: Arc<dyn DebridProvider> = match config.provider_kind {
+        ProviderKind::RealDebrid => Arc::new(RealDebridClient::new(config.provider_token.clone())?),
+        ProviderKind::TorBox => Arc::new(TorBoxClient::new(config.provider_token.clone())?),
     };
 
-    let tmdb_api_key = std::env::var("TMDB_API_KEY")
-        .unwrap_or_else(|_| {
-            eprintln!("Configuration error: TMDB_API_KEY must be set");
-            std::process::exit(1);
-        })
-        .trim()
-        .to_string();
-    let scan_interval_secs = match std::env::var("SCAN_INTERVAL_SECS") {
-        Ok(s) => s.parse::<u64>().unwrap_or_else(|_| {
-            warn!(
-                "Invalid SCAN_INTERVAL_SECS value '{}', falling back to 60",
-                s
-            );
-            60
-        }),
-        Err(_) => 60,
-    }
-    .max(10); // Enforce minimum 10s to prevent hammering the Real-Debrid API
+    info!("Scan interval: {}s", config.scan_interval_secs);
 
-    info!("Scan interval: {}s", scan_interval_secs);
-
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key)?);
+    let tmdb_client = Arc::new(TmdbClient::new(config.tmdb_api_key.clone())?);
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
     let repair_manager = Arc::new(RepairManager::new(provider.clone()));
 
@@ -90,56 +68,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Jellyfin notification disabled (set JELLYFIN_URL, JELLYFIN_API_KEY, JELLYFIN_RCLONE_MOUNT_PATH to enable)");
     }
 
-    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "metadata.db".to_string());
-    // Surface a recoverable, user-fixable failure (locked DB, read-only volume) as a
-    // clean error exit rather than a panic with a backtrace.
-    let db = Arc::new(Database::create(&db_path)?);
-
-    // Ensure table exists on fresh databases
-    {
-        let write_txn = db.begin_write()?;
-        write_txn.open_table(MATCHES_TABLE)?;
-        write_txn.commit()?;
-    }
+    // Open the metadata cache. Store::open never fails on an incompatible/corrupt
+    // database: it moves the old file aside (<db_path>.corrupt) and recreates it.
+    let store = debridmoviemapper::store::Store::open(&config.db_path)?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    let app_state = AppState {
+        provider: provider.clone(),
+        tmdb_client: tmdb_client.clone(),
+        vfs: vfs.clone(),
+        store: store.clone(),
+        repair_manager: repair_manager.clone(),
+        config: Arc::new(config),
+        jellyfin_client,
+        http_client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to build CDN HTTP client"),
+    };
+
     let scan_handle = tokio::spawn(debridmoviemapper::tasks::run_scan_loop(
         ScanConfig {
-            rd_client: provider.clone(),
-            tmdb_client: tmdb_client.clone(),
-            vfs: vfs.clone(),
-            db: db.clone(),
-            repair_manager: repair_manager.clone(),
-            interval_secs: scan_interval_secs,
-            jellyfin_client,
+            app: app_state.clone(),
         },
         shutdown_rx,
     ));
 
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("Failed to build CDN HTTP client");
     let dav_fs = DebridFileSystem::new(
-        provider.clone(),
-        vfs.clone(),
-        repair_manager.clone(),
-        http_client,
+        app_state.provider.clone(),
+        app_state.vfs.clone(),
+        app_state.repair_manager.clone(),
+        app_state.http_client.clone(),
     );
     let dav_handler = DavHandler::builder()
         .filesystem(Box::new(dav_fs))
         .locksystem(dav_server::fakels::FakeLs::new())
         .build_handler();
 
-    let port: u16 = match std::env::var("PORT") {
-        Ok(s) => s.parse().unwrap_or_else(|_| {
-            warn!("Invalid PORT value '{}', falling back to 8080", s);
-            8080
-        }),
-        Err(_) => 8080,
-    };
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], app_state.config.port));
     let listener = TcpListener::bind(addr).await?;
     info!("WebDAV server listening on http://{}", addr);
 
