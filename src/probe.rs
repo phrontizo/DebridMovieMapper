@@ -112,7 +112,11 @@ fn check_lang(tracks: &[Track], kind: TrackKind, want: &str) -> LangCheck {
 /// Verify parsed tracks against the requirement. Reject only on *positive* evidence of a
 /// violation (a track tagged with a non-matching language, or the required track positively
 /// absent). Untagged tracks (no language metadata) are inconclusive — not a failure — so a
-/// correct-but-untagged release isn't wrongly rejected.
+/// correct-but-untagged release isn't wrongly rejected. This deliberately also accepts a
+/// non-matching *tagged* track when an untagged track is present alongside it (the untagged one
+/// could be the wanted language). Note: MKV tracks that omit the Language element are
+/// pre-resolved to `eng` by the parser (Matroska's spec default), so only MP4 untagged audio
+/// (`language: None`) actually reaches the inconclusive branch.
 pub fn verify(tracks: &[Track], req: &LangReq) -> Verify {
     if tracks.is_empty() {
         return Verify::Inconclusive;
@@ -660,6 +664,19 @@ mod tests {
         let tracks = vec![Track { kind: TrackKind::Audio, language: Some("ita".into()) }];
         let req = LangReq { audio: AudioReq::Lang("eng".into()), subtitle: SubReq::None, original_language: None };
         assert_eq!(verify(&tracks, &req), Verify::FailAudio);
+    }
+
+    #[test]
+    fn verify_wrong_tagged_plus_untagged_audio_accepts() {
+        // Deliberate softening (pinned): a non-matching tagged track alongside an untagged one is
+        // accepted — the untagged track could be the wanted language. Only an all-tagged,
+        // all-wrong set is rejected.
+        let tracks = vec![
+            Track { kind: TrackKind::Audio, language: Some("ita".into()) },
+            Track { kind: TrackKind::Audio, language: None },
+        ];
+        let req = LangReq { audio: AudioReq::Lang("eng".into()), subtitle: SubReq::None, original_language: None };
+        assert_eq!(verify(&tracks, &req), Verify::Pass);
     }
 
     #[test]

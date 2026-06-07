@@ -73,6 +73,8 @@ static RESOLVE_IDX_RE: LazyLock<Regex> =
 /// `.../resolve/<provider>/<token>/<infohash>/<season:episode|null>/<fileidx>/<filename>`.
 /// A debrid-keyed Torrentio returns url-only streams (no `infoHash`/`fileIdx` fields), so this
 /// recovers the hash the acquisition engine needs to add the torrent by magnet.
+/// Note: only 40-hex (BitTorrent v1) infohashes are recovered; a 32-char base32 hash (rare, and
+/// not emitted by debrid-keyed Torrentio) would not match and the stream would be skipped.
 fn hash_idx_from_url(url: &str) -> Option<(String, Option<usize>)> {
     let hash = RESOLVE_HASH_RE.captures(url)?.get(1)?.as_str().to_string();
     let idx = RESOLVE_IDX_RE
