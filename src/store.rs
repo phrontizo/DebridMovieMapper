@@ -134,10 +134,10 @@ impl Store {
         Ok(())
     }
 
-    /// Apply forward migrations from `from_version` up to `SCHEMA_VERSION`.
-    /// SP0 ships **no** migrations. SP1+ add steps here (each in its own
-    /// transaction, keyed on `from_version`) BEFORE the version stamp is written,
-    /// migrating authoritative tables rather than dropping them.
+    /// Apply forward migrations from `from_version` up to `SCHEMA_VERSION`. The v1→v2 step is a
+    /// no-op: the new tables (owned_hashes/authoritative_ids/blacklist) are additive and created
+    /// lazily by `ensure_schema`. Future non-additive migrations add steps here, keyed on
+    /// `from_version`, before the version stamp is written.
     fn run_migrations(_db: &Database, _from_version: u64) -> Result<(), redb::Error> {
         Ok(())
     }
@@ -334,12 +334,30 @@ impl Store {
     }
 
     pub async fn set_owned_status(&self, hash: String, status: OwnedStatus) -> Result<(), AppError> {
-        if let Some(mut rec) = self.get_owned(hash.clone()).await {
-            rec.status = status;
-            self.put_owned(hash, rec).await
-        } else {
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            let txn = db.begin_write()?;
+            {
+                let mut table = txn.open_table(OWNED_TABLE)?;
+                // Read the raw bytes into an owned Vec first so the read borrow ends
+                // before we call insert (which needs &mut table).
+                let existing: Option<Vec<u8>> = table
+                    .get(hash.as_str())?
+                    .map(|guard| guard.value().to_vec());
+                if let Some(raw) = existing {
+                    if let Ok(mut rec) = serde_json::from_slice::<OwnedRecord>(&raw) {
+                        rec.status = status;
+                        if let Ok(bytes) = serde_json::to_vec(&rec) {
+                            table.insert(hash.as_str(), bytes.as_slice())?;
+                        }
+                    }
+                }
+            }
+            txn.commit()?;
             Ok(())
-        }
+        })
+        .await;
+        Self::flatten_join(result)
     }
 
     pub async fn remove_owned(&self, hash: String) -> Result<(), AppError> {
