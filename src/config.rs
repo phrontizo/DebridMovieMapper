@@ -2,6 +2,153 @@ use crate::error::AppError;
 use crate::provider::{choose_provider, ProviderKind};
 use tracing::warn;
 
+/// Hard resolution ceiling. Ordered so `as u16` gives the pixel height for comparisons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MaxResolution {
+    P720,
+    P1080,
+    P2160,
+}
+
+impl MaxResolution {
+    pub fn height(self) -> u16 {
+        match self {
+            MaxResolution::P720 => 720,
+            MaxResolution::P1080 => 1080,
+            MaxResolution::P2160 => 2160,
+        }
+    }
+    /// Parse "720"/"1080"/"2160"/"4k"; anything else → default 1080p.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "720" | "720p" => MaxResolution::P720,
+            "1080" | "1080p" => MaxResolution::P1080,
+            "2160" | "2160p" | "4k" | "uhd" => MaxResolution::P2160,
+            _ => MaxResolution::P1080,
+        }
+    }
+}
+
+/// Required audio language: a specific ISO code, or the title's original language.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioReq {
+    Lang(String),
+    Original,
+}
+
+impl AudioReq {
+    /// `None`/empty/"original" → Original; otherwise the given language code.
+    pub fn parse(s: Option<String>) -> Self {
+        match s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            None => AudioReq::Original,
+            Some(v) if v.eq_ignore_ascii_case("original") => AudioReq::Original,
+            Some(v) => AudioReq::Lang(v.to_ascii_lowercase()),
+        }
+    }
+}
+
+/// Required subtitle language: a specific ISO code, or `None` = skip the check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubReq {
+    Lang(String),
+    None,
+}
+
+impl SubReq {
+    /// `None`/empty/"none" → None (skip); otherwise the given language code.
+    pub fn parse(s: Option<String>) -> Self {
+        match s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            None => SubReq::None,
+            Some(v) if v.eq_ignore_ascii_case("none") => SubReq::None,
+            Some(v) => SubReq::Lang(v.to_ascii_lowercase()),
+        }
+    }
+}
+
+/// Quality preferences used by scoring (`release.rs`) and verification (`probe.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualityPrefs {
+    pub max_resolution: MaxResolution,
+    pub audio: AudioReq,
+    pub subtitle: SubReq,
+    pub prefer_hevc: bool,
+    pub prefer_hdr: bool,
+}
+
+/// Acquisition-engine configuration (SP1). Held by `Config`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquisitionConfig {
+    pub prefs: QualityPrefs,
+    pub stall_timeout_secs: u64,
+    pub max_acquire_attempts: u32,
+    /// Override for the scraper base URL; `None` → template Torrentio from the active provider.
+    pub scraper_addon_url: Option<String>,
+}
+
+impl Default for AcquisitionConfig {
+    fn default() -> Self {
+        Self::from_parts(None, None, None, None, None, None, None)
+    }
+}
+
+impl AcquisitionConfig {
+    fn parse_bool(s: Option<String>, default: bool) -> bool {
+        match s.map(|s| s.trim().to_ascii_lowercase()) {
+            Some(v) if v == "true" || v == "1" || v == "yes" => true,
+            Some(v) if v == "false" || v == "0" || v == "no" => false,
+            _ => default,
+        }
+    }
+
+    /// Pure construction from raw values (env-independent, for tests).
+    /// `scraper_addon_url` is set by `from_env`, not here.
+    pub fn from_parts(
+        max_resolution: Option<String>,
+        audio_language: Option<String>,
+        subtitle_language: Option<String>,
+        prefer_hevc: Option<String>,
+        prefer_hdr: Option<String>,
+        stall_timeout_secs: Option<String>,
+        max_acquire_attempts: Option<String>,
+    ) -> Self {
+        AcquisitionConfig {
+            prefs: QualityPrefs {
+                max_resolution: max_resolution
+                    .map(|s| MaxResolution::parse(&s))
+                    .unwrap_or(MaxResolution::P1080),
+                audio: AudioReq::parse(audio_language),
+                subtitle: SubReq::parse(subtitle_language),
+                prefer_hevc: Self::parse_bool(prefer_hevc, true),
+                prefer_hdr: Self::parse_bool(prefer_hdr, false),
+            },
+            stall_timeout_secs: stall_timeout_secs
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(1800),
+            max_acquire_attempts: max_acquire_attempts
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(5),
+            scraper_addon_url: None,
+        }
+    }
+
+    pub fn from_env() -> Self {
+        let mut a = Self::from_parts(
+            std::env::var("MAX_RESOLUTION").ok(),
+            std::env::var("AUDIO_LANGUAGE").ok(),
+            std::env::var("SUBTITLE_LANGUAGE").ok(),
+            std::env::var("PREFER_HEVC").ok(),
+            std::env::var("PREFER_HDR").ok(),
+            std::env::var("STALL_TIMEOUT_SECS").ok(),
+            std::env::var("MAX_ACQUIRE_ATTEMPTS").ok(),
+        );
+        a.scraper_addon_url = std::env::var("SCRAPER_ADDON_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        a
+    }
+}
+
 /// Startup configuration parsed from environment variables.
 ///
 /// These values are fixed at startup. A future DB-backed override layer (web-UI
@@ -16,19 +163,22 @@ pub struct Config {
     pub scan_interval_secs: u64,
     pub db_path: String,
     pub port: u16,
+    pub acquisition: AcquisitionConfig,
 }
 
 impl Config {
     /// Build from the process environment (reads the same variables as before).
     pub fn from_env() -> Result<Self, AppError> {
-        Self::from_parts(
+        let mut cfg = Self::from_parts(
             std::env::var("RD_API_TOKEN").ok(),
             std::env::var("TORBOX_API_KEY").ok(),
             std::env::var("TMDB_API_KEY").ok(),
             std::env::var("SCAN_INTERVAL_SECS").ok(),
             std::env::var("DB_PATH").ok(),
             std::env::var("PORT").ok(),
-        )
+        )?;
+        cfg.acquisition = AcquisitionConfig::from_env();
+        Ok(cfg)
     }
 
     /// Pure construction from raw optional values — unit-testable without touching
@@ -74,6 +224,7 @@ impl Config {
             scan_interval_secs,
             db_path,
             port,
+            acquisition: AcquisitionConfig::default(),
         })
     }
 }
@@ -161,5 +312,54 @@ mod tests {
             parts(Some("rd"), None, Some("t"), None, Some("/data/x.db"), None).unwrap().db_path,
             "/data/x.db"
         );
+    }
+
+    #[test]
+    fn acquisition_defaults() {
+        let a = AcquisitionConfig::from_parts(None, None, None, None, None, None, None);
+        assert_eq!(a.prefs.max_resolution, MaxResolution::P1080);
+        assert_eq!(a.prefs.audio, AudioReq::Original);
+        assert_eq!(a.prefs.subtitle, SubReq::None);
+        assert!(a.prefs.prefer_hevc);
+        assert!(!a.prefs.prefer_hdr);
+        assert_eq!(a.stall_timeout_secs, 1800);
+        assert_eq!(a.max_acquire_attempts, 5);
+        assert_eq!(a.scraper_addon_url, None);
+    }
+
+    #[test]
+    fn acquisition_parses_overrides() {
+        let a = AcquisitionConfig::from_parts(
+            Some("2160".into()),
+            Some("eng".into()),
+            Some("eng".into()),
+            Some("false".into()),
+            Some("true".into()),
+            Some("600".into()),
+            Some("3".into()),
+        );
+        assert_eq!(a.prefs.max_resolution, MaxResolution::P2160);
+        assert_eq!(a.prefs.audio, AudioReq::Lang("eng".into()));
+        assert_eq!(a.prefs.subtitle, SubReq::Lang("eng".into()));
+        assert!(!a.prefs.prefer_hevc);
+        assert!(a.prefs.prefer_hdr);
+        assert_eq!(a.stall_timeout_secs, 600);
+        assert_eq!(a.max_acquire_attempts, 3);
+    }
+
+    #[test]
+    fn max_resolution_parse_and_invalid_falls_back() {
+        assert_eq!(MaxResolution::parse("720"), MaxResolution::P720);
+        assert_eq!(MaxResolution::parse("1080"), MaxResolution::P1080);
+        assert_eq!(MaxResolution::parse("2160"), MaxResolution::P2160);
+        assert_eq!(MaxResolution::parse("4k"), MaxResolution::P2160);
+        assert_eq!(MaxResolution::parse("garbage"), MaxResolution::P1080);
+    }
+
+    #[test]
+    fn subtitle_none_keyword_means_skip() {
+        assert_eq!(SubReq::parse(None), SubReq::None);
+        assert_eq!(SubReq::parse(Some("none".into())), SubReq::None);
+        assert_eq!(SubReq::parse(Some("eng".into())), SubReq::Lang("eng".into()));
     }
 }
