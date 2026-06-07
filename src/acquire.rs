@@ -245,12 +245,7 @@ impl AcquisitionEngine {
         }
         let ranked = release::rank(parsed, &self.prefs);
 
-        let mut attempts = 0u32;
-        for cand in ranked {
-            if attempts >= self.max_attempts {
-                break;
-            }
-            attempts += 1;
+        for cand in ranked.into_iter().take(self.max_attempts as usize) {
             if self.store.get_owned(cand.info_hash.clone()).await.is_some() {
                 return AcquireOutcome::Acquired(cand.info_hash.clone()); // idempotent
             }

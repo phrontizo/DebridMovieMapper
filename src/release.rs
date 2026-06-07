@@ -143,7 +143,7 @@ pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
     if r.container.is_verifiable() { s += 2_000; }
     s += (r.seeders.unwrap_or(0).min(1000) as i64) * 2;
     if let Some(sz) = r.size_bytes {
-        if sz < 300_000_000 || sz > 25_000_000_000 { s -= 4_000; }
+        if !(300_000_000..=25_000_000_000).contains(&sz) { s -= 4_000; }
     }
     if let AudioReq::Lang(want) = &prefs.audio {
         if !r.languages.is_empty() && !r.languages.iter().any(|l| l == want || l == "mul") {
