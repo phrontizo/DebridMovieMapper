@@ -1,6 +1,7 @@
 use crate::error::AppError;
 use rand::Rng;
 use reqwest::{Client, RequestBuilder};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -79,7 +80,7 @@ impl TmdbClient {
 
     async fn search(&self, url: &str, params: Vec<(&str, &str)>) -> Vec<TmdbSearchResult> {
         match self
-            .fetch_with_retry(|| self.client.get(url).query(&params))
+            .fetch_with_retry::<TmdbResponse>(|| self.client.get(url).query(&params))
             .await
         {
             Ok(resp) => resp.results,
@@ -93,10 +94,14 @@ impl TmdbClient {
     /// Resolve an IMDB id (`tt…`) to (tmdb_id, kind) via TMDB /find.
     pub async fn find_by_imdb(&self, imdb_id: &str) -> Result<Option<(u64, crate::vfs::MediaType)>, reqwest::Error> {
         let url = format!("https://api.themoviedb.org/3/find/{}", imdb_id);
-        let v: serde_json::Value = self.client
-            .get(&url)
-            .query(&[("api_key", self.api_key.as_str()), ("external_source", "imdb_id")])
-            .send().await?.json().await?;
+        let api_key = self.api_key.clone();
+        let v = self
+            .fetch_with_retry::<serde_json::Value>(|| {
+                self.client
+                    .get(&url)
+                    .query(&[("api_key", api_key.as_str()), ("external_source", "imdb_id")])
+            })
+            .await?;
         Ok(parse_find_response(&v))
     }
 
@@ -104,17 +109,21 @@ impl TmdbClient {
     pub async fn external_imdb_id(&self, tmdb_id: u64, kind: crate::vfs::MediaType) -> Result<Option<String>, reqwest::Error> {
         let path = match kind { crate::vfs::MediaType::Movie => "movie", crate::vfs::MediaType::Show => "tv" };
         let url = format!("https://api.themoviedb.org/3/{}/{}/external_ids", path, tmdb_id);
-        let v: serde_json::Value = self.client
-            .get(&url)
-            .query(&[("api_key", self.api_key.as_str())])
-            .send().await?.json().await?;
+        let api_key = self.api_key.clone();
+        let v = self
+            .fetch_with_retry::<serde_json::Value>(|| {
+                self.client
+                    .get(&url)
+                    .query(&[("api_key", api_key.as_str())])
+            })
+            .await?;
         Ok(parse_external_ids(&v))
     }
 
-    async fn fetch_with_retry(
+    async fn fetch_with_retry<T: DeserializeOwned>(
         &self,
         make_request: impl Fn() -> RequestBuilder,
-    ) -> Result<TmdbResponse, reqwest::Error> {
+    ) -> Result<T, reqwest::Error> {
         let mut last_error: Option<reqwest::Error> = None;
         let max_attempts = 10;
 
@@ -159,7 +168,7 @@ impl TmdbClient {
                     }
 
                     match resp.error_for_status() {
-                        Ok(resp) => return resp.json::<TmdbResponse>().await,
+                        Ok(resp) => return resp.json::<T>().await,
                         Err(e) => {
                             let e = e.without_url();
                             warn!(
@@ -324,5 +333,7 @@ mod tests {
         assert_eq!(super::parse_external_ids(&json), Some("tt0816692".to_string()));
         let none = serde_json::json!({"imdb_id": serde_json::Value::Null});
         assert_eq!(super::parse_external_ids(&none), None);
+        let empty = serde_json::json!({"imdb_id": ""});
+        assert_eq!(super::parse_external_ids(&empty), None);
     }
 }
