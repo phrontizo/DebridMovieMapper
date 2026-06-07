@@ -43,6 +43,8 @@ impl TorrentioScraper {
             ProviderKind::RealDebrid => "realdebrid",
             ProviderKind::TorBox => "torbox",
         };
+        // Single provider option. Additional Torrentio options are '|'-separated
+        // (e.g. "realdebrid=TOKEN|sort=size") — extend here if needed.
         format!("https://torrentio.strem.fun/{}={}", opt, token)
     }
 
@@ -71,7 +73,7 @@ pub fn parse_streams(v: &serde_json::Value) -> Vec<RawCandidate> {
         out.push(RawCandidate {
             name: s.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
             description: s.get("title").or_else(|| s.get("description")).and_then(|t| t.as_str()).unwrap_or("").to_string(),
-            info_hash: info_hash.to_string(),
+            info_hash: info_hash.to_ascii_lowercase(),
             file_idx: s.get("fileIdx").and_then(|i| i.as_u64()).map(|i| i as usize),
             file_name: s.get("behaviorHints").and_then(|b| b.get("filename")).and_then(|f| f.as_str()).map(String::from),
         });
@@ -84,6 +86,13 @@ impl Scraper for TorrentioScraper {
     async fn find(&self, imdb_id: &str, kind: MediaKind, season: Option<u32>, episode: Option<u32>) -> Result<Vec<RawCandidate>, AppError> {
         let url = Self::stream_url(&self.base_url, imdb_id, kind, season, episode);
         let resp = self.http.get(&url).send().await.map_err(AppError::Http)?;
+        // 404 = unknown id (genuinely no streams). Any other non-success (429/5xx) is a
+        // retriable addon error — surface it so the engine treats it as TemporarilyUnavailable
+        // rather than silently seeing zero candidates.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        let resp = resp.error_for_status().map_err(AppError::Http)?;
         let v: serde_json::Value = resp.json().await.map_err(AppError::Http)?;
         Ok(parse_streams(&v))
     }
