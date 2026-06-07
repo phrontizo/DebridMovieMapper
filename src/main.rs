@@ -116,8 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // TEMPORARY (SP1) dev/verification trigger — remove once SP2 (Trakt) / SP4 (ad-hoc add) exist.
     // Usage: --acquire <movie|series> <imdb-or-tmdb-id> [season episode]
-    if let Some(pos) = std::env::args().position(|a| a == "--acquire") {
-        let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--acquire") {
         let kind_s = args.get(pos + 1).cloned().unwrap_or_default();
         let id_s = args.get(pos + 2).cloned().unwrap_or_default();
         let season = args.get(pos + 3).and_then(|s| s.parse::<u32>().ok());
@@ -146,7 +146,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => { eprintln!("--acquire: could not resolve IMDB id for tmdb {}", tid); std::process::exit(2); }
             }
         };
-        let (title, year, original_language) = tmdb_client.details(tmdb_id, media_type.clone()).await.unwrap_or_default();
+        let (title, year, original_language) = match tmdb_client.details(tmdb_id, media_type.clone()).await {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("--acquire: could not fetch TMDB details for {}: {}", tmdb_id, e);
+                std::process::exit(2);
+            }
+        };
         let req = debridmoviemapper::store::AcquireRequest {
             imdb_id,
             tmdb_id,

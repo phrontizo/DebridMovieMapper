@@ -109,7 +109,12 @@ impl TmdbClient {
     pub async fn details(&self, tmdb_id: u64, kind: crate::vfs::MediaType) -> Result<(String, Option<String>, Option<String>), reqwest::Error> {
         let path = match kind { crate::vfs::MediaType::Movie => "movie", crate::vfs::MediaType::Show => "tv" };
         let url = format!("https://api.themoviedb.org/3/{}/{}", path, tmdb_id);
-        let v: serde_json::Value = self.client.get(&url).query(&[("api_key", self.api_key.as_str())]).send().await?.json().await?;
+        let api_key = self.api_key.clone();
+        let v = self
+            .fetch_with_retry::<serde_json::Value>(|| {
+                self.client.get(&url).query(&[("api_key", api_key.as_str())])
+            })
+            .await?;
         Ok(parse_details(&v, kind))
     }
 
