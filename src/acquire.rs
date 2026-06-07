@@ -130,8 +130,15 @@ pub struct AcquisitionEngine {
     verify_attempts: Arc<Mutex<HashMap<String, u32>>>,
 }
 
-/// Choose file ids to select for a candidate: the addon's named/index file, else the largest video.
-fn select_file_ids(info: &TorrentInfo, file_hint: Option<&str>, file_idx: Option<usize>) -> Vec<u32> {
+/// The single target media file for a candidate: the addon's named/index file, else the largest
+/// video. Used both to choose what to select and to identify the served file afterwards — the
+/// latter matters because some providers (TorBox) auto-select *every* file, so "first selected"
+/// is not the video (it could be a `.srt`/`.nfo`).
+fn select_target<'a>(
+    info: &'a TorrentInfo,
+    file_hint: Option<&str>,
+    file_idx: Option<usize>,
+) -> Option<&'a crate::rd_client::TorrentFile> {
     if let Some(hint) = file_hint {
         let hint_base = hint.rsplit('/').next().unwrap_or(hint);
         if let Some(f) = info
@@ -139,18 +146,23 @@ fn select_file_ids(info: &TorrentInfo, file_hint: Option<&str>, file_idx: Option
             .iter()
             .find(|f| f.path.rsplit('/').next().unwrap_or(&f.path) == hint_base)
         {
-            return vec![f.id];
+            return Some(f);
         }
     }
     if let Some(idx) = file_idx {
         if let Some(f) = info.files.get(idx) {
-            return vec![f.id];
+            return Some(f);
         }
     }
     info.files
         .iter()
         .filter(|f| crate::vfs::is_video_file(&f.path))
         .max_by_key(|f| f.bytes)
+}
+
+/// Choose file ids to select for a candidate (see `select_target`).
+fn select_file_ids(info: &TorrentInfo, file_hint: Option<&str>, file_idx: Option<usize>) -> Vec<u32> {
+    select_target(info, file_hint, file_idx)
         .map(|f| vec![f.id])
         .unwrap_or_default()
 }
@@ -287,11 +299,8 @@ impl AcquisitionEngine {
                 return CandidateResult::Next;
             }
         };
-        let Some(selected_path) = final_info
-            .files
-            .iter()
-            .find(|f| f.selected == 1)
-            .map(|f| f.path.clone())
+        let Some(selected_path) =
+            select_target(&final_info, cand.file_name.as_deref(), cand.file_idx).map(|f| f.path.clone())
         else {
             let _ = self.provider.delete_torrent(&new_id).await;
             return CandidateResult::Next;
@@ -456,7 +465,8 @@ impl AcquisitionEngine {
             Ok(i) => i,
             Err(_) => return,
         };
-        let Some(path) = info.files.iter().find(|f| f.selected == 1).map(|f| f.path.clone()) else {
+        // No candidate hint here (we work from the owned record), so fall back to the largest video.
+        let Some(path) = select_target(&info, None, None).map(|f| f.path.clone()) else {
             return;
         };
         let locator = locator_for(&info, hash, &path);
