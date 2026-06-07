@@ -4,6 +4,7 @@ pub mod dav_fs;
 pub mod error;
 pub mod identification;
 pub mod jellyfin_client;
+pub mod probe;
 pub mod provider;
 pub mod ratelimit;
 pub mod rd_client;
