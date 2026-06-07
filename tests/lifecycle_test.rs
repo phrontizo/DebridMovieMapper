@@ -266,6 +266,10 @@ async fn lifecycle_acquire_sintel_by_imdb() {
             external_id: Some(format!("tmdb:{}", tmdb_id)),
         },
     };
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_test_writer()
+        .try_init();
     let outcome = engine.acquire(req).await;
     eprintln!("acquire outcome: {:?}", outcome);
     assert!(

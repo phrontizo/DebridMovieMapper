@@ -91,6 +91,18 @@ fn clamp_size(size: i64) -> u64 {
     size.max(0) as u64
 }
 
+/// Extract the BitTorrent infohash from a `magnet:?xt=urn:btih:<hash>` URI (lowercased).
+/// Used to recover the existing torrent's id when TorBox rejects a re-add as already present.
+fn magnet_infohash(magnet: &str) -> Option<String> {
+    let lower = magnet.to_ascii_lowercase();
+    let start = lower.find("btih:")? + "btih:".len();
+    let hash: String = lower[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    (hash.len() >= 32).then_some(hash)
+}
+
 fn to_torrent_file(f: &TbFile) -> TorrentFile {
     TorrentFile {
         id: f.id,
@@ -296,7 +308,13 @@ impl TorBoxClient {
                 tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
                 continue;
             }
-            let resp = resp.error_for_status().map_err(|e| e.without_url())?;
+            let status = resp.status();
+            if let Err(e) = resp.error_for_status_ref() {
+                // Surface TorBox's error detail (e.g. why createtorrent 400s) before discarding it.
+                let body = resp.text().await.unwrap_or_default();
+                warn!("TorBox {} error body: {:.300}", status, body);
+                return Err(e.without_url());
+            }
             let text = resp.text().await?;
             match serde_json::from_str::<Envelope<T>>(&text) {
                 Ok(env) if env.success => {
@@ -387,16 +405,39 @@ impl TorBoxClient {
     ) -> Result<crate::rd_client::AddMagnetResponse, reqwest::Error> {
         let url = format!("{}/torrents/createtorrent", TORBOX_BASE);
         let magnet = magnet.to_string();
-        let created: TbCreate = self
-            .send_data(|| {
-                let form = reqwest::multipart::Form::new().text("magnet", magnet.clone());
+        let form_magnet = magnet.clone();
+        match self
+            .send_data::<TbCreate, _>(|| {
+                let form = reqwest::multipart::Form::new().text("magnet", form_magnet.clone());
                 self.client.post(&url).multipart(form)
             })
-            .await?;
-        Ok(crate::rd_client::AddMagnetResponse {
-            id: created.torrent_id.to_string(),
-            uri: magnet,
-        })
+            .await
+        {
+            Ok(created) => Ok(crate::rd_client::AddMagnetResponse {
+                id: created.torrent_id.to_string(),
+                uri: magnet,
+            }),
+            Err(e) => {
+                // TorBox 400s ("Download already queued") when the torrent is already in the
+                // account. Recover idempotently by locating the existing torrent by infohash
+                // rather than failing the acquisition.
+                if let Some(hash) = magnet_infohash(&magnet) {
+                    if let Ok(list) = self.list_torrents_raw().await {
+                        if let Some(t) = list.iter().find(|t| t.hash.eq_ignore_ascii_case(&hash)) {
+                            info!(
+                                "TorBox createtorrent rejected but torrent already present; reusing id {}",
+                                t.id
+                            );
+                            return Ok(crate::rd_client::AddMagnetResponse {
+                                id: t.id.clone(),
+                                uri: magnet,
+                            });
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     pub async fn delete_torrent_raw(&self, id: &str) -> Result<(), reqwest::Error> {
@@ -505,6 +546,20 @@ mod tests {
         ));
         assert!(!is_transient_status(reqwest::StatusCode::OK));
         assert!(!is_transient_status(reqwest::StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn magnet_infohash_extracts_btih() {
+        assert_eq!(
+            magnet_infohash("magnet:?xt=urn:btih:64877b5490208c3015c0f5121287949d62622e54&dn=Sintel"),
+            Some("64877b5490208c3015c0f5121287949d62622e54".to_string())
+        );
+        // Uppercase input is normalised to lowercase.
+        assert_eq!(
+            magnet_infohash("magnet:?xt=urn:btih:AABBCCDDEEFF00112233445566778899AABBCCDD"),
+            Some("aabbccddeeff00112233445566778899aabbccdd".to_string())
+        );
+        assert_eq!(magnet_infohash("magnet:?dn=NoHash"), None);
     }
 
     #[test]
