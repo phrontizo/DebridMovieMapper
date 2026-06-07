@@ -167,6 +167,16 @@ fn select_file_ids(info: &TorrentInfo, file_hint: Option<&str>, file_idx: Option
         .unwrap_or_default()
 }
 
+/// Count feature-sized video files. A real single-movie release has exactly one; more than one
+/// signals a multi-movie pack. The size floor excludes samples / extras / featurettes.
+fn count_feature_videos(info: &TorrentInfo) -> usize {
+    const FEATURE_MIN_BYTES: u64 = 700_000_000;
+    info.files
+        .iter()
+        .filter(|f| crate::vfs::is_video_file(&f.path) && f.bytes >= FEATURE_MIN_BYTES)
+        .count()
+}
+
 /// Build a FileLocator for `path` within `info` (pairs the per-file link by position among selected).
 fn locator_for(info: &TorrentInfo, hash: &str, path: &str) -> FileLocator {
     let mut link_idx = 0;
@@ -299,6 +309,16 @@ impl AcquisitionEngine {
                 return CandidateResult::Next;
             }
         };
+        // Movie-pack guard: a single-movie request must not adopt a multi-movie pack. Providers
+        // that auto-select every file (TorBox) would otherwise pull the whole pack into the
+        // library (dozens of unrelated films under one folder). A genuine movie release has one
+        // feature-sized video; more than one means a pack — reject and try the next candidate.
+        if req.kind == MediaKind::Movie && count_feature_videos(&final_info) > 1 {
+            warn!("rejecting multi-movie pack for {} (feature-sized videos > 1)", hash);
+            let _ = self.provider.delete_torrent(&new_id).await;
+            return CandidateResult::Next;
+        }
+
         let Some(selected_path) =
             select_target(&final_info, cand.file_name.as_deref(), cand.file_idx).map(|f| f.path.clone())
         else {
@@ -744,6 +764,35 @@ mod tests {
         );
         let out = eng.acquire(req()).await;
         assert_eq!(out, AcquireOutcome::Acquired("h1".into()));
+    }
+
+    #[tokio::test]
+    async fn movie_pack_candidate_is_rejected() {
+        // A single-movie request must reject a multi-movie pack (>1 feature-sized video) so a
+        // provider that auto-selects all files (TorBox) doesn't pull dozens of unrelated films.
+        let st = store();
+        let scraper = Arc::new(MockScraper { candidates: vec![cand("h1", true)] });
+        let prober = Arc::new(CannedProber(Ok(vec![])));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            add_magnet: Some(AddMagnetResponse { id: "tid".into(), uri: String::new() }),
+            torrent_info: Some(TI {
+                id: "tid".into(),
+                hash: "h1".into(),
+                status: "downloaded".into(),
+                files: vec![
+                    TorrentFile { id: 0, path: "Movie.A.2020.1080p.mkv".into(), bytes: 2_000_000_000, selected: 1 },
+                    TorrentFile { id: 1, path: "Movie.B.2019.1080p.mkv".into(), bytes: 2_000_000_000, selected: 1 },
+                ],
+                links: vec!["https://cdn/a".into(), "https://cdn/b".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/a".into()),
+            ..Default::default()
+        });
+        let eng = engine(provider, scraper, Arc::new(OkValidator(true)), prober, st.clone());
+        let out = eng.acquire(req()).await;
+        assert_eq!(out, AcquireOutcome::NoAcceptableRelease, "a multi-movie pack must be rejected");
+        assert!(st.get_owned("h1".into()).await.is_none(), "a rejected pack must not be recorded");
     }
 
     #[tokio::test]

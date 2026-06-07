@@ -34,6 +34,31 @@ impl Container {
     }
 }
 
+/// Source/release tier. `Cam` covers cam/telesync/telecine/screener/R5/workprint/pre-DVD — these
+/// are hard-rejected (the quality floor). The rest rank by tier (REMUX > BluRay > WEB > HDTV).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Cam,
+    Remux,
+    BluRay,
+    Web,
+    Hdtv,
+    Other,
+}
+
+impl Source {
+    /// Ranking bonus by tier. `Cam` is rejected before this is consulted.
+    fn tier_score(self) -> i64 {
+        match self {
+            Source::Remux => 8_000,
+            Source::BluRay => 6_000,
+            Source::Web => 3_000,
+            Source::Hdtv => 1_000,
+            Source::Cam | Source::Other => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ReleaseInfo {
     pub info_hash: String,
@@ -48,6 +73,7 @@ pub struct ReleaseInfo {
     pub seeders: Option<u32>,
     pub cached: bool,
     pub container: Container,
+    pub source: Source,
 }
 
 static RES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(\d{3,4})p\b|\b(4k|uhd)\b").unwrap());
@@ -66,6 +92,43 @@ fn extract_group(s: &str) -> Option<String> {
         None
     } else {
         Some(g.to_string())
+    }
+}
+
+// Cam / telesync / telecine / screener / R5 / workprint / pre-DVD markers (the quality floor).
+static CAM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(cam|cam-?rip|hd-?cam|hq-?cam|ts|hd-?ts|tele-?sync|hd-?tc|tele-?cine|scr|screener|dvd-?scr|bd-?scr|work-?print|r5|pre-?dvd|predvd)\b",
+    )
+    .unwrap()
+});
+
+/// Classify the release source from its (lowercased) name/description.
+fn detect_source(lower: &str) -> Source {
+    if CAM_RE.is_match(lower) {
+        Source::Cam
+    } else if lower.contains("remux") {
+        Source::Remux
+    } else if lower.contains("bluray")
+        || lower.contains("blu-ray")
+        || lower.contains("bdrip")
+        || lower.contains("brrip")
+    {
+        Source::BluRay
+    } else if lower.contains("web-dl")
+        || lower.contains("webdl")
+        || lower.contains("web.dl")
+        || lower.contains("webrip")
+        || lower.contains("web-rip")
+        || lower.contains("amzn")
+        || lower.contains("dsnp")
+        || lower.contains("nf.web")
+    {
+        Source::Web
+    } else if lower.contains("hdtv") {
+        Source::Hdtv
+    } else {
+        Source::Other
     }
 }
 
@@ -113,12 +176,13 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
     }
 
     let container = c.file_name.as_deref().map(Container::from_name).unwrap_or(Container::Other);
+    let source = detect_source(&lower);
 
     ReleaseInfo {
         info_hash: c.info_hash.clone(),
         file_idx: c.file_idx,
         file_name: c.file_name.clone(),
-        resolution, codec, hdr, languages, group, size_bytes, seeders, cached, container,
+        resolution, codec, hdr, languages, group, size_bytes, seeders, cached, container, source,
     }
 }
 
@@ -130,6 +194,10 @@ const LANG_WORDS: &[(&str, &str)] = &[
 
 /// Score a release against prefs. `None` = excluded by a hard rule (resolution ceiling). Higher better.
 pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
+    // Quality floor: never acquire a cam / telesync / telecine / screener / R5 / workprint source.
+    if r.source == Source::Cam {
+        return None;
+    }
     // A release with no parsed resolution is let through rather than excluded (don't
     // blindly drop potentially-valid releases the scraper failed to tag).
     if let Some(res) = r.resolution {
@@ -137,13 +205,22 @@ pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
     }
     let mut s: i64 = 0;
     if r.cached { s += 1_000_000; }
+    s += r.source.tier_score();
     s += r.resolution.unwrap_or(0) as i64 * 100;
     if prefs.prefer_hevc && r.codec == Codec::Hevc { s += 5_000; }
     if prefs.prefer_hdr && r.hdr { s += 3_000; }
     if r.container.is_verifiable() { s += 2_000; }
     s += (r.seeders.unwrap_or(0).min(1000) as i64) * 2;
     if let Some(sz) = r.size_bytes {
-        if !(300_000_000..=25_000_000_000).contains(&sz) { s -= 4_000; }
+        // Reject fake/sample (<300 MB) and absurd (>80 GB) files. The upper bound is generous so
+        // a legitimate REMUX (often 25–40 GB at 1080p — now our top source tier) isn't penalised.
+        if sz < 300_000_000 || sz > 80_000_000_000 {
+            s -= 4_000;
+        } else {
+            // Prefer higher bitrate (larger file) at a given resolution/source — a tiebreaker
+            // capped well below the codec/source weights so it never overrides them.
+            s += (sz / 1_000_000_000).min(15) as i64 * 200; // up to +3000 at ≥15 GB
+        }
     }
     if let AudioReq::Lang(want) = &prefs.audio {
         if !r.languages.is_empty() && !r.languages.iter().any(|l| l == want || l == "mul") {
@@ -266,12 +343,47 @@ mod tests {
     }
 
     #[test]
-    fn score_penalises_tiny_and_huge_sizes() {
+    fn score_penalises_tiny_and_absurd_sizes_and_prefers_bitrate() {
         let normal = parse(&raw("t", "A.1080p.x265\n\u{1f4be} 8 GB", "h1", Some("A.mkv")));
         let tiny = parse(&raw("t", "A.1080p.x265\n\u{1f4be} 150 MB", "h2", Some("A.mkv")));
-        let huge = parse(&raw("t", "A.1080p.x265\n\u{1f4be} 40 GB", "h3", Some("A.mkv")));
+        let absurd = parse(&raw("t", "A.1080p.x265\n\u{1f4be} 120 GB", "h3", Some("A.mkv")));
+        let bigger = parse(&raw("t", "A.1080p.x265\n\u{1f4be} 12 GB", "h4", Some("A.mkv")));
+        let remux = parse(&raw("t", "A.1080p.x265\n\u{1f4be} 35 GB", "h5", Some("A.mkv")));
         assert!(score(&normal, &prefs()).unwrap() > score(&tiny, &prefs()).unwrap());
-        assert!(score(&normal, &prefs()).unwrap() > score(&huge, &prefs()).unwrap());
+        assert!(score(&normal, &prefs()).unwrap() > score(&absurd, &prefs()).unwrap());
+        // Higher bitrate (larger) preferred at the same resolution/source…
+        assert!(score(&bigger, &prefs()).unwrap() > score(&normal, &prefs()).unwrap());
+        // …and a 35 GB REMUX-sized file is no longer penalised (it's capped, not rejected).
+        assert!(score(&remux, &prefs()).unwrap() > score(&normal, &prefs()).unwrap());
+    }
+
+    #[test]
+    fn score_rejects_cam_and_telesync_sources() {
+        // The quality floor: cam/telesync/screener are excluded even when cached at the ceiling.
+        for marker in ["HDTS", "CAM", "HDCAM", "TELESYNC", "DVDScr", "R5", "TS", "WORKPRINT"] {
+            let c = raw(
+                "Torrentio\n1080p",
+                &format!("Movie.2025.1080p.{marker}.x265\nRD+"),
+                "h",
+                Some("Movie.2025.1080p.mkv"),
+            );
+            assert_eq!(score(&parse(&c), &prefs()), None, "{marker} must be rejected by the quality floor");
+        }
+        // A real BluRay at the same resolution is accepted.
+        let good = parse(&raw("Torrentio\n1080p", "Movie.2025.1080p.BluRay.x265\nRD+", "h", Some("Movie.mkv")));
+        assert!(score(&good, &prefs()).is_some());
+    }
+
+    #[test]
+    fn score_prefers_higher_source_tier() {
+        let remux = parse(&raw("t", "A.1080p.BluRay.REMUX.x265\nRD+", "h1", Some("A.1080p.mkv")));
+        let web = parse(&raw("t", "A.1080p.WEB-DL.x265\nRD+", "h2", Some("A.1080p.mkv")));
+        assert_eq!(remux.source, Source::Remux);
+        assert_eq!(web.source, Source::Web);
+        assert!(
+            score(&remux, &prefs()).unwrap() > score(&web, &prefs()).unwrap(),
+            "REMUX should outrank WEB-DL at the same resolution"
+        );
     }
 
     #[test]
