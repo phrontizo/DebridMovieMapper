@@ -72,6 +72,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // database: it moves the old file aside (<db_path>.corrupt) and recreates it.
     let store = debridmoviemapper::store::Store::open(&config.db_path)?;
 
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("Failed to build CDN HTTP client");
+
+    let scraper: Arc<dyn debridmoviemapper::scraper::Scraper> =
+        Arc::new(debridmoviemapper::scraper::TorrentioScraper::new(
+            config.acquisition.scraper_addon_url.clone(),
+            config.provider_kind,
+            &config.provider_token,
+            http_client.clone(),
+        ));
+    let validator: Arc<dyn debridmoviemapper::acquire::TitleValidator> =
+        Arc::new(debridmoviemapper::acquire::TmdbTitleValidator { tmdb: tmdb_client.clone() });
+    let prober: Arc<dyn debridmoviemapper::acquire::Prober> =
+        Arc::new(debridmoviemapper::acquire::HttpProber { http: http_client.clone() });
+    let engine = Arc::new(debridmoviemapper::acquire::AcquisitionEngine::new(
+        provider.clone(),
+        scraper.clone(),
+        validator,
+        prober,
+        store.clone(),
+        config.acquisition.prefs.clone(),
+        config.acquisition.max_acquire_attempts,
+        std::time::Duration::from_secs(config.acquisition.stall_timeout_secs),
+    ));
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let app_state = AppState {
@@ -82,11 +109,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         repair_manager: repair_manager.clone(),
         config: Arc::new(config),
         jellyfin_client,
-        http_client: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("Failed to build CDN HTTP client"),
+        http_client: http_client.clone(),
+        scraper: scraper.clone(),
+        engine: engine.clone(),
     };
+
+    // TEMPORARY (SP1) dev/verification trigger — remove once SP2 (Trakt) / SP4 (ad-hoc add) exist.
+    // Usage: --acquire <movie|series> <imdb-or-tmdb-id> [season episode]
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--acquire") {
+        let kind_s = args.get(pos + 1).cloned().unwrap_or_default();
+        let id_s = args.get(pos + 2).cloned().unwrap_or_default();
+        let season = args.get(pos + 3).and_then(|s| s.parse::<u32>().ok());
+        let episode = args.get(pos + 4).and_then(|s| s.parse::<u32>().ok());
+        let kind = match kind_s.as_str() {
+            "movie" => debridmoviemapper::scraper::MediaKind::Movie,
+            "series" => debridmoviemapper::scraper::MediaKind::Series,
+            other => {
+                eprintln!("--acquire: kind must be 'movie' or 'series', got '{}'", other);
+                std::process::exit(2);
+            }
+        };
+        let media_type = match kind {
+            debridmoviemapper::scraper::MediaKind::Movie => debridmoviemapper::vfs::MediaType::Movie,
+            debridmoviemapper::scraper::MediaKind::Series => debridmoviemapper::vfs::MediaType::Show,
+        };
+        let (imdb_id, tmdb_id) = if id_s.starts_with("tt") {
+            match tmdb_client.find_by_imdb(&id_s).await {
+                Ok(Some((tid, _))) => (id_s.clone(), tid),
+                _ => { eprintln!("--acquire: could not resolve IMDB id {}", id_s); std::process::exit(2); }
+            }
+        } else {
+            let tid: u64 = id_s.parse().unwrap_or_else(|_| { eprintln!("--acquire: invalid id {}", id_s); std::process::exit(2); });
+            match tmdb_client.external_imdb_id(tid, media_type.clone()).await {
+                Ok(Some(imdb)) => (imdb, tid),
+                _ => { eprintln!("--acquire: could not resolve IMDB id for tmdb {}", tid); std::process::exit(2); }
+            }
+        };
+        let (title, year, original_language) = match tmdb_client.details(tmdb_id, media_type.clone()).await {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("--acquire: could not fetch TMDB details for {}: {}", tmdb_id, e);
+                std::process::exit(2);
+            }
+        };
+        let req = debridmoviemapper::store::AcquireRequest {
+            imdb_id,
+            tmdb_id,
+            kind,
+            season,
+            episode,
+            original_language,
+            metadata: debridmoviemapper::vfs::MediaMetadata {
+                title,
+                year,
+                media_type,
+                external_id: Some(format!("tmdb:{}", tmdb_id)),
+            },
+        };
+        let outcome = engine.acquire(req).await;
+        println!("--acquire outcome: {:?}", outcome);
+        return Ok(());
+    }
 
     let scan_handle = tokio::spawn(debridmoviemapper::tasks::run_scan_loop(
         ScanConfig {

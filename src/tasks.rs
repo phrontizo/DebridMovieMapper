@@ -2,6 +2,7 @@ use crate::app_state::AppState;
 use crate::identification::identify_torrent;
 use crate::repair::RepairManager;
 use crate::store::Store;
+use crate::tmdb_client::TmdbClient;
 use crate::vfs::{DebridVfs, MediaMetadata};
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -9,6 +10,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
+
+/// Resolve a torrent's metadata: an authoritative `hash -> MediaMetadata` (recorded by the
+/// acquisition engine for content we chose) wins over filename-based TMDB identification.
+/// The hash is lowercased to match the engine's lowercased keys.
+async fn resolve_metadata(
+    store: &Store,
+    tmdb_client: &TmdbClient,
+    info: &crate::rd_client::TorrentInfo,
+) -> MediaMetadata {
+    match store.authoritative_meta(info.hash.to_ascii_lowercase()).await {
+        Some(m) => m,
+        None => identify_torrent(info, tmdb_client).await,
+    }
+}
 
 pub struct ScanConfig {
     pub app: AppState,
@@ -24,6 +39,8 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
         config,
         jellyfin_client,
         http_client: _,
+        scraper: _,
+        engine,
     } = scan_config.app;
     let interval_secs = config.scan_interval_secs;
     // Load persisted matches from DB on startup
@@ -71,6 +88,8 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
                 if torrents.is_empty() {
                     warn!("No torrents found in {} account.", provider.name());
                 }
+
+                engine.observe(&torrents).await;
 
                 // Deduplicate torrents by hash — keep the newest "downloaded" entry per hash.
                 // Duplicates arise when repair's add_magnet leaks a torrent, or when
@@ -152,10 +171,11 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
                         .map(|torrent| {
                             let provider = provider.clone();
                             let tmdb_client = tmdb_client.clone();
+                            let store = store.clone();
                             async move {
                                 match provider.get_torrent_info(&torrent.id).await {
                                     Ok(info) => {
-                                        let metadata = identify_torrent(&info, &tmdb_client).await;
+                                        let metadata = resolve_metadata(&store, &tmdb_client, &info).await;
                                         Ok::<
                                             (String, crate::rd_client::TorrentInfo, MediaMetadata),
                                             reqwest::Error,
@@ -402,6 +422,22 @@ mod tests {
         let config = ScanConfig { app };
         run_scan_loop(config, shutdown).await;
     }
+
+    #[tokio::test]
+    async fn authoritative_metadata_overrides_identification() {
+        use crate::store::Store;
+        use crate::vfs::{MediaMetadata, MediaType};
+        let store = Store::from_database(std::sync::Arc::new(
+            redb::Database::builder().create_with_backend(redb::backends::InMemoryBackend::new()).unwrap(),
+        )).unwrap();
+        let meta = MediaMetadata { title: "Authoritative".into(), year: Some("2020".into()), media_type: MediaType::Movie, external_id: Some("tmdb:99".into()) };
+        store.put_authoritative("hash".to_string(), meta.clone()).await.unwrap();
+        let tmdb = TmdbClient::new("k".to_string()).unwrap();
+        let info = crate::rd_client::TorrentInfo { hash: "HASH".into(), filename: "totally.unrelated.name.mkv".into(), ..Default::default() };
+        let got = resolve_metadata(&store, &tmdb, &info).await;
+        assert_eq!(got.title, "Authoritative");
+        assert_eq!(got.external_id.as_deref(), Some("tmdb:99"));
+    }
 }
 
 #[cfg(test)]
@@ -436,6 +472,19 @@ mod provider_abstraction_tests {
             None,
         )
         .unwrap();
+        let scraper: std::sync::Arc<dyn crate::scraper::Scraper> = std::sync::Arc::new(
+            crate::scraper::TorrentioScraper::new(None, crate::provider::ProviderKind::TorBox, "tok", reqwest::Client::new()),
+        );
+        let validator: std::sync::Arc<dyn crate::acquire::TitleValidator> = std::sync::Arc::new(
+            crate::acquire::TmdbTitleValidator { tmdb: std::sync::Arc::new(TmdbClient::new("k".to_string()).unwrap()) },
+        );
+        let prober: std::sync::Arc<dyn crate::acquire::Prober> = std::sync::Arc::new(
+            crate::acquire::HttpProber { http: reqwest::Client::new() },
+        );
+        let engine = std::sync::Arc::new(crate::acquire::AcquisitionEngine::new(
+            provider.clone(), scraper.clone(), validator, prober, store.clone(),
+            crate::config::AcquisitionConfig::default().prefs, 5, std::time::Duration::from_secs(1800),
+        ));
         let app = AppState {
             provider: provider.clone(),
             tmdb_client: Arc::new(TmdbClient::new("k".to_string()).unwrap()),
@@ -445,6 +494,8 @@ mod provider_abstraction_tests {
             config: Arc::new(config),
             jellyfin_client: None,
             http_client: reqwest::Client::new(),
+            scraper,
+            engine,
         };
         let _config = ScanConfig { app };
     }

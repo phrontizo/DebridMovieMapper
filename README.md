@@ -53,6 +53,16 @@ PORT=8080                   # WebDAV server listen port (default: 8080)
 JELLYFIN_URL=http://jellyfin:8096
 JELLYFIN_API_KEY=your_jellyfin_api_key
 JELLYFIN_RCLONE_MOUNT_PATH=/media
+
+# Optional: SP1 acquisition preferences (see Acquisition section below)
+# SCRAPER_ADDON_URL=https://torrentio.strem.fun/realdebrid=TOKEN   # override scraper URL
+# MAX_RESOLUTION=1080        # 720 | 1080 | 2160
+# AUDIO_LANGUAGE=original    # original | eng | ...
+# SUBTITLE_LANGUAGE=         # none (default) | eng | ...
+# PREFER_HEVC=true
+# PREFER_HDR=false
+# STALL_TIMEOUT_SECS=1800
+# MAX_ACQUIRE_ATTEMPTS=5
 ```
 
 ### Environment Variables
@@ -70,6 +80,14 @@ A debrid provider token is required: set **exactly one** of `RD_API_TOKEN` or `T
 | `JELLYFIN_URL`               | No       | -              | Jellyfin server URL for library update notifications                 |
 | `JELLYFIN_API_KEY`           | No       | -              | Jellyfin API key for authentication                                  |
 | `JELLYFIN_RCLONE_MOUNT_PATH` | No       | -              | rclone mount path as seen by Jellyfin (e.g. `/media`)                |
+| `SCRAPER_ADDON_URL`          | No       | *(auto)*       | Override the Torrentio scraper base URL. Defaults to a URL auto-built from your provider token (`https://torrentio.strem.fun/<provider>=<token>`). |
+| `MAX_RESOLUTION`             | No       | `1080`         | Hard resolution ceiling for acquisition: `720`, `1080`, `2160` / `4k`. Candidates above this height are excluded. |
+| `AUDIO_LANGUAGE`             | No       | `original`     | Required audio language for acquisition: an ISO code (e.g. `eng`) or `original` (uses the title's original language from TMDB). |
+| `SUBTITLE_LANGUAGE`          | No       | *(none)*       | Required subtitle language for acquisition: an ISO code, or omit / set to `none` to skip the check. |
+| `PREFER_HEVC`                | No       | `true`         | Prefer HEVC/H.265 encodes when scoring acquisition candidates. |
+| `PREFER_HDR`                 | No       | `false`        | Prefer HDR/Dolby Vision encodes when scoring acquisition candidates. |
+| `STALL_TIMEOUT_SECS`         | No       | `1800`         | Seconds without download progress before a Pending torrent is considered stalled and re-acquired. |
+| `MAX_ACQUIRE_ATTEMPTS`       | No       | `5`            | Maximum number of candidates to try before giving up on a title. |
 
 \* Exactly one of `RD_API_TOKEN` / `TORBOX_API_KEY` must be set — not both, and not neither.
 
@@ -173,6 +191,35 @@ Once running, the WebDAV server will be available at `http://localhost:8080`. Mo
 - **Plex** (via rclone mount)
 - **Kodi**
 - **Infuse** (iOS/tvOS/macOS)
+
+## Acquisition (SP1)
+
+The SP1 acquisition engine lets the service find and add content to your debrid account automatically, using Torrentio as a scraper.
+
+### How Acquisition Works
+
+1. **Scrape**: Given an IMDB id and media type, `TorrentioScraper` queries a Stremio-compatible addon (default: Torrentio, URL auto-built from your provider token; override with `SCRAPER_ADDON_URL`) for candidate torrents.
+2. **Score and rank**: Candidates are parsed for resolution, codec, HDR, file size, seeder count, and cached status. A hard ceiling at `MAX_RESOLUTION` excludes anything above it. Remaining candidates are ranked: cached content first, then by resolution, HEVC preference, verifiable container (MKV/MP4), and seeder count.
+3. **Materialise**: The top candidate is added to your debrid account by hash and selected for download.
+4. **Title validation**: The acquired file's name is run through the same identification logic used by the scan loop and must resolve to the requested TMDB id. Mismatches are blacklisted and the next candidate is tried.
+5. **File probe**: For cached (immediately downloadable) content, the first 4 MB of the CDN URL is fetched and parsed for audio/subtitle tracks. If `AUDIO_LANGUAGE` or `SUBTITLE_LANGUAGE` is set and the tracks don't match, the candidate is blacklisted. Unknown or unsupported containers are accepted without probing.
+6. **Outcome**: `Acquired` (ready to play), `Pending` (still downloading — the scan loop will verify it when complete), `NoAcceptableRelease`, or `TemporarilyUnavailable` (scraper unreachable — retry later).
+
+The `observe` method runs each scan tick and handles Pending torrents: it re-probes completed downloads, detects stalled downloads (no progress for `STALL_TIMEOUT_SECS`), and re-acquires failed torrents using the next unblacklisted candidate.
+
+### Temporary `--acquire` CLI
+
+A temporary command-line trigger is included for SP1 verification:
+
+```bash
+# Acquire a movie by IMDB id
+RD_API_TOKEN=<token> TMDB_API_KEY=<key> cargo run -- --acquire movie tt1727587
+
+# Acquire a specific episode
+RD_API_TOKEN=<token> TMDB_API_KEY=<key> cargo run -- --acquire series tt0903747 1 1
+```
+
+This flag is a development aid and will be removed once a proper UI or automation layer is in place.
 
 ## Technical Details
 

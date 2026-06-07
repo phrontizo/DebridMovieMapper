@@ -1,6 +1,7 @@
 use crate::error::AppError;
 use rand::Rng;
 use reqwest::{Client, RequestBuilder};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -79,7 +80,7 @@ impl TmdbClient {
 
     async fn search(&self, url: &str, params: Vec<(&str, &str)>) -> Vec<TmdbSearchResult> {
         match self
-            .fetch_with_retry(|| self.client.get(url).query(&params))
+            .fetch_with_retry::<TmdbResponse>(|| self.client.get(url).query(&params))
             .await
         {
             Ok(resp) => resp.results,
@@ -90,10 +91,52 @@ impl TmdbClient {
         }
     }
 
-    async fn fetch_with_retry(
+    /// Resolve an IMDB id (`tt…`) to (tmdb_id, kind) via TMDB /find.
+    pub async fn find_by_imdb(&self, imdb_id: &str) -> Result<Option<(u64, crate::vfs::MediaType)>, reqwest::Error> {
+        let url = format!("https://api.themoviedb.org/3/find/{}", imdb_id);
+        let api_key = self.api_key.clone();
+        let v = self
+            .fetch_with_retry::<serde_json::Value>(|| {
+                self.client
+                    .get(&url)
+                    .query(&[("api_key", api_key.as_str()), ("external_source", "imdb_id")])
+            })
+            .await?;
+        Ok(parse_find_response(&v))
+    }
+
+    /// Fetch (title, year, original_language) for a TMDB id.
+    pub async fn details(&self, tmdb_id: u64, kind: crate::vfs::MediaType) -> Result<(String, Option<String>, Option<String>), reqwest::Error> {
+        let path = match kind { crate::vfs::MediaType::Movie => "movie", crate::vfs::MediaType::Show => "tv" };
+        let url = format!("https://api.themoviedb.org/3/{}/{}", path, tmdb_id);
+        let api_key = self.api_key.clone();
+        let v = self
+            .fetch_with_retry::<serde_json::Value>(|| {
+                self.client.get(&url).query(&[("api_key", api_key.as_str())])
+            })
+            .await?;
+        Ok(parse_details(&v, kind))
+    }
+
+    /// Resolve a TMDB id to its IMDB id via /{type}/{id}/external_ids.
+    pub async fn external_imdb_id(&self, tmdb_id: u64, kind: crate::vfs::MediaType) -> Result<Option<String>, reqwest::Error> {
+        let path = match kind { crate::vfs::MediaType::Movie => "movie", crate::vfs::MediaType::Show => "tv" };
+        let url = format!("https://api.themoviedb.org/3/{}/{}/external_ids", path, tmdb_id);
+        let api_key = self.api_key.clone();
+        let v = self
+            .fetch_with_retry::<serde_json::Value>(|| {
+                self.client
+                    .get(&url)
+                    .query(&[("api_key", api_key.as_str())])
+            })
+            .await?;
+        Ok(parse_external_ids(&v))
+    }
+
+    async fn fetch_with_retry<T: DeserializeOwned>(
         &self,
         make_request: impl Fn() -> RequestBuilder,
-    ) -> Result<TmdbResponse, reqwest::Error> {
+    ) -> Result<T, reqwest::Error> {
         let mut last_error: Option<reqwest::Error> = None;
         let max_attempts = 10;
 
@@ -138,7 +181,7 @@ impl TmdbClient {
                     }
 
                     match resp.error_for_status() {
-                        Ok(resp) => return resp.json::<TmdbResponse>().await,
+                        Ok(resp) => return resp.json::<T>().await,
                         Err(e) => {
                             let e = e.without_url();
                             warn!(
@@ -174,6 +217,44 @@ impl TmdbClient {
             Err(synthetic_exhausted_error())
         }
     }
+}
+
+/// Parse a TMDB movie/tv details object into (title, year, original_language).
+pub(crate) fn parse_details(v: &serde_json::Value, kind: crate::vfs::MediaType) -> (String, Option<String>, Option<String>) {
+    let title = match kind {
+        crate::vfs::MediaType::Movie => v.get("title"),
+        crate::vfs::MediaType::Show => v.get("name"),
+    }
+    .and_then(|t| t.as_str())
+    .unwrap_or("")
+    .to_string();
+    let date = match kind {
+        crate::vfs::MediaType::Movie => v.get("release_date"),
+        crate::vfs::MediaType::Show => v.get("first_air_date"),
+    }
+    .and_then(|d| d.as_str())
+    .unwrap_or("");
+    let year = date.split('-').next().filter(|y| y.len() == 4).map(String::from);
+    let original_language = v.get("original_language").and_then(|l| l.as_str()).map(String::from);
+    (title, year, original_language)
+}
+
+/// Parse TMDB `/find/{imdb_id}?external_source=imdb_id` into (tmdb_id, kind). Movie wins over TV.
+pub(crate) fn parse_find_response(v: &serde_json::Value) -> Option<(u64, crate::vfs::MediaType)> {
+    if let Some(id) = v.get("movie_results").and_then(|a| a.as_array()).and_then(|a| a.first())
+        .and_then(|m| m.get("id")).and_then(|i| i.as_u64()) {
+        return Some((id, crate::vfs::MediaType::Movie));
+    }
+    if let Some(id) = v.get("tv_results").and_then(|a| a.as_array()).and_then(|a| a.first())
+        .and_then(|m| m.get("id")).and_then(|i| i.as_u64()) {
+        return Some((id, crate::vfs::MediaType::Show));
+    }
+    None
+}
+
+/// Parse `/{type}/{id}/external_ids` into the IMDB id (non-empty).
+pub(crate) fn parse_external_ids(v: &serde_json::Value) -> Option<String> {
+    v.get("imdb_id").and_then(|i| i.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// Build the synthetic Bad Gateway error returned when every retry attempt hit a retryable
@@ -267,5 +348,33 @@ mod tests {
         let result: super::TmdbSearchResult = serde_json::from_str(json).unwrap();
         assert_eq!(result.id, 789);
         assert_eq!(result.title, "Test");
+    }
+
+    #[test]
+    fn parse_find_response_extracts_tmdb_id_and_kind() {
+        let json = serde_json::json!({ "movie_results": [{"id": 27205}], "tv_results": [] });
+        assert_eq!(super::parse_find_response(&json), Some((27205, crate::vfs::MediaType::Movie)));
+        let json2 = serde_json::json!({ "movie_results": [], "tv_results": [{"id": 1396}] });
+        assert_eq!(super::parse_find_response(&json2), Some((1396, crate::vfs::MediaType::Show)));
+        let empty = serde_json::json!({"movie_results": [], "tv_results": []});
+        assert_eq!(super::parse_find_response(&empty), None);
+    }
+
+    #[test]
+    fn parse_external_ids_extracts_imdb() {
+        let json = serde_json::json!({"imdb_id": "tt0816692"});
+        assert_eq!(super::parse_external_ids(&json), Some("tt0816692".to_string()));
+        let none = serde_json::json!({"imdb_id": serde_json::Value::Null});
+        assert_eq!(super::parse_external_ids(&none), None);
+        let empty = serde_json::json!({"imdb_id": ""});
+        assert_eq!(super::parse_external_ids(&empty), None);
+    }
+
+    #[test]
+    fn parse_details_movie_and_show() {
+        let m = serde_json::json!({"title": "Inception", "release_date": "2010-07-16", "original_language": "en"});
+        assert_eq!(super::parse_details(&m, crate::vfs::MediaType::Movie), ("Inception".into(), Some("2010".into()), Some("en".into())));
+        let s = serde_json::json!({"name": "Breaking Bad", "first_air_date": "2008-01-20", "original_language": "en"});
+        assert_eq!(super::parse_details(&s, crate::vfs::MediaType::Show), ("Breaking Bad".into(), Some("2008".into()), Some("en".into())));
     }
 }
