@@ -72,6 +72,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // database: it moves the old file aside (<db_path>.corrupt) and recreates it.
     let store = debridmoviemapper::store::Store::open(&config.db_path)?;
 
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("Failed to build CDN HTTP client");
+
+    let scraper: Arc<dyn debridmoviemapper::scraper::Scraper> =
+        Arc::new(debridmoviemapper::scraper::TorrentioScraper::new(
+            config.acquisition.scraper_addon_url.clone(),
+            config.provider_kind,
+            &config.provider_token,
+            http_client.clone(),
+        ));
+    let validator: Arc<dyn debridmoviemapper::acquire::TitleValidator> =
+        Arc::new(debridmoviemapper::acquire::TmdbTitleValidator { tmdb: tmdb_client.clone() });
+    let prober: Arc<dyn debridmoviemapper::acquire::Prober> =
+        Arc::new(debridmoviemapper::acquire::HttpProber { http: http_client.clone() });
+    let engine = Arc::new(debridmoviemapper::acquire::AcquisitionEngine::new(
+        provider.clone(),
+        scraper.clone(),
+        validator,
+        prober,
+        store.clone(),
+        config.acquisition.prefs.clone(),
+        config.acquisition.max_acquire_attempts,
+        std::time::Duration::from_secs(config.acquisition.stall_timeout_secs),
+    ));
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let app_state = AppState {
@@ -82,10 +109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         repair_manager: repair_manager.clone(),
         config: Arc::new(config),
         jellyfin_client,
-        http_client: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("Failed to build CDN HTTP client"),
+        http_client: http_client.clone(),
+        scraper: scraper.clone(),
+        engine: engine.clone(),
     };
 
     let scan_handle = tokio::spawn(debridmoviemapper::tasks::run_scan_loop(

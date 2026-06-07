@@ -1,7 +1,9 @@
+use crate::acquire::AcquisitionEngine;
 use crate::config::Config;
 use crate::jellyfin_client::JellyfinClient;
 use crate::provider::DebridProvider;
 use crate::repair::RepairManager;
+use crate::scraper::Scraper;
 use crate::store::Store;
 use crate::tmdb_client::TmdbClient;
 use crate::vfs::DebridVfs;
@@ -21,4 +23,6 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub jellyfin_client: Option<Arc<JellyfinClient>>,
     pub http_client: reqwest::Client,
+    pub scraper: Arc<dyn Scraper>,
+    pub engine: Arc<AcquisitionEngine>,
 }
