@@ -126,6 +126,8 @@ pub struct AcquisitionEngine {
     stall_timeout: Duration,
     /// torrent_id -> (last progress, when first seen at that progress) for stall detection.
     progress: Arc<Mutex<HashMap<String, (f64, Instant)>>>,
+    /// hash -> consecutive deferred-probe count, to bound re-probing of stuck-Pending torrents.
+    verify_attempts: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 /// Choose file ids to select for a candidate: the addon's named/index file, else the largest video.
@@ -191,6 +193,10 @@ enum VerifyResult {
     Defer,
 }
 
+/// Max consecutive deferred probes for a downloaded-but-Pending torrent before `observe`
+/// stops re-probing it and accepts it unverified (bounds transient-CDN probe retries).
+const MAX_VERIFY_ATTEMPTS: u32 = 5;
+
 impl AcquisitionEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -213,6 +219,7 @@ impl AcquisitionEngine {
             max_attempts,
             stall_timeout,
             progress: Arc::new(Mutex::new(HashMap::new())),
+            verify_attempts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -388,30 +395,48 @@ impl AcquisitionEngine {
     /// torrents, and re-acquires owned torrents that have stalled/died/failed verification.
     pub async fn observe(&self, torrents: &[crate::rd_client::Torrent]) {
         let owned = self.store.all_owned().await;
-        let by_hash: HashMap<&str, &crate::rd_client::Torrent> =
-            torrents.iter().map(|t| (t.hash.as_str(), t)).collect();
+        // Key by lowercased provider hash so it matches the lowercased candidate hashes we store.
+        let by_hash: HashMap<String, &crate::rd_client::Torrent> = torrents
+            .iter()
+            .map(|t| (t.hash.to_ascii_lowercase(), t))
+            .collect();
 
-        for (hash, rec) in owned {
+        for (hash, rec) in &owned {
             let Some(t) = by_hash.get(hash.as_str()).copied() else {
                 continue; // not in the current account listing; leave it
             };
             let dead = matches!(t.status.as_str(), "magnet_error" | "dead" | "error" | "virus");
             if dead {
-                self.fail_and_reacquire(&hash, &t.id, &rec.request, "Dead").await;
+                self.fail_and_reacquire(hash, &t.id, &rec.request, "Dead").await;
                 continue;
             }
             if t.status == "downloaded" {
                 if rec.status == OwnedStatus::Pending {
-                    self.verify_pending(&hash, &t.id, &rec.request).await;
+                    self.verify_pending(hash, &t.id, &rec.request).await;
                 }
                 self.progress.lock().await.remove(&t.id);
                 continue;
             }
             // still downloading — stall check
             if self.is_stalled(&t.id, t.progress).await {
-                self.fail_and_reacquire(&hash, &t.id, &rec.request, "Stalled").await;
+                self.fail_and_reacquire(hash, &t.id, &rec.request, "Stalled").await;
             }
         }
+
+        // Bound the in-memory maps to live torrents / owned hashes (avoid unbounded growth
+        // when torrents disappear from the listing).
+        let live_ids: std::collections::HashSet<&str> =
+            torrents.iter().map(|t| t.id.as_str()).collect();
+        self.progress
+            .lock()
+            .await
+            .retain(|tid, _| live_ids.contains(tid.as_str()));
+        let owned_hashes: std::collections::HashSet<&str> =
+            owned.iter().map(|(h, _)| h.as_str()).collect();
+        self.verify_attempts
+            .lock()
+            .await
+            .retain(|h, _| owned_hashes.contains(h.as_str()));
     }
 
     async fn is_stalled(&self, torrent_id: &str, progress: f64) -> bool {
@@ -428,6 +453,10 @@ impl AcquisitionEngine {
     }
 
     async fn verify_pending(&self, hash: &str, torrent_id: &str, req: &AcquireRequest) {
+        // Bound re-probing: once we've deferred MAX_VERIFY_ATTEMPTS times, stop probing.
+        if self.verify_attempts.lock().await.get(hash).copied().unwrap_or(0) >= MAX_VERIFY_ATTEMPTS {
+            return;
+        }
         let info = match self.provider.get_torrent_info(torrent_id).await {
             Ok(i) => i,
             Err(_) => return,
@@ -442,9 +471,30 @@ impl AcquisitionEngine {
                     .store
                     .set_owned_status(hash.to_string(), OwnedStatus::Verified)
                     .await;
+                self.verify_attempts.lock().await.remove(hash);
             }
-            VerifyResult::Defer => {} // retry next tick
-            VerifyResult::Reject(reason) => self.fail_and_reacquire(hash, torrent_id, req, reason).await,
+            VerifyResult::Defer => {
+                let n = {
+                    let mut m = self.verify_attempts.lock().await;
+                    let n = m.entry(hash.to_string()).or_insert(0);
+                    *n += 1;
+                    *n
+                };
+                if n >= MAX_VERIFY_ATTEMPTS {
+                    warn!(
+                        "giving up verifying {} after {} deferred probes; accepting unverified",
+                        hash, n
+                    );
+                    let _ = self
+                        .store
+                        .set_owned_status(hash.to_string(), OwnedStatus::Verified)
+                        .await;
+                }
+            }
+            VerifyResult::Reject(reason) => {
+                self.verify_attempts.lock().await.remove(hash);
+                self.fail_and_reacquire(hash, torrent_id, req, reason).await;
+            }
         }
     }
 
@@ -458,6 +508,7 @@ impl AcquisitionEngine {
         let _ = self.store.remove_authoritative(hash.to_string()).await;
         let _ = self.provider.delete_torrent(torrent_id).await;
         self.progress.lock().await.remove(torrent_id);
+        self.verify_attempts.lock().await.remove(hash);
         let _ = self.acquire(req.clone()).await; // promotes the next candidate (bad hash now blacklisted)
     }
 }
@@ -688,5 +739,45 @@ mod tests {
         );
         let out = eng.acquire(req()).await;
         assert_eq!(out, AcquireOutcome::Acquired("h1".into()));
+    }
+
+    #[tokio::test]
+    async fn observe_caps_deferred_probes_and_accepts() {
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                source: "manual".into(),
+                added_at: 1,
+                status: OwnedStatus::Pending,
+            },
+        )
+        .await
+        .unwrap();
+        let scraper = Arc::new(MockScraper { candidates: vec![] });
+        let prober = Arc::new(CannedProber(Err(ProbeError::Transient))); // always defers
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            scraper,
+            Arc::new(OkValidator(true)),
+            prober,
+            st.clone(),
+        );
+        let torrents = vec![crate::rd_client::Torrent {
+            id: "tid_h1".into(),
+            hash: "h1".into(),
+            status: "downloaded".into(),
+            progress: 100.0,
+            ..Default::default()
+        }];
+        for _ in 0..MAX_VERIFY_ATTEMPTS {
+            eng.observe(&torrents).await;
+        }
+        assert_eq!(
+            st.get_owned("h1".into()).await.unwrap().status,
+            OwnedStatus::Verified,
+            "should accept unverified after MAX deferred probes"
+        );
     }
 }
