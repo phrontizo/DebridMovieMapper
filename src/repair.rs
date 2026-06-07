@@ -160,63 +160,23 @@ impl RepairManager {
         old_info: &TorrentInfo,
         wait_duration: Duration,
     ) -> Result<(String, TorrentInfo), String> {
-        let magnet = format!("magnet:?xt=urn:btih:{}", old_info.hash);
-
-        // Add magnet
-        let add_response = match self.rd_client.add_magnet(&magnet).await {
-            Ok(resp) => resp,
+        // Selector: match the new torrent's files to the old torrent's previously-selected paths.
+        let old_info_cl = old_info.clone();
+        let select = move |new_info: &TorrentInfo| -> Vec<u32> {
+            old_info_cl
+                .files
+                .iter()
+                .filter(|f| f.selected == 1)
+                .filter_map(|of| new_info.files.iter().find(|nf| nf.path == of.path).map(|nf| nf.id))
+                .collect()
+        };
+        match crate::reacquire::materialise(&*self.rd_client, &old_info.hash, wait_duration, select).await {
+            Ok(pair) => Ok(pair),
             Err(e) => {
                 self.set_repair_failed(old_torrent_id).await;
-                return Err(format!("Failed to add magnet: {}", e));
+                Err(e.to_string())
             }
-        };
-        let new_torrent_id = add_response.id;
-
-        // Wait for RD to process the magnet
-        tokio::time::sleep(wait_duration).await;
-
-        // Get new torrent info for file matching
-        let new_info = match self.rd_client.get_torrent_info(&new_torrent_id).await {
-            Ok(info) => info,
-            Err(e) => {
-                self.cleanup_leaked_torrent(&new_torrent_id).await;
-                self.set_repair_failed(old_torrent_id).await;
-                return Err(format!("Failed to get new torrent info: {}", e));
-            }
-        };
-
-        // Match files by path: find new file IDs that correspond to old selected files
-        let selected_file_ids: Vec<String> = old_info
-            .files
-            .iter()
-            .filter(|f| f.selected == 1)
-            .filter_map(|original_file| {
-                new_info
-                    .files
-                    .iter()
-                    .find(|new_file| new_file.path == original_file.path)
-                    .map(|new_file| new_file.id.to_string())
-            })
-            .collect();
-
-        if selected_file_ids.is_empty() {
-            self.cleanup_leaked_torrent(&new_torrent_id).await;
-            self.set_repair_failed(old_torrent_id).await;
-            return Err("No matching files found in new torrent".to_string());
         }
-
-        let file_ids_str = selected_file_ids.join(",");
-        if let Err(e) = self
-            .rd_client
-            .select_files(&new_torrent_id, &file_ids_str)
-            .await
-        {
-            self.cleanup_leaked_torrent(&new_torrent_id).await;
-            self.set_repair_failed(old_torrent_id).await;
-            return Err(format!("Failed to select files: {}", e));
-        }
-
-        Ok((new_torrent_id, new_info))
     }
 
     /// Delete old torrent, update health_map (remove old, insert new as Healthy), record replacement.

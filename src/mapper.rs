@@ -9,6 +9,7 @@ pub mod provider;
 pub mod ratelimit;
 pub mod rd_client;
 pub mod release;
+pub mod reacquire;
 pub mod repair;
 pub mod scraper;
 pub mod store;
