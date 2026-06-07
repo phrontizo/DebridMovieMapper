@@ -55,6 +55,20 @@ static SIZE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)([\d.]+)\s*(
 static SEED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{1f464}\s*(\d+)").unwrap());
 static GROUP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-([A-Za-z0-9]+)$").unwrap());
 
+/// Extract a trailing `-GROUP` token, rejecting common source/codec tokens that aren't groups.
+fn extract_group(s: &str) -> Option<String> {
+    const GROUP_DENY: &[&str] = &[
+        "dl", "rip", "hevc", "avc", "hdr", "sdr", "cam", "ts", "hdtv", "bluray",
+        "bdrip", "dvdrip", "web", "webdl", "webrip", "x264", "x265", "aac", "ac3", "dts", "ddp",
+    ];
+    let g = GROUP_RE.captures(s.trim())?.get(1)?.as_str();
+    if GROUP_DENY.iter().any(|d| d.eq_ignore_ascii_case(g)) {
+        None
+    } else {
+        Some(g.to_string())
+    }
+}
+
 pub fn parse(c: &RawCandidate) -> ReleaseInfo {
     let text = format!("{}\n{}", c.name, c.description);
     let lower = text.to_ascii_lowercase();
@@ -73,7 +87,7 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
 
     let hdr = lower.contains("hdr") || lower.contains("dolby vision") || lower.contains("dovi") || lower.contains(" dv ");
 
-    let cached = lower.contains("rd+") || lower.contains("tb+") || lower.contains("[rd+]") || lower.contains("[tb+]") || text.contains('\u{26a1}');
+    let cached = lower.contains("rd+") || lower.contains("tb+") || text.contains('\u{26a1}');
 
     let size_bytes = SIZE_RE.captures(&text).and_then(|cap| {
         let n: f64 = cap.get(1)?.as_str().parse().ok()?;
@@ -90,13 +104,8 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
         .file_name
         .as_deref()
         .map(|f| f.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(f))
-        .and_then(|stem| GROUP_RE.captures(stem.trim()).and_then(|cap| cap.get(1).map(|m| m.as_str().to_string())))
-        .or_else(|| {
-            c.description
-                .lines()
-                .next()
-                .and_then(|line| GROUP_RE.captures(line.trim()).and_then(|cap| cap.get(1).map(|m| m.as_str().to_string())))
-        });
+        .and_then(extract_group)
+        .or_else(|| c.description.lines().next().and_then(extract_group));
 
     let mut languages = Vec::new();
     for (word, code) in LANG_WORDS {
@@ -121,6 +130,8 @@ const LANG_WORDS: &[(&str, &str)] = &[
 
 /// Score a release against prefs. `None` = excluded by a hard rule (resolution ceiling). Higher better.
 pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
+    // A release with no parsed resolution is let through rather than excluded (don't
+    // blindly drop potentially-valid releases the scraper failed to tag).
     if let Some(res) = r.resolution {
         if res > prefs.max_resolution.height() { return None; }
     }
@@ -242,5 +253,36 @@ mod tests {
         assert_eq!(ranked.len(), 2, "the 2160p candidate is dropped");
         assert_eq!(ranked[0].info_hash, "hc", "cached ranks first");
         assert_eq!(ranked[1].info_hash, "hu");
+    }
+
+    #[test]
+    fn score_downranks_wrong_audio_language() {
+        let mut p = prefs();
+        p.audio = AudioReq::Lang("eng".to_string());
+        let wrong = parse(&raw("t", "Film.1080p.x265 German", "h1", Some("Film.mkv")));   // languages=["ger"]
+        let untagged = parse(&raw("t", "Film.1080p.x265", "h2", Some("Film.mkv")));        // languages=[]
+        assert!(score(&wrong, &p).unwrap() < score(&untagged, &p).unwrap(),
+            "a release tagged as a non-required language must rank below an untagged one");
+    }
+
+    #[test]
+    fn score_penalises_tiny_and_huge_sizes() {
+        let normal = parse(&raw("t", "A.1080p.x265\n\u{1f4be} 8 GB", "h1", Some("A.mkv")));
+        let tiny = parse(&raw("t", "A.1080p.x265\n\u{1f4be} 150 MB", "h2", Some("A.mkv")));
+        let huge = parse(&raw("t", "A.1080p.x265\n\u{1f4be} 40 GB", "h3", Some("A.mkv")));
+        assert!(score(&normal, &prefs()).unwrap() > score(&tiny, &prefs()).unwrap());
+        assert!(score(&normal, &prefs()).unwrap() > score(&huge, &prefs()).unwrap());
+    }
+
+    #[test]
+    fn group_parsed_from_description_when_no_file_name() {
+        let r = parse(&raw("t", "Movie.2023.1080p.BluRay.x265-GRP", "h", None));
+        assert_eq!(r.group.as_deref(), Some("GRP"));
+    }
+
+    #[test]
+    fn group_rejects_tech_tokens() {
+        let r = parse(&raw("t", "Movie.2023.1080p.WEB-DL", "h", None));
+        assert_eq!(r.group, None, "WEB-DL must not be parsed as group 'DL'");
     }
 }
