@@ -2,8 +2,8 @@ use crate::error::AppError;
 use crate::provider::{choose_provider, ProviderKind};
 use tracing::warn;
 
-/// Hard resolution ceiling. Ordered so `as u16` gives the pixel height for comparisons.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Hard resolution ceiling. Compare via `height()` (pixel height), not by variant order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaxResolution {
     P720,
     P1080,
@@ -121,12 +121,20 @@ impl AcquisitionConfig {
                 prefer_hevc: Self::parse_bool(prefer_hevc, true),
                 prefer_hdr: Self::parse_bool(prefer_hdr, false),
             },
-            stall_timeout_secs: stall_timeout_secs
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(1800),
-            max_acquire_attempts: max_acquire_attempts
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(5),
+            stall_timeout_secs: match stall_timeout_secs {
+                Some(s) => s.trim().parse().unwrap_or_else(|_| {
+                    warn!("Invalid STALL_TIMEOUT_SECS value '{}', falling back to 1800", s);
+                    1800
+                }),
+                None => 1800,
+            },
+            max_acquire_attempts: match max_acquire_attempts {
+                Some(s) => s.trim().parse().unwrap_or_else(|_| {
+                    warn!("Invalid MAX_ACQUIRE_ATTEMPTS value '{}', falling back to 5", s);
+                    5
+                }),
+                None => 5,
+            },
             scraper_addon_url: None,
         }
     }
