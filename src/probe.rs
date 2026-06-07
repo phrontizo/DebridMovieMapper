@@ -191,7 +191,7 @@ pub fn parse_mkv_tracks(buf: &[u8]) -> Result<Vec<Track>, ProbeError> {
         let end = if size == u64::MAX {
             t_end
         } else {
-            pos + size as usize
+            pos.checked_add(size as usize).ok_or(ProbeError::Corrupt)?
         };
         if end > buf.len() || end > t_end {
             return Err(ProbeError::Corrupt);
@@ -217,18 +217,11 @@ fn find_ebml_child(
         let size = read_ebml_size(buf, &mut pos).ok_or(ProbeError::Corrupt)?;
         let payload_start = pos;
         let payload_end = if size == u64::MAX {
-            end
+            end // unknown/streaming size → spans to the end of the search region
         } else {
-            payload_start + size as usize
+            payload_start.checked_add(size as usize).ok_or(ProbeError::Corrupt)?
         };
         if payload_end > end {
-            if size == u64::MAX {
-                return Ok(if id == target_id {
-                    Some((payload_start, end))
-                } else {
-                    None
-                });
-            }
             return Err(ProbeError::Corrupt);
         }
         if id == target_id {
@@ -246,8 +239,11 @@ fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, 
     while pos < end {
         let id = read_ebml_id(buf, &mut pos).ok_or(ProbeError::Corrupt)?;
         let size = read_ebml_size(buf, &mut pos).ok_or(ProbeError::Corrupt)?;
-        let p_end = pos + size as usize;
-        if size == u64::MAX || p_end > end {
+        if size == u64::MAX {
+            return Err(ProbeError::Corrupt);
+        }
+        let p_end = pos.checked_add(size as usize).ok_or(ProbeError::Corrupt)?;
+        if p_end > end {
             return Err(ProbeError::Corrupt);
         }
         match id {
@@ -288,11 +284,17 @@ fn read_box_header(buf: &[u8], pos: usize) -> Result<([u8; 4], usize, usize), Pr
             return Err(ProbeError::Corrupt);
         }
         let big = u64::from_be_bytes(buf[pos + 8..pos + 16].try_into().unwrap());
-        (pos + 16, pos + big as usize)
+        // A crafted 64-bit largesize must not overflow usize (input is untrusted CDN bytes).
+        let end = usize::try_from(big)
+            .ok()
+            .and_then(|b| pos.checked_add(b))
+            .ok_or(ProbeError::Corrupt)?;
+        (pos + 16, end)
     } else if size32 == 0 {
         (pos + 8, buf.len())
     } else {
-        (pos + 8, pos + size32 as usize)
+        let end = pos.checked_add(size32 as usize).ok_or(ProbeError::Corrupt)?;
+        (pos + 8, end)
     };
     if box_end < payload_start {
         return Err(ProbeError::Corrupt);
@@ -422,6 +424,10 @@ pub async fn probe_tracks(http: &reqwest::Client, cdn_url: &str) -> Result<Vec<T
         Some(ContainerKind::Mkv) => parse_mkv_tracks(&front),
         Some(ContainerKind::Mp4) => match parse_mp4_tracks(&front) {
             Err(ProbeError::TracksNotFound) => {
+                // moov is likely at the tail (non-faststart MP4). The suffix rarely starts on a
+                // box boundary, so this only parses when it happens to; otherwise the probe
+                // returns TracksNotFound and acquisition accepts with a warning.
+                // TODO(SP1+): scan the tail for the `moov` box signature for reliable handling.
                 let tail = fetch_suffix(http, cdn_url, FRONT).await?;
                 parse_mp4_tracks(&tail)
             }
@@ -584,6 +590,15 @@ mod tests {
         let mut bytes = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
         bytes.extend_from_slice(&4u32.to_be_bytes());
         bytes.extend_from_slice(b"moov");
+        assert!(matches!(parse_mp4_tracks(&bytes), Err(ProbeError::Corrupt)));
+    }
+    #[test]
+    fn mp4_largesize_overflow_is_corrupt() {
+        // 64-bit largesize (size==1) set to u64::MAX must be rejected, never panic/overflow.
+        let mut bytes = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(b"moov");
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
         assert!(matches!(parse_mp4_tracks(&bytes), Err(ProbeError::Corrupt)));
     }
     #[test]
