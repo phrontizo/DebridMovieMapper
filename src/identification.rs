@@ -27,6 +27,12 @@ static SHOW_RE: LazyLock<Regex> = LazyLock::new(|| {
 static GENERIC_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(episode|season|part|volume|vol)\s*(\d+|[a-z])?$").unwrap());
 
+/// A bare " - NNN - " episode-number separator (e.g. "Rick and Morty - 409 - Childrick of
+/// Mort": the absolute/SxxEyy code some packs use instead of "S04E09"). The show name
+/// precedes it; everything from the separator on is episode numbering/title.
+static EPISODE_NUM_DASH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s+-\s+\d{1,3}\s+-\s+").unwrap());
+
 pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) -> MediaMetadata {
     let representative_name = info
         .files
@@ -493,6 +499,15 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
         }
     }
 
+    // 3b. Truncate at a bare " - NNN - " episode-number separator. Otherwise the episode
+    // title leaks into the TMDB query: the show search returns nothing and a fallback can
+    // match an unrelated title (e.g. a Rick and Morty episode landing on tmdb:99966).
+    if let Some(m) = EPISODE_NUM_DASH_RE.find(&title) {
+        if m.start() > 0 {
+            title.truncate(m.start());
+        }
+    }
+
     // 4. Find year (19xx or 20xx)
     let year = YEAR_RE.find(&title).map(|m| m.as_str().to_string());
 
@@ -763,6 +778,27 @@ mod tests {
         // Verify that clean_name's "aka" handling doesn't panic on multi-byte UTF-8
         let (name, _year) = clean_name("Üntersuchung aka Study 2024 1080p");
         assert_eq!(name, "Study");
+    }
+
+    #[test]
+    fn clean_name_truncates_at_bare_episode_number_dash() {
+        // Packs that name files "Show - NNN - Episode Title" (the absolute/SxxEyy episode
+        // code without the S/E letters, e.g. 409 = S04E09) must reduce to just the show
+        // name. Otherwise the episode title leaks into the TMDB query, the show search
+        // returns nothing, and a fallback matches an unrelated title (e.g. tmdb:99966).
+        assert_eq!(
+            clean_name("Rick and Morty - 409 - Childrick of Mort.mkv").0,
+            "Rick and Morty"
+        );
+        assert_eq!(
+            clean_name("Rick and Morty - 401 - Edge of Tomorty. Rick Die Rickpeat.mkv").0,
+            "Rick and Morty"
+        );
+        // A hyphenated title without the episode-number pattern is unaffected.
+        assert_eq!(
+            clean_name("Spider-Man - Far From Home 1080p").0,
+            "Spider-Man - Far From Home"
+        );
     }
 
     #[test]
@@ -1044,6 +1080,90 @@ mod tests {
             metadata.external_id.is_some(),
             "Short title 'ted' should be identified via TMDB, got external_id=None"
         );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rick_and_morty_absolute_episode_pack() {
+        dotenvy::dotenv().ok();
+        let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
+        let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
+
+        // A real season pack whose files use "Rick and Morty - 4NN - Title" (absolute
+        // episode codes, no "S04E09"). The largest file (409) becomes the representative
+        // name; before the fix the episode title leaked into the query and it matched the
+        // wrong show (tmdb:99966 "All of Us Are Dead").
+        let files: Vec<TorrentFile> = [
+            (
+                3_280_780_352u64,
+                "Rick and Morty - 409 - Childrick of Mort.mkv",
+            ),
+            (3_080_453_464, "Rick and Morty - 407 - Promortyus.mkv"),
+            (
+                2_925_419_418,
+                "Rick and Morty - 401 - Edge of Tomorty. Rick Die Rickpeat.mkv",
+            ),
+            (
+                2_843_834_861,
+                "Rick and Morty - 404 - Claw and Hoarder. Special Ricktim's Morty.mkv",
+            ),
+            (
+                2_806_190_621,
+                "Rick and Morty - 406 - Never Ricking Morty.mkv",
+            ),
+            (
+                2_720_331_553,
+                "Rick and Morty - 405 - Rattlestar Ricklactica.mkv",
+            ),
+            (
+                2_685_110_119,
+                "Rick and Morty - 408 - The Vat of Acid Episode.mkv",
+            ),
+            (
+                2_677_574_737,
+                "Rick and Morty - 410 - Star Mort. Rickturn of the Jerri.mkv",
+            ),
+            (
+                2_573_808_900,
+                "Rick and Morty - 403 - One Crew Over the Crewcoo's Morty.mkv",
+            ),
+            (
+                2_548_892_920,
+                "Rick and Morty - 402 - The Old Man and the Seat.mkv",
+            ),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, (bytes, name))| TorrentFile {
+            id: i as u32 + 1,
+            path: format!("Rick and Morty (4 season) [Blu-ray Remux 1080p]/{name}"),
+            bytes: *bytes,
+            selected: 1,
+        })
+        .collect();
+
+        let info = TorrentInfo {
+            id: "rm4".to_string(),
+            filename: "Rick and Morty (4 season) [Blu-ray Remux 1080p]".to_string(),
+            original_filename: "Rick and Morty (4 season) [Blu-ray Remux 1080p]".to_string(),
+            hash: "f06b32c97ea553f5166e0b126be44574f9dfdebf".to_string(),
+            bytes: 27_000_000_000,
+            original_bytes: 27_000_000_000,
+            host: "host".to_string(),
+            split: 1,
+            progress: 100.0,
+            status: "downloaded".to_string(),
+            added: "2020-05-01".to_string(),
+            files,
+            links: vec![],
+            ended: Some("2020-05-01".to_string()),
+        };
+
+        let metadata = identify_torrent(&info, &tmdb_client).await;
+
+        assert_eq!(metadata.media_type, MediaType::Show);
+        assert_eq!(metadata.title, "Rick and Morty");
+        assert_eq!(metadata.external_id, Some("tmdb:60625".to_string()));
     }
 
     // --- Helper for best_scored_result / select_best_match tests ---
