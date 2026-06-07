@@ -179,3 +179,113 @@ async fn lifecycle_torbox() {
     let provider: Arc<dyn DebridProvider> = Arc::new(TorBoxClient::new(tb).unwrap());
     run_lifecycle(provider, tmdb_client(), "torbox").await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn lifecycle_acquire_sintel_by_imdb() {
+    dotenvy::dotenv().ok();
+    let Ok((kind, token)) = debridmoviemapper::provider::choose_provider(
+        std::env::var("RD_API_TOKEN").ok(),
+        std::env::var("TORBOX_API_KEY").ok(),
+    ) else {
+        eprintln!("skipping: no provider token");
+        return;
+    };
+    let Ok(tmdb_key) = std::env::var("TMDB_API_KEY") else {
+        eprintln!("skipping: no TMDB key");
+        return;
+    };
+    let provider: Arc<dyn debridmoviemapper::provider::DebridProvider> = match kind {
+        debridmoviemapper::provider::ProviderKind::RealDebrid => {
+            Arc::new(debridmoviemapper::rd_client::RealDebridClient::new(token.clone()).unwrap())
+        }
+        debridmoviemapper::provider::ProviderKind::TorBox => {
+            Arc::new(debridmoviemapper::torbox_client::TorBoxClient::new(token.clone()).unwrap())
+        }
+    };
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let tmdb = Arc::new(debridmoviemapper::tmdb_client::TmdbClient::new(tmdb_key).unwrap());
+    let mut dbp = std::env::temp_dir();
+    dbp.push(format!(
+        "dmm_sp1_lifecycle_{}.redb",
+        std::process::id()
+    ));
+    let store = debridmoviemapper::store::Store::open(dbp.to_str().unwrap()).unwrap();
+    let scraper: Arc<dyn debridmoviemapper::scraper::Scraper> = Arc::new(
+        debridmoviemapper::scraper::TorrentioScraper::new(
+            std::env::var("SCRAPER_ADDON_URL").ok(),
+            kind,
+            &token,
+            http.clone(),
+        ),
+    );
+    let validator: Arc<dyn debridmoviemapper::acquire::TitleValidator> =
+        Arc::new(debridmoviemapper::acquire::TmdbTitleValidator {
+            tmdb: tmdb.clone(),
+        });
+    let prober: Arc<dyn debridmoviemapper::acquire::Prober> =
+        Arc::new(debridmoviemapper::acquire::HttpProber { http: http.clone() });
+    let engine = debridmoviemapper::acquire::AcquisitionEngine::new(
+        provider.clone(),
+        scraper,
+        validator,
+        prober,
+        store.clone(),
+        debridmoviemapper::config::AcquisitionConfig::default().prefs,
+        5,
+        std::time::Duration::from_secs(1800),
+    );
+
+    // Resolve Sintel's TMDB id from its IMDB id at runtime.
+    let imdb = "tt1727587";
+    let (tmdb_id, mtype) = match tmdb.find_by_imdb(imdb).await {
+        Ok(Some(v)) => v,
+        _ => {
+            eprintln!("skipping: could not resolve Sintel tmdb id (TMDB unreachable?)");
+            return;
+        }
+    };
+    let (title, year, original_language) = tmdb
+        .details(tmdb_id, mtype.clone())
+        .await
+        .unwrap_or_default();
+    let req = debridmoviemapper::store::AcquireRequest {
+        imdb_id: imdb.to_string(),
+        tmdb_id,
+        kind: debridmoviemapper::scraper::MediaKind::Movie,
+        season: None,
+        episode: None,
+        original_language,
+        metadata: debridmoviemapper::vfs::MediaMetadata {
+            title,
+            year,
+            media_type: mtype,
+            external_id: Some(format!("tmdb:{}", tmdb_id)),
+        },
+    };
+    let outcome = engine.acquire(req).await;
+    eprintln!("acquire outcome: {:?}", outcome);
+    assert!(
+        matches!(
+            outcome,
+            debridmoviemapper::acquire::AcquireOutcome::Acquired(_)
+                | debridmoviemapper::acquire::AcquireOutcome::Pending(_)
+        ),
+        "Sintel should be acquirable; got {:?}",
+        outcome
+    );
+
+    // Cleanup: delete every service-owned torrent we just added.
+    for (hash, _rec) in store.all_owned().await {
+        if let Ok(torrents) = provider.get_torrents().await {
+            for t in torrents.iter().filter(|t| t.hash.eq_ignore_ascii_case(&hash)) {
+                let _ = provider.delete_torrent(&t.id).await;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&dbp);
+    let _ = std::fs::remove_file(format!("{}.corrupt", dbp.to_str().unwrap()));
+}
