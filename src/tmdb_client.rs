@@ -105,6 +105,14 @@ impl TmdbClient {
         Ok(parse_find_response(&v))
     }
 
+    /// Fetch (title, year, original_language) for a TMDB id.
+    pub async fn details(&self, tmdb_id: u64, kind: crate::vfs::MediaType) -> Result<(String, Option<String>, Option<String>), reqwest::Error> {
+        let path = match kind { crate::vfs::MediaType::Movie => "movie", crate::vfs::MediaType::Show => "tv" };
+        let url = format!("https://api.themoviedb.org/3/{}/{}", path, tmdb_id);
+        let v: serde_json::Value = self.client.get(&url).query(&[("api_key", self.api_key.as_str())]).send().await?.json().await?;
+        Ok(parse_details(&v, kind))
+    }
+
     /// Resolve a TMDB id to its IMDB id via /{type}/{id}/external_ids.
     pub async fn external_imdb_id(&self, tmdb_id: u64, kind: crate::vfs::MediaType) -> Result<Option<String>, reqwest::Error> {
         let path = match kind { crate::vfs::MediaType::Movie => "movie", crate::vfs::MediaType::Show => "tv" };
@@ -204,6 +212,26 @@ impl TmdbClient {
             Err(synthetic_exhausted_error())
         }
     }
+}
+
+/// Parse a TMDB movie/tv details object into (title, year, original_language).
+pub(crate) fn parse_details(v: &serde_json::Value, kind: crate::vfs::MediaType) -> (String, Option<String>, Option<String>) {
+    let title = match kind {
+        crate::vfs::MediaType::Movie => v.get("title"),
+        crate::vfs::MediaType::Show => v.get("name"),
+    }
+    .and_then(|t| t.as_str())
+    .unwrap_or("")
+    .to_string();
+    let date = match kind {
+        crate::vfs::MediaType::Movie => v.get("release_date"),
+        crate::vfs::MediaType::Show => v.get("first_air_date"),
+    }
+    .and_then(|d| d.as_str())
+    .unwrap_or("");
+    let year = date.split('-').next().filter(|y| y.len() == 4).map(String::from);
+    let original_language = v.get("original_language").and_then(|l| l.as_str()).map(String::from);
+    (title, year, original_language)
 }
 
 /// Parse TMDB `/find/{imdb_id}?external_source=imdb_id` into (tmdb_id, kind). Movie wins over TV.
@@ -335,5 +363,13 @@ mod tests {
         assert_eq!(super::parse_external_ids(&none), None);
         let empty = serde_json::json!({"imdb_id": ""});
         assert_eq!(super::parse_external_ids(&empty), None);
+    }
+
+    #[test]
+    fn parse_details_movie_and_show() {
+        let m = serde_json::json!({"title": "Inception", "release_date": "2010-07-16", "original_language": "en"});
+        assert_eq!(super::parse_details(&m, crate::vfs::MediaType::Movie), ("Inception".into(), Some("2010".into()), Some("en".into())));
+        let s = serde_json::json!({"name": "Breaking Bad", "first_air_date": "2008-01-20", "original_language": "en"});
+        assert_eq!(super::parse_details(&s, crate::vfs::MediaType::Show), ("Breaking Bad".into(), Some("2008".into()), Some("en".into())));
     }
 }

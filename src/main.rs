@@ -114,6 +114,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine: engine.clone(),
     };
 
+    // TEMPORARY (SP1) dev/verification trigger — remove once SP2 (Trakt) / SP4 (ad-hoc add) exist.
+    // Usage: --acquire <movie|series> <imdb-or-tmdb-id> [season episode]
+    if let Some(pos) = std::env::args().position(|a| a == "--acquire") {
+        let args: Vec<String> = std::env::args().collect();
+        let kind_s = args.get(pos + 1).cloned().unwrap_or_default();
+        let id_s = args.get(pos + 2).cloned().unwrap_or_default();
+        let season = args.get(pos + 3).and_then(|s| s.parse::<u32>().ok());
+        let episode = args.get(pos + 4).and_then(|s| s.parse::<u32>().ok());
+        let kind = match kind_s.as_str() {
+            "movie" => debridmoviemapper::scraper::MediaKind::Movie,
+            "series" => debridmoviemapper::scraper::MediaKind::Series,
+            other => {
+                eprintln!("--acquire: kind must be 'movie' or 'series', got '{}'", other);
+                std::process::exit(2);
+            }
+        };
+        let media_type = match kind {
+            debridmoviemapper::scraper::MediaKind::Movie => debridmoviemapper::vfs::MediaType::Movie,
+            debridmoviemapper::scraper::MediaKind::Series => debridmoviemapper::vfs::MediaType::Show,
+        };
+        let (imdb_id, tmdb_id) = if id_s.starts_with("tt") {
+            match tmdb_client.find_by_imdb(&id_s).await {
+                Ok(Some((tid, _))) => (id_s.clone(), tid),
+                _ => { eprintln!("--acquire: could not resolve IMDB id {}", id_s); std::process::exit(2); }
+            }
+        } else {
+            let tid: u64 = id_s.parse().unwrap_or_else(|_| { eprintln!("--acquire: invalid id {}", id_s); std::process::exit(2); });
+            match tmdb_client.external_imdb_id(tid, media_type.clone()).await {
+                Ok(Some(imdb)) => (imdb, tid),
+                _ => { eprintln!("--acquire: could not resolve IMDB id for tmdb {}", tid); std::process::exit(2); }
+            }
+        };
+        let (title, year, original_language) = tmdb_client.details(tmdb_id, media_type.clone()).await.unwrap_or_default();
+        let req = debridmoviemapper::store::AcquireRequest {
+            imdb_id,
+            tmdb_id,
+            kind,
+            season,
+            episode,
+            original_language,
+            metadata: debridmoviemapper::vfs::MediaMetadata {
+                title,
+                year,
+                media_type,
+                external_id: Some(format!("tmdb:{}", tmdb_id)),
+            },
+        };
+        let outcome = engine.acquire(req).await;
+        println!("--acquire outcome: {:?}", outcome);
+        return Ok(());
+    }
+
     let scan_handle = tokio::spawn(debridmoviemapper::tasks::run_scan_loop(
         ScanConfig {
             app: app_state.clone(),
