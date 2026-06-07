@@ -81,33 +81,53 @@ fn lang_eq(a: &str, b: &str) -> bool {
     to_iso639_2(a) == to_iso639_2(b)
 }
 
-/// Verify parsed tracks against the requirement. Audio always enforced; subtitle only when set.
+enum LangCheck {
+    Pass,
+    Fail,
+    Inconclusive,
+}
+
+/// Does the requirement for language `want` hold for tracks of `kind`?
+/// - `Pass`: a track is tagged with `want`.
+/// - `Inconclusive`: a track of that kind carries no determinable language (it *could* be `want`);
+///   we only have positive evidence when a language is actually tagged, so don't reject.
+/// - `Fail`: every track of that kind is tagged with a *different* language, or there are none —
+///   i.e. the wanted language is positively absent.
+fn check_lang(tracks: &[Track], kind: TrackKind, want: &str) -> LangCheck {
+    let mut has_untagged = false;
+    for t in tracks.iter().filter(|t| t.kind == kind) {
+        match &t.language {
+            Some(l) if lang_eq(l, want) => return LangCheck::Pass,
+            Some(_) => {}
+            None => has_untagged = true,
+        }
+    }
+    if has_untagged {
+        LangCheck::Inconclusive
+    } else {
+        LangCheck::Fail
+    }
+}
+
+/// Verify parsed tracks against the requirement. Reject only on *positive* evidence of a
+/// violation (a track tagged with a non-matching language, or the required track positively
+/// absent). Untagged tracks (no language metadata) are inconclusive — not a failure — so a
+/// correct-but-untagged release isn't wrongly rejected.
 pub fn verify(tracks: &[Track], req: &LangReq) -> Verify {
     if tracks.is_empty() {
         return Verify::Inconclusive;
     }
-    let audios: Vec<&str> = tracks
-        .iter()
-        .filter(|t| t.kind == TrackKind::Audio)
-        .filter_map(|t| t.language.as_deref())
-        .collect();
-    let subs: Vec<&str> = tracks
-        .iter()
-        .filter(|t| t.kind == TrackKind::Subtitle)
-        .filter_map(|t| t.language.as_deref())
-        .collect();
-
     let want_audio: Option<String> = match &req.audio {
         AudioReq::Lang(l) => Some(l.clone()),
         AudioReq::Original => req.original_language.clone(),
     };
     if let Some(want) = want_audio {
-        if !audios.iter().any(|a| lang_eq(a, &want)) {
+        if let LangCheck::Fail = check_lang(tracks, TrackKind::Audio, &want) {
             return Verify::FailAudio;
         }
     }
     if let SubReq::Lang(want) = &req.subtitle {
-        if !subs.iter().any(|s| lang_eq(s, want)) {
+        if let LangCheck::Fail = check_lang(tracks, TrackKind::Subtitle, want) {
             return Verify::FailSubtitle;
         }
     }
@@ -620,6 +640,43 @@ mod tests {
         let req3 = LangReq { audio: AudioReq::Original, subtitle: SubReq::Lang("ger".into()), original_language: Some("jpn".into()) };
         assert_eq!(verify(&tracks, &req3), Verify::FailSubtitle);
         assert_eq!(verify(&[], &req), Verify::Inconclusive);
+    }
+
+    #[test]
+    fn verify_untagged_audio_is_not_rejected() {
+        // Audio with no determinable language (e.g. MP4 with und/missing mdhd) is inconclusive,
+        // not a BadAudio rejection — a correct-but-untagged release must not be dropped.
+        let tracks = vec![
+            Track { kind: TrackKind::Video, language: None },
+            Track { kind: TrackKind::Audio, language: None },
+        ];
+        let req = LangReq { audio: AudioReq::Original, subtitle: SubReq::None, original_language: Some("eng".into()) };
+        assert_eq!(verify(&tracks, &req), Verify::Pass);
+    }
+
+    #[test]
+    fn verify_tagged_wrong_audio_still_fails() {
+        // A track positively tagged with a non-matching language is still rejected (a real dub).
+        let tracks = vec![Track { kind: TrackKind::Audio, language: Some("ita".into()) }];
+        let req = LangReq { audio: AudioReq::Lang("eng".into()), subtitle: SubReq::None, original_language: None };
+        assert_eq!(verify(&tracks, &req), Verify::FailAudio);
+    }
+
+    #[test]
+    fn verify_subtitle_untagged_inconclusive_but_wrong_tagged_fails() {
+        let req = LangReq { audio: AudioReq::Lang("eng".into()), subtitle: SubReq::Lang("eng".into()), original_language: None };
+        // Untagged subtitle present → could be the wanted one → inconclusive (accept).
+        let untagged_sub = vec![
+            Track { kind: TrackKind::Audio, language: Some("eng".into()) },
+            Track { kind: TrackKind::Subtitle, language: None },
+        ];
+        assert_eq!(verify(&untagged_sub, &req), Verify::Pass);
+        // Only a differently-tagged subtitle → the wanted subtitle is positively absent → fail.
+        let wrong_sub = vec![
+            Track { kind: TrackKind::Audio, language: Some("eng".into()) },
+            Track { kind: TrackKind::Subtitle, language: Some("fre".into()) },
+        ];
+        assert_eq!(verify(&wrong_sub, &req), Verify::FailSubtitle);
     }
     #[test]
     fn iso_639_1_to_2_mapping() {
