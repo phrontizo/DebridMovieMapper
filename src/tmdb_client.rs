@@ -308,7 +308,7 @@ fn synthetic_exhausted_error() -> reqwest::Error {
 /// TMDB series production status, collapsed to the three buckets the removal
 /// lifecycle cares about. `Ended` = no more episodes coming (finished/cancelled);
 /// `Returning` = still producing / will return; `Other` = anything else (planned, unknown).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShowStatus {
     Ended,
     Returning,

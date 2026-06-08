@@ -7,7 +7,9 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 /// Current on-disk schema version. Bump when a migration is added in `run_migrations`.
-pub const SCHEMA_VERSION: u64 = 2;
+/// v1→v2: additive (owned_hashes, authoritative_ids, blacklist tables).
+/// v2→v3: additive (trakt_tokens, wanted tables).
+pub const SCHEMA_VERSION: u64 = 3;
 
 /// TMDB identification cache: torrent id -> serde_json((TorrentInfo, MediaMetadata)).
 /// Same name + value encoding as the pre-Store inline table, so existing databases
@@ -22,6 +24,10 @@ const OWNED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_ha
 const AUTH_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("authoritative_ids");
 /// Blacklisted (tmdb_id, hash) pairs: "tmdbid|hash" -> serde_json({reason, at}).
 const BLACKLIST_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blacklist");
+/// Per-user Trakt OAuth tokens: user_slug -> serde_json(TraktTokens).
+const TRAKT_TOKENS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("trakt_tokens");
+/// Materialised per-(user, tmdb_id) wanted-set: "user|tmdb_id" -> serde_json(WantedRecord).
+const WANTED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wanted");
 
 /// The persisted "what to acquire" spec (also used by `acquire.rs`). Stored in `owned_hashes`
 /// so `observe` can re-acquire a title after a stall/failure without external context.
@@ -48,6 +54,45 @@ pub struct OwnedRecord {
     pub source: String,
     pub added_at: u64,
     pub status: OwnedStatus,
+}
+
+/// Persisted per-user Trakt OAuth tokens (the `trakt_tokens` table value; key = user slug).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TraktTokens {
+    pub access: String,
+    pub refresh: String,
+    pub expires_at: u64, // unix epoch seconds
+    pub username: String,
+}
+
+/// Which Trakt sources put a title in a user's wanted-set.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WantedSources {
+    pub watchlist: bool,
+    pub in_progress: bool,
+}
+
+/// Per-user watched progress snapshot; the lifecycle reconciler uses this to determine
+/// when a title is fully watched and eligible for removal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WatchedState {
+    Movie { watched: bool },
+    Show { watched_episodes: Vec<(u32, u32)> }, // (season, episode) pairs the user has watched
+}
+
+/// One (user, tmdb_id) row of the materialised wanted-set. Self-describing: it embeds its
+/// own `user`+`tmdb_id` (the composite table key is derived from them) so the reconciler
+/// gets a flat, fully-keyed list from `all_wanted()` without re-parsing keys.
+/// Invariant: `media_type` and the `WatchedState` variant (Movie/Show) must agree —
+/// `media_type` drives acquire-engine routing, `WatchedState` drives lifecycle logic.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WantedRecord {
+    pub user: String,
+    pub tmdb_id: u64,
+    pub media_type: crate::vfs::MediaType,
+    pub sources: WantedSources,
+    pub watched_state: WatchedState,
+    pub show_status: Option<crate::tmdb_client::ShowStatus>, // None for movies
 }
 
 /// Owns the redb database and all table access. Cheap to clone (the database is an `Arc`).
@@ -123,10 +168,12 @@ impl Store {
         }
         let write_txn = db.begin_write()?;
         {
-            write_txn.open_table(MATCHES_TABLE)?; // create if absent
-            write_txn.open_table(OWNED_TABLE)?; // create if absent
-            write_txn.open_table(AUTH_TABLE)?; // create if absent
-            write_txn.open_table(BLACKLIST_TABLE)?; // create if absent
+            write_txn.open_table(MATCHES_TABLE)?;       // create if absent
+            write_txn.open_table(OWNED_TABLE)?;         // create if absent
+            write_txn.open_table(AUTH_TABLE)?;          // create if absent
+            write_txn.open_table(BLACKLIST_TABLE)?;     // create if absent
+            write_txn.open_table(TRAKT_TOKENS_TABLE)?;  // create if absent
+            write_txn.open_table(WANTED_TABLE)?;        // create if absent
             let mut meta = write_txn.open_table(META_TABLE)?; // create if absent
             meta.insert(SCHEMA_VERSION_KEY, &SCHEMA_VERSION)?;
         }
@@ -134,10 +181,11 @@ impl Store {
         Ok(())
     }
 
-    /// Apply forward migrations from `from_version` up to `SCHEMA_VERSION`. The v1→v2 step is a
-    /// no-op: the new tables (owned_hashes/authoritative_ids/blacklist) are additive and created
-    /// lazily by `ensure_schema`. Future non-additive migrations add steps here, keyed on
-    /// `from_version`, before the version stamp is written.
+    /// Apply forward migrations from `from_version` up to `SCHEMA_VERSION`. The v1→v2 and v2→v3
+    /// steps are no-ops: the new tables (owned_hashes/authoritative_ids/blacklist for v2;
+    /// trakt_tokens/wanted for v3) are additive and created lazily by `ensure_schema`. Future
+    /// non-additive migrations add steps here, keyed on `from_version`, before the version stamp
+    /// is written.
     fn run_migrations(_db: &Database, _from_version: u64) -> Result<(), redb::Error> {
         Ok(())
     }
@@ -462,6 +510,137 @@ impl Store {
             matches!(table.get(key.as_str()), Ok(Some(_)))
         }).await.unwrap_or(false)
     }
+
+    // ── trakt_tokens accessors ────────────────────────────────────────────────
+
+    /// `slug` is the user's Trakt URL slug and is the key under which the tokens are stored.
+    pub async fn put_trakt_tokens(&self, slug: String, tokens: TraktTokens) -> Result<(), AppError> {
+        // Serialise before opening the transaction to avoid partial writes on serde failure.
+        let bytes = match serde_json::to_vec(&tokens) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Failed to serialise TraktTokens for {}: {}", slug, e);
+                return Ok(());
+            }
+        };
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            let txn = db.begin_write()?;
+            { txn.open_table(TRAKT_TOKENS_TABLE)?.insert(slug.as_str(), bytes.as_slice())?; }
+            txn.commit()?;
+            Ok(())
+        }).await;
+        Self::flatten_join(result)
+    }
+
+    pub async fn get_trakt_tokens(&self, slug: String) -> Option<TraktTokens> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let txn = db.begin_read().ok()?;
+            let table = txn.open_table(TRAKT_TOKENS_TABLE).ok()?;
+            let e = table.get(slug.as_str()).ok()??;
+            serde_json::from_slice::<TraktTokens>(e.value()).ok()
+        }).await.ok().flatten()
+    }
+
+    pub async fn remove_trakt_tokens(&self, slug: String) -> Result<(), AppError> {
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            let txn = db.begin_write()?;
+            { txn.open_table(TRAKT_TOKENS_TABLE)?.remove(slug.as_str())?; }
+            txn.commit()?;
+            Ok(())
+        }).await;
+        Self::flatten_join(result)
+    }
+
+    /// Returns all stored Trakt token entries as (slug, tokens) pairs.
+    pub async fn all_trakt_tokens(&self) -> Vec<(String, TraktTokens)> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            if let Ok(txn) = db.begin_read() {
+                if let Ok(table) = txn.open_table(TRAKT_TOKENS_TABLE) {
+                    if let Ok(iter) = table.iter() {
+                        for entry in iter.flatten() {
+                            let (k, v) = entry;
+                            if let Ok(tokens) = serde_json::from_slice::<TraktTokens>(v.value()) {
+                                out.push((k.value().to_string(), tokens));
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        }).await.unwrap_or_default()
+    }
+
+    // ── wanted accessors ──────────────────────────────────────────────────────
+
+    pub async fn put_wanted(&self, rec: WantedRecord) -> Result<(), AppError> {
+        // Serialise before opening the transaction to avoid partial writes on serde failure.
+        let bytes = match serde_json::to_vec(&rec) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Failed to serialise WantedRecord for {}|{}: {}", rec.user, rec.tmdb_id, e);
+                return Ok(());
+            }
+        };
+        let key = format!("{}|{}", rec.user, rec.tmdb_id);
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            let txn = db.begin_write()?;
+            { txn.open_table(WANTED_TABLE)?.insert(key.as_str(), bytes.as_slice())?; }
+            txn.commit()?;
+            Ok(())
+        }).await;
+        Self::flatten_join(result)
+    }
+
+    pub async fn get_wanted(&self, user: String, tmdb_id: u64) -> Option<WantedRecord> {
+        let key = format!("{}|{}", user, tmdb_id);
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let txn = db.begin_read().ok()?;
+            let table = txn.open_table(WANTED_TABLE).ok()?;
+            let e = table.get(key.as_str()).ok()??;
+            serde_json::from_slice::<WantedRecord>(e.value()).ok()
+        }).await.ok().flatten()
+    }
+
+    pub async fn remove_wanted(&self, user: String, tmdb_id: u64) -> Result<(), AppError> {
+        let key = format!("{}|{}", user, tmdb_id);
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            let txn = db.begin_write()?;
+            { txn.open_table(WANTED_TABLE)?.remove(key.as_str())?; }
+            txn.commit()?;
+            Ok(())
+        }).await;
+        Self::flatten_join(result)
+    }
+
+    /// Returns all wanted-set records across all users. Each record is self-keyed (embeds
+    /// `user` and `tmdb_id`), so the reconciler can work with a flat list without re-parsing keys.
+    pub async fn all_wanted(&self) -> Vec<WantedRecord> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            if let Ok(txn) = db.begin_read() {
+                if let Ok(table) = txn.open_table(WANTED_TABLE) {
+                    if let Ok(iter) = table.iter() {
+                        for entry in iter.flatten() {
+                            let (_, v) = entry;
+                            if let Ok(rec) = serde_json::from_slice::<WantedRecord>(v.value()) {
+                                out.push(rec);
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        }).await.unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -739,6 +918,184 @@ mod tests {
         assert!(store.is_blacklisted(27205, "h1".to_string()).await);
         assert!(!store.is_blacklisted(27205, "h2".to_string()).await);
         assert!(!store.is_blacklisted(99999, "h1".to_string()).await);
+    }
+
+    // ── SP2 Task 3 tests (trakt_tokens + wanted) ─────────────────────────────
+
+    use crate::tmdb_client::ShowStatus;
+
+    fn trakt_tokens_fixture(access: &str, username: &str) -> TraktTokens {
+        TraktTokens {
+            access: access.to_string(),
+            refresh: "refresh_tok".to_string(),
+            expires_at: 9_999_999_999,
+            username: username.to_string(),
+        }
+    }
+
+    fn movie_wanted(user: &str, tmdb_id: u64) -> WantedRecord {
+        WantedRecord {
+            user: user.to_string(),
+            tmdb_id,
+            media_type: MediaType::Movie,
+            sources: WantedSources { watchlist: true, in_progress: false },
+            watched_state: WatchedState::Movie { watched: false },
+            show_status: None,
+        }
+    }
+
+    fn show_wanted(user: &str, tmdb_id: u64) -> WantedRecord {
+        WantedRecord {
+            user: user.to_string(),
+            tmdb_id,
+            media_type: MediaType::Show,
+            sources: WantedSources { watchlist: false, in_progress: true },
+            watched_state: WatchedState::Show {
+                watched_episodes: vec![(1, 1), (1, 2), (2, 1)],
+            },
+            show_status: Some(ShowStatus::Ended),
+        }
+    }
+
+    #[tokio::test]
+    async fn trakt_tokens_round_trip() {
+        let store = mem_store();
+        let tok1 = trakt_tokens_fixture("access1", "alice");
+        let tok2 = TraktTokens {
+            access: "access2".to_string(),
+            refresh: "ref2".to_string(),
+            expires_at: 1_234_567_890,
+            username: "bob".to_string(),
+        };
+        store.put_trakt_tokens("alice".to_string(), tok1.clone()).await.unwrap();
+        store.put_trakt_tokens("bob".to_string(), tok2.clone()).await.unwrap();
+
+        let got1 = store.get_trakt_tokens("alice".to_string()).await.expect("alice present");
+        assert_eq!(got1, tok1);
+
+        let got2 = store.get_trakt_tokens("bob".to_string()).await.expect("bob present");
+        assert_eq!(got2, tok2);
+
+        let all = store.all_trakt_tokens().await;
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|(slug, _)| slug == "alice"));
+        assert!(all.iter().any(|(slug, _)| slug == "bob"));
+
+        store.remove_trakt_tokens("alice".to_string()).await.unwrap();
+        assert!(store.get_trakt_tokens("alice".to_string()).await.is_none());
+        assert_eq!(store.all_trakt_tokens().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wanted_round_trip() {
+        let store = mem_store();
+        let movie_rec = movie_wanted("alice", 27205);
+        let show_rec = show_wanted("bob", 1396);
+
+        store.put_wanted(movie_rec.clone()).await.unwrap();
+        store.put_wanted(show_rec.clone()).await.unwrap();
+
+        let got_movie = store.get_wanted("alice".to_string(), 27205).await.expect("movie present");
+        assert_eq!(got_movie, movie_rec);
+
+        // Upsert: writing a modified record at the same (user, tmdb_id) must overwrite in place.
+        let updated_movie = WantedRecord {
+            sources: WantedSources { watchlist: false, in_progress: true },
+            ..movie_rec.clone()
+        };
+        store.put_wanted(updated_movie.clone()).await.unwrap();
+        let got_updated = store.get_wanted("alice".to_string(), 27205).await.expect("updated present");
+        assert_eq!(got_updated, updated_movie);
+
+        let got_show = store.get_wanted("bob".to_string(), 1396).await.expect("show present");
+        assert_eq!(got_show, show_rec);
+        // Verify deep equality on watched_episodes
+        assert_eq!(
+            got_show.watched_state,
+            WatchedState::Show { watched_episodes: vec![(1, 1), (1, 2), (2, 1)] }
+        );
+        assert_eq!(got_show.show_status, Some(ShowStatus::Ended));
+
+        let all = store.all_wanted().await;
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|r| r.user == "alice" && r.tmdb_id == 27205));
+        assert!(all.iter().any(|r| r.user == "bob" && r.tmdb_id == 1396));
+
+        store.remove_wanted("alice".to_string(), 27205).await.unwrap();
+        assert!(store.get_wanted("alice".to_string(), 27205).await.is_none());
+        assert_eq!(store.all_wanted().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_wanted_aggregates_multi_user_same_tmdb_id() {
+        let store = mem_store();
+        let rec_a = movie_wanted("userA", 123);
+        let rec_b = WantedRecord { user: "userB".to_string(), ..movie_wanted("userB", 123) };
+        store.put_wanted(rec_a).await.unwrap();
+        store.put_wanted(rec_b).await.unwrap();
+
+        let all = store.all_wanted().await;
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|r| r.user == "userA" && r.tmdb_id == 123));
+        assert!(all.iter().any(|r| r.user == "userB" && r.tmdb_id == 123));
+    }
+
+    #[tokio::test]
+    async fn migrates_v2_db_to_v3_preserving_tables() {
+        let tmp = TempDb::new("migrate_v2_v3");
+        {
+            let db = Database::create(&tmp.path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                // matches row
+                let mdef: TableDefinition<&str, &[u8]> = TableDefinition::new("matches");
+                let mut t = txn.open_table(mdef).unwrap();
+                let i = info("m2");
+                let m = movie("KeptV2");
+                t.insert("m2", serde_json::to_vec(&(&i, &m)).unwrap().as_slice()).unwrap();
+
+                // owned_hashes row
+                let odef: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_hashes");
+                let mut ot = txn.open_table(odef).unwrap();
+                let rec = OwnedRecord {
+                    request: req("tt2", 99_999),
+                    source: "test".to_string(),
+                    added_at: 42,
+                    status: OwnedStatus::Pending,
+                };
+                ot.insert("hash2", serde_json::to_vec(&rec).unwrap().as_slice()).unwrap();
+
+                // version stamp as v2
+                let vdef: TableDefinition<&str, u64> = TableDefinition::new("meta");
+                let mut v = txn.open_table(vdef).unwrap();
+                v.insert("schema_version", &2u64).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = Store::open(&tmp.path).unwrap();
+
+        // existing tables survive
+        assert_eq!(store.get_match("m2".to_string()).await.unwrap().1.title, "KeptV2");
+        assert_eq!(store.get_owned("hash2".to_string()).await.unwrap().status, OwnedStatus::Pending);
+
+        // new tables are usable after migration
+        let tokens = TraktTokens {
+            access: "a".to_string(),
+            refresh: "r".to_string(),
+            expires_at: 1,
+            username: "u".to_string(),
+        };
+        store.put_trakt_tokens("u".to_string(), tokens).await.unwrap();
+        assert_eq!(store.get_trakt_tokens("u".to_string()).await.unwrap().access, "a");
+
+        let wanted_rec = movie_wanted("u", 1);
+        store.put_wanted(wanted_rec.clone()).await.unwrap();
+        assert_eq!(store.get_wanted("u".to_string(), 1).await.unwrap(), wanted_rec);
+
+        assert!(
+            !std::path::Path::new(&tmp.corrupt_path()).exists(),
+            "valid v2 DB must not be moved aside"
+        );
     }
 
     #[tokio::test]
