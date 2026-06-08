@@ -2,6 +2,7 @@ pub mod acquire;
 pub mod app_state;
 pub mod config;
 pub mod dav_fs;
+pub mod enrolment;
 pub mod error;
 pub mod identification;
 pub mod jellyfin_client;

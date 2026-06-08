@@ -1,6 +1,7 @@
 use dav_server::DavHandler;
 use debridmoviemapper::dav_fs::DebridFileSystem;
 use debridmoviemapper::config::Config;
+use debridmoviemapper::enrolment::EnrolmentService;
 use debridmoviemapper::provider::{DebridProvider, ProviderKind};
 use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::repair::RepairManager;
@@ -199,6 +200,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .locksystem(dav_server::fakels::FakeLs::new())
         .build_handler();
 
+    // Local-network Trakt enrolment routes (no auth — trusted LAN), present only when Trakt is
+    // configured. Served on the same listener; `/trakt*` requests are routed here below.
+    let enrolment: Option<Arc<EnrolmentService>> = app_state
+        .trakt_client
+        .clone()
+        .map(|t| Arc::new(EnrolmentService::new(t, app_state.store.clone())));
+    if enrolment.is_some() {
+        info!("Trakt enrolment page available at /trakt/accounts");
+    }
+
     let addr = SocketAddr::from(([0, 0, 0, 0], app_state.config.port));
     let listener = TcpListener::bind(addr).await?;
     info!("WebDAV server listening on http://{}", addr);
@@ -240,6 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let io = TokioIo::new(stream);
                 let dav_handler = dav_handler.clone();
+                let enrolment = enrolment.clone();
 
                 tokio::task::spawn(async move {
                     let _permit = permit; // Hold permit until connection closes
@@ -248,7 +260,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             io,
                             service_fn(move |req: Request<hyper::body::Incoming>| {
                                 let dav_handler = dav_handler.clone();
-                                async move { Ok::<_, hyper::Error>(dav_handler.handle(req).await) }
+                                let enrolment = enrolment.clone();
+                                async move {
+                                    // Route the local-network Trakt enrolment paths to the
+                                    // enrolment service; everything else is WebDAV. Both arms
+                                    // produce a `Response<dav_server::body::Body>`.
+                                    let p = req.uri().path();
+                                    if p == "/trakt" || p.starts_with("/trakt/") {
+                                        match &enrolment {
+                                            Some(enr) => Ok::<_, hyper::Error>(enr.handle(req).await),
+                                            None => Ok::<_, hyper::Error>(
+                                                hyper::Response::builder()
+                                                    .status(hyper::StatusCode::NOT_FOUND)
+                                                    .body(dav_server::body::Body::from(
+                                                        "Trakt enrolment is not enabled".to_string(),
+                                                    ))
+                                                    .expect("static 404 response"),
+                                            ),
+                                        }
+                                    } else {
+                                        Ok::<_, hyper::Error>(dav_handler.handle(req).await)
+                                    }
+                                }
                             }),
                         )
                         .await

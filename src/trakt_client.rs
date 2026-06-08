@@ -35,6 +35,14 @@ pub struct TraktTokenResponse {
     pub created_at: u64, // unix epoch seconds
 }
 
+/// The authenticated user's identity (`GET /users/me`). `slug` is the stable Trakt URL slug
+/// used as the per-user key for stored tokens + wanted rows; `username` is for display.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TraktUser {
+    pub slug: String,
+    pub username: String,
+}
+
 /// Single-poll outcome of `POST /oauth/device/token`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceTokenPoll {
@@ -72,6 +80,8 @@ pub trait TraktClient: Send + Sync {
     async fn poll_token(&self, device_code: &str) -> Result<DeviceTokenPoll, AppError>;
     /// POST /oauth/token (grant_type=refresh_token) — exchange a refresh token for fresh tokens.
     async fn refresh(&self, refresh_token: &str) -> Result<TraktTokenResponse, AppError>;
+    /// GET /users/me — the authenticated user's slug + username (keys the per-user tokens).
+    async fn me(&self, access_token: &str) -> Result<TraktUser, AppError>;
     /// GET /sync/watchlist/movies + /sync/watchlist/shows — the user's watchlisted movies+shows.
     async fn watchlist(&self, access_token: &str) -> Result<Vec<TraktItem>, AppError>;
     /// GET /sync/playback — movies + (show via episodes) the user is mid-watch, deduped by show tmdb.
@@ -200,6 +210,11 @@ impl TraktClient for TraktClientImpl {
         Ok(parse_token_response(&v))
     }
 
+    async fn me(&self, access_token: &str) -> Result<TraktUser, AppError> {
+        let v = self.authed_get_json("/users/me", access_token).await?;
+        Ok(parse_user(&v))
+    }
+
     async fn watchlist(&self, access_token: &str) -> Result<Vec<TraktItem>, AppError> {
         let movies = self.authed_get_json("/sync/watchlist/movies", access_token).await?;
         let shows = self.authed_get_json("/sync/watchlist/shows", access_token).await?;
@@ -282,6 +297,20 @@ pub fn parse_token_response(v: &serde_json::Value) -> TraktTokenResponse {
         expires_in: u64_field(v, "expires_in"),
         created_at: u64_field(v, "created_at"),
     }
+}
+
+/// Parse a `GET /users/me` response into the user's slug + username. Reads `ids.slug`
+/// (falling back to `username` when the slug is missing/empty) and `username`. Total/no-panic.
+pub(crate) fn parse_user(v: &serde_json::Value) -> TraktUser {
+    let username = str_field(v, "username");
+    let slug = v
+        .get("ids")
+        .and_then(|i| i.get("slug"))
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| username.clone());
+    TraktUser { slug, username }
 }
 
 /// Map a `POST /oauth/device/token` status (+ body) to a single-poll outcome.
@@ -403,6 +432,7 @@ pub struct MockTrakt {
     pub device_code: DeviceCode,
     pub poll: DeviceTokenPoll,
     pub token: TraktTokenResponse,
+    pub user: TraktUser,
     pub watchlist: Vec<TraktItem>,
     pub in_progress: Vec<TraktItem>,
     pub watched: WatchedData,
@@ -433,6 +463,12 @@ impl TraktClient for MockTrakt {
             return Err(AppError::Config("mock trakt refresh failure".to_string()));
         }
         Ok(self.token.clone())
+    }
+    async fn me(&self, _access_token: &str) -> Result<TraktUser, AppError> {
+        if self.fail_reads {
+            return Err(Self::read_error());
+        }
+        Ok(self.user.clone())
     }
     async fn watchlist(&self, _access_token: &str) -> Result<Vec<TraktItem>, AppError> {
         if self.fail_reads {
@@ -530,6 +566,28 @@ mod tests {
                 created_at: 1700000000,
             }
         );
+    }
+
+    #[test]
+    fn parse_user_reads_slug_and_username() {
+        let v = serde_json::json!({
+            "username": "Alice",
+            "ids": { "slug": "alice-slug", "uuid": "x" }
+        });
+        assert_eq!(
+            parse_user(&v),
+            TraktUser { slug: "alice-slug".into(), username: "Alice".into() }
+        );
+    }
+
+    #[test]
+    fn parse_user_falls_back_to_username_when_slug_missing() {
+        // slug missing entirely
+        let v = serde_json::json!({ "username": "bob" });
+        assert_eq!(parse_user(&v), TraktUser { slug: "bob".into(), username: "bob".into() });
+        // slug present but empty → still falls back to username
+        let v2 = serde_json::json!({ "username": "carol", "ids": { "slug": "" } });
+        assert_eq!(parse_user(&v2), TraktUser { slug: "carol".into(), username: "carol".into() });
     }
 
     #[test]
@@ -643,6 +701,7 @@ mod tests {
             device_code: DeviceCode { user_code: "CODE".into(), ..Default::default() },
             poll: DeviceTokenPoll::Authorized(TraktTokenResponse { access_token: "X".into(), ..Default::default() }),
             token: TraktTokenResponse { access_token: "AT".into(), ..Default::default() },
+            user: TraktUser { slug: "alice".into(), username: "Alice".into() },
             watchlist: vec![TraktItem { media_type: MediaType::Movie, tmdb_id: 1 }],
             in_progress: vec![TraktItem { media_type: MediaType::Show, tmdb_id: 2 }],
             watched: WatchedData { movies: vec![3], shows: vec![] },
@@ -656,6 +715,10 @@ mod tests {
             DeviceTokenPoll::Authorized(TraktTokenResponse { access_token: "X".into(), ..Default::default() })
         );
         assert_eq!(client.refresh("ignored").await.unwrap().access_token, "AT");
+        assert_eq!(
+            client.me("ignored").await.unwrap(),
+            TraktUser { slug: "alice".into(), username: "Alice".into() }
+        );
         assert_eq!(
             client.watchlist("ignored").await.unwrap(),
             vec![TraktItem { media_type: MediaType::Movie, tmdb_id: 1 }]
