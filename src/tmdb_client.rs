@@ -133,6 +133,38 @@ impl TmdbClient {
         Ok(parse_external_ids(&v))
     }
 
+    /// Fetch a series' production status from TMDB `/tv/{id}` (the `status` field).
+    /// Network/HTTP failure → Err; an unrecognised or missing status → Ok(ShowStatus::Other).
+    pub async fn show_status(&self, tmdb_id: u64) -> Result<ShowStatus, reqwest::Error> {
+        let url = format!("https://api.themoviedb.org/3/tv/{}", tmdb_id);
+        let api_key = self.api_key.clone();
+        let v = self
+            .fetch_with_retry::<serde_json::Value>(|| {
+                self.client.get(&url).query(&[("api_key", api_key.as_str())])
+            })
+            .await?;
+        Ok(parse_show_status(&v))
+    }
+
+    /// Fetch a season's episode air dates from TMDB `/tv/{id}/season/{season}`.
+    pub async fn season_air_dates(
+        &self,
+        tmdb_id: u64,
+        season: u32,
+    ) -> Result<Vec<EpisodeAirDate>, reqwest::Error> {
+        let url = format!(
+            "https://api.themoviedb.org/3/tv/{}/season/{}",
+            tmdb_id, season
+        );
+        let api_key = self.api_key.clone();
+        let v = self
+            .fetch_with_retry::<serde_json::Value>(|| {
+                self.client.get(&url).query(&[("api_key", api_key.as_str())])
+            })
+            .await?;
+        Ok(parse_season_air_dates(&v, season))
+    }
+
     async fn fetch_with_retry<T: DeserializeOwned>(
         &self,
         make_request: impl Fn() -> RequestBuilder,
@@ -273,6 +305,62 @@ fn synthetic_exhausted_error() -> reqwest::Error {
     .expect_err("BAD_GATEWAY always yields an error status")
 }
 
+/// TMDB series production status, collapsed to the three buckets the removal
+/// lifecycle cares about. `Ended` = no more episodes coming (finished/cancelled);
+/// `Returning` = still producing / will return; `Other` = anything else (planned, unknown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShowStatus {
+    Ended,
+    Returning,
+    Other,
+}
+
+/// One episode's air date within a season. `air_date` is None when TMDB has no
+/// date yet (null/missing/unparseable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpisodeAirDate {
+    pub season: u32,
+    pub episode: u32,
+    pub air_date: Option<chrono::NaiveDate>,
+}
+
+/// Parse the top-level `status` string field from a TMDB `/tv/{id}` response into a `ShowStatus`.
+/// Matching is case-insensitive and the value is trimmed. Unrecognised, empty, or missing → `Other`.
+pub(crate) fn parse_show_status(v: &serde_json::Value) -> ShowStatus {
+    let raw = v
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    match raw.as_str() {
+        "ended" | "canceled" | "cancelled" => ShowStatus::Ended,
+        "returning series" | "in production" => ShowStatus::Returning,
+        _ => ShowStatus::Other,
+    }
+}
+
+/// Parse the `episodes` array from a TMDB `/tv/{id}/season/{season}` response into a
+/// `Vec<EpisodeAirDate>`. Elements missing a numeric `episode_number` are skipped.
+/// `air_date` values that are null, missing, empty, or unparseable yield `None`.
+pub(crate) fn parse_season_air_dates(v: &serde_json::Value, season: u32) -> Vec<EpisodeAirDate> {
+    let Some(episodes) = v.get("episodes").and_then(|e| e.as_array()) else {
+        return Vec::new();
+    };
+    episodes
+        .iter()
+        .filter_map(|ep| {
+            let episode = u32::try_from(ep.get("episode_number")?.as_u64()?).ok()?;
+            let air_date = ep
+                .get("air_date")
+                .and_then(|d| d.as_str())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+            Some(EpisodeAirDate { season, episode, air_date })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +464,107 @@ mod tests {
         assert_eq!(super::parse_details(&m, crate::vfs::MediaType::Movie), ("Inception".into(), Some("2010".into()), Some("en".into())));
         let s = serde_json::json!({"name": "Breaking Bad", "first_air_date": "2008-01-20", "original_language": "en"});
         assert_eq!(super::parse_details(&s, crate::vfs::MediaType::Show), ("Breaking Bad".into(), Some("2008".into()), Some("en".into())));
+    }
+
+    // --- ShowStatus tests ---
+
+    #[test]
+    fn parse_show_status_table_driven() {
+        use super::{parse_show_status, ShowStatus};
+
+        let cases: &[(&str, ShowStatus)] = &[
+            ("Ended", ShowStatus::Ended),
+            ("Returning Series", ShowStatus::Returning),
+            ("Canceled", ShowStatus::Ended),
+            ("Cancelled", ShowStatus::Ended),
+            ("In Production", ShowStatus::Returning),
+            ("Planned", ShowStatus::Other),
+            ("  Ended  ", ShowStatus::Ended),
+            // missing status field
+        ];
+
+        for (status_str, expected) in cases {
+            let v = serde_json::json!({ "status": status_str });
+            assert_eq!(
+                parse_show_status(&v),
+                *expected,
+                "status {:?} should map to {:?}",
+                status_str,
+                expected
+            );
+        }
+
+        // Missing status field → Other
+        let missing = serde_json::json!({});
+        assert_eq!(parse_show_status(&missing), ShowStatus::Other, "missing status → Other");
+
+        // Mixed-case: "ended" (all lower) → Ended
+        let lower = serde_json::json!({ "status": "ended" });
+        assert_eq!(parse_show_status(&lower), ShowStatus::Ended, "lowercase 'ended' → Ended");
+
+        // Mixed-case: "CANCELED" (all upper) → Ended
+        let upper = serde_json::json!({ "status": "CANCELED" });
+        assert_eq!(parse_show_status(&upper), ShowStatus::Ended, "uppercase 'CANCELED' → Ended");
+    }
+
+    // --- EpisodeAirDate / parse_season_air_dates tests ---
+
+    #[test]
+    fn parse_season_air_dates_mixed_episodes() {
+        use super::{parse_season_air_dates, EpisodeAirDate};
+
+        let v = serde_json::json!({
+            "episodes": [
+                { "episode_number": 1, "air_date": "2022-03-15" },
+                { "episode_number": 2, "air_date": serde_json::Value::Null },
+                { "episode_number": 3 },                              // missing air_date key
+                { "episode_number": 4, "air_date": "not-a-date" },   // unparseable
+                { "air_date": "2022-03-20" },                         // no episode_number → skipped
+            ]
+        });
+
+        let result = parse_season_air_dates(&v, 2);
+
+        assert_eq!(result.len(), 4);
+
+        assert_eq!(
+            result[0],
+            EpisodeAirDate {
+                season: 2,
+                episode: 1,
+                air_date: Some(chrono::NaiveDate::from_ymd_opt(2022, 3, 15).unwrap()),
+            }
+        );
+        assert_eq!(
+            result[1],
+            EpisodeAirDate { season: 2, episode: 2, air_date: None }
+        );
+        assert_eq!(
+            result[2],
+            EpisodeAirDate { season: 2, episode: 3, air_date: None }
+        );
+        assert_eq!(
+            result[3],
+            EpisodeAirDate { season: 2, episode: 4, air_date: None }
+        );
+        // All entries carry the threaded season value
+        assert!(result.iter().all(|e| e.season == 2));
+    }
+
+    #[test]
+    fn parse_season_air_dates_absent_episodes_array() {
+        use super::parse_season_air_dates;
+
+        // Missing `episodes` key → empty vec
+        let no_key = serde_json::json!({});
+        assert!(parse_season_air_dates(&no_key, 1).is_empty());
+
+        // Explicit null → empty vec
+        let null_array = serde_json::json!({ "episodes": serde_json::Value::Null });
+        assert!(parse_season_air_dates(&null_array, 1).is_empty());
+
+        // Empty array → empty vec
+        let empty_array = serde_json::json!({ "episodes": [] });
+        assert!(parse_season_air_dates(&empty_array, 1).is_empty());
     }
 }
