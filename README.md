@@ -13,7 +13,8 @@ Note that this is still a work in progress and is provided as-is for educational
 Future work:
 * Test with Kodi 
 * Add a web-ui to track progress and correct mismatches
-* Automatically populate Real-Debrid with watchlist content from Trakt and newly released episodes from already tracked shows
+
+Trakt-driven acquisition (populate your debrid account from Trakt watchlists/in-progress and newly aired episodes of tracked shows, plus automatic lifecycle removal) is now built in — see the [Trakt Integration](#trakt-integration) section below.
 
 This was 100% vibe coded using a mix of Claude and Junie as further AI experimentation.
 ## Features
@@ -24,6 +25,7 @@ This was 100% vibe coded using a mix of Claude and Junie as further AI experimen
 - **Real-Debrid *and* TorBox**: One codebase, either provider. Set `RD_API_TOKEN` for Real-Debrid or `TORBOX_API_KEY` for TorBox (exactly one) — everything else works the same.
 - **WebDAV Endpoint**: Exposes a WebDAV server (port 8080) serving proxied media files with real file sizes and extensions. Media bytes are fetched on demand from the provider's CDN. Mount via rclone for use with Jellyfin/Plex.
 - **On-Demand Repair**: Detects unavailable files at playback time (a 503 from Real-Debrid, or an uncached/expired file on TorBox) and attempts instant synchronous repair by re-adding the torrent. For cached content, playback continues after a ~1-2s delay; otherwise a fresh download is started automatically.
+- **Trakt Integration (optional)**: Drive the library from your Trakt account(s) — watchlisted and in-progress movies/shows are auto-acquired, new episodes of tracked shows are picked up as they air, and content is automatically removed once everyone who wanted it has finished (or abandoned) it. Link one or more accounts via a local-network enrolment page. Disabled by default; when not configured the service runs exactly as before.
 - **Persistent Cache**: Uses an embedded database (`redb`) to cache media identifications, reducing API calls and speeding up restarts.
 - **Configurable Scan Interval**: Customizable scan interval via environment variable.
 - **Robust Identification Logic**: Handles complex torrent naming conventions, including CamelCase splitting, technical metadata stripping, and multi-service fallback strategies.
@@ -54,7 +56,13 @@ JELLYFIN_URL=http://jellyfin:8096
 JELLYFIN_API_KEY=your_jellyfin_api_key
 JELLYFIN_RCLONE_MOUNT_PATH=/media
 
-# Optional: SP1 acquisition preferences (see Acquisition section below)
+# Optional: Trakt integration (both client id + secret required to enable — see Trakt Integration section)
+# TRAKT_CLIENT_ID=your_trakt_client_id
+# TRAKT_CLIENT_SECRET=your_trakt_client_secret
+# TRAKT_SYNC_INTERVAL_SECS=900            # Trakt sync + reconcile cadence (default: 900, minimum: 60)
+# TRAKT_EPISODE_CHECK_INTERVAL_SECS=3600  # episode-monitor cadence (default: 3600, minimum: 300)
+
+# Optional: acquisition preferences (see Acquisition section below)
 # SCRAPER_ADDON_URL=https://torrentio.strem.fun/realdebrid=TOKEN   # override scraper URL
 # MAX_RESOLUTION=1080        # 720 | 1080 | 2160
 # AUDIO_LANGUAGE=original    # original | eng | ...
@@ -88,8 +96,14 @@ A debrid provider token is required: set **exactly one** of `RD_API_TOKEN` or `T
 | `PREFER_HDR`                 | No       | `false`        | Prefer HDR/Dolby Vision encodes when scoring acquisition candidates. |
 | `STALL_TIMEOUT_SECS`         | No       | `1800`         | Seconds without download progress before a Pending torrent is considered stalled and re-acquired. |
 | `MAX_ACQUIRE_ATTEMPTS`       | No       | `5`            | Maximum number of candidates to try before giving up on a title. |
+| `TRAKT_CLIENT_ID`            | No†      | -              | Trakt API app client id. Both this and `TRAKT_CLIENT_SECRET` are required to enable Trakt sync. |
+| `TRAKT_CLIENT_SECRET`        | No†      | -              | Trakt API app client secret. |
+| `TRAKT_SYNC_INTERVAL_SECS`   | No       | `900`          | How often (seconds) to sync each enrolled Trakt account and reconcile the library (minimum: 60). |
+| `TRAKT_EPISODE_CHECK_INTERVAL_SECS` | No | `3600`      | How often (seconds) to check tracked shows for newly aired episodes (minimum: 300). |
 
 \* Exactly one of `RD_API_TOKEN` / `TORBOX_API_KEY` must be set — not both, and not neither.
+
+† Trakt sync is enabled only when **both** `TRAKT_CLIENT_ID` and `TRAKT_CLIENT_SECRET` are set. If either is absent, Trakt sync is disabled and the service runs exactly as before (account-mirror + on-demand repair only).
 
 ## Running with Docker
 
@@ -192,9 +206,9 @@ Once running, the WebDAV server will be available at `http://localhost:8080`. Mo
 - **Kodi**
 - **Infuse** (iOS/tvOS/macOS)
 
-## Acquisition (SP1)
+## Acquisition
 
-The SP1 acquisition engine lets the service find and add content to your debrid account automatically, using Torrentio as a scraper.
+The acquisition engine lets the service find and add content to your debrid account automatically, using Torrentio as a scraper. It is driven by [Trakt Integration](#trakt-integration) (and the library reconciler) — there is no manual trigger.
 
 ### How Acquisition Works
 
@@ -207,19 +221,42 @@ The SP1 acquisition engine lets the service find and add content to your debrid 
 
 The `observe` method runs each scan tick and handles Pending torrents: it re-probes completed downloads, detects stalled downloads (no progress for `STALL_TIMEOUT_SECS`), and re-acquires failed torrents using the next unblacklisted candidate.
 
-### Temporary `--acquire` CLI
+### What triggers acquisition
 
-A temporary command-line trigger is included for SP1 verification:
+Acquisition is triggered by [Trakt Integration](#trakt-integration): the Trakt reconciler scans each enrolled account's watchlist and in-progress titles and asks the engine to acquire anything missing, while the episode monitor picks up newly aired episodes of tracked shows. (An earlier development build had a temporary `--acquire` command-line trigger; it has been removed.)
 
-```bash
-# Acquire a movie by IMDB id
-RD_API_TOKEN=<token> TMDB_API_KEY=<key> cargo run -- --acquire movie tt1727587
+## Trakt Integration
 
-# Acquire a specific episode
-RD_API_TOKEN=<token> TMDB_API_KEY=<key> cargo run -- --acquire series tt0903747 1 1
-```
+When configured, DebridMovieMapper keeps your library in sync with one or more Trakt accounts:
 
-This flag is a development aid and will be removed once a proper UI or automation layer is in place.
+- **Watchlist + in-progress** movies and shows are automatically acquired into your debrid account.
+- **New episodes** of tracked shows are picked up as they air (using TMDB air dates).
+- **Automatic removal**: engine-acquired content is removed once *every* user who wanted it has finished it (a watched movie; a fully-watched ended show), or once a watchlisted title is un-watchlisted and nobody else wants it. Manually-added content is never auto-removed.
+
+It is a single shared household library: acquisition is the union across all linked accounts, and removal is per-user-aware (a title is only removed when no linked account still wants it).
+
+**Trakt sync is disabled by default.** When `TRAKT_CLIENT_ID`/`TRAKT_CLIENT_SECRET` are not set, the service behaves exactly as before (account-mirror + on-demand repair only).
+
+### Enabling Trakt sync
+
+1. Create a Trakt API application at <https://trakt.tv/oauth/applications> (any redirect URI is fine — the service uses device-flow OAuth). Note its **Client ID** and **Client Secret**.
+2. Set the environment variables:
+
+   ```env
+   TRAKT_CLIENT_ID=your_trakt_client_id
+   TRAKT_CLIENT_SECRET=your_trakt_client_secret
+   # Optional cadences:
+   TRAKT_SYNC_INTERVAL_SECS=900            # Trakt sync + reconcile (default: 900, minimum: 60)
+   TRAKT_EPISODE_CHECK_INTERVAL_SECS=3600  # newly-aired-episode check (default: 3600, minimum: 300)
+   ```
+
+3. Restart the service. On startup it logs that the Trakt enrolment page is available.
+
+### Linking accounts
+
+Visit `/trakt/accounts` on the server (e.g. `http://localhost:8080/trakt/accounts`) to link, refresh, or remove Trakt accounts. Linking uses Trakt's **device flow**: click *Enrol a new account*, then open the shown URL on any device and enter the code to approve it. Once approved, the account is linked automatically and its tokens are stored (keyed by the Trakt username slug).
+
+> ⚠️ The enrolment page is **unauthenticated**, just like the WebDAV endpoint — it assumes the port is only reachable on a trusted local network. Do not expose it to an untrusted network. If a linked account later needs re-authorising (e.g. its token was revoked), it is flagged on the accounts page as *needs re-enrolment*.
 
 ## Technical Details
 
@@ -234,9 +271,13 @@ This flag is a development aid and will be removed once a proper UI or automatio
 
 ## Project Structure
 
-- `src/main.rs`: Entry point — selects the debrid provider, initialises shared state, starts the WebDAV server.
+- `src/main.rs`: Entry point — selects the debrid provider, initialises shared state, starts the scheduler and the WebDAV server (which also serves the Trakt enrolment routes).
 - `src/provider.rs`: The `DebridProvider` trait and `FileLocator`; startup provider selection (`choose_provider`).
-- `src/tasks.rs`: Background scan loop — polls the active provider, identifies new torrents, updates the VFS.
+- `src/scheduler.rs`: Spawns the cooperating background jobs (scan loop always; Trakt cycle + episode monitor when Trakt is configured).
+- `src/tasks.rs`: Background jobs — the scan loop (polls the active provider, identifies new torrents, updates the VFS) plus the Trakt jobs (`sync_trakt`, `reconcile_wanted`, `monitor_episodes`).
+- `src/trakt_client.rs`: Trakt API client — device-flow OAuth and the watchlist/in-progress/watched reads.
+- `src/wanted.rs`: Pure reconcile-core — diffs the wanted-set against owned content and emits acquire/remove decisions (the removal lifecycle rules).
+- `src/enrolment.rs`: Local-network Trakt enrolment page (`/trakt/accounts`) served on the WebDAV listener.
 - `src/rd_client.rs`: Real-Debrid implementation of `DebridProvider` (1-hour unrestrict cache).
 - `src/torbox_client.rs`: TorBox implementation of `DebridProvider` (mylist / requestdl / createtorrent / controltorrent).
 - `src/ratelimit.rs`: Shared adaptive token-bucket rate limiter used by both clients.
@@ -253,12 +294,14 @@ This flag is a development aid and will be removed once a proper UI or automatio
 
 ### Background Tasks
 
-The service runs one background task:
+A scheduler spawns cooperating periodic jobs (each runs immediately on startup, then on its own interval):
 
 1. **Scan Task**: Polls the active debrid provider for new/updated torrents and updates the virtual filesystem
-   - Runs immediately on startup
    - Repeats every `SCAN_INTERVAL_SECS` (default: 60 seconds)
    - Builds the VFS with a `FileLocator` per file; resolution to a CDN URL happens lazily at read time
+   - Also verifies the progress of in-flight acquisitions each tick
+2. **Trakt Cycle** *(only when Trakt is configured)*: Syncs each enrolled account's watchlist/in-progress + watched state, then reconciles the library (acquire missing titles, remove finished/abandoned ones). Repeats every `TRAKT_SYNC_INTERVAL_SECS` (default: 900 seconds)
+3. **Episode Monitor** *(only when Trakt is configured)*: Checks tracked shows for newly aired episodes and acquires them. Repeats every `TRAKT_EPISODE_CHECK_INTERVAL_SECS` (default: 3600 seconds)
 
 ### On-Demand Repair
 

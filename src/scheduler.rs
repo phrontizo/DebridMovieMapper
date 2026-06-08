@@ -5,7 +5,7 @@
 //!   (`engine.observe`), sharing one `get_torrents` per tick. Cadence: `SCAN_INTERVAL_SECS`.
 //! - **Trakt cycle task** = `sync_trakt` THEN `reconcile_wanted`, sequentially each tick (so the
 //!   reconciler sees the just-synced wanted set). Cadence: `TRAKT_SYNC_INTERVAL_SECS`.
-//! - **Episode monitor task** = `monitor_episodes`. Cadence: `EPISODE_CHECK_INTERVAL_SECS`.
+//! - **Episode monitor task** = `monitor_episodes`. Cadence: `TRAKT_EPISODE_CHECK_INTERVAL_SECS`.
 //!
 //! The Trakt cycle + monitor tasks are spawned ONLY when `trakt_jobs_enabled(&app)` — i.e. both a
 //! Trakt client and `config.trakt` are present; otherwise the service runs exactly as before.
