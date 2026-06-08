@@ -192,7 +192,8 @@ const LANG_WORDS: &[(&str, &str)] = &[
     ("korean", "kor"), ("portuguese", "por"), ("multi", "mul"),
 ];
 
-/// Score a release against prefs. `None` = excluded by a hard rule (resolution ceiling). Higher better.
+/// Score a release against prefs. `None` = excluded by a hard rule (resolution ceiling,
+/// cam/telesync source, or an uncached zero-seeder release). Higher better.
 pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
     // Quality floor: never acquire a cam / telesync / telecine / screener / R5 / workprint source.
     if r.source == Source::Cam {
@@ -202,6 +203,12 @@ pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
     // blindly drop potentially-valid releases the scraper failed to tag).
     if let Some(res) = r.resolution {
         if res > prefs.max_resolution.height() { return None; }
+    }
+    // An uncached release with zero seeders cannot download — ignore it entirely so the engine
+    // never burns an acquire attempt on a dead torrent (nor leaves a "checking" magnet behind).
+    // Cached releases are exempt: already on the provider, so live peers are irrelevant.
+    if !r.cached && r.seeders == Some(0) {
+        return None;
     }
     let mut s: i64 = 0;
     if r.cached { s += 1_000_000; }
@@ -372,6 +379,23 @@ mod tests {
         // A real BluRay at the same resolution is accepted.
         let good = parse(&raw("Torrentio\n1080p", "Movie.2025.1080p.BluRay.x265\nRD+", "h", Some("Movie.mkv")));
         assert!(score(&good, &prefs()).is_some());
+    }
+
+    #[test]
+    fn score_excludes_uncached_zero_seeder_keeps_cached() {
+        // 👤0 and uncached → undownloadable → excluded outright (not scored).
+        let dead = parse(&raw("Torrentio 1080p", "A.2009.1080p.BluRay.x264\n\u{1f464} 0 \u{1f4be} 6 GB", "h", Some("A.mkv")));
+        assert_eq!(dead.seeders, Some(0));
+        assert!(!dead.cached);
+        assert_eq!(score(&dead, &prefs()), None);
+        // Same release but cached → kept: a cached copy needs no live peers.
+        let cached_dead = parse(&raw("Torrentio 1080p", "A.2009.1080p.BluRay.x264\n\u{1f464} 0 \u{1f4be} 6 GB\nRD+", "h", Some("A.mkv")));
+        assert!(cached_dead.cached);
+        assert!(score(&cached_dead, &prefs()).is_some());
+        // Seeded uncached → kept.
+        let seeded = parse(&raw("Torrentio 1080p", "A.2009.1080p.BluRay.x264\n\u{1f464} 10 \u{1f4be} 6 GB", "h", Some("A.mkv")));
+        assert_eq!(seeded.seeders, Some(10));
+        assert!(score(&seeded, &prefs()).is_some());
     }
 
     #[test]
