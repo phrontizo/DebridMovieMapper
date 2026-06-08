@@ -149,6 +149,18 @@ pub fn detect_container(buf: &[u8]) -> Option<ContainerKind> {
     None
 }
 
+/// Classify an element/box whose declared extent runs past a boundary. If it runs past the
+/// *fetched buffer* we simply under-fetched (a truncated ranged read under load) → `Transient`
+/// (defer + retry), never a verdict. If it stays within the fetched bytes but violates a parent
+/// boundary, the structure is genuinely broken → `Corrupt`.
+fn overrun_error(declared_end: usize, buf_len: usize) -> ProbeError {
+    if declared_end > buf_len {
+        ProbeError::Transient
+    } else {
+        ProbeError::Corrupt
+    }
+}
+
 // --- MKV (EBML) parser ---
 
 /// Read an EBML element id (1..=4 bytes, marker bits retained). Advances `pos`.
@@ -218,7 +230,7 @@ pub fn parse_mkv_tracks(buf: &[u8]) -> Result<Vec<Track>, ProbeError> {
             pos.checked_add(size as usize).ok_or(ProbeError::Corrupt)?
         };
         if end > buf.len() || end > t_end {
-            return Err(ProbeError::Corrupt);
+            return Err(overrun_error(end, buf.len()));
         }
         if id == 0xAE {
             out.push(parse_mkv_track_entry(buf, pos, end)?);
@@ -246,7 +258,7 @@ fn find_ebml_child(
             payload_start.checked_add(size as usize).ok_or(ProbeError::Corrupt)?
         };
         if payload_end > end {
-            return Err(ProbeError::Corrupt);
+            return Err(overrun_error(payload_end, buf.len()));
         }
         if id == target_id {
             return Ok(Some((payload_start, payload_end)));
@@ -268,7 +280,7 @@ fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, 
         }
         let p_end = pos.checked_add(size as usize).ok_or(ProbeError::Corrupt)?;
         if p_end > end {
-            return Err(ProbeError::Corrupt);
+            return Err(overrun_error(p_end, buf.len()));
         }
         match id {
             0x83 => {
@@ -333,7 +345,8 @@ pub fn parse_mp4_tracks(buf: &[u8]) -> Result<Vec<Track>, ProbeError> {
         let (typ, p_start, b_end) = read_box_header(buf, pos)?;
         if b_end > buf.len() {
             if &typ == b"moov" {
-                return Err(ProbeError::Corrupt);
+                // moov declared past the fetched bytes → truncated read, not a broken file.
+                return Err(ProbeError::Transient);
             }
             break;
         }
@@ -351,7 +364,7 @@ fn parse_mp4_moov(buf: &[u8], start: usize, end: usize) -> Result<Vec<Track>, Pr
     while pos + 8 <= end {
         let (typ, p_start, b_end) = read_box_header(buf, pos)?;
         if b_end > end {
-            return Err(ProbeError::Corrupt);
+            return Err(overrun_error(b_end, buf.len()));
         }
         if &typ == b"trak" {
             out.push(parse_mp4_trak(buf, p_start, b_end)?);
@@ -378,7 +391,7 @@ fn parse_mp4_trak(buf: &[u8], start: usize, end: usize) -> Result<Track, ProbeEr
     while pos + 8 <= m_end {
         let (typ, p_start, b_end) = read_box_header(buf, pos)?;
         if b_end > m_end {
-            return Err(ProbeError::Corrupt);
+            return Err(overrun_error(b_end, buf.len()));
         }
         if &typ == b"hdlr" {
             if p_start + 12 <= b_end {
@@ -408,7 +421,7 @@ fn find_mp4_child(
     while pos + 8 <= end {
         let (typ, p_start, b_end) = read_box_header(buf, pos)?;
         if b_end > end {
-            return Err(ProbeError::Corrupt);
+            return Err(overrun_error(b_end, buf.len()));
         }
         if &typ == target {
             return Ok(Some((p_start, b_end)));
@@ -591,10 +604,24 @@ mod tests {
         assert!(tracks.iter().any(|t| t.kind == TrackKind::Subtitle && t.language.as_deref() == Some("fre")));
     }
     #[test]
-    fn mkv_truncated_is_corrupt() {
+    fn mkv_truncated_is_transient() {
+        // A truncated ranged read (an element declared past the fetched bytes) is an under-fetch
+        // to defer, not a broken file to blacklist.
         let mut bytes = mkv_with("eng", None);
         bytes.truncate(bytes.len() - 3);
-        assert!(matches!(parse_mkv_tracks(&bytes), Err(ProbeError::Corrupt)));
+        assert!(matches!(parse_mkv_tracks(&bytes), Err(ProbeError::Transient)));
+    }
+    #[test]
+    fn mp4_truncated_moov_is_transient() {
+        let mut bytes = mp4_with(&[(b"soun", packed("eng"))]);
+        bytes.truncate(bytes.len() - 4);
+        assert!(matches!(parse_mp4_tracks(&bytes), Err(ProbeError::Transient)));
+    }
+    #[test]
+    fn overrun_classifies_under_fetch_vs_malformed() {
+        assert_eq!(overrun_error(120, 100), ProbeError::Transient); // past the fetched buffer
+        assert_eq!(overrun_error(80, 100), ProbeError::Corrupt); // within buffer, past a parent
+        assert_eq!(overrun_error(100, 100), ProbeError::Corrupt); // exactly at end, not past
     }
     #[test]
     fn mp4_tracks_front_moov() {

@@ -171,6 +171,16 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
     )
 }
 
+/// Parse TorBox's advertised rate-limit window from response headers. TorBox sends
+/// `x-ratelimit-remaining` + `x-ratelimit-reset` (a unix-epoch float) on every response,
+/// letting us pace proactively. Returns `None` if either header is missing or unparseable.
+fn parse_rate_headers(headers: &reqwest::header::HeaderMap) -> Option<(u64, f64)> {
+    let get = |name: &str| -> Option<&str> { headers.get(name)?.to_str().ok() };
+    let remaining = get("x-ratelimit-remaining")?.parse::<u64>().ok()?;
+    let reset = get("x-ratelimit-reset")?.parse::<f64>().ok()?;
+    Some((remaining, reset))
+}
+
 /// Build a synthetic Bad Gateway `reqwest::Error` for cases where we must return a
 /// `reqwest::Error` but have no live response — exhausted retries, or unparsable
 /// input we refuse to act on. Centralised so the fallible construction lives in one
@@ -269,6 +279,15 @@ impl TorBoxClient {
         bound_cache(&mut cache, RESOLVE_CACHE_MAX);
     }
 
+    /// Feed TorBox's advertised rate-limit window into the limiter so it paces proactively
+    /// (and never trips a 429). Called on every response — including 429s and 200s, since
+    /// TorBox sends the headers on both.
+    async fn observe_rate_headers(&self, resp: &reqwest::Response) {
+        if let Some((remaining, reset)) = parse_rate_headers(resp.headers()) {
+            self.rate_limiter.observe_rate_limit(remaining, reset).await;
+        }
+    }
+
     /// Send a request, rate-limited with 429/transient retry, returning the envelope's `data`.
     /// Synthesises a Bad Gateway reqwest error when `success` is false or `data` is missing.
     async fn send_data<T, F>(&self, make: F) -> Result<T, reqwest::Error>
@@ -292,6 +311,7 @@ impl TorBoxClient {
                     return Err(e);
                 }
             };
+            self.observe_rate_headers(&resp).await;
             if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 let retry_after = resp
                     .headers()
@@ -362,6 +382,7 @@ impl TorBoxClient {
                     return Err(e);
                 }
             };
+            self.observe_rate_headers(&resp).await;
             if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 let retry_after = resp
                     .headers()
@@ -560,6 +581,25 @@ mod tests {
             Some("aabbccddeeff00112233445566778899aabbccdd".to_string())
         );
         assert_eq!(magnet_infohash("magnet:?dn=NoHash"), None);
+    }
+
+    #[test]
+    fn parse_rate_headers_reads_remaining_and_reset() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("x-ratelimit-remaining", "2".parse().unwrap());
+        h.insert("x-ratelimit-reset", "1780870003.85".parse().unwrap());
+        let (remaining, reset) = parse_rate_headers(&h).expect("should parse window");
+        assert_eq!(remaining, 2);
+        assert!((reset - 1780870003.85).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_rate_headers_none_when_missing_or_bad() {
+        assert_eq!(parse_rate_headers(&reqwest::header::HeaderMap::new()), None);
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("x-ratelimit-remaining", "lots".parse().unwrap());
+        h.insert("x-ratelimit-reset", "soon".parse().unwrap());
+        assert_eq!(parse_rate_headers(&h), None);
     }
 
     #[test]
