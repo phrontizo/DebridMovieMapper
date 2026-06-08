@@ -92,6 +92,9 @@ pub struct MockProvider {
     pub unavailable_torrent_ids: std::collections::HashSet<String>,
     /// Records every `delete_torrent` id so tests can assert that leaked torrents are cleaned up.
     pub deleted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// When `true`, `get_torrents` returns a `reqwest::Error` so tests can exercise the
+    /// early-return guard in `reconcile_wanted` / `monitor_episodes`.
+    pub fail_get_torrents: bool,
 }
 
 #[cfg(test)]
@@ -101,6 +104,10 @@ impl DebridProvider for MockProvider {
         "mock"
     }
     async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
+        if self.fail_get_torrents {
+            // Drive an immediate URL-parse failure to produce a reqwest::Error without any I/O.
+            return reqwest::Client::new().get("").send().await.map(|_| vec![]);
+        }
         Ok(self.torrents.clone())
     }
     async fn get_torrent_info(&self, _id: &str) -> Result<TorrentInfo, reqwest::Error> {

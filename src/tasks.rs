@@ -822,7 +822,13 @@ pub async fn reconcile_wanted(
     tmdb: &TmdbClient,
     store: &Store,
 ) {
-    let torrents = provider.get_torrents().await.unwrap_or_default();
+    let torrents = match provider.get_torrents().await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("reconcile_wanted: get_torrents failed ({}); skipping this tick to avoid acting on a stale/empty listing", e);
+            return;
+        }
+    };
     let ops = plan_reconcile_ops(store, &torrents).await;
     for op in ops {
         match op {
@@ -908,7 +914,13 @@ pub async fn monitor_episodes(
     let today = chrono::Utc::now().date_naive();
     // TODO(Task 10): the scheduler could pass a shared torrents snapshot to avoid a
     // duplicate get_torrents() when monitor_episodes and reconcile_wanted run on the same tick.
-    let torrents = provider.get_torrents().await.unwrap_or_default();
+    let torrents = match provider.get_torrents().await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("monitor_episodes: get_torrents failed ({}); skipping this tick to avoid acting on a stale/empty listing", e);
+            return;
+        }
+    };
 
     // Group wanted rows by tmdb_id.
     let wanted_by = group_wanted_by_tmdb(store).await;
@@ -1743,6 +1755,70 @@ mod reconcile_wanted_tests {
         execute_remove(&provider, &torrents, &store, 27205, &["h1".to_string()]).await;
         assert_eq!(*deleted.lock().unwrap(), vec!["t1".to_string()], "the torrent must be deleted");
         assert!(store.get_owned("h1".to_string()).await.is_none(), "the owned record must be removed");
+    }
+
+    /// When `get_torrents` fails, `reconcile_wanted` must early-return without executing any ops:
+    /// no `delete_torrent` call and no owned records removed. Without the guard, a failed fetch
+    /// defaults to an empty listing and Trigger-B fires, incorrectly removing owned content.
+    #[tokio::test]
+    async fn reconcile_wanted_skips_tick_when_get_torrents_fails() {
+        use crate::config::AcquisitionConfig;
+
+        let store = mem_store();
+        // A show owned via watchlist with no current wanter → Trigger B fires if get_torrents
+        // returns Ok([]) (empty listing). With the fail guard it must be skipped entirely.
+        store
+            .put_owned(
+                "aaa".into(),
+                owned_record(1396, MediaKind::Series, Provenance::watchlist("alice")),
+            )
+            .await
+            .unwrap();
+
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            fail_get_torrents: true,
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+
+        let scraper: Arc<dyn crate::scraper::Scraper> = Arc::new(
+            crate::scraper::TorrentioScraper::new(
+                None,
+                crate::provider::ProviderKind::TorBox,
+                "tok",
+                reqwest::Client::new(),
+            ),
+        );
+        let validator: Arc<dyn crate::acquire::TitleValidator> = Arc::new(
+            crate::acquire::TmdbTitleValidator {
+                tmdb: Arc::new(crate::tmdb_client::TmdbClient::new("k".into()).unwrap()),
+            },
+        );
+        let prober: Arc<dyn crate::acquire::Prober> =
+            Arc::new(crate::acquire::HttpProber { http: reqwest::Client::new() });
+        let engine = crate::acquire::AcquisitionEngine::new(
+            provider.clone(),
+            scraper,
+            validator,
+            prober,
+            store.clone(),
+            AcquisitionConfig::default().prefs,
+            5,
+            std::time::Duration::from_secs(1800),
+        );
+        let tmdb = crate::tmdb_client::TmdbClient::new("k".into()).unwrap();
+
+        reconcile_wanted(&engine, &provider, &tmdb, &store).await;
+
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "delete_torrent must not be called when get_torrents fails"
+        );
+        assert!(
+            store.get_owned("aaa".to_string()).await.is_some(),
+            "owned record must survive a skipped tick"
+        );
     }
 }
 
