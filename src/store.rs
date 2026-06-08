@@ -48,10 +48,65 @@ pub enum OwnedStatus {
     Verified,
 }
 
+/// One reason a title is engine-owned: a manual (non-Trakt) origin, or a specific
+/// Trakt user via a specific source.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ProvenanceEntry {
+    /// Added outside Trakt (legacy / direct). Never auto-removed by the reconciler.
+    Manual,
+    /// A user's Trakt watchlist caused the add.
+    Watchlist { user: String },
+    /// A user's Trakt in-progress (playback) caused the add.
+    InProgress { user: String },
+}
+
+/// Why a title is engine-owned — the de-duplicated set of (user, source) reasons.
+/// Multiple users / sources can keep one shared library title alive.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Provenance {
+    pub entries: Vec<ProvenanceEntry>,
+}
+
+impl Default for Provenance {
+    /// An owned record with no recorded provenance (e.g. decoded from the pre-provenance
+    /// schema) is treated as a manual add — the safe default the reconciler never removes.
+    fn default() -> Self {
+        Provenance::manual()
+    }
+}
+
+impl Provenance {
+    pub fn manual() -> Self {
+        Provenance { entries: vec![ProvenanceEntry::Manual] }
+    }
+    pub fn watchlist(user: impl Into<String>) -> Self {
+        Provenance { entries: vec![ProvenanceEntry::Watchlist { user: user.into() }] }
+    }
+    pub fn in_progress(user: impl Into<String>) -> Self {
+        Provenance { entries: vec![ProvenanceEntry::InProgress { user: user.into() }] }
+    }
+    /// Union `other`'s entries into `self`, de-duplicating identical (variant, user) entries.
+    // O(n²) dedup, but n is small in practice (Manual + at most one entry per user per source).
+    pub fn merge(&mut self, other: &Provenance) {
+        for e in &other.entries {
+            if !self.entries.contains(e) {
+                self.entries.push(e.clone());
+            }
+        }
+    }
+    /// True if at least one entry is `Manual`. A title with any manual origin must never be
+    /// auto-removed by the reconciler, regardless of Trakt state. (Provenance built via the
+    /// constructors is always non-empty; `entries` is `pub` only for multi-entry construction.)
+    pub fn has_manual_entry(&self) -> bool {
+        self.entries.iter().any(|e| matches!(e, ProvenanceEntry::Manual))
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OwnedRecord {
     pub request: AcquireRequest,
-    pub source: String,
+    #[serde(default)]
+    pub provenance: Provenance,
     pub added_at: u64,
     pub status: OwnedStatus,
 }
@@ -888,7 +943,7 @@ mod tests {
         let store = mem_store();
         let rec = OwnedRecord {
             request: req("tt1", 27205),
-            source: "manual".to_string(),
+            provenance: Provenance::manual(),
             added_at: 100,
             status: OwnedStatus::Pending,
         };
@@ -1059,7 +1114,7 @@ mod tests {
                 let mut ot = txn.open_table(odef).unwrap();
                 let rec = OwnedRecord {
                     request: req("tt2", 99_999),
-                    source: "test".to_string(),
+                    provenance: Provenance::manual(),
                     added_at: 42,
                     status: OwnedStatus::Pending,
                 };
@@ -1124,5 +1179,81 @@ mod tests {
             !std::path::Path::new(&tmp.corrupt_path()).exists(),
             "valid v1 DB must not be moved aside"
         );
+    }
+
+    // ── SP2 Task 4 tests (per-user provenance on OwnedRecord) ─────────────────
+
+    /// Old-schema records (with `"source"` key, no `"provenance"` key) must decode as
+    /// `Provenance::manual()` — the safe default the reconciler never auto-removes.
+    /// The decode must be invariant to the old string's value, not just the literal `"manual"`.
+    #[tokio::test]
+    async fn old_encoding_decodes_to_manual() {
+        let old = serde_json::json!({
+            "request": serde_json::to_value(req("tt1", 27205)).unwrap(),
+            "source": "manual",
+            "added_at": 100,
+            "status": "Pending",
+        });
+        let decoded: OwnedRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(decoded.provenance, Provenance::manual());
+        assert_eq!(decoded.status, OwnedStatus::Pending);
+
+        // An arbitrary old "source" value must also decode as manual() — the field is ignored.
+        let old_arbitrary = serde_json::json!({
+            "request": serde_json::to_value(req("tt1", 27205)).unwrap(),
+            "source": "test",
+            "added_at": 100,
+            "status": "Pending",
+        });
+        let decoded2: OwnedRecord = serde_json::from_value(old_arbitrary).unwrap();
+        assert_eq!(decoded2.provenance, Provenance::manual());
+    }
+
+    /// A new-format record with multi-user provenance must survive a put→get round-trip
+    /// through the store with all entries intact.
+    #[tokio::test]
+    async fn provenance_round_trips_through_store() {
+        let store = mem_store();
+        let expected_prov = Provenance {
+            entries: vec![
+                ProvenanceEntry::Watchlist { user: "alice".into() },
+                ProvenanceEntry::InProgress { user: "bob".into() },
+            ],
+        };
+        let rec = OwnedRecord {
+            request: req("tt1", 27205),
+            provenance: expected_prov.clone(),
+            added_at: 100,
+            status: OwnedStatus::Pending,
+        };
+        store.put_owned("h1".to_string(), rec).await.unwrap();
+        let got = store.get_owned("h1".to_string()).await.unwrap();
+        assert_eq!(got.provenance, expected_prov);
+    }
+
+    /// `Provenance::merge` unions entries and deduplicates; `has_manual_entry` reports correctly.
+    #[test]
+    fn provenance_merge_deduplicates() {
+        let mut p = Provenance::watchlist("alice");
+        p.merge(&Provenance::in_progress("bob"));
+        assert_eq!(p.entries.len(), 2);
+
+        // Merging an identical entry must not grow the list.
+        p.merge(&Provenance::watchlist("alice"));
+        assert_eq!(p.entries.len(), 2, "duplicate entry must not be added");
+
+        assert!(!p.has_manual_entry(), "watchlist+in_progress provenance must not report has_manual_entry");
+        assert!(Provenance::manual().has_manual_entry(), "Manual provenance must report has_manual_entry");
+
+        // Critical mixed case: a manually-acquired title that a Trakt user later watchlisted
+        // must still be protected from auto-removal (this is what the OLD .all()-based predicate
+        // wrongly returned false for).
+        let mut mixed = Provenance::manual();
+        mixed.merge(&Provenance::watchlist("alice"));
+        assert_eq!(mixed.entries.len(), 2, "[Manual, Watchlist] should have 2 entries");
+        assert!(mixed.has_manual_entry(), "mixed Manual+Watchlist must report has_manual_entry");
+
+        // A pure watchlist provenance must NOT be considered manual.
+        assert!(!Provenance::watchlist("alice").has_manual_entry(), "pure watchlist must not report has_manual_entry");
     }
 }

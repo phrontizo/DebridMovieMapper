@@ -4,7 +4,7 @@ use crate::provider::{DebridProvider, FileLocator};
 use crate::rd_client::TorrentInfo;
 use crate::release::{self, ReleaseInfo};
 use crate::scraper::{MediaKind, Scraper};
-use crate::store::{AcquireRequest, OwnedRecord, OwnedStatus, Store};
+use crate::store::{AcquireRequest, OwnedRecord, OwnedStatus, Provenance, Store};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -366,7 +366,7 @@ impl AcquisitionEngine {
                 hash.clone(),
                 OwnedRecord {
                     request: req.clone(),
-                    source: "manual".to_string(),
+                    provenance: Provenance::manual(),
                     added_at: now_secs(),
                     status: OwnedStatus::Pending,
                 },
@@ -560,6 +560,7 @@ mod tests {
     use crate::rd_client::{AddMagnetResponse, TorrentFile, TorrentInfo as TI};
     use crate::release::RawCandidate;
     use crate::scraper::MockScraper;
+    use crate::store::Provenance;
     use crate::vfs::{MediaMetadata, MediaType};
     use redb::backends::InMemoryBackend;
 
@@ -784,7 +785,7 @@ mod tests {
             "h1".into(),
             OwnedRecord {
                 request: req(),
-                source: "manual".into(),
+                provenance: Provenance::manual(),
                 added_at: 1,
                 status: OwnedStatus::Verified,
             },
@@ -840,7 +841,7 @@ mod tests {
             "h1".into(),
             OwnedRecord {
                 request: req(),
-                source: "manual".into(),
+                provenance: Provenance::manual(),
                 added_at: 1,
                 status: OwnedStatus::Pending,
             },
