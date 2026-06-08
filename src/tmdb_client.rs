@@ -165,6 +165,18 @@ impl TmdbClient {
         Ok(parse_season_air_dates(&v, season))
     }
 
+    /// Enumerate a series' (non-Specials) season numbers from TMDB `/tv/{id}` details.
+    pub async fn show_season_numbers(&self, tmdb_id: u64) -> Result<Vec<u32>, reqwest::Error> {
+        let url = format!("https://api.themoviedb.org/3/tv/{}", tmdb_id);
+        let api_key = self.api_key.clone();
+        let v = self
+            .fetch_with_retry::<serde_json::Value>(|| {
+                self.client.get(&url).query(&[("api_key", api_key.as_str())])
+            })
+            .await?;
+        Ok(parse_season_numbers(&v))
+    }
+
     async fn fetch_with_retry<T: DeserializeOwned>(
         &self,
         make_request: impl Fn() -> RequestBuilder,
@@ -359,6 +371,23 @@ pub(crate) fn parse_season_air_dates(v: &serde_json::Value, season: u32) -> Vec<
             Some(EpisodeAirDate { season, episode, air_date })
         })
         .collect()
+}
+
+/// Parse the `seasons` array from a TMDB `/tv/{id}` details response into season numbers.
+/// Season 0 (TMDB "Specials") is excluded; entries with a missing or non-numeric
+/// `season_number` are skipped. The result is sorted ascending and de-duplicated.
+pub(crate) fn parse_season_numbers(v: &serde_json::Value) -> Vec<u32> {
+    let Some(seasons) = v.get("seasons").and_then(|s| s.as_array()) else {
+        return Vec::new();
+    };
+    let mut nums: Vec<u32> = seasons
+        .iter()
+        .filter_map(|s| u32::try_from(s.get("season_number")?.as_u64()?).ok())
+        .filter(|&n| n != 0)
+        .collect();
+    nums.sort_unstable();
+    nums.dedup();
+    nums
 }
 
 #[cfg(test)]
@@ -566,5 +595,44 @@ mod tests {
         // Empty array → empty vec
         let empty_array = serde_json::json!({ "episodes": [] });
         assert!(parse_season_air_dates(&empty_array, 1).is_empty());
+    }
+
+    // --- parse_season_numbers tests ---
+
+    #[test]
+    fn parse_season_numbers_excludes_specials_and_sorts() {
+        use super::parse_season_numbers;
+        // seasons arrive out of order and include season 0 (Specials), which must be dropped.
+        let v = serde_json::json!({
+            "seasons": [
+                { "season_number": 2 },
+                { "season_number": 0 }, // Specials → excluded
+                { "season_number": 1 },
+            ]
+        });
+        assert_eq!(parse_season_numbers(&v), vec![1, 2]);
+    }
+
+    #[test]
+    fn parse_season_numbers_missing_key_is_empty() {
+        use super::parse_season_numbers;
+        assert_eq!(parse_season_numbers(&serde_json::json!({})), Vec::<u32>::new());
+        // An explicit empty seasons array must also yield an empty vec.
+        assert_eq!(parse_season_numbers(&serde_json::json!({ "seasons": [] })), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn parse_season_numbers_skips_non_numeric_and_dedups() {
+        use super::parse_season_numbers;
+        let v = serde_json::json!({
+            "seasons": [
+                { "season_number": 1 },
+                { "season_number": "x" }, // non-numeric → skipped
+                { "name": "no number" },  // missing season_number → skipped
+                { "season_number": 1 },   // duplicate → de-duped
+                { "season_number": 3 },
+            ]
+        });
+        assert_eq!(parse_season_numbers(&v), vec![1, 3]);
     }
 }

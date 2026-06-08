@@ -617,30 +617,21 @@ async fn build_acquire_request(
     })
 }
 
-/// The pure, unit-testable decision layer: diff the combined `wanted` set against owned content
-/// (present in `torrents` = available) and return the `ReconcileOp`s. NO TMDB, NO engine.
-///
-/// Movies are fully reconciled (acquire / re-acquire / Trigger-A + Trigger-B removal) via
-/// `wanted::reconcile_title`. Shows in Task 8 handle ONLY Trigger-B removal (abandoned watchlist,
-/// no air dates needed); show-episode acquisition and Trigger-A finish removal are Task 9.
-pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> Vec<ReconcileOp> {
-    use crate::wanted::{reconcile_title, trigger_b_abandoned, Action, Owned, TitleView};
-    use std::collections::{BTreeMap, BTreeSet, HashSet};
+/// An aggregated view of every owned record sharing a `tmdb_id`: all (lowercased) hashes, the
+/// merged provenance across those hashes, the union of owned `(season, episode)` pairs, and the
+/// `media_type` taken from the records' requests. Built by [`group_owned_by_tmdb`].
+pub(crate) struct OwnedGroup {
+    pub hashes: Vec<String>,
+    pub provenance: Provenance,
+    pub owned_episodes: Vec<(u32, u32)>,
+    pub media_type: MediaType,
+}
 
-    // Group wanted rows by tmdb_id.
-    let mut wanted_by: BTreeMap<u64, Vec<WantedRecord>> = BTreeMap::new();
-    for r in store.all_wanted().await {
-        wanted_by.entry(r.tmdb_id).or_default().push(r);
-    }
-
-    // Group owned records by tmdb_id: all (lowercased) hashes, merged provenance, owned
-    // (season, episode) pairs, and the media_type from the first record's request.
-    struct OwnedGroup {
-        hashes: Vec<String>,
-        provenance: Provenance,
-        owned_episodes: Vec<(u32, u32)>,
-        media_type: MediaType,
-    }
+/// Group every owned record by its request's `tmdb_id` into an [`OwnedGroup`]. Shared by
+/// `plan_reconcile_ops` (Task 8) and `monitor_episodes` (Task 9) so the owned-grouping +
+/// per-title aggregation lives in exactly one place.
+pub(crate) async fn group_owned_by_tmdb(store: &Store) -> std::collections::BTreeMap<u64, OwnedGroup> {
+    use std::collections::BTreeMap;
     let mut owned_by: BTreeMap<u64, OwnedGroup> = BTreeMap::new();
     for (hash, rec) in store.all_owned().await {
         let group = owned_by.entry(rec.request.tmdb_id).or_insert_with(|| OwnedGroup {
@@ -652,9 +643,38 @@ pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> V
         group.hashes.push(hash.to_ascii_lowercase());
         group.provenance.merge(&rec.provenance);
         if let (Some(s), Some(e)) = (rec.request.season, rec.request.episode) {
-            group.owned_episodes.push((s, e)); // populated for Task 9 (monitor_episodes); unused in Task 8
+            group.owned_episodes.push((s, e));
         }
     }
+    owned_by
+}
+
+/// Group every wanted record by its `tmdb_id` into a `BTreeMap`. Shared by
+/// `plan_reconcile_ops` and `monitor_episodes` so the wanted-grouping lives in one place.
+pub(crate) async fn group_wanted_by_tmdb(store: &Store) -> std::collections::BTreeMap<u64, Vec<WantedRecord>> {
+    use std::collections::BTreeMap;
+    let mut wanted_by: BTreeMap<u64, Vec<WantedRecord>> = BTreeMap::new();
+    for r in store.all_wanted().await {
+        wanted_by.entry(r.tmdb_id).or_default().push(r);
+    }
+    wanted_by
+}
+
+/// The pure, unit-testable decision layer: diff the combined `wanted` set against owned content
+/// (present in `torrents` = available) and return the `ReconcileOp`s. NO TMDB, NO engine.
+///
+/// Movies are fully reconciled (acquire / re-acquire / Trigger-A + Trigger-B removal) via
+/// `wanted::reconcile_title`. Shows in Task 8 handle ONLY Trigger-B removal (abandoned watchlist,
+/// no air dates needed); show-episode acquisition and Trigger-A finish removal are Task 9.
+pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> Vec<ReconcileOp> {
+    use crate::wanted::{reconcile_title, trigger_b_abandoned, Action, Owned, TitleView};
+    use std::collections::{BTreeSet, HashSet};
+
+    // Group wanted rows by tmdb_id.
+    let wanted_by = group_wanted_by_tmdb(store).await;
+
+    // Group owned records by tmdb_id (shared helper — same grouping monitor_episodes uses).
+    let owned_by = group_owned_by_tmdb(store).await;
 
     // Presence in the provider listing = available; an absent owned hash is lapsed/lost.
     let present: HashSet<String> = torrents
@@ -810,6 +830,139 @@ pub async fn reconcile_wanted(
             }
             ReconcileOp::Acquire { tmdb_id, kind, season, episode, provenance } => {
                 execute_acquire(engine, tmdb, tmdb_id, kind, season, episode, provenance).await
+            }
+        }
+    }
+}
+
+// ── monitor_episodes (SP2 Task 9) ────────────────────────────────────────────
+
+/// Keep the episodes that have aired on/before `today` — an episode airing TODAY counts as aired
+/// (the `<=` boundary) — dropping those with no air date (`None`) or a future date. Returns the
+/// `(season, episode)` pairs in INPUT order. PURE — unit-tested for the chrono boundary.
+pub(crate) fn aired_pairs(
+    episodes: &[crate::tmdb_client::EpisodeAirDate],
+    today: chrono::NaiveDate,
+) -> Vec<(u32, u32)> {
+    episodes
+        .iter()
+        .filter_map(|e| match e.air_date {
+            Some(d) if d <= today => Some((e.season, e.episode)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// All aired `(season, episode)` pairs for a show as of `today`: enumerate the show's
+/// (non-Specials) seasons, fetch each season's episode air dates, and collect `aired_pairs`
+/// across them. Best-effort I/O — a failure to enumerate seasons, or to fetch ONE season's air
+/// dates, is logged and skipped rather than failing the whole show. TMDB-driven, so exercised by
+/// the live smoke rather than unit tests.
+async fn aired_episodes(tmdb: &TmdbClient, tmdb_id: u64, today: chrono::NaiveDate) -> Vec<(u32, u32)> {
+    let seasons = match tmdb.show_season_numbers(tmdb_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("monitor_episodes: show_season_numbers({}) failed: {}; skipping show", tmdb_id, e);
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for season in seasons {
+        match tmdb.season_air_dates(tmdb_id, season).await {
+            Ok(eps) => out.extend(aired_pairs(&eps, today)),
+            Err(e) => warn!(
+                "monitor_episodes: season_air_dates({}, {}) failed: {}; skipping season",
+                tmdb_id, season, e
+            ),
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// For each tracked (wanted) SHOW, compute the episodes aired as-of-now from TMDB air dates,
+/// assemble a `TitleView` with those aired episodes, run the SAME pure reconcile-core
+/// (`wanted::reconcile_title`), and execute the resulting ops — acquiring aired-but-not-owned
+/// episodes and removing finished/abandoned shows. This is the air-date-dependent half of show
+/// handling that Task 8 (`reconcile_wanted`) deferred.
+///
+/// OVERLAP: this re-derives `reconcile_wanted`'s show Trigger-B removal, which is harmless (both
+/// idempotent); `monitor_episodes` ADDITIONALLY does episode acquisition + Trigger-A finish
+/// removal (both air-date dependent, hence here and not in Task 8).
+///
+/// AVAILABILITY is title-level: a show's owned copy counts as `available` if ANY of its owned
+/// hashes is present in the provider listing. A specific episode is therefore treated as available
+/// whenever any of the show's hashes is present — acceptable for PROACTIVE acquisition (per-episode
+/// unavailability is still caught at playback/repair).
+pub async fn monitor_episodes(
+    engine: &AcquisitionEngine,
+    provider: &Arc<dyn DebridProvider>,
+    tmdb: &TmdbClient,
+    store: &Store,
+) {
+    use crate::wanted::{reconcile_title, Action, Owned, TitleView};
+    use std::collections::HashSet;
+
+    let today = chrono::Utc::now().date_naive();
+    // TODO(Task 10): the scheduler could pass a shared torrents snapshot to avoid a
+    // duplicate get_torrents() when monitor_episodes and reconcile_wanted run on the same tick.
+    let torrents = provider.get_torrents().await.unwrap_or_default();
+
+    // Group wanted rows by tmdb_id.
+    let wanted_by = group_wanted_by_tmdb(store).await;
+
+    // Same owned-grouping + availability logic as plan_reconcile_ops (shared helper).
+    let owned_by = group_owned_by_tmdb(store).await;
+    let present: HashSet<String> = torrents.iter().map(|t| t.hash.to_ascii_lowercase()).collect();
+
+    // Only tmdb_ids that a wanted row marks as a Show. (Owned-but-unwanted shows are handled by
+    // reconcile_wanted's Trigger-B path; monitor_episodes is the wanted-set's air-date driver.)
+    for (&tmdb_id, wanted) in &wanted_by {
+        if !wanted.iter().any(|r| r.media_type == MediaType::Show) {
+            continue;
+        }
+        let owned_group = owned_by.get(&tmdb_id);
+        let available = owned_group
+            .map(|g| g.hashes.iter().any(|h| present.contains(h)))
+            .unwrap_or(false);
+
+        let aired = aired_episodes(tmdb, tmdb_id, today).await;
+
+        let view = TitleView {
+            tmdb_id,
+            media_type: MediaType::Show,
+            wanted: wanted.clone(),
+            owned: owned_group.map(|g| Owned {
+                hash: g.hashes.first().cloned().unwrap_or_default(),
+                provenance: g.provenance.clone(),
+                available,
+                owned_episodes: g.owned_episodes.clone(),
+            }),
+            aired_episodes: aired,
+        };
+
+        for action in reconcile_title(&view) {
+            match action {
+                Action::AcquireEpisode { tmdb_id, season, episode } => {
+                    let mut prov = provenance_from_wanted(wanted);
+                    // Preserve existing provenance (esp. Manual) on re-acquire — exactly like Task 8's
+                    // AcquireMovie fix — so a manually-owned show keeps its never-auto-remove guard.
+                    if let Some(g) = owned_group {
+                        prov.merge(&g.provenance);
+                    }
+                    execute_acquire(
+                        engine, tmdb, tmdb_id, MediaKind::Series, Some(season), Some(episode), prov,
+                    )
+                    .await;
+                }
+                // Delete EVERY owned hash for this tmdb_id (the Action's `hash` is a representative).
+                Action::Remove { tmdb_id, .. } => {
+                    if let Some(g) = owned_group {
+                        execute_remove(provider, &torrents, store, tmdb_id, &g.hashes).await;
+                    }
+                }
+                Action::AcquireMovie { .. } => {} // unreachable for a Show
             }
         }
     }
@@ -1588,5 +1741,51 @@ mod reconcile_wanted_tests {
         execute_remove(&provider, &torrents, &store, 27205, &["h1".to_string()]).await;
         assert_eq!(*deleted.lock().unwrap(), vec!["t1".to_string()], "the torrent must be deleted");
         assert!(store.get_owned("h1".to_string()).await.is_none(), "the owned record must be removed");
+    }
+}
+
+#[cfg(test)]
+mod monitor_episodes_tests {
+    use super::*;
+    use crate::tmdb_client::EpisodeAirDate;
+
+    fn ep(season: u32, episode: u32, air: Option<(i32, u32, u32)>) -> EpisodeAirDate {
+        EpisodeAirDate {
+            season,
+            episode,
+            air_date: air.map(|(y, m, d)| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap()),
+        }
+    }
+
+    // ── aired_pairs (pure — the chrono boundary heart of Task 9) ───────────────
+
+    #[test]
+    fn aired_pairs_includes_past_and_today_excludes_future_and_none() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 8).unwrap();
+        let eps = vec![
+            ep(1, 1, Some((2026, 6, 7))), // yesterday → included
+            ep(1, 2, Some((2026, 6, 9))), // tomorrow  → excluded
+            ep(1, 3, Some((2026, 6, 8))), // today     → included (≤ boundary)
+            ep(1, 4, None),               // no air date → excluded
+        ];
+        assert_eq!(aired_pairs(&eps, today), vec![(1, 1), (1, 3)]);
+    }
+
+    #[test]
+    fn aired_pairs_preserves_input_order() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 8).unwrap();
+        let eps = vec![
+            ep(2, 5, Some((2020, 1, 1))),
+            ep(1, 1, Some((2019, 1, 1))),
+            ep(1, 2, Some((2030, 1, 1))), // future → dropped
+            ep(3, 1, Some((2021, 1, 1))),
+        ];
+        assert_eq!(aired_pairs(&eps, today), vec![(2, 5), (1, 1), (3, 1)]);
+    }
+
+    #[test]
+    fn aired_pairs_empty_input_is_empty() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 8).unwrap();
+        assert_eq!(aired_pairs(&[], today), Vec::<(u32, u32)>::new());
     }
 }
