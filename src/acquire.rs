@@ -301,6 +301,7 @@ impl AcquisitionEngine {
             &*self.provider,
             &hash,
             Duration::from_secs(1),
+            Duration::from_secs(15),
             selector,
         )
         .await

@@ -170,7 +170,9 @@ impl RepairManager {
                 .filter_map(|of| new_info.files.iter().find(|nf| nf.path == of.path).map(|nf| nf.id))
                 .collect()
         };
-        match crate::reacquire::materialise(&*self.rd_client, &old_info.hash, wait_duration, select).await {
+        // Repair keeps the single-poll behaviour (max_wait == settle): the re-added torrent is a
+        // known-good hash whose metadata should already be available.
+        match crate::reacquire::materialise(&*self.rd_client, &old_info.hash, wait_duration, wait_duration, select).await {
             Ok(pair) => Ok(pair),
             Err(e) => {
                 self.set_repair_failed(old_torrent_id).await;
