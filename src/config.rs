@@ -75,6 +75,85 @@ pub struct QualityPrefs {
     pub prefer_hdr: bool,
 }
 
+/// Trakt sync configuration (SP2). Held by `Config` as `Option<TraktConfig>`.
+///
+/// Present only when both `TRAKT_CLIENT_ID` and `TRAKT_CLIENT_SECRET` are set;
+/// absent means Trakt sync is disabled and the service runs as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraktConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    /// How often (seconds) to sync the Trakt watched-set. Default 900, min 60.
+    pub sync_interval_secs: u64,
+    /// How often (seconds) to check for new episodes of tracked shows. Default 3600, min 300.
+    pub episode_check_interval_secs: u64,
+}
+
+impl TraktConfig {
+    /// Pure construction from raw optional values (env-independent, for tests).
+    ///
+    /// Returns `None` unless both `client_id` and `client_secret` are present and
+    /// non-empty after trimming. Interval values default and clamp as documented.
+    pub fn from_parts(
+        client_id: Option<String>,
+        client_secret: Option<String>,
+        sync_interval_secs: Option<String>,
+        episode_check_interval_secs: Option<String>,
+    ) -> Option<TraktConfig> {
+        let client_id = client_id
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+        let client_secret = client_secret
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+
+        const DEFAULT_SYNC: u64 = 900;
+        const MIN_SYNC: u64 = 60;
+        const DEFAULT_EPISODE: u64 = 3600;
+        const MIN_EPISODE: u64 = 300;
+
+        let sync_interval_secs = match sync_interval_secs {
+            Some(s) => s.trim().parse::<u64>().unwrap_or_else(|_| {
+                warn!("Invalid TRAKT_SYNC_INTERVAL_SECS value '{}', falling back to {}", s, DEFAULT_SYNC);
+                DEFAULT_SYNC
+            }),
+            None => DEFAULT_SYNC,
+        }
+        .max(MIN_SYNC);
+
+        let episode_check_interval_secs = match episode_check_interval_secs {
+            Some(s) => s.trim().parse::<u64>().unwrap_or_else(|_| {
+                warn!(
+                    "Invalid TRAKT_EPISODE_CHECK_INTERVAL_SECS value '{}', falling back to {}",
+                    s, DEFAULT_EPISODE
+                );
+                DEFAULT_EPISODE
+            }),
+            None => DEFAULT_EPISODE,
+        }
+        .max(MIN_EPISODE);
+
+        Some(TraktConfig {
+            client_id,
+            client_secret,
+            sync_interval_secs,
+            episode_check_interval_secs,
+        })
+    }
+
+    /// Read `TRAKT_CLIENT_ID`, `TRAKT_CLIENT_SECRET`, `TRAKT_SYNC_INTERVAL_SECS`,
+    /// and `TRAKT_EPISODE_CHECK_INTERVAL_SECS` from the process environment, then delegate
+    /// to `from_parts`.
+    pub fn from_env() -> Option<TraktConfig> {
+        Self::from_parts(
+            std::env::var("TRAKT_CLIENT_ID").ok(),
+            std::env::var("TRAKT_CLIENT_SECRET").ok(),
+            std::env::var("TRAKT_SYNC_INTERVAL_SECS").ok(),
+            std::env::var("TRAKT_EPISODE_CHECK_INTERVAL_SECS").ok(),
+        )
+    }
+}
+
 /// Acquisition-engine configuration (SP1). Held by `Config`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcquisitionConfig {
@@ -172,6 +251,8 @@ pub struct Config {
     pub db_path: String,
     pub port: u16,
     pub acquisition: AcquisitionConfig,
+    /// Trakt sync config. `None` when `TRAKT_CLIENT_ID`/`TRAKT_CLIENT_SECRET` are absent.
+    pub trakt: Option<TraktConfig>,
 }
 
 impl Config {
@@ -186,6 +267,7 @@ impl Config {
             std::env::var("PORT").ok(),
         )?;
         cfg.acquisition = AcquisitionConfig::from_env();
+        cfg.trakt = TraktConfig::from_env();
         Ok(cfg)
     }
 
@@ -233,6 +315,7 @@ impl Config {
             db_path,
             port,
             acquisition: AcquisitionConfig::default(),
+            trakt: None,
         })
     }
 }
@@ -369,5 +452,85 @@ mod tests {
         assert_eq!(SubReq::parse(None), SubReq::None);
         assert_eq!(SubReq::parse(Some("none".into())), SubReq::None);
         assert_eq!(SubReq::parse(Some("eng".into())), SubReq::Lang("eng".into()));
+    }
+
+    // ── TraktConfig tests ────────────────────────────────────────────────────
+
+    fn trakt(
+        id: Option<&str>,
+        secret: Option<&str>,
+        sync: Option<&str>,
+        episode: Option<&str>,
+    ) -> Option<TraktConfig> {
+        TraktConfig::from_parts(
+            id.map(String::from),
+            secret.map(String::from),
+            sync.map(String::from),
+            episode.map(String::from),
+        )
+    }
+
+    #[test]
+    fn trakt_both_present_uses_defaults() {
+        let t = trakt(Some("id123"), Some("secret456"), None, None).unwrap();
+        assert_eq!(t.client_id, "id123");
+        assert_eq!(t.client_secret, "secret456");
+        assert_eq!(t.sync_interval_secs, 900);
+        assert_eq!(t.episode_check_interval_secs, 3600);
+    }
+
+    #[test]
+    fn trakt_id_absent_gives_none() {
+        assert!(trakt(None, Some("secret"), None, None).is_none());
+    }
+
+    #[test]
+    fn trakt_secret_absent_gives_none() {
+        assert!(trakt(Some("id"), None, None, None).is_none());
+    }
+
+    #[test]
+    fn trakt_both_absent_gives_none() {
+        assert!(trakt(None, None, None, None).is_none());
+    }
+
+    #[test]
+    fn trakt_empty_id_gives_none() {
+        assert!(trakt(Some("  "), Some("secret"), None, None).is_none());
+    }
+
+    #[test]
+    fn trakt_empty_secret_gives_none() {
+        assert!(trakt(Some("id"), Some(""), None, None).is_none());
+    }
+
+    #[test]
+    fn trakt_sync_interval_clamped() {
+        // Below min → clamped to 60
+        assert_eq!(trakt(Some("id"), Some("s"), Some("5"), None).unwrap().sync_interval_secs, 60);
+        // Exactly at min → kept as-is (boundary)
+        assert_eq!(trakt(Some("id"), Some("s"), Some("60"), None).unwrap().sync_interval_secs, 60);
+        // Invalid → default 900
+        assert_eq!(trakt(Some("id"), Some("s"), Some("abc"), None).unwrap().sync_interval_secs, 900);
+        // Valid above min → kept
+        assert_eq!(trakt(Some("id"), Some("s"), Some("1200"), None).unwrap().sync_interval_secs, 1200);
+    }
+
+    #[test]
+    fn trakt_episode_check_interval_clamped() {
+        // Below min → clamped to 300
+        assert_eq!(trakt(Some("id"), Some("s"), None, Some("100")).unwrap().episode_check_interval_secs, 300);
+        // Exactly at min → kept as-is (boundary)
+        assert_eq!(trakt(Some("id"), Some("s"), None, Some("300")).unwrap().episode_check_interval_secs, 300);
+        // Invalid → default 3600
+        assert_eq!(trakt(Some("id"), Some("s"), None, Some("xyz")).unwrap().episode_check_interval_secs, 3600);
+        // Valid above min → kept
+        assert_eq!(trakt(Some("id"), Some("s"), None, Some("7200")).unwrap().episode_check_interval_secs, 7200);
+    }
+
+    #[test]
+    fn config_from_parts_has_trakt_none() {
+        let c = parts(Some("rd"), None, Some("tmdb"), None, None, None).unwrap();
+        assert_eq!(c.trakt, None);
     }
 }
