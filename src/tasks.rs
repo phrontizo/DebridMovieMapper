@@ -46,6 +46,7 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
         http_client: _,
         scraper: _,
         engine,
+        trakt_client: _,
     } = scan_config.app;
     let interval_secs = config.scan_interval_secs;
     // Load persisted matches from DB on startup
@@ -1108,6 +1109,7 @@ mod provider_abstraction_tests {
             http_client: reqwest::Client::new(),
             scraper,
             engine,
+            trakt_client: None,
         };
         let _config = ScanConfig { app };
     }

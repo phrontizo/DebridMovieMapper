@@ -12,6 +12,7 @@ pub mod rd_client;
 pub mod release;
 pub mod reacquire;
 pub mod repair;
+pub mod scheduler;
 pub mod scraper;
 pub mod store;
 pub mod tasks;

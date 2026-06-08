@@ -11,8 +11,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Shared application state, constructed once at startup and cloned (cheaply —
-/// every field is an `Arc`/handle) into the background scan task. Future phases
-/// (scheduler, web UI) hang their handles off this struct.
+/// every field is an `Arc`/handle) into the background tasks spawned by the
+/// scheduler. Future phases (web UI) hang their handles off this struct.
 #[derive(Clone)]
 pub struct AppState {
     pub provider: Arc<dyn DebridProvider>,
@@ -25,4 +25,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub scraper: Arc<dyn Scraper>,
     pub engine: Arc<AcquisitionEngine>,
+    /// The Trakt client, present only when Trakt sync is configured. The scheduler
+    /// gates the Trakt cycle + episode-monitor jobs on `is_some()`; the wanted/token
+    /// store handles are reachable via `store`.
+    pub trakt_client: Option<Arc<dyn crate::trakt_client::TraktClient>>,
 }

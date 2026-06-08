@@ -5,7 +5,6 @@ use debridmoviemapper::provider::{DebridProvider, ProviderKind};
 use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::repair::RepairManager;
 use debridmoviemapper::app_state::AppState;
-use debridmoviemapper::tasks::ScanConfig;
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::torbox_client::TorBoxClient;
 use debridmoviemapper::vfs::DebridVfs;
@@ -101,6 +100,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Construct the Trakt client only when Trakt sync is configured. Read `config.trakt`
+    // here, before `config` is moved into the `AppState` (`config: Arc::new(config)`).
+    let trakt_client: Option<Arc<dyn debridmoviemapper::trakt_client::TraktClient>> =
+        config.trakt.as_ref().map(|t| {
+            Arc::new(debridmoviemapper::trakt_client::TraktClientImpl::new(
+                t.client_id.clone(),
+                t.client_secret.clone(),
+                http_client.clone(),
+            )) as Arc<dyn debridmoviemapper::trakt_client::TraktClient>
+        });
+
     let app_state = AppState {
         provider: provider.clone(),
         tmdb_client: tmdb_client.clone(),
@@ -112,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_client: http_client.clone(),
         scraper: scraper.clone(),
         engine: engine.clone(),
+        trakt_client,
     };
 
     // TEMPORARY (SP1) dev/verification trigger — remove once SP2 (Trakt) / SP4 (ad-hoc add) exist.
@@ -172,10 +183,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let scan_handle = tokio::spawn(debridmoviemapper::tasks::run_scan_loop(
-        ScanConfig {
-            app: app_state.clone(),
-        },
+    let scheduler_handle = tokio::spawn(debridmoviemapper::scheduler::run(
+        app_state.clone(),
         shutdown_rx,
     ));
 
@@ -270,10 +279,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Signal the scan loop to stop and wait for it to finish
+    // Signal the background tasks to stop and wait for them to finish
     let _ = shutdown_tx.send(true);
-    info!("Waiting for scan task to finish...");
-    let _ = scan_handle.await;
+    info!("Waiting for background tasks to finish...");
+    if let Err(e) = scheduler_handle.await {
+        tracing::error!("Scheduler task ended abnormally: {:?}", e);
+    }
 
     info!("Shutdown complete.");
     Ok(())
