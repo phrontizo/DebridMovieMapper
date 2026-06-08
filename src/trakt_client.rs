@@ -394,7 +394,9 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
 
 // --- Test-only mock -------------------------------------------------------------------------
 
-/// Test-only client returning canned values (mirrors `MockScraper`).
+/// Test-only client returning canned values (mirrors `MockScraper`). The `fail_reads`/
+/// `fail_refresh` flags inject errors so callers (e.g. `sync_trakt`) can exercise their
+/// failure-handling paths; when both are false the canned values are returned unchanged.
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub struct MockTrakt {
@@ -404,6 +406,17 @@ pub struct MockTrakt {
     pub watchlist: Vec<TraktItem>,
     pub in_progress: Vec<TraktItem>,
     pub watched: WatchedData,
+    /// When true, `watchlist`/`in_progress`/`watched` return `Err`.
+    pub fail_reads: bool,
+    /// When true, `refresh` returns `Err`.
+    pub fail_refresh: bool,
+}
+
+#[cfg(test)]
+impl MockTrakt {
+    fn read_error() -> AppError {
+        AppError::Config("mock trakt read failure".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -416,15 +429,27 @@ impl TraktClient for MockTrakt {
         Ok(self.poll.clone())
     }
     async fn refresh(&self, _refresh_token: &str) -> Result<TraktTokenResponse, AppError> {
+        if self.fail_refresh {
+            return Err(AppError::Config("mock trakt refresh failure".to_string()));
+        }
         Ok(self.token.clone())
     }
     async fn watchlist(&self, _access_token: &str) -> Result<Vec<TraktItem>, AppError> {
+        if self.fail_reads {
+            return Err(Self::read_error());
+        }
         Ok(self.watchlist.clone())
     }
     async fn in_progress(&self, _access_token: &str) -> Result<Vec<TraktItem>, AppError> {
+        if self.fail_reads {
+            return Err(Self::read_error());
+        }
         Ok(self.in_progress.clone())
     }
     async fn watched(&self, _access_token: &str) -> Result<WatchedData, AppError> {
+        if self.fail_reads {
+            return Err(Self::read_error());
+        }
         Ok(self.watched.clone())
     }
 }
@@ -621,6 +646,8 @@ mod tests {
             watchlist: vec![TraktItem { media_type: MediaType::Movie, tmdb_id: 1 }],
             in_progress: vec![TraktItem { media_type: MediaType::Show, tmdb_id: 2 }],
             watched: WatchedData { movies: vec![3], shows: vec![] },
+            fail_reads: false,
+            fail_refresh: false,
         };
         let client: Arc<dyn TraktClient> = Arc::new(mock);
         assert_eq!(client.device_code().await.unwrap().user_code, "CODE");
@@ -638,5 +665,22 @@ mod tests {
             vec![TraktItem { media_type: MediaType::Show, tmdb_id: 2 }]
         );
         assert_eq!(client.watched("ignored").await.unwrap().movies, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn mock_trakt_fail_reads_errors_reads_and_fail_refresh_errors_refresh() {
+        let mock = MockTrakt {
+            watchlist: vec![TraktItem { media_type: MediaType::Movie, tmdb_id: 1 }],
+            fail_reads: true,
+            fail_refresh: true,
+            ..Default::default()
+        };
+        assert!(mock.watchlist("ignored").await.is_err());
+        assert!(mock.in_progress("ignored").await.is_err());
+        assert!(mock.watched("ignored").await.is_err());
+        assert!(mock.refresh("ignored").await.is_err());
+        // device_code / poll_token are unaffected by the flags.
+        assert!(mock.device_code().await.is_ok());
+        assert!(mock.poll_token("dc").await.is_ok());
     }
 }

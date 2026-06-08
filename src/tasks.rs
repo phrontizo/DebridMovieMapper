@@ -7,7 +7,7 @@ use crate::vfs::{DebridVfs, MediaMetadata};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -356,6 +356,181 @@ async fn update_vfs(
     }
 }
 
+// ── Trakt → wanted sync (SP2 Task 7) ─────────────────────────────────────────
+
+/// Refresh a token this many seconds before it expires, so a sync never races the expiry.
+const REFRESH_BUFFER_SECS: u64 = 86_400;
+
+/// Combine a user's Trakt reads into their materialised wanted-set rows. PURE and deterministic:
+/// it aggregates per `tmdb_id` across `watchlist` (sets `sources.watchlist`) and `in_progress`
+/// (sets `sources.in_progress`) — the `media_type` comes from the item — and is keyed by a
+/// `BTreeMap` so the output is sorted by `tmdb_id`. Per title: a movie's `watched_state` reflects
+/// `watched.movies`; a show's reflects the matching `WatchedShow.watched_episodes` (else empty)
+/// and `show_status` is taken from the map (`None` when absent). `media_type` and the
+/// `WatchedState` variant always agree.
+pub(crate) fn build_wanted(
+    user: &str,
+    watchlist: &[crate::trakt_client::TraktItem],
+    in_progress: &[crate::trakt_client::TraktItem],
+    watched: &crate::trakt_client::WatchedData,
+    show_status: &std::collections::HashMap<u64, crate::tmdb_client::ShowStatus>,
+) -> Vec<crate::store::WantedRecord> {
+    use crate::store::{WantedRecord, WantedSources, WatchedState};
+    use crate::vfs::MediaType;
+
+    /// Per-tmdb_id aggregation of which sources want a title.
+    struct Agg {
+        media_type: MediaType,
+        watchlist: bool,
+        in_progress: bool,
+    }
+    // BTreeMap keyed by tmdb_id keeps the output deterministically sorted.
+    let mut agg: std::collections::BTreeMap<u64, Agg> = std::collections::BTreeMap::new();
+    for item in watchlist {
+        agg.entry(item.tmdb_id)
+            .or_insert_with(|| Agg { media_type: item.media_type.clone(), watchlist: false, in_progress: false })
+            .watchlist = true;
+    }
+    for item in in_progress {
+        agg.entry(item.tmdb_id)
+            .or_insert_with(|| Agg { media_type: item.media_type.clone(), watchlist: false, in_progress: false })
+            .in_progress = true;
+    }
+
+    agg.into_iter()
+        .map(|(tmdb_id, a)| {
+            let (watched_state, status) = match a.media_type {
+                MediaType::Movie => (WatchedState::Movie { watched: watched.movies.contains(&tmdb_id) }, None),
+                MediaType::Show => {
+                    let watched_episodes = watched
+                        .shows
+                        .iter()
+                        .find(|s| s.tmdb_id == tmdb_id)
+                        .map(|s| s.watched_episodes.clone())
+                        .unwrap_or_default();
+                    (WatchedState::Show { watched_episodes }, show_status.get(&tmdb_id).copied())
+                }
+            };
+            WantedRecord {
+                user: user.to_string(),
+                tmdb_id,
+                media_type: a.media_type,
+                sources: WantedSources { watchlist: a.watchlist, in_progress: a.in_progress },
+                watched_state,
+                show_status: status,
+            }
+        })
+        .collect()
+}
+
+/// For every enrolled Trakt user, refresh near-expiry tokens, pull their Trakt reads + per-show
+/// TMDB status, and rewrite their `wanted` rows. A user whose sync fails is `warn!`ed and flagged
+/// for re-enrolment (`needs_reenrolment = true`); because `sync_trakt_user` performs all of its
+/// `wanted` writes only after every fetch has succeeded, a failure leaves that user's existing
+/// `wanted` rows untouched.
+pub async fn sync_trakt(
+    trakt: &std::sync::Arc<dyn crate::trakt_client::TraktClient>,
+    tmdb: &crate::tmdb_client::TmdbClient,
+    store: &crate::store::Store,
+) {
+    for (slug, tokens) in store.all_trakt_tokens().await {
+        if let Err(e) = sync_trakt_user(trakt, tmdb, store, &slug, tokens.clone()).await {
+            warn!("Trakt sync failed for {}: {}; flagging account for re-enrolment", slug, e);
+            // A successful refresh inside sync_trakt_user persists a fresh (single-use) token before a
+            // later read can fail; re-read so we don't clobber it with the stale pre-refresh snapshot.
+            let current = store.get_trakt_tokens(slug.clone()).await.unwrap_or(tokens);
+            let flagged = crate::store::TraktTokens { needs_reenrolment: true, ..current };
+            if let Err(pe) = store.put_trakt_tokens(slug, flagged).await {
+                error!("Failed to persist re-enrolment flag for account: {}", pe);
+            }
+        }
+    }
+}
+
+/// Sync one user. Returns `Err` (so `sync_trakt` flags the account) on a token-refresh or
+/// Trakt-read failure; a TMDB hiccup is tolerated (it is not a de-auth). All `wanted` writes
+/// happen only after every Trakt fetch has succeeded, so an early error leaves `wanted` intact.
+///
+/// NOTE: store-write errors (`put_wanted`/`remove_wanted`/`put_trakt_tokens`) also propagate as
+/// `Err` and therefore trigger `needs_reenrolment`; this is intentional and self-healing — the
+/// flag is cleared on the next successful sync.
+async fn sync_trakt_user(
+    trakt: &std::sync::Arc<dyn crate::trakt_client::TraktClient>,
+    tmdb: &crate::tmdb_client::TmdbClient,
+    store: &crate::store::Store,
+    slug: &str,
+    mut tokens: crate::store::TraktTokens,
+) -> Result<(), crate::error::AppError> {
+    use crate::store::TraktTokens;
+    use crate::vfs::MediaType;
+
+    // Refresh if at/near expiry, persisting the fresh tokens before using them.
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if tokens.expires_at <= now + REFRESH_BUFFER_SECS {
+        let r = trakt.refresh(&tokens.refresh).await?;
+        tokens = TraktTokens {
+            access: r.access_token,
+            refresh: r.refresh_token,
+            expires_at: r.created_at + r.expires_in,
+            username: tokens.username.clone(),
+            needs_reenrolment: false,
+        };
+        store.put_trakt_tokens(slug.to_string(), tokens.clone()).await?;
+    }
+
+    // Pull reads. Any error propagates → the account is flagged by `sync_trakt`.
+    let watchlist = trakt.watchlist(&tokens.access).await?;
+    let in_progress = trakt.in_progress(&tokens.access).await?;
+    let watched = trakt.watched(&tokens.access).await?;
+
+    // Per-show TMDB status. A TMDB failure must NOT fail the whole sync — skip that show
+    // (→ build_wanted yields show_status: None, which the reconciler treats conservatively).
+    let mut show_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for item in watchlist.iter().chain(in_progress.iter()) {
+        if item.media_type == MediaType::Show {
+            show_ids.insert(item.tmdb_id);
+        }
+    }
+    let mut statuses: std::collections::HashMap<u64, crate::tmdb_client::ShowStatus> =
+        std::collections::HashMap::new();
+    for tmdb_id in show_ids {
+        match tmdb.show_status(tmdb_id).await {
+            Ok(s) => {
+                statuses.insert(tmdb_id, s);
+            }
+            Err(e) => warn!("TMDB show_status({}) failed for {}: {}; treating status as unknown", tmdb_id, slug, e),
+        }
+    }
+
+    // Build the user's new wanted-set and write it: prune rows no longer wanted, then upsert.
+    let new = build_wanted(slug, &watchlist, &in_progress, &watched, &statuses);
+    let existing_ids: Vec<u64> = store
+        .all_wanted()
+        .await
+        .into_iter()
+        .filter(|r| r.user == slug)
+        .map(|r| r.tmdb_id)
+        .collect();
+    let new_ids: std::collections::HashSet<u64> = new.iter().map(|r| r.tmdb_id).collect();
+    for id in existing_ids {
+        if !new_ids.contains(&id) {
+            store.remove_wanted(slug.to_string(), id).await?;
+        }
+    }
+    for rec in new {
+        store.put_wanted(rec).await?;
+    }
+
+    // Clear a stale re-enrolment flag now that this sync has succeeded.
+    if tokens.needs_reenrolment {
+        store
+            .put_trakt_tokens(slug.to_string(), TraktTokens { needs_reenrolment: false, ..tokens })
+            .await?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,5 +673,320 @@ mod provider_abstraction_tests {
             engine,
         };
         let _config = ScanConfig { app };
+    }
+}
+
+#[cfg(test)]
+mod trakt_sync_tests {
+    use super::*;
+    use crate::store::{Store, TraktTokens, WantedRecord, WantedSources, WatchedState};
+    use crate::tmdb_client::{ShowStatus, TmdbClient};
+    use crate::trakt_client::{MockTrakt, TraktClient, TraktItem, TraktTokenResponse, WatchedData, WatchedShow};
+    use crate::vfs::MediaType;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn mem_store() -> Store {
+        let db = Arc::new(
+            redb::Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        );
+        Store::from_database(db).unwrap()
+    }
+
+    fn item(media_type: MediaType, tmdb_id: u64) -> TraktItem {
+        TraktItem { media_type, tmdb_id }
+    }
+
+    fn tokens(access: &str, expires_at: u64, needs_reenrolment: bool) -> TraktTokens {
+        TraktTokens {
+            access: access.to_string(),
+            refresh: "ref".to_string(),
+            expires_at,
+            username: "alice".to_string(),
+            needs_reenrolment,
+        }
+    }
+
+    fn movie_wanted_row(user: &str, tmdb_id: u64) -> WantedRecord {
+        WantedRecord {
+            user: user.to_string(),
+            tmdb_id,
+            media_type: MediaType::Movie,
+            sources: WantedSources { watchlist: true, in_progress: false },
+            watched_state: WatchedState::Movie { watched: false },
+            show_status: None,
+        }
+    }
+
+    // ── build_wanted (pure) ───────────────────────────────────────────────────
+
+    #[test]
+    fn build_wanted_watchlist_movie() {
+        let got = build_wanted(
+            "alice",
+            &[item(MediaType::Movie, 27205)],
+            &[],
+            &WatchedData::default(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            got,
+            vec![WantedRecord {
+                user: "alice".to_string(),
+                tmdb_id: 27205,
+                media_type: MediaType::Movie,
+                sources: WantedSources { watchlist: true, in_progress: false },
+                watched_state: WatchedState::Movie { watched: false },
+                show_status: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn build_wanted_watchlist_show_with_status_and_watched_episodes() {
+        let watched = WatchedData {
+            movies: vec![],
+            shows: vec![WatchedShow { tmdb_id: 1396, watched_episodes: vec![(1, 1), (1, 2)] }],
+        };
+        let mut status = HashMap::new();
+        status.insert(1396u64, ShowStatus::Ended);
+        let got = build_wanted("alice", &[item(MediaType::Show, 1396)], &[], &watched, &status);
+        assert_eq!(
+            got,
+            vec![WantedRecord {
+                user: "alice".to_string(),
+                tmdb_id: 1396,
+                media_type: MediaType::Show,
+                sources: WantedSources { watchlist: true, in_progress: false },
+                watched_state: WatchedState::Show { watched_episodes: vec![(1, 1), (1, 2)] },
+                show_status: Some(ShowStatus::Ended),
+            }]
+        );
+    }
+
+    #[test]
+    fn build_wanted_title_in_both_sources_sets_both_flags() {
+        let got = build_wanted(
+            "alice",
+            &[item(MediaType::Movie, 100)],
+            &[item(MediaType::Movie, 100)],
+            &WatchedData::default(),
+            &HashMap::new(),
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].sources, WantedSources { watchlist: true, in_progress: true });
+    }
+
+    #[test]
+    fn build_wanted_in_progress_only_show_sets_in_progress_and_absent_status_none() {
+        let got = build_wanted(
+            "alice",
+            &[],
+            &[item(MediaType::Show, 200)],
+            &WatchedData::default(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            got,
+            vec![WantedRecord {
+                user: "alice".to_string(),
+                tmdb_id: 200,
+                media_type: MediaType::Show,
+                sources: WantedSources { watchlist: false, in_progress: true },
+                watched_state: WatchedState::Show { watched_episodes: vec![] },
+                show_status: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn build_wanted_watched_movie_marks_watched() {
+        let watched = WatchedData { movies: vec![27205], shows: vec![] };
+        let got = build_wanted("alice", &[item(MediaType::Movie, 27205)], &[], &watched, &HashMap::new());
+        assert_eq!(got[0].watched_state, WatchedState::Movie { watched: true });
+    }
+
+    #[test]
+    fn build_wanted_is_sorted_by_tmdb_id() {
+        let wl = vec![item(MediaType::Movie, 30), item(MediaType::Movie, 10), item(MediaType::Movie, 20)];
+        let got = build_wanted("alice", &wl, &[], &WatchedData::default(), &HashMap::new());
+        assert_eq!(got.iter().map(|r| r.tmdb_id).collect::<Vec<_>>(), vec![10, 20, 30]);
+    }
+
+    // ── sync_trakt (async, MockTrakt + mem Store) ─────────────────────────────
+
+    #[tokio::test]
+    async fn sync_trakt_success_populates_wanted_and_leaves_flag_false() {
+        let store = mem_store();
+        store.put_trakt_tokens("alice".to_string(), tokens("acc", 9_999_999_999, false)).await.unwrap();
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            watchlist: vec![item(MediaType::Movie, 27205)],
+            watched: WatchedData { movies: vec![], shows: vec![] },
+            ..Default::default()
+        });
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+
+        sync_trakt(&trakt, &tmdb, &store).await;
+
+        let w = store.get_wanted("alice".to_string(), 27205).await.expect("wanted present");
+        assert!(w.sources.watchlist);
+        assert!(!store.get_trakt_tokens("alice".to_string()).await.unwrap().needs_reenrolment);
+    }
+
+    #[tokio::test]
+    async fn sync_trakt_refreshes_near_expiry_token() {
+        let store = mem_store();
+        store.put_trakt_tokens("alice".to_string(), tokens("old", 0, false)).await.unwrap();
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            token: TraktTokenResponse {
+                access_token: "REFRESHED".into(),
+                refresh_token: "newref".into(),
+                expires_in: 7_776_000,
+                created_at: 1_700_000_000,
+            },
+            watchlist: vec![item(MediaType::Movie, 27205)],
+            watched: WatchedData::default(),
+            ..Default::default()
+        });
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+
+        sync_trakt(&trakt, &tmdb, &store).await;
+
+        let tok = store.get_trakt_tokens("alice".to_string()).await.unwrap();
+        assert_eq!(tok.access, "REFRESHED", "refresh must have run and persisted");
+        assert!(store.get_wanted("alice".to_string(), 27205).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn sync_trakt_fetch_error_leaves_wanted_and_flags_account() {
+        let store = mem_store();
+        store.put_trakt_tokens("alice".to_string(), tokens("acc", 9_999_999_999, false)).await.unwrap();
+        let preexisting = movie_wanted_row("alice", 999);
+        store.put_wanted(preexisting.clone()).await.unwrap();
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt { fail_reads: true, ..Default::default() });
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+
+        sync_trakt(&trakt, &tmdb, &store).await;
+
+        assert_eq!(
+            store.get_wanted("alice".to_string(), 999).await,
+            Some(preexisting),
+            "a fetch failure must leave existing wanted rows untouched"
+        );
+        assert!(store.get_trakt_tokens("alice".to_string()).await.unwrap().needs_reenrolment);
+    }
+
+    #[tokio::test]
+    async fn sync_trakt_prunes_stale_wanted() {
+        let store = mem_store();
+        store.put_trakt_tokens("alice".to_string(), tokens("acc", 9_999_999_999, false)).await.unwrap();
+        store.put_wanted(movie_wanted_row("alice", 999)).await.unwrap();
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            watchlist: vec![item(MediaType::Movie, 27205)],
+            watched: WatchedData::default(),
+            ..Default::default()
+        });
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+
+        sync_trakt(&trakt, &tmdb, &store).await;
+
+        assert!(store.get_wanted("alice".to_string(), 27205).await.is_some(), "new title present");
+        assert!(store.get_wanted("alice".to_string(), 999).await.is_none(), "stale title pruned");
+    }
+
+    #[tokio::test]
+    async fn sync_trakt_clears_preexisting_flag_on_success() {
+        let store = mem_store();
+        store.put_trakt_tokens("alice".to_string(), tokens("acc", 9_999_999_999, true)).await.unwrap();
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            watchlist: vec![item(MediaType::Movie, 27205)],
+            watched: WatchedData::default(),
+            ..Default::default()
+        });
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+
+        sync_trakt(&trakt, &tmdb, &store).await;
+
+        assert!(
+            !store.get_trakt_tokens("alice".to_string()).await.unwrap().needs_reenrolment,
+            "a successful sync clears a stale re-enrolment flag"
+        );
+    }
+
+    /// A failure for one user must not affect other users. alice has an expired token and the
+    /// mock refuses to refresh (fail_refresh=true) → she is flagged and gets no wanted rows.
+    /// bob has a future-expiry token (no refresh needed) and the same mock succeeds his reads →
+    /// bob's wanted row is populated and his flag stays false.
+    #[tokio::test]
+    async fn sync_trakt_multi_user_failure_isolates_to_one_account() {
+        let store = mem_store();
+        // alice: expired token — refresh will fail
+        store.put_trakt_tokens("alice".to_string(), TraktTokens {
+            access: "alice-acc".to_string(),
+            refresh: "alice-ref".to_string(),
+            expires_at: 0,
+            username: "alice".to_string(),
+            needs_reenrolment: false,
+        }).await.unwrap();
+        // bob: fresh token — no refresh needed, reads will succeed
+        store.put_trakt_tokens("bob".to_string(), TraktTokens {
+            access: "bob-acc".to_string(),
+            refresh: "bob-ref".to_string(),
+            expires_at: 9_999_999_999,
+            username: "bob".to_string(),
+            needs_reenrolment: false,
+        }).await.unwrap();
+
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            fail_refresh: true,
+            watchlist: vec![item(MediaType::Movie, 27205)],
+            watched: WatchedData::default(),
+            ..Default::default()
+        });
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+
+        sync_trakt(&trakt, &tmdb, &store).await;
+
+        // alice: refresh failed → flagged, no wanted rows written
+        let alice_tok = store.get_trakt_tokens("alice".to_string()).await.unwrap();
+        assert!(alice_tok.needs_reenrolment, "alice must be flagged after refresh failure");
+        assert!(store.get_wanted("alice".to_string(), 27205).await.is_none(),
+            "alice's wanted must be empty — error occurred before any read");
+
+        // bob: sync succeeded → wanted row present, NOT flagged
+        let bob_tok = store.get_trakt_tokens("bob".to_string()).await.unwrap();
+        assert!(!bob_tok.needs_reenrolment, "bob must NOT be flagged");
+        assert!(store.get_wanted("bob".to_string(), 27205).await.is_some(),
+            "bob's wanted must be populated");
+    }
+
+    /// When refresh fails for an expired token, the account is flagged but the stored refresh
+    /// token is preserved (we never blank it) and no wanted rows are written.
+    #[tokio::test]
+    async fn sync_trakt_fail_refresh_flags_account_and_preserves_refresh_token() {
+        let store = mem_store();
+        store.put_trakt_tokens("alice".to_string(), TraktTokens {
+            access: "acc".to_string(),
+            refresh: "original-ref".to_string(),
+            expires_at: 0,
+            username: "alice".to_string(),
+            needs_reenrolment: false,
+        }).await.unwrap();
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            fail_refresh: true,
+            ..Default::default()
+        });
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+
+        sync_trakt(&trakt, &tmdb, &store).await;
+
+        let tok = store.get_trakt_tokens("alice".to_string()).await.unwrap();
+        assert!(tok.needs_reenrolment, "account must be flagged");
+        assert!(!tok.refresh.is_empty(), "refresh token must not be blanked");
+        // No wanted rows: the error occurred before any Trakt read
+        assert!(store.get_wanted("alice".to_string(), 27205).await.is_none(),
+            "no wanted rows must have been written");
     }
 }

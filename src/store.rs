@@ -112,12 +112,17 @@ pub struct OwnedRecord {
 }
 
 /// Persisted per-user Trakt OAuth tokens (the `trakt_tokens` table value; key = user slug).
+/// `needs_reenrolment` is set by the `sync_trakt` job when a token refresh or read fails (the
+/// account likely needs re-authorising); it is cleared on the next successful sync. Old records
+/// written before this field existed decode it as `false`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TraktTokens {
     pub access: String,
     pub refresh: String,
     pub expires_at: u64, // unix epoch seconds
     pub username: String,
+    #[serde(default)]
+    pub needs_reenrolment: bool,
 }
 
 /// Which Trakt sources put a title in a user's wanted-set.
@@ -985,6 +990,7 @@ mod tests {
             refresh: "refresh_tok".to_string(),
             expires_at: 9_999_999_999,
             username: username.to_string(),
+            needs_reenrolment: false,
         }
     }
 
@@ -1021,6 +1027,7 @@ mod tests {
             refresh: "ref2".to_string(),
             expires_at: 1_234_567_890,
             username: "bob".to_string(),
+            needs_reenrolment: true,
         };
         store.put_trakt_tokens("alice".to_string(), tok1.clone()).await.unwrap();
         store.put_trakt_tokens("bob".to_string(), tok2.clone()).await.unwrap();
@@ -1039,6 +1046,20 @@ mod tests {
         store.remove_trakt_tokens("alice".to_string()).await.unwrap();
         assert!(store.get_trakt_tokens("alice".to_string()).await.is_none());
         assert_eq!(store.all_trakt_tokens().await.len(), 1);
+    }
+
+    /// Old-shape token JSON (written before `needs_reenrolment` existed) must decode with the
+    /// flag defaulting to `false` — backward-compatible, mirroring the OwnedRecord provenance test.
+    #[test]
+    fn trakt_tokens_old_encoding_defaults_needs_reenrolment_false() {
+        let old = serde_json::json!({
+            "access": "a",
+            "refresh": "r",
+            "expires_at": 1,
+            "username": "u",
+        });
+        let decoded: TraktTokens = serde_json::from_value(old).unwrap();
+        assert!(!decoded.needs_reenrolment);
     }
 
     #[tokio::test]
@@ -1139,6 +1160,7 @@ mod tests {
             refresh: "r".to_string(),
             expires_at: 1,
             username: "u".to_string(),
+            needs_reenrolment: false,
         };
         store.put_trakt_tokens("u".to_string(), tokens).await.unwrap();
         assert_eq!(store.get_trakt_tokens("u".to_string()).await.unwrap().access, "a");
