@@ -90,6 +90,8 @@ pub struct MockProvider {
     /// Torrent ids whose `resolve_url` should return `Unavailable` (simulates a broken torrent),
     /// letting tests exercise the repair-on-`Unavailable` path while other ids resolve normally.
     pub unavailable_torrent_ids: std::collections::HashSet<String>,
+    /// Records every `delete_torrent` id so tests can assert that leaked torrents are cleaned up.
+    pub deleted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[cfg(test)]
@@ -110,7 +112,8 @@ impl DebridProvider for MockProvider {
     async fn select_files(&self, _torrent_id: &str, _file_ids: &str) -> Result<(), reqwest::Error> {
         Ok(())
     }
-    async fn delete_torrent(&self, _torrent_id: &str) -> Result<(), reqwest::Error> {
+    async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error> {
+        self.deleted.lock().unwrap().push(torrent_id.to_string());
         Ok(())
     }
     async fn resolve_url(&self, loc: &FileLocator) -> Result<String, crate::error::AppError> {

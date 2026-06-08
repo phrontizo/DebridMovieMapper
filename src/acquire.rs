@@ -279,6 +279,18 @@ impl AcquisitionEngine {
         AcquireOutcome::NoAcceptableRelease
     }
 
+    /// Delete any torrent in the account whose hash matches `hash`. Used when a candidate's
+    /// materialise fails *after* the provider registered the magnet (TorBox "already queued", or an
+    /// add whose file list never resolves and whose in-materialise delete lost a race) so a rejected
+    /// candidate never lingers as a dead "checking" torrent.
+    async fn cleanup_leaked(&self, hash: &str) {
+        if let Ok(torrents) = self.provider.get_torrents().await {
+            for t in torrents.iter().filter(|t| t.hash.eq_ignore_ascii_case(hash)) {
+                let _ = self.provider.delete_torrent(&t.id).await;
+            }
+        }
+    }
+
     async fn try_candidate(&self, req: &AcquireRequest, cand: &ReleaseInfo) -> CandidateResult {
         let hash = cand.info_hash.clone();
         let hint = cand.file_name.clone();
@@ -295,7 +307,8 @@ impl AcquisitionEngine {
         {
             Ok(p) => p,
             Err(e) => {
-                warn!("materialise failed for {}: {} — trying next", hash, e);
+                warn!("materialise failed for {}: {} — cleaning up and trying next", hash, e);
+                self.cleanup_leaked(&hash).await;
                 return CandidateResult::Next;
             }
         };
@@ -665,6 +678,30 @@ mod tests {
             st.authoritative_meta("h1".into()).await.unwrap().external_id.as_deref(),
             Some("tmdb:27205")
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_leaked_deletes_only_hash_matching_torrents() {
+        // A rejected/failed candidate's torrent must be removed (matched by hash, case-insensitive)
+        // so it doesn't linger as a dead "checking" torrent; unrelated torrents are left alone.
+        let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                crate::rd_client::Torrent { id: "keep".into(), hash: "other".into(), ..Default::default() },
+                crate::rd_client::Torrent { id: "leak".into(), hash: "H1".into(), ..Default::default() },
+            ],
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            store(),
+        );
+        eng.cleanup_leaked("h1").await; // case-insensitive vs the stored "H1"
+        assert_eq!(*deleted.lock().unwrap(), vec!["leak".to_string()]);
     }
 
     #[tokio::test]
