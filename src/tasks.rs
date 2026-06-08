@@ -1,9 +1,14 @@
+use crate::acquire::AcquisitionEngine;
 use crate::app_state::AppState;
+use crate::error::AppError;
 use crate::identification::identify_torrent;
+use crate::provider::DebridProvider;
+use crate::rd_client::Torrent;
 use crate::repair::RepairManager;
-use crate::store::Store;
+use crate::scraper::MediaKind;
+use crate::store::{AcquireRequest, Provenance, ProvenanceEntry, Store, WantedRecord};
 use crate::tmdb_client::TmdbClient;
-use crate::vfs::{DebridVfs, MediaMetadata};
+use crate::vfs::{DebridVfs, MediaMetadata, MediaType};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -531,6 +536,285 @@ async fn sync_trakt_user(
     Ok(())
 }
 
+// ── reconcile_wanted (SP2 Task 8) ────────────────────────────────────────────
+
+/// Map the scraper's `MediaKind` to the VFS `MediaType` (explicit Movie↔Movie / Series↔Show).
+fn media_type_of(kind: MediaKind) -> MediaType {
+    match kind {
+        MediaKind::Movie => MediaType::Movie,
+        MediaKind::Series => MediaType::Show,
+    }
+}
+
+/// The provenance to record AT ACQUIRE TIME: one entry per (user, source) that currently wants
+/// the title. PURE and deterministic — de-duplicated, never includes `Manual` (manual origins
+/// come from the `--acquire` CLI, not from a wanted-set).
+pub(crate) fn provenance_from_wanted(wanted: &[WantedRecord]) -> Provenance {
+    let mut prov = Provenance { entries: Vec::new() };
+    for r in wanted {
+        if r.sources.watchlist {
+            let e = ProvenanceEntry::Watchlist { user: r.user.clone() };
+            if !prov.entries.contains(&e) {
+                prov.entries.push(e);
+            }
+        }
+        if r.sources.in_progress {
+            let e = ProvenanceEntry::InProgress { user: r.user.clone() };
+            if !prov.entries.contains(&e) {
+                prov.entries.push(e);
+            }
+        }
+    }
+    prov
+}
+
+/// One reconcile decision, derived purely from the store + provider listing. Executed by
+/// `execute_acquire` / `execute_remove`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReconcileOp {
+    Acquire {
+        tmdb_id: u64,
+        kind: MediaKind,
+        season: Option<u32>,
+        episode: Option<u32>,
+        provenance: Provenance,
+    },
+    Remove {
+        tmdb_id: u64,
+        hashes: Vec<String>,
+    },
+}
+
+/// Build the `AcquireRequest` for `tmdb_id` by mirroring the `--acquire` CLI: resolve the IMDB id
+/// and (title, year, original_language) from TMDB. Any TMDB failure → `Err` (the caller logs and
+/// skips). TMDB-dependent, so it is exercised by the live smoke rather than unit tests.
+async fn build_acquire_request(
+    tmdb: &TmdbClient,
+    tmdb_id: u64,
+    kind: MediaKind,
+    season: Option<u32>,
+    episode: Option<u32>,
+) -> Result<AcquireRequest, AppError> {
+    let media_type = media_type_of(kind);
+    let imdb_id = tmdb
+        .external_imdb_id(tmdb_id, media_type.clone())
+        .await?
+        .ok_or_else(|| AppError::Config(format!("no IMDB id for tmdb {}", tmdb_id)))?;
+    let (title, year, original_language) = tmdb.details(tmdb_id, media_type.clone()).await?;
+    Ok(AcquireRequest {
+        imdb_id,
+        tmdb_id,
+        kind,
+        season,
+        episode,
+        original_language,
+        metadata: MediaMetadata {
+            title,
+            year,
+            media_type,
+            external_id: Some(format!("tmdb:{}", tmdb_id)),
+        },
+    })
+}
+
+/// The pure, unit-testable decision layer: diff the combined `wanted` set against owned content
+/// (present in `torrents` = available) and return the `ReconcileOp`s. NO TMDB, NO engine.
+///
+/// Movies are fully reconciled (acquire / re-acquire / Trigger-A + Trigger-B removal) via
+/// `wanted::reconcile_title`. Shows in Task 8 handle ONLY Trigger-B removal (abandoned watchlist,
+/// no air dates needed); show-episode acquisition and Trigger-A finish removal are Task 9.
+pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> Vec<ReconcileOp> {
+    use crate::wanted::{reconcile_title, trigger_b_abandoned, Action, Owned, TitleView};
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+    // Group wanted rows by tmdb_id.
+    let mut wanted_by: BTreeMap<u64, Vec<WantedRecord>> = BTreeMap::new();
+    for r in store.all_wanted().await {
+        wanted_by.entry(r.tmdb_id).or_default().push(r);
+    }
+
+    // Group owned records by tmdb_id: all (lowercased) hashes, merged provenance, owned
+    // (season, episode) pairs, and the media_type from the first record's request.
+    struct OwnedGroup {
+        hashes: Vec<String>,
+        provenance: Provenance,
+        owned_episodes: Vec<(u32, u32)>,
+        media_type: MediaType,
+    }
+    let mut owned_by: BTreeMap<u64, OwnedGroup> = BTreeMap::new();
+    for (hash, rec) in store.all_owned().await {
+        let group = owned_by.entry(rec.request.tmdb_id).or_insert_with(|| OwnedGroup {
+            hashes: Vec::new(),
+            provenance: Provenance { entries: Vec::new() },
+            owned_episodes: Vec::new(),
+            media_type: media_type_of(rec.request.kind),
+        });
+        group.hashes.push(hash.to_ascii_lowercase());
+        group.provenance.merge(&rec.provenance);
+        if let (Some(s), Some(e)) = (rec.request.season, rec.request.episode) {
+            group.owned_episodes.push((s, e)); // populated for Task 9 (monitor_episodes); unused in Task 8
+        }
+    }
+
+    // Presence in the provider listing = available; an absent owned hash is lapsed/lost.
+    let present: HashSet<String> = torrents
+        .iter()
+        .map(|t| t.hash.to_ascii_lowercase())
+        .collect();
+
+    let mut ids: BTreeSet<u64> = BTreeSet::new();
+    ids.extend(wanted_by.keys().copied());
+    ids.extend(owned_by.keys().copied());
+
+    let mut ops = Vec::new();
+    for tmdb_id in ids {
+        let wanted = wanted_by.get(&tmdb_id).cloned().unwrap_or_default();
+        let owned_group = owned_by.get(&tmdb_id);
+
+        // Prefer the wanted rows' media_type; else fall back to the owned group's.
+        let wanted_type = wanted.first().map(|r| r.media_type.clone());
+        if let (Some(wt), Some(og)) = (&wanted_type, owned_group) {
+            if *wt != og.media_type {
+                warn!("reconcile: tmdb {} media_type skew: wanted={:?} owned={:?}", tmdb_id, wt, og.media_type);
+            }
+        }
+        let Some(media_type) = wanted_type.or_else(|| owned_group.map(|g| g.media_type.clone())) else {
+            continue;
+        };
+
+        // available = ANY owned hash for this title is present in the listing.
+        let available = owned_group
+            .map(|g| g.hashes.iter().any(|h| present.contains(h)))
+            .unwrap_or(false);
+
+        match media_type {
+            MediaType::Movie => {
+                let view = TitleView {
+                    tmdb_id,
+                    media_type: MediaType::Movie,
+                    wanted: wanted.clone(),
+                    owned: owned_group.map(|g| Owned {
+                        hash: g.hashes.first().cloned().unwrap_or_default(),
+                        provenance: g.provenance.clone(),
+                        available,
+                        owned_episodes: Vec::new(),
+                    }),
+                    aired_episodes: Vec::new(),
+                };
+                for action in reconcile_title(&view) {
+                    match action {
+                        Action::AcquireMovie { tmdb_id } => {
+                            let mut prov = provenance_from_wanted(&wanted);
+                            // Preserve existing provenance (esp. Manual) on a lapsed re-acquire so a manually-owned
+                            // title can't have its Manual origin — and thus its never-auto-remove guard — silently erased.
+                            if let Some(g) = owned_group {
+                                prov.merge(&g.provenance);
+                            }
+                            ops.push(ReconcileOp::Acquire {
+                                tmdb_id,
+                                kind: MediaKind::Movie,
+                                season: None,
+                                episode: None,
+                                provenance: prov,
+                            });
+                        }
+                        // Delete EVERY owned hash for this tmdb_id (the Action's `hash` is a representative).
+                        Action::Remove { tmdb_id, .. } => {
+                            if let Some(g) = owned_group {
+                                ops.push(ReconcileOp::Remove { tmdb_id, hashes: g.hashes.clone() });
+                            }
+                        }
+                        Action::AcquireEpisode { .. } => {} // movies never produce this
+                    }
+                }
+            }
+            MediaType::Show => {
+                // Task 8 handles show REMOVAL via Trigger B only (abandoned watchlist; no air dates).
+                if let Some(g) = owned_group {
+                    if !g.provenance.has_manual_entry()
+                        && trigger_b_abandoned(&wanted, &g.provenance)
+                    {
+                        ops.push(ReconcileOp::Remove { tmdb_id, hashes: g.hashes.clone() });
+                    }
+                }
+                // Task 9 handles show-episode acquire + Trigger-A finish removal (air-date dependent).
+            }
+        }
+    }
+    ops
+}
+
+/// Execute a `Remove`: delete each owned hash's torrent from the provider (matched
+/// case-insensitively in `torrents`) and drop its `owned` record. Errors are logged, not fatal.
+/// NO TMDB — unit-testable.
+async fn execute_remove(
+    provider: &Arc<dyn DebridProvider>,
+    torrents: &[Torrent],
+    store: &Store,
+    tmdb_id: u64,
+    hashes: &[String],
+) {
+    // NOTE: on a delete failure we skip remove_owned so the next reconcile tick retries — leaving
+    // the owned record intact means the Remove op is re-derived and the torrent is retried instead
+    // of being silently orphaned on the provider. MockProvider::delete_torrent always returns Ok,
+    // so this path is exercised only in integration/production; no unit test added for the failure
+    // branch — the code fix is self-evident.
+    for hash in hashes {
+        if let Some(t) = torrents.iter().find(|t| t.hash.eq_ignore_ascii_case(hash)) {
+            if let Err(e) = provider.delete_torrent(&t.id).await {
+                warn!("reconcile: delete_torrent {} (tmdb {}) failed: {}; will retry next tick", t.id, tmdb_id, e);
+                continue; // leave the owned record so the next reconcile retries
+            }
+        }
+        if let Err(e) = store.remove_owned(hash.clone()).await {
+            warn!("reconcile: remove_owned {} (tmdb {}) failed: {}", hash, tmdb_id, e);
+        }
+    }
+}
+
+/// Execute an `Acquire`: build the request from TMDB, then drive the SP1 engine, recording the
+/// supplied provenance. TMDB/engine-dependent — exercised by the live smoke.
+async fn execute_acquire(
+    engine: &AcquisitionEngine,
+    tmdb: &TmdbClient,
+    tmdb_id: u64,
+    kind: MediaKind,
+    season: Option<u32>,
+    episode: Option<u32>,
+    provenance: Provenance,
+) {
+    match build_acquire_request(tmdb, tmdb_id, kind, season, episode).await {
+        Ok(req) => {
+            let outcome = engine.acquire(req, provenance).await;
+            info!("reconcile: acquire tmdb {} -> {:?}", tmdb_id, outcome);
+        }
+        Err(e) => warn!("reconcile: build_acquire_request for tmdb {} failed: {}", tmdb_id, e),
+    }
+}
+
+/// Reconcile the combined wanted-set against owned-and-available content: acquire missing/lapsed
+/// titles (recording per-user provenance) and remove engine-owned titles per the removal
+/// lifecycle. Idempotent — re-derives every decision from the store + provider listing each call.
+pub async fn reconcile_wanted(
+    engine: &AcquisitionEngine,
+    provider: &Arc<dyn DebridProvider>,
+    tmdb: &TmdbClient,
+    store: &Store,
+) {
+    let torrents = provider.get_torrents().await.unwrap_or_default();
+    let ops = plan_reconcile_ops(store, &torrents).await;
+    for op in ops {
+        match op {
+            ReconcileOp::Remove { tmdb_id, hashes } => {
+                execute_remove(provider, &torrents, store, tmdb_id, &hashes).await
+            }
+            ReconcileOp::Acquire { tmdb_id, kind, season, episode, provenance } => {
+                execute_acquire(engine, tmdb, tmdb_id, kind, season, episode, provenance).await
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,5 +1272,321 @@ mod trakt_sync_tests {
         // No wanted rows: the error occurred before any Trakt read
         assert!(store.get_wanted("alice".to_string(), 27205).await.is_none(),
             "no wanted rows must have been written");
+    }
+}
+
+#[cfg(test)]
+mod reconcile_wanted_tests {
+    use super::*;
+    use crate::provider::MockProvider;
+    use crate::store::{OwnedRecord, OwnedStatus, WantedSources, WatchedState};
+    use crate::tmdb_client::ShowStatus;
+    use std::sync::Arc;
+
+    fn mem_store() -> Store {
+        Store::from_database(Arc::new(
+            redb::Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        ))
+        .unwrap()
+    }
+
+    fn wanted_movie(user: &str, tmdb_id: u64, watchlist: bool, in_progress: bool, watched: bool) -> WantedRecord {
+        WantedRecord {
+            user: user.to_string(),
+            tmdb_id,
+            media_type: MediaType::Movie,
+            sources: WantedSources { watchlist, in_progress },
+            watched_state: WatchedState::Movie { watched },
+            show_status: None,
+        }
+    }
+
+    fn wanted_show(user: &str, tmdb_id: u64, watchlist: bool, in_progress: bool) -> WantedRecord {
+        WantedRecord {
+            user: user.to_string(),
+            tmdb_id,
+            media_type: MediaType::Show,
+            sources: WantedSources { watchlist, in_progress },
+            watched_state: WatchedState::Show { watched_episodes: vec![] },
+            show_status: Some(ShowStatus::Returning),
+        }
+    }
+
+    fn owned_record(tmdb_id: u64, kind: MediaKind, provenance: Provenance) -> OwnedRecord {
+        OwnedRecord {
+            request: AcquireRequest {
+                imdb_id: String::new(),
+                tmdb_id,
+                kind,
+                season: None,
+                episode: None,
+                original_language: None,
+                metadata: MediaMetadata {
+                    title: String::new(),
+                    year: None,
+                    media_type: media_type_of(kind),
+                    external_id: None,
+                },
+            },
+            provenance,
+            added_at: 0,
+            status: OwnedStatus::Pending,
+        }
+    }
+
+    fn torrent(id: &str, hash: &str) -> Torrent {
+        Torrent {
+            id: id.to_string(),
+            hash: hash.to_string(),
+            status: "downloaded".to_string(),
+            ..Default::default()
+        }
+    }
+
+    // ── provenance_from_wanted (pure) ─────────────────────────────────────────
+
+    #[test]
+    fn provenance_from_wanted_watchlist_user() {
+        let w = vec![wanted_movie("alice", 1, true, false, false)];
+        assert_eq!(provenance_from_wanted(&w), Provenance::watchlist("alice"));
+    }
+
+    #[test]
+    fn provenance_from_wanted_in_progress_user() {
+        let w = vec![wanted_movie("alice", 1, false, true, false)];
+        assert_eq!(provenance_from_wanted(&w), Provenance::in_progress("alice"));
+    }
+
+    #[test]
+    fn provenance_from_wanted_both_sources_one_user() {
+        let w = vec![wanted_movie("alice", 1, true, true, false)];
+        assert_eq!(
+            provenance_from_wanted(&w).entries,
+            vec![
+                ProvenanceEntry::Watchlist { user: "alice".into() },
+                ProvenanceEntry::InProgress { user: "alice".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn provenance_from_wanted_two_users() {
+        let w = vec![
+            wanted_movie("alice", 1, true, false, false),
+            wanted_movie("bob", 1, false, true, false),
+        ];
+        assert_eq!(
+            provenance_from_wanted(&w).entries,
+            vec![
+                ProvenanceEntry::Watchlist { user: "alice".into() },
+                ProvenanceEntry::InProgress { user: "bob".into() },
+            ]
+        );
+    }
+
+    // ── plan_reconcile_ops (mem Store, no TMDB / engine) ──────────────────────
+
+    #[tokio::test]
+    async fn plan_missing_wanted_movie_acquires() {
+        let store = mem_store();
+        store.put_wanted(wanted_movie("alice", 27205, true, false, false)).await.unwrap();
+        let ops = plan_reconcile_ops(&store, &[]).await;
+        assert_eq!(
+            ops,
+            vec![ReconcileOp::Acquire {
+                tmdb_id: 27205,
+                kind: MediaKind::Movie,
+                season: None,
+                episode: None,
+                provenance: Provenance::watchlist("alice"),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_finished_owned_movie_removes_trigger_a() {
+        let store = mem_store();
+        // all wanters watched + owned hash present → Trigger A.
+        store.put_wanted(wanted_movie("alice", 27205, true, false, true)).await.unwrap();
+        store
+            .put_owned("abc".into(), owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")))
+            .await
+            .unwrap();
+        let torrents = vec![torrent("t1", "ABC")];
+        let ops = plan_reconcile_ops(&store, &torrents).await;
+        assert_eq!(ops, vec![ReconcileOp::Remove { tmdb_id: 27205, hashes: vec!["abc".into()] }]);
+    }
+
+    #[tokio::test]
+    async fn plan_lapsed_owned_wanted_movie_reacquires() {
+        let store = mem_store();
+        store.put_wanted(wanted_movie("alice", 27205, true, false, false)).await.unwrap();
+        store
+            .put_owned("abc".into(), owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")))
+            .await
+            .unwrap();
+        // No torrents → the owned hash is absent → lapsed → re-acquire.
+        let ops = plan_reconcile_ops(&store, &[]).await;
+        assert_eq!(
+            ops,
+            vec![ReconcileOp::Acquire {
+                tmdb_id: 27205,
+                kind: MediaKind::Movie,
+                season: None,
+                episode: None,
+                provenance: Provenance::watchlist("alice"),
+            }]
+        );
+    }
+
+    /// A lapsed movie owned with Manual provenance (and a Trakt wanter) must keep its Manual
+    /// origin after the re-acquire plan is built — so the never-auto-remove guard is not erased.
+    #[tokio::test]
+    async fn plan_lapsed_manual_owned_with_wanter_preserves_manual_provenance() {
+        let store = mem_store();
+        // alice wants it via watchlist
+        store.put_wanted(wanted_movie("alice", 27205, true, false, false)).await.unwrap();
+        // The owned record has BOTH Manual and alice's Watchlist entries
+        let mut combined = Provenance::manual();
+        combined.merge(&Provenance::watchlist("alice"));
+        store
+            .put_owned("abc".into(), owned_record(27205, MediaKind::Movie, combined))
+            .await
+            .unwrap();
+        // No torrents → lapsed → AcquireMovie
+        let ops = plan_reconcile_ops(&store, &[]).await;
+        assert_eq!(ops.len(), 1, "expected one Acquire op");
+        match &ops[0] {
+            ReconcileOp::Acquire { provenance, .. } => {
+                assert!(provenance.has_manual_entry(), "Manual provenance must be preserved on lapsed re-acquire");
+            }
+            other => panic!("expected Acquire, got {:?}", other),
+        }
+    }
+
+    /// A lapsed movie whose only wanter has already watched it produces a Remove — not an Acquire.
+    /// Documents that `reconcile_title`'s removal precedence holds even when the title is lapsed
+    /// (hash absent from listing).
+    #[tokio::test]
+    async fn plan_lapsed_and_finished_movie_removes_not_reacquires() {
+        let store = mem_store();
+        // alice has watched the movie and it's on her watchlist (Trigger A conditions met)
+        store.put_wanted(wanted_movie("alice", 27205, true, false, true)).await.unwrap();
+        store
+            .put_owned("abc".into(), owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")))
+            .await
+            .unwrap();
+        // No torrents → lapsed (hash absent), but removal takes precedence over re-acquire.
+        let ops = plan_reconcile_ops(&store, &[]).await;
+        assert_eq!(ops, vec![ReconcileOp::Remove { tmdb_id: 27205, hashes: vec!["abc".into()] }]);
+    }
+
+    #[tokio::test]
+    async fn plan_manual_owned_no_wanters_is_never_removed() {
+        let store = mem_store();
+        store
+            .put_owned("abc".into(), owned_record(27205, MediaKind::Movie, Provenance::manual()))
+            .await
+            .unwrap();
+        let torrents = vec![torrent("t1", "ABC")];
+        let ops = plan_reconcile_ops(&store, &torrents).await;
+        assert_eq!(ops, vec![]);
+    }
+
+    #[tokio::test]
+    async fn plan_owned_available_not_finished_no_op() {
+        let store = mem_store();
+        store.put_wanted(wanted_movie("alice", 27205, true, false, false)).await.unwrap();
+        store
+            .put_owned("abc".into(), owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")))
+            .await
+            .unwrap();
+        let torrents = vec![torrent("t1", "ABC")];
+        let ops = plan_reconcile_ops(&store, &torrents).await;
+        assert_eq!(ops, vec![]);
+    }
+
+    #[tokio::test]
+    async fn plan_ignores_unrelated_torrent() {
+        // A torrent whose hash is in neither wanted nor owned must never appear in ops.
+        let store = mem_store();
+        let torrents = vec![torrent("t1", "DEADBEEF")];
+        let ops = plan_reconcile_ops(&store, &torrents).await;
+        assert_eq!(ops, vec![]);
+    }
+
+    #[tokio::test]
+    async fn plan_show_trigger_b_removes() {
+        let store = mem_store();
+        // Owned show via alice's watchlist, nobody wants it now → Trigger B.
+        store
+            .put_owned("abc".into(), owned_record(1396, MediaKind::Series, Provenance::watchlist("alice")))
+            .await
+            .unwrap();
+        let torrents = vec![torrent("t1", "ABC")];
+        let ops = plan_reconcile_ops(&store, &torrents).await;
+        assert_eq!(ops, vec![ReconcileOp::Remove { tmdb_id: 1396, hashes: vec!["abc".into()] }]);
+    }
+
+    #[tokio::test]
+    async fn plan_show_still_wanted_no_op() {
+        // Task 8 defers show acquire + Trigger-A; a still-wanted owned show yields nothing.
+        let store = mem_store();
+        store.put_wanted(wanted_show("alice", 1396, true, false)).await.unwrap();
+        store
+            .put_owned("abc".into(), owned_record(1396, MediaKind::Series, Provenance::watchlist("alice")))
+            .await
+            .unwrap();
+        let torrents = vec![torrent("t1", "ABC")];
+        let ops = plan_reconcile_ops(&store, &torrents).await;
+        assert_eq!(ops, vec![]);
+    }
+
+    #[tokio::test]
+    async fn plan_multi_hash_remove_lists_all_hashes() {
+        let store = mem_store();
+        // finished movie owned under TWO hashes → one Remove op listing BOTH.
+        store.put_wanted(wanted_movie("alice", 27205, true, false, true)).await.unwrap();
+        store
+            .put_owned("aaa".into(), owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")))
+            .await
+            .unwrap();
+        store
+            .put_owned("bbb".into(), owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")))
+            .await
+            .unwrap();
+        let torrents = vec![torrent("t1", "AAA"), torrent("t2", "BBB")];
+        let mut ops = plan_reconcile_ops(&store, &torrents).await;
+        assert_eq!(ops.len(), 1, "expected a single Remove op");
+        match ops.remove(0) {
+            ReconcileOp::Remove { tmdb_id, mut hashes } => {
+                assert_eq!(tmdb_id, 27205);
+                hashes.sort();
+                assert_eq!(hashes, vec!["aaa".to_string(), "bbb".to_string()]);
+            }
+            other => panic!("expected Remove, got {:?}", other),
+        }
+    }
+
+    // ── execute_remove (mem Store + MockProvider) ─────────────────────────────
+
+    #[tokio::test]
+    async fn execute_remove_deletes_torrent_and_owned_record() {
+        let store = mem_store();
+        store
+            .put_owned("h1".into(), owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")))
+            .await
+            .unwrap();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let torrents = vec![torrent("t1", "H1")]; // hash case differs from stored "h1"
+        execute_remove(&provider, &torrents, &store, 27205, &["h1".to_string()]).await;
+        assert_eq!(*deleted.lock().unwrap(), vec!["t1".to_string()], "the torrent must be deleted");
+        assert!(store.get_owned("h1".to_string()).await.is_none(), "the owned record must be removed");
     }
 }

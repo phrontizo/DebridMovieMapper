@@ -167,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 external_id: Some(format!("tmdb:{}", tmdb_id)),
             },
         };
-        let outcome = engine.acquire(req).await;
+        let outcome = engine.acquire(req, debridmoviemapper::store::Provenance::manual()).await;
         println!("--acquire outcome: {:?}", outcome);
         return Ok(());
     }

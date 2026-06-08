@@ -270,7 +270,9 @@ async fn lifecycle_acquire_sintel_by_imdb() {
         .with_max_level(tracing::Level::INFO)
         .with_test_writer()
         .try_init();
-    let outcome = engine.acquire(req).await;
+    let outcome = engine
+        .acquire(req, debridmoviemapper::store::Provenance::manual())
+        .await;
     eprintln!("acquire outcome: {:?}", outcome);
     assert!(
         matches!(

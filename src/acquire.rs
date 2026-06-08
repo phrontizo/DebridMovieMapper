@@ -245,7 +245,11 @@ impl AcquisitionEngine {
         }
     }
 
-    pub async fn acquire(&self, req: AcquireRequest) -> AcquireOutcome {
+    /// Acquire `req`, recording `provenance` on the resulting `OwnedRecord`. The provenance is
+    /// supplied by the caller (the `--acquire` CLI passes `Provenance::manual()`; the SP2
+    /// reconciler passes the current wanters) and is preserved across `observe`'s
+    /// fail-and-reacquire so a re-acquired title keeps its original origin (sticky provenance).
+    pub async fn acquire(&self, req: AcquireRequest, provenance: Provenance) -> AcquireOutcome {
         let candidates = match self
             .scraper
             .find(&req.imdb_id, req.kind, req.season, req.episode)
@@ -271,7 +275,7 @@ impl AcquisitionEngine {
             if self.store.get_owned(cand.info_hash.clone()).await.is_some() {
                 return AcquireOutcome::Acquired(cand.info_hash.clone()); // idempotent
             }
-            match self.try_candidate(&req, &cand).await {
+            match self.try_candidate(&req, &cand, &provenance).await {
                 CandidateResult::Done(o) => return o,
                 CandidateResult::Next => continue,
             }
@@ -291,7 +295,12 @@ impl AcquisitionEngine {
         }
     }
 
-    async fn try_candidate(&self, req: &AcquireRequest, cand: &ReleaseInfo) -> CandidateResult {
+    async fn try_candidate(
+        &self,
+        req: &AcquireRequest,
+        cand: &ReleaseInfo,
+        provenance: &Provenance,
+    ) -> CandidateResult {
         let hash = cand.info_hash.clone();
         let hint = cand.file_name.clone();
         let idx = cand.file_idx;
@@ -366,7 +375,7 @@ impl AcquisitionEngine {
                 hash.clone(),
                 OwnedRecord {
                     request: req.clone(),
-                    provenance: Provenance::manual(),
+                    provenance: provenance.clone(),
                     added_at: now_secs(),
                     status: OwnedStatus::Pending,
                 },
@@ -445,19 +454,19 @@ impl AcquisitionEngine {
             };
             let dead = matches!(t.status.as_str(), "magnet_error" | "dead" | "error" | "virus");
             if dead {
-                self.fail_and_reacquire(hash, &t.id, &rec.request, "Dead").await;
+                self.fail_and_reacquire(hash, &t.id, &rec.request, "Dead", &rec.provenance).await;
                 continue;
             }
             if t.status == "downloaded" {
                 if rec.status == OwnedStatus::Pending {
-                    self.verify_pending(hash, &t.id, &rec.request).await;
+                    self.verify_pending(hash, &t.id, &rec.request, &rec.provenance).await;
                 }
                 self.progress.lock().await.remove(&t.id);
                 continue;
             }
             // still downloading — stall check
             if self.is_stalled(&t.id, t.progress).await {
-                self.fail_and_reacquire(hash, &t.id, &rec.request, "Stalled").await;
+                self.fail_and_reacquire(hash, &t.id, &rec.request, "Stalled", &rec.provenance).await;
             }
         }
 
@@ -490,7 +499,13 @@ impl AcquisitionEngine {
         }
     }
 
-    async fn verify_pending(&self, hash: &str, torrent_id: &str, req: &AcquireRequest) {
+    async fn verify_pending(
+        &self,
+        hash: &str,
+        torrent_id: &str,
+        req: &AcquireRequest,
+        provenance: &Provenance,
+    ) {
         // Bound re-probing: once we've deferred MAX_VERIFY_ATTEMPTS times, stop probing.
         if self.verify_attempts.lock().await.get(hash).copied().unwrap_or(0) >= MAX_VERIFY_ATTEMPTS {
             return;
@@ -532,12 +547,19 @@ impl AcquisitionEngine {
             }
             VerifyResult::Reject(reason) => {
                 self.verify_attempts.lock().await.remove(hash);
-                self.fail_and_reacquire(hash, torrent_id, req, reason).await;
+                self.fail_and_reacquire(hash, torrent_id, req, reason, provenance).await;
             }
         }
     }
 
-    async fn fail_and_reacquire(&self, hash: &str, torrent_id: &str, req: &AcquireRequest, reason: &str) {
+    async fn fail_and_reacquire(
+        &self,
+        hash: &str,
+        torrent_id: &str,
+        req: &AcquireRequest,
+        reason: &str,
+        provenance: &Provenance,
+    ) {
         warn!("owned torrent {} failed ({}) — blacklist + re-acquire", hash, reason);
         let _ = self
             .store
@@ -548,7 +570,8 @@ impl AcquisitionEngine {
         let _ = self.provider.delete_torrent(torrent_id).await;
         self.progress.lock().await.remove(torrent_id);
         self.verify_attempts.lock().await.remove(hash);
-        let _ = self.acquire(req.clone()).await; // promotes the next candidate (bad hash now blacklisted)
+        // Sticky provenance: re-acquire preserves the failed record's origin (Trigger B correctness).
+        let _ = self.acquire(req.clone(), provenance.clone()).await; // promotes the next candidate (bad hash now blacklisted)
     }
 }
 
@@ -673,9 +696,15 @@ mod tests {
             prober,
             st.clone(),
         );
-        let out = eng.acquire(req()).await;
+        // The provenance passed to acquire must be the one recorded on the OwnedRecord.
+        let out = eng.acquire(req(), Provenance::watchlist("alice")).await;
         assert_eq!(out, AcquireOutcome::Acquired("h1".into()));
         assert_eq!(st.get_owned("h1".into()).await.unwrap().status, OwnedStatus::Verified);
+        assert_eq!(
+            st.get_owned("h1".into()).await.unwrap().provenance,
+            Provenance::watchlist("alice"),
+            "the provenance passed to acquire must be stored on the OwnedRecord"
+        );
         assert_eq!(
             st.authoritative_meta("h1".into()).await.unwrap().external_id.as_deref(),
             Some("tmdb:27205")
@@ -718,7 +747,7 @@ mod tests {
             prober,
             st.clone(),
         );
-        let out = eng.acquire(req()).await;
+        let out = eng.acquire(req(), Provenance::manual()).await;
         assert_eq!(out, AcquireOutcome::NoAcceptableRelease);
         assert!(st.get_owned("h1".into()).await.is_none(), "rejected hash must not be recorded");
         assert!(st.is_blacklisted(27205, "h1".into()).await, "rejected hash must be blacklisted");
@@ -739,7 +768,7 @@ mod tests {
             prober,
             st.clone(),
         );
-        let out = eng.acquire(req()).await;
+        let out = eng.acquire(req(), Provenance::manual()).await;
         assert_eq!(out, AcquireOutcome::NoAcceptableRelease);
         assert!(st.is_blacklisted(27205, "h1".into()).await);
         assert!(st.get_owned("h1".into()).await.is_none());
@@ -757,7 +786,7 @@ mod tests {
             prober,
             st.clone(),
         );
-        let out = eng.acquire(req()).await;
+        let out = eng.acquire(req(), Provenance::manual()).await;
         assert_eq!(out, AcquireOutcome::Pending("h1".into()));
         assert_eq!(st.get_owned("h1".into()).await.unwrap().status, OwnedStatus::Pending);
     }
@@ -774,7 +803,7 @@ mod tests {
             prober,
             st.clone(),
         );
-        let out = eng.acquire(req()).await;
+        let out = eng.acquire(req(), Provenance::manual()).await;
         assert_eq!(out, AcquireOutcome::Acquired("h1".into()));
     }
 
@@ -801,7 +830,7 @@ mod tests {
             prober,
             st.clone(),
         );
-        let out = eng.acquire(req()).await;
+        let out = eng.acquire(req(), Provenance::manual()).await;
         assert_eq!(out, AcquireOutcome::Acquired("h1".into()));
     }
 
@@ -829,7 +858,7 @@ mod tests {
             ..Default::default()
         });
         let eng = engine(provider, scraper, Arc::new(OkValidator(true)), prober, st.clone());
-        let out = eng.acquire(req()).await;
+        let out = eng.acquire(req(), Provenance::manual()).await;
         assert_eq!(out, AcquireOutcome::NoAcceptableRelease, "a multi-movie pack must be rejected");
         assert!(st.get_owned("h1".into()).await.is_none(), "a rejected pack must not be recorded");
     }
