@@ -17,4 +17,5 @@ pub mod store;
 pub mod tasks;
 pub mod tmdb_client;
 pub mod torbox_client;
+pub mod trakt_client;
 pub mod vfs;
