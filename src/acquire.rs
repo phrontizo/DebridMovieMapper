@@ -357,6 +357,11 @@ impl AcquisitionEngine {
         AcquireOutcome::NoAcceptableRelease
     }
 
+    /// Validate a file name against an expected title (used by the upgrade engine before staging).
+    pub async fn validate_title(&self, file_name: &str, tmdb_id: u64, kind: MediaKind, season: Option<u32>, episode: Option<u32>) -> bool {
+        self.validator.validate(file_name, tmdb_id, kind, season, episode).await
+    }
+
     async fn verify_file(&self, locator: &FileLocator, req: &AcquireRequest) -> VerifyResult {
         let url = match self.provider.resolve_url(locator).await {
             Ok(u) => u,

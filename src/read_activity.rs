@@ -30,6 +30,19 @@ impl ReadActivity {
             None => true,
         }
     }
+
+    /// The most recent read across all paths, if any.
+    pub async fn most_recent(&self) -> Option<Instant> {
+        self.last_read.read().await.values().copied().max()
+    }
+
+    /// `true` if NO path has been read within `window`.
+    pub async fn all_idle(&self, window: Duration) -> bool {
+        match self.most_recent().await {
+            Some(t) => t.elapsed() >= window,
+            None => true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -49,5 +62,20 @@ mod tests {
         assert!(!ra.is_idle("p", Duration::from_secs(300)).await, "just-read is active");
         // A zero-length window makes any elapsed time count as idle.
         assert!(ra.is_idle("p", Duration::from_secs(0)).await);
+    }
+
+    #[tokio::test]
+    async fn all_idle_is_library_wide_mirroring_is_idle() {
+        let ra = ReadActivity::new();
+        // No reads anywhere ⇒ the whole library is idle.
+        assert!(ra.all_idle(Duration::from_secs(300)).await);
+        assert!(ra.most_recent().await.is_none());
+
+        // A read on ANY path makes the whole library active for a non-zero window…
+        ra.touch("Movies/anything.mkv").await;
+        assert!(!ra.all_idle(Duration::from_secs(300)).await, "a recent read anywhere is active");
+        assert!(ra.most_recent().await.is_some());
+        // …and a zero-length window makes any elapsed time count as idle again.
+        assert!(ra.all_idle(Duration::from_secs(0)).await);
     }
 }
