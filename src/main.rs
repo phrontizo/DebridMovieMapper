@@ -112,6 +112,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )) as Arc<dyn debridmoviemapper::trakt_client::TraktClient>
         });
 
+    let read_activity = Arc::new(debridmoviemapper::read_activity::ReadActivity::new());
+
     let app_state = AppState {
         provider: provider.clone(),
         tmdb_client: tmdb_client.clone(),
@@ -124,6 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scraper: scraper.clone(),
         engine: engine.clone(),
         trakt_client,
+        read_activity: read_activity.clone(),
     };
 
     let scheduler_handle = tokio::spawn(debridmoviemapper::scheduler::run(
@@ -136,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app_state.vfs.clone(),
         app_state.repair_manager.clone(),
         app_state.http_client.clone(),
+        app_state.read_activity.clone(),
     );
     let dav_handler = DavHandler::builder()
         .filesystem(Box::new(dav_fs))

@@ -29,4 +29,6 @@ pub struct AppState {
     /// gates the Trakt cycle + episode-monitor jobs on `is_some()`; the wanted/token
     /// store handles are reachable via `store`.
     pub trakt_client: Option<Arc<dyn crate::trakt_client::TraktClient>>,
+    /// Proxy read-activity tracker (SP3) — stamped by `dav_fs` reads, read by the upgrade engine.
+    pub read_activity: Arc<crate::read_activity::ReadActivity>,
 }

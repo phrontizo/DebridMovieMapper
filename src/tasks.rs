@@ -47,6 +47,7 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
         scraper: _,
         engine,
         trakt_client: _,
+        read_activity: _,
     } = scan_config.app;
     let interval_secs = config.scan_interval_secs;
     // Load persisted matches from DB on startup
@@ -1122,6 +1123,7 @@ mod provider_abstraction_tests {
             scraper,
             engine,
             trakt_client: None,
+            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
         };
         let _config = ScanConfig { app };
     }

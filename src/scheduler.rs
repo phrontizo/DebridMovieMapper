@@ -194,6 +194,7 @@ fn make_test_app(with_trakt: bool) -> crate::app_state::AppState {
         scraper,
         engine,
         trakt_client,
+        read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
     }
 }
 

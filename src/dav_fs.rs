@@ -21,6 +21,7 @@ pub struct DebridFileSystem {
     rd_client: Arc<dyn DebridProvider>,
     repair_manager: Arc<RepairManager>,
     http_client: reqwest::Client,
+    read_activity: Arc<crate::read_activity::ReadActivity>,
 }
 
 impl DebridFileSystem {
@@ -29,12 +30,14 @@ impl DebridFileSystem {
         vfs: Arc<RwLock<DebridVfs>>,
         repair_manager: Arc<RepairManager>,
         http_client: reqwest::Client,
+        read_activity: Arc<crate::read_activity::ReadActivity>,
     ) -> Self {
         Self {
             vfs,
             rd_client,
             repair_manager,
             http_client,
+            read_activity,
         }
     }
 
@@ -80,6 +83,7 @@ impl DavFileSystem for DebridFileSystem {
     ) -> FsFuture<'a, Box<dyn DavFile>> {
         async move {
             let node = self.find_node(path).await.ok_or(FsError::NotFound)?;
+            let vfs_path = path.as_rel_ospath().to_string_lossy().into_owned();
             let name = path
                 .as_rel_ospath()
                 .to_str()
@@ -98,6 +102,8 @@ impl DavFileSystem for DebridFileSystem {
                     cdn_url: None,
                     buffer: Bytes::new(),
                     buffer_start: 0,
+                    read_activity: self.read_activity.clone(),
+                    vfs_path,
                 })
                     as Box<dyn DavFile>),
                 VfsNode::VirtualFile { content } => Ok(Box::new(VirtualFile {
@@ -231,6 +237,8 @@ struct ProxiedMediaFile {
     cdn_url: Option<String>,
     buffer: Bytes,
     buffer_start: u64,
+    read_activity: Arc<crate::read_activity::ReadActivity>,
+    vfs_path: String,
 }
 
 impl ProxiedMediaFile {
@@ -455,7 +463,7 @@ impl DavFile for ProxiedMediaFile {
             {
                 return Err(FsError::GeneralFailure);
             }
-
+            self.read_activity.touch(&self.vfs_path).await;
             self.fetch_bytes(len).await
         }
         .boxed()
@@ -518,6 +526,8 @@ mod tests {
             cdn_url: None,
             buffer: Bytes::new(),
             buffer_start: 0,
+            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            vfs_path: String::new(),
         };
     }
 
@@ -791,7 +801,8 @@ mod provider_abstraction_tests {
         let vfs = Arc::new(RwLock::new(DebridVfs::new()));
         let repair = Arc::new(RepairManager::new(provider.clone()));
         let http = reqwest::Client::new();
-        let _fs = DebridFileSystem::new(provider, vfs, repair, http);
+        let ra = Arc::new(crate::read_activity::ReadActivity::new());
+        let _fs = DebridFileSystem::new(provider, vfs, repair, http, ra);
     }
 
     #[test]
@@ -820,6 +831,8 @@ mod provider_abstraction_tests {
             cdn_url: None,
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
+            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            vfs_path: String::new(),
         };
         assert_eq!(f.locator.file_id, 3);
     }
@@ -865,6 +878,8 @@ mod provider_abstraction_tests {
             cdn_url: Some(url),
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
+            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            vfs_path: String::new(),
         };
 
         // The 200 carries the file from offset 0, not from 500 — serving it would hand the
@@ -918,6 +933,8 @@ mod provider_abstraction_tests {
             cdn_url: Some(url),
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
+            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            vfs_path: String::new(),
         }
     }
 
@@ -1048,6 +1065,8 @@ mod provider_abstraction_tests {
             cdn_url: Some(url),
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
+            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            vfs_path: String::new(),
         };
         (f, counter)
     }
@@ -1091,6 +1110,33 @@ mod provider_abstraction_tests {
             .await
             .expect("a 403 then 206 must recover and serve bytes");
         assert_eq!(&data[..], b"FRESHBYT");
+    }
+
+    #[tokio::test]
+    async fn read_bytes_stamps_read_activity() {
+        use crate::read_activity::ReadActivity;
+        let ra = Arc::new(ReadActivity::new());
+        let provider: Arc<dyn DebridProvider> = Arc::new(crate::provider::MockProvider {
+            resolved_url: Some("http://127.0.0.1:0/none".into()),
+            ..Default::default()
+        });
+        let mut f = ProxiedMediaFile {
+            name: "x.mkv".into(),
+            locator: crate::provider::FileLocator { torrent_id: "t".into(), ..Default::default() },
+            file_size: 10,
+            repair_manager: Arc::new(RepairManager::new(provider.clone())),
+            rd_client: provider,
+            http_client: reqwest::Client::new(),
+            pos: 0,
+            cdn_url: None,
+            buffer: Bytes::new(),
+            buffer_start: 0,
+            read_activity: ra.clone(),
+            vfs_path: "Movies/X/x.mkv".into(),
+        };
+        // The CDN fetch will fail (unroutable URL), but the stamp happens before the fetch.
+        let _ = f.read_bytes(4).await;
+        assert!(!ra.is_idle("Movies/X/x.mkv", std::time::Duration::from_secs(300)).await);
     }
 
     #[tokio::test]
@@ -1145,6 +1191,8 @@ mod provider_abstraction_tests {
             cdn_url: None,
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
+            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            vfs_path: String::new(),
         };
 
         let url = f

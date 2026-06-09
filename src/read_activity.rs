@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ReadActivity {
     last_read: Arc<RwLock<HashMap<String, Instant>>>,
 }

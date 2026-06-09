@@ -104,7 +104,8 @@ async fn run_player_simulation(provider: Arc<dyn DebridProvider>, label: &str) {
 
     let repair_manager = Arc::new(RepairManager::new(provider.clone()));
     let http_client = reqwest::Client::new();
-    let dav_fs = DebridFileSystem::new(provider.clone(), vfs.clone(), repair_manager, http_client);
+    let ra = std::sync::Arc::new(debridmoviemapper::read_activity::ReadActivity::new());
+    let dav_fs = DebridFileSystem::new(provider.clone(), vfs.clone(), repair_manager, http_client, ra);
 
     let mut video_files = Vec::new();
     {
@@ -294,7 +295,8 @@ async fn run_size_consistency(provider: Arc<dyn DebridProvider>, label: &str) {
     let vfs = Arc::new(RwLock::new(DebridVfs::build(current_data)));
     let repair_manager = Arc::new(RepairManager::new(provider.clone()));
     let http_client = reqwest::Client::new();
-    let dav_fs = DebridFileSystem::new(provider.clone(), vfs.clone(), repair_manager, http_client);
+    let ra = std::sync::Arc::new(debridmoviemapper::read_activity::ReadActivity::new());
+    let dav_fs = DebridFileSystem::new(provider.clone(), vfs.clone(), repair_manager, http_client, ra);
 
     // Find a media file
     let mut media_files = Vec::new();
