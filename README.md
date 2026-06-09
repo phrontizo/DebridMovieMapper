@@ -62,6 +62,12 @@ JELLYFIN_RCLONE_MOUNT_PATH=/media
 # TRAKT_SYNC_INTERVAL_SECS=900            # Trakt sync + reconcile cadence (default: 900, minimum: 60)
 # TRAKT_EPISODE_CHECK_INTERVAL_SECS=3600  # episode-monitor cadence (default: 3600, minimum: 300)
 
+# Optional: auto-upgrade engine (SP3 — on by default; set UPGRADE_INTERVAL_SECS=0 to disable)
+# UPGRADE_INTERVAL_SECS=86400    # how often to run the quality-upgrade + consolidation pass (default: daily; 0=off)
+# UPGRADE_BUDGET_PER_TICK=20     # max titles re-scored per tick (default: 20)
+# UPGRADE_IDLE_SECS=300          # proxy-read inactivity window before a slot may be swapped (default: 300)
+# ACQUIRE_DEAD_TIMEOUT_SECS=600  # seconds before an unresolved Pending torrent is reaped + re-scraped (default: 600)
+
 # Optional: acquisition preferences (see Acquisition section below)
 # SCRAPER_ADDON_URL=https://torrentio.strem.fun/realdebrid=TOKEN   # override scraper URL
 # MAX_RESOLUTION=1080        # 720 | 1080 | 2160
@@ -100,6 +106,10 @@ A debrid provider token is required: set **exactly one** of `RD_API_TOKEN` or `T
 | `TRAKT_CLIENT_SECRET`        | No†      | -              | Trakt API app client secret. |
 | `TRAKT_SYNC_INTERVAL_SECS`   | No       | `900`          | How often (seconds) to sync each enrolled Trakt account and reconcile the library (minimum: 60). |
 | `TRAKT_EPISODE_CHECK_INTERVAL_SECS` | No | `3600`      | How often (seconds) to check tracked shows for newly aired episodes (minimum: 300). |
+| `UPGRADE_INTERVAL_SECS`      | No       | `86400`        | How often (seconds) to run the quality-upgrade + full-season consolidation pass. `0` disables the upgrade engine entirely. Default is daily (86 400 s). |
+| `UPGRADE_BUDGET_PER_TICK`    | No       | `20`           | Maximum number of owned titles re-scored per upgrade tick (round-robin across the library; minimum: 1). |
+| `UPGRADE_IDLE_SECS`          | No       | `300`          | Seconds of proxy read inactivity before a slot is considered idle enough to swap/prune (minimum: 30). Prevents swapping a file that is being actively streamed. |
+| `ACQUIRE_DEAD_TIMEOUT_SECS`  | No       | `600`          | Seconds an optimistically-added `Pending` torrent may remain unresolved before `observe` reaps it as dead, blacklists its hash, and re-scrapes (minimum: 120). |
 
 \* Exactly one of `RD_API_TOKEN` / `TORBOX_API_KEY` must be set — not both, and not neither.
 
@@ -212,14 +222,15 @@ The acquisition engine lets the service find and add content to your debrid acco
 
 ### How Acquisition Works
 
-1. **Scrape**: Given an IMDB id and media type, `TorrentioScraper` queries a Stremio-compatible addon (default: Torrentio, URL auto-built from your provider token; override with `SCRAPER_ADDON_URL`) for candidate torrents.
-2. **Score and rank**: Candidates are parsed for resolution, codec, HDR, file size, seeder count, and cached status. A hard ceiling at `MAX_RESOLUTION` excludes anything above it. Remaining candidates are ranked: cached content first, then by resolution, HEVC preference, verifiable container (MKV/MP4), and seeder count.
-3. **Materialise**: The top candidate is added to your debrid account by hash and selected for download.
-4. **Title validation**: The acquired file's name is run through the same identification logic used by the scan loop and must resolve to the requested TMDB id. Mismatches are blacklisted and the next candidate is tried.
-5. **File probe**: For cached (immediately downloadable) content, the first 4 MB of the CDN URL is fetched and parsed for audio/subtitle tracks. If `AUDIO_LANGUAGE` or `SUBTITLE_LANGUAGE` is set and the tracks don't match, the candidate is blacklisted. Unknown or unsupported containers are accepted without probing.
-6. **Outcome**: `Acquired` (ready to play), `Pending` (still downloading — the scan loop will verify it when complete), `NoAcceptableRelease`, or `TemporarilyUnavailable` (scraper unreachable — retry later).
+Acquisition uses an **optimistic-add** model (SP3): the engine adds the best candidate and records it `Pending` immediately, then resolves it asynchronously so slow-to-seed torrents are not judged prematurely.
 
-The `observe` method runs each scan tick and handles Pending torrents: it re-probes completed downloads, detects stalled downloads (no progress for `STALL_TIMEOUT_SECS`), and re-acquires failed torrents using the next unblacklisted candidate.
+1. **Scrape**: Given an IMDB id and media type, `TorrentioScraper` queries a Stremio-compatible addon (default: Torrentio, URL auto-built from your provider token; override with `SCRAPER_ADDON_URL`) for candidate torrents.
+2. **Score and rank**: Candidates are parsed for resolution, codec, HDR, file size, seeder count, and cached status. A hard ceiling at `MAX_RESOLUTION` excludes anything above it. Remaining candidates are ranked: cached content first, then by source tier (REMUX>BluRay>WEB>HDTV), resolution, HEVC preference, verifiable container, and seeder count. Uncached zero-seeder releases are hard-filtered (undownloadable).
+3. **Optimistic add**: The top non-blacklisted candidate is added to your debrid account by hash, recorded as `Pending`, and control returns immediately — no synchronous wait.
+4. **Asynchronous resolve** (`observe`, runs every scan tick): once the torrent's files appear, the deferred gates run: pack-guard (multi-feature movie packs are rejected) → strict title validation (the file name must identify to the requested TMDB id; mismatches are blacklisted) → file probe (for cached content, the first 4 MB is checked for required audio/subtitle languages; corrupt/wrong-language probes are blacklisted). On pass — marked `Verified`, `provides` (which episodes the hash covers) and a quality snapshot are recorded, and the `selection` entry is written. On fail — hash is blacklisted and the next candidate is tried.
+5. **Dead-torrent reaping**: if a `Pending` torrent remains unresolved beyond `ACQUIRE_DEAD_TIMEOUT_SECS` (default 600 s), or shows a terminal provider error, `observe` reaps it, blacklists the hash, and re-scrapes for the next-best candidate.
+6. **Stall detection**: no progress for `STALL_TIMEOUT_SECS` triggers re-acquisition via the next unblacklisted candidate.
+7. **Outcome**: `Acquired` (instantly cached + verified), `Pending` (resolving asynchronously), `NoAcceptableRelease`, or `TemporarilyUnavailable` (scraper unreachable — retry later).
 
 ### What triggers acquisition
 
@@ -268,6 +279,17 @@ cargo test --test trakt_integration_test -- --ignored --nocapture
 
 The test prints a verification URL and a short code, then waits for you to open the URL and approve it at trakt.tv/activate. Once approved it reads your watchlist, in-progress and watched history, and runs the full `sync_trakt` path, asserting the `wanted` set is populated. Requires `TRAKT_CLIENT_ID`, `TRAKT_CLIENT_SECRET`, and `TMDB_API_KEY` (in `.env` or environment); it skips cleanly if any is absent. Tokens are minted on demand via the device-flow and stored only in a temporary file that the test cleans up afterwards.
 
+## Auto-upgrades & consolidation (SP3)
+
+The upgrade engine runs a quality-improvement pass over your library **once a day by default** (controlled by `UPGRADE_INTERVAL_SECS`, default 86 400 s). It is on by default for any deployment with engine-acquired titles; set `UPGRADE_INTERVAL_SECS=0` to disable it entirely.
+
+Each pass works through owned titles in a round-robin budget (`UPGRADE_BUDGET_PER_TICK`, default 20 titles per tick):
+
+- **Quality upgrades (movies & shows):** re-scrapes the title with Torrentio and checks whether a meaningfully-better **cached** release exists — meaningfully-better means at least one concrete category jump: uncached→cached, a higher source tier (e.g. WEB→BluRay/REMUX), or a higher resolution. Marginal score differences (same tier, same resolution) are never acted on to avoid churn. When a better release is found it is staged (added to the debrid account) and the VFS `selection` for the title is swapped — but only once the file has been **idle for `UPGRADE_IDLE_SECS`** (default 5 minutes without a proxy read). The superseded torrent is then pruned.
+- **Full-season consolidation (shows):** when scattered per-episode torrents exist for a season, the engine looks for a **cached** full-season pack that covers every aired episode (per TMDB) at same-or-better source tier and resolution. If one is found, the season's episode `selection` slots are repointed to the pack and the individual episode torrents are pruned — idle-gated in the same way. Partial-season packs are never adopted.
+
+Both operations are **idle-gated**: a slot being actively streamed is never swapped or pruned. After a service restart all slots read as idle (no in-memory handles can survive a restart).
+
 ## Technical Details
 
 - **Language**: Rust (2021 edition)
@@ -308,10 +330,11 @@ A scheduler spawns cooperating periodic jobs (each runs immediately on startup, 
 
 1. **Scan Task**: Polls the active debrid provider for new/updated torrents and updates the virtual filesystem
    - Repeats every `SCAN_INTERVAL_SECS` (default: 60 seconds)
-   - Builds the VFS with a `FileLocator` per file; resolution to a CDN URL happens lazily at read time
-   - Also verifies the progress of in-flight acquisitions each tick
+   - Builds the VFS consulting the persisted `selection` table (falls back to largest-bytes for un-managed torrents)
+   - Also runs `observe` to resolve in-flight acquisitions (deferred gates, provides recording, dead-torrent reaping)
 2. **Trakt Cycle** *(only when Trakt is configured)*: Syncs each enrolled account's watchlist/in-progress + watched state, then reconciles the library (acquire missing titles, remove finished/abandoned ones). Repeats every `TRAKT_SYNC_INTERVAL_SECS` (default: 900 seconds)
 3. **Episode Monitor** *(only when Trakt is configured)*: Checks tracked shows for newly aired episodes and acquires them. Repeats every `TRAKT_EPISODE_CHECK_INTERVAL_SECS` (default: 3600 seconds)
+4. **Upgrade Engine** *(on by default; disable with `UPGRADE_INTERVAL_SECS=0`)*: Re-scores owned titles and upgrades them to meaningfully-better cached releases; consolidates scattered per-episode torrents into full-season cached packs. Idle-gated — never swaps or prunes a file being actively streamed. Repeats every `UPGRADE_INTERVAL_SECS` (default: 86 400 seconds / daily)
 
 ### On-Demand Repair
 
