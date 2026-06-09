@@ -10,6 +10,7 @@ pub mod probe;
 pub mod provider;
 pub mod ratelimit;
 pub mod rd_client;
+pub mod read_activity;
 pub mod release;
 pub mod reacquire;
 pub mod repair;
