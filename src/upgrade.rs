@@ -74,6 +74,11 @@ async fn try_upgrade_movie(
         let r = release::parse(raw);
         if owned_hashes.iter().any(|h| h.eq_ignore_ascii_case(&r.info_hash)) { continue; }
         if app.store.is_blacklisted(tmdb_id, r.info_hash.clone()).await { continue; }
+        // Apply the same hard filters as acquisition (resolution ceiling, cam/telesync, dead seeders):
+        // score() returns None for any release that fails them. Never "upgrade" past the ceiling.
+        if release::score(&r, &app.config.acquisition.prefs).is_none() {
+            continue;
+        }
         let q = QualitySummary::of(&r, &app.config.acquisition.prefs);
         if !release::is_meaningful_upgrade(&current, &q) { continue; }
         if best.as_ref().map(|(_, bq)| q.score > bq.score).unwrap_or(true) {
@@ -120,7 +125,13 @@ async fn stage_and_verify(
     let hash = cand.info_hash.clone();
     let magnet = format!("magnet:?xt=urn:btih:{}", hash);
     let added = app.provider.add_magnet(&magnet).await.map_err(|e| format!("add failed: {e}"))?;
-    let info = app.provider.get_torrent_info(&added.id).await.map_err(|e| format!("info failed: {e}"))?;
+    let info = match app.provider.get_torrent_info(&added.id).await {
+        Ok(i) => i,
+        Err(e) => {
+            let _ = app.provider.delete_torrent(&added.id).await;
+            return Err(format!("info failed: {e}"));
+        }
+    };
     // Must be cached/downloaded with a video file to stage (we never speculatively download upgrades).
     if info.status != "downloaded" {
         let _ = app.provider.delete_torrent(&added.id).await;
@@ -203,6 +214,11 @@ mod tests {
     /// A cached REMUX 1080p candidate (a meaningful upgrade over a cached WEB 1080p).
     fn remux_candidate() -> RawCandidate {
         RawCandidate { name: "Torrentio\n1080p".into(), description: "M.2020.1080p.BluRay.REMUX.x265\nRD+".into(), info_hash: "hnew".into(), file_idx: Some(0), file_name: Some("M.2020.1080p.REMUX.mkv".into()) }
+    }
+    /// A cached WEB 1080p candidate — same tier and resolution as the owned "hold" record.
+    /// Not a meaningful upgrade; used to verify the no-churn guard.
+    fn web_1080_candidate() -> RawCandidate {
+        RawCandidate { name: "Torrentio\n1080p".into(), description: "M.2020.1080p.WEB-DL.x265\nRD+".into(), info_hash: "hweb".into(), file_idx: Some(0), file_name: Some("M.2020.1080p.WEB-DL.mkv".into()) }
     }
 
     /// Deterministic title validator for the upgrade flow tests — title validation has its own
@@ -312,6 +328,68 @@ mod tests {
         // Nothing pruned, nothing staged, selection unchanged — the upgrade was deferred.
         assert!(deleted.lock().unwrap().is_empty(), "active library must not be pruned");
         assert!(store.get_owned("hnew".into()).await.is_none(), "no stage while active");
+        assert_eq!(store.get_selection(movie_slot(27205)).await.unwrap().hash, "hold", "selection unchanged");
+    }
+
+    #[tokio::test]
+    async fn no_meaningful_upgrade_is_a_noop() {
+        let store = mem_store();
+        // Owned: cached WEB 1080p movie, Verified, with a selection.
+        store.put_owned("hold".into(), OwnedRecord {
+            request: movie_req(), provenance: Provenance::watchlist("a"), added_at: 1, status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: Some(QualitySummary { cached: true, source_tier: 3_000, resolution: 1080, score: 10 }),
+        }).await.unwrap();
+        store.put_selection(movie_slot(27205), SelectionEntry { hash: "hold".into(), file_path: "old.mkv".into() }).await.unwrap();
+
+        // Scraper returns only a same-tier same-resolution WEB 1080p candidate — not an upgrade.
+        let scraper = Arc::new(MockScraper { candidates: vec![web_1080_candidate()] });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        run_upgrade_once(&app).await;
+
+        assert!(deleted.lock().unwrap().is_empty(), "nothing pruned on no-upgrade");
+        assert!(store.get_owned("hweb".into()).await.is_none(), "no new owned record for same-tier candidate");
+        assert_eq!(store.get_selection(movie_slot(27205)).await.unwrap().hash, "hold", "selection unchanged");
+    }
+
+    #[tokio::test]
+    async fn above_ceiling_cached_release_is_not_staged() {
+        let store = mem_store();
+        // Owned: cached WEB 1080p movie, Verified, with a selection.
+        store.put_owned("hold".into(), OwnedRecord {
+            request: movie_req(), provenance: Provenance::watchlist("a"), added_at: 1, status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: Some(QualitySummary { cached: true, source_tier: 3_000, resolution: 1080, score: 10 }),
+        }).await.unwrap();
+        store.put_selection(movie_slot(27205), SelectionEntry { hash: "hold".into(), file_path: "old.mkv".into() }).await.unwrap();
+
+        // Scraper returns a cached 2160p REMUX — above the P1080 ceiling in AcquisitionConfig::default().
+        let cand_4k = RawCandidate {
+            name: "Torrentio\n2160p".into(),
+            description: "M.2020.2160p.BluRay.REMUX.x265\nRD+".into(),
+            info_hash: "h4k".into(),
+            file_idx: Some(0),
+            file_name: Some("M.2020.2160p.REMUX.mkv".into()),
+        };
+        let scraper = Arc::new(MockScraper { candidates: vec![cand_4k] });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        run_upgrade_once(&app).await;
+
+        // release::score returns None for 2160p when ceiling is P1080 → candidate is filtered out.
+        assert!(deleted.lock().unwrap().is_empty(), "nothing staged/pruned when candidate is above ceiling");
+        assert!(store.get_owned("h4k".into()).await.is_none(), "no new owned record for above-ceiling candidate");
         assert_eq!(store.get_selection(movie_slot(27205)).await.unwrap().hash, "hold", "selection unchanged");
     }
 }
