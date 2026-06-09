@@ -7,6 +7,27 @@ use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Resolved live-selection for `build`: slot key (`store::movie_slot`/`episode_slot`) ->
+/// `SelectionEntry`. An empty map ⇒ no managed selection ⇒ build uses its largest-bytes fallback,
+/// i.e. exactly the pre-SP3 behaviour (external / un-managed torrents are unaffected).
+pub type SelectionMap = std::collections::HashMap<String, crate::store::SelectionEntry>;
+
+/// Parse a SxxExx episode code from a file name. Mirrors `acquire::parse_se`.
+fn parse_se(name: &str) -> Option<(u32, u32)> {
+    static SE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})e(\d{1,3})").unwrap());
+    let c = SE.captures(name)?;
+    Some((c.get(1)?.as_str().parse().ok()?, c.get(2)?.as_str().parse().ok()?))
+}
+
+/// Extract the numeric tmdb id from a `MediaMetadata.external_id` like `"tmdb:1396"`.
+fn tmdb_id_of(metadata: &MediaMetadata) -> Option<u64> {
+    metadata
+        .external_id
+        .as_deref()
+        .and_then(|s| s.strip_prefix("tmdb:"))
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     ".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
 ];
@@ -218,7 +239,7 @@ impl DebridVfs {
         }
     }
 
-    pub fn build(torrents: Vec<(TorrentInfo, MediaMetadata)>) -> Self {
+    pub fn build(torrents: Vec<(TorrentInfo, MediaMetadata)>, selection: &SelectionMap) -> Self {
         let mut movies_nodes = BTreeMap::new();
         let mut shows_nodes = BTreeMap::new();
         let mut timestamps: HashMap<String, SystemTime> = HashMap::new();
@@ -298,8 +319,15 @@ impl DebridVfs {
             match metadata.media_type {
                 MediaType::Movie => {
                     let mut children = BTreeMap::new();
-                    // For movies, only take the largest torrent to avoid duplicates
-                    if let Some(torrent) = torrents.first() {
+                    // SP3: if a managed selection names a hash present in this group, that torrent
+                    // represents the movie; else fall back to the largest (torrents are size-sorted).
+                    let chosen = tmdb_id_of(&metadata)
+                        .and_then(|id| selection.get(&crate::store::movie_slot(id)))
+                        .and_then(|sel| {
+                            torrents.iter().find(|t| t.hash.eq_ignore_ascii_case(&sel.hash))
+                        })
+                        .or_else(|| torrents.first());
+                    if let Some(torrent) = chosen {
                         let torrent_ts = parse_rd_date(&torrent.added);
                         Self::add_torrent_files(&mut children, torrent, None);
                         if !children.is_empty() {
@@ -328,6 +356,13 @@ impl DebridVfs {
                     // Torrents are sorted by size descending, so larger (better quality) torrents
                     // are processed first. If a file with the same name already exists in a season
                     // directory, skip it to avoid creating (1)/(2) duplicates from repair replacements.
+                    // SP3: per-episode selection overrides for this show (slot -> entry).
+                    let show_tmdb = tmdb_id_of(&metadata);
+                    // Hashes present in this show's group — a selection naming an absent hash is
+                    // stale and must NOT hide the episode (self-healing). Compute BEFORE the loop
+                    // below moves `torrents`.
+                    let present_hashes: std::collections::HashSet<String> =
+                        torrents.iter().map(|t| t.hash.to_ascii_lowercase()).collect();
                     for torrent in torrents {
                         let torrent_ts = parse_rd_date(&torrent.added);
                         if torrent_ts > show_max_ts {
@@ -351,6 +386,34 @@ impl DebridVfs {
                                     if link.is_some() || torrent.links.is_empty() {
                                         let filename =
                                             file.path.split('/').next_back().unwrap_or(&file.path);
+                                        // SP3 selection gate: if this episode has a managed
+                                        // selection, only the selected (hash, file_path) is used;
+                                        // any other torrent's copy of the episode is skipped. With
+                                        // no selection entry, the legacy first/largest-wins dedup
+                                        // below applies unchanged.
+                                        if let (Some(tmdb), Some((se_s, se_e))) =
+                                            (show_tmdb, parse_se(filename))
+                                        {
+                                            if let Some(sel) = selection
+                                                .get(&crate::store::episode_slot(tmdb, se_s, se_e))
+                                            {
+                                                // Enforce the override only when the selected hash
+                                                // is actually present; a stale selection degrades to
+                                                // the legacy dedup so the episode still appears.
+                                                if present_hashes
+                                                    .contains(&sel.hash.to_ascii_lowercase())
+                                                {
+                                                    let is_selected = torrent
+                                                        .hash
+                                                        .eq_ignore_ascii_case(&sel.hash)
+                                                        && file.path == sel.file_path;
+                                                    if !is_selected {
+                                                        link_idx += 1;
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
                                         let season = SEASON_RE
                                             .captures(filename)
                                             .and_then(|cap| {
@@ -925,7 +988,7 @@ mod tests {
                 external_id: None,
             },
         )];
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
             if let VfsNode::Directory { children: mc } = movies {
@@ -997,7 +1060,7 @@ mod tests {
             },
         )];
 
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
             if let VfsNode::Directory { children: mc } = movies {
@@ -1052,7 +1115,7 @@ mod tests {
                 external_id: None,
             },
         )];
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").expect("Movies dir");
             if let VfsNode::Directory { children: mc } = movies {
@@ -1141,7 +1204,7 @@ mod tests {
             ),
         ];
 
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").expect("Movies directory missing");
@@ -1265,7 +1328,7 @@ mod tests {
                 external_id: Some("tmdb:12/34".to_string()),
             },
         )];
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
         if let VfsNode::Directory { children } = &vfs.root {
             if let Some(VfsNode::Directory {
                 children: movie_children,
@@ -1344,7 +1407,7 @@ mod tests {
             ),
         ];
 
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
@@ -1423,7 +1486,7 @@ mod tests {
             ),
         ];
 
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
         if let VfsNode::Directory { children } = &vfs.root {
             let shows = children.get("Shows").unwrap();
@@ -1523,7 +1586,7 @@ mod tests {
             ),
         ];
 
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
         if let VfsNode::Directory { children } = &vfs.root {
             let shows = children.get("Shows").unwrap();
@@ -1643,7 +1706,7 @@ mod tests {
             ),
         ];
 
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
@@ -1836,7 +1899,7 @@ mod tests {
             },
         )];
 
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
             if let VfsNode::Directory {
@@ -1915,7 +1978,7 @@ mod tests {
             ),
         ];
 
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
         let movie_ts = parse_rd_date("2023-06-15T14:30:45.000Z");
         let show_ts = parse_rd_date("2024-03-10T08:00:00.000Z");
 
@@ -2028,7 +2091,7 @@ mod tests {
             ),
         ];
 
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
         if let VfsNode::Directory { children } = &vfs.root {
             let shows = children.get("Shows").unwrap();
@@ -2561,7 +2624,7 @@ mod tests {
             },
         )];
 
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
@@ -2645,7 +2708,7 @@ mod tests {
             },
         )];
 
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
         if let VfsNode::Directory { children } = &vfs.root {
             let shows = children.get("Shows").unwrap();
@@ -2723,7 +2786,7 @@ mod tests {
             },
         )];
 
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
@@ -2796,7 +2859,7 @@ mod tests {
         )];
 
         // Should not panic
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
         if let VfsNode::Directory { children } = &vfs.root {
             let movies = children.get("Movies").unwrap();
@@ -2989,7 +3052,7 @@ mod tests {
             },
         )];
 
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
         // Archive-only torrents should produce no folder (no video files = no entry)
         if let VfsNode::Directory { children } = &vfs.root {
@@ -3004,5 +3067,108 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use crate::rd_client::{TorrentFile, TorrentInfo};
+    use crate::store::{episode_slot, movie_slot, SelectionEntry};
+
+    fn movie_meta(tmdb: u64) -> MediaMetadata {
+        MediaMetadata { title: "Movie".into(), year: Some("2023".into()), media_type: MediaType::Movie, external_id: Some(format!("tmdb:{}", tmdb)) }
+    }
+    fn show_meta(tmdb: u64) -> MediaMetadata {
+        MediaMetadata { title: "Show".into(), year: None, media_type: MediaType::Show, external_id: Some(format!("tmdb:{}", tmdb)) }
+    }
+    fn movie_torrent(id: &str, hash: &str, bytes: u64) -> TorrentInfo {
+        TorrentInfo {
+            id: id.into(), hash: hash.into(), bytes, status: "downloaded".into(),
+            files: vec![TorrentFile { id: 0, path: "Movie.2023.1080p.mkv".into(), bytes, selected: 1 }],
+            links: vec!["https://cdn/movie".into()],
+            ..Default::default()
+        }
+    }
+
+    fn movie_file_locators(vfs: &DebridVfs) -> Vec<FileLocator> {
+        // Collect every MediaFile locator under Movies/.
+        fn walk(n: &VfsNode, out: &mut Vec<FileLocator>) {
+            match n {
+                VfsNode::Directory { children } => for c in children.values() { walk(c, out) },
+                VfsNode::MediaFile { locator, .. } => out.push(locator.clone()),
+                VfsNode::VirtualFile { .. } => {}
+            }
+        }
+        let mut out = Vec::new();
+        if let VfsNode::Directory { children } = &vfs.root {
+            if let Some(m) = children.get("Movies") { walk(m, &mut out); }
+        }
+        out
+    }
+
+    #[test]
+    fn movie_empty_selection_falls_back_to_largest() {
+        // Two torrents for one movie; no selection ⇒ largest (h_big) wins (legacy behaviour).
+        let torrents = vec![
+            (movie_torrent("small", "h_small", 1_000_000_000), movie_meta(27205)),
+            (movie_torrent("big", "h_big", 9_000_000_000), movie_meta(27205)),
+        ];
+        let vfs = DebridVfs::build(torrents, &SelectionMap::new());
+        let locs = movie_file_locators(&vfs);
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].hash, "h_big", "largest-bytes fallback picks the big torrent");
+    }
+
+    #[test]
+    fn movie_selection_overrides_largest() {
+        // Selection points at the SMALL torrent's hash ⇒ it must win over the larger one.
+        let mut sel = SelectionMap::new();
+        sel.insert(movie_slot(27205), SelectionEntry { hash: "h_small".into(), file_path: "Movie.2023.1080p.mkv".into() });
+        let torrents = vec![
+            (movie_torrent("small", "h_small", 1_000_000_000), movie_meta(27205)),
+            (movie_torrent("big", "h_big", 9_000_000_000), movie_meta(27205)),
+        ];
+        let vfs = DebridVfs::build(torrents, &sel);
+        let locs = movie_file_locators(&vfs);
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].hash, "h_small", "selection overrides the largest-bytes default");
+    }
+
+    #[test]
+    fn episode_selection_picks_the_selected_hash_per_episode() {
+        // Two torrents both contain S01E01; selection picks the per-episode hash "h_pack".
+        let pack = TorrentInfo {
+            id: "pack".into(), hash: "h_pack".into(), bytes: 5_000_000_000, status: "downloaded".into(),
+            files: vec![TorrentFile { id: 0, path: "Show.S01E01.1080p.mkv".into(), bytes: 2_000_000_000, selected: 1 }],
+            links: vec!["https://cdn/pack-e1".into()],
+            ..Default::default()
+        };
+        let single = TorrentInfo {
+            id: "single".into(), hash: "h_single".into(), bytes: 9_000_000_000, status: "downloaded".into(),
+            files: vec![TorrentFile { id: 0, path: "Show.S01E01.2160p.mkv".into(), bytes: 9_000_000_000, selected: 1 }],
+            links: vec!["https://cdn/single-e1".into()],
+            ..Default::default()
+        };
+        let mut sel = SelectionMap::new();
+        sel.insert(episode_slot(1396, 1, 1), SelectionEntry { hash: "h_pack".into(), file_path: "Show.S01E01.1080p.mkv".into() });
+        // single is larger, so without selection it would win; selection forces h_pack.
+        let vfs = DebridVfs::build(vec![(single, show_meta(1396)), (pack, show_meta(1396))], &sel);
+        // Find the S01E01 media file's locator.
+        let mut found: Option<FileLocator> = None;
+        if let VfsNode::Directory { children } = &vfs.root {
+            if let Some(VfsNode::Directory { children: shows }) = children.get("Shows") {
+                for show in shows.values() {
+                    if let VfsNode::Directory { children: seasons } = show {
+                        if let Some(VfsNode::Directory { children: eps }) = seasons.get("Season 01") {
+                            for n in eps.values() {
+                                if let VfsNode::MediaFile { locator, .. } = n { found = Some(locator.clone()); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(found.expect("S01E01 present").hash, "h_pack", "per-episode selection wins");
     }
 }

@@ -97,7 +97,7 @@ async fn run_player_simulation(provider: Arc<dyn DebridProvider>, label: &str) {
 
     println!("[{label}] Updating VFS...");
     {
-        let new_vfs = DebridVfs::build(current_data);
+        let new_vfs = DebridVfs::build(current_data, &debridmoviemapper::vfs::SelectionMap::new());
         let mut vfs_lock = vfs.write().await;
         *vfs_lock = new_vfs;
     }
@@ -292,7 +292,7 @@ async fn run_size_consistency(provider: Arc<dyn DebridProvider>, label: &str) {
         current_data.push(result);
     }
 
-    let vfs = Arc::new(RwLock::new(DebridVfs::build(current_data)));
+    let vfs = Arc::new(RwLock::new(DebridVfs::build(current_data, &debridmoviemapper::vfs::SelectionMap::new())));
     let repair_manager = Arc::new(RepairManager::new(provider.clone()));
     let http_client = reqwest::Client::new();
     let ra = std::sync::Arc::new(debridmoviemapper::read_activity::ReadActivity::new());

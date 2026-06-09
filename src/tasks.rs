@@ -346,7 +346,7 @@ async fn update_vfs(
         .map(|(torrent_info, metadata)| (torrent_info.clone(), metadata.clone()))
         .collect();
     // Build VFS without holding the lock to avoid blocking WebDAV reads during scans
-    let new_vfs = DebridVfs::build(filtered);
+    let new_vfs = DebridVfs::build(filtered, &crate::vfs::SelectionMap::new());
     // Diff old vs new, then swap
     let mut vfs_lock = vfs.write().await;
     let changes = crate::vfs::diff_trees(&vfs_lock.root, &new_vfs.root, "");

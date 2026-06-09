@@ -637,7 +637,7 @@ mod tests {
             },
         )];
 
-        let vfs = DebridVfs::build(torrents);
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
         let path = DavPath::new("/Movies/Test Movie [tmdbid-123]/Test.mkv").unwrap();
         let result = DebridFileSystem::find_node_in(&vfs, &path);
         assert!(result.is_some(), "Deep path to media file should resolve");

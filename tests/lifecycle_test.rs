@@ -114,7 +114,10 @@ async fn run_lifecycle(provider: Arc<dyn DebridProvider>, tmdb: Arc<TmdbClient>,
 
     // 5. Appears in the built library (VFS).
     let metadata = identify_torrent(&info, &tmdb).await;
-    let vfs = DebridVfs::build(vec![(info.clone(), metadata)]);
+    let vfs = DebridVfs::build(
+        vec![(info.clone(), metadata)],
+        &debridmoviemapper::vfs::SelectionMap::new(),
+    );
     assert!(
         vfs_has_media_file(&vfs.root, ".mp4"),
         "[{label}] the .mp4 should appear in the VFS library"

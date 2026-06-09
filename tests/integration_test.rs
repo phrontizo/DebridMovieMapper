@@ -176,7 +176,7 @@ async fn test_vfs_structure() {
     );
 
     println!("Building VFS...");
-    let new_vfs = DebridVfs::build(data.clone());
+    let new_vfs = DebridVfs::build(data.clone(), &debridmoviemapper::vfs::SelectionMap::new());
     let vfs = Arc::new(RwLock::new(new_vfs));
 
     let vfs_lock = vfs.read().await;
@@ -247,7 +247,7 @@ async fn test_vfs_completeness() {
     );
 
     println!("Building VFS...");
-    let new_vfs = DebridVfs::build(data.clone());
+    let new_vfs = DebridVfs::build(data.clone(), &debridmoviemapper::vfs::SelectionMap::new());
     let vfs = Arc::new(RwLock::new(new_vfs));
 
     let vfs_lock = vfs.read().await;
@@ -329,8 +329,8 @@ async fn test_vfs_timestamps_stable() {
         "Need identified torrents to test timestamps"
     );
 
-    let vfs1 = DebridVfs::build(data.clone());
-    let vfs2 = DebridVfs::build(data.clone());
+    let vfs1 = DebridVfs::build(data.clone(), &debridmoviemapper::vfs::SelectionMap::new());
+    let vfs2 = DebridVfs::build(data.clone(), &debridmoviemapper::vfs::SelectionMap::new());
 
     // Timestamps should be populated
     assert!(

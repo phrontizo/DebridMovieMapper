@@ -70,7 +70,7 @@ async fn test_media_file_generation() {
 
     println!("Updating VFS...");
     {
-        let new_vfs = DebridVfs::build(current_data);
+        let new_vfs = DebridVfs::build(current_data, &debridmoviemapper::vfs::SelectionMap::new());
         let mut vfs_lock = vfs.write().await;
         *vfs_lock = new_vfs;
     }
@@ -187,7 +187,7 @@ async fn test_media_filename_keeps_original_extension() {
     }
 
     {
-        let new_vfs = DebridVfs::build(current_data);
+        let new_vfs = DebridVfs::build(current_data, &debridmoviemapper::vfs::SelectionMap::new());
         let mut vfs_lock = vfs.write().await;
         *vfs_lock = new_vfs;
     }
@@ -274,7 +274,7 @@ async fn test_nfo_generation_with_media() {
     }
 
     {
-        let new_vfs = DebridVfs::build(current_data);
+        let new_vfs = DebridVfs::build(current_data, &debridmoviemapper::vfs::SelectionMap::new());
         let mut vfs_lock = vfs.write().await;
         *vfs_lock = new_vfs;
     }
