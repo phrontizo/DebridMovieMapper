@@ -416,10 +416,14 @@ impl AcquisitionEngine {
                     }
                 }
                 // Persist provides = the SE-mapped episode set (the churn fix).
+                // Write provides + Verified in one put_owned so there is no intermediate
+                // Pending+provides failure window.
                 if let Some(mut rec) = self.store.get_owned(hash.to_string()).await {
                     rec.provides = eps.iter().map(|(s, e, _)| (*s, *e)).collect();
+                    rec.status = OwnedStatus::Verified;
                     let _ = self.store.put_owned(hash.to_string(), rec).await;
                 }
+                return;
             }
         }
         let _ = self.store.set_owned_status(hash.to_string(), OwnedStatus::Verified).await;
@@ -471,6 +475,7 @@ impl AcquisitionEngine {
             // Ensure something is selected so it downloads (RD: nothing downloads until selected).
             let none_selected = info.files.iter().all(|f| f.selected != 1);
             if none_selected {
+                // No candidate hint preserved in OwnedRecord; use the kind-appropriate fallback (largest video for movies, all videos for series).
                 let ids = select_ids_for(rec.request.kind, &info, None, None);
                 if !ids.is_empty() {
                     let csv = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
@@ -539,7 +544,6 @@ impl AcquisitionEngine {
                     }
                 }
                 VerifyResult::Reject(reason) => {
-                    self.verify_attempts.lock().await.remove(hash);
                     self.fail_and_reacquire(hash, &t.id, &rec.request, reason, &rec.provenance).await;
                 }
             }
@@ -898,5 +902,109 @@ mod tests {
         );
         eng.observe(&[torrent("tid_h1", "h1", "downloading", 12.0)]).await;
         assert_eq!(st.get_owned("h1".into()).await.unwrap().status, OwnedStatus::Pending, "slow-seed not judged early");
+    }
+
+    #[tokio::test]
+    async fn observe_movie_pack_guard_rejects_and_reacquires() {
+        let st = store();
+        st.put_owned("h1".into(), OwnedRecord {
+            request: req(), provenance: Provenance::manual(), added_at: now_secs(),
+            status: OwnedStatus::Pending, provides: vec![], quality: None,
+        }).await.unwrap();
+        // Provider returns a TI with TWO feature-sized video files — a multi-movie pack.
+        let pack_provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            add_magnet: Some(AddMagnetResponse { id: "tid_h1".into(), uri: String::new() }),
+            torrent_info: Some(TI {
+                id: "tid_h1".into(),
+                hash: "h1".into(),
+                status: "downloaded".into(),
+                files: vec![
+                    TorrentFile { id: 0, path: "Movie.A.2020.1080p.mkv".into(), bytes: 2_000_000_000, selected: 1 },
+                    TorrentFile { id: 1, path: "Movie.B.2019.1080p.mkv".into(), bytes: 2_000_000_000, selected: 1 },
+                ],
+                links: vec!["https://cdn/a".into(), "https://cdn/b".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/a".into()),
+            ..Default::default()
+        });
+        // Scraper returns no replacement candidates — blacklist is the only outcome.
+        let eng = engine(
+            pack_provider,
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)]).await;
+        assert!(st.get_owned("h1".into()).await.is_none(), "movie-pack record must be removed");
+        assert!(st.is_blacklisted(27205, "h1".into()).await, "movie-pack hash must be blacklisted");
+    }
+
+    #[tokio::test]
+    async fn observe_series_pack_writes_provides_and_episode_selection() {
+        let st = store();
+        let series_req = AcquireRequest {
+            imdb_id: "tt1".into(),
+            tmdb_id: 27205,
+            kind: MediaKind::Series,
+            season: Some(1),
+            episode: Some(1),
+            original_language: Some("eng".into()),
+            metadata: MediaMetadata {
+                title: "Show".into(),
+                year: Some("2023".into()),
+                media_type: MediaType::Show,
+                external_id: Some("tmdb:27205".into()),
+            },
+        };
+        st.put_owned("hp".into(), OwnedRecord {
+            request: series_req.clone(),
+            provenance: Provenance::manual(),
+            added_at: now_secs(),
+            status: OwnedStatus::Pending,
+            provides: vec![(1, 1)],
+            quality: None,
+        }).await.unwrap();
+        // Provider returns a season-pack TI: S01E01 + S01E02, both selected.
+        let series_provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            add_magnet: Some(AddMagnetResponse { id: "tid_hp".into(), uri: String::new() }),
+            torrent_info: Some(TI {
+                id: "tid_hp".into(),
+                hash: "hp".into(),
+                status: "downloaded".into(),
+                files: vec![
+                    TorrentFile { id: 0, path: "Show.S01E01.1080p.mkv".into(), bytes: 1_000_000_000, selected: 1 },
+                    TorrentFile { id: 1, path: "Show.S01E02.1080p.mkv".into(), bytes: 1_000_000_000, selected: 1 },
+                ],
+                links: vec!["https://cdn/e01".into(), "https://cdn/e02".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/e01".into()),
+            ..Default::default()
+        });
+        let eng = engine(
+            series_provider,
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_hp", "hp", "downloaded", 100.0)]).await;
+        let rec = st.get_owned("hp".into()).await.unwrap();
+        assert_eq!(rec.status, OwnedStatus::Verified, "series pack must be Verified after observe");
+        let mut provides = rec.provides.clone();
+        provides.sort();
+        assert_eq!(provides, vec![(1u32, 1u32), (1u32, 2u32)], "provides must cover both episodes");
+        assert_eq!(
+            st.get_selection(crate::store::episode_slot(27205, 1, 1)).await.unwrap().hash,
+            "hp",
+            "selection slot for S01E01 must point to hp"
+        );
+        assert_eq!(
+            st.get_selection(crate::store::episode_slot(27205, 1, 2)).await.unwrap().hash,
+            "hp",
+            "selection slot for S01E02 must point to hp"
+        );
     }
 }
