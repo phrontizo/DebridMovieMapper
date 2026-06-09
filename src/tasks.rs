@@ -647,9 +647,19 @@ pub(crate) async fn group_owned_by_tmdb(store: &Store) -> std::collections::BTre
         });
         group.hashes.push(hash.to_ascii_lowercase());
         group.provenance.merge(&rec.provenance);
-        if let (Some(s), Some(e)) = (rec.request.season, rec.request.episode) {
-            group.owned_episodes.push((s, e));
+        // SP3: prefer the recorded `provides` (a pack supplies many episodes); fall back to the
+        // request's single (season, episode) for pre-SP3 records that have no `provides` yet.
+        if rec.provides.is_empty() {
+            if let (Some(s), Some(e)) = (rec.request.season, rec.request.episode) {
+                group.owned_episodes.push((s, e));
+            }
+        } else {
+            group.owned_episodes.extend(rec.provides.iter().copied());
         }
+    }
+    for g in owned_by.values_mut() {
+        g.owned_episodes.sort_unstable();
+        g.owned_episodes.dedup();
     }
     owned_by
 }
@@ -1073,6 +1083,33 @@ mod tests {
         let got = resolve_metadata(&store, &tmdb, &info).await;
         assert_eq!(got.title, "Authoritative");
         assert_eq!(got.external_id.as_deref(), Some("tmdb:99"));
+    }
+
+    #[tokio::test]
+    async fn group_owned_uses_provides_for_episode_set() {
+        use crate::store::{Store, OwnedRecord, OwnedStatus, Provenance, AcquireRequest};
+        use crate::scraper::MediaKind;
+        use crate::vfs::{MediaMetadata, MediaType};
+        let store = Store::from_database(std::sync::Arc::new(
+            redb::Database::builder().create_with_backend(redb::backends::InMemoryBackend::new()).unwrap(),
+        )).unwrap();
+        // A single season-pack hash acquired via an S01E01 request, but `provides` records the WHOLE
+        // season — the churn fix: the group's owned_episodes must reflect every provided episode.
+        let req = AcquireRequest {
+            imdb_id: "tt2".into(), tmdb_id: 1396, kind: MediaKind::Series, season: Some(1), episode: Some(1),
+            original_language: None,
+            metadata: MediaMetadata { title: "S".into(), year: None, media_type: MediaType::Show, external_id: Some("tmdb:1396".into()) },
+        };
+        store.put_owned("pack".into(), OwnedRecord {
+            request: req, provenance: Provenance::watchlist("a"), added_at: 1, status: OwnedStatus::Verified,
+            provides: vec![(1, 1), (1, 2), (1, 3)], quality: None,
+        }).await.unwrap();
+
+        let groups = group_owned_by_tmdb(&store).await;
+        let g = groups.get(&1396).unwrap();
+        let mut eps = g.owned_episodes.clone();
+        eps.sort_unstable();
+        assert_eq!(eps, vec![(1, 1), (1, 2), (1, 3)], "owned_episodes is the union of provides, not the request's single (s,e)");
     }
 }
 
