@@ -378,6 +378,8 @@ impl AcquisitionEngine {
                     provenance: provenance.clone(),
                     added_at: now_secs(),
                     status: OwnedStatus::Pending,
+                    provides: vec![],
+                    quality: None,
                 },
             )
             .await;
@@ -817,6 +819,8 @@ mod tests {
                 provenance: Provenance::manual(),
                 added_at: 1,
                 status: OwnedStatus::Verified,
+                provides: vec![],
+                quality: None,
             },
         )
         .await
@@ -873,6 +877,8 @@ mod tests {
                 provenance: Provenance::manual(),
                 added_at: 1,
                 status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
             },
         )
         .await

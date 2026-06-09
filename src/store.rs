@@ -9,7 +9,8 @@ use tracing::{error, info, warn};
 /// Current on-disk schema version. Bump when a migration is added in `run_migrations`.
 /// v1→v2: additive (owned_hashes, authoritative_ids, blacklist tables).
 /// v2→v3: additive (trakt_tokens, wanted tables).
-pub const SCHEMA_VERSION: u64 = 3;
+/// v3→v4: additive (selection, upgrade_checks tables; OwnedRecord.provides/quality fields).
+pub const SCHEMA_VERSION: u64 = 4;
 
 /// TMDB identification cache: torrent id -> serde_json((TorrentInfo, MediaMetadata)).
 /// Same name + value encoding as the pre-Store inline table, so existing databases
@@ -28,6 +29,10 @@ const BLACKLIST_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blac
 const TRAKT_TOKENS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("trakt_tokens");
 /// Materialised per-(user, tmdb_id) wanted-set: "user|tmdb_id" -> serde_json(WantedRecord).
 const WANTED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wanted");
+/// SP3 live-selection: slot ("m|tmdb" / "e|tmdb|s|e") -> serde_json(SelectionEntry).
+const SELECTION_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("selection");
+/// SP3 upgrade round-robin cursor: tmdb_id (as string) -> last-checked unix secs.
+const UPGRADE_CHECKS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("upgrade_checks");
 
 /// The persisted "what to acquire" spec (also used by `acquire.rs`). Stored in `owned_hashes`
 /// so `observe` can re-acquire a title after a stall/failure without external context.
@@ -40,6 +45,22 @@ pub struct AcquireRequest {
     pub episode: Option<u32>,
     pub original_language: Option<String>,
     pub metadata: crate::vfs::MediaMetadata,
+}
+
+/// The live representative for one VFS slot (movie or episode): which hash + which file path.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SelectionEntry {
+    pub hash: String,
+    pub file_path: String,
+}
+
+/// Slot key for a movie's selection entry.
+pub fn movie_slot(tmdb_id: u64) -> String {
+    format!("m|{}", tmdb_id)
+}
+/// Slot key for one episode's selection entry.
+pub fn episode_slot(tmdb_id: u64, season: u32, episode: u32) -> String {
+    format!("e|{}|{}|{}", tmdb_id, season, episode)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -109,6 +130,14 @@ pub struct OwnedRecord {
     pub provenance: Provenance,
     pub added_at: u64,
     pub status: OwnedStatus,
+    /// (season, episode) pairs this hash supplies. Single-episode ⇒ one pair; movie ⇒ empty;
+    /// season pack ⇒ the full set (computed in `observe` from the resolved files). The union
+    /// across a show's hashes is the show's owned-episode set (kills season-pack churn).
+    #[serde(default)]
+    pub provides: Vec<(u32, u32)>,
+    /// Quality snapshot of the chosen release, for upgrade comparison. `None` on pre-SP3 records.
+    #[serde(default)]
+    pub quality: Option<crate::release::QualitySummary>,
 }
 
 /// Persisted per-user Trakt OAuth tokens (the `trakt_tokens` table value; key = user slug).
@@ -234,6 +263,8 @@ impl Store {
             write_txn.open_table(BLACKLIST_TABLE)?;     // create if absent
             write_txn.open_table(TRAKT_TOKENS_TABLE)?;  // create if absent
             write_txn.open_table(WANTED_TABLE)?;        // create if absent
+            write_txn.open_table(SELECTION_TABLE)?;     // create if absent
+            write_txn.open_table(UPGRADE_CHECKS_TABLE)?; // create if absent
             let mut meta = write_txn.open_table(META_TABLE)?; // create if absent
             meta.insert(SCHEMA_VERSION_KEY, &SCHEMA_VERSION)?;
         }
@@ -701,6 +732,88 @@ impl Store {
             out
         }).await.unwrap_or_default()
     }
+
+    // ── selection accessors (SP3) ─────────────────────────────────────────────
+
+    pub async fn put_selection(&self, slot: String, entry: SelectionEntry) -> Result<(), AppError> {
+        let bytes = match serde_json::to_vec(&entry) {
+            Ok(b) => b,
+            Err(e) => { error!("Failed to serialise SelectionEntry for {}: {}", slot, e); return Ok(()); }
+        };
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            let txn = db.begin_write()?;
+            { txn.open_table(SELECTION_TABLE)?.insert(slot.as_str(), bytes.as_slice())?; }
+            txn.commit()?;
+            Ok(())
+        }).await;
+        Self::flatten_join(result)
+    }
+
+    pub async fn get_selection(&self, slot: String) -> Option<SelectionEntry> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let txn = db.begin_read().ok()?;
+            let table = txn.open_table(SELECTION_TABLE).ok()?;
+            let e = table.get(slot.as_str()).ok()??;
+            serde_json::from_slice::<SelectionEntry>(e.value()).ok()
+        }).await.ok().flatten()
+    }
+
+    pub async fn remove_selection(&self, slot: String) -> Result<(), AppError> {
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            let txn = db.begin_write()?;
+            { txn.open_table(SELECTION_TABLE)?.remove(slot.as_str())?; }
+            txn.commit()?;
+            Ok(())
+        }).await;
+        Self::flatten_join(result)
+    }
+
+    pub async fn all_selection(&self) -> Vec<(String, SelectionEntry)> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            if let Ok(txn) = db.begin_read() {
+                if let Ok(table) = txn.open_table(SELECTION_TABLE) {
+                    if let Ok(iter) = table.iter() {
+                        for entry in iter.flatten() {
+                            let (k, v) = entry;
+                            if let Ok(rec) = serde_json::from_slice::<SelectionEntry>(v.value()) {
+                                out.push((k.value().to_string(), rec));
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        }).await.unwrap_or_default()
+    }
+
+    // ── upgrade_checks cursor (SP3) ───────────────────────────────────────────
+
+    pub async fn get_upgrade_checked(&self, tmdb_id: u64) -> u64 {
+        let key = tmdb_id.to_string();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let txn = match db.begin_read() { Ok(t) => t, Err(_) => return 0 };
+            let table = match txn.open_table(UPGRADE_CHECKS_TABLE) { Ok(t) => t, Err(_) => return 0 };
+            table.get(key.as_str()).ok().flatten().map(|g| g.value()).unwrap_or(0)
+        }).await.unwrap_or(0)
+    }
+
+    pub async fn set_upgrade_checked(&self, tmdb_id: u64, at: u64) -> Result<(), AppError> {
+        let key = tmdb_id.to_string();
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            let txn = db.begin_write()?;
+            { txn.open_table(UPGRADE_CHECKS_TABLE)?.insert(key.as_str(), &at)?; }
+            txn.commit()?;
+            Ok(())
+        }).await;
+        Self::flatten_join(result)
+    }
 }
 
 #[cfg(test)]
@@ -951,6 +1064,8 @@ mod tests {
             provenance: Provenance::manual(),
             added_at: 100,
             status: OwnedStatus::Pending,
+            provides: vec![],
+            quality: None,
         };
         store.put_owned("h1".to_string(), rec).await.unwrap();
         assert_eq!(store.get_owned("h1".to_string()).await.unwrap().status, OwnedStatus::Pending);
@@ -1138,6 +1253,8 @@ mod tests {
                     provenance: Provenance::manual(),
                     added_at: 42,
                     status: OwnedStatus::Pending,
+                    provides: vec![],
+                    quality: None,
                 };
                 ot.insert("hash2", serde_json::to_vec(&rec).unwrap().as_slice()).unwrap();
 
@@ -1247,10 +1364,72 @@ mod tests {
             provenance: expected_prov.clone(),
             added_at: 100,
             status: OwnedStatus::Pending,
+            provides: vec![],
+            quality: None,
         };
         store.put_owned("h1".to_string(), rec).await.unwrap();
         let got = store.get_owned("h1".to_string()).await.unwrap();
         assert_eq!(got.provenance, expected_prov);
+    }
+
+    // ── SP3 Task 2 tests (OwnedRecord provides/quality, selection, upgrade_checks) ─
+
+    #[tokio::test]
+    async fn owned_record_provides_and_quality_round_trip() {
+        let store = mem_store();
+        let rec = OwnedRecord {
+            request: req("tt1", 1396),
+            provenance: Provenance::manual(),
+            added_at: 100,
+            status: OwnedStatus::Pending,
+            provides: vec![(1, 1), (1, 2)],
+            quality: Some(crate::release::QualitySummary { cached: true, source_tier: 6_000, resolution: 1080, score: 42 }),
+        };
+        store.put_owned("h1".to_string(), rec.clone()).await.unwrap();
+        let got = store.get_owned("h1".to_string()).await.unwrap();
+        assert_eq!(got.provides, vec![(1, 1), (1, 2)]);
+        assert_eq!(got.quality.unwrap().source_tier, 6_000);
+    }
+
+    /// An old OwnedRecord JSON (no `provides`/`quality` keys) decodes with empty/None defaults.
+    #[test]
+    fn owned_record_old_encoding_defaults_provides_and_quality() {
+        let old = serde_json::json!({
+            "request": serde_json::to_value(req("tt1", 27205)).unwrap(),
+            "provenance": serde_json::to_value(Provenance::manual()).unwrap(),
+            "added_at": 1,
+            "status": "Verified",
+        });
+        let decoded: OwnedRecord = serde_json::from_value(old).unwrap();
+        assert!(decoded.provides.is_empty());
+        assert!(decoded.quality.is_none());
+    }
+
+    #[tokio::test]
+    async fn selection_round_trip_and_remove() {
+        let store = mem_store();
+        let slot = crate::store::episode_slot(1396, 1, 2);
+        store.put_selection(slot.clone(), SelectionEntry { hash: "h1".into(), file_path: "S01E02.mkv".into() }).await.unwrap();
+        let got = store.get_selection(slot.clone()).await.unwrap();
+        assert_eq!(got.hash, "h1");
+        assert_eq!(got.file_path, "S01E02.mkv");
+        assert_eq!(store.all_selection().await.len(), 1);
+        store.remove_selection(slot.clone()).await.unwrap();
+        assert!(store.get_selection(slot).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn upgrade_checked_cursor_round_trip() {
+        let store = mem_store();
+        assert_eq!(store.get_upgrade_checked(1396).await, 0, "absent → 0");
+        store.set_upgrade_checked(1396, 1_700_000_000).await.unwrap();
+        assert_eq!(store.get_upgrade_checked(1396).await, 1_700_000_000);
+    }
+
+    #[test]
+    fn slot_keys_distinguish_movie_and_episode() {
+        assert_eq!(crate::store::movie_slot(27205), "m|27205");
+        assert_eq!(crate::store::episode_slot(1396, 1, 2), "e|1396|1|2");
     }
 
     /// `Provenance::merge` unions entries and deduplicates; `has_manual_entry` reports correctly.

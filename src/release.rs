@@ -48,7 +48,7 @@ pub enum Source {
 
 impl Source {
     /// Ranking bonus by tier. `Cam` is rejected before this is consulted.
-    fn tier_score(self) -> i64 {
+    pub fn tier_score(self) -> i64 {
         match self {
             Source::Remux => 8_000,
             Source::BluRay => 6_000,
@@ -245,6 +245,42 @@ pub fn rank(candidates: Vec<ReleaseInfo>, prefs: &QualityPrefs) -> Vec<ReleaseIn
     scored.into_iter().map(|(_, r)| r).collect()
 }
 
+/// A compact, serialisable snapshot of a release's quality, recorded on `OwnedRecord` at acquire
+/// time so the upgrade engine can compare a fresh candidate against what we own without
+/// re-parsing the provider listing. All primitives (no enum serde needed); `source_tier` is
+/// `Source::tier_score()`, so a larger value is a higher tier.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct QualitySummary {
+    pub cached: bool,
+    pub source_tier: i64,
+    pub resolution: u16,
+    pub score: i64,
+}
+
+impl QualitySummary {
+    pub fn of(r: &ReleaseInfo, prefs: &QualityPrefs) -> Self {
+        QualitySummary {
+            cached: r.cached,
+            source_tier: r.source.tier_score(),
+            resolution: r.resolution.unwrap_or(0),
+            score: score(r, prefs).unwrap_or(i64::MIN),
+        }
+    }
+}
+
+/// A candidate is a meaningful upgrade over the current owned release iff it is CACHED and
+/// represents a concrete category jump: current is uncached, OR a higher source tier, OR a higher
+/// resolution. Marginal score wobble (same tier + resolution) is NOT an upgrade (avoids churn).
+pub fn is_meaningful_upgrade(current: &QualitySummary, candidate: &QualitySummary) -> bool {
+    if !candidate.cached {
+        return false;
+    }
+    if !current.cached {
+        return true;
+    }
+    candidate.source_tier > current.source_tier || candidate.resolution > current.resolution
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +456,26 @@ mod tests {
     fn group_rejects_tech_tokens() {
         let r = parse(&raw("t", "Movie.2023.1080p.WEB-DL", "h", None));
         assert_eq!(r.group, None, "WEB-DL must not be parsed as group 'DL'");
+    }
+
+    #[test]
+    fn meaningful_upgrade_requires_cached_category_jump() {
+        use super::{is_meaningful_upgrade, QualitySummary};
+        let owned_web_1080_cached = QualitySummary { cached: true, source_tier: 3_000, resolution: 1080, score: 1 };
+        // uncached candidate is never an upgrade
+        let cand_uncached = QualitySummary { cached: false, source_tier: 8_000, resolution: 2160, score: 9 };
+        assert!(!is_meaningful_upgrade(&owned_web_1080_cached, &cand_uncached));
+        // cached, higher tier → upgrade
+        let cand_remux = QualitySummary { cached: true, source_tier: 8_000, resolution: 1080, score: 5 };
+        assert!(is_meaningful_upgrade(&owned_web_1080_cached, &cand_remux));
+        // cached, same tier + same resolution → NOT an upgrade (marginal)
+        let cand_same = QualitySummary { cached: true, source_tier: 3_000, resolution: 1080, score: 999 };
+        assert!(!is_meaningful_upgrade(&owned_web_1080_cached, &cand_same));
+        // cached, higher resolution → upgrade
+        let cand_4k = QualitySummary { cached: true, source_tier: 3_000, resolution: 2160, score: 2 };
+        assert!(is_meaningful_upgrade(&owned_web_1080_cached, &cand_4k));
+        // owned uncached → any cached candidate upgrades it
+        let owned_uncached = QualitySummary { cached: false, source_tier: 6_000, resolution: 1080, score: 0 };
+        assert!(is_meaningful_upgrade(&owned_uncached, &cand_same));
     }
 }

@@ -1500,6 +1500,8 @@ mod reconcile_wanted_tests {
             provenance,
             added_at: 0,
             status: OwnedStatus::Pending,
+            provides: vec![],
+            quality: None,
         }
     }
 
