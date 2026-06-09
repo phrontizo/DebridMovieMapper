@@ -16,7 +16,10 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 fn parse_se(name: &str) -> Option<(u32, u32)> {
     static SE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})e(\d{1,3})").unwrap());
     let c = SE.captures(name)?;
-    Some((c.get(1)?.as_str().parse().ok()?, c.get(2)?.as_str().parse().ok()?))
+    Some((
+        c.get(1)?.as_str().parse().ok()?,
+        c.get(2)?.as_str().parse().ok()?,
+    ))
 }
 
 /// Extract the numeric tmdb id from a `MediaMetadata.external_id` like `"tmdb:1396"`.
@@ -324,7 +327,9 @@ impl DebridVfs {
                     let chosen = tmdb_id_of(&metadata)
                         .and_then(|id| selection.get(&crate::store::movie_slot(id)))
                         .and_then(|sel| {
-                            torrents.iter().find(|t| t.hash.eq_ignore_ascii_case(&sel.hash))
+                            torrents
+                                .iter()
+                                .find(|t| t.hash.eq_ignore_ascii_case(&sel.hash))
                         })
                         .or_else(|| torrents.first());
                     if let Some(torrent) = chosen {
@@ -361,8 +366,10 @@ impl DebridVfs {
                     // Hashes present in this show's group — a selection naming an absent hash is
                     // stale and must NOT hide the episode (self-healing). Compute BEFORE the loop
                     // below moves `torrents`.
-                    let present_hashes: std::collections::HashSet<String> =
-                        torrents.iter().map(|t| t.hash.to_ascii_lowercase()).collect();
+                    let present_hashes: std::collections::HashSet<String> = torrents
+                        .iter()
+                        .map(|t| t.hash.to_ascii_lowercase())
+                        .collect();
                     for torrent in torrents {
                         let torrent_ts = parse_rd_date(&torrent.added);
                         if torrent_ts > show_max_ts {
@@ -3077,15 +3084,33 @@ mod selection_tests {
     use crate::store::{episode_slot, movie_slot, SelectionEntry};
 
     fn movie_meta(tmdb: u64) -> MediaMetadata {
-        MediaMetadata { title: "Movie".into(), year: Some("2023".into()), media_type: MediaType::Movie, external_id: Some(format!("tmdb:{}", tmdb)) }
+        MediaMetadata {
+            title: "Movie".into(),
+            year: Some("2023".into()),
+            media_type: MediaType::Movie,
+            external_id: Some(format!("tmdb:{}", tmdb)),
+        }
     }
     fn show_meta(tmdb: u64) -> MediaMetadata {
-        MediaMetadata { title: "Show".into(), year: None, media_type: MediaType::Show, external_id: Some(format!("tmdb:{}", tmdb)) }
+        MediaMetadata {
+            title: "Show".into(),
+            year: None,
+            media_type: MediaType::Show,
+            external_id: Some(format!("tmdb:{}", tmdb)),
+        }
     }
     fn movie_torrent(id: &str, hash: &str, bytes: u64) -> TorrentInfo {
         TorrentInfo {
-            id: id.into(), hash: hash.into(), bytes, status: "downloaded".into(),
-            files: vec![TorrentFile { id: 0, path: "Movie.2023.1080p.mkv".into(), bytes, selected: 1 }],
+            id: id.into(),
+            hash: hash.into(),
+            bytes,
+            status: "downloaded".into(),
+            files: vec![TorrentFile {
+                id: 0,
+                path: "Movie.2023.1080p.mkv".into(),
+                bytes,
+                selected: 1,
+            }],
             links: vec!["https://cdn/movie".into()],
             ..Default::default()
         }
@@ -3095,14 +3120,20 @@ mod selection_tests {
         // Collect every MediaFile locator under Movies/.
         fn walk(n: &VfsNode, out: &mut Vec<FileLocator>) {
             match n {
-                VfsNode::Directory { children } => for c in children.values() { walk(c, out) },
+                VfsNode::Directory { children } => {
+                    for c in children.values() {
+                        walk(c, out)
+                    }
+                }
                 VfsNode::MediaFile { locator, .. } => out.push(locator.clone()),
                 VfsNode::VirtualFile { .. } => {}
             }
         }
         let mut out = Vec::new();
         if let VfsNode::Directory { children } = &vfs.root {
-            if let Some(m) = children.get("Movies") { walk(m, &mut out); }
+            if let Some(m) = children.get("Movies") {
+                walk(m, &mut out);
+            }
         }
         out
     }
@@ -3111,65 +3142,121 @@ mod selection_tests {
     fn movie_empty_selection_falls_back_to_largest() {
         // Two torrents for one movie; no selection ⇒ largest (h_big) wins (legacy behaviour).
         let torrents = vec![
-            (movie_torrent("small", "h_small", 1_000_000_000), movie_meta(27205)),
-            (movie_torrent("big", "h_big", 9_000_000_000), movie_meta(27205)),
+            (
+                movie_torrent("small", "h_small", 1_000_000_000),
+                movie_meta(27205),
+            ),
+            (
+                movie_torrent("big", "h_big", 9_000_000_000),
+                movie_meta(27205),
+            ),
         ];
         let vfs = DebridVfs::build(torrents, &SelectionMap::new());
         let locs = movie_file_locators(&vfs);
         assert_eq!(locs.len(), 1);
-        assert_eq!(locs[0].hash, "h_big", "largest-bytes fallback picks the big torrent");
+        assert_eq!(
+            locs[0].hash, "h_big",
+            "largest-bytes fallback picks the big torrent"
+        );
     }
 
     #[test]
     fn movie_selection_overrides_largest() {
         // Selection points at the SMALL torrent's hash ⇒ it must win over the larger one.
         let mut sel = SelectionMap::new();
-        sel.insert(movie_slot(27205), SelectionEntry { hash: "h_small".into(), file_path: "Movie.2023.1080p.mkv".into() });
+        sel.insert(
+            movie_slot(27205),
+            SelectionEntry {
+                hash: "h_small".into(),
+                file_path: "Movie.2023.1080p.mkv".into(),
+            },
+        );
         let torrents = vec![
-            (movie_torrent("small", "h_small", 1_000_000_000), movie_meta(27205)),
-            (movie_torrent("big", "h_big", 9_000_000_000), movie_meta(27205)),
+            (
+                movie_torrent("small", "h_small", 1_000_000_000),
+                movie_meta(27205),
+            ),
+            (
+                movie_torrent("big", "h_big", 9_000_000_000),
+                movie_meta(27205),
+            ),
         ];
         let vfs = DebridVfs::build(torrents, &sel);
         let locs = movie_file_locators(&vfs);
         assert_eq!(locs.len(), 1);
-        assert_eq!(locs[0].hash, "h_small", "selection overrides the largest-bytes default");
+        assert_eq!(
+            locs[0].hash, "h_small",
+            "selection overrides the largest-bytes default"
+        );
     }
 
     #[test]
     fn episode_selection_picks_the_selected_hash_per_episode() {
         // Two torrents both contain S01E01; selection picks the per-episode hash "h_pack".
         let pack = TorrentInfo {
-            id: "pack".into(), hash: "h_pack".into(), bytes: 5_000_000_000, status: "downloaded".into(),
-            files: vec![TorrentFile { id: 0, path: "Show.S01E01.1080p.mkv".into(), bytes: 2_000_000_000, selected: 1 }],
+            id: "pack".into(),
+            hash: "h_pack".into(),
+            bytes: 5_000_000_000,
+            status: "downloaded".into(),
+            files: vec![TorrentFile {
+                id: 0,
+                path: "Show.S01E01.1080p.mkv".into(),
+                bytes: 2_000_000_000,
+                selected: 1,
+            }],
             links: vec!["https://cdn/pack-e1".into()],
             ..Default::default()
         };
         let single = TorrentInfo {
-            id: "single".into(), hash: "h_single".into(), bytes: 9_000_000_000, status: "downloaded".into(),
-            files: vec![TorrentFile { id: 0, path: "Show.S01E01.2160p.mkv".into(), bytes: 9_000_000_000, selected: 1 }],
+            id: "single".into(),
+            hash: "h_single".into(),
+            bytes: 9_000_000_000,
+            status: "downloaded".into(),
+            files: vec![TorrentFile {
+                id: 0,
+                path: "Show.S01E01.2160p.mkv".into(),
+                bytes: 9_000_000_000,
+                selected: 1,
+            }],
             links: vec!["https://cdn/single-e1".into()],
             ..Default::default()
         };
         let mut sel = SelectionMap::new();
-        sel.insert(episode_slot(1396, 1, 1), SelectionEntry { hash: "h_pack".into(), file_path: "Show.S01E01.1080p.mkv".into() });
+        sel.insert(
+            episode_slot(1396, 1, 1),
+            SelectionEntry {
+                hash: "h_pack".into(),
+                file_path: "Show.S01E01.1080p.mkv".into(),
+            },
+        );
         // single is larger, so without selection it would win; selection forces h_pack.
-        let vfs = DebridVfs::build(vec![(single, show_meta(1396)), (pack, show_meta(1396))], &sel);
+        let vfs = DebridVfs::build(
+            vec![(single, show_meta(1396)), (pack, show_meta(1396))],
+            &sel,
+        );
         // Find the S01E01 media file's locator.
         let mut found: Option<FileLocator> = None;
         if let VfsNode::Directory { children } = &vfs.root {
             if let Some(VfsNode::Directory { children: shows }) = children.get("Shows") {
                 for show in shows.values() {
                     if let VfsNode::Directory { children: seasons } = show {
-                        if let Some(VfsNode::Directory { children: eps }) = seasons.get("Season 01") {
+                        if let Some(VfsNode::Directory { children: eps }) = seasons.get("Season 01")
+                        {
                             for n in eps.values() {
-                                if let VfsNode::MediaFile { locator, .. } = n { found = Some(locator.clone()); }
+                                if let VfsNode::MediaFile { locator, .. } = n {
+                                    found = Some(locator.clone());
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        assert_eq!(found.expect("S01E01 present").hash, "h_pack", "per-episode selection wins");
+        assert_eq!(
+            found.expect("S01E01 present").hash,
+            "h_pack",
+            "per-episode selection wins"
+        );
     }
 
     #[test]
@@ -3177,13 +3264,27 @@ mod selection_tests {
         // A selection entry naming a hash that is NOT in the group is stale; it must NOT hide the
         // episode — self-healing falls through to the legacy dedup so the episode still appears.
         let torrent = TorrentInfo {
-            id: "t".into(), hash: "h_live".into(), bytes: 1_000_000_000, status: "downloaded".into(),
-            files: vec![TorrentFile { id: 0, path: "Show.S01E01.1080p.mkv".into(), bytes: 1_000_000_000, selected: 1 }],
+            id: "t".into(),
+            hash: "h_live".into(),
+            bytes: 1_000_000_000,
+            status: "downloaded".into(),
+            files: vec![TorrentFile {
+                id: 0,
+                path: "Show.S01E01.1080p.mkv".into(),
+                bytes: 1_000_000_000,
+                selected: 1,
+            }],
             links: vec!["https://cdn/e1".into()],
             ..Default::default()
         };
         let mut sel = SelectionMap::new();
-        sel.insert(episode_slot(1396, 1, 1), SelectionEntry { hash: "h_gone".into(), file_path: "Show.S01E01.1080p.mkv".into() });
+        sel.insert(
+            episode_slot(1396, 1, 1),
+            SelectionEntry {
+                hash: "h_gone".into(),
+                file_path: "Show.S01E01.1080p.mkv".into(),
+            },
+        );
         let vfs = DebridVfs::build(vec![(torrent, show_meta(1396))], &sel);
         // Episode S01E01 must still be present under Shows/<show>/Season 01.
         let mut found = false;
@@ -3191,13 +3292,19 @@ mod selection_tests {
             if let Some(VfsNode::Directory { children: shows }) = children.get("Shows") {
                 for show in shows.values() {
                     if let VfsNode::Directory { children: seasons } = show {
-                        if let Some(VfsNode::Directory { children: eps }) = seasons.get("Season 01") {
-                            if eps.values().any(|n| matches!(n, VfsNode::MediaFile { .. })) { found = true; }
+                        if let Some(VfsNode::Directory { children: eps }) = seasons.get("Season 01")
+                        {
+                            if eps.values().any(|n| matches!(n, VfsNode::MediaFile { .. })) {
+                                found = true;
+                            }
                         }
                     }
                 }
             }
         }
-        assert!(found, "stale selection (absent hash) must not hide the episode");
+        assert!(
+            found,
+            "stale selection (absent hash) must not hide the episode"
+        );
     }
 }

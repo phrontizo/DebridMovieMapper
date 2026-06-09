@@ -114,7 +114,10 @@ impl TraktConfig {
 
         let sync_interval_secs = match sync_interval_secs {
             Some(s) => s.trim().parse::<u64>().unwrap_or_else(|_| {
-                warn!("Invalid TRAKT_SYNC_INTERVAL_SECS value '{}', falling back to {}", s, DEFAULT_SYNC);
+                warn!(
+                    "Invalid TRAKT_SYNC_INTERVAL_SECS value '{}', falling back to {}",
+                    s, DEFAULT_SYNC
+                );
                 DEFAULT_SYNC
             }),
             None => DEFAULT_SYNC,
@@ -205,14 +208,20 @@ impl AcquisitionConfig {
             },
             stall_timeout_secs: match stall_timeout_secs {
                 Some(s) => s.trim().parse().unwrap_or_else(|_| {
-                    warn!("Invalid STALL_TIMEOUT_SECS value '{}', falling back to 1800", s);
+                    warn!(
+                        "Invalid STALL_TIMEOUT_SECS value '{}', falling back to 1800",
+                        s
+                    );
                     1800
                 }),
                 None => 1800,
             },
             max_acquire_attempts: match max_acquire_attempts {
                 Some(s) => s.trim().parse().unwrap_or_else(|_| {
-                    warn!("Invalid MAX_ACQUIRE_ATTEMPTS value '{}', falling back to 5", s);
+                    warn!(
+                        "Invalid MAX_ACQUIRE_ATTEMPTS value '{}', falling back to 5",
+                        s
+                    );
                     5
                 }),
                 None => 5,
@@ -281,7 +290,10 @@ impl UpgradeConfig {
                     Ok(0) if zero_disables => 0,
                     Ok(n) => n.max(min),
                     Err(_) => {
-                        warn!("Invalid {} value '{}', falling back to {}", name, s, default);
+                        warn!(
+                            "Invalid {} value '{}', falling back to {}",
+                            name, s, default
+                        );
                         default
                     }
                 },
@@ -290,9 +302,16 @@ impl UpgradeConfig {
         }
         UpgradeConfig {
             interval_secs: num(interval_secs, 86_400, 600, true, "UPGRADE_INTERVAL_SECS"),
-            budget_per_tick: num(budget_per_tick, 20, 1, false, "UPGRADE_BUDGET_PER_TICK").min(u32::MAX as u64) as u32,
+            budget_per_tick: num(budget_per_tick, 20, 1, false, "UPGRADE_BUDGET_PER_TICK")
+                .min(u32::MAX as u64) as u32,
             idle_secs: num(idle_secs, 300, 30, false, "UPGRADE_IDLE_SECS"),
-            stage_max_secs: num(stage_max_secs, 604_800, 3600, false, "UPGRADE_STAGE_MAX_SECS"),
+            stage_max_secs: num(
+                stage_max_secs,
+                604_800,
+                3600,
+                false,
+                "UPGRADE_STAGE_MAX_SECS",
+            ),
         }
     }
 
@@ -365,7 +384,10 @@ impl Config {
 
         let scan_interval_secs = match scan_interval_secs {
             Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
-                warn!("Invalid SCAN_INTERVAL_SECS value '{}', falling back to 60", s);
+                warn!(
+                    "Invalid SCAN_INTERVAL_SECS value '{}', falling back to 60",
+                    s
+                );
                 60
             }),
             None => 60,
@@ -454,29 +476,47 @@ mod tests {
     #[test]
     fn scan_interval_clamped_and_parsed() {
         assert_eq!(
-            parts(Some("rd"), None, Some("t"), Some("5"), None, None).unwrap().scan_interval_secs,
+            parts(Some("rd"), None, Some("t"), Some("5"), None, None)
+                .unwrap()
+                .scan_interval_secs,
             10
         );
         assert_eq!(
-            parts(Some("rd"), None, Some("t"), Some("abc"), None, None).unwrap().scan_interval_secs,
+            parts(Some("rd"), None, Some("t"), Some("abc"), None, None)
+                .unwrap()
+                .scan_interval_secs,
             60
         );
         assert_eq!(
-            parts(Some("rd"), None, Some("t"), Some("120"), None, None).unwrap().scan_interval_secs,
+            parts(Some("rd"), None, Some("t"), Some("120"), None, None)
+                .unwrap()
+                .scan_interval_secs,
             120
         );
     }
 
     #[test]
     fn port_parsed_with_fallback() {
-        assert_eq!(parts(Some("rd"), None, Some("t"), None, None, Some("9000")).unwrap().port, 9000);
-        assert_eq!(parts(Some("rd"), None, Some("t"), None, None, Some("nope")).unwrap().port, 8080);
+        assert_eq!(
+            parts(Some("rd"), None, Some("t"), None, None, Some("9000"))
+                .unwrap()
+                .port,
+            9000
+        );
+        assert_eq!(
+            parts(Some("rd"), None, Some("t"), None, None, Some("nope"))
+                .unwrap()
+                .port,
+            8080
+        );
     }
 
     #[test]
     fn db_path_override() {
         assert_eq!(
-            parts(Some("rd"), None, Some("t"), None, Some("/data/x.db"), None).unwrap().db_path,
+            parts(Some("rd"), None, Some("t"), None, Some("/data/x.db"), None)
+                .unwrap()
+                .db_path,
             "/data/x.db"
         );
     }
@@ -527,7 +567,10 @@ mod tests {
     fn subtitle_none_keyword_means_skip() {
         assert_eq!(SubReq::parse(None), SubReq::None);
         assert_eq!(SubReq::parse(Some("none".into())), SubReq::None);
-        assert_eq!(SubReq::parse(Some("eng".into())), SubReq::Lang("eng".into()));
+        assert_eq!(
+            SubReq::parse(Some("eng".into())),
+            SubReq::Lang("eng".into())
+        );
     }
 
     // ── TraktConfig tests ────────────────────────────────────────────────────
@@ -583,25 +626,65 @@ mod tests {
     #[test]
     fn trakt_sync_interval_clamped() {
         // Below min → clamped to 60
-        assert_eq!(trakt(Some("id"), Some("s"), Some("5"), None).unwrap().sync_interval_secs, 60);
+        assert_eq!(
+            trakt(Some("id"), Some("s"), Some("5"), None)
+                .unwrap()
+                .sync_interval_secs,
+            60
+        );
         // Exactly at min → kept as-is (boundary)
-        assert_eq!(trakt(Some("id"), Some("s"), Some("60"), None).unwrap().sync_interval_secs, 60);
+        assert_eq!(
+            trakt(Some("id"), Some("s"), Some("60"), None)
+                .unwrap()
+                .sync_interval_secs,
+            60
+        );
         // Invalid → default 900
-        assert_eq!(trakt(Some("id"), Some("s"), Some("abc"), None).unwrap().sync_interval_secs, 900);
+        assert_eq!(
+            trakt(Some("id"), Some("s"), Some("abc"), None)
+                .unwrap()
+                .sync_interval_secs,
+            900
+        );
         // Valid above min → kept
-        assert_eq!(trakt(Some("id"), Some("s"), Some("1200"), None).unwrap().sync_interval_secs, 1200);
+        assert_eq!(
+            trakt(Some("id"), Some("s"), Some("1200"), None)
+                .unwrap()
+                .sync_interval_secs,
+            1200
+        );
     }
 
     #[test]
     fn trakt_episode_check_interval_clamped() {
         // Below min → clamped to 300
-        assert_eq!(trakt(Some("id"), Some("s"), None, Some("100")).unwrap().episode_check_interval_secs, 300);
+        assert_eq!(
+            trakt(Some("id"), Some("s"), None, Some("100"))
+                .unwrap()
+                .episode_check_interval_secs,
+            300
+        );
         // Exactly at min → kept as-is (boundary)
-        assert_eq!(trakt(Some("id"), Some("s"), None, Some("300")).unwrap().episode_check_interval_secs, 300);
+        assert_eq!(
+            trakt(Some("id"), Some("s"), None, Some("300"))
+                .unwrap()
+                .episode_check_interval_secs,
+            300
+        );
         // Invalid → default 3600
-        assert_eq!(trakt(Some("id"), Some("s"), None, Some("xyz")).unwrap().episode_check_interval_secs, 3600);
+        assert_eq!(
+            trakt(Some("id"), Some("s"), None, Some("xyz"))
+                .unwrap()
+                .episode_check_interval_secs,
+            3600
+        );
         // Valid above min → kept
-        assert_eq!(trakt(Some("id"), Some("s"), None, Some("7200")).unwrap().episode_check_interval_secs, 7200);
+        assert_eq!(
+            trakt(Some("id"), Some("s"), None, Some("7200"))
+                .unwrap()
+                .episode_check_interval_secs,
+            7200
+        );
     }
 
     #[test]
@@ -627,7 +710,10 @@ mod tests {
 
         // Below-min interval (but non-zero) clamps up to 600; sub-knobs clamp to their mins.
         let clamped = UpgradeConfig::from_parts(
-            Some("60".into()), Some("0".into()), Some("5".into()), Some("10".into()),
+            Some("60".into()),
+            Some("0".into()),
+            Some("5".into()),
+            Some("10".into()),
         );
         assert_eq!(clamped.interval_secs, 600);
         assert_eq!(clamped.budget_per_tick, 1);

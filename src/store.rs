@@ -98,13 +98,19 @@ impl Default for Provenance {
 
 impl Provenance {
     pub fn manual() -> Self {
-        Provenance { entries: vec![ProvenanceEntry::Manual] }
+        Provenance {
+            entries: vec![ProvenanceEntry::Manual],
+        }
     }
     pub fn watchlist(user: impl Into<String>) -> Self {
-        Provenance { entries: vec![ProvenanceEntry::Watchlist { user: user.into() }] }
+        Provenance {
+            entries: vec![ProvenanceEntry::Watchlist { user: user.into() }],
+        }
     }
     pub fn in_progress(user: impl Into<String>) -> Self {
-        Provenance { entries: vec![ProvenanceEntry::InProgress { user: user.into() }] }
+        Provenance {
+            entries: vec![ProvenanceEntry::InProgress { user: user.into() }],
+        }
     }
     /// Union `other`'s entries into `self`, de-duplicating identical (variant, user) entries.
     // O(n²) dedup, but n is small in practice (Manual + at most one entry per user per source).
@@ -119,7 +125,9 @@ impl Provenance {
     /// auto-removed by the reconciler, regardless of Trakt state. (Provenance built via the
     /// constructors is always non-empty; `entries` is `pub` only for multi-entry construction.)
     pub fn has_manual_entry(&self) -> bool {
-        self.entries.iter().any(|e| matches!(e, ProvenanceEntry::Manual))
+        self.entries
+            .iter()
+            .any(|e| matches!(e, ProvenanceEntry::Manual))
     }
 }
 
@@ -246,7 +254,10 @@ impl Store {
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
             Err(e) => return Err(e.into()),
         };
-        Ok(table.get(SCHEMA_VERSION_KEY)?.map(|g| g.value()).unwrap_or(0))
+        Ok(table
+            .get(SCHEMA_VERSION_KEY)?
+            .map(|g| g.value())
+            .unwrap_or(0))
     }
 
     /// Ensure required tables exist, run any pending migrations, and stamp the
@@ -257,13 +268,13 @@ impl Store {
         }
         let write_txn = db.begin_write()?;
         {
-            write_txn.open_table(MATCHES_TABLE)?;       // create if absent
-            write_txn.open_table(OWNED_TABLE)?;         // create if absent
-            write_txn.open_table(AUTH_TABLE)?;          // create if absent
-            write_txn.open_table(BLACKLIST_TABLE)?;     // create if absent
-            write_txn.open_table(TRAKT_TOKENS_TABLE)?;  // create if absent
-            write_txn.open_table(WANTED_TABLE)?;        // create if absent
-            write_txn.open_table(SELECTION_TABLE)?;     // create if absent
+            write_txn.open_table(MATCHES_TABLE)?; // create if absent
+            write_txn.open_table(OWNED_TABLE)?; // create if absent
+            write_txn.open_table(AUTH_TABLE)?; // create if absent
+            write_txn.open_table(BLACKLIST_TABLE)?; // create if absent
+            write_txn.open_table(TRAKT_TOKENS_TABLE)?; // create if absent
+            write_txn.open_table(WANTED_TABLE)?; // create if absent
+            write_txn.open_table(SELECTION_TABLE)?; // create if absent
             write_txn.open_table(UPGRADE_CHECKS_TABLE)?; // create if absent
             let mut meta = write_txn.open_table(META_TABLE)?; // create if absent
             meta.insert(SCHEMA_VERSION_KEY, &SCHEMA_VERSION)?;
@@ -456,10 +467,14 @@ impl Store {
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
-            { txn.open_table(OWNED_TABLE)?.insert(hash.as_str(), bytes.as_slice())?; }
+            {
+                txn.open_table(OWNED_TABLE)?
+                    .insert(hash.as_str(), bytes.as_slice())?;
+            }
             txn.commit()?;
             Ok(())
-        }).await;
+        })
+        .await;
         Self::flatten_join(result)
     }
 
@@ -470,10 +485,17 @@ impl Store {
             let table = txn.open_table(OWNED_TABLE).ok()?;
             let e = table.get(hash.as_str()).ok()??;
             serde_json::from_slice::<OwnedRecord>(e.value()).ok()
-        }).await.ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
-    pub async fn set_owned_status(&self, hash: String, status: OwnedStatus) -> Result<(), AppError> {
+    pub async fn set_owned_status(
+        &self,
+        hash: String,
+        status: OwnedStatus,
+    ) -> Result<(), AppError> {
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
@@ -504,10 +526,13 @@ impl Store {
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
-            { txn.open_table(OWNED_TABLE)?.remove(hash.as_str())?; }
+            {
+                txn.open_table(OWNED_TABLE)?.remove(hash.as_str())?;
+            }
             txn.commit()?;
             Ok(())
-        }).await;
+        })
+        .await;
         Self::flatten_join(result)
     }
 
@@ -528,26 +553,39 @@ impl Store {
                 }
             }
             out
-        }).await.unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     // ── authoritative_ids accessors ───────────────────────────────────────────
 
-    pub async fn put_authoritative(&self, hash: String, meta: crate::vfs::MediaMetadata) -> Result<(), AppError> {
+    pub async fn put_authoritative(
+        &self,
+        hash: String,
+        meta: crate::vfs::MediaMetadata,
+    ) -> Result<(), AppError> {
         let bytes = match serde_json::to_vec(&meta) {
             Ok(b) => b,
             Err(e) => {
-                error!("Failed to serialise authoritative metadata for {}: {}", hash, e);
+                error!(
+                    "Failed to serialise authoritative metadata for {}: {}",
+                    hash, e
+                );
                 return Ok(());
             }
         };
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
-            { txn.open_table(AUTH_TABLE)?.insert(hash.as_str(), bytes.as_slice())?; }
+            {
+                txn.open_table(AUTH_TABLE)?
+                    .insert(hash.as_str(), bytes.as_slice())?;
+            }
             txn.commit()?;
             Ok(())
-        }).await;
+        })
+        .await;
         Self::flatten_join(result)
     }
 
@@ -558,38 +596,57 @@ impl Store {
             let table = txn.open_table(AUTH_TABLE).ok()?;
             let e = table.get(hash.as_str()).ok()??;
             serde_json::from_slice::<crate::vfs::MediaMetadata>(e.value()).ok()
-        }).await.ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     pub async fn remove_authoritative(&self, hash: String) -> Result<(), AppError> {
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
-            { txn.open_table(AUTH_TABLE)?.remove(hash.as_str())?; }
+            {
+                txn.open_table(AUTH_TABLE)?.remove(hash.as_str())?;
+            }
             txn.commit()?;
             Ok(())
-        }).await;
+        })
+        .await;
         Self::flatten_join(result)
     }
 
     // ── blacklist accessors ───────────────────────────────────────────────────
 
-    pub async fn blacklist_add(&self, tmdb_id: u64, hash: String, reason: &str, at: u64) -> Result<(), AppError> {
+    pub async fn blacklist_add(
+        &self,
+        tmdb_id: u64,
+        hash: String,
+        reason: &str,
+        at: u64,
+    ) -> Result<(), AppError> {
         let key = format!("{}|{}", tmdb_id, hash);
         let bytes = match serde_json::to_vec(&serde_json::json!({"reason": reason, "at": at})) {
             Ok(b) => b,
             Err(e) => {
-                error!("Failed to serialise blacklist entry {}|{}: {}", tmdb_id, hash, e);
+                error!(
+                    "Failed to serialise blacklist entry {}|{}: {}",
+                    tmdb_id, hash, e
+                );
                 return Ok(());
             }
         };
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
-            { txn.open_table(BLACKLIST_TABLE)?.insert(key.as_str(), bytes.as_slice())?; }
+            {
+                txn.open_table(BLACKLIST_TABLE)?
+                    .insert(key.as_str(), bytes.as_slice())?;
+            }
             txn.commit()?;
             Ok(())
-        }).await;
+        })
+        .await;
         Self::flatten_join(result)
     }
 
@@ -597,16 +654,28 @@ impl Store {
         let key = format!("{}|{}", tmdb_id, hash);
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let txn = match db.begin_read() { Ok(t) => t, Err(_) => return false };
-            let table = match txn.open_table(BLACKLIST_TABLE) { Ok(t) => t, Err(_) => return false };
+            let txn = match db.begin_read() {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            let table = match txn.open_table(BLACKLIST_TABLE) {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
             matches!(table.get(key.as_str()), Ok(Some(_)))
-        }).await.unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
     }
 
     // ── trakt_tokens accessors ────────────────────────────────────────────────
 
     /// `slug` is the user's Trakt URL slug and is the key under which the tokens are stored.
-    pub async fn put_trakt_tokens(&self, slug: String, tokens: TraktTokens) -> Result<(), AppError> {
+    pub async fn put_trakt_tokens(
+        &self,
+        slug: String,
+        tokens: TraktTokens,
+    ) -> Result<(), AppError> {
         // Serialise before opening the transaction to avoid partial writes on serde failure.
         let bytes = match serde_json::to_vec(&tokens) {
             Ok(b) => b,
@@ -618,10 +687,14 @@ impl Store {
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
-            { txn.open_table(TRAKT_TOKENS_TABLE)?.insert(slug.as_str(), bytes.as_slice())?; }
+            {
+                txn.open_table(TRAKT_TOKENS_TABLE)?
+                    .insert(slug.as_str(), bytes.as_slice())?;
+            }
             txn.commit()?;
             Ok(())
-        }).await;
+        })
+        .await;
         Self::flatten_join(result)
     }
 
@@ -632,17 +705,23 @@ impl Store {
             let table = txn.open_table(TRAKT_TOKENS_TABLE).ok()?;
             let e = table.get(slug.as_str()).ok()??;
             serde_json::from_slice::<TraktTokens>(e.value()).ok()
-        }).await.ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     pub async fn remove_trakt_tokens(&self, slug: String) -> Result<(), AppError> {
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
-            { txn.open_table(TRAKT_TOKENS_TABLE)?.remove(slug.as_str())?; }
+            {
+                txn.open_table(TRAKT_TOKENS_TABLE)?.remove(slug.as_str())?;
+            }
             txn.commit()?;
             Ok(())
-        }).await;
+        })
+        .await;
         Self::flatten_join(result)
     }
 
@@ -664,7 +743,9 @@ impl Store {
                 }
             }
             out
-        }).await.unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     // ── wanted accessors ──────────────────────────────────────────────────────
@@ -674,7 +755,10 @@ impl Store {
         let bytes = match serde_json::to_vec(&rec) {
             Ok(b) => b,
             Err(e) => {
-                error!("Failed to serialise WantedRecord for {}|{}: {}", rec.user, rec.tmdb_id, e);
+                error!(
+                    "Failed to serialise WantedRecord for {}|{}: {}",
+                    rec.user, rec.tmdb_id, e
+                );
                 return Ok(());
             }
         };
@@ -682,10 +766,14 @@ impl Store {
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
-            { txn.open_table(WANTED_TABLE)?.insert(key.as_str(), bytes.as_slice())?; }
+            {
+                txn.open_table(WANTED_TABLE)?
+                    .insert(key.as_str(), bytes.as_slice())?;
+            }
             txn.commit()?;
             Ok(())
-        }).await;
+        })
+        .await;
         Self::flatten_join(result)
     }
 
@@ -697,7 +785,10 @@ impl Store {
             let table = txn.open_table(WANTED_TABLE).ok()?;
             let e = table.get(key.as_str()).ok()??;
             serde_json::from_slice::<WantedRecord>(e.value()).ok()
-        }).await.ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     pub async fn remove_wanted(&self, user: String, tmdb_id: u64) -> Result<(), AppError> {
@@ -705,10 +796,13 @@ impl Store {
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
-            { txn.open_table(WANTED_TABLE)?.remove(key.as_str())?; }
+            {
+                txn.open_table(WANTED_TABLE)?.remove(key.as_str())?;
+            }
             txn.commit()?;
             Ok(())
-        }).await;
+        })
+        .await;
         Self::flatten_join(result)
     }
 
@@ -731,7 +825,9 @@ impl Store {
                 }
             }
             out
-        }).await.unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     // ── selection accessors (SP3) ─────────────────────────────────────────────
@@ -739,16 +835,23 @@ impl Store {
     pub async fn put_selection(&self, slot: String, entry: SelectionEntry) -> Result<(), AppError> {
         let bytes = match serde_json::to_vec(&entry) {
             Ok(b) => b,
-            Err(e) => { error!("Failed to serialise SelectionEntry for {}: {}", slot, e); return Ok(()); }
+            Err(e) => {
+                error!("Failed to serialise SelectionEntry for {}: {}", slot, e);
+                return Ok(());
+            }
         };
         // Serialise before opening the transaction to avoid partial writes on serde failure.
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
-            { txn.open_table(SELECTION_TABLE)?.insert(slot.as_str(), bytes.as_slice())?; }
+            {
+                txn.open_table(SELECTION_TABLE)?
+                    .insert(slot.as_str(), bytes.as_slice())?;
+            }
             txn.commit()?;
             Ok(())
-        }).await;
+        })
+        .await;
         Self::flatten_join(result)
     }
 
@@ -759,17 +862,23 @@ impl Store {
             let table = txn.open_table(SELECTION_TABLE).ok()?;
             let e = table.get(slot.as_str()).ok()??;
             serde_json::from_slice::<SelectionEntry>(e.value()).ok()
-        }).await.ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     pub async fn remove_selection(&self, slot: String) -> Result<(), AppError> {
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
-            { txn.open_table(SELECTION_TABLE)?.remove(slot.as_str())?; }
+            {
+                txn.open_table(SELECTION_TABLE)?.remove(slot.as_str())?;
+            }
             txn.commit()?;
             Ok(())
-        }).await;
+        })
+        .await;
         Self::flatten_join(result)
     }
 
@@ -790,7 +899,9 @@ impl Store {
                 }
             }
             out
-        }).await.unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     // ── upgrade_checks cursor (SP3) ───────────────────────────────────────────
@@ -800,10 +911,23 @@ impl Store {
         let key = tmdb_id.to_string();
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let txn = match db.begin_read() { Ok(t) => t, Err(_) => return 0 };
-            let table = match txn.open_table(UPGRADE_CHECKS_TABLE) { Ok(t) => t, Err(_) => return 0 };
-            table.get(key.as_str()).ok().flatten().map(|g| g.value()).unwrap_or(0)
-        }).await.unwrap_or(0)
+            let txn = match db.begin_read() {
+                Ok(t) => t,
+                Err(_) => return 0,
+            };
+            let table = match txn.open_table(UPGRADE_CHECKS_TABLE) {
+                Ok(t) => t,
+                Err(_) => return 0,
+            };
+            table
+                .get(key.as_str())
+                .ok()
+                .flatten()
+                .map(|g| g.value())
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0)
     }
 
     pub async fn set_upgrade_checked(&self, tmdb_id: u64, at: u64) -> Result<(), AppError> {
@@ -811,10 +935,14 @@ impl Store {
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
-            { txn.open_table(UPGRADE_CHECKS_TABLE)?.insert(key.as_str(), &at)?; }
+            {
+                txn.open_table(UPGRADE_CHECKS_TABLE)?
+                    .insert(key.as_str(), &at)?;
+            }
             txn.commit()?;
             Ok(())
-        }).await;
+        })
+        .await;
         Self::flatten_join(result)
     }
 }
@@ -895,11 +1023,19 @@ mod tests {
             .await
             .unwrap();
         store
-            .replace_match("old".to_string(), "new".to_string(), info("new"), movie("Title"))
+            .replace_match(
+                "old".to_string(),
+                "new".to_string(),
+                info("new"),
+                movie("Title"),
+            )
             .await
             .unwrap();
         assert!(store.get_match("old".to_string()).await.is_none());
-        assert_eq!(store.get_match("new".to_string()).await.unwrap().0.id, "new");
+        assert_eq!(
+            store.get_match("new".to_string()).await.unwrap().0.id,
+            "new"
+        );
     }
 
     #[tokio::test]
@@ -907,7 +1043,12 @@ mod tests {
         // Removing a non-existent key is a no-op in redb; the insert must still happen.
         let store = mem_store();
         store
-            .replace_match("ghost".to_string(), "fresh".to_string(), info("fresh"), movie("Fresh"))
+            .replace_match(
+                "ghost".to_string(),
+                "fresh".to_string(),
+                info("fresh"),
+                movie("Fresh"),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -936,7 +1077,10 @@ mod tests {
             txn.commit().unwrap();
         }
         let store = Store::from_database(db).unwrap();
-        let got = store.get_match("leg".to_string()).await.expect("legacy row");
+        let got = store
+            .get_match("leg".to_string())
+            .await
+            .expect("legacy row");
         assert_eq!(got.1.title, "Legacy");
     }
 
@@ -948,7 +1092,12 @@ mod tests {
             static N: AtomicU32 = AtomicU32::new(0);
             let n = N.fetch_add(1, Ordering::SeqCst);
             let mut p = std::env::temp_dir();
-            p.push(format!("dmm_store_{}_{}_{}.redb", tag, std::process::id(), n));
+            p.push(format!(
+                "dmm_store_{}_{}_{}.redb",
+                tag,
+                std::process::id(),
+                n
+            ));
             TempDb {
                 path: p.to_string_lossy().into_owned(),
             }
@@ -1071,9 +1220,18 @@ mod tests {
             quality: None,
         };
         store.put_owned("h1".to_string(), rec).await.unwrap();
-        assert_eq!(store.get_owned("h1".to_string()).await.unwrap().status, OwnedStatus::Pending);
-        store.set_owned_status("h1".to_string(), OwnedStatus::Verified).await.unwrap();
-        assert_eq!(store.get_owned("h1".to_string()).await.unwrap().status, OwnedStatus::Verified);
+        assert_eq!(
+            store.get_owned("h1".to_string()).await.unwrap().status,
+            OwnedStatus::Pending
+        );
+        store
+            .set_owned_status("h1".to_string(), OwnedStatus::Verified)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_owned("h1".to_string()).await.unwrap().status,
+            OwnedStatus::Verified
+        );
         assert_eq!(store.all_owned().await.len(), 1);
         store.remove_owned("h1".to_string()).await.unwrap();
         assert!(store.get_owned("h1".to_string()).await.is_none());
@@ -1082,8 +1240,18 @@ mod tests {
     #[tokio::test]
     async fn authoritative_round_trip() {
         let store = mem_store();
-        store.put_authoritative("h1".to_string(), movie("Auth")).await.unwrap();
-        assert_eq!(store.authoritative_meta("h1".to_string()).await.unwrap().title, "Auth");
+        store
+            .put_authoritative("h1".to_string(), movie("Auth"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .authoritative_meta("h1".to_string())
+                .await
+                .unwrap()
+                .title,
+            "Auth"
+        );
         store.remove_authoritative("h1".to_string()).await.unwrap();
         assert!(store.authoritative_meta("h1".to_string()).await.is_none());
     }
@@ -1092,7 +1260,10 @@ mod tests {
     async fn blacklist_add_and_check() {
         let store = mem_store();
         assert!(!store.is_blacklisted(27205, "h1".to_string()).await);
-        store.blacklist_add(27205, "h1".to_string(), "WrongTitle", 100).await.unwrap();
+        store
+            .blacklist_add(27205, "h1".to_string(), "WrongTitle", 100)
+            .await
+            .unwrap();
         assert!(store.is_blacklisted(27205, "h1".to_string()).await);
         assert!(!store.is_blacklisted(27205, "h2".to_string()).await);
         assert!(!store.is_blacklisted(99999, "h1".to_string()).await);
@@ -1117,7 +1288,10 @@ mod tests {
             user: user.to_string(),
             tmdb_id,
             media_type: MediaType::Movie,
-            sources: WantedSources { watchlist: true, in_progress: false },
+            sources: WantedSources {
+                watchlist: true,
+                in_progress: false,
+            },
             watched_state: WatchedState::Movie { watched: false },
             show_status: None,
         }
@@ -1128,7 +1302,10 @@ mod tests {
             user: user.to_string(),
             tmdb_id,
             media_type: MediaType::Show,
-            sources: WantedSources { watchlist: false, in_progress: true },
+            sources: WantedSources {
+                watchlist: false,
+                in_progress: true,
+            },
             watched_state: WatchedState::Show {
                 watched_episodes: vec![(1, 1), (1, 2), (2, 1)],
             },
@@ -1147,13 +1324,25 @@ mod tests {
             username: "bob".to_string(),
             needs_reenrolment: true,
         };
-        store.put_trakt_tokens("alice".to_string(), tok1.clone()).await.unwrap();
-        store.put_trakt_tokens("bob".to_string(), tok2.clone()).await.unwrap();
+        store
+            .put_trakt_tokens("alice".to_string(), tok1.clone())
+            .await
+            .unwrap();
+        store
+            .put_trakt_tokens("bob".to_string(), tok2.clone())
+            .await
+            .unwrap();
 
-        let got1 = store.get_trakt_tokens("alice".to_string()).await.expect("alice present");
+        let got1 = store
+            .get_trakt_tokens("alice".to_string())
+            .await
+            .expect("alice present");
         assert_eq!(got1, tok1);
 
-        let got2 = store.get_trakt_tokens("bob".to_string()).await.expect("bob present");
+        let got2 = store
+            .get_trakt_tokens("bob".to_string())
+            .await
+            .expect("bob present");
         assert_eq!(got2, tok2);
 
         let all = store.all_trakt_tokens().await;
@@ -1161,7 +1350,10 @@ mod tests {
         assert!(all.iter().any(|(slug, _)| slug == "alice"));
         assert!(all.iter().any(|(slug, _)| slug == "bob"));
 
-        store.remove_trakt_tokens("alice".to_string()).await.unwrap();
+        store
+            .remove_trakt_tokens("alice".to_string())
+            .await
+            .unwrap();
         assert!(store.get_trakt_tokens("alice".to_string()).await.is_none());
         assert_eq!(store.all_trakt_tokens().await.len(), 1);
     }
@@ -1189,24 +1381,38 @@ mod tests {
         store.put_wanted(movie_rec.clone()).await.unwrap();
         store.put_wanted(show_rec.clone()).await.unwrap();
 
-        let got_movie = store.get_wanted("alice".to_string(), 27205).await.expect("movie present");
+        let got_movie = store
+            .get_wanted("alice".to_string(), 27205)
+            .await
+            .expect("movie present");
         assert_eq!(got_movie, movie_rec);
 
         // Upsert: writing a modified record at the same (user, tmdb_id) must overwrite in place.
         let updated_movie = WantedRecord {
-            sources: WantedSources { watchlist: false, in_progress: true },
+            sources: WantedSources {
+                watchlist: false,
+                in_progress: true,
+            },
             ..movie_rec.clone()
         };
         store.put_wanted(updated_movie.clone()).await.unwrap();
-        let got_updated = store.get_wanted("alice".to_string(), 27205).await.expect("updated present");
+        let got_updated = store
+            .get_wanted("alice".to_string(), 27205)
+            .await
+            .expect("updated present");
         assert_eq!(got_updated, updated_movie);
 
-        let got_show = store.get_wanted("bob".to_string(), 1396).await.expect("show present");
+        let got_show = store
+            .get_wanted("bob".to_string(), 1396)
+            .await
+            .expect("show present");
         assert_eq!(got_show, show_rec);
         // Verify deep equality on watched_episodes
         assert_eq!(
             got_show.watched_state,
-            WatchedState::Show { watched_episodes: vec![(1, 1), (1, 2), (2, 1)] }
+            WatchedState::Show {
+                watched_episodes: vec![(1, 1), (1, 2), (2, 1)]
+            }
         );
         assert_eq!(got_show.show_status, Some(ShowStatus::Ended));
 
@@ -1215,7 +1421,10 @@ mod tests {
         assert!(all.iter().any(|r| r.user == "alice" && r.tmdb_id == 27205));
         assert!(all.iter().any(|r| r.user == "bob" && r.tmdb_id == 1396));
 
-        store.remove_wanted("alice".to_string(), 27205).await.unwrap();
+        store
+            .remove_wanted("alice".to_string(), 27205)
+            .await
+            .unwrap();
         assert!(store.get_wanted("alice".to_string(), 27205).await.is_none());
         assert_eq!(store.all_wanted().await.len(), 1);
     }
@@ -1224,7 +1433,10 @@ mod tests {
     async fn all_wanted_aggregates_multi_user_same_tmdb_id() {
         let store = mem_store();
         let rec_a = movie_wanted("userA", 123);
-        let rec_b = WantedRecord { user: "userB".to_string(), ..movie_wanted("userB", 123) };
+        let rec_b = WantedRecord {
+            user: "userB".to_string(),
+            ..movie_wanted("userB", 123)
+        };
         store.put_wanted(rec_a).await.unwrap();
         store.put_wanted(rec_b).await.unwrap();
 
@@ -1246,7 +1458,8 @@ mod tests {
                 let mut t = txn.open_table(mdef).unwrap();
                 let i = info("m2");
                 let m = movie("KeptV2");
-                t.insert("m2", serde_json::to_vec(&(&i, &m)).unwrap().as_slice()).unwrap();
+                t.insert("m2", serde_json::to_vec(&(&i, &m)).unwrap().as_slice())
+                    .unwrap();
 
                 // owned_hashes row
                 let odef: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_hashes");
@@ -1259,7 +1472,8 @@ mod tests {
                     provides: vec![],
                     quality: None,
                 };
-                ot.insert("hash2", serde_json::to_vec(&rec).unwrap().as_slice()).unwrap();
+                ot.insert("hash2", serde_json::to_vec(&rec).unwrap().as_slice())
+                    .unwrap();
 
                 // version stamp as v2
                 let vdef: TableDefinition<&str, u64> = TableDefinition::new("meta");
@@ -1271,8 +1485,14 @@ mod tests {
         let store = Store::open(&tmp.path).unwrap();
 
         // existing tables survive
-        assert_eq!(store.get_match("m2".to_string()).await.unwrap().1.title, "KeptV2");
-        assert_eq!(store.get_owned("hash2".to_string()).await.unwrap().status, OwnedStatus::Pending);
+        assert_eq!(
+            store.get_match("m2".to_string()).await.unwrap().1.title,
+            "KeptV2"
+        );
+        assert_eq!(
+            store.get_owned("hash2".to_string()).await.unwrap().status,
+            OwnedStatus::Pending
+        );
 
         // new tables are usable after migration
         let tokens = TraktTokens {
@@ -1282,12 +1502,25 @@ mod tests {
             username: "u".to_string(),
             needs_reenrolment: false,
         };
-        store.put_trakt_tokens("u".to_string(), tokens).await.unwrap();
-        assert_eq!(store.get_trakt_tokens("u".to_string()).await.unwrap().access, "a");
+        store
+            .put_trakt_tokens("u".to_string(), tokens)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_trakt_tokens("u".to_string())
+                .await
+                .unwrap()
+                .access,
+            "a"
+        );
 
         let wanted_rec = movie_wanted("u", 1);
         store.put_wanted(wanted_rec.clone()).await.unwrap();
-        assert_eq!(store.get_wanted("u".to_string(), 1).await.unwrap(), wanted_rec);
+        assert_eq!(
+            store.get_wanted("u".to_string(), 1).await.unwrap(),
+            wanted_rec
+        );
 
         assert!(
             !std::path::Path::new(&tmp.corrupt_path()).exists(),
@@ -1306,7 +1539,8 @@ mod tests {
                 let mut t = txn.open_table(mdef).unwrap();
                 let i = info("m1");
                 let m = movie("Kept");
-                t.insert("m1", serde_json::to_vec(&(&i, &m)).unwrap().as_slice()).unwrap();
+                t.insert("m1", serde_json::to_vec(&(&i, &m)).unwrap().as_slice())
+                    .unwrap();
                 let vdef: TableDefinition<&str, u64> = TableDefinition::new("meta");
                 let mut v = txn.open_table(vdef).unwrap();
                 v.insert("schema_version", &1u64).unwrap();
@@ -1314,9 +1548,22 @@ mod tests {
             txn.commit().unwrap();
         }
         let store = Store::open(&tmp.path).unwrap();
-        assert_eq!(store.get_match("m1".to_string()).await.unwrap().1.title, "Kept");
-        store.put_authoritative("h".to_string(), movie("New")).await.unwrap();
-        assert_eq!(store.authoritative_meta("h".to_string()).await.unwrap().title, "New");
+        assert_eq!(
+            store.get_match("m1".to_string()).await.unwrap().1.title,
+            "Kept"
+        );
+        store
+            .put_authoritative("h".to_string(), movie("New"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .authoritative_meta("h".to_string())
+                .await
+                .unwrap()
+                .title,
+            "New"
+        );
         assert!(
             !std::path::Path::new(&tmp.corrupt_path()).exists(),
             "valid v1 DB must not be moved aside"
@@ -1358,7 +1605,9 @@ mod tests {
         let store = mem_store();
         let expected_prov = Provenance {
             entries: vec![
-                ProvenanceEntry::Watchlist { user: "alice".into() },
+                ProvenanceEntry::Watchlist {
+                    user: "alice".into(),
+                },
                 ProvenanceEntry::InProgress { user: "bob".into() },
             ],
         };
@@ -1386,9 +1635,17 @@ mod tests {
             added_at: 100,
             status: OwnedStatus::Pending,
             provides: vec![(1, 1), (1, 2)],
-            quality: Some(crate::release::QualitySummary { cached: true, source_tier: 6_000, resolution: 1080, score: 42 }),
+            quality: Some(crate::release::QualitySummary {
+                cached: true,
+                source_tier: 6_000,
+                resolution: 1080,
+                score: 42,
+            }),
         };
-        store.put_owned("h1".to_string(), rec.clone()).await.unwrap();
+        store
+            .put_owned("h1".to_string(), rec.clone())
+            .await
+            .unwrap();
         let got = store.get_owned("h1".to_string()).await.unwrap();
         assert_eq!(got.provides, vec![(1, 1), (1, 2)]);
         assert_eq!(got.quality.unwrap().source_tier, 6_000);
@@ -1412,7 +1669,16 @@ mod tests {
     async fn selection_round_trip_and_remove() {
         let store = mem_store();
         let slot = crate::store::episode_slot(1396, 1, 2);
-        store.put_selection(slot.clone(), SelectionEntry { hash: "h1".into(), file_path: "S01E02.mkv".into() }).await.unwrap();
+        store
+            .put_selection(
+                slot.clone(),
+                SelectionEntry {
+                    hash: "h1".into(),
+                    file_path: "S01E02.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
         let got = store.get_selection(slot.clone()).await.unwrap();
         assert_eq!(got.hash, "h1");
         assert_eq!(got.file_path, "S01E02.mkv");
@@ -1428,7 +1694,10 @@ mod tests {
     async fn upgrade_checked_cursor_round_trip() {
         let store = mem_store();
         assert_eq!(store.get_upgrade_checked(1396).await, 0, "absent → 0");
-        store.set_upgrade_checked(1396, 1_700_000_000).await.unwrap();
+        store
+            .set_upgrade_checked(1396, 1_700_000_000)
+            .await
+            .unwrap();
         assert_eq!(store.get_upgrade_checked(1396).await, 1_700_000_000);
     }
 
@@ -1449,18 +1718,34 @@ mod tests {
         p.merge(&Provenance::watchlist("alice"));
         assert_eq!(p.entries.len(), 2, "duplicate entry must not be added");
 
-        assert!(!p.has_manual_entry(), "watchlist+in_progress provenance must not report has_manual_entry");
-        assert!(Provenance::manual().has_manual_entry(), "Manual provenance must report has_manual_entry");
+        assert!(
+            !p.has_manual_entry(),
+            "watchlist+in_progress provenance must not report has_manual_entry"
+        );
+        assert!(
+            Provenance::manual().has_manual_entry(),
+            "Manual provenance must report has_manual_entry"
+        );
 
         // Critical mixed case: a manually-acquired title that a Trakt user later watchlisted
         // must still be protected from auto-removal (this is what the OLD .all()-based predicate
         // wrongly returned false for).
         let mut mixed = Provenance::manual();
         mixed.merge(&Provenance::watchlist("alice"));
-        assert_eq!(mixed.entries.len(), 2, "[Manual, Watchlist] should have 2 entries");
-        assert!(mixed.has_manual_entry(), "mixed Manual+Watchlist must report has_manual_entry");
+        assert_eq!(
+            mixed.entries.len(),
+            2,
+            "[Manual, Watchlist] should have 2 entries"
+        );
+        assert!(
+            mixed.has_manual_entry(),
+            "mixed Manual+Watchlist must report has_manual_entry"
+        );
 
         // A pure watchlist provenance must NOT be considered manual.
-        assert!(!Provenance::watchlist("alice").has_manual_entry(), "pure watchlist must not report has_manual_entry");
+        assert!(
+            !Provenance::watchlist("alice").has_manual_entry(),
+            "pure watchlist must not report has_manual_entry"
+        );
     }
 }

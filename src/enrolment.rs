@@ -174,7 +174,10 @@ pub async fn poll_to_completion(
 /// HTML-escape `s` for safe use in both element text and double-quoted attributes (`href="..."`,
 /// `action="..."`). Covers `&`, `<`, `>`, and `"` (`&` first to avoid double-escaping).
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// The enrolment instructions page (shows the device user_code + verification URL).
@@ -281,16 +284,24 @@ mod tests {
                 expires_in: 50,
                 created_at: 1_000,
             }),
-            user: TraktUser { slug: "alice".into(), username: "Alice".into() },
+            user: TraktUser {
+                slug: "alice".into(),
+                username: "Alice".into(),
+            },
             ..Default::default()
         });
         let store = mem_store();
 
         // Authorized on the first poll → no real sleep occurs.
-        let slug = poll_to_completion(&trakt, &store, "dc".into(), 1, 30).await.unwrap();
+        let slug = poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
+            .await
+            .unwrap();
         assert_eq!(slug, "alice");
 
-        let tok = store.get_trakt_tokens("alice".into()).await.expect("tokens stored");
+        let tok = store
+            .get_trakt_tokens("alice".into())
+            .await
+            .expect("tokens stored");
         assert_eq!(tok.access, "AT");
         assert_eq!(tok.refresh, "RT");
         assert_eq!(tok.username, "Alice");
@@ -300,27 +311,41 @@ mod tests {
 
     #[tokio::test]
     async fn poll_to_completion_expired_is_err_and_stores_nothing() {
-        let trakt: Arc<dyn TraktClient> =
-            Arc::new(MockTrakt { poll: DeviceTokenPoll::Expired, ..Default::default() });
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            poll: DeviceTokenPoll::Expired,
+            ..Default::default()
+        });
         let store = mem_store();
-        assert!(poll_to_completion(&trakt, &store, "dc".into(), 1, 30).await.is_err());
+        assert!(poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
+            .await
+            .is_err());
         assert!(store.all_trakt_tokens().await.is_empty());
     }
 
     #[tokio::test]
     async fn poll_to_completion_denied_is_err_and_stores_nothing() {
-        let trakt: Arc<dyn TraktClient> =
-            Arc::new(MockTrakt { poll: DeviceTokenPoll::Denied, ..Default::default() });
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            poll: DeviceTokenPoll::Denied,
+            ..Default::default()
+        });
         let store = mem_store();
-        assert!(poll_to_completion(&trakt, &store, "dc".into(), 1, 30).await.is_err());
+        assert!(poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
+            .await
+            .is_err());
         assert!(store.all_trakt_tokens().await.is_empty());
     }
 
     #[tokio::test]
     async fn remove_account_deletes_only_that_slug() {
         let store = mem_store();
-        store.put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice")).await.unwrap();
-        store.put_trakt_tokens("bob".into(), tokens_fixture("BT", "Bob")).await.unwrap();
+        store
+            .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
+            .await
+            .unwrap();
+        store
+            .put_trakt_tokens("bob".into(), tokens_fixture("BT", "Bob"))
+            .await
+            .unwrap();
         let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), store.clone());
 
         svc.remove_account("alice").await.unwrap();
@@ -358,14 +383,23 @@ mod tests {
     #[tokio::test]
     async fn refresh_account_flags_on_error() {
         let store = mem_store();
-        store.put_trakt_tokens("alice".into(), tokens_fixture("OLD", "Alice")).await.unwrap();
-        let trakt = Arc::new(MockTrakt { fail_refresh: true, ..Default::default() });
+        store
+            .put_trakt_tokens("alice".into(), tokens_fixture("OLD", "Alice"))
+            .await
+            .unwrap();
+        let trakt = Arc::new(MockTrakt {
+            fail_refresh: true,
+            ..Default::default()
+        });
         let svc = EnrolmentService::new(trakt, store.clone());
 
         svc.refresh_account("alice").await.unwrap();
 
         let tok = store.get_trakt_tokens("alice".into()).await.unwrap();
-        assert!(tok.needs_reenrolment, "a refresh failure must flag the account");
+        assert!(
+            tok.needs_reenrolment,
+            "a refresh failure must flag the account"
+        );
         assert_eq!(tok.refresh, "RT", "the refresh token must be preserved");
     }
 
@@ -380,7 +414,10 @@ mod tests {
         };
         let html = enrol_html(&dc);
         assert!(html.contains("ABCD-1234"), "user_code must appear");
-        assert!(html.contains("https://trakt.tv/activate"), "verification_url must appear");
+        assert!(
+            html.contains("https://trakt.tv/activate"),
+            "verification_url must appear"
+        );
     }
 
     #[tokio::test]
@@ -399,7 +436,10 @@ mod tests {
                 access_token: "AT".into(),
                 ..Default::default()
             }),
-            user: TraktUser { slug: "alice".into(), username: "Alice".into() },
+            user: TraktUser {
+                slug: "alice".into(),
+                username: "Alice".into(),
+            },
             ..Default::default()
         });
         let svc = EnrolmentService::new(trakt, mem_store());

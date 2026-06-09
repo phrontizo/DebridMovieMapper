@@ -48,7 +48,11 @@ pub async fn materialise(
             new_id
         )));
     }
-    let ids_str = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let ids_str = ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     if let Err(e) = provider.select_files(&new_id, &ids_str).await {
         let _ = provider.delete_torrent(&new_id).await;
         return Err(AppError::Http(e));
@@ -65,12 +69,20 @@ mod tests {
 
     fn mock(status: &str) -> MockProvider {
         MockProvider {
-            add_magnet: Some(AddMagnetResponse { id: "new".into(), uri: String::new() }),
+            add_magnet: Some(AddMagnetResponse {
+                id: "new".into(),
+                uri: String::new(),
+            }),
             torrent_info: Some(TorrentInfo {
                 id: "new".into(),
                 hash: "H".into(),
                 status: status.into(),
-                files: vec![TorrentFile { id: 7, path: "/Movie.mkv".into(), bytes: 10, selected: 0 }],
+                files: vec![TorrentFile {
+                    id: 7,
+                    path: "/Movie.mkv".into(),
+                    bytes: 10,
+                    selected: 0,
+                }],
                 ..Default::default()
             }),
             ..Default::default()
@@ -80,9 +92,19 @@ mod tests {
     #[tokio::test]
     async fn materialise_selects_via_closure_and_returns_info() {
         let provider: Arc<dyn DebridProvider> = Arc::new(mock("downloaded"));
-        let (id, info) = materialise(&*provider, "H", Duration::from_millis(0), Duration::from_millis(0), |info| {
-            info.files.iter().filter(|f| f.path.ends_with(".mkv")).map(|f| f.id).collect()
-        })
+        let (id, info) = materialise(
+            &*provider,
+            "H",
+            Duration::from_millis(0),
+            Duration::from_millis(0),
+            |info| {
+                info.files
+                    .iter()
+                    .filter(|f| f.path.ends_with(".mkv"))
+                    .map(|f| f.id)
+                    .collect()
+            },
+        )
         .await
         .expect("materialise");
         assert_eq!(id, "new");
@@ -92,7 +114,14 @@ mod tests {
     #[tokio::test]
     async fn materialise_errors_when_selector_matches_nothing() {
         let provider: Arc<dyn DebridProvider> = Arc::new(mock("downloaded"));
-        let r = materialise(&*provider, "H", Duration::from_millis(0), Duration::from_millis(0), |_| Vec::<u32>::new()).await;
+        let r = materialise(
+            &*provider,
+            "H",
+            Duration::from_millis(0),
+            Duration::from_millis(0),
+            |_| Vec::<u32>::new(),
+        )
+        .await;
         assert!(r.is_err(), "no selected files must be an error");
     }
 
@@ -114,14 +143,28 @@ mod tests {
         async fn get_torrent_info(&self, _id: &str) -> Result<TorrentInfo, reqwest::Error> {
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let files = if n >= self.resolve_after {
-                vec![TorrentFile { id: 7, path: "/Movie.mkv".into(), bytes: 10, selected: 0 }]
+                vec![TorrentFile {
+                    id: 7,
+                    path: "/Movie.mkv".into(),
+                    bytes: 10,
+                    selected: 0,
+                }]
             } else {
                 vec![]
             };
-            Ok(TorrentInfo { id: "new".into(), hash: "H".into(), status: "downloading".into(), files, ..Default::default() })
+            Ok(TorrentInfo {
+                id: "new".into(),
+                hash: "H".into(),
+                status: "downloading".into(),
+                files,
+                ..Default::default()
+            })
         }
         async fn add_magnet(&self, _m: &str) -> Result<AddMagnetResponse, reqwest::Error> {
-            Ok(AddMagnetResponse { id: "new".into(), uri: String::new() })
+            Ok(AddMagnetResponse {
+                id: "new".into(),
+                uri: String::new(),
+            })
         }
         async fn select_files(&self, _t: &str, _f: &str) -> Result<(), reqwest::Error> {
             Ok(())
@@ -129,7 +172,10 @@ mod tests {
         async fn delete_torrent(&self, _t: &str) -> Result<(), reqwest::Error> {
             Ok(())
         }
-        async fn resolve_url(&self, _l: &crate::provider::FileLocator) -> Result<String, crate::error::AppError> {
+        async fn resolve_url(
+            &self,
+            _l: &crate::provider::FileLocator,
+        ) -> Result<String, crate::error::AppError> {
             Err(crate::error::AppError::Unavailable)
         }
         async fn invalidate(&self, _l: &crate::provider::FileLocator) {}
@@ -137,28 +183,47 @@ mod tests {
     }
 
     fn mkv_selector(info: &TorrentInfo) -> Vec<u32> {
-        info.files.iter().filter(|f| f.path.ends_with(".mkv")).map(|f| f.id).collect()
+        info.files
+            .iter()
+            .filter(|f| f.path.ends_with(".mkv"))
+            .map(|f| f.id)
+            .collect()
     }
 
     #[tokio::test]
     async fn materialise_polls_until_file_list_resolves() {
         // Empty on the first check, file present on the second → materialise should keep polling.
-        let provider: Arc<dyn DebridProvider> =
-            Arc::new(PollProvider { calls: std::sync::atomic::AtomicUsize::new(0), resolve_after: 1 });
-        let (id, info) =
-            materialise(&*provider, "H", Duration::from_millis(5), Duration::from_secs(2), mkv_selector)
-                .await
-                .expect("should resolve on a later poll");
+        let provider: Arc<dyn DebridProvider> = Arc::new(PollProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            resolve_after: 1,
+        });
+        let (id, info) = materialise(
+            &*provider,
+            "H",
+            Duration::from_millis(5),
+            Duration::from_secs(2),
+            mkv_selector,
+        )
+        .await
+        .expect("should resolve on a later poll");
         assert_eq!(id, "new");
         assert_eq!(info.files.len(), 1);
     }
 
     #[tokio::test]
     async fn materialise_times_out_when_file_list_never_resolves() {
-        let provider: Arc<dyn DebridProvider> =
-            Arc::new(PollProvider { calls: std::sync::atomic::AtomicUsize::new(0), resolve_after: 9999 });
-        let r =
-            materialise(&*provider, "H", Duration::from_millis(5), Duration::from_millis(40), mkv_selector).await;
+        let provider: Arc<dyn DebridProvider> = Arc::new(PollProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            resolve_after: 9999,
+        });
+        let r = materialise(
+            &*provider,
+            "H",
+            Duration::from_millis(5),
+            Duration::from_millis(40),
+            mkv_selector,
+        )
+        .await;
         assert!(r.is_err(), "must error after max_wait with no file list");
     }
 }

@@ -20,7 +20,10 @@ impl ReadActivity {
 
     /// Record that `path` was just read. Cheap; called on every proxy read.
     pub async fn touch(&self, path: &str) {
-        self.last_read.write().await.insert(path.to_string(), Instant::now());
+        self.last_read
+            .write()
+            .await
+            .insert(path.to_string(), Instant::now());
     }
 
     /// `true` if `path` has had no read within `window` (never-read counts as idle).
@@ -59,7 +62,10 @@ mod tests {
     async fn just_touched_is_not_idle_then_becomes_idle() {
         let ra = ReadActivity::new();
         ra.touch("p").await;
-        assert!(!ra.is_idle("p", Duration::from_secs(300)).await, "just-read is active");
+        assert!(
+            !ra.is_idle("p", Duration::from_secs(300)).await,
+            "just-read is active"
+        );
         // A zero-length window makes any elapsed time count as idle.
         assert!(ra.is_idle("p", Duration::from_secs(0)).await);
     }
@@ -73,7 +79,10 @@ mod tests {
 
         // A read on ANY path makes the whole library active for a non-zero window…
         ra.touch("Movies/anything.mkv").await;
-        assert!(!ra.all_idle(Duration::from_secs(300)).await, "a recent read anywhere is active");
+        assert!(
+            !ra.all_idle(Duration::from_secs(300)).await,
+            "a recent read anywhere is active"
+        );
         assert!(ra.most_recent().await.is_some());
         // …and a zero-length window makes any elapsed time count as idle again.
         assert!(ra.all_idle(Duration::from_secs(0)).await);

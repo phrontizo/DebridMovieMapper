@@ -4,7 +4,11 @@ use debridmoviemapper::scraper::{MediaKind, Scraper, TorrentioScraper};
 
 fn provider_from_env() -> Option<(ProviderKind, String)> {
     dotenvy::dotenv().ok();
-    choose_provider(std::env::var("RD_API_TOKEN").ok(), std::env::var("TORBOX_API_KEY").ok()).ok()
+    choose_provider(
+        std::env::var("RD_API_TOKEN").ok(),
+        std::env::var("TORBOX_API_KEY").ok(),
+    )
+    .ok()
 }
 
 #[tokio::test]
@@ -18,12 +22,8 @@ async fn scraper_live_returns_parseable_streams() {
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap();
-    let scraper = TorrentioScraper::new(
-        std::env::var("SCRAPER_ADDON_URL").ok(),
-        kind,
-        &token,
-        http,
-    );
+    let scraper =
+        TorrentioScraper::new(std::env::var("SCRAPER_ADDON_URL").ok(), kind, &token, http);
     // Sintel (Creative Commons): tt1727587
     let cands = scraper
         .find("tt1727587", MediaKind::Movie, None, None)

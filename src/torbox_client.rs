@@ -572,7 +572,9 @@ mod tests {
     #[test]
     fn magnet_infohash_extracts_btih() {
         assert_eq!(
-            magnet_infohash("magnet:?xt=urn:btih:64877b5490208c3015c0f5121287949d62622e54&dn=Sintel"),
+            magnet_infohash(
+                "magnet:?xt=urn:btih:64877b5490208c3015c0f5121287949d62622e54&dn=Sintel"
+            ),
             Some("64877b5490208c3015c0f5121287949d62622e54".to_string())
         );
         // Uppercase input is normalised to lowercase.

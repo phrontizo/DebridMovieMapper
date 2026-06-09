@@ -1122,7 +1122,10 @@ mod provider_abstraction_tests {
         });
         let mut f = ProxiedMediaFile {
             name: "x.mkv".into(),
-            locator: crate::provider::FileLocator { torrent_id: "t".into(), ..Default::default() },
+            locator: crate::provider::FileLocator {
+                torrent_id: "t".into(),
+                ..Default::default()
+            },
             file_size: 10,
             repair_manager: Arc::new(RepairManager::new(provider.clone())),
             rd_client: provider,
@@ -1136,7 +1139,10 @@ mod provider_abstraction_tests {
         };
         // The CDN fetch will fail (unroutable URL), but the stamp happens before the fetch.
         let _ = f.read_bytes(4).await;
-        assert!(!ra.is_idle("Movies/X/x.mkv", std::time::Duration::from_secs(300)).await);
+        assert!(
+            !ra.is_idle("Movies/X/x.mkv", std::time::Duration::from_secs(300))
+                .await
+        );
     }
 
     #[tokio::test]

@@ -40,11 +40,13 @@ async fn trakt_live_device_flow_and_sync() {
         }
     };
 
-    let trakt: Arc<dyn TraktClient> =
-        Arc::new(TraktClientImpl::new(client_id, client_secret, reqwest::Client::new()));
+    let trakt: Arc<dyn TraktClient> = Arc::new(TraktClientImpl::new(
+        client_id,
+        client_secret,
+        reqwest::Client::new(),
+    ));
     let tmdb = TmdbClient::new(tmdb_key).expect("tmdb client");
-    let path =
-        std::env::temp_dir().join(format!("dmm_trakt_integ_{}.redb", std::process::id()));
+    let path = std::env::temp_dir().join(format!("dmm_trakt_integ_{}.redb", std::process::id()));
     let path_str = path.to_str().expect("temp path is valid UTF-8").to_string();
     let store = Store::open(&path_str).expect("store");
 
@@ -64,10 +66,16 @@ async fn trakt_live_device_flow_and_sync() {
         .expect("device authorisation (did you approve it in time?)");
     eprintln!("Authorised as: {}", slug);
 
-    let tokens = store.get_trakt_tokens(slug.clone()).await.expect("tokens persisted");
+    let tokens = store
+        .get_trakt_tokens(slug.clone())
+        .await
+        .expect("tokens persisted");
 
     let wl = trakt.watchlist(&tokens.access).await.expect("watchlist");
-    let ip = trakt.in_progress(&tokens.access).await.expect("in_progress");
+    let ip = trakt
+        .in_progress(&tokens.access)
+        .await
+        .expect("in_progress");
     let watched = trakt.watched(&tokens.access).await.expect("watched");
     let me = trakt.me(&tokens.access).await.expect("me");
     eprintln!(

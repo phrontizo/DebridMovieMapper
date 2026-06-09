@@ -1,11 +1,11 @@
 use dav_server::DavHandler;
-use debridmoviemapper::dav_fs::DebridFileSystem;
+use debridmoviemapper::app_state::AppState;
 use debridmoviemapper::config::Config;
+use debridmoviemapper::dav_fs::DebridFileSystem;
 use debridmoviemapper::enrolment::EnrolmentService;
 use debridmoviemapper::provider::{DebridProvider, ProviderKind};
 use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::repair::RepairManager;
-use debridmoviemapper::app_state::AppState;
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::torbox_client::TorBoxClient;
 use debridmoviemapper::vfs::DebridVfs;
@@ -85,9 +85,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             http_client.clone(),
         ));
     let validator: Arc<dyn debridmoviemapper::acquire::TitleValidator> =
-        Arc::new(debridmoviemapper::acquire::TmdbTitleValidator { tmdb: tmdb_client.clone() });
+        Arc::new(debridmoviemapper::acquire::TmdbTitleValidator {
+            tmdb: tmdb_client.clone(),
+        });
     let prober: Arc<dyn debridmoviemapper::acquire::Prober> =
-        Arc::new(debridmoviemapper::acquire::HttpProber { http: http_client.clone() });
+        Arc::new(debridmoviemapper::acquire::HttpProber {
+            http: http_client.clone(),
+        });
     let engine = Arc::new(debridmoviemapper::acquire::AcquisitionEngine::new(
         provider.clone(),
         scraper.clone(),

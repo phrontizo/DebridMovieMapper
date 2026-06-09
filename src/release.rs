@@ -13,10 +13,18 @@ pub struct RawCandidate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Codec { Hevc, Avc, Other }
+pub enum Codec {
+    Hevc,
+    Avc,
+    Other,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Container { Mkv, Mp4, Other }
+pub enum Container {
+    Mkv,
+    Mp4,
+    Other,
+}
 
 impl Container {
     pub fn is_verifiable(self) -> bool {
@@ -76,7 +84,8 @@ pub struct ReleaseInfo {
     pub source: Source,
 }
 
-static RES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(\d{3,4})p\b|\b(4k|uhd)\b").unwrap());
+static RES_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(\d{3,4})p\b|\b(4k|uhd)\b").unwrap());
 static SIZE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)([\d.]+)\s*(gb|mb)").unwrap());
 static SEED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{1f464}\s*(\d+)").unwrap());
 static GROUP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-([A-Za-z0-9]+)$").unwrap());
@@ -84,8 +93,8 @@ static GROUP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-([A-Za-z0-9]+)
 /// Extract a trailing `-GROUP` token, rejecting common source/codec tokens that aren't groups.
 fn extract_group(s: &str) -> Option<String> {
     const GROUP_DENY: &[&str] = &[
-        "dl", "rip", "hevc", "avc", "hdr", "sdr", "cam", "ts", "hdtv", "bluray",
-        "bdrip", "dvdrip", "web", "webdl", "webrip", "x264", "x265", "aac", "ac3", "dts", "ddp",
+        "dl", "rip", "hevc", "avc", "hdr", "sdr", "cam", "ts", "hdtv", "bluray", "bdrip", "dvdrip",
+        "web", "webdl", "webrip", "x264", "x265", "aac", "ac3", "dts", "ddp",
     ];
     let g = GROUP_RE.captures(s.trim())?.get(1)?.as_str();
     if GROUP_DENY.iter().any(|d| d.eq_ignore_ascii_case(g)) {
@@ -137,7 +146,11 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
     let lower = text.to_ascii_lowercase();
 
     let resolution = RES_RE.captures(&text).and_then(|cap| {
-        if let Some(m) = cap.get(1) { m.as_str().parse::<u16>().ok() } else { Some(2160) }
+        if let Some(m) = cap.get(1) {
+            m.as_str().parse::<u16>().ok()
+        } else {
+            Some(2160)
+        }
     });
 
     let codec = if lower.contains("x265") || lower.contains("h265") || lower.contains("hevc") {
@@ -148,18 +161,27 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
         Codec::Other
     };
 
-    let hdr = lower.contains("hdr") || lower.contains("dolby vision") || lower.contains("dovi") || lower.contains(" dv ");
+    let hdr = lower.contains("hdr")
+        || lower.contains("dolby vision")
+        || lower.contains("dovi")
+        || lower.contains(" dv ");
 
     let cached = lower.contains("rd+") || lower.contains("tb+") || text.contains('\u{26a1}');
 
     let size_bytes = SIZE_RE.captures(&text).and_then(|cap| {
         let n: f64 = cap.get(1)?.as_str().parse().ok()?;
         let unit = cap.get(2)?.as_str().to_ascii_lowercase();
-        let mult = if unit == "gb" { 1_000_000_000.0 } else { 1_000_000.0 };
+        let mult = if unit == "gb" {
+            1_000_000_000.0
+        } else {
+            1_000_000.0
+        };
         Some((n * mult) as u64)
     });
 
-    let seeders = SEED_RE.captures(&text).and_then(|cap| cap.get(1)?.as_str().parse::<u32>().ok());
+    let seeders = SEED_RE
+        .captures(&text)
+        .and_then(|cap| cap.get(1)?.as_str().parse::<u32>().ok());
 
     // Release group is the trailing "-GROUP". Prefer the file's stem; fall back to the
     // release-name line in the description (which usually carries the group).
@@ -172,24 +194,47 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
 
     let mut languages = Vec::new();
     for (word, code) in LANG_WORDS {
-        if lower.contains(word) { languages.push((*code).to_string()); }
+        if lower.contains(word) {
+            languages.push((*code).to_string());
+        }
     }
 
-    let container = c.file_name.as_deref().map(Container::from_name).unwrap_or(Container::Other);
+    let container = c
+        .file_name
+        .as_deref()
+        .map(Container::from_name)
+        .unwrap_or(Container::Other);
     let source = detect_source(&lower);
 
     ReleaseInfo {
         info_hash: c.info_hash.clone(),
         file_idx: c.file_idx,
         file_name: c.file_name.clone(),
-        resolution, codec, hdr, languages, group, size_bytes, seeders, cached, container, source,
+        resolution,
+        codec,
+        hdr,
+        languages,
+        group,
+        size_bytes,
+        seeders,
+        cached,
+        container,
+        source,
     }
 }
 
 const LANG_WORDS: &[(&str, &str)] = &[
-    ("english", "eng"), ("french", "fre"), ("german", "ger"), ("spanish", "spa"),
-    ("italian", "ita"), ("russian", "rus"), ("hindi", "hin"), ("japanese", "jpn"),
-    ("korean", "kor"), ("portuguese", "por"), ("multi", "mul"),
+    ("english", "eng"),
+    ("french", "fre"),
+    ("german", "ger"),
+    ("spanish", "spa"),
+    ("italian", "ita"),
+    ("russian", "rus"),
+    ("hindi", "hin"),
+    ("japanese", "jpn"),
+    ("korean", "kor"),
+    ("portuguese", "por"),
+    ("multi", "mul"),
 ];
 
 /// Score a release against prefs. `None` = excluded by a hard rule (resolution ceiling,
@@ -202,7 +247,9 @@ pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
     // A release with no parsed resolution is let through rather than excluded (don't
     // blindly drop potentially-valid releases the scraper failed to tag).
     if let Some(res) = r.resolution {
-        if res > prefs.max_resolution.height() { return None; }
+        if res > prefs.max_resolution.height() {
+            return None;
+        }
     }
     // An uncached release with zero seeders cannot download — ignore it entirely so the engine
     // never burns an acquire attempt on a dead torrent (nor leaves a "checking" magnet behind).
@@ -211,17 +258,25 @@ pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
         return None;
     }
     let mut s: i64 = 0;
-    if r.cached { s += 1_000_000; }
+    if r.cached {
+        s += 1_000_000;
+    }
     s += r.source.tier_score();
     s += r.resolution.unwrap_or(0) as i64 * 100;
-    if prefs.prefer_hevc && r.codec == Codec::Hevc { s += 5_000; }
-    if prefs.prefer_hdr && r.hdr { s += 3_000; }
-    if r.container.is_verifiable() { s += 2_000; }
+    if prefs.prefer_hevc && r.codec == Codec::Hevc {
+        s += 5_000;
+    }
+    if prefs.prefer_hdr && r.hdr {
+        s += 3_000;
+    }
+    if r.container.is_verifiable() {
+        s += 2_000;
+    }
     s += (r.seeders.unwrap_or(0).min(1000) as i64) * 2;
     if let Some(sz) = r.size_bytes {
         // Reject fake/sample (<300 MB) and absurd (>80 GB) files. The upper bound is generous so
         // a legitimate REMUX (often 25–40 GB at 1080p — now our top source tier) isn't penalised.
-        if sz < 300_000_000 || sz > 80_000_000_000 {
+        if !(300_000_000..=80_000_000_000).contains(&sz) {
             s -= 4_000;
         } else {
             // Prefer higher bitrate (larger file) at a given resolution/source — a tiebreaker
@@ -238,7 +293,8 @@ pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
 }
 
 pub fn rank(candidates: Vec<ReleaseInfo>, prefs: &QualityPrefs) -> Vec<ReleaseInfo> {
-    let mut scored: Vec<(i64, ReleaseInfo)> = candidates.into_iter()
+    let mut scored: Vec<(i64, ReleaseInfo)> = candidates
+        .into_iter()
         .filter_map(|r| score(&r, prefs).map(|s| (s, r)))
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0));
@@ -343,22 +399,51 @@ mod tests {
 
     #[test]
     fn score_excludes_above_ceiling() {
-        let c = raw("Torrentio\n4k", "X.2160p.x265\nRD+", "h", Some("X.2160p.mkv"));
+        let c = raw(
+            "Torrentio\n4k",
+            "X.2160p.x265\nRD+",
+            "h",
+            Some("X.2160p.mkv"),
+        );
         let r = parse(&c);
-        assert_eq!(score(&r, &prefs()), None, "2160p must be excluded at a 1080p ceiling");
+        assert_eq!(
+            score(&r, &prefs()),
+            None,
+            "2160p must be excluded at a 1080p ceiling"
+        );
     }
 
     #[test]
     fn score_ranks_cached_above_uncached() {
-        let cached = parse(&raw("Torrentio\n1080p", "A.1080p.x265\nRD+", "h1", Some("A.1080p.mkv")));
-        let uncached = parse(&raw("Torrentio\n1080p", "A.1080p.x265", "h2", Some("A.1080p.mkv")));
+        let cached = parse(&raw(
+            "Torrentio\n1080p",
+            "A.1080p.x265\nRD+",
+            "h1",
+            Some("A.1080p.mkv"),
+        ));
+        let uncached = parse(&raw(
+            "Torrentio\n1080p",
+            "A.1080p.x265",
+            "h2",
+            Some("A.1080p.mkv"),
+        ));
         assert!(score(&cached, &prefs()).unwrap() > score(&uncached, &prefs()).unwrap());
     }
 
     #[test]
     fn score_prefers_verifiable_container_and_hevc() {
-        let mkv = parse(&raw("Torrentio\n1080p", "A.1080p.x265", "h1", Some("A.1080p.mkv")));
-        let avi = parse(&raw("Torrentio\n1080p", "A.1080p.x264", "h2", Some("A.1080p.avi")));
+        let mkv = parse(&raw(
+            "Torrentio\n1080p",
+            "A.1080p.x265",
+            "h1",
+            Some("A.1080p.mkv"),
+        ));
+        let avi = parse(&raw(
+            "Torrentio\n1080p",
+            "A.1080p.x264",
+            "h2",
+            Some("A.1080p.avi"),
+        ));
         assert!(score(&mkv, &prefs()).unwrap() > score(&avi, &prefs()).unwrap());
     }
 
@@ -379,19 +464,46 @@ mod tests {
     fn score_downranks_wrong_audio_language() {
         let mut p = prefs();
         p.audio = AudioReq::Lang("eng".to_string());
-        let wrong = parse(&raw("t", "Film.1080p.x265 German", "h1", Some("Film.mkv")));   // languages=["ger"]
-        let untagged = parse(&raw("t", "Film.1080p.x265", "h2", Some("Film.mkv")));        // languages=[]
-        assert!(score(&wrong, &p).unwrap() < score(&untagged, &p).unwrap(),
-            "a release tagged as a non-required language must rank below an untagged one");
+        let wrong = parse(&raw("t", "Film.1080p.x265 German", "h1", Some("Film.mkv"))); // languages=["ger"]
+        let untagged = parse(&raw("t", "Film.1080p.x265", "h2", Some("Film.mkv"))); // languages=[]
+        assert!(
+            score(&wrong, &p).unwrap() < score(&untagged, &p).unwrap(),
+            "a release tagged as a non-required language must rank below an untagged one"
+        );
     }
 
     #[test]
     fn score_penalises_tiny_and_absurd_sizes_and_prefers_bitrate() {
-        let normal = parse(&raw("t", "A.1080p.x265\n\u{1f4be} 8 GB", "h1", Some("A.mkv")));
-        let tiny = parse(&raw("t", "A.1080p.x265\n\u{1f4be} 150 MB", "h2", Some("A.mkv")));
-        let absurd = parse(&raw("t", "A.1080p.x265\n\u{1f4be} 120 GB", "h3", Some("A.mkv")));
-        let bigger = parse(&raw("t", "A.1080p.x265\n\u{1f4be} 12 GB", "h4", Some("A.mkv")));
-        let remux = parse(&raw("t", "A.1080p.x265\n\u{1f4be} 35 GB", "h5", Some("A.mkv")));
+        let normal = parse(&raw(
+            "t",
+            "A.1080p.x265\n\u{1f4be} 8 GB",
+            "h1",
+            Some("A.mkv"),
+        ));
+        let tiny = parse(&raw(
+            "t",
+            "A.1080p.x265\n\u{1f4be} 150 MB",
+            "h2",
+            Some("A.mkv"),
+        ));
+        let absurd = parse(&raw(
+            "t",
+            "A.1080p.x265\n\u{1f4be} 120 GB",
+            "h3",
+            Some("A.mkv"),
+        ));
+        let bigger = parse(&raw(
+            "t",
+            "A.1080p.x265\n\u{1f4be} 12 GB",
+            "h4",
+            Some("A.mkv"),
+        ));
+        let remux = parse(&raw(
+            "t",
+            "A.1080p.x265\n\u{1f4be} 35 GB",
+            "h5",
+            Some("A.mkv"),
+        ));
         assert!(score(&normal, &prefs()).unwrap() > score(&tiny, &prefs()).unwrap());
         assert!(score(&normal, &prefs()).unwrap() > score(&absurd, &prefs()).unwrap());
         // Higher bitrate (larger) preferred at the same resolution/source…
@@ -403,41 +515,84 @@ mod tests {
     #[test]
     fn score_rejects_cam_and_telesync_sources() {
         // The quality floor: cam/telesync/screener are excluded even when cached at the ceiling.
-        for marker in ["HDTS", "CAM", "HDCAM", "TELESYNC", "DVDScr", "R5", "TS", "WORKPRINT"] {
+        for marker in [
+            "HDTS",
+            "CAM",
+            "HDCAM",
+            "TELESYNC",
+            "DVDScr",
+            "R5",
+            "TS",
+            "WORKPRINT",
+        ] {
             let c = raw(
                 "Torrentio\n1080p",
                 &format!("Movie.2025.1080p.{marker}.x265\nRD+"),
                 "h",
                 Some("Movie.2025.1080p.mkv"),
             );
-            assert_eq!(score(&parse(&c), &prefs()), None, "{marker} must be rejected by the quality floor");
+            assert_eq!(
+                score(&parse(&c), &prefs()),
+                None,
+                "{marker} must be rejected by the quality floor"
+            );
         }
         // A real BluRay at the same resolution is accepted.
-        let good = parse(&raw("Torrentio\n1080p", "Movie.2025.1080p.BluRay.x265\nRD+", "h", Some("Movie.mkv")));
+        let good = parse(&raw(
+            "Torrentio\n1080p",
+            "Movie.2025.1080p.BluRay.x265\nRD+",
+            "h",
+            Some("Movie.mkv"),
+        ));
         assert!(score(&good, &prefs()).is_some());
     }
 
     #[test]
     fn score_excludes_uncached_zero_seeder_keeps_cached() {
         // 👤0 and uncached → undownloadable → excluded outright (not scored).
-        let dead = parse(&raw("Torrentio 1080p", "A.2009.1080p.BluRay.x264\n\u{1f464} 0 \u{1f4be} 6 GB", "h", Some("A.mkv")));
+        let dead = parse(&raw(
+            "Torrentio 1080p",
+            "A.2009.1080p.BluRay.x264\n\u{1f464} 0 \u{1f4be} 6 GB",
+            "h",
+            Some("A.mkv"),
+        ));
         assert_eq!(dead.seeders, Some(0));
         assert!(!dead.cached);
         assert_eq!(score(&dead, &prefs()), None);
         // Same release but cached → kept: a cached copy needs no live peers.
-        let cached_dead = parse(&raw("Torrentio 1080p", "A.2009.1080p.BluRay.x264\n\u{1f464} 0 \u{1f4be} 6 GB\nRD+", "h", Some("A.mkv")));
+        let cached_dead = parse(&raw(
+            "Torrentio 1080p",
+            "A.2009.1080p.BluRay.x264\n\u{1f464} 0 \u{1f4be} 6 GB\nRD+",
+            "h",
+            Some("A.mkv"),
+        ));
         assert!(cached_dead.cached);
         assert!(score(&cached_dead, &prefs()).is_some());
         // Seeded uncached → kept.
-        let seeded = parse(&raw("Torrentio 1080p", "A.2009.1080p.BluRay.x264\n\u{1f464} 10 \u{1f4be} 6 GB", "h", Some("A.mkv")));
+        let seeded = parse(&raw(
+            "Torrentio 1080p",
+            "A.2009.1080p.BluRay.x264\n\u{1f464} 10 \u{1f4be} 6 GB",
+            "h",
+            Some("A.mkv"),
+        ));
         assert_eq!(seeded.seeders, Some(10));
         assert!(score(&seeded, &prefs()).is_some());
     }
 
     #[test]
     fn score_prefers_higher_source_tier() {
-        let remux = parse(&raw("t", "A.1080p.BluRay.REMUX.x265\nRD+", "h1", Some("A.1080p.mkv")));
-        let web = parse(&raw("t", "A.1080p.WEB-DL.x265\nRD+", "h2", Some("A.1080p.mkv")));
+        let remux = parse(&raw(
+            "t",
+            "A.1080p.BluRay.REMUX.x265\nRD+",
+            "h1",
+            Some("A.1080p.mkv"),
+        ));
+        let web = parse(&raw(
+            "t",
+            "A.1080p.WEB-DL.x265\nRD+",
+            "h2",
+            Some("A.1080p.mkv"),
+        ));
         assert_eq!(remux.source, Source::Remux);
         assert_eq!(web.source, Source::Web);
         assert!(
@@ -461,21 +616,54 @@ mod tests {
     #[test]
     fn meaningful_upgrade_requires_cached_category_jump() {
         use super::{is_meaningful_upgrade, QualitySummary};
-        let owned_web_1080_cached = QualitySummary { cached: true, source_tier: 3_000, resolution: 1080, score: 1 };
+        let owned_web_1080_cached = QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 1080,
+            score: 1,
+        };
         // uncached candidate is never an upgrade
-        let cand_uncached = QualitySummary { cached: false, source_tier: 8_000, resolution: 2160, score: 9 };
-        assert!(!is_meaningful_upgrade(&owned_web_1080_cached, &cand_uncached));
+        let cand_uncached = QualitySummary {
+            cached: false,
+            source_tier: 8_000,
+            resolution: 2160,
+            score: 9,
+        };
+        assert!(!is_meaningful_upgrade(
+            &owned_web_1080_cached,
+            &cand_uncached
+        ));
         // cached, higher tier → upgrade
-        let cand_remux = QualitySummary { cached: true, source_tier: 8_000, resolution: 1080, score: 5 };
+        let cand_remux = QualitySummary {
+            cached: true,
+            source_tier: 8_000,
+            resolution: 1080,
+            score: 5,
+        };
         assert!(is_meaningful_upgrade(&owned_web_1080_cached, &cand_remux));
         // cached, same tier + same resolution → NOT an upgrade (marginal)
-        let cand_same = QualitySummary { cached: true, source_tier: 3_000, resolution: 1080, score: 999 };
+        let cand_same = QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 1080,
+            score: 999,
+        };
         assert!(!is_meaningful_upgrade(&owned_web_1080_cached, &cand_same));
         // cached, higher resolution → upgrade
-        let cand_4k = QualitySummary { cached: true, source_tier: 3_000, resolution: 2160, score: 2 };
+        let cand_4k = QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 2160,
+            score: 2,
+        };
         assert!(is_meaningful_upgrade(&owned_web_1080_cached, &cand_4k));
         // owned uncached → any cached candidate upgrades it
-        let owned_uncached = QualitySummary { cached: false, source_tier: 6_000, resolution: 1080, score: 0 };
+        let owned_uncached = QualitySummary {
+            cached: false,
+            source_tier: 6_000,
+            resolution: 1080,
+            score: 0,
+        };
         assert!(is_meaningful_upgrade(&owned_uncached, &cand_same));
     }
 }

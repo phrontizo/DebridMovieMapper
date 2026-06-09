@@ -92,36 +92,59 @@ impl TmdbClient {
     }
 
     /// Resolve an IMDB id (`tt…`) to (tmdb_id, kind) via TMDB /find.
-    pub async fn find_by_imdb(&self, imdb_id: &str) -> Result<Option<(u64, crate::vfs::MediaType)>, reqwest::Error> {
+    pub async fn find_by_imdb(
+        &self,
+        imdb_id: &str,
+    ) -> Result<Option<(u64, crate::vfs::MediaType)>, reqwest::Error> {
         let url = format!("https://api.themoviedb.org/3/find/{}", imdb_id);
         let api_key = self.api_key.clone();
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
-                self.client
-                    .get(&url)
-                    .query(&[("api_key", api_key.as_str()), ("external_source", "imdb_id")])
+                self.client.get(&url).query(&[
+                    ("api_key", api_key.as_str()),
+                    ("external_source", "imdb_id"),
+                ])
             })
             .await?;
         Ok(parse_find_response(&v))
     }
 
     /// Fetch (title, year, original_language) for a TMDB id.
-    pub async fn details(&self, tmdb_id: u64, kind: crate::vfs::MediaType) -> Result<(String, Option<String>, Option<String>), reqwest::Error> {
-        let path = match kind { crate::vfs::MediaType::Movie => "movie", crate::vfs::MediaType::Show => "tv" };
+    pub async fn details(
+        &self,
+        tmdb_id: u64,
+        kind: crate::vfs::MediaType,
+    ) -> Result<(String, Option<String>, Option<String>), reqwest::Error> {
+        let path = match kind {
+            crate::vfs::MediaType::Movie => "movie",
+            crate::vfs::MediaType::Show => "tv",
+        };
         let url = format!("https://api.themoviedb.org/3/{}/{}", path, tmdb_id);
         let api_key = self.api_key.clone();
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
-                self.client.get(&url).query(&[("api_key", api_key.as_str())])
+                self.client
+                    .get(&url)
+                    .query(&[("api_key", api_key.as_str())])
             })
             .await?;
         Ok(parse_details(&v, kind))
     }
 
     /// Resolve a TMDB id to its IMDB id via /{type}/{id}/external_ids.
-    pub async fn external_imdb_id(&self, tmdb_id: u64, kind: crate::vfs::MediaType) -> Result<Option<String>, reqwest::Error> {
-        let path = match kind { crate::vfs::MediaType::Movie => "movie", crate::vfs::MediaType::Show => "tv" };
-        let url = format!("https://api.themoviedb.org/3/{}/{}/external_ids", path, tmdb_id);
+    pub async fn external_imdb_id(
+        &self,
+        tmdb_id: u64,
+        kind: crate::vfs::MediaType,
+    ) -> Result<Option<String>, reqwest::Error> {
+        let path = match kind {
+            crate::vfs::MediaType::Movie => "movie",
+            crate::vfs::MediaType::Show => "tv",
+        };
+        let url = format!(
+            "https://api.themoviedb.org/3/{}/{}/external_ids",
+            path, tmdb_id
+        );
         let api_key = self.api_key.clone();
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
@@ -140,7 +163,9 @@ impl TmdbClient {
         let api_key = self.api_key.clone();
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
-                self.client.get(&url).query(&[("api_key", api_key.as_str())])
+                self.client
+                    .get(&url)
+                    .query(&[("api_key", api_key.as_str())])
             })
             .await?;
         Ok(parse_show_status(&v))
@@ -159,7 +184,9 @@ impl TmdbClient {
         let api_key = self.api_key.clone();
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
-                self.client.get(&url).query(&[("api_key", api_key.as_str())])
+                self.client
+                    .get(&url)
+                    .query(&[("api_key", api_key.as_str())])
             })
             .await?;
         Ok(parse_season_air_dates(&v, season))
@@ -171,7 +198,9 @@ impl TmdbClient {
         let api_key = self.api_key.clone();
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
-                self.client.get(&url).query(&[("api_key", api_key.as_str())])
+                self.client
+                    .get(&url)
+                    .query(&[("api_key", api_key.as_str())])
             })
             .await?;
         Ok(parse_season_numbers(&v))
@@ -264,7 +293,10 @@ impl TmdbClient {
 }
 
 /// Parse a TMDB movie/tv details object into (title, year, original_language).
-pub(crate) fn parse_details(v: &serde_json::Value, kind: crate::vfs::MediaType) -> (String, Option<String>, Option<String>) {
+pub(crate) fn parse_details(
+    v: &serde_json::Value,
+    kind: crate::vfs::MediaType,
+) -> (String, Option<String>, Option<String>) {
     let title = match kind {
         crate::vfs::MediaType::Movie => v.get("title"),
         crate::vfs::MediaType::Show => v.get("name"),
@@ -278,19 +310,36 @@ pub(crate) fn parse_details(v: &serde_json::Value, kind: crate::vfs::MediaType) 
     }
     .and_then(|d| d.as_str())
     .unwrap_or("");
-    let year = date.split('-').next().filter(|y| y.len() == 4).map(String::from);
-    let original_language = v.get("original_language").and_then(|l| l.as_str()).map(String::from);
+    let year = date
+        .split('-')
+        .next()
+        .filter(|y| y.len() == 4)
+        .map(String::from);
+    let original_language = v
+        .get("original_language")
+        .and_then(|l| l.as_str())
+        .map(String::from);
     (title, year, original_language)
 }
 
 /// Parse TMDB `/find/{imdb_id}?external_source=imdb_id` into (tmdb_id, kind). Movie wins over TV.
 pub(crate) fn parse_find_response(v: &serde_json::Value) -> Option<(u64, crate::vfs::MediaType)> {
-    if let Some(id) = v.get("movie_results").and_then(|a| a.as_array()).and_then(|a| a.first())
-        .and_then(|m| m.get("id")).and_then(|i| i.as_u64()) {
+    if let Some(id) = v
+        .get("movie_results")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|m| m.get("id"))
+        .and_then(|i| i.as_u64())
+    {
         return Some((id, crate::vfs::MediaType::Movie));
     }
-    if let Some(id) = v.get("tv_results").and_then(|a| a.as_array()).and_then(|a| a.first())
-        .and_then(|m| m.get("id")).and_then(|i| i.as_u64()) {
+    if let Some(id) = v
+        .get("tv_results")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|m| m.get("id"))
+        .and_then(|i| i.as_u64())
+    {
         return Some((id, crate::vfs::MediaType::Show));
     }
     None
@@ -298,7 +347,10 @@ pub(crate) fn parse_find_response(v: &serde_json::Value) -> Option<(u64, crate::
 
 /// Parse `/{type}/{id}/external_ids` into the IMDB id (non-empty).
 pub(crate) fn parse_external_ids(v: &serde_json::Value) -> Option<String> {
-    v.get("imdb_id").and_then(|i| i.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    v.get("imdb_id")
+        .and_then(|i| i.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Build the synthetic Bad Gateway error returned when every retry attempt hit a retryable
@@ -368,7 +420,11 @@ pub(crate) fn parse_season_air_dates(v: &serde_json::Value, season: u32) -> Vec<
                 .and_then(|d| d.as_str())
                 .filter(|s| !s.is_empty())
                 .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
-            Some(EpisodeAirDate { season, episode, air_date })
+            Some(EpisodeAirDate {
+                season,
+                episode,
+                air_date,
+            })
         })
         .collect()
 }
@@ -470,9 +526,15 @@ mod tests {
     #[test]
     fn parse_find_response_extracts_tmdb_id_and_kind() {
         let json = serde_json::json!({ "movie_results": [{"id": 27205}], "tv_results": [] });
-        assert_eq!(super::parse_find_response(&json), Some((27205, crate::vfs::MediaType::Movie)));
+        assert_eq!(
+            super::parse_find_response(&json),
+            Some((27205, crate::vfs::MediaType::Movie))
+        );
         let json2 = serde_json::json!({ "movie_results": [], "tv_results": [{"id": 1396}] });
-        assert_eq!(super::parse_find_response(&json2), Some((1396, crate::vfs::MediaType::Show)));
+        assert_eq!(
+            super::parse_find_response(&json2),
+            Some((1396, crate::vfs::MediaType::Show))
+        );
         let empty = serde_json::json!({"movie_results": [], "tv_results": []});
         assert_eq!(super::parse_find_response(&empty), None);
     }
@@ -480,7 +542,10 @@ mod tests {
     #[test]
     fn parse_external_ids_extracts_imdb() {
         let json = serde_json::json!({"imdb_id": "tt0816692"});
-        assert_eq!(super::parse_external_ids(&json), Some("tt0816692".to_string()));
+        assert_eq!(
+            super::parse_external_ids(&json),
+            Some("tt0816692".to_string())
+        );
         let none = serde_json::json!({"imdb_id": serde_json::Value::Null});
         assert_eq!(super::parse_external_ids(&none), None);
         let empty = serde_json::json!({"imdb_id": ""});
@@ -490,9 +555,19 @@ mod tests {
     #[test]
     fn parse_details_movie_and_show() {
         let m = serde_json::json!({"title": "Inception", "release_date": "2010-07-16", "original_language": "en"});
-        assert_eq!(super::parse_details(&m, crate::vfs::MediaType::Movie), ("Inception".into(), Some("2010".into()), Some("en".into())));
+        assert_eq!(
+            super::parse_details(&m, crate::vfs::MediaType::Movie),
+            ("Inception".into(), Some("2010".into()), Some("en".into()))
+        );
         let s = serde_json::json!({"name": "Breaking Bad", "first_air_date": "2008-01-20", "original_language": "en"});
-        assert_eq!(super::parse_details(&s, crate::vfs::MediaType::Show), ("Breaking Bad".into(), Some("2008".into()), Some("en".into())));
+        assert_eq!(
+            super::parse_details(&s, crate::vfs::MediaType::Show),
+            (
+                "Breaking Bad".into(),
+                Some("2008".into()),
+                Some("en".into())
+            )
+        );
     }
 
     // --- ShowStatus tests ---
@@ -525,15 +600,27 @@ mod tests {
 
         // Missing status field → Other
         let missing = serde_json::json!({});
-        assert_eq!(parse_show_status(&missing), ShowStatus::Other, "missing status → Other");
+        assert_eq!(
+            parse_show_status(&missing),
+            ShowStatus::Other,
+            "missing status → Other"
+        );
 
         // Mixed-case: "ended" (all lower) → Ended
         let lower = serde_json::json!({ "status": "ended" });
-        assert_eq!(parse_show_status(&lower), ShowStatus::Ended, "lowercase 'ended' → Ended");
+        assert_eq!(
+            parse_show_status(&lower),
+            ShowStatus::Ended,
+            "lowercase 'ended' → Ended"
+        );
 
         // Mixed-case: "CANCELED" (all upper) → Ended
         let upper = serde_json::json!({ "status": "CANCELED" });
-        assert_eq!(parse_show_status(&upper), ShowStatus::Ended, "uppercase 'CANCELED' → Ended");
+        assert_eq!(
+            parse_show_status(&upper),
+            ShowStatus::Ended,
+            "uppercase 'CANCELED' → Ended"
+        );
     }
 
     // --- EpisodeAirDate / parse_season_air_dates tests ---
@@ -566,15 +653,27 @@ mod tests {
         );
         assert_eq!(
             result[1],
-            EpisodeAirDate { season: 2, episode: 2, air_date: None }
+            EpisodeAirDate {
+                season: 2,
+                episode: 2,
+                air_date: None
+            }
         );
         assert_eq!(
             result[2],
-            EpisodeAirDate { season: 2, episode: 3, air_date: None }
+            EpisodeAirDate {
+                season: 2,
+                episode: 3,
+                air_date: None
+            }
         );
         assert_eq!(
             result[3],
-            EpisodeAirDate { season: 2, episode: 4, air_date: None }
+            EpisodeAirDate {
+                season: 2,
+                episode: 4,
+                air_date: None
+            }
         );
         // All entries carry the threaded season value
         assert!(result.iter().all(|e| e.season == 2));
@@ -616,9 +715,15 @@ mod tests {
     #[test]
     fn parse_season_numbers_missing_key_is_empty() {
         use super::parse_season_numbers;
-        assert_eq!(parse_season_numbers(&serde_json::json!({})), Vec::<u32>::new());
+        assert_eq!(
+            parse_season_numbers(&serde_json::json!({})),
+            Vec::<u32>::new()
+        );
         // An explicit empty seasons array must also yield an empty vec.
-        assert_eq!(parse_season_numbers(&serde_json::json!({ "seasons": [] })), Vec::<u32>::new());
+        assert_eq!(
+            parse_season_numbers(&serde_json::json!({ "seasons": [] })),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]

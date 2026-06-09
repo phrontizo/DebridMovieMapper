@@ -89,7 +89,13 @@ async fn test_media_file_generation() {
     let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
     let http_client = reqwest::Client::new();
     let ra = std::sync::Arc::new(debridmoviemapper::read_activity::ReadActivity::new());
-    let dav_fs = DebridFileSystem::new(rd_client.clone(), vfs.clone(), repair_manager, http_client, ra);
+    let dav_fs = DebridFileSystem::new(
+        rd_client.clone(),
+        vfs.clone(),
+        repair_manager,
+        http_client,
+        ra,
+    );
 
     // Test a few media files
     for (path_str, rd_link, file_size) in media_files.iter().take(3) {

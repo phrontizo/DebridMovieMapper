@@ -255,7 +255,9 @@ fn find_ebml_child(
         let payload_end = if size == u64::MAX {
             end // unknown/streaming size → spans to the end of the search region
         } else {
-            payload_start.checked_add(size as usize).ok_or(ProbeError::Corrupt)?
+            payload_start
+                .checked_add(size as usize)
+                .ok_or(ProbeError::Corrupt)?
         };
         if payload_end > end {
             return Err(overrun_error(payload_end, buf.len()));
@@ -329,7 +331,9 @@ fn read_box_header(buf: &[u8], pos: usize) -> Result<([u8; 4], usize, usize), Pr
     } else if size32 == 0 {
         (pos + 8, buf.len())
     } else {
-        let end = pos.checked_add(size32 as usize).ok_or(ProbeError::Corrupt)?;
+        let end = pos
+            .checked_add(size32 as usize)
+            .ok_or(ProbeError::Corrupt)?;
         (pos + 8, end)
     };
     if box_end < payload_start {
@@ -600,8 +604,12 @@ mod tests {
     fn mkv_audio_and_subtitle_languages() {
         let bytes = mkv_with("eng", Some("fre"));
         let tracks = parse_mkv_tracks(&bytes).expect("parse");
-        assert!(tracks.iter().any(|t| t.kind == TrackKind::Audio && t.language.as_deref() == Some("eng")));
-        assert!(tracks.iter().any(|t| t.kind == TrackKind::Subtitle && t.language.as_deref() == Some("fre")));
+        assert!(tracks
+            .iter()
+            .any(|t| t.kind == TrackKind::Audio && t.language.as_deref() == Some("eng")));
+        assert!(tracks
+            .iter()
+            .any(|t| t.kind == TrackKind::Subtitle && t.language.as_deref() == Some("fre")));
     }
     #[test]
     fn mkv_truncated_is_transient() {
@@ -609,13 +617,19 @@ mod tests {
         // to defer, not a broken file to blacklist.
         let mut bytes = mkv_with("eng", None);
         bytes.truncate(bytes.len() - 3);
-        assert!(matches!(parse_mkv_tracks(&bytes), Err(ProbeError::Transient)));
+        assert!(matches!(
+            parse_mkv_tracks(&bytes),
+            Err(ProbeError::Transient)
+        ));
     }
     #[test]
     fn mp4_truncated_moov_is_transient() {
         let mut bytes = mp4_with(&[(b"soun", packed("eng"))]);
         bytes.truncate(bytes.len() - 4);
-        assert!(matches!(parse_mp4_tracks(&bytes), Err(ProbeError::Transient)));
+        assert!(matches!(
+            parse_mp4_tracks(&bytes),
+            Err(ProbeError::Transient)
+        ));
     }
     #[test]
     fn overrun_classifies_under_fetch_vs_malformed() {
@@ -627,14 +641,21 @@ mod tests {
     fn mp4_tracks_front_moov() {
         let bytes = mp4_with(&[(b"soun", packed("eng")), (b"subt", packed("ger"))]);
         let tracks = parse_mp4_tracks(&bytes).expect("parse");
-        assert!(tracks.iter().any(|t| t.kind == TrackKind::Audio && t.language.as_deref() == Some("eng")));
-        assert!(tracks.iter().any(|t| t.kind == TrackKind::Subtitle && t.language.as_deref() == Some("ger")));
+        assert!(tracks
+            .iter()
+            .any(|t| t.kind == TrackKind::Audio && t.language.as_deref() == Some("eng")));
+        assert!(tracks
+            .iter()
+            .any(|t| t.kind == TrackKind::Subtitle && t.language.as_deref() == Some("ger")));
     }
     #[test]
     fn mp4_no_moov_is_tracks_not_found() {
         let mut bytes = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
         bytes.extend(mp4_box(b"mdat", &[0u8; 16]));
-        assert!(matches!(parse_mp4_tracks(&bytes), Err(ProbeError::TracksNotFound)));
+        assert!(matches!(
+            parse_mp4_tracks(&bytes),
+            Err(ProbeError::TracksNotFound)
+        ));
     }
     #[test]
     fn mp4_bad_box_size_is_corrupt() {
@@ -654,21 +675,45 @@ mod tests {
     }
     #[test]
     fn detect_container_by_magic() {
-        assert_eq!(detect_container(&mkv_with("eng", None)), Some(ContainerKind::Mkv));
-        assert_eq!(detect_container(&mp4_with(&[(b"soun", packed("eng"))])), Some(ContainerKind::Mp4));
+        assert_eq!(
+            detect_container(&mkv_with("eng", None)),
+            Some(ContainerKind::Mkv)
+        );
+        assert_eq!(
+            detect_container(&mp4_with(&[(b"soun", packed("eng"))])),
+            Some(ContainerKind::Mp4)
+        );
         assert_eq!(detect_container(b"RIFF\0\0\0\0AVI LIST"), None);
     }
     #[test]
     fn verify_audio_original_and_subtitle_rules() {
         let tracks = vec![
-            Track { kind: TrackKind::Audio, language: Some("jpn".into()) },
-            Track { kind: TrackKind::Subtitle, language: Some("eng".into()) },
+            Track {
+                kind: TrackKind::Audio,
+                language: Some("jpn".into()),
+            },
+            Track {
+                kind: TrackKind::Subtitle,
+                language: Some("eng".into()),
+            },
         ];
-        let req = LangReq { audio: AudioReq::Original, subtitle: SubReq::Lang("eng".into()), original_language: Some("jpn".into()) };
+        let req = LangReq {
+            audio: AudioReq::Original,
+            subtitle: SubReq::Lang("eng".into()),
+            original_language: Some("jpn".into()),
+        };
         assert_eq!(verify(&tracks, &req), Verify::Pass);
-        let req2 = LangReq { audio: AudioReq::Lang("eng".into()), subtitle: SubReq::None, original_language: None };
+        let req2 = LangReq {
+            audio: AudioReq::Lang("eng".into()),
+            subtitle: SubReq::None,
+            original_language: None,
+        };
         assert_eq!(verify(&tracks, &req2), Verify::FailAudio);
-        let req3 = LangReq { audio: AudioReq::Original, subtitle: SubReq::Lang("ger".into()), original_language: Some("jpn".into()) };
+        let req3 = LangReq {
+            audio: AudioReq::Original,
+            subtitle: SubReq::Lang("ger".into()),
+            original_language: Some("jpn".into()),
+        };
         assert_eq!(verify(&tracks, &req3), Verify::FailSubtitle);
         assert_eq!(verify(&[], &req), Verify::Inconclusive);
     }
@@ -678,18 +723,35 @@ mod tests {
         // Audio with no determinable language (e.g. MP4 with und/missing mdhd) is inconclusive,
         // not a BadAudio rejection — a correct-but-untagged release must not be dropped.
         let tracks = vec![
-            Track { kind: TrackKind::Video, language: None },
-            Track { kind: TrackKind::Audio, language: None },
+            Track {
+                kind: TrackKind::Video,
+                language: None,
+            },
+            Track {
+                kind: TrackKind::Audio,
+                language: None,
+            },
         ];
-        let req = LangReq { audio: AudioReq::Original, subtitle: SubReq::None, original_language: Some("eng".into()) };
+        let req = LangReq {
+            audio: AudioReq::Original,
+            subtitle: SubReq::None,
+            original_language: Some("eng".into()),
+        };
         assert_eq!(verify(&tracks, &req), Verify::Pass);
     }
 
     #[test]
     fn verify_tagged_wrong_audio_still_fails() {
         // A track positively tagged with a non-matching language is still rejected (a real dub).
-        let tracks = vec![Track { kind: TrackKind::Audio, language: Some("ita".into()) }];
-        let req = LangReq { audio: AudioReq::Lang("eng".into()), subtitle: SubReq::None, original_language: None };
+        let tracks = vec![Track {
+            kind: TrackKind::Audio,
+            language: Some("ita".into()),
+        }];
+        let req = LangReq {
+            audio: AudioReq::Lang("eng".into()),
+            subtitle: SubReq::None,
+            original_language: None,
+        };
         assert_eq!(verify(&tracks, &req), Verify::FailAudio);
     }
 
@@ -699,26 +761,52 @@ mod tests {
         // accepted — the untagged track could be the wanted language. Only an all-tagged,
         // all-wrong set is rejected.
         let tracks = vec![
-            Track { kind: TrackKind::Audio, language: Some("ita".into()) },
-            Track { kind: TrackKind::Audio, language: None },
+            Track {
+                kind: TrackKind::Audio,
+                language: Some("ita".into()),
+            },
+            Track {
+                kind: TrackKind::Audio,
+                language: None,
+            },
         ];
-        let req = LangReq { audio: AudioReq::Lang("eng".into()), subtitle: SubReq::None, original_language: None };
+        let req = LangReq {
+            audio: AudioReq::Lang("eng".into()),
+            subtitle: SubReq::None,
+            original_language: None,
+        };
         assert_eq!(verify(&tracks, &req), Verify::Pass);
     }
 
     #[test]
     fn verify_subtitle_untagged_inconclusive_but_wrong_tagged_fails() {
-        let req = LangReq { audio: AudioReq::Lang("eng".into()), subtitle: SubReq::Lang("eng".into()), original_language: None };
+        let req = LangReq {
+            audio: AudioReq::Lang("eng".into()),
+            subtitle: SubReq::Lang("eng".into()),
+            original_language: None,
+        };
         // Untagged subtitle present → could be the wanted one → inconclusive (accept).
         let untagged_sub = vec![
-            Track { kind: TrackKind::Audio, language: Some("eng".into()) },
-            Track { kind: TrackKind::Subtitle, language: None },
+            Track {
+                kind: TrackKind::Audio,
+                language: Some("eng".into()),
+            },
+            Track {
+                kind: TrackKind::Subtitle,
+                language: None,
+            },
         ];
         assert_eq!(verify(&untagged_sub, &req), Verify::Pass);
         // Only a differently-tagged subtitle → the wanted subtitle is positively absent → fail.
         let wrong_sub = vec![
-            Track { kind: TrackKind::Audio, language: Some("eng".into()) },
-            Track { kind: TrackKind::Subtitle, language: Some("fre".into()) },
+            Track {
+                kind: TrackKind::Audio,
+                language: Some("eng".into()),
+            },
+            Track {
+                kind: TrackKind::Subtitle,
+                language: Some("fre".into()),
+            },
         ];
         assert_eq!(verify(&wrong_sub, &req), Verify::FailSubtitle);
     }

@@ -8,6 +8,7 @@
 //! without fixtures. The two removal triggers are:
 //!   - **Trigger A** (finished): everyone who currently wants a title has finished watching it.
 //!   - **Trigger B** (abandoned): the watchlist that added it was abandoned and nobody wants it.
+//!
 //! A title with any **manual** provenance is never auto-removed, regardless of Trakt state.
 
 use crate::store::{Provenance, ProvenanceEntry, WantedRecord, WatchedState};
@@ -20,8 +21,8 @@ use crate::vfs::MediaType;
 pub struct Owned {
     pub hash: String,
     pub provenance: Provenance,
-    pub available: bool,                  // false → cache lapsed / missing / 503 → re-acquire
-    pub owned_episodes: Vec<(u32, u32)>,  // shows: which (season, episode) are owned
+    pub available: bool, // false → cache lapsed / missing / 503 → re-acquire
+    pub owned_episodes: Vec<(u32, u32)>, // shows: which (season, episode) are owned
 }
 
 /// Everything the reconciler needs about ONE title (one tmdb_id), assembled by the caller (Task 8).
@@ -29,7 +30,7 @@ pub struct Owned {
 pub struct TitleView {
     pub tmdb_id: u64,
     pub media_type: MediaType,
-    pub wanted: Vec<WantedRecord>,        // per-user current wanted rows for this title (empty → nobody wants it)
+    pub wanted: Vec<WantedRecord>, // per-user current wanted rows for this title (empty → nobody wants it)
     /// The engine-owned copy of this title, or `None` if not owned. The reconciler models
     /// ONE owned copy per title: for shows acquired episode-by-episode (multiple hashes),
     /// the caller (Task 8) MUST aggregate all per-episode hashes into a single `Owned` whose
@@ -39,15 +40,24 @@ pub struct TitleView {
     /// would make Trigger A misfire on partial coverage — assemble per *tmdb_id*.
     pub owned: Option<Owned>,
     /// Caller is responsible for de-duplicating; duplicate entries would yield duplicate AcquireEpisode actions.
-    pub aired_episodes: Vec<(u32, u32)>,  // shows: episodes aired as of "now" (from TMDB). movies: ignored
+    pub aired_episodes: Vec<(u32, u32)>, // shows: episodes aired as of "now" (from TMDB). movies: ignored
 }
 
 /// An action the reconciler asks the engine to take.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    AcquireMovie { tmdb_id: u64 },
-    AcquireEpisode { tmdb_id: u64, season: u32, episode: u32 },
-    Remove { tmdb_id: u64, hash: String },
+    AcquireMovie {
+        tmdb_id: u64,
+    },
+    AcquireEpisode {
+        tmdb_id: u64,
+        season: u32,
+        episode: u32,
+    },
+    Remove {
+        tmdb_id: u64,
+        hash: String,
+    },
 }
 
 /// True iff a user currently wants this title via either Trakt source.
@@ -140,11 +150,13 @@ pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
     match title.media_type {
         MediaType::Movie => {
             let needs_acquire = match &title.owned {
-                None => true,             // not owned → acquire
+                None => true,                    // not owned → acquire
                 Some(owned) => !owned.available, // owned but lapsed → re-acquire
             };
             if needs_acquire {
-                vec![Action::AcquireMovie { tmdb_id: title.tmdb_id }]
+                vec![Action::AcquireMovie {
+                    tmdb_id: title.tmdb_id,
+                }]
             } else {
                 vec![]
             }
@@ -176,16 +188,27 @@ mod tests {
 
     /// A movie wanted via watchlist only, with the given watched flag.
     fn watchlist_movie_record(user: &str, tmdb: u64, watched: bool) -> WantedRecord {
-        movie_record(user, tmdb, /*watchlist*/ true, /*in_progress*/ false, watched)
+        movie_record(
+            user, tmdb, /*watchlist*/ true, /*in_progress*/ false, watched,
+        )
     }
 
     /// A movie wanted record with explicit sources + watched flag.
-    fn movie_record(user: &str, tmdb: u64, watchlist: bool, in_progress: bool, watched: bool) -> WantedRecord {
+    fn movie_record(
+        user: &str,
+        tmdb: u64,
+        watchlist: bool,
+        in_progress: bool,
+        watched: bool,
+    ) -> WantedRecord {
         WantedRecord {
             user: user.to_string(),
             tmdb_id: tmdb,
             media_type: MediaType::Movie,
-            sources: WantedSources { watchlist, in_progress },
+            sources: WantedSources {
+                watchlist,
+                in_progress,
+            },
             watched_state: WatchedState::Movie { watched },
             show_status: None,
         }
@@ -204,18 +227,34 @@ mod tests {
             user: user.to_string(),
             tmdb_id: tmdb,
             media_type: MediaType::Show,
-            sources: WantedSources { watchlist: watchlisted, in_progress },
-            watched_state: WatchedState::Show { watched_episodes: watched_eps },
+            sources: WantedSources {
+                watchlist: watchlisted,
+                in_progress,
+            },
+            watched_state: WatchedState::Show {
+                watched_episodes: watched_eps,
+            },
             show_status: Some(status),
         }
     }
 
     fn owned(hash: &str, provenance: Provenance, available: bool, eps: Vec<(u32, u32)>) -> Owned {
-        Owned { hash: hash.to_string(), provenance, available, owned_episodes: eps }
+        Owned {
+            hash: hash.to_string(),
+            provenance,
+            available,
+            owned_episodes: eps,
+        }
     }
 
     fn movie_title(tmdb: u64, wanted: Vec<WantedRecord>, owned: Option<Owned>) -> TitleView {
-        TitleView { tmdb_id: tmdb, media_type: MediaType::Movie, wanted, owned, aired_episodes: vec![] }
+        TitleView {
+            tmdb_id: tmdb,
+            media_type: MediaType::Movie,
+            wanted,
+            owned,
+            aired_episodes: vec![],
+        }
     }
 
     fn show_title(
@@ -224,7 +263,13 @@ mod tests {
         owned: Option<Owned>,
         aired: Vec<(u32, u32)>,
     ) -> TitleView {
-        TitleView { tmdb_id: tmdb, media_type: MediaType::Show, wanted, owned, aired_episodes: aired }
+        TitleView {
+            tmdb_id: tmdb,
+            media_type: MediaType::Show,
+            wanted,
+            owned,
+            aired_episodes: aired,
+        }
     }
 
     // ── removal lifecycle ─────────────────────────────────────────────────────
@@ -237,7 +282,13 @@ mod tests {
             Some(owned("h", Provenance::watchlist("alice"), true, vec![])),
         );
         assert!(should_remove(&t));
-        assert_eq!(reconcile_title(&t), vec![Action::Remove { tmdb_id: 1, hash: "h".into() }]);
+        assert_eq!(
+            reconcile_title(&t),
+            vec![Action::Remove {
+                tmdb_id: 1,
+                hash: "h".into()
+            }]
+        );
     }
 
     #[test]
@@ -245,12 +296,30 @@ mod tests {
         let aired = vec![(1, 1), (1, 2)];
         let t = show_title(
             2,
-            vec![show_record("alice", 2, true, false, vec![(1, 1), (1, 2)], ShowStatus::Ended)],
-            Some(owned("h", Provenance::watchlist("alice"), true, vec![(1, 1), (1, 2)])),
+            vec![show_record(
+                "alice",
+                2,
+                true,
+                false,
+                vec![(1, 1), (1, 2)],
+                ShowStatus::Ended,
+            )],
+            Some(owned(
+                "h",
+                Provenance::watchlist("alice"),
+                true,
+                vec![(1, 1), (1, 2)],
+            )),
             aired,
         );
         assert!(should_remove(&t));
-        assert_eq!(reconcile_title(&t), vec![Action::Remove { tmdb_id: 2, hash: "h".into() }]);
+        assert_eq!(
+            reconcile_title(&t),
+            vec![Action::Remove {
+                tmdb_id: 2,
+                hash: "h".into()
+            }]
+        );
     }
 
     #[test]
@@ -258,12 +327,31 @@ mod tests {
         let aired = vec![(1, 1), (1, 2)];
         let t = show_title(
             3,
-            vec![show_record("alice", 3, true, false, vec![(1, 1), (1, 2)], ShowStatus::Returning)],
-            Some(owned("h", Provenance::watchlist("alice"), true, vec![(1, 1), (1, 2)])),
+            vec![show_record(
+                "alice",
+                3,
+                true,
+                false,
+                vec![(1, 1), (1, 2)],
+                ShowStatus::Returning,
+            )],
+            Some(owned(
+                "h",
+                Provenance::watchlist("alice"),
+                true,
+                vec![(1, 1), (1, 2)],
+            )),
             aired,
         );
-        assert!(!should_remove(&t), "a returning show is never finished, even at 100% watched");
-        assert_eq!(reconcile_title(&t), vec![], "all aired owned+available → nothing to acquire");
+        assert!(
+            !should_remove(&t),
+            "a returning show is never finished, even at 100% watched"
+        );
+        assert_eq!(
+            reconcile_title(&t),
+            vec![],
+            "all aired owned+available → nothing to acquire"
+        );
     }
 
     #[test]
@@ -271,13 +359,29 @@ mod tests {
         // alice un-watchlisted (both sources false) — nobody wants it now. Trigger B fires
         // regardless of how much she had watched (incl. the record being gone entirely).
         for watched in [false, true] {
-            let rec = movie_record("alice", 4, /*watchlist*/ false, /*in_progress*/ false, watched);
-            let t = movie_title(4, vec![rec], Some(owned("h", Provenance::watchlist("alice"), true, vec![])));
+            let rec = movie_record(
+                "alice", 4, /*watchlist*/ false, /*in_progress*/ false, watched,
+            );
+            let t = movie_title(
+                4,
+                vec![rec],
+                Some(owned("h", Provenance::watchlist("alice"), true, vec![])),
+            );
             assert!(should_remove(&t), "watched={watched}");
-            assert_eq!(reconcile_title(&t), vec![Action::Remove { tmdb_id: 4, hash: "h".into() }]);
+            assert_eq!(
+                reconcile_title(&t),
+                vec![Action::Remove {
+                    tmdb_id: 4,
+                    hash: "h".into()
+                }]
+            );
         }
         // Record removed entirely (empty wanted-set) — still removed.
-        let t = movie_title(4, vec![], Some(owned("h", Provenance::watchlist("alice"), true, vec![])));
+        let t = movie_title(
+            4,
+            vec![],
+            Some(owned("h", Provenance::watchlist("alice"), true, vec![])),
+        );
         assert!(should_remove(&t));
     }
 
@@ -286,15 +390,33 @@ mod tests {
         let aired = vec![(1, 1), (1, 2), (1, 3)];
         for watched_eps in [vec![], vec![(1, 1)], vec![(1, 1), (1, 2), (1, 3)]] {
             // present but un-watchlisted (both sources false) → nobody wants it
-            let rec = show_record("alice", 5, false, false, watched_eps.clone(), ShowStatus::Returning);
+            let rec = show_record(
+                "alice",
+                5,
+                false,
+                false,
+                watched_eps.clone(),
+                ShowStatus::Returning,
+            );
             let t = show_title(
                 5,
                 vec![rec],
-                Some(owned("h", Provenance::watchlist("alice"), true, watched_eps.clone())),
+                Some(owned(
+                    "h",
+                    Provenance::watchlist("alice"),
+                    true,
+                    watched_eps.clone(),
+                )),
                 aired.clone(),
             );
             assert!(should_remove(&t), "watched_eps={watched_eps:?}");
-            assert_eq!(reconcile_title(&t), vec![Action::Remove { tmdb_id: 5, hash: "h".into() }]);
+            assert_eq!(
+                reconcile_title(&t),
+                vec![Action::Remove {
+                    tmdb_id: 5,
+                    hash: "h".into()
+                }]
+            );
         }
     }
 
@@ -306,15 +428,24 @@ mod tests {
             vec![watchlist_movie_record("bob", 6, false)],
             Some(owned("h", Provenance::watchlist("alice"), true, vec![])),
         );
-        assert!(!should_remove(&t), "bob still wants it (no B) and hasn't finished it (no A)");
-        assert_eq!(reconcile_title(&t), vec![], "already owned + available → no acquire");
+        assert!(
+            !should_remove(&t),
+            "bob still wants it (no B) and hasn't finished it (no A)"
+        );
+        assert_eq!(
+            reconcile_title(&t),
+            vec![],
+            "already owned + available → no acquire"
+        );
     }
 
     #[test]
     fn another_user_in_progress_keeps_title() {
         let t = movie_title(
             7,
-            vec![movie_record("bob", 7, /*watchlist*/ false, /*in_progress*/ true, false)],
+            vec![movie_record(
+                "bob", 7, /*watchlist*/ false, /*in_progress*/ true, false,
+            )],
             Some(owned("h", Provenance::watchlist("alice"), true, vec![])),
         );
         assert!(!should_remove(&t));
@@ -323,7 +454,11 @@ mod tests {
 
     #[test]
     fn manual_provenance_is_never_removed() {
-        let t = movie_title(8, vec![], Some(owned("h", Provenance::manual(), true, vec![])));
+        let t = movie_title(
+            8,
+            vec![],
+            Some(owned("h", Provenance::manual(), true, vec![])),
+        );
         assert!(!should_remove(&t));
         assert_eq!(reconcile_title(&t), vec![]);
 
@@ -339,13 +474,20 @@ mod tests {
         let t = movie_title(
             9,
             vec![
-                watchlist_movie_record("alice", 9, true),  // finished
-                watchlist_movie_record("bob", 9, false),   // mid-watch
+                watchlist_movie_record("alice", 9, true), // finished
+                watchlist_movie_record("bob", 9, false),  // mid-watch
             ],
             Some(owned("h", Provenance::watchlist("alice"), true, vec![])),
         );
-        assert!(!should_remove(&t), "bob hasn't finished → Trigger A blocked");
-        assert_eq!(reconcile_title(&t), vec![], "still wanted, owned+available → no acquire");
+        assert!(
+            !should_remove(&t),
+            "bob hasn't finished → Trigger A blocked"
+        );
+        assert_eq!(
+            reconcile_title(&t),
+            vec![],
+            "still wanted, owned+available → no acquire"
+        );
     }
 
     // ── acquire ───────────────────────────────────────────────────────────────
@@ -353,7 +495,10 @@ mod tests {
     #[test]
     fn wanted_movie_not_owned_acquires() {
         let t = movie_title(10, vec![watchlist_movie_record("alice", 10, false)], None);
-        assert_eq!(reconcile_title(&t), vec![Action::AcquireMovie { tmdb_id: 10 }]);
+        assert_eq!(
+            reconcile_title(&t),
+            vec![Action::AcquireMovie { tmdb_id: 10 }]
+        );
     }
 
     #[test]
@@ -363,7 +508,10 @@ mod tests {
             vec![watchlist_movie_record("alice", 11, false)],
             Some(owned("h", Provenance::watchlist("alice"), false, vec![])),
         );
-        assert_eq!(reconcile_title(&t), vec![Action::AcquireMovie { tmdb_id: 11 }]);
+        assert_eq!(
+            reconcile_title(&t),
+            vec![Action::AcquireMovie { tmdb_id: 11 }]
+        );
     }
 
     #[test]
@@ -381,16 +529,35 @@ mod tests {
         let aired = vec![(1, 1), (1, 2), (2, 1)];
         let t = show_title(
             13,
-            vec![show_record("alice", 13, true, false, vec![], ShowStatus::Returning)],
+            vec![show_record(
+                "alice",
+                13,
+                true,
+                false,
+                vec![],
+                ShowStatus::Returning,
+            )],
             None,
             aired,
         );
         assert_eq!(
             reconcile_title(&t),
             vec![
-                Action::AcquireEpisode { tmdb_id: 13, season: 1, episode: 1 },
-                Action::AcquireEpisode { tmdb_id: 13, season: 1, episode: 2 },
-                Action::AcquireEpisode { tmdb_id: 13, season: 2, episode: 1 },
+                Action::AcquireEpisode {
+                    tmdb_id: 13,
+                    season: 1,
+                    episode: 1
+                },
+                Action::AcquireEpisode {
+                    tmdb_id: 13,
+                    season: 1,
+                    episode: 2
+                },
+                Action::AcquireEpisode {
+                    tmdb_id: 13,
+                    season: 2,
+                    episode: 1
+                },
             ]
         );
     }
@@ -400,13 +567,29 @@ mod tests {
         let aired = vec![(1, 1), (1, 2)];
         let t = show_title(
             14,
-            vec![show_record("alice", 14, true, false, vec![], ShowStatus::Returning)],
-            Some(owned("h", Provenance::watchlist("alice"), true, vec![(1, 1)])),
+            vec![show_record(
+                "alice",
+                14,
+                true,
+                false,
+                vec![],
+                ShowStatus::Returning,
+            )],
+            Some(owned(
+                "h",
+                Provenance::watchlist("alice"),
+                true,
+                vec![(1, 1)],
+            )),
             aired,
         );
         assert_eq!(
             reconcile_title(&t),
-            vec![Action::AcquireEpisode { tmdb_id: 14, season: 1, episode: 2 }]
+            vec![Action::AcquireEpisode {
+                tmdb_id: 14,
+                season: 1,
+                episode: 2
+            }]
         );
     }
 
@@ -415,16 +598,36 @@ mod tests {
         let aired = vec![(1, 1), (1, 2)];
         let t = show_title(
             15,
-            vec![show_record("alice", 15, true, false, vec![], ShowStatus::Returning)],
+            vec![show_record(
+                "alice",
+                15,
+                true,
+                false,
+                vec![],
+                ShowStatus::Returning,
+            )],
             // owned_episodes cover both, but available=false ⇒ nothing is "covered"
-            Some(owned("h", Provenance::watchlist("alice"), false, vec![(1, 1), (1, 2)])),
+            Some(owned(
+                "h",
+                Provenance::watchlist("alice"),
+                false,
+                vec![(1, 1), (1, 2)],
+            )),
             aired,
         );
         assert_eq!(
             reconcile_title(&t),
             vec![
-                Action::AcquireEpisode { tmdb_id: 15, season: 1, episode: 1 },
-                Action::AcquireEpisode { tmdb_id: 15, season: 1, episode: 2 },
+                Action::AcquireEpisode {
+                    tmdb_id: 15,
+                    season: 1,
+                    episode: 1
+                },
+                Action::AcquireEpisode {
+                    tmdb_id: 15,
+                    season: 1,
+                    episode: 2
+                },
             ]
         );
     }
@@ -442,7 +645,10 @@ mod tests {
     #[test]
     fn user_finished_movie() {
         assert!(user_finished(&movie_record("a", 1, true, false, true), &[]));
-        assert!(!user_finished(&movie_record("a", 1, true, false, false), &[]));
+        assert!(!user_finished(
+            &movie_record("a", 1, true, false, false),
+            &[]
+        ));
     }
 
     #[test]
@@ -460,11 +666,21 @@ mod tests {
         ));
         // Returning + all watched → not finished (still producing)
         assert!(!user_finished(
-            &show_record("a", 1, true, false, vec![(1, 1), (1, 2)], ShowStatus::Returning),
+            &show_record(
+                "a",
+                1,
+                true,
+                false,
+                vec![(1, 1), (1, 2)],
+                ShowStatus::Returning
+            ),
             &aired
         ));
         // Ended + empty aired → vacuously finished
-        assert!(user_finished(&show_record("a", 1, true, false, vec![], ShowStatus::Ended), &[]));
+        assert!(user_finished(
+            &show_record("a", 1, true, false, vec![], ShowStatus::Ended),
+            &[]
+        ));
         // Other status (not Ended) → not finished
         assert!(!user_finished(
             &show_record("a", 1, true, false, vec![(1, 1), (1, 2)], ShowStatus::Other),
@@ -476,11 +692,17 @@ mod tests {
     fn trigger_a_finished_predicate() {
         let aired: Vec<(u32, u32)> = vec![];
         // no wanters → false
-        assert!(!trigger_a_finished(&[movie_record("a", 1, false, false, true)], &aired));
+        assert!(!trigger_a_finished(
+            &[movie_record("a", 1, false, false, true)],
+            &aired
+        ));
         // empty list → false
         assert!(!trigger_a_finished(&[], &aired));
         // single wanter, finished → true
-        assert!(trigger_a_finished(&[movie_record("a", 1, true, false, true)], &aired));
+        assert!(trigger_a_finished(
+            &[movie_record("a", 1, true, false, true)],
+            &aired
+        ));
         // one wanter unfinished → false
         assert!(!trigger_a_finished(
             &[
@@ -510,7 +732,10 @@ mod tests {
             &Provenance::watchlist("alice")
         ));
         // no watchlist prov + empty wanted → false (in-progress-only or manual origin)
-        assert!(!trigger_b_abandoned(&empty, &Provenance::in_progress("alice")));
+        assert!(!trigger_b_abandoned(
+            &empty,
+            &Provenance::in_progress("alice")
+        ));
         assert!(!trigger_b_abandoned(&empty, &Provenance::manual()));
         // watchlist prov + record present but all-false sources → true (un-watchlisted)
         assert!(trigger_b_abandoned(
@@ -537,7 +762,10 @@ mod tests {
             reconcile(&titles),
             vec![
                 Action::AcquireMovie { tmdb_id: 10 },
-                Action::Remove { tmdb_id: 1, hash: "h".into() },
+                Action::Remove {
+                    tmdb_id: 1,
+                    hash: "h".into()
+                },
             ]
         );
     }
@@ -554,7 +782,11 @@ mod tests {
             vec![(1, 1)],
         );
         assert!(!should_remove(&t), "manual provenance blocks removal");
-        assert_eq!(reconcile_title(&t), vec![], "nobody wants it → keep as-is, no AcquireEpisode");
+        assert_eq!(
+            reconcile_title(&t),
+            vec![],
+            "nobody wants it → keep as-is, no AcquireEpisode"
+        );
     }
 
     #[test]
@@ -567,8 +799,13 @@ mod tests {
             user: "alice".to_string(),
             tmdb_id: 99,
             media_type: MediaType::Movie, // media_type says Movie …
-            sources: WantedSources { watchlist: true, in_progress: false },
-            watched_state: WatchedState::Show { watched_episodes: vec![(1, 1)] }, // … but state is Show
+            sources: WantedSources {
+                watchlist: true,
+                in_progress: false,
+            },
+            watched_state: WatchedState::Show {
+                watched_episodes: vec![(1, 1)],
+            }, // … but state is Show
             show_status: Some(ShowStatus::Ended),
         };
         // Show branch: Ended + all aired [(1,1)] are in watched_episodes → finished = true.

@@ -212,23 +212,17 @@ async fn lifecycle_acquire_sintel_by_imdb() {
         .unwrap();
     let tmdb = Arc::new(debridmoviemapper::tmdb_client::TmdbClient::new(tmdb_key).unwrap());
     let mut dbp = std::env::temp_dir();
-    dbp.push(format!(
-        "dmm_sp1_lifecycle_{}.redb",
-        std::process::id()
-    ));
+    dbp.push(format!("dmm_sp1_lifecycle_{}.redb", std::process::id()));
     let store = debridmoviemapper::store::Store::open(dbp.to_str().unwrap()).unwrap();
-    let scraper: Arc<dyn debridmoviemapper::scraper::Scraper> = Arc::new(
-        debridmoviemapper::scraper::TorrentioScraper::new(
+    let scraper: Arc<dyn debridmoviemapper::scraper::Scraper> =
+        Arc::new(debridmoviemapper::scraper::TorrentioScraper::new(
             std::env::var("SCRAPER_ADDON_URL").ok(),
             kind,
             &token,
             http.clone(),
-        ),
-    );
+        ));
     let validator: Arc<dyn debridmoviemapper::acquire::TitleValidator> =
-        Arc::new(debridmoviemapper::acquire::TmdbTitleValidator {
-            tmdb: tmdb.clone(),
-        });
+        Arc::new(debridmoviemapper::acquire::TmdbTitleValidator { tmdb: tmdb.clone() });
     let prober: Arc<dyn debridmoviemapper::acquire::Prober> =
         Arc::new(debridmoviemapper::acquire::HttpProber { http: http.clone() });
     let engine = debridmoviemapper::acquire::AcquisitionEngine::new(
@@ -300,11 +294,17 @@ async fn lifecycle_acquire_sintel_by_imdb() {
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-    assert!(verified, "Sintel should verify via observe within the poll window");
+    assert!(
+        verified,
+        "Sintel should verify via observe within the poll window"
+    );
 
     // Build the VFS from the live selection map and assert Sintel appears under Movies/.
     // `get_torrents` returns Torrent (listing); `build` needs TorrentInfo — fetch full info.
-    let torrents = provider.get_torrents().await.expect("get_torrents for VFS build");
+    let torrents = provider
+        .get_torrents()
+        .await
+        .expect("get_torrents for VFS build");
     let mut filtered = Vec::new();
     for t in &torrents {
         if t.status == "downloaded" {

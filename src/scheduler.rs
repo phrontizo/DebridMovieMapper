@@ -112,14 +112,19 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
 
     if app.config.upgrade.enabled() {
         let secs = app.config.upgrade.interval_secs;
-        info!("Upgrade engine enabled: re-scoring owned titles every {}s", secs);
+        info!(
+            "Upgrade engine enabled: re-scoring owned titles every {}s",
+            secs
+        );
         let upgrade_app = app.clone();
         handles.push(tokio::spawn(periodic(
             Duration::from_secs(secs),
             shutdown.clone(),
             move || {
                 let app = upgrade_app.clone();
-                async move { run_upgrade_once(&app).await; }
+                async move {
+                    run_upgrade_once(&app).await;
+                }
             },
         )));
     } else {
@@ -174,21 +179,20 @@ fn make_test_app(with_trakt: bool) -> crate::app_state::AppState {
     } else {
         None
     };
-    let scraper: Arc<dyn crate::scraper::Scraper> = Arc::new(
-        crate::scraper::TorrentioScraper::new(
+    let scraper: Arc<dyn crate::scraper::Scraper> =
+        Arc::new(crate::scraper::TorrentioScraper::new(
             None,
             ProviderKind::TorBox,
             "tok",
             reqwest::Client::new(),
-        ),
-    );
-    let validator: Arc<dyn crate::acquire::TitleValidator> = Arc::new(
-        crate::acquire::TmdbTitleValidator {
+        ));
+    let validator: Arc<dyn crate::acquire::TitleValidator> =
+        Arc::new(crate::acquire::TmdbTitleValidator {
             tmdb: Arc::new(TmdbClient::new("k".to_string()).unwrap()),
-        },
-    );
-    let prober: Arc<dyn crate::acquire::Prober> =
-        Arc::new(crate::acquire::HttpProber { http: reqwest::Client::new() });
+        });
+    let prober: Arc<dyn crate::acquire::Prober> = Arc::new(crate::acquire::HttpProber {
+        http: reqwest::Client::new(),
+    });
     let engine = Arc::new(crate::acquire::AcquisitionEngine::new(
         provider.clone(),
         scraper.clone(),
@@ -225,14 +229,20 @@ mod trakt_gate_tests {
     #[test]
     fn disabled_when_no_trakt_client() {
         let app = make_test_app(false);
-        assert!(!trakt_jobs_enabled(&app), "Trakt gate must be false when trakt_client is None");
+        assert!(
+            !trakt_jobs_enabled(&app),
+            "Trakt gate must be false when trakt_client is None"
+        );
     }
 
     /// With both a Trakt client and a Trakt config present, `trakt_jobs_enabled` returns true.
     #[test]
     fn enabled_when_trakt_configured() {
         let app = make_test_app(true);
-        assert!(trakt_jobs_enabled(&app), "Trakt gate must be true when both client and config are present");
+        assert!(
+            trakt_jobs_enabled(&app),
+            "Trakt gate must be true when both client and config are present"
+        );
     }
 
     /// `upgrade_gate_follows_config`: default `Config` has the upgrade job enabled (daily);
@@ -303,7 +313,11 @@ mod tests {
         let _ = handle.await;
 
         let n = counter.load(Ordering::SeqCst);
-        assert!(n >= 4 && n <= 5, "expected ~4 runs (initial + 3 ticks), got {}", n);
+        assert!(
+            (4..=5).contains(&n),
+            "expected ~4 runs (initial + 3 ticks), got {}",
+            n
+        );
     }
 
     /// `periodic` returns promptly when shutdown is signalled, without waiting the full interval.

@@ -24,7 +24,10 @@ async fn resolve_metadata(
     tmdb_client: &TmdbClient,
     info: &crate::rd_client::TorrentInfo,
 ) -> MediaMetadata {
-    match store.authoritative_meta(info.hash.to_ascii_lowercase()).await {
+    match store
+        .authoritative_meta(info.hash.to_ascii_lowercase())
+        .await
+    {
         Some(m) => m,
         None => identify_torrent(info, tmdb_client).await,
     }
@@ -34,7 +37,10 @@ pub struct ScanConfig {
     pub app: AppState,
 }
 
-pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+pub async fn run_scan_loop(
+    scan_config: ScanConfig,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     let AppState {
         provider,
         tmdb_client,
@@ -182,7 +188,8 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
                             async move {
                                 match provider.get_torrent_info(&torrent.id).await {
                                     Ok(info) => {
-                                        let metadata = resolve_metadata(&store, &tmdb_client, &info).await;
+                                        let metadata =
+                                            resolve_metadata(&store, &tmdb_client, &info).await;
                                         Ok::<
                                             (String, crate::rd_client::TorrentInfo, MediaMetadata),
                                             reqwest::Error,
@@ -219,7 +226,11 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
                         processed_new += 1;
                         match result {
                             Ok((id, info, metadata)) => {
-                                pending_db_writes.push((id.clone(), info.clone(), metadata.clone()));
+                                pending_db_writes.push((
+                                    id.clone(),
+                                    info.clone(),
+                                    metadata.clone(),
+                                ));
                                 seen_torrents.insert(id, (info.clone(), metadata.clone()));
                                 current_data.push((info, metadata));
                             }
@@ -234,12 +245,25 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
                                 "Progress: {}/{} new torrents identified",
                                 processed_new, new_total
                             );
-                            update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client, &store)
-                                .await;
+                            update_vfs(
+                                &vfs,
+                                &current_data,
+                                &repair_manager,
+                                &jellyfin_client,
+                                &store,
+                            )
+                            .await;
                         }
                     }
                 } else {
-                    update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client, &store).await;
+                    update_vfs(
+                        &vfs,
+                        &current_data,
+                        &repair_manager,
+                        &jellyfin_client,
+                        &store,
+                    )
+                    .await;
                 }
 
                 let current_ids: std::collections::HashSet<&str> =
@@ -398,19 +422,32 @@ pub(crate) fn build_wanted(
     let mut agg: std::collections::BTreeMap<u64, Agg> = std::collections::BTreeMap::new();
     for item in watchlist {
         agg.entry(item.tmdb_id)
-            .or_insert_with(|| Agg { media_type: item.media_type.clone(), watchlist: false, in_progress: false })
+            .or_insert_with(|| Agg {
+                media_type: item.media_type.clone(),
+                watchlist: false,
+                in_progress: false,
+            })
             .watchlist = true;
     }
     for item in in_progress {
         agg.entry(item.tmdb_id)
-            .or_insert_with(|| Agg { media_type: item.media_type.clone(), watchlist: false, in_progress: false })
+            .or_insert_with(|| Agg {
+                media_type: item.media_type.clone(),
+                watchlist: false,
+                in_progress: false,
+            })
             .in_progress = true;
     }
 
     agg.into_iter()
         .map(|(tmdb_id, a)| {
             let (watched_state, status) = match a.media_type {
-                MediaType::Movie => (WatchedState::Movie { watched: watched.movies.contains(&tmdb_id) }, None),
+                MediaType::Movie => (
+                    WatchedState::Movie {
+                        watched: watched.movies.contains(&tmdb_id),
+                    },
+                    None,
+                ),
                 MediaType::Show => {
                     let watched_episodes = watched
                         .shows
@@ -418,14 +455,20 @@ pub(crate) fn build_wanted(
                         .find(|s| s.tmdb_id == tmdb_id)
                         .map(|s| s.watched_episodes.clone())
                         .unwrap_or_default();
-                    (WatchedState::Show { watched_episodes }, show_status.get(&tmdb_id).copied())
+                    (
+                        WatchedState::Show { watched_episodes },
+                        show_status.get(&tmdb_id).copied(),
+                    )
                 }
             };
             WantedRecord {
                 user: user.to_string(),
                 tmdb_id,
                 media_type: a.media_type,
-                sources: WantedSources { watchlist: a.watchlist, in_progress: a.in_progress },
+                sources: WantedSources {
+                    watchlist: a.watchlist,
+                    in_progress: a.in_progress,
+                },
                 watched_state,
                 show_status: status,
             }
@@ -445,11 +488,17 @@ pub async fn sync_trakt(
 ) {
     for (slug, tokens) in store.all_trakt_tokens().await {
         if let Err(e) = sync_trakt_user(trakt, tmdb, store, &slug, tokens.clone()).await {
-            warn!("Trakt sync failed for {}: {}; flagging account for re-enrolment", slug, e);
+            warn!(
+                "Trakt sync failed for {}: {}; flagging account for re-enrolment",
+                slug, e
+            );
             // A successful refresh inside sync_trakt_user persists a fresh (single-use) token before a
             // later read can fail; re-read so we don't clobber it with the stale pre-refresh snapshot.
             let current = store.get_trakt_tokens(slug.clone()).await.unwrap_or(tokens);
-            let flagged = crate::store::TraktTokens { needs_reenrolment: true, ..current };
+            let flagged = crate::store::TraktTokens {
+                needs_reenrolment: true,
+                ..current
+            };
             if let Err(pe) = store.put_trakt_tokens(slug, flagged).await {
                 error!("Failed to persist re-enrolment flag for account: {}", pe);
             }
@@ -475,7 +524,10 @@ async fn sync_trakt_user(
     use crate::vfs::MediaType;
 
     // Refresh if at/near expiry, persisting the fresh tokens before using them.
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     if tokens.expires_at <= now + REFRESH_BUFFER_SECS {
         let r = trakt.refresh(&tokens.refresh).await?;
         tokens = TraktTokens {
@@ -485,7 +537,9 @@ async fn sync_trakt_user(
             username: tokens.username.clone(),
             needs_reenrolment: false,
         };
-        store.put_trakt_tokens(slug.to_string(), tokens.clone()).await?;
+        store
+            .put_trakt_tokens(slug.to_string(), tokens.clone())
+            .await?;
     }
 
     // Pull reads. Any error propagates → the account is flagged by `sync_trakt`.
@@ -508,7 +562,10 @@ async fn sync_trakt_user(
             Ok(s) => {
                 statuses.insert(tmdb_id, s);
             }
-            Err(e) => warn!("TMDB show_status({}) failed for {}: {}; treating status as unknown", tmdb_id, slug, e),
+            Err(e) => warn!(
+                "TMDB show_status({}) failed for {}: {}; treating status as unknown",
+                tmdb_id, slug, e
+            ),
         }
     }
 
@@ -534,7 +591,13 @@ async fn sync_trakt_user(
     // Clear a stale re-enrolment flag now that this sync has succeeded.
     if tokens.needs_reenrolment {
         store
-            .put_trakt_tokens(slug.to_string(), TraktTokens { needs_reenrolment: false, ..tokens })
+            .put_trakt_tokens(
+                slug.to_string(),
+                TraktTokens {
+                    needs_reenrolment: false,
+                    ..tokens
+                },
+            )
             .await?;
     }
 
@@ -555,16 +618,22 @@ fn media_type_of(kind: MediaKind) -> MediaType {
 /// the title. PURE and deterministic — de-duplicated, never includes `Manual` (manual origins
 /// come from the `--acquire` CLI, not from a wanted-set).
 pub(crate) fn provenance_from_wanted(wanted: &[WantedRecord]) -> Provenance {
-    let mut prov = Provenance { entries: Vec::new() };
+    let mut prov = Provenance {
+        entries: Vec::new(),
+    };
     for r in wanted {
         if r.sources.watchlist {
-            let e = ProvenanceEntry::Watchlist { user: r.user.clone() };
+            let e = ProvenanceEntry::Watchlist {
+                user: r.user.clone(),
+            };
             if !prov.entries.contains(&e) {
                 prov.entries.push(e);
             }
         }
         if r.sources.in_progress {
-            let e = ProvenanceEntry::InProgress { user: r.user.clone() };
+            let e = ProvenanceEntry::InProgress {
+                user: r.user.clone(),
+            };
             if !prov.entries.contains(&e) {
                 prov.entries.push(e);
             }
@@ -635,16 +704,22 @@ pub(crate) struct OwnedGroup {
 /// Group every owned record by its request's `tmdb_id` into an [`OwnedGroup`]. Shared by
 /// `plan_reconcile_ops` (Task 8) and `monitor_episodes` (Task 9) so the owned-grouping +
 /// per-title aggregation lives in exactly one place.
-pub(crate) async fn group_owned_by_tmdb(store: &Store) -> std::collections::BTreeMap<u64, OwnedGroup> {
+pub(crate) async fn group_owned_by_tmdb(
+    store: &Store,
+) -> std::collections::BTreeMap<u64, OwnedGroup> {
     use std::collections::BTreeMap;
     let mut owned_by: BTreeMap<u64, OwnedGroup> = BTreeMap::new();
     for (hash, rec) in store.all_owned().await {
-        let group = owned_by.entry(rec.request.tmdb_id).or_insert_with(|| OwnedGroup {
-            hashes: Vec::new(),
-            provenance: Provenance { entries: Vec::new() },
-            owned_episodes: Vec::new(),
-            media_type: media_type_of(rec.request.kind),
-        });
+        let group = owned_by
+            .entry(rec.request.tmdb_id)
+            .or_insert_with(|| OwnedGroup {
+                hashes: Vec::new(),
+                provenance: Provenance {
+                    entries: Vec::new(),
+                },
+                owned_episodes: Vec::new(),
+                media_type: media_type_of(rec.request.kind),
+            });
         group.hashes.push(hash.to_ascii_lowercase());
         group.provenance.merge(&rec.provenance);
         // SP3: prefer the recorded `provides` (a pack supplies many episodes); fall back to the
@@ -666,7 +741,9 @@ pub(crate) async fn group_owned_by_tmdb(store: &Store) -> std::collections::BTre
 
 /// Group every wanted record by its `tmdb_id` into a `BTreeMap`. Shared by
 /// `plan_reconcile_ops` and `monitor_episodes` so the wanted-grouping lives in one place.
-pub(crate) async fn group_wanted_by_tmdb(store: &Store) -> std::collections::BTreeMap<u64, Vec<WantedRecord>> {
+pub(crate) async fn group_wanted_by_tmdb(
+    store: &Store,
+) -> std::collections::BTreeMap<u64, Vec<WantedRecord>> {
     use std::collections::BTreeMap;
     let mut wanted_by: BTreeMap<u64, Vec<WantedRecord>> = BTreeMap::new();
     for r in store.all_wanted().await {
@@ -710,10 +787,14 @@ pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> V
         let wanted_type = wanted.first().map(|r| r.media_type.clone());
         if let (Some(wt), Some(og)) = (&wanted_type, owned_group) {
             if *wt != og.media_type {
-                warn!("reconcile: tmdb {} media_type skew: wanted={:?} owned={:?}", tmdb_id, wt, og.media_type);
+                warn!(
+                    "reconcile: tmdb {} media_type skew: wanted={:?} owned={:?}",
+                    tmdb_id, wt, og.media_type
+                );
             }
         }
-        let Some(media_type) = wanted_type.or_else(|| owned_group.map(|g| g.media_type.clone())) else {
+        let Some(media_type) = wanted_type.or_else(|| owned_group.map(|g| g.media_type.clone()))
+        else {
             continue;
         };
 
@@ -756,7 +837,10 @@ pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> V
                         // Delete EVERY owned hash for this tmdb_id (the Action's `hash` is a representative).
                         Action::Remove { tmdb_id, .. } => {
                             if let Some(g) = owned_group {
-                                ops.push(ReconcileOp::Remove { tmdb_id, hashes: g.hashes.clone() });
+                                ops.push(ReconcileOp::Remove {
+                                    tmdb_id,
+                                    hashes: g.hashes.clone(),
+                                });
                             }
                         }
                         Action::AcquireEpisode { .. } => {} // movies never produce this
@@ -769,7 +853,10 @@ pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> V
                     if !g.provenance.has_manual_entry()
                         && trigger_b_abandoned(&wanted, &g.provenance)
                     {
-                        ops.push(ReconcileOp::Remove { tmdb_id, hashes: g.hashes.clone() });
+                        ops.push(ReconcileOp::Remove {
+                            tmdb_id,
+                            hashes: g.hashes.clone(),
+                        });
                     }
                 }
                 // Task 9 handles show-episode acquire + Trigger-A finish removal (air-date dependent).
@@ -797,7 +884,10 @@ async fn execute_remove(
     for hash in hashes {
         if let Some(t) = torrents.iter().find(|t| t.hash.eq_ignore_ascii_case(hash)) {
             if let Err(e) = provider.delete_torrent(&t.id).await {
-                warn!("reconcile: delete_torrent {} (tmdb {}) failed: {}; will retry next tick", t.id, tmdb_id, e);
+                warn!(
+                    "reconcile: delete_torrent {} (tmdb {}) failed: {}; will retry next tick",
+                    t.id, tmdb_id, e
+                );
                 continue; // leave the owned record so the next reconcile retries
             }
         }
@@ -830,7 +920,10 @@ async fn execute_acquire(
             let outcome = engine.acquire(req, provenance).await;
             info!("reconcile: acquire tmdb {} -> {:?}", tmdb_id, outcome);
         }
-        Err(e) => warn!("reconcile: build_acquire_request for tmdb {} failed: {}", tmdb_id, e),
+        Err(e) => warn!(
+            "reconcile: build_acquire_request for tmdb {} failed: {}",
+            tmdb_id, e
+        ),
     }
 }
 
@@ -856,9 +949,13 @@ pub async fn reconcile_wanted(
             ReconcileOp::Remove { tmdb_id, hashes } => {
                 execute_remove(provider, &torrents, store, tmdb_id, &hashes).await
             }
-            ReconcileOp::Acquire { tmdb_id, kind, season, episode, provenance } => {
-                execute_acquire(engine, tmdb, tmdb_id, kind, season, episode, provenance).await
-            }
+            ReconcileOp::Acquire {
+                tmdb_id,
+                kind,
+                season,
+                episode,
+                provenance,
+            } => execute_acquire(engine, tmdb, tmdb_id, kind, season, episode, provenance).await,
         }
     }
 }
@@ -886,11 +983,18 @@ pub(crate) fn aired_pairs(
 /// across them. Best-effort I/O — a failure to enumerate seasons, or to fetch ONE season's air
 /// dates, is logged and skipped rather than failing the whole show. TMDB-driven, so exercised by
 /// the live smoke rather than unit tests.
-pub(crate) async fn aired_episodes(tmdb: &TmdbClient, tmdb_id: u64, today: chrono::NaiveDate) -> Vec<(u32, u32)> {
+pub(crate) async fn aired_episodes(
+    tmdb: &TmdbClient,
+    tmdb_id: u64,
+    today: chrono::NaiveDate,
+) -> Vec<(u32, u32)> {
     let seasons = match tmdb.show_season_numbers(tmdb_id).await {
         Ok(s) => s,
         Err(e) => {
-            warn!("monitor_episodes: show_season_numbers({}) failed: {}; skipping show", tmdb_id, e);
+            warn!(
+                "monitor_episodes: show_season_numbers({}) failed: {}; skipping show",
+                tmdb_id, e
+            );
             return Vec::new();
         }
     };
@@ -912,7 +1016,11 @@ pub(crate) async fn aired_episodes(tmdb: &TmdbClient, tmdb_id: u64, today: chron
 /// Filter aired pairs to one season's episode numbers (sorted+deduped). PURE — used by the SP3
 /// upgrade consolidation path to ask "what is the full aired set for THIS season?".
 pub(crate) fn season_aired(aired: &[(u32, u32)], season: u32) -> Vec<u32> {
-    let mut v: Vec<u32> = aired.iter().filter(|(s, _)| *s == season).map(|(_, e)| *e).collect();
+    let mut v: Vec<u32> = aired
+        .iter()
+        .filter(|(s, _)| *s == season)
+        .map(|(_, e)| *e)
+        .collect();
     v.sort_unstable();
     v.dedup();
     v
@@ -957,7 +1065,10 @@ pub async fn monitor_episodes(
 
     // Same owned-grouping + availability logic as plan_reconcile_ops (shared helper).
     let owned_by = group_owned_by_tmdb(store).await;
-    let present: HashSet<String> = torrents.iter().map(|t| t.hash.to_ascii_lowercase()).collect();
+    let present: HashSet<String> = torrents
+        .iter()
+        .map(|t| t.hash.to_ascii_lowercase())
+        .collect();
 
     // Only tmdb_ids that a wanted row marks as a Show. (Owned-but-unwanted shows are handled by
     // reconcile_wanted's Trigger-B path; monitor_episodes is the wanted-set's air-date driver.)
@@ -987,7 +1098,11 @@ pub async fn monitor_episodes(
 
         for action in reconcile_title(&view) {
             match action {
-                Action::AcquireEpisode { tmdb_id, season, episode } => {
+                Action::AcquireEpisode {
+                    tmdb_id,
+                    season,
+                    episode,
+                } => {
                     let mut prov = provenance_from_wanted(wanted);
                     // Preserve existing provenance (esp. Manual) on re-acquire — exactly like Task 8's
                     // AcquireMovie fix — so a manually-owned show keeps its never-auto-remove guard.
@@ -995,7 +1110,13 @@ pub async fn monitor_episodes(
                         prov.merge(&g.provenance);
                     }
                     execute_acquire(
-                        engine, tmdb, tmdb_id, MediaKind::Series, Some(season), Some(episode), prov,
+                        engine,
+                        tmdb,
+                        tmdb_id,
+                        MediaKind::Series,
+                        Some(season),
+                        Some(episode),
+                        prov,
                     )
                     .await;
                 }
@@ -1083,12 +1204,27 @@ mod tests {
         use crate::store::Store;
         use crate::vfs::{MediaMetadata, MediaType};
         let store = Store::from_database(std::sync::Arc::new(
-            redb::Database::builder().create_with_backend(redb::backends::InMemoryBackend::new()).unwrap(),
-        )).unwrap();
-        let meta = MediaMetadata { title: "Authoritative".into(), year: Some("2020".into()), media_type: MediaType::Movie, external_id: Some("tmdb:99".into()) };
-        store.put_authoritative("hash".to_string(), meta.clone()).await.unwrap();
+            redb::Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        ))
+        .unwrap();
+        let meta = MediaMetadata {
+            title: "Authoritative".into(),
+            year: Some("2020".into()),
+            media_type: MediaType::Movie,
+            external_id: Some("tmdb:99".into()),
+        };
+        store
+            .put_authoritative("hash".to_string(), meta.clone())
+            .await
+            .unwrap();
         let tmdb = TmdbClient::new("k".to_string()).unwrap();
-        let info = crate::rd_client::TorrentInfo { hash: "HASH".into(), filename: "totally.unrelated.name.mkv".into(), ..Default::default() };
+        let info = crate::rd_client::TorrentInfo {
+            hash: "HASH".into(),
+            filename: "totally.unrelated.name.mkv".into(),
+            ..Default::default()
+        };
         let got = resolve_metadata(&store, &tmdb, &info).await;
         assert_eq!(got.title, "Authoritative");
         assert_eq!(got.external_id.as_deref(), Some("tmdb:99"));
@@ -1096,29 +1232,55 @@ mod tests {
 
     #[tokio::test]
     async fn group_owned_uses_provides_for_episode_set() {
-        use crate::store::{Store, OwnedRecord, OwnedStatus, Provenance, AcquireRequest};
         use crate::scraper::MediaKind;
+        use crate::store::{AcquireRequest, OwnedRecord, OwnedStatus, Provenance, Store};
         use crate::vfs::{MediaMetadata, MediaType};
         let store = Store::from_database(std::sync::Arc::new(
-            redb::Database::builder().create_with_backend(redb::backends::InMemoryBackend::new()).unwrap(),
-        )).unwrap();
+            redb::Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        ))
+        .unwrap();
         // A single season-pack hash acquired via an S01E01 request, but `provides` records the WHOLE
         // season — the churn fix: the group's owned_episodes must reflect every provided episode.
         let req = AcquireRequest {
-            imdb_id: "tt2".into(), tmdb_id: 1396, kind: MediaKind::Series, season: Some(1), episode: Some(1),
+            imdb_id: "tt2".into(),
+            tmdb_id: 1396,
+            kind: MediaKind::Series,
+            season: Some(1),
+            episode: Some(1),
             original_language: None,
-            metadata: MediaMetadata { title: "S".into(), year: None, media_type: MediaType::Show, external_id: Some("tmdb:1396".into()) },
+            metadata: MediaMetadata {
+                title: "S".into(),
+                year: None,
+                media_type: MediaType::Show,
+                external_id: Some("tmdb:1396".into()),
+            },
         };
-        store.put_owned("pack".into(), OwnedRecord {
-            request: req, provenance: Provenance::watchlist("a"), added_at: 1, status: OwnedStatus::Verified,
-            provides: vec![(1, 1), (1, 2), (1, 3)], quality: None,
-        }).await.unwrap();
+        store
+            .put_owned(
+                "pack".into(),
+                OwnedRecord {
+                    request: req,
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![(1, 1), (1, 2), (1, 3)],
+                    quality: None,
+                },
+            )
+            .await
+            .unwrap();
 
         let groups = group_owned_by_tmdb(&store).await;
         let g = groups.get(&1396).unwrap();
         let mut eps = g.owned_episodes.clone();
         eps.sort_unstable();
-        assert_eq!(eps, vec![(1, 1), (1, 2), (1, 3)], "owned_episodes is the union of provides, not the request's single (s,e)");
+        assert_eq!(
+            eps,
+            vec![(1, 1), (1, 2), (1, 3)],
+            "owned_episodes is the union of provides, not the request's single (s,e)"
+        );
     }
 }
 
@@ -1154,18 +1316,30 @@ mod provider_abstraction_tests {
             None,
         )
         .unwrap();
-        let scraper: std::sync::Arc<dyn crate::scraper::Scraper> = std::sync::Arc::new(
-            crate::scraper::TorrentioScraper::new(None, crate::provider::ProviderKind::TorBox, "tok", reqwest::Client::new()),
-        );
-        let validator: std::sync::Arc<dyn crate::acquire::TitleValidator> = std::sync::Arc::new(
-            crate::acquire::TmdbTitleValidator { tmdb: std::sync::Arc::new(TmdbClient::new("k".to_string()).unwrap()) },
-        );
-        let prober: std::sync::Arc<dyn crate::acquire::Prober> = std::sync::Arc::new(
-            crate::acquire::HttpProber { http: reqwest::Client::new() },
-        );
+        let scraper: std::sync::Arc<dyn crate::scraper::Scraper> =
+            std::sync::Arc::new(crate::scraper::TorrentioScraper::new(
+                None,
+                crate::provider::ProviderKind::TorBox,
+                "tok",
+                reqwest::Client::new(),
+            ));
+        let validator: std::sync::Arc<dyn crate::acquire::TitleValidator> =
+            std::sync::Arc::new(crate::acquire::TmdbTitleValidator {
+                tmdb: std::sync::Arc::new(TmdbClient::new("k".to_string()).unwrap()),
+            });
+        let prober: std::sync::Arc<dyn crate::acquire::Prober> =
+            std::sync::Arc::new(crate::acquire::HttpProber {
+                http: reqwest::Client::new(),
+            });
         let engine = std::sync::Arc::new(crate::acquire::AcquisitionEngine::new(
-            provider.clone(), scraper.clone(), validator, prober, store.clone(),
-            crate::config::AcquisitionConfig::default().prefs, 5, std::time::Duration::from_secs(1800),
+            provider.clone(),
+            scraper.clone(),
+            validator,
+            prober,
+            store.clone(),
+            crate::config::AcquisitionConfig::default().prefs,
+            5,
+            std::time::Duration::from_secs(1800),
             std::time::Duration::from_secs(600),
         ));
         let app = AppState {
@@ -1191,7 +1365,9 @@ mod trakt_sync_tests {
     use super::*;
     use crate::store::{Store, TraktTokens, WantedRecord, WantedSources, WatchedState};
     use crate::tmdb_client::{ShowStatus, TmdbClient};
-    use crate::trakt_client::{MockTrakt, TraktClient, TraktItem, TraktTokenResponse, WatchedData, WatchedShow};
+    use crate::trakt_client::{
+        MockTrakt, TraktClient, TraktItem, TraktTokenResponse, WatchedData, WatchedShow,
+    };
     use crate::vfs::MediaType;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1206,7 +1382,10 @@ mod trakt_sync_tests {
     }
 
     fn item(media_type: MediaType, tmdb_id: u64) -> TraktItem {
-        TraktItem { media_type, tmdb_id }
+        TraktItem {
+            media_type,
+            tmdb_id,
+        }
     }
 
     fn tokens(access: &str, expires_at: u64, needs_reenrolment: bool) -> TraktTokens {
@@ -1224,7 +1403,10 @@ mod trakt_sync_tests {
             user: user.to_string(),
             tmdb_id,
             media_type: MediaType::Movie,
-            sources: WantedSources { watchlist: true, in_progress: false },
+            sources: WantedSources {
+                watchlist: true,
+                in_progress: false,
+            },
             watched_state: WatchedState::Movie { watched: false },
             show_status: None,
         }
@@ -1247,7 +1429,10 @@ mod trakt_sync_tests {
                 user: "alice".to_string(),
                 tmdb_id: 27205,
                 media_type: MediaType::Movie,
-                sources: WantedSources { watchlist: true, in_progress: false },
+                sources: WantedSources {
+                    watchlist: true,
+                    in_progress: false
+                },
                 watched_state: WatchedState::Movie { watched: false },
                 show_status: None,
             }]
@@ -1258,19 +1443,33 @@ mod trakt_sync_tests {
     fn build_wanted_watchlist_show_with_status_and_watched_episodes() {
         let watched = WatchedData {
             movies: vec![],
-            shows: vec![WatchedShow { tmdb_id: 1396, watched_episodes: vec![(1, 1), (1, 2)] }],
+            shows: vec![WatchedShow {
+                tmdb_id: 1396,
+                watched_episodes: vec![(1, 1), (1, 2)],
+            }],
         };
         let mut status = HashMap::new();
         status.insert(1396u64, ShowStatus::Ended);
-        let got = build_wanted("alice", &[item(MediaType::Show, 1396)], &[], &watched, &status);
+        let got = build_wanted(
+            "alice",
+            &[item(MediaType::Show, 1396)],
+            &[],
+            &watched,
+            &status,
+        );
         assert_eq!(
             got,
             vec![WantedRecord {
                 user: "alice".to_string(),
                 tmdb_id: 1396,
                 media_type: MediaType::Show,
-                sources: WantedSources { watchlist: true, in_progress: false },
-                watched_state: WatchedState::Show { watched_episodes: vec![(1, 1), (1, 2)] },
+                sources: WantedSources {
+                    watchlist: true,
+                    in_progress: false
+                },
+                watched_state: WatchedState::Show {
+                    watched_episodes: vec![(1, 1), (1, 2)]
+                },
                 show_status: Some(ShowStatus::Ended),
             }]
         );
@@ -1286,7 +1485,13 @@ mod trakt_sync_tests {
             &HashMap::new(),
         );
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].sources, WantedSources { watchlist: true, in_progress: true });
+        assert_eq!(
+            got[0].sources,
+            WantedSources {
+                watchlist: true,
+                in_progress: true
+            }
+        );
     }
 
     #[test]
@@ -1304,8 +1509,13 @@ mod trakt_sync_tests {
                 user: "alice".to_string(),
                 tmdb_id: 200,
                 media_type: MediaType::Show,
-                sources: WantedSources { watchlist: false, in_progress: true },
-                watched_state: WatchedState::Show { watched_episodes: vec![] },
+                sources: WantedSources {
+                    watchlist: false,
+                    in_progress: true
+                },
+                watched_state: WatchedState::Show {
+                    watched_episodes: vec![]
+                },
                 show_status: None,
             }]
         );
@@ -1313,16 +1523,32 @@ mod trakt_sync_tests {
 
     #[test]
     fn build_wanted_watched_movie_marks_watched() {
-        let watched = WatchedData { movies: vec![27205], shows: vec![] };
-        let got = build_wanted("alice", &[item(MediaType::Movie, 27205)], &[], &watched, &HashMap::new());
+        let watched = WatchedData {
+            movies: vec![27205],
+            shows: vec![],
+        };
+        let got = build_wanted(
+            "alice",
+            &[item(MediaType::Movie, 27205)],
+            &[],
+            &watched,
+            &HashMap::new(),
+        );
         assert_eq!(got[0].watched_state, WatchedState::Movie { watched: true });
     }
 
     #[test]
     fn build_wanted_is_sorted_by_tmdb_id() {
-        let wl = vec![item(MediaType::Movie, 30), item(MediaType::Movie, 10), item(MediaType::Movie, 20)];
+        let wl = vec![
+            item(MediaType::Movie, 30),
+            item(MediaType::Movie, 10),
+            item(MediaType::Movie, 20),
+        ];
         let got = build_wanted("alice", &wl, &[], &WatchedData::default(), &HashMap::new());
-        assert_eq!(got.iter().map(|r| r.tmdb_id).collect::<Vec<_>>(), vec![10, 20, 30]);
+        assert_eq!(
+            got.iter().map(|r| r.tmdb_id).collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
     }
 
     // ── sync_trakt (async, MockTrakt + mem Store) ─────────────────────────────
@@ -1330,25 +1556,43 @@ mod trakt_sync_tests {
     #[tokio::test]
     async fn sync_trakt_success_populates_wanted_and_leaves_flag_false() {
         let store = mem_store();
-        store.put_trakt_tokens("alice".to_string(), tokens("acc", 9_999_999_999, false)).await.unwrap();
+        store
+            .put_trakt_tokens("alice".to_string(), tokens("acc", 9_999_999_999, false))
+            .await
+            .unwrap();
         let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
             watchlist: vec![item(MediaType::Movie, 27205)],
-            watched: WatchedData { movies: vec![], shows: vec![] },
+            watched: WatchedData {
+                movies: vec![],
+                shows: vec![],
+            },
             ..Default::default()
         });
         let tmdb = TmdbClient::new("k".into()).unwrap();
 
         sync_trakt(&trakt, &tmdb, &store).await;
 
-        let w = store.get_wanted("alice".to_string(), 27205).await.expect("wanted present");
+        let w = store
+            .get_wanted("alice".to_string(), 27205)
+            .await
+            .expect("wanted present");
         assert!(w.sources.watchlist);
-        assert!(!store.get_trakt_tokens("alice".to_string()).await.unwrap().needs_reenrolment);
+        assert!(
+            !store
+                .get_trakt_tokens("alice".to_string())
+                .await
+                .unwrap()
+                .needs_reenrolment
+        );
     }
 
     #[tokio::test]
     async fn sync_trakt_refreshes_near_expiry_token() {
         let store = mem_store();
-        store.put_trakt_tokens("alice".to_string(), tokens("old", 0, false)).await.unwrap();
+        store
+            .put_trakt_tokens("alice".to_string(), tokens("old", 0, false))
+            .await
+            .unwrap();
         let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
             token: TraktTokenResponse {
                 access_token: "REFRESHED".into(),
@@ -1365,17 +1609,26 @@ mod trakt_sync_tests {
         sync_trakt(&trakt, &tmdb, &store).await;
 
         let tok = store.get_trakt_tokens("alice".to_string()).await.unwrap();
-        assert_eq!(tok.access, "REFRESHED", "refresh must have run and persisted");
+        assert_eq!(
+            tok.access, "REFRESHED",
+            "refresh must have run and persisted"
+        );
         assert!(store.get_wanted("alice".to_string(), 27205).await.is_some());
     }
 
     #[tokio::test]
     async fn sync_trakt_fetch_error_leaves_wanted_and_flags_account() {
         let store = mem_store();
-        store.put_trakt_tokens("alice".to_string(), tokens("acc", 9_999_999_999, false)).await.unwrap();
+        store
+            .put_trakt_tokens("alice".to_string(), tokens("acc", 9_999_999_999, false))
+            .await
+            .unwrap();
         let preexisting = movie_wanted_row("alice", 999);
         store.put_wanted(preexisting.clone()).await.unwrap();
-        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt { fail_reads: true, ..Default::default() });
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            fail_reads: true,
+            ..Default::default()
+        });
         let tmdb = TmdbClient::new("k".into()).unwrap();
 
         sync_trakt(&trakt, &tmdb, &store).await;
@@ -1385,31 +1638,26 @@ mod trakt_sync_tests {
             Some(preexisting),
             "a fetch failure must leave existing wanted rows untouched"
         );
-        assert!(store.get_trakt_tokens("alice".to_string()).await.unwrap().needs_reenrolment);
+        assert!(
+            store
+                .get_trakt_tokens("alice".to_string())
+                .await
+                .unwrap()
+                .needs_reenrolment
+        );
     }
 
     #[tokio::test]
     async fn sync_trakt_prunes_stale_wanted() {
         let store = mem_store();
-        store.put_trakt_tokens("alice".to_string(), tokens("acc", 9_999_999_999, false)).await.unwrap();
-        store.put_wanted(movie_wanted_row("alice", 999)).await.unwrap();
-        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
-            watchlist: vec![item(MediaType::Movie, 27205)],
-            watched: WatchedData::default(),
-            ..Default::default()
-        });
-        let tmdb = TmdbClient::new("k".into()).unwrap();
-
-        sync_trakt(&trakt, &tmdb, &store).await;
-
-        assert!(store.get_wanted("alice".to_string(), 27205).await.is_some(), "new title present");
-        assert!(store.get_wanted("alice".to_string(), 999).await.is_none(), "stale title pruned");
-    }
-
-    #[tokio::test]
-    async fn sync_trakt_clears_preexisting_flag_on_success() {
-        let store = mem_store();
-        store.put_trakt_tokens("alice".to_string(), tokens("acc", 9_999_999_999, true)).await.unwrap();
+        store
+            .put_trakt_tokens("alice".to_string(), tokens("acc", 9_999_999_999, false))
+            .await
+            .unwrap();
+        store
+            .put_wanted(movie_wanted_row("alice", 999))
+            .await
+            .unwrap();
         let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
             watchlist: vec![item(MediaType::Movie, 27205)],
             watched: WatchedData::default(),
@@ -1420,7 +1668,37 @@ mod trakt_sync_tests {
         sync_trakt(&trakt, &tmdb, &store).await;
 
         assert!(
-            !store.get_trakt_tokens("alice".to_string()).await.unwrap().needs_reenrolment,
+            store.get_wanted("alice".to_string(), 27205).await.is_some(),
+            "new title present"
+        );
+        assert!(
+            store.get_wanted("alice".to_string(), 999).await.is_none(),
+            "stale title pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_trakt_clears_preexisting_flag_on_success() {
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".to_string(), tokens("acc", 9_999_999_999, true))
+            .await
+            .unwrap();
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            watchlist: vec![item(MediaType::Movie, 27205)],
+            watched: WatchedData::default(),
+            ..Default::default()
+        });
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+
+        sync_trakt(&trakt, &tmdb, &store).await;
+
+        assert!(
+            !store
+                .get_trakt_tokens("alice".to_string())
+                .await
+                .unwrap()
+                .needs_reenrolment,
             "a successful sync clears a stale re-enrolment flag"
         );
     }
@@ -1433,21 +1711,33 @@ mod trakt_sync_tests {
     async fn sync_trakt_multi_user_failure_isolates_to_one_account() {
         let store = mem_store();
         // alice: expired token — refresh will fail
-        store.put_trakt_tokens("alice".to_string(), TraktTokens {
-            access: "alice-acc".to_string(),
-            refresh: "alice-ref".to_string(),
-            expires_at: 0,
-            username: "alice".to_string(),
-            needs_reenrolment: false,
-        }).await.unwrap();
+        store
+            .put_trakt_tokens(
+                "alice".to_string(),
+                TraktTokens {
+                    access: "alice-acc".to_string(),
+                    refresh: "alice-ref".to_string(),
+                    expires_at: 0,
+                    username: "alice".to_string(),
+                    needs_reenrolment: false,
+                },
+            )
+            .await
+            .unwrap();
         // bob: fresh token — no refresh needed, reads will succeed
-        store.put_trakt_tokens("bob".to_string(), TraktTokens {
-            access: "bob-acc".to_string(),
-            refresh: "bob-ref".to_string(),
-            expires_at: 9_999_999_999,
-            username: "bob".to_string(),
-            needs_reenrolment: false,
-        }).await.unwrap();
+        store
+            .put_trakt_tokens(
+                "bob".to_string(),
+                TraktTokens {
+                    access: "bob-acc".to_string(),
+                    refresh: "bob-ref".to_string(),
+                    expires_at: 9_999_999_999,
+                    username: "bob".to_string(),
+                    needs_reenrolment: false,
+                },
+            )
+            .await
+            .unwrap();
 
         let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
             fail_refresh: true,
@@ -1461,15 +1751,22 @@ mod trakt_sync_tests {
 
         // alice: refresh failed → flagged, no wanted rows written
         let alice_tok = store.get_trakt_tokens("alice".to_string()).await.unwrap();
-        assert!(alice_tok.needs_reenrolment, "alice must be flagged after refresh failure");
-        assert!(store.get_wanted("alice".to_string(), 27205).await.is_none(),
-            "alice's wanted must be empty — error occurred before any read");
+        assert!(
+            alice_tok.needs_reenrolment,
+            "alice must be flagged after refresh failure"
+        );
+        assert!(
+            store.get_wanted("alice".to_string(), 27205).await.is_none(),
+            "alice's wanted must be empty — error occurred before any read"
+        );
 
         // bob: sync succeeded → wanted row present, NOT flagged
         let bob_tok = store.get_trakt_tokens("bob".to_string()).await.unwrap();
         assert!(!bob_tok.needs_reenrolment, "bob must NOT be flagged");
-        assert!(store.get_wanted("bob".to_string(), 27205).await.is_some(),
-            "bob's wanted must be populated");
+        assert!(
+            store.get_wanted("bob".to_string(), 27205).await.is_some(),
+            "bob's wanted must be populated"
+        );
     }
 
     /// When refresh fails for an expired token, the account is flagged but the stored refresh
@@ -1477,13 +1774,19 @@ mod trakt_sync_tests {
     #[tokio::test]
     async fn sync_trakt_fail_refresh_flags_account_and_preserves_refresh_token() {
         let store = mem_store();
-        store.put_trakt_tokens("alice".to_string(), TraktTokens {
-            access: "acc".to_string(),
-            refresh: "original-ref".to_string(),
-            expires_at: 0,
-            username: "alice".to_string(),
-            needs_reenrolment: false,
-        }).await.unwrap();
+        store
+            .put_trakt_tokens(
+                "alice".to_string(),
+                TraktTokens {
+                    access: "acc".to_string(),
+                    refresh: "original-ref".to_string(),
+                    expires_at: 0,
+                    username: "alice".to_string(),
+                    needs_reenrolment: false,
+                },
+            )
+            .await
+            .unwrap();
         let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
             fail_refresh: true,
             ..Default::default()
@@ -1496,8 +1799,10 @@ mod trakt_sync_tests {
         assert!(tok.needs_reenrolment, "account must be flagged");
         assert!(!tok.refresh.is_empty(), "refresh token must not be blanked");
         // No wanted rows: the error occurred before any Trakt read
-        assert!(store.get_wanted("alice".to_string(), 27205).await.is_none(),
-            "no wanted rows must have been written");
+        assert!(
+            store.get_wanted("alice".to_string(), 27205).await.is_none(),
+            "no wanted rows must have been written"
+        );
     }
 }
 
@@ -1518,12 +1823,21 @@ mod reconcile_wanted_tests {
         .unwrap()
     }
 
-    fn wanted_movie(user: &str, tmdb_id: u64, watchlist: bool, in_progress: bool, watched: bool) -> WantedRecord {
+    fn wanted_movie(
+        user: &str,
+        tmdb_id: u64,
+        watchlist: bool,
+        in_progress: bool,
+        watched: bool,
+    ) -> WantedRecord {
         WantedRecord {
             user: user.to_string(),
             tmdb_id,
             media_type: MediaType::Movie,
-            sources: WantedSources { watchlist, in_progress },
+            sources: WantedSources {
+                watchlist,
+                in_progress,
+            },
             watched_state: WatchedState::Movie { watched },
             show_status: None,
         }
@@ -1534,8 +1848,13 @@ mod reconcile_wanted_tests {
             user: user.to_string(),
             tmdb_id,
             media_type: MediaType::Show,
-            sources: WantedSources { watchlist, in_progress },
-            watched_state: WatchedState::Show { watched_episodes: vec![] },
+            sources: WantedSources {
+                watchlist,
+                in_progress,
+            },
+            watched_state: WatchedState::Show {
+                watched_episodes: vec![],
+            },
             show_status: Some(ShowStatus::Returning),
         }
     }
@@ -1593,8 +1912,12 @@ mod reconcile_wanted_tests {
         assert_eq!(
             provenance_from_wanted(&w).entries,
             vec![
-                ProvenanceEntry::Watchlist { user: "alice".into() },
-                ProvenanceEntry::InProgress { user: "alice".into() },
+                ProvenanceEntry::Watchlist {
+                    user: "alice".into()
+                },
+                ProvenanceEntry::InProgress {
+                    user: "alice".into()
+                },
             ]
         );
     }
@@ -1608,7 +1931,9 @@ mod reconcile_wanted_tests {
         assert_eq!(
             provenance_from_wanted(&w).entries,
             vec![
-                ProvenanceEntry::Watchlist { user: "alice".into() },
+                ProvenanceEntry::Watchlist {
+                    user: "alice".into()
+                },
                 ProvenanceEntry::InProgress { user: "bob".into() },
             ]
         );
@@ -1619,7 +1944,10 @@ mod reconcile_wanted_tests {
     #[tokio::test]
     async fn plan_missing_wanted_movie_acquires() {
         let store = mem_store();
-        store.put_wanted(wanted_movie("alice", 27205, true, false, false)).await.unwrap();
+        store
+            .put_wanted(wanted_movie("alice", 27205, true, false, false))
+            .await
+            .unwrap();
         let ops = plan_reconcile_ops(&store, &[]).await;
         assert_eq!(
             ops,
@@ -1637,22 +1965,40 @@ mod reconcile_wanted_tests {
     async fn plan_finished_owned_movie_removes_trigger_a() {
         let store = mem_store();
         // all wanters watched + owned hash present → Trigger A.
-        store.put_wanted(wanted_movie("alice", 27205, true, false, true)).await.unwrap();
         store
-            .put_owned("abc".into(), owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")))
+            .put_wanted(wanted_movie("alice", 27205, true, false, true))
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "abc".into(),
+                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+            )
             .await
             .unwrap();
         let torrents = vec![torrent("t1", "ABC")];
         let ops = plan_reconcile_ops(&store, &torrents).await;
-        assert_eq!(ops, vec![ReconcileOp::Remove { tmdb_id: 27205, hashes: vec!["abc".into()] }]);
+        assert_eq!(
+            ops,
+            vec![ReconcileOp::Remove {
+                tmdb_id: 27205,
+                hashes: vec!["abc".into()]
+            }]
+        );
     }
 
     #[tokio::test]
     async fn plan_lapsed_owned_wanted_movie_reacquires() {
         let store = mem_store();
-        store.put_wanted(wanted_movie("alice", 27205, true, false, false)).await.unwrap();
         store
-            .put_owned("abc".into(), owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")))
+            .put_wanted(wanted_movie("alice", 27205, true, false, false))
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "abc".into(),
+                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+            )
             .await
             .unwrap();
         // No torrents → the owned hash is absent → lapsed → re-acquire.
@@ -1675,12 +2021,18 @@ mod reconcile_wanted_tests {
     async fn plan_lapsed_manual_owned_with_wanter_preserves_manual_provenance() {
         let store = mem_store();
         // alice wants it via watchlist
-        store.put_wanted(wanted_movie("alice", 27205, true, false, false)).await.unwrap();
+        store
+            .put_wanted(wanted_movie("alice", 27205, true, false, false))
+            .await
+            .unwrap();
         // The owned record has BOTH Manual and alice's Watchlist entries
         let mut combined = Provenance::manual();
         combined.merge(&Provenance::watchlist("alice"));
         store
-            .put_owned("abc".into(), owned_record(27205, MediaKind::Movie, combined))
+            .put_owned(
+                "abc".into(),
+                owned_record(27205, MediaKind::Movie, combined),
+            )
             .await
             .unwrap();
         // No torrents → lapsed → AcquireMovie
@@ -1688,7 +2040,10 @@ mod reconcile_wanted_tests {
         assert_eq!(ops.len(), 1, "expected one Acquire op");
         match &ops[0] {
             ReconcileOp::Acquire { provenance, .. } => {
-                assert!(provenance.has_manual_entry(), "Manual provenance must be preserved on lapsed re-acquire");
+                assert!(
+                    provenance.has_manual_entry(),
+                    "Manual provenance must be preserved on lapsed re-acquire"
+                );
             }
             other => panic!("expected Acquire, got {:?}", other),
         }
@@ -1701,21 +2056,36 @@ mod reconcile_wanted_tests {
     async fn plan_lapsed_and_finished_movie_removes_not_reacquires() {
         let store = mem_store();
         // alice has watched the movie and it's on her watchlist (Trigger A conditions met)
-        store.put_wanted(wanted_movie("alice", 27205, true, false, true)).await.unwrap();
         store
-            .put_owned("abc".into(), owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")))
+            .put_wanted(wanted_movie("alice", 27205, true, false, true))
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "abc".into(),
+                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+            )
             .await
             .unwrap();
         // No torrents → lapsed (hash absent), but removal takes precedence over re-acquire.
         let ops = plan_reconcile_ops(&store, &[]).await;
-        assert_eq!(ops, vec![ReconcileOp::Remove { tmdb_id: 27205, hashes: vec!["abc".into()] }]);
+        assert_eq!(
+            ops,
+            vec![ReconcileOp::Remove {
+                tmdb_id: 27205,
+                hashes: vec!["abc".into()]
+            }]
+        );
     }
 
     #[tokio::test]
     async fn plan_manual_owned_no_wanters_is_never_removed() {
         let store = mem_store();
         store
-            .put_owned("abc".into(), owned_record(27205, MediaKind::Movie, Provenance::manual()))
+            .put_owned(
+                "abc".into(),
+                owned_record(27205, MediaKind::Movie, Provenance::manual()),
+            )
             .await
             .unwrap();
         let torrents = vec![torrent("t1", "ABC")];
@@ -1726,9 +2096,15 @@ mod reconcile_wanted_tests {
     #[tokio::test]
     async fn plan_owned_available_not_finished_no_op() {
         let store = mem_store();
-        store.put_wanted(wanted_movie("alice", 27205, true, false, false)).await.unwrap();
         store
-            .put_owned("abc".into(), owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")))
+            .put_wanted(wanted_movie("alice", 27205, true, false, false))
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "abc".into(),
+                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+            )
             .await
             .unwrap();
         let torrents = vec![torrent("t1", "ABC")];
@@ -1750,21 +2126,36 @@ mod reconcile_wanted_tests {
         let store = mem_store();
         // Owned show via alice's watchlist, nobody wants it now → Trigger B.
         store
-            .put_owned("abc".into(), owned_record(1396, MediaKind::Series, Provenance::watchlist("alice")))
+            .put_owned(
+                "abc".into(),
+                owned_record(1396, MediaKind::Series, Provenance::watchlist("alice")),
+            )
             .await
             .unwrap();
         let torrents = vec![torrent("t1", "ABC")];
         let ops = plan_reconcile_ops(&store, &torrents).await;
-        assert_eq!(ops, vec![ReconcileOp::Remove { tmdb_id: 1396, hashes: vec!["abc".into()] }]);
+        assert_eq!(
+            ops,
+            vec![ReconcileOp::Remove {
+                tmdb_id: 1396,
+                hashes: vec!["abc".into()]
+            }]
+        );
     }
 
     #[tokio::test]
     async fn plan_show_still_wanted_no_op() {
         // Task 8 defers show acquire + Trigger-A; a still-wanted owned show yields nothing.
         let store = mem_store();
-        store.put_wanted(wanted_show("alice", 1396, true, false)).await.unwrap();
         store
-            .put_owned("abc".into(), owned_record(1396, MediaKind::Series, Provenance::watchlist("alice")))
+            .put_wanted(wanted_show("alice", 1396, true, false))
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "abc".into(),
+                owned_record(1396, MediaKind::Series, Provenance::watchlist("alice")),
+            )
             .await
             .unwrap();
         let torrents = vec![torrent("t1", "ABC")];
@@ -1776,20 +2167,32 @@ mod reconcile_wanted_tests {
     async fn plan_multi_hash_remove_lists_all_hashes() {
         let store = mem_store();
         // finished movie owned under TWO hashes → one Remove op listing BOTH.
-        store.put_wanted(wanted_movie("alice", 27205, true, false, true)).await.unwrap();
         store
-            .put_owned("aaa".into(), owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")))
+            .put_wanted(wanted_movie("alice", 27205, true, false, true))
             .await
             .unwrap();
         store
-            .put_owned("bbb".into(), owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")))
+            .put_owned(
+                "aaa".into(),
+                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+            )
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "bbb".into(),
+                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+            )
             .await
             .unwrap();
         let torrents = vec![torrent("t1", "AAA"), torrent("t2", "BBB")];
         let mut ops = plan_reconcile_ops(&store, &torrents).await;
         assert_eq!(ops.len(), 1, "expected a single Remove op");
         match ops.remove(0) {
-            ReconcileOp::Remove { tmdb_id, mut hashes } => {
+            ReconcileOp::Remove {
+                tmdb_id,
+                mut hashes,
+            } => {
                 assert_eq!(tmdb_id, 27205);
                 hashes.sort();
                 assert_eq!(hashes, vec!["aaa".to_string(), "bbb".to_string()]);
@@ -1802,33 +2205,75 @@ mod reconcile_wanted_tests {
 
     #[tokio::test]
     async fn execute_remove_drops_owned_and_selection() {
-        use crate::store::{OwnedRecord, OwnedStatus, SelectionEntry, movie_slot};
         use crate::scraper::MediaKind;
+        use crate::store::{movie_slot, OwnedRecord, OwnedStatus, SelectionEntry};
         use crate::vfs::{MediaMetadata, MediaType};
         let store = mem_store();
         let req = AcquireRequest {
-            imdb_id: "tt1".into(), tmdb_id: 27205, kind: MediaKind::Movie, season: None, episode: None,
+            imdb_id: "tt1".into(),
+            tmdb_id: 27205,
+            kind: MediaKind::Movie,
+            season: None,
+            episode: None,
             original_language: None,
-            metadata: MediaMetadata { title: "M".into(), year: None, media_type: MediaType::Movie, external_id: Some("tmdb:27205".into()) },
+            metadata: MediaMetadata {
+                title: "M".into(),
+                year: None,
+                media_type: MediaType::Movie,
+                external_id: Some("tmdb:27205".into()),
+            },
         };
-        store.put_owned("h1".into(), OwnedRecord { request: req, provenance: Provenance::watchlist("a"), added_at: 1, status: OwnedStatus::Verified, provides: vec![], quality: None }).await.unwrap();
-        store.put_selection(movie_slot(27205), SelectionEntry { hash: "h1".into(), file_path: "m.mkv".into() }).await.unwrap();
+        store
+            .put_owned(
+                "h1".into(),
+                OwnedRecord {
+                    request: req,
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "h1".into(),
+                    file_path: "m.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
 
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![Torrent { id: "tid".into(), hash: "h1".into(), status: "downloaded".into(), ..Default::default() }],
+            torrents: vec![Torrent {
+                id: "tid".into(),
+                hash: "h1".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         });
         let torrents = provider.get_torrents().await.unwrap();
         execute_remove(&provider, &torrents, &store, 27205, &["h1".to_string()]).await;
         assert!(store.get_owned("h1".into()).await.is_none());
-        assert!(store.get_selection(movie_slot(27205)).await.is_none(), "removal must clear the selection slot");
+        assert!(
+            store.get_selection(movie_slot(27205)).await.is_none(),
+            "removal must clear the selection slot"
+        );
     }
 
     #[tokio::test]
     async fn execute_remove_deletes_torrent_and_owned_record() {
         let store = mem_store();
         store
-            .put_owned("h1".into(), owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")))
+            .put_owned(
+                "h1".into(),
+                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+            )
             .await
             .unwrap();
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1838,8 +2283,15 @@ mod reconcile_wanted_tests {
         });
         let torrents = vec![torrent("t1", "H1")]; // hash case differs from stored "h1"
         execute_remove(&provider, &torrents, &store, 27205, &["h1".to_string()]).await;
-        assert_eq!(*deleted.lock().unwrap(), vec!["t1".to_string()], "the torrent must be deleted");
-        assert!(store.get_owned("h1".to_string()).await.is_none(), "the owned record must be removed");
+        assert_eq!(
+            *deleted.lock().unwrap(),
+            vec!["t1".to_string()],
+            "the torrent must be deleted"
+        );
+        assert!(
+            store.get_owned("h1".to_string()).await.is_none(),
+            "the owned record must be removed"
+        );
     }
 
     /// When `get_torrents` fails, `reconcile_wanted` must early-return without executing any ops:
@@ -1867,21 +2319,20 @@ mod reconcile_wanted_tests {
             ..Default::default()
         });
 
-        let scraper: Arc<dyn crate::scraper::Scraper> = Arc::new(
-            crate::scraper::TorrentioScraper::new(
+        let scraper: Arc<dyn crate::scraper::Scraper> =
+            Arc::new(crate::scraper::TorrentioScraper::new(
                 None,
                 crate::provider::ProviderKind::TorBox,
                 "tok",
                 reqwest::Client::new(),
-            ),
-        );
-        let validator: Arc<dyn crate::acquire::TitleValidator> = Arc::new(
-            crate::acquire::TmdbTitleValidator {
+            ));
+        let validator: Arc<dyn crate::acquire::TitleValidator> =
+            Arc::new(crate::acquire::TmdbTitleValidator {
                 tmdb: Arc::new(crate::tmdb_client::TmdbClient::new("k".into()).unwrap()),
-            },
-        );
-        let prober: Arc<dyn crate::acquire::Prober> =
-            Arc::new(crate::acquire::HttpProber { http: reqwest::Client::new() });
+            });
+        let prober: Arc<dyn crate::acquire::Prober> = Arc::new(crate::acquire::HttpProber {
+            http: reqwest::Client::new(),
+        });
         let engine = crate::acquire::AcquisitionEngine::new(
             provider.clone(),
             scraper,

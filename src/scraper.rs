@@ -30,14 +30,26 @@ pub struct TorrentioScraper {
 }
 
 impl TorrentioScraper {
-    pub fn new(override_url: Option<String>, provider: ProviderKind, token: &str, http: reqwest::Client) -> Self {
-        Self { base_url: Self::build_base_url(override_url, provider, token), http }
+    pub fn new(
+        override_url: Option<String>,
+        provider: ProviderKind,
+        token: &str,
+        http: reqwest::Client,
+    ) -> Self {
+        Self {
+            base_url: Self::build_base_url(override_url, provider, token),
+            http,
+        }
     }
 
     /// Override (trimmed) wins; else template Torrentio from provider + token.
     /// NOTE: verify the `<provider>=<token>` option syntax against torrentio.strem.fun/configure;
     /// the live scraper test guards drift.
-    pub fn build_base_url(override_url: Option<String>, provider: ProviderKind, token: &str) -> String {
+    pub fn build_base_url(
+        override_url: Option<String>,
+        provider: ProviderKind,
+        token: &str,
+    ) -> String {
         if let Some(u) = override_url {
             return u.trim().trim_end_matches('/').to_string();
         }
@@ -50,7 +62,13 @@ impl TorrentioScraper {
         format!("https://torrentio.strem.fun/{}={}", opt, token)
     }
 
-    pub fn stream_url(base: &str, imdb_id: &str, kind: MediaKind, season: Option<u32>, episode: Option<u32>) -> String {
+    pub fn stream_url(
+        base: &str,
+        imdb_id: &str,
+        kind: MediaKind,
+        season: Option<u32>,
+        episode: Option<u32>,
+    ) -> String {
         match kind {
             MediaKind::Movie => format!("{}/stream/movie/{}.json", base, imdb_id),
             MediaKind::Series => {
@@ -64,7 +82,8 @@ impl TorrentioScraper {
 
 // A 40-hex infohash as a slash-delimited path segment. Case-sensitive (lowercase) so a
 // mixed-case debrid token in the same URL can't be mistaken for the hash.
-static RESOLVE_HASH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/([0-9a-f]{40})/").unwrap());
+static RESOLVE_HASH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/([0-9a-f]{40})/").unwrap());
 // The fileIdx following the hash: `/<hash>/<season:episode|null>/<fileidx>`.
 static RESOLVE_IDX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/[0-9a-f]{40}/[^/]*/(\d+)").unwrap());
@@ -95,7 +114,11 @@ pub fn parse_streams(v: &serde_json::Value) -> Vec<RawCandidate> {
     for s in streams {
         let (info_hash, url_idx) = match s.get("infoHash").and_then(|h| h.as_str()) {
             Some(h) => (h.to_ascii_lowercase(), None),
-            None => match s.get("url").and_then(|u| u.as_str()).and_then(hash_idx_from_url) {
+            None => match s
+                .get("url")
+                .and_then(|u| u.as_str())
+                .and_then(hash_idx_from_url)
+            {
                 Some((h, idx)) => (h, idx),
                 None => continue,
             },
@@ -106,11 +129,24 @@ pub fn parse_streams(v: &serde_json::Value) -> Vec<RawCandidate> {
             .map(|i| i as usize)
             .or(url_idx);
         out.push(RawCandidate {
-            name: s.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
-            description: s.get("title").or_else(|| s.get("description")).and_then(|t| t.as_str()).unwrap_or("").to_string(),
+            name: s
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string(),
+            description: s
+                .get("title")
+                .or_else(|| s.get("description"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string(),
             info_hash,
             file_idx,
-            file_name: s.get("behaviorHints").and_then(|b| b.get("filename")).and_then(|f| f.as_str()).map(String::from),
+            file_name: s
+                .get("behaviorHints")
+                .and_then(|b| b.get("filename"))
+                .and_then(|f| f.as_str())
+                .map(String::from),
         });
     }
     out
@@ -118,7 +154,13 @@ pub fn parse_streams(v: &serde_json::Value) -> Vec<RawCandidate> {
 
 #[async_trait]
 impl Scraper for TorrentioScraper {
-    async fn find(&self, imdb_id: &str, kind: MediaKind, season: Option<u32>, episode: Option<u32>) -> Result<Vec<RawCandidate>, AppError> {
+    async fn find(
+        &self,
+        imdb_id: &str,
+        kind: MediaKind,
+        season: Option<u32>,
+        episode: Option<u32>,
+    ) -> Result<Vec<RawCandidate>, AppError> {
         let url = Self::stream_url(&self.base_url, imdb_id, kind, season, episode);
         let resp = self.http.get(&url).send().await.map_err(AppError::Http)?;
         // 404 = unknown id (genuinely no streams). Any other non-success (429/5xx) is a
@@ -142,7 +184,13 @@ pub struct MockScraper {
 #[cfg(test)]
 #[async_trait]
 impl Scraper for MockScraper {
-    async fn find(&self, _imdb_id: &str, _kind: MediaKind, _season: Option<u32>, _episode: Option<u32>) -> Result<Vec<RawCandidate>, AppError> {
+    async fn find(
+        &self,
+        _imdb_id: &str,
+        _kind: MediaKind,
+        _season: Option<u32>,
+        _episode: Option<u32>,
+    ) -> Result<Vec<RawCandidate>, AppError> {
         Ok(self.candidates.clone())
     }
 }
@@ -165,18 +213,34 @@ mod tests {
 
     #[test]
     fn override_url_is_used_verbatim_trimming_trailing_slash() {
-        let base = TorrentioScraper::build_base_url(Some("https://my.host/comet/abc/".into()), ProviderKind::RealDebrid, "TOKEN");
+        let base = TorrentioScraper::build_base_url(
+            Some("https://my.host/comet/abc/".into()),
+            ProviderKind::RealDebrid,
+            "TOKEN",
+        );
         assert_eq!(base, "https://my.host/comet/abc");
     }
 
     #[test]
     fn stream_url_for_movie_and_series() {
         assert_eq!(
-            TorrentioScraper::stream_url("https://torrentio.strem.fun/realdebrid=T", "tt0816692", MediaKind::Movie, None, None),
+            TorrentioScraper::stream_url(
+                "https://torrentio.strem.fun/realdebrid=T",
+                "tt0816692",
+                MediaKind::Movie,
+                None,
+                None
+            ),
             "https://torrentio.strem.fun/realdebrid=T/stream/movie/tt0816692.json"
         );
         assert_eq!(
-            TorrentioScraper::stream_url("https://torrentio.strem.fun/realdebrid=T", "tt0903747", MediaKind::Series, Some(1), Some(2)),
+            TorrentioScraper::stream_url(
+                "https://torrentio.strem.fun/realdebrid=T",
+                "tt0903747",
+                MediaKind::Series,
+                Some(1),
+                Some(2)
+            ),
             "https://torrentio.strem.fun/realdebrid=T/stream/series/tt0903747:1:2.json"
         );
     }
@@ -199,7 +263,10 @@ mod tests {
         assert_eq!(cands.len(), 2);
         assert_eq!(cands[0].info_hash, "aabbcc");
         assert_eq!(cands[0].file_idx, Some(0));
-        assert_eq!(cands[0].file_name.as_deref(), Some("Movie.2023.1080p.x265-GRP.mkv"));
+        assert_eq!(
+            cands[0].file_name.as_deref(),
+            Some("Movie.2023.1080p.x265-GRP.mkv")
+        );
         assert_eq!(cands[1].info_hash, "ddeeff");
         assert_eq!(cands[1].file_idx, None);
     }
@@ -219,10 +286,19 @@ mod tests {
         });
         let cands = parse_streams(&json);
         assert_eq!(cands.len(), 1);
-        assert_eq!(cands[0].info_hash, "64877b5490208c3015c0f5121287949d62622e54");
+        assert_eq!(
+            cands[0].info_hash,
+            "64877b5490208c3015c0f5121287949d62622e54"
+        );
         assert_eq!(cands[0].file_idx, Some(0));
-        assert_eq!(cands[0].file_name.as_deref(), Some("Movie.2023.1080p.x265-GRP.mkv"));
-        assert_eq!(cands[0].name, "[RD+] Torrentio\n1080p", "cache marker preserved for ranking");
+        assert_eq!(
+            cands[0].file_name.as_deref(),
+            Some("Movie.2023.1080p.x265-GRP.mkv")
+        );
+        assert_eq!(
+            cands[0].name, "[RD+] Torrentio\n1080p",
+            "cache marker preserved for ranking"
+        );
     }
 
     #[test]
@@ -236,7 +312,10 @@ mod tests {
         });
         let cands = parse_streams(&json);
         assert_eq!(cands.len(), 1);
-        assert_eq!(cands[0].info_hash, "aabbccddeeff00112233445566778899aabbccdd");
+        assert_eq!(
+            cands[0].info_hash,
+            "aabbccddeeff00112233445566778899aabbccdd"
+        );
         assert_eq!(cands[0].file_idx, Some(3));
     }
 
@@ -251,10 +330,19 @@ mod tests {
     #[tokio::test]
     async fn mock_scraper_returns_canned() {
         let mock = MockScraper {
-            candidates: vec![RawCandidate { name: "n".into(), description: "d".into(), info_hash: "h".into(), file_idx: None, file_name: None }],
+            candidates: vec![RawCandidate {
+                name: "n".into(),
+                description: "d".into(),
+                info_hash: "h".into(),
+                file_idx: None,
+                file_name: None,
+            }],
         };
         let scraper: std::sync::Arc<dyn Scraper> = std::sync::Arc::new(mock);
-        let got = scraper.find("tt1", MediaKind::Movie, None, None).await.unwrap();
+        let got = scraper
+            .find("tt1", MediaKind::Movie, None, None)
+            .await
+            .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].info_hash, "h");
     }

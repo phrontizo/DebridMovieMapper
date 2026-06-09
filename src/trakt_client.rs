@@ -44,18 +44,13 @@ pub struct TraktUser {
 }
 
 /// Single-poll outcome of `POST /oauth/device/token`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DeviceTokenPoll {
+    #[default]
     Pending,
     Authorized(TraktTokenResponse),
     Denied,
     Expired,
-}
-
-impl Default for DeviceTokenPoll {
-    fn default() -> Self {
-        DeviceTokenPoll::Pending
-    }
 }
 
 /// Per-show watched-episode set, for the removal finish-test.
@@ -175,12 +170,21 @@ impl TraktClientImpl {
     }
 
     /// Authed GET returning parsed JSON, erroring on any non-success status.
-    async fn authed_get_json(&self, path: &str, access_token: &str) -> Result<serde_json::Value, AppError> {
+    async fn authed_get_json(
+        &self,
+        path: &str,
+        access_token: &str,
+    ) -> Result<serde_json::Value, AppError> {
         let resp = self
-            .send_with_retry(|| self.request(reqwest::Method::GET, path).bearer_auth(access_token))
+            .send_with_retry(|| {
+                self.request(reqwest::Method::GET, path)
+                    .bearer_auth(access_token)
+            })
             .await?;
         let resp = resp.error_for_status().map_err(AppError::Http)?;
-        resp.json::<serde_json::Value>().await.map_err(AppError::Http)
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(AppError::Http)
     }
 }
 
@@ -189,7 +193,10 @@ impl TraktClient for TraktClientImpl {
     async fn device_code(&self) -> Result<DeviceCode, AppError> {
         let body = build_device_code_body(&self.client_id);
         let resp = self
-            .send_with_retry(|| self.request(reqwest::Method::POST, "/oauth/device/code").json(&body))
+            .send_with_retry(|| {
+                self.request(reqwest::Method::POST, "/oauth/device/code")
+                    .json(&body)
+            })
             .await?;
         let resp = resp.error_for_status().map_err(AppError::Http)?;
         let v: serde_json::Value = resp.json().await.map_err(AppError::Http)?;
@@ -199,19 +206,28 @@ impl TraktClient for TraktClientImpl {
     async fn poll_token(&self, device_code: &str) -> Result<DeviceTokenPoll, AppError> {
         let body = build_poll_token_body(device_code, &self.client_id, &self.client_secret);
         let resp = self
-            .send_with_retry(|| self.request(reqwest::Method::POST, "/oauth/device/token").json(&body))
+            .send_with_retry(|| {
+                self.request(reqwest::Method::POST, "/oauth/device/token")
+                    .json(&body)
+            })
             .await?;
         let status = resp.status();
         // Only a 200 carries a useful body; any other status maps purely off the code, so a
         // missing/non-JSON body is fine (treated as Null).
-        let v = resp.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null);
+        let v = resp
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or(serde_json::Value::Null);
         Ok(interpret_device_token(status, &v))
     }
 
     async fn refresh(&self, refresh_token: &str) -> Result<TraktTokenResponse, AppError> {
         let body = build_refresh_body(refresh_token, &self.client_id, &self.client_secret);
         let resp = self
-            .send_with_retry(|| self.request(reqwest::Method::POST, "/oauth/token").json(&body))
+            .send_with_retry(|| {
+                self.request(reqwest::Method::POST, "/oauth/token")
+                    .json(&body)
+            })
             .await?;
         let resp = resp.error_for_status().map_err(AppError::Http)?;
         let v: serde_json::Value = resp.json().await.map_err(AppError::Http)?;
@@ -224,8 +240,12 @@ impl TraktClient for TraktClientImpl {
     }
 
     async fn watchlist(&self, access_token: &str) -> Result<Vec<TraktItem>, AppError> {
-        let movies = self.authed_get_json("/sync/watchlist/movies", access_token).await?;
-        let shows = self.authed_get_json("/sync/watchlist/shows", access_token).await?;
+        let movies = self
+            .authed_get_json("/sync/watchlist/movies", access_token)
+            .await?;
+        let shows = self
+            .authed_get_json("/sync/watchlist/shows", access_token)
+            .await?;
         let mut out = parse_watchlist(&movies, MediaType::Movie);
         out.extend(parse_watchlist(&shows, MediaType::Show));
         Ok(out)
@@ -237,8 +257,12 @@ impl TraktClient for TraktClientImpl {
     }
 
     async fn watched(&self, access_token: &str) -> Result<WatchedData, AppError> {
-        let movies = self.authed_get_json("/sync/watched/movies", access_token).await?;
-        let shows = self.authed_get_json("/sync/watched/shows", access_token).await?;
+        let movies = self
+            .authed_get_json("/sync/watched/movies", access_token)
+            .await?;
+        let shows = self
+            .authed_get_json("/sync/watched/shows", access_token)
+            .await?;
         Ok(WatchedData {
             movies: parse_watched_movies(&movies),
             shows: parse_watched_shows(&shows),
@@ -254,12 +278,20 @@ pub fn build_device_code_body(client_id: &str) -> serde_json::Value {
 }
 
 /// `POST /oauth/device/token` body.
-pub fn build_poll_token_body(code: &str, client_id: &str, client_secret: &str) -> serde_json::Value {
+pub fn build_poll_token_body(
+    code: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> serde_json::Value {
     serde_json::json!({ "code": code, "client_id": client_id, "client_secret": client_secret })
 }
 
 /// `POST /oauth/token` (refresh) body.
-pub fn build_refresh_body(refresh_token: &str, client_id: &str, client_secret: &str) -> serde_json::Value {
+pub fn build_refresh_body(
+    refresh_token: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "refresh_token": refresh_token,
         "client_id": client_id,
@@ -273,7 +305,10 @@ pub fn build_refresh_body(refresh_token: &str, client_id: &str, client_secret: &
 
 /// Extract a `String` field (missing/non-string → empty).
 fn str_field(v: &serde_json::Value, key: &str) -> String {
-    v.get(key).and_then(|x| x.as_str()).unwrap_or_default().to_string()
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Extract a `u64` field (missing/non-numeric → 0).
@@ -283,7 +318,9 @@ fn u64_field(v: &serde_json::Value, key: &str) -> u64 {
 
 /// The common `obj.ids.tmdb` numeric extraction.
 fn tmdb_id_of(obj: &serde_json::Value) -> Option<u64> {
-    obj.get("ids").and_then(|i| i.get("tmdb")).and_then(|t| t.as_u64())
+    obj.get("ids")
+        .and_then(|i| i.get("tmdb"))
+        .and_then(|t| t.as_u64())
 }
 
 /// Parse the `POST /oauth/device/code` response.
@@ -333,7 +370,10 @@ pub(crate) fn parse_user(v: &serde_json::Value) -> TraktUser {
 ///   429 Too Many Req  -> polling too fast; normally absorbed by the retry helper, mapped to
 ///                        Pending defensively so a stray 429 doesn't abort enrolment.
 /// Any other status is treated as terminal (Expired) so the caller's poll loop can't spin forever.
-pub fn interpret_device_token(status: reqwest::StatusCode, body: &serde_json::Value) -> DeviceTokenPoll {
+pub fn interpret_device_token(
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+) -> DeviceTokenPoll {
     match status.as_u16() {
         200 => DeviceTokenPoll::Authorized(parse_token_response(body)),
         400 | 429 => DeviceTokenPoll::Pending,
@@ -357,7 +397,10 @@ pub fn parse_watchlist(v: &serde_json::Value, media_type: MediaType) -> Vec<Trak
     arr.iter()
         .filter_map(|e| {
             let tmdb_id = tmdb_id_of(e.get(key)?)?;
-            Some(TraktItem { media_type: media_type.clone(), tmdb_id })
+            Some(TraktItem {
+                media_type: media_type.clone(),
+                tmdb_id,
+            })
         })
         .collect()
 }
@@ -375,11 +418,14 @@ pub fn parse_playback(v: &serde_json::Value) -> Vec<TraktItem> {
             Some("movie") => e
                 .get("movie")
                 .and_then(tmdb_id_of)
-                .map(|tmdb_id| TraktItem { media_type: MediaType::Movie, tmdb_id }),
-            Some("episode") => e
-                .get("show")
-                .and_then(tmdb_id_of)
-                .map(|tmdb_id| TraktItem { media_type: MediaType::Show, tmdb_id }),
+                .map(|tmdb_id| TraktItem {
+                    media_type: MediaType::Movie,
+                    tmdb_id,
+                }),
+            Some("episode") => e.get("show").and_then(tmdb_id_of).map(|tmdb_id| TraktItem {
+                media_type: MediaType::Show,
+                tmdb_id,
+            }),
             _ => None,
         };
         if let Some(item) = item {
@@ -396,7 +442,9 @@ pub fn parse_watched_movies(v: &serde_json::Value) -> Vec<u64> {
     let Some(arr) = v.as_array() else {
         return Vec::new();
     };
-    arr.iter().filter_map(|e| e.get("movie").and_then(tmdb_id_of)).collect()
+    arr.iter()
+        .filter_map(|e| e.get("movie").and_then(tmdb_id_of))
+        .collect()
 }
 
 /// Parse a `/sync/watched/shows` array into per-show watched-episode `(season, episode)` sets.
@@ -411,20 +459,31 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
             let mut watched_episodes = Vec::new();
             if let Some(seasons) = e.get("seasons").and_then(|s| s.as_array()) {
                 for season in seasons {
-                    let Some(season_number) = season.get("number").and_then(|n| n.as_u64()).and_then(|n| u32::try_from(n).ok()) else {
+                    let Some(season_number) = season
+                        .get("number")
+                        .and_then(|n| n.as_u64())
+                        .and_then(|n| u32::try_from(n).ok())
+                    else {
                         continue;
                     };
                     let Some(episodes) = season.get("episodes").and_then(|ep| ep.as_array()) else {
                         continue;
                     };
                     for ep in episodes {
-                        if let Some(episode_number) = ep.get("number").and_then(|n| n.as_u64()).and_then(|n| u32::try_from(n).ok()) {
+                        if let Some(episode_number) = ep
+                            .get("number")
+                            .and_then(|n| n.as_u64())
+                            .and_then(|n| u32::try_from(n).ok())
+                        {
                             watched_episodes.push((season_number, episode_number));
                         }
                     }
                 }
             }
-            Some(WatchedShow { tmdb_id, watched_episodes })
+            Some(WatchedShow {
+                tmdb_id,
+                watched_episodes,
+            })
         })
         .collect()
 }
@@ -504,7 +563,10 @@ mod tests {
 
     #[test]
     fn build_device_code_body_shape() {
-        assert_eq!(build_device_code_body("CID"), serde_json::json!({ "client_id": "CID" }));
+        assert_eq!(
+            build_device_code_body("CID"),
+            serde_json::json!({ "client_id": "CID" })
+        );
     }
 
     #[test]
@@ -552,7 +614,10 @@ mod tests {
 
     #[test]
     fn parse_device_code_missing_fields_default() {
-        assert_eq!(parse_device_code(&serde_json::json!({})), DeviceCode::default());
+        assert_eq!(
+            parse_device_code(&serde_json::json!({})),
+            DeviceCode::default()
+        );
     }
 
     #[test]
@@ -584,7 +649,10 @@ mod tests {
         });
         assert_eq!(
             parse_user(&v),
-            TraktUser { slug: "alice-slug".into(), username: "Alice".into() }
+            TraktUser {
+                slug: "alice-slug".into(),
+                username: "Alice".into()
+            }
         );
     }
 
@@ -592,10 +660,22 @@ mod tests {
     fn parse_user_falls_back_to_username_when_slug_missing() {
         // slug missing entirely
         let v = serde_json::json!({ "username": "bob" });
-        assert_eq!(parse_user(&v), TraktUser { slug: "bob".into(), username: "bob".into() });
+        assert_eq!(
+            parse_user(&v),
+            TraktUser {
+                slug: "bob".into(),
+                username: "bob".into()
+            }
+        );
         // slug present but empty → still falls back to username
         let v2 = serde_json::json!({ "username": "carol", "ids": { "slug": "" } });
-        assert_eq!(parse_user(&v2), TraktUser { slug: "carol".into(), username: "carol".into() });
+        assert_eq!(
+            parse_user(&v2),
+            TraktUser {
+                slug: "carol".into(),
+                username: "carol".into()
+            }
+        );
     }
 
     #[test]
@@ -619,18 +699,39 @@ mod tests {
         );
         let empty = serde_json::Value::Null;
         // 400 → Pending (authorization pending)
-        assert_eq!(interpret_device_token(StatusCode::BAD_REQUEST, &empty), DeviceTokenPoll::Pending);
+        assert_eq!(
+            interpret_device_token(StatusCode::BAD_REQUEST, &empty),
+            DeviceTokenPoll::Pending
+        );
         // 418 → Denied
-        assert_eq!(interpret_device_token(StatusCode::IM_A_TEAPOT, &empty), DeviceTokenPoll::Denied);
+        assert_eq!(
+            interpret_device_token(StatusCode::IM_A_TEAPOT, &empty),
+            DeviceTokenPoll::Denied
+        );
         // 410 → Expired
-        assert_eq!(interpret_device_token(StatusCode::GONE, &empty), DeviceTokenPoll::Expired);
+        assert_eq!(
+            interpret_device_token(StatusCode::GONE, &empty),
+            DeviceTokenPoll::Expired
+        );
         // 404/409 → Expired (invalid/used code, terminal)
-        assert_eq!(interpret_device_token(StatusCode::NOT_FOUND, &empty), DeviceTokenPoll::Expired);
-        assert_eq!(interpret_device_token(StatusCode::CONFLICT, &empty), DeviceTokenPoll::Expired);
+        assert_eq!(
+            interpret_device_token(StatusCode::NOT_FOUND, &empty),
+            DeviceTokenPoll::Expired
+        );
+        assert_eq!(
+            interpret_device_token(StatusCode::CONFLICT, &empty),
+            DeviceTokenPoll::Expired
+        );
         // 429 defensively → Pending (the retry helper normally absorbs this)
-        assert_eq!(interpret_device_token(StatusCode::TOO_MANY_REQUESTS, &empty), DeviceTokenPoll::Pending);
+        assert_eq!(
+            interpret_device_token(StatusCode::TOO_MANY_REQUESTS, &empty),
+            DeviceTokenPoll::Pending
+        );
         // 500 → Expired: a 5xx surfacing here after exhausted retries is treated as terminal
-        assert_eq!(interpret_device_token(StatusCode::INTERNAL_SERVER_ERROR, &empty), DeviceTokenPoll::Expired);
+        assert_eq!(
+            interpret_device_token(StatusCode::INTERNAL_SERVER_ERROR, &empty),
+            DeviceTokenPoll::Expired
+        );
     }
 
     #[test]
@@ -642,7 +743,10 @@ mod tests {
         ]);
         assert_eq!(
             parse_watchlist(&v, MediaType::Movie),
-            vec![TraktItem { media_type: MediaType::Movie, tmdb_id: 27205 }]
+            vec![TraktItem {
+                media_type: MediaType::Movie,
+                tmdb_id: 27205
+            }]
         );
     }
 
@@ -653,7 +757,10 @@ mod tests {
         ]);
         assert_eq!(
             parse_watchlist(&v, MediaType::Show),
-            vec![TraktItem { media_type: MediaType::Show, tmdb_id: 1396 }]
+            vec![TraktItem {
+                media_type: MediaType::Show,
+                tmdb_id: 1396
+            }]
         );
     }
 
@@ -669,8 +776,14 @@ mod tests {
         assert_eq!(
             parse_playback(&v),
             vec![
-                TraktItem { media_type: MediaType::Movie, tmdb_id: 100 },
-                TraktItem { media_type: MediaType::Show, tmdb_id: 200 },
+                TraktItem {
+                    media_type: MediaType::Movie,
+                    tmdb_id: 100
+                },
+                TraktItem {
+                    media_type: MediaType::Show,
+                    tmdb_id: 200
+                },
             ]
         );
     }
@@ -698,7 +811,10 @@ mod tests {
         ]);
         assert_eq!(
             parse_watched_shows(&v),
-            vec![WatchedShow { tmdb_id: 1396, watched_episodes: vec![(1, 1), (1, 2), (2, 1)] }]
+            vec![WatchedShow {
+                tmdb_id: 1396,
+                watched_episodes: vec![(1, 1), (1, 2), (2, 1)]
+            }]
         );
     }
 
@@ -706,13 +822,34 @@ mod tests {
     async fn mock_trakt_returns_canned() {
         use std::sync::Arc;
         let mock = MockTrakt {
-            device_code: DeviceCode { user_code: "CODE".into(), ..Default::default() },
-            poll: DeviceTokenPoll::Authorized(TraktTokenResponse { access_token: "X".into(), ..Default::default() }),
-            token: TraktTokenResponse { access_token: "AT".into(), ..Default::default() },
-            user: TraktUser { slug: "alice".into(), username: "Alice".into() },
-            watchlist: vec![TraktItem { media_type: MediaType::Movie, tmdb_id: 1 }],
-            in_progress: vec![TraktItem { media_type: MediaType::Show, tmdb_id: 2 }],
-            watched: WatchedData { movies: vec![3], shows: vec![] },
+            device_code: DeviceCode {
+                user_code: "CODE".into(),
+                ..Default::default()
+            },
+            poll: DeviceTokenPoll::Authorized(TraktTokenResponse {
+                access_token: "X".into(),
+                ..Default::default()
+            }),
+            token: TraktTokenResponse {
+                access_token: "AT".into(),
+                ..Default::default()
+            },
+            user: TraktUser {
+                slug: "alice".into(),
+                username: "Alice".into(),
+            },
+            watchlist: vec![TraktItem {
+                media_type: MediaType::Movie,
+                tmdb_id: 1,
+            }],
+            in_progress: vec![TraktItem {
+                media_type: MediaType::Show,
+                tmdb_id: 2,
+            }],
+            watched: WatchedData {
+                movies: vec![3],
+                shows: vec![],
+            },
             fail_reads: false,
             fail_refresh: false,
         };
@@ -720,20 +857,32 @@ mod tests {
         assert_eq!(client.device_code().await.unwrap().user_code, "CODE");
         assert_eq!(
             client.poll_token("dc").await.unwrap(),
-            DeviceTokenPoll::Authorized(TraktTokenResponse { access_token: "X".into(), ..Default::default() })
+            DeviceTokenPoll::Authorized(TraktTokenResponse {
+                access_token: "X".into(),
+                ..Default::default()
+            })
         );
         assert_eq!(client.refresh("ignored").await.unwrap().access_token, "AT");
         assert_eq!(
             client.me("ignored").await.unwrap(),
-            TraktUser { slug: "alice".into(), username: "Alice".into() }
+            TraktUser {
+                slug: "alice".into(),
+                username: "Alice".into()
+            }
         );
         assert_eq!(
             client.watchlist("ignored").await.unwrap(),
-            vec![TraktItem { media_type: MediaType::Movie, tmdb_id: 1 }]
+            vec![TraktItem {
+                media_type: MediaType::Movie,
+                tmdb_id: 1
+            }]
         );
         assert_eq!(
             client.in_progress("ignored").await.unwrap(),
-            vec![TraktItem { media_type: MediaType::Show, tmdb_id: 2 }]
+            vec![TraktItem {
+                media_type: MediaType::Show,
+                tmdb_id: 2
+            }]
         );
         assert_eq!(client.watched("ignored").await.unwrap().movies, vec![3]);
     }
@@ -741,7 +890,10 @@ mod tests {
     #[tokio::test]
     async fn mock_trakt_fail_reads_errors_reads_and_fail_refresh_errors_refresh() {
         let mock = MockTrakt {
-            watchlist: vec![TraktItem { media_type: MediaType::Movie, tmdb_id: 1 }],
+            watchlist: vec![TraktItem {
+                media_type: MediaType::Movie,
+                tmdb_id: 1,
+            }],
             fail_reads: true,
             fail_refresh: true,
             ..Default::default()
