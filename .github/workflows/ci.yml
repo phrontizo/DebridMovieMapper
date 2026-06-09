@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, v2]
   pull_request:
-    branches: [main]
+    branches: [main, v2]
 
 permissions: {}
 
@@ -87,16 +87,22 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # The rolling edge tag is per-line: `main` publishes `:edge`, the `v2` development
+      # line publishes `:v2edge`, so both can be built from their branch without clashing.
       - name: Compute image tags
         id: tags
         env:
           HAS_DOCKERHUB: ${{ steps.dockerhub.outputs.enabled }}
         run: |
+          case "${GITHUB_REF_NAME}" in
+            v2) edge_tag="v2edge" ;;
+            *)  edge_tag="edge" ;;
+          esac
           {
             echo "value<<EOF"
-            echo "${GHCR_IMAGE}:edge"
+            echo "${GHCR_IMAGE}:${edge_tag}"
             if [ "$HAS_DOCKERHUB" = "true" ]; then
-              echo "${DOCKERHUB_IMAGE}:edge"
+              echo "${DOCKERHUB_IMAGE}:${edge_tag}"
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
