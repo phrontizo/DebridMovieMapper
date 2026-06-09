@@ -792,7 +792,8 @@ async fn execute_remove(
             }
         }
         if let Err(e) = store.remove_owned(hash.clone()).await {
-            warn!("reconcile: remove_owned {} (tmdb {}) failed: {}", hash, tmdb_id, e);
+            warn!("reconcile: remove_owned {} (tmdb {}) failed: {}; leaving selection intact for retry", hash, tmdb_id, e);
+            continue;
         }
         // SP3: drop any selection slots this hash represented.
         for (slot, entry) in store.all_selection().await {
