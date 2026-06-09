@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcquireOutcome {
@@ -124,6 +124,9 @@ pub struct AcquisitionEngine {
     prefs: QualityPrefs,
     max_attempts: u32,
     stall_timeout: Duration,
+    /// How long an optimistically-added torrent may stay Pending without resolving its file list
+    /// (or seeding) before `observe` reaps it as dead and re-scrapes (SP3).
+    dead_timeout: Duration,
     /// torrent_id -> (last progress, when first seen at that progress) for stall detection.
     progress: Arc<Mutex<HashMap<String, (f64, Instant)>>>,
     /// hash -> consecutive deferred-probe count, to bound re-probing of stuck-Pending torrents.
@@ -167,6 +170,34 @@ fn select_file_ids(info: &TorrentInfo, file_hint: Option<&str>, file_idx: Option
         .unwrap_or_default()
 }
 
+/// Select file ids appropriate to the request kind: a single target video for a movie (so the
+/// movie-pack guard can reject multi-feature packs), or ALL video files for a series (so a season
+/// pack downloads fully on providers that don't auto-select, and `provides` covers every episode).
+fn select_ids_for(kind: MediaKind, info: &TorrentInfo, hint: Option<&str>, idx: Option<usize>) -> Vec<u32> {
+    match kind {
+        MediaKind::Movie => select_file_ids(info, hint, idx),
+        MediaKind::Series => info
+            .files
+            .iter()
+            .filter(|f| crate::vfs::is_video_file(&f.path))
+            .map(|f| f.id)
+            .collect(),
+    }
+}
+
+/// Map a torrent's SELECTED video files to (season, episode, file_path) by parsing SxxExx.
+/// `pub(crate)` so the upgrade engine can reuse it for consolidation.
+pub(crate) fn episode_files(info: &TorrentInfo) -> Vec<(u32, u32, String)> {
+    info.files
+        .iter()
+        .filter(|f| f.selected == 1 && crate::vfs::is_video_file(&f.path))
+        .filter_map(|f| {
+            let name = f.path.rsplit('/').next().unwrap_or(&f.path);
+            parse_se(name).map(|(s, e)| (s, e, f.path.clone()))
+        })
+        .collect()
+}
+
 /// Count feature-sized video files. A real single-movie release has exactly one; more than one
 /// signals a multi-movie pack. The size floor excludes samples / extras / featurettes.
 fn count_feature_videos(info: &TorrentInfo) -> usize {
@@ -203,11 +234,6 @@ fn locator_for(info: &TorrentInfo, hash: &str, path: &str) -> FileLocator {
     }
 }
 
-enum CandidateResult {
-    Done(AcquireOutcome),
-    Next,
-}
-
 enum VerifyResult {
     Pass,
     Accept,
@@ -230,6 +256,7 @@ impl AcquisitionEngine {
         prefs: QualityPrefs,
         max_attempts: u32,
         stall_timeout: Duration,
+        dead_timeout: Duration,
     ) -> Self {
         Self {
             provider,
@@ -240,15 +267,17 @@ impl AcquisitionEngine {
             prefs,
             max_attempts,
             stall_timeout,
+            dead_timeout,
             progress: Arc::new(Mutex::new(HashMap::new())),
             verify_attempts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Acquire `req`, recording `provenance` on the resulting `OwnedRecord`. The provenance is
-    /// supplied by the caller (the `--acquire` CLI passes `Provenance::manual()`; the SP2
-    /// reconciler passes the current wanters) and is preserved across `observe`'s
-    /// fail-and-reacquire so a re-acquired title keeps its original origin (sticky provenance).
+    /// Optimistically acquire `req`: scrape, rank, add the best non-blacklisted candidate, record
+    /// it `Pending`, and return — WITHOUT synchronously selecting/validating/probing (that is
+    /// `observe`'s job once the torrent's files resolve). A slow-to-seed release is therefore no
+    /// longer judged or deleted prematurely. `provenance` is recorded and preserved across
+    /// `observe`'s re-acquire (sticky).
     pub async fn acquire(&self, req: AcquireRequest, provenance: Provenance) -> AcquireOutcome {
         let candidates = match self
             .scraper
@@ -275,146 +304,49 @@ impl AcquisitionEngine {
             if self.store.get_owned(cand.info_hash.clone()).await.is_some() {
                 return AcquireOutcome::Acquired(cand.info_hash.clone()); // idempotent
             }
-            match self.try_candidate(&req, &cand, &provenance).await {
-                CandidateResult::Done(o) => return o,
-                CandidateResult::Next => continue,
-            }
-        }
-        AcquireOutcome::NoAcceptableRelease
-    }
-
-    /// Delete any torrent in the account whose hash matches `hash`. Used when a candidate's
-    /// materialise fails *after* the provider registered the magnet (TorBox "already queued", or an
-    /// add whose file list never resolves and whose in-materialise delete lost a race) so a rejected
-    /// candidate never lingers as a dead "checking" torrent.
-    async fn cleanup_leaked(&self, hash: &str) {
-        if let Ok(torrents) = self.provider.get_torrents().await {
-            for t in torrents.iter().filter(|t| t.hash.eq_ignore_ascii_case(hash)) {
-                let _ = self.provider.delete_torrent(&t.id).await;
-            }
-        }
-    }
-
-    async fn try_candidate(
-        &self,
-        req: &AcquireRequest,
-        cand: &ReleaseInfo,
-        provenance: &Provenance,
-    ) -> CandidateResult {
-        let hash = cand.info_hash.clone();
-        let hint = cand.file_name.clone();
-        let idx = cand.file_idx;
-        let selector = move |info: &TorrentInfo| select_file_ids(info, hint.as_deref(), idx);
-
-        let (new_id, _post) = match crate::reacquire::materialise(
-            &*self.provider,
-            &hash,
-            Duration::from_secs(1),
-            Duration::from_secs(15),
-            selector,
-        )
-        .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("materialise failed for {}: {} — cleaning up and trying next", hash, e);
-                self.cleanup_leaked(&hash).await;
-                return CandidateResult::Next;
-            }
-        };
-
-        // Re-fetch final info (materialise returns pre-select info; links/status settle after select).
-        let final_info = match self.provider.get_torrent_info(&new_id).await {
-            Ok(i) => i,
-            Err(e) => {
-                warn!("get_torrent_info failed for {}: {}", new_id, e);
-                let _ = self.provider.delete_torrent(&new_id).await;
-                return CandidateResult::Next;
-            }
-        };
-        // Movie-pack guard: a single-movie request must not adopt a multi-movie pack. Providers
-        // that auto-select every file (TorBox) would otherwise pull the whole pack into the
-        // library (dozens of unrelated films under one folder). A genuine movie release has one
-        // feature-sized video; more than one means a pack — reject and try the next candidate.
-        if req.kind == MediaKind::Movie && count_feature_videos(&final_info) > 1 {
-            warn!("rejecting multi-movie pack for {} (feature-sized videos > 1)", hash);
-            let _ = self.provider.delete_torrent(&new_id).await;
-            return CandidateResult::Next;
-        }
-
-        let Some(selected_path) =
-            select_target(&final_info, cand.file_name.as_deref(), cand.file_idx).map(|f| f.path.clone())
-        else {
-            let _ = self.provider.delete_torrent(&new_id).await;
-            return CandidateResult::Next;
-        };
-        let file_name = selected_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&selected_path)
-            .to_string();
-
-        // STRICT title validation BEFORE recording anything.
-        if !self
-            .validator
-            .validate(&file_name, req.tmdb_id, req.kind, req.season, req.episode)
-            .await
-        {
-            warn!("title validation rejected {} (hash {})", file_name, hash);
+            let magnet = format!("magnet:?xt=urn:btih:{}", cand.info_hash);
+            let added = match self.provider.add_magnet(&magnet).await {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!("add_magnet failed for {}: {} — trying next", cand.info_hash, e);
+                    continue;
+                }
+            };
+            // Record Pending immediately (the verdict belongs to observe).
+            let provides = match (req.kind, req.season, req.episode) {
+                (MediaKind::Series, Some(s), Some(e)) => vec![(s, e)],
+                _ => vec![],
+            };
             let _ = self
                 .store
-                .blacklist_add(req.tmdb_id, hash.clone(), "WrongTitle", now_secs())
+                .put_owned(
+                    cand.info_hash.clone(),
+                    OwnedRecord {
+                        request: req.clone(),
+                        provenance: provenance.clone(),
+                        added_at: now_secs(),
+                        status: OwnedStatus::Pending,
+                        provides,
+                        quality: Some(release::QualitySummary::of(&cand, &self.prefs)),
+                    },
+                )
                 .await;
-            let _ = self.provider.delete_torrent(&new_id).await;
-            return CandidateResult::Next;
-        }
-
-        let _ = self
-            .store
-            .put_owned(
-                hash.clone(),
-                OwnedRecord {
-                    request: req.clone(),
-                    provenance: provenance.clone(),
-                    added_at: now_secs(),
-                    status: OwnedStatus::Pending,
-                    provides: vec![],
-                    quality: None,
-                },
-            )
-            .await;
-        let _ = self
-            .store
-            .put_authoritative(hash.clone(), req.metadata.clone())
-            .await;
-
-        if final_info.status != "downloaded" {
-            info!("acquired {} (downloading; verify on completion)", hash);
-            return CandidateResult::Done(AcquireOutcome::Pending(hash));
-        }
-
-        let locator = locator_for(&final_info, &hash, &selected_path);
-        match self.verify_file(&locator, req).await {
-            VerifyResult::Pass | VerifyResult::Accept => {
-                let _ = self
-                    .store
-                    .set_owned_status(hash.clone(), OwnedStatus::Verified)
-                    .await;
-                CandidateResult::Done(AcquireOutcome::Acquired(hash))
+            let _ = self
+                .store
+                .put_authoritative(cand.info_hash.clone(), req.metadata.clone())
+                .await;
+            // Best-effort: if the file list is already present (cached), select now so it is
+            // immediately resolvable; otherwise observe selects once metadata resolves.
+            if let Ok(info) = self.provider.get_torrent_info(&added.id).await {
+                let ids = select_ids_for(req.kind, &info, cand.file_name.as_deref(), cand.file_idx);
+                if !ids.is_empty() {
+                    let csv = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+                    let _ = self.provider.select_files(&added.id, &csv).await;
+                }
             }
-            VerifyResult::Defer => CandidateResult::Done(AcquireOutcome::Pending(hash)),
-            VerifyResult::Reject(reason) => {
-                warn!("probe rejected {} ({}) — blacklisting", hash, reason);
-                let _ = self
-                    .store
-                    .blacklist_add(req.tmdb_id, hash.clone(), reason, now_secs())
-                    .await;
-                let _ = self.store.remove_owned(hash.clone()).await;
-                let _ = self.store.remove_authoritative(hash.clone()).await;
-                let _ = self.provider.delete_torrent(&new_id).await;
-                CandidateResult::Next
-            }
+            return AcquireOutcome::Pending(cand.info_hash);
         }
+        AcquireOutcome::NoAcceptableRelease
     }
 
     async fn verify_file(&self, locator: &FileLocator, req: &AcquireRequest) -> VerifyResult {
@@ -680,33 +612,26 @@ mod tests {
         prober: Arc<dyn Prober>,
         store: Store,
     ) -> AcquisitionEngine {
-        AcquisitionEngine::new(provider, scraper, validator, prober, store, prefs(), 5, Duration::from_secs(1800))
+        AcquisitionEngine::new(provider, scraper, validator, prober, store, prefs(), 5, Duration::from_secs(1800), Duration::from_secs(600))
     }
 
     #[tokio::test]
-    async fn cached_pass_records_owned_and_authoritative() {
+    async fn acquire_records_pending_and_quality_optimistically() {
         let st = store();
         let scraper = Arc::new(MockScraper { candidates: vec![cand("h1", true)] });
-        let prober = Arc::new(CannedProber(Ok(vec![Track {
-            kind: crate::probe::TrackKind::Audio,
-            language: Some("eng".into()),
-        }])));
         let eng = engine(
             provider_returning("downloaded", "h1"),
             scraper,
             Arc::new(OkValidator(true)),
-            prober,
+            Arc::new(CannedProber(Ok(vec![]))),
             st.clone(),
         );
-        // The provenance passed to acquire must be the one recorded on the OwnedRecord.
         let out = eng.acquire(req(), Provenance::watchlist("alice")).await;
-        assert_eq!(out, AcquireOutcome::Acquired("h1".into()));
-        assert_eq!(st.get_owned("h1".into()).await.unwrap().status, OwnedStatus::Verified);
-        assert_eq!(
-            st.get_owned("h1".into()).await.unwrap().provenance,
-            Provenance::watchlist("alice"),
-            "the provenance passed to acquire must be stored on the OwnedRecord"
-        );
+        assert_eq!(out, AcquireOutcome::Pending("h1".into()), "acquire is optimistic: always Pending");
+        let rec = st.get_owned("h1".into()).await.unwrap();
+        assert_eq!(rec.status, OwnedStatus::Pending);
+        assert_eq!(rec.provenance, Provenance::watchlist("alice"));
+        assert!(rec.quality.unwrap().cached, "cached candidate's quality recorded");
         assert_eq!(
             st.authoritative_meta("h1".into()).await.unwrap().external_id.as_deref(),
             Some("tmdb:27205")
@@ -714,157 +639,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_leaked_deletes_only_hash_matching_torrents() {
-        // A rejected/failed candidate's torrent must be removed (matched by hash, case-insensitive)
-        // so it doesn't linger as a dead "checking" torrent; unrelated torrents are left alone.
-        let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                crate::rd_client::Torrent { id: "keep".into(), hash: "other".into(), ..Default::default() },
-                crate::rd_client::Torrent { id: "leak".into(), hash: "H1".into(), ..Default::default() },
-            ],
-            deleted: deleted.clone(),
-            ..Default::default()
-        });
+    async fn acquire_idempotent_when_already_owned() {
+        let st = store();
+        st.put_owned("h1".into(), OwnedRecord {
+            request: req(), provenance: Provenance::manual(), added_at: 1,
+            status: OwnedStatus::Verified, provides: vec![], quality: None,
+        }).await.unwrap();
         let eng = engine(
-            provider,
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![cand("h1", true)] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        assert_eq!(eng.acquire(req(), Provenance::manual()).await, AcquireOutcome::Acquired("h1".into()));
+    }
+
+    #[tokio::test]
+    async fn acquire_no_candidates_is_no_acceptable() {
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
             Arc::new(MockScraper { candidates: vec![] }),
             Arc::new(OkValidator(true)),
             Arc::new(CannedProber(Ok(vec![]))),
             store(),
         );
-        eng.cleanup_leaked("h1").await; // case-insensitive vs the stored "H1"
-        assert_eq!(*deleted.lock().unwrap(), vec!["leak".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn wrong_title_is_blacklisted_and_not_recorded() {
-        let st = store();
-        let scraper = Arc::new(MockScraper { candidates: vec![cand("h1", true)] });
-        let prober = Arc::new(CannedProber(Ok(vec![])));
-        let eng = engine(
-            provider_returning("downloaded", "h1"),
-            scraper,
-            Arc::new(OkValidator(false)),
-            prober,
-            st.clone(),
-        );
-        let out = eng.acquire(req(), Provenance::manual()).await;
-        assert_eq!(out, AcquireOutcome::NoAcceptableRelease);
-        assert!(st.get_owned("h1".into()).await.is_none(), "rejected hash must not be recorded");
-        assert!(st.is_blacklisted(27205, "h1".into()).await, "rejected hash must be blacklisted");
-    }
-
-    #[tokio::test]
-    async fn bad_audio_blacklists_and_returns_no_acceptable() {
-        let st = store();
-        let scraper = Arc::new(MockScraper { candidates: vec![cand("h1", true)] });
-        let prober = Arc::new(CannedProber(Ok(vec![Track {
-            kind: crate::probe::TrackKind::Audio,
-            language: Some("jpn".into()),
-        }])));
-        let eng = engine(
-            provider_returning("downloaded", "h1"),
-            scraper,
-            Arc::new(OkValidator(true)),
-            prober,
-            st.clone(),
-        );
-        let out = eng.acquire(req(), Provenance::manual()).await;
-        assert_eq!(out, AcquireOutcome::NoAcceptableRelease);
-        assert!(st.is_blacklisted(27205, "h1".into()).await);
-        assert!(st.get_owned("h1".into()).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn uncached_pick_returns_pending() {
-        let st = store();
-        let scraper = Arc::new(MockScraper { candidates: vec![cand("h1", false)] });
-        let prober = Arc::new(CannedProber(Ok(vec![])));
-        let eng = engine(
-            provider_returning("downloading", "h1"),
-            scraper,
-            Arc::new(OkValidator(true)),
-            prober,
-            st.clone(),
-        );
-        let out = eng.acquire(req(), Provenance::manual()).await;
-        assert_eq!(out, AcquireOutcome::Pending("h1".into()));
-        assert_eq!(st.get_owned("h1".into()).await.unwrap().status, OwnedStatus::Pending);
-    }
-
-    #[tokio::test]
-    async fn inconclusive_probe_accepts() {
-        let st = store();
-        let scraper = Arc::new(MockScraper { candidates: vec![cand("h1", true)] });
-        let prober = Arc::new(CannedProber(Err(ProbeError::Unsupported)));
-        let eng = engine(
-            provider_returning("downloaded", "h1"),
-            scraper,
-            Arc::new(OkValidator(true)),
-            prober,
-            st.clone(),
-        );
-        let out = eng.acquire(req(), Provenance::manual()).await;
-        assert_eq!(out, AcquireOutcome::Acquired("h1".into()));
-    }
-
-    #[tokio::test]
-    async fn already_owned_is_idempotent() {
-        let st = store();
-        st.put_owned(
-            "h1".into(),
-            OwnedRecord {
-                request: req(),
-                provenance: Provenance::manual(),
-                added_at: 1,
-                status: OwnedStatus::Verified,
-                provides: vec![],
-                quality: None,
-            },
-        )
-        .await
-        .unwrap();
-        let scraper = Arc::new(MockScraper { candidates: vec![cand("h1", true)] });
-        let prober = Arc::new(CannedProber(Ok(vec![])));
-        let eng = engine(
-            provider_returning("downloaded", "h1"),
-            scraper,
-            Arc::new(OkValidator(true)),
-            prober,
-            st.clone(),
-        );
-        let out = eng.acquire(req(), Provenance::manual()).await;
-        assert_eq!(out, AcquireOutcome::Acquired("h1".into()));
-    }
-
-    #[tokio::test]
-    async fn movie_pack_candidate_is_rejected() {
-        // A single-movie request must reject a multi-movie pack (>1 feature-sized video) so a
-        // provider that auto-selects all files (TorBox) doesn't pull dozens of unrelated films.
-        let st = store();
-        let scraper = Arc::new(MockScraper { candidates: vec![cand("h1", true)] });
-        let prober = Arc::new(CannedProber(Ok(vec![])));
-        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            add_magnet: Some(AddMagnetResponse { id: "tid".into(), uri: String::new() }),
-            torrent_info: Some(TI {
-                id: "tid".into(),
-                hash: "h1".into(),
-                status: "downloaded".into(),
-                files: vec![
-                    TorrentFile { id: 0, path: "Movie.A.2020.1080p.mkv".into(), bytes: 2_000_000_000, selected: 1 },
-                    TorrentFile { id: 1, path: "Movie.B.2019.1080p.mkv".into(), bytes: 2_000_000_000, selected: 1 },
-                ],
-                links: vec!["https://cdn/a".into(), "https://cdn/b".into()],
-                ..Default::default()
-            }),
-            resolved_url: Some("https://cdn/a".into()),
-            ..Default::default()
-        });
-        let eng = engine(provider, scraper, Arc::new(OkValidator(true)), prober, st.clone());
-        let out = eng.acquire(req(), Provenance::manual()).await;
-        assert_eq!(out, AcquireOutcome::NoAcceptableRelease, "a multi-movie pack must be rejected");
-        assert!(st.get_owned("h1".into()).await.is_none(), "a rejected pack must not be recorded");
+        assert_eq!(eng.acquire(req(), Provenance::manual()).await, AcquireOutcome::NoAcceptableRelease);
     }
 
     #[tokio::test]

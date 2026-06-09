@@ -240,6 +240,7 @@ async fn lifecycle_acquire_sintel_by_imdb() {
         debridmoviemapper::config::AcquisitionConfig::default().prefs,
         5,
         std::time::Duration::from_secs(1800),
+        std::time::Duration::from_secs(600),
     );
 
     // Resolve Sintel's TMDB id from its IMDB id at runtime.

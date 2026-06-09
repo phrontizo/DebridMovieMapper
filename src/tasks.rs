@@ -1110,6 +1110,7 @@ mod provider_abstraction_tests {
         let engine = std::sync::Arc::new(crate::acquire::AcquisitionEngine::new(
             provider.clone(), scraper.clone(), validator, prober, store.clone(),
             crate::config::AcquisitionConfig::default().prefs, 5, std::time::Duration::from_secs(1800),
+            std::time::Duration::from_secs(600),
         ));
         let app = AppState {
             provider: provider.clone(),
@@ -1810,6 +1811,7 @@ mod reconcile_wanted_tests {
             AcquisitionConfig::default().prefs,
             5,
             std::time::Duration::from_secs(1800),
+            std::time::Duration::from_secs(600),
         );
         let tmdb = crate::tmdb_client::TmdbClient::new("k".into()).unwrap();
 

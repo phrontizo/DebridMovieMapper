@@ -97,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.acquisition.prefs.clone(),
         config.acquisition.max_acquire_attempts,
         std::time::Duration::from_secs(config.acquisition.stall_timeout_secs),
+        std::time::Duration::from_secs(config.acquisition.acquire_dead_timeout_secs),
     ));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

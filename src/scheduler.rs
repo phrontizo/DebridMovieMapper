@@ -181,6 +181,7 @@ fn make_test_app(with_trakt: bool) -> crate::app_state::AppState {
         crate::config::AcquisitionConfig::default().prefs,
         5,
         std::time::Duration::from_secs(1800),
+        std::time::Duration::from_secs(600),
     ));
     AppState {
         provider: provider.clone(),
