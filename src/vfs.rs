@@ -363,12 +363,20 @@ impl DebridVfs {
                     // directory, skip it to avoid creating (1)/(2) duplicates from repair replacements.
                     // SP3: per-episode selection overrides for this show (slot -> entry).
                     let show_tmdb = tmdb_id_of(&metadata);
-                    // Hashes present in this show's group — a selection naming an absent hash is
-                    // stale and must NOT hide the episode (self-healing). Compute BEFORE the loop
-                    // below moves `torrents`.
-                    let present_hashes: std::collections::HashSet<String> = torrents
+                    // The (hash, file_path) pairs actually emittable in this show's group. A
+                    // selection naming a pair that isn't present — an absent hash, OR a present
+                    // hash whose file was re-listed under a different path — is stale and must NOT
+                    // hide the episode (self-healing → falls back to the legacy first/largest dedup
+                    // so the episode still appears). Computed BEFORE the loop below moves `torrents`.
+                    let present_files: std::collections::HashSet<(String, String)> = torrents
                         .iter()
-                        .map(|t| t.hash.to_ascii_lowercase())
+                        .flat_map(|t| {
+                            let h = t.hash.to_ascii_lowercase();
+                            t.files
+                                .iter()
+                                .filter(|f| f.selected == 1 && is_video_file(&f.path))
+                                .map(move |f| (h.clone(), f.path.clone()))
+                        })
                         .collect();
                     for torrent in torrents {
                         let torrent_ts = parse_rd_date(&torrent.added);
@@ -404,12 +412,15 @@ impl DebridVfs {
                                             if let Some(sel) = selection
                                                 .get(&crate::store::episode_slot(tmdb, se_s, se_e))
                                             {
-                                                // Enforce the override only when the selected hash
-                                                // is actually present; a stale selection degrades to
-                                                // the legacy dedup so the episode still appears.
-                                                if present_hashes
-                                                    .contains(&sel.hash.to_ascii_lowercase())
-                                                {
+                                                // Enforce the override only when the selected
+                                                // (hash, file_path) is actually present; a stale
+                                                // selection (absent hash, or a path that no longer
+                                                // matches) degrades to the legacy dedup so the
+                                                // episode still appears.
+                                                if present_files.contains(&(
+                                                    sel.hash.to_ascii_lowercase(),
+                                                    sel.file_path.clone(),
+                                                )) {
                                                     let is_selected = torrent
                                                         .hash
                                                         .eq_ignore_ascii_case(&sel.hash)
@@ -3305,6 +3316,57 @@ mod selection_tests {
         assert!(
             found,
             "stale selection (absent hash) must not hide the episode"
+        );
+    }
+
+    #[test]
+    fn episode_selection_present_hash_wrong_path_degrades_to_legacy_dedup() {
+        // The selection names a hash that IS present, but a file_path that no file under that hash
+        // matches (e.g. the provider re-listed the torrent with a slightly different path). The
+        // episode must still appear — the (hash, file_path) pair isn't emittable, so it degrades to
+        // the legacy dedup rather than skipping every copy and vanishing.
+        let torrent = TorrentInfo {
+            id: "t".into(),
+            hash: "h_live".into(),
+            bytes: 1_000_000_000,
+            status: "downloaded".into(),
+            files: vec![TorrentFile {
+                id: 0,
+                path: "Show.S01E01.1080p.mkv".into(),
+                bytes: 1_000_000_000,
+                selected: 1,
+            }],
+            links: vec!["https://cdn/e1".into()],
+            ..Default::default()
+        };
+        let mut sel = SelectionMap::new();
+        sel.insert(
+            episode_slot(1396, 1, 1),
+            SelectionEntry {
+                hash: "h_live".into(),
+                // Present hash, but a path no file under it matches.
+                file_path: "Show.S01E01.720p.mkv".into(),
+            },
+        );
+        let vfs = DebridVfs::build(vec![(torrent, show_meta(1396))], &sel);
+        let mut found = false;
+        if let VfsNode::Directory { children } = &vfs.root {
+            if let Some(VfsNode::Directory { children: shows }) = children.get("Shows") {
+                for show in shows.values() {
+                    if let VfsNode::Directory { children: seasons } = show {
+                        if let Some(VfsNode::Directory { children: eps }) = seasons.get("Season 01")
+                        {
+                            if eps.values().any(|n| matches!(n, VfsNode::MediaFile { .. })) {
+                                found = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            found,
+            "a selection with a present hash but mismatched file_path must not hide the episode"
         );
     }
 }

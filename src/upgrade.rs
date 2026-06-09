@@ -163,6 +163,34 @@ async fn try_upgrade_movie(
     Ok(())
 }
 
+/// Real-Debrid reports a freshly-added torrent as `waiting_files_selection` (its file list is
+/// already populated) until `select_files` is called, and only flips a *cached* torrent to
+/// `downloaded` a moment after the selection registers. So an upgrade stage must select FIRST, then
+/// poll for the cached verdict — gating on `status == "downloaded"` before selection would reject
+/// every candidate on RD (this is exactly how the `observe` path is ordered). Returns the latest
+/// `TorrentInfo` seen so the caller can inspect `status`/`files` against the post-selection state.
+async fn await_downloaded(
+    provider: &dyn crate::provider::DebridProvider,
+    id: &str,
+) -> Option<crate::rd_client::TorrentInfo> {
+    const ATTEMPTS: u32 = 10;
+    const SETTLE: Duration = Duration::from_secs(1);
+    let mut last = None;
+    for i in 0..ATTEMPTS {
+        if i > 0 {
+            tokio::time::sleep(SETTLE).await;
+        }
+        if let Ok(info) = provider.get_torrent_info(id).await {
+            let done = info.status == "downloaded";
+            last = Some(info);
+            if done {
+                break;
+            }
+        }
+    }
+    last
+}
+
 /// Add the candidate, wait briefly for it to resolve (it should be cached), validate + record it
 /// Verified with sticky provenance, and return (hash, torrent_id, selected_file_path). On any
 /// failure the candidate is cleaned up and the current release is left untouched (non-destructive).
@@ -186,12 +214,9 @@ async fn stage_and_verify(
             return Err(format!("info failed: {e}"));
         }
     };
-    // Must be cached/downloaded with a video file to stage (we never speculatively download upgrades).
-    if info.status != "downloaded" {
-        let _ = app.provider.delete_torrent(&added.id).await;
-        return Err("candidate not cached".into());
-    }
-    // Select the single feature file.
+    // Select the single feature file FIRST: RD only reports a (cached) torrent as `downloaded`
+    // after selection, so gating on cached-ness before selecting would reject every candidate on
+    // RD (mirrors the `observe` ordering). The file list is populated pre-selection.
     let Some(file) = info
         .files
         .iter()
@@ -202,8 +227,17 @@ async fn stage_and_verify(
         return Err("no video file".into());
     };
     let csv = file.id.to_string();
-    let _ = app.provider.select_files(&added.id, &csv).await;
     let selected_path = file.path.clone();
+    let _ = app.provider.select_files(&added.id, &csv).await;
+    // Re-fetch and wait for the cached verdict; only a `downloaded` torrent may be staged (we never
+    // speculatively download upgrades). All later gates run against this post-selection `fresh`.
+    let fresh = await_downloaded(app.provider.as_ref(), &added.id)
+        .await
+        .unwrap_or(info);
+    if fresh.status != "downloaded" {
+        let _ = app.provider.delete_torrent(&added.id).await;
+        return Err("candidate not cached".into());
+    }
     let file_name = selected_path
         .rsplit('/')
         .next()
@@ -212,7 +246,7 @@ async fn stage_and_verify(
     // Movie-pack guard (I-2): a candidate that materialises into more than one feature-sized
     // video is a multi-movie pack (providers like TorBox auto-select all files) — never adopt it.
     // Run BEFORE title-validation to save a TMDB lookup on a pack that would be rejected anyway.
-    if crate::acquire::count_feature_videos(&info) > 1 {
+    if crate::acquire::count_feature_videos(&fresh) > 1 {
         let _ = app.provider.delete_torrent(&added.id).await;
         let _ = app
             .store
@@ -238,7 +272,7 @@ async fn stage_and_verify(
     // dropped without blacklisting (retried next tick) so we never degrade the working release.
     match app
         .engine
-        .probe_file(&info, &hash, &selected_path, base_req)
+        .probe_file(&fresh, &hash, &selected_path, base_req)
         .await
     {
         crate::acquire::VerifyResult::Pass | crate::acquire::VerifyResult::Accept => {}
@@ -443,11 +477,9 @@ async fn try_consolidate_show(
                 let _ = app.provider.delete_torrent(&added.id).await;
                 continue;
             };
-            if info.status != "downloaded" {
-                let _ = app.provider.delete_torrent(&added.id).await;
-                continue;
-            }
-            // Select all videos so the pack is fully available.
+            // Select all videos so the pack is fully available. RD reports a cached torrent as
+            // `downloaded` only AFTER selection, so the cached gate must come after select + poll
+            // (gating on `info.status` here would reject every cached pack on RD).
             let ids: Vec<u32> = info
                 .files
                 .iter()
@@ -472,11 +504,15 @@ async fn try_consolidate_show(
                     );
                 }
             }
-            let fresh = app
-                .provider
-                .get_torrent_info(&added.id)
+            // Poll for the cached verdict (RD lags select→downloaded by a moment), then gate: never
+            // adopt an uncached pack (we never speculatively download a consolidation).
+            let fresh = await_downloaded(app.provider.as_ref(), &added.id)
                 .await
                 .unwrap_or(info);
+            if fresh.status != "downloaded" {
+                let _ = app.provider.delete_torrent(&added.id).await;
+                continue;
+            }
             let eps = crate::acquire::episode_files(&fresh); // (s,e,path) — pub(crate) from Task 6
                                                              // Fix A: consolidation adopts a single-season pack only. A multi-season ("complete series") pack
                                                              // would leave its other seasons recorded-as-owned but un-repointed/un-pruned — reject it so
@@ -875,6 +911,137 @@ mod tests {
         assert!(
             deleted.lock().unwrap().contains(&"told".to_string()),
             "old torrent deleted from provider"
+        );
+    }
+
+    /// Simulates Real-Debrid's add→select→downloaded lifecycle: a freshly-added (even cached)
+    /// torrent reports `waiting_files_selection` with its file list already populated, and flips to
+    /// `downloaded` only AFTER `select_files` is called. The pre-fix ordering (gate on status
+    /// before selecting) rejects every candidate against this provider; the fixed ordering adopts
+    /// it. This is a regression guard for the upgrade engine being silently inert on RD.
+    #[derive(Debug)]
+    struct RdLifecycleProvider {
+        selected: std::sync::atomic::AtomicBool,
+        listing: Vec<Torrent>,
+        deleted: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl DebridProvider for RdLifecycleProvider {
+        fn name(&self) -> &'static str {
+            "rd-lifecycle"
+        }
+        async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
+            Ok(self.listing.clone())
+        }
+        async fn get_torrent_info(&self, _id: &str) -> Result<TorrentInfo, reqwest::Error> {
+            let sel = self.selected.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(TorrentInfo {
+                id: "tnew".into(),
+                hash: "hnew".into(),
+                status: if sel {
+                    "downloaded".into()
+                } else {
+                    "waiting_files_selection".into()
+                },
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "M.2020.1080p.REMUX.mkv".into(),
+                    bytes: 30_000_000_000,
+                    selected: if sel { 1 } else { 0 },
+                }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            })
+        }
+        async fn add_magnet(&self, _m: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+            Ok(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            })
+        }
+        async fn select_files(&self, _t: &str, _f: &str) -> Result<(), reqwest::Error> {
+            self.selected
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn delete_torrent(&self, t: &str) -> Result<(), reqwest::Error> {
+            self.deleted.lock().unwrap().push(t.to_string());
+            Ok(())
+        }
+        async fn resolve_url(
+            &self,
+            _l: &crate::provider::FileLocator,
+        ) -> Result<String, crate::error::AppError> {
+            Ok("https://cdn/new".into())
+        }
+        async fn invalidate(&self, _l: &crate::provider::FileLocator) {}
+        async fn evict_expired_cache(&self) {}
+    }
+
+    #[tokio::test]
+    async fn rd_lifecycle_movie_upgrade_selects_before_cached_gate() {
+        let store = mem_store();
+        store
+            .put_owned(
+                "hold".into(),
+                OwnedRecord {
+                    request: movie_req(),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(QualitySummary {
+                        cached: true,
+                        source_tier: 3_000,
+                        resolution: 1080,
+                        score: 10,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "hold".into(),
+                    file_path: "old.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![remux_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(RdLifecycleProvider {
+            selected: std::sync::atomic::AtomicBool::new(false),
+            listing: vec![
+                Torrent {
+                    id: "told".into(),
+                    hash: "hold".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tnew".into(),
+                    hash: "hnew".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            deleted: deleted.clone(),
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        run_upgrade_once(&app).await;
+
+        let sel = store.get_selection(movie_slot(27205)).await.unwrap();
+        assert_eq!(
+            sel.hash, "hnew",
+            "upgrade must select files before gating on `downloaded`, so the cached REMUX is \
+             adopted even though RD reports `waiting_files_selection` until selection"
         );
     }
 

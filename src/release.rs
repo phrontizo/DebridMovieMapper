@@ -238,7 +238,13 @@ const LANG_WORDS: &[(&str, &str)] = &[
 ];
 
 /// Score a release against prefs. `None` = excluded by a hard rule (resolution ceiling,
-/// cam/telesync source, or an uncached zero-seeder release). Higher better.
+/// cam/telesync source, or an uncached zero-seeder release). Higher is better.
+///
+/// Weight hierarchy (by magnitude): cached availability dominates (1_000_000); then resolution
+/// (`height * 100`, so up to ~216k) — note this intentionally outweighs the source-tier band
+/// (1_000–8_000), since a candidate is only ever scored after the `MAX_RESOLUTION` hard-filter, so
+/// "higher resolution within the allowed ceiling" wins over a lower-resolution higher-tier release;
+/// then source tier, codec/HDR, container, bitrate, and seeders as progressively smaller terms.
 pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
     // Quality floor: never acquire a cam / telesync / telecine / screener / R5 / workprint source.
     if r.source == Source::Cam {

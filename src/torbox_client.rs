@@ -397,10 +397,32 @@ impl TorBoxClient {
                 tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
                 continue;
             }
-            let resp = resp.error_for_status().map_err(|e| e.without_url())?;
-            let _ = resp.text().await?;
-            self.rate_limiter.record_success().await;
-            return Ok(());
+            let status = resp.status();
+            if let Err(e) = resp.error_for_status_ref() {
+                let body = resp.text().await.unwrap_or_default();
+                warn!("TorBox {} error body: {:.300}", status, body);
+                return Err(e.without_url());
+            }
+            // A 200 can still carry `{"success":false}` (TorBox soft failure, e.g. controltorrent
+            // rejecting a delete) — that is NOT success. Parse the envelope and require `success`,
+            // so a caller's "delete the leaked torrent" invariant isn't defeated by a silent no-op.
+            let text = resp.text().await?;
+            match serde_json::from_str::<Envelope<serde_json::Value>>(&text) {
+                Ok(env) if env.success => {
+                    self.rate_limiter.record_success().await;
+                    return Ok(());
+                }
+                Ok(env) => {
+                    warn!(
+                        "TorBox response not success: {:?} body {:.160}",
+                        env.detail, text
+                    );
+                }
+                Err(e) => {
+                    warn!("TorBox decode failed: {} body {:.160}", e, text);
+                }
+            }
+            break;
         }
         Err(synthetic_bad_gateway())
     }
@@ -659,6 +681,52 @@ mod tests {
         let c = TorBoxClient::new("fake".to_string()).unwrap();
         let p: std::sync::Arc<dyn DebridProvider> = std::sync::Arc::new(c);
         assert_eq!(p.name(), "torbox");
+    }
+
+    /// Spawn a local HTTP server that replies once with `200 OK` and the given JSON body.
+    async fn spawn_json_200(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{}/", addr)
+    }
+
+    #[tokio::test]
+    async fn send_ok_rejects_200_with_success_false() {
+        // TorBox returns HTTP 200 with `{"success":false}` for soft failures (e.g. controltorrent
+        // rejecting a delete). That must surface as an error, not a silent Ok — otherwise the
+        // acquisition engine believes a leaked torrent was deleted when it wasn't.
+        let url = spawn_json_200(r#"{"success":false,"detail":"cannot delete"}"#).await;
+        let client = TorBoxClient::new("fake".to_string()).unwrap();
+        let body = serde_json::json!({"torrent_id": 1, "operation": "delete"});
+        let r = client
+            .send_ok(|| client.client.post(&url).json(&body))
+            .await;
+        assert!(r.is_err(), "a 200 with success:false must be an error");
+    }
+
+    #[tokio::test]
+    async fn send_ok_accepts_200_with_success_true() {
+        let url = spawn_json_200(r#"{"success":true,"detail":"deleted"}"#).await;
+        let client = TorBoxClient::new("fake".to_string()).unwrap();
+        let body = serde_json::json!({"torrent_id": 1, "operation": "delete"});
+        let r = client
+            .send_ok(|| client.client.post(&url).json(&body))
+            .await;
+        assert!(r.is_ok(), "a 200 with success:true must be Ok");
     }
 
     // Real shapes captured live from the TorBox API (Sintel).

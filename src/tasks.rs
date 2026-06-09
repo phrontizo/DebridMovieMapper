@@ -615,8 +615,8 @@ fn media_type_of(kind: MediaKind) -> MediaType {
 }
 
 /// The provenance to record AT ACQUIRE TIME: one entry per (user, source) that currently wants
-/// the title. PURE and deterministic — de-duplicated, never includes `Manual` (manual origins
-/// come from the `--acquire` CLI, not from a wanted-set).
+/// the title. PURE and deterministic — de-duplicated, never includes `Manual` (manual origins are
+/// account-mirror adds, not Trakt-driven acquisitions, so they are never derived from a wanted-set).
 pub(crate) fn provenance_from_wanted(wanted: &[WantedRecord]) -> Provenance {
     let mut prov = Provenance {
         entries: Vec::new(),
@@ -659,9 +659,9 @@ pub(crate) enum ReconcileOp {
     },
 }
 
-/// Build the `AcquireRequest` for `tmdb_id` by mirroring the `--acquire` CLI: resolve the IMDB id
-/// and (title, year, original_language) from TMDB. Any TMDB failure → `Err` (the caller logs and
-/// skips). TMDB-dependent, so it is exercised by the live smoke rather than unit tests.
+/// Build the `AcquireRequest` for `tmdb_id`: resolve the IMDB id and (title, year,
+/// original_language) from TMDB. Any TMDB failure → `Err` (the caller logs and skips).
+/// TMDB-dependent, so it is exercised by the live smoke rather than unit tests.
 async fn build_acquire_request(
     tmdb: &TmdbClient,
     tmdb_id: u64,

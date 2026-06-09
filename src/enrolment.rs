@@ -21,11 +21,19 @@ use tracing::{info, warn};
 pub struct EnrolmentService {
     trakt: Arc<dyn TraktClient>,
     store: Store,
+    /// Caps concurrent device-flow enrolment polls to one. The `/trakt/enrol` route carries no
+    /// auth, so without this a single client could spawn unbounded long-lived (~600s) background
+    /// poll tasks — exhausting host resources and hammering Trakt's API under our `client_id`.
+    inflight: Arc<tokio::sync::Semaphore>,
 }
 
 impl EnrolmentService {
     pub fn new(trakt: Arc<dyn TraktClient>, store: Store) -> Self {
-        Self { trakt, store }
+        Self {
+            trakt,
+            store,
+            inflight: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
     }
 
     /// Route a `/trakt*` request by method + path. Unknown `/trakt` paths return 404.
@@ -56,9 +64,22 @@ impl EnrolmentService {
     /// Begin device-flow enrolment: fetch a device code, spawn the background poll that
     /// completes the link, and return HTML showing the user_code + verification URL.
     pub(crate) async fn start_enrolment(&self) -> Response<Body> {
+        // Admit only one in-flight enrolment at a time (the route is unauthenticated). The owned
+        // permit is moved into the background poll below and released when it finishes/expires.
+        let Ok(permit) = self.inflight.clone().try_acquire_owned() else {
+            return html(
+                StatusCode::TOO_MANY_REQUESTS,
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Enrolment in progress</title></head>\
+                 <body><h1>An enrolment is already in progress</h1>\
+                 <p>Finish approving the current device code on trakt.tv, or wait for it to expire, then try again.</p>\
+                 <p><a href=\"/trakt/accounts\">Back to accounts</a></p></body></html>"
+                    .to_string(),
+            );
+        };
         let dc = match self.trakt.device_code().await {
             Ok(dc) => dc,
             Err(e) => {
+                // `permit` drops here, releasing the slot for the next attempt.
                 return html(
                     StatusCode::BAD_GATEWAY,
                     format!(
@@ -66,7 +87,7 @@ impl EnrolmentService {
                          <body><h1>Could not start enrolment</h1><p>{}</p></body></html>",
                         esc(&e.to_string())
                     ),
-                )
+                );
             }
         };
         // Spawn the device-flow completion in the background; the operator approves the code on
@@ -77,6 +98,7 @@ impl EnrolmentService {
         let interval = dc.interval;
         let expires_in = dc.expires_in;
         tokio::spawn(async move {
+            let _permit = permit; // held for the lifetime of the poll → frees the slot on completion/expiry
             match poll_to_completion(&trakt, &store, device_code, interval, expires_in).await {
                 Ok(slug) => info!("Trakt enrolment completed for '{}'", slug),
                 Err(e) => warn!("Trakt enrolment did not complete: {}", e),
@@ -333,6 +355,32 @@ mod tests {
             .await
             .is_err());
         assert!(store.all_trakt_tokens().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_enrolment_caps_concurrent_polls_to_one() {
+        let store = mem_store();
+        let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), store);
+        // Hold the single permit to simulate one enrolment already in flight.
+        let held = svc
+            .inflight
+            .clone()
+            .try_acquire_owned()
+            .expect("first permit available");
+        let refused = svc.start_enrolment().await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a second concurrent enrolment must be refused, not spawn another poll task"
+        );
+        // Once the in-flight enrolment ends, the slot frees and a new enrolment is admitted again.
+        drop(held);
+        let admitted = svc.start_enrolment().await;
+        assert_ne!(
+            admitted.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the slot must free after the in-flight enrolment ends"
+        );
     }
 
     #[tokio::test]

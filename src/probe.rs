@@ -467,15 +467,46 @@ pub async fn probe_tracks(http: &reqwest::Client, cdn_url: &str) -> Result<Vec<T
             Err(ProbeError::TracksNotFound) => {
                 // moov is likely at the tail (non-faststart MP4). The suffix rarely starts on a
                 // box boundary, so this only parses when it happens to; otherwise the probe
-                // returns TracksNotFound and acquisition accepts with a warning.
+                // accepts with a warning. A misaligned tail can make `parse_mp4_tracks` read a
+                // bogus box size and return `Corrupt` — that is NOT evidence the release is
+                // broken, so map any speculative-parse error down to `TracksNotFound` (accept)
+                // rather than blacklisting a valid non-faststart MP4. (A transient *fetch* failure
+                // still propagates via `?` so it defers/retries.)
                 // TODO(SP1+): scan the tail for the `moov` box signature for reliable handling.
                 let tail = fetch_suffix(http, cdn_url, FRONT).await?;
-                parse_mp4_tracks(&tail)
+                parse_mp4_tracks(&tail).or(Err(ProbeError::TracksNotFound))
             }
             other => other,
         },
         None => Err(ProbeError::Unsupported),
     }
+}
+
+/// Cap on a single probe fetch. We only ever request `FRONT` (4 MB) windows, so allow a little
+/// slack above that and refuse anything larger. This is the hard memory guarantee: a CDN that
+/// ignores `Range` (replying `200` with the whole multi-GB file) or lies about a `206` length must
+/// never drive an unbounded allocation in the probe path.
+const MAX_PROBE_FETCH: usize = 8 * 1024 * 1024;
+
+/// Read a ranged response body for the probe. Requires `206 Partial Content` — a `200` means the
+/// CDN ignored the `Range` header and is streaming the entire (potentially multi-GB) object, which
+/// is both wrong (for a suffix request) and an OOM risk. Anything other than 206, a read error, or
+/// a body exceeding `MAX_PROBE_FETCH` maps to `Transient` (defer + retry; we never blacklist a
+/// release merely because we couldn't fetch a probe window). Media files are always far larger than
+/// `FRONT`, so a well-behaved CDN always answers these requests with 206.
+async fn read_partial_body(resp: reqwest::Response) -> Result<Vec<u8>, ProbeError> {
+    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(ProbeError::Transient);
+    }
+    let mut resp = resp;
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|_| ProbeError::Transient)? {
+        buf.extend_from_slice(&chunk);
+        if buf.len() > MAX_PROBE_FETCH {
+            return Err(ProbeError::Transient);
+        }
+    }
+    Ok(buf)
 }
 
 async fn fetch_range(
@@ -490,13 +521,7 @@ async fn fetch_range(
         .send()
         .await
         .map_err(|_| ProbeError::Transient)?;
-    if !resp.status().is_success() {
-        return Err(ProbeError::Transient);
-    }
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|_| ProbeError::Transient)
+    read_partial_body(resp).await
 }
 
 async fn fetch_suffix(http: &reqwest::Client, url: &str, len: u64) -> Result<Vec<u8>, ProbeError> {
@@ -506,13 +531,7 @@ async fn fetch_suffix(http: &reqwest::Client, url: &str, len: u64) -> Result<Vec
         .send()
         .await
         .map_err(|_| ProbeError::Transient)?;
-    if !resp.status().is_success() {
-        return Err(ProbeError::Transient);
-    }
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|_| ProbeError::Transient)
+    read_partial_body(resp).await
 }
 
 #[cfg(test)]

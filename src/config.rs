@@ -377,13 +377,15 @@ impl Config {
     ) -> Result<Self, AppError> {
         let (provider_kind, provider_token) = choose_provider(rd_token, torbox_token)?;
 
+        // Reject a blank key (whitespace-only) rather than deferring the failure to TmdbClient,
+        // mirroring how `choose_provider` treats a whitespace-only provider token as unset.
         let tmdb_api_key = tmdb_api_key
-            .ok_or_else(|| AppError::Config("TMDB_API_KEY must be set".to_string()))?
-            .trim()
-            .to_string();
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AppError::Config("TMDB_API_KEY must be set".to_string()))?;
 
         let scan_interval_secs = match scan_interval_secs {
-            Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
+            Some(s) => s.trim().parse::<u64>().unwrap_or_else(|_| {
                 warn!(
                     "Invalid SCAN_INTERVAL_SECS value '{}', falling back to 60",
                     s
@@ -397,7 +399,7 @@ impl Config {
         let db_path = db_path.unwrap_or_else(|| "metadata.db".to_string());
 
         let port = match port {
-            Some(s) => s.parse::<u16>().unwrap_or_else(|_| {
+            Some(s) => s.trim().parse::<u16>().unwrap_or_else(|_| {
                 warn!("Invalid PORT value '{}', falling back to 8080", s);
                 8080
             }),
@@ -471,6 +473,29 @@ mod tests {
     #[test]
     fn missing_tmdb_is_error() {
         assert!(parts(Some("rd"), None, None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn blank_tmdb_is_error() {
+        // A whitespace-only key is rejected at config time, not deferred to TmdbClient.
+        assert!(parts(Some("rd"), None, Some("   "), None, None, None).is_err());
+    }
+
+    #[test]
+    fn scan_interval_and_port_tolerate_surrounding_whitespace() {
+        // Quoted compose YAML can yield values with surrounding whitespace; honour them rather
+        // than silently falling back to the default.
+        let c = parts(
+            Some("rd"),
+            None,
+            Some("t"),
+            Some(" 120 "),
+            None,
+            Some(" 9000 "),
+        )
+        .unwrap();
+        assert_eq!(c.scan_interval_secs, 120);
+        assert_eq!(c.port, 9000);
     }
 
     #[test]

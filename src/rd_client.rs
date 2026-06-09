@@ -11,6 +11,20 @@ use tracing::{error, info, warn};
 const MAX_CACHE_SIZE: usize = 10_000;
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
 
+/// Build a synthetic Bad Gateway `reqwest::Error` for cases where we must return a
+/// `reqwest::Error` but have no live error response — exhausted retries that only ever produced
+/// deserialisation failures, or (defensively) a success status improbably configured as terminal.
+fn synthetic_bad_gateway(detail: &'static [u8]) -> reqwest::Error {
+    reqwest::Response::from(
+        hyper::Response::builder()
+            .status(reqwest::StatusCode::BAD_GATEWAY)
+            .body(hyper::body::Bytes::from_static(detail))
+            .expect("static BAD_GATEWAY response always builds"),
+    )
+    .error_for_status()
+    .expect_err("BAD_GATEWAY always yields an error status")
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Torrent {
     pub id: String,
@@ -223,9 +237,19 @@ impl RealDebridClient {
                     page += 1;
                 }
                 Err(e) => {
+                    // Returning the partial list here is unsafe: downstream treats a wanted, owned
+                    // title that is absent from the listing as lapsed and re-acquires it, so the
+                    // torrents on the dropped pages would churn. A truncated listing is worse than
+                    // no listing — surface the error so callers skip this tick (their get_torrents
+                    // guards early-return on Err) instead of acting on incomplete data.
                     if !all_torrents.is_empty() {
-                        warn!("Failed to fetch torrents page {}, but returning {} gathered torrents: {}", page, all_torrents.len(), e);
-                        break;
+                        warn!(
+                            "Failed to fetch torrents page {} after gathering {} torrents; failing \
+                             the whole listing to avoid treating dropped pages as removals: {}",
+                            page,
+                            all_torrents.len(),
+                            e
+                        );
                     }
                     return Err(e);
                 }
@@ -364,7 +388,12 @@ impl RealDebridClient {
                             "RD API returned terminal status {} — not retrying (attempt {}/{})",
                             status, attempt, max_attempts
                         );
-                        return Err(resp.error_for_status().unwrap_err());
+                        return Err(match resp.error_for_status() {
+                            Err(e) => e,
+                            // Defensive: a non-error status was configured terminal (no current
+                            // caller does this). Surface a synthetic error rather than panicking.
+                            Ok(_) => synthetic_bad_gateway(b"terminal non-error status"),
+                        });
                     }
 
                     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -451,15 +480,9 @@ impl RealDebridClient {
                 "fetch_with_retry: all {} attempts exhausted due to deserialization failures",
                 max_attempts
             );
-            let synthetic = reqwest::Response::from(
-                hyper::Response::builder()
-                    .status(reqwest::StatusCode::BAD_GATEWAY)
-                    .body(hyper::body::Bytes::from_static(
-                        b"all attempts exhausted: deserialization failures",
-                    ))
-                    .unwrap(),
-            );
-            Err(synthetic.error_for_status().unwrap_err())
+            Err(synthetic_bad_gateway(
+                b"all attempts exhausted: deserialization failures",
+            ))
         }
     }
 

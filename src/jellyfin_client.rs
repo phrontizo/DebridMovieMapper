@@ -132,7 +132,7 @@ impl JellyfinClient {
                         }
                         NotifyOutcome::Retry => {
                             tracing::warn!(
-                                "Jellyfin returned {} (transient), retry {}/{}",
+                                "Jellyfin returned {} (transient), attempt {}/{}",
                                 status,
                                 attempt + 1,
                                 MAX_RETRIES
@@ -152,7 +152,7 @@ impl JellyfinClient {
                 }
                 Err(e) if e.is_connect() => {
                     tracing::warn!(
-                        "Cannot connect to Jellyfin (not started?), retry {}/{}",
+                        "Cannot connect to Jellyfin (not started?), attempt {}/{}",
                         attempt + 1,
                         MAX_RETRIES
                     );
@@ -165,7 +165,10 @@ impl JellyfinClient {
             }
         }
 
-        tracing::warn!("Jellyfin notification failed after {} retries", MAX_RETRIES);
+        tracing::warn!(
+            "Jellyfin notification failed after {} attempts",
+            MAX_RETRIES
+        );
     }
 
     /// Try to create a JellyfinClient from environment variables.

@@ -621,7 +621,7 @@ impl AcquisitionEngine {
                 continue;
             }
             if t.status != "downloaded" {
-                // Still downloading — stall check (uses dead_timeout as the no-progress ceiling).
+                // Still downloading — stall check (uses stall_timeout as the no-progress ceiling).
                 if self.is_stalled(&t.id, t.progress).await {
                     self.fail_and_reacquire(hash, &t.id, &rec.request, "Stalled", &rec.provenance)
                         .await;

@@ -8,6 +8,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+/// Soft cap on tracked paths. The active set (files currently streaming) is tiny; this only bounds
+/// the accumulation of paths that were streamed once and never again — e.g. a file renamed by an
+/// upgrade/repair. Without it the map grows for every distinct path *ever* streamed.
+const MAX_TRACKED: usize = 4096;
+
 #[derive(Clone, Debug, Default)]
 pub struct ReadActivity {
     last_read: Arc<RwLock<HashMap<String, Instant>>>,
@@ -18,12 +23,22 @@ impl ReadActivity {
         Self::default()
     }
 
-    /// Record that `path` was just read. Cheap; called on every proxy read.
+    /// Record that `path` was just read. Cheap; called on every proxy read. When the map exceeds
+    /// `MAX_TRACKED`, the least-recently-read entries are evicted down to the cap. Eviction removes
+    /// only the *oldest* entries, so `most_recent`/`all_idle` (which key off the newest read) are
+    /// provably unaffected, and an evicted entry only ever reads *more* idle, never less.
     pub async fn touch(&self, path: &str) {
-        self.last_read
-            .write()
-            .await
-            .insert(path.to_string(), Instant::now());
+        let mut map = self.last_read.write().await;
+        map.insert(path.to_string(), Instant::now());
+        if map.len() > MAX_TRACKED {
+            let excess = map.len() - MAX_TRACKED;
+            let mut entries: Vec<(String, Instant)> =
+                map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            entries.sort_unstable_by_key(|(_, t)| *t); // oldest first
+            for (k, _) in entries.into_iter().take(excess) {
+                map.remove(&k);
+            }
+        }
     }
 
     /// `true` if `path` has had no read within `window` (never-read counts as idle).
@@ -86,5 +101,24 @@ mod tests {
         assert!(ra.most_recent().await.is_some());
         // …and a zero-length window makes any elapsed time count as idle again.
         assert!(ra.all_idle(Duration::from_secs(0)).await);
+    }
+
+    #[tokio::test]
+    async fn map_is_bounded_and_eviction_preserves_all_idle() {
+        let ra = ReadActivity::new();
+        // Stream far more distinct paths than the cap; the most-recent one is "live".
+        for i in 0..(MAX_TRACKED + 500) {
+            ra.touch(&format!("Movies/{i}/file.mkv")).await;
+        }
+        let len = ra.last_read.read().await.len();
+        assert!(
+            len <= MAX_TRACKED,
+            "map must stay bounded at the cap, got {len}"
+        );
+        // The newest read is never evicted ⇒ the library still reads active for a non-zero window.
+        assert!(
+            !ra.all_idle(Duration::from_secs(300)).await,
+            "the most-recent read must survive eviction so all_idle is unaffected"
+        );
     }
 }

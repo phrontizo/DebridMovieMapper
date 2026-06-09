@@ -109,6 +109,7 @@ A debrid provider token is required: set **exactly one** of `RD_API_TOKEN` or `T
 | `UPGRADE_INTERVAL_SECS`      | No       | `86400`        | How often (seconds) to run the quality-upgrade + full-season consolidation pass. `0` disables the upgrade engine entirely. Default is daily (86 400 s); minimum 600 when non-zero. |
 | `UPGRADE_BUDGET_PER_TICK`    | No       | `20`           | Maximum number of owned titles re-scored per upgrade tick (round-robin across the library; minimum: 1). |
 | `UPGRADE_IDLE_SECS`          | No       | `300`          | Seconds of proxy read inactivity before a slot is considered idle enough to swap/prune (minimum: 30). Prevents swapping a file that is being actively streamed. |
+| `UPGRADE_STAGE_MAX_SECS`     | No       | `604800`       | Reserved/informational: maximum age of a staged upgrade before it is abandoned (minimum: 3600). |
 | `ACQUIRE_DEAD_TIMEOUT_SECS`  | No       | `600`          | Seconds an optimistically-added `Pending` torrent may remain unresolved before `observe` reaps it as dead, blacklists its hash, and re-scrapes (minimum: 120). |
 
 \* Exactly one of `RD_API_TOKEN` / `TORBOX_API_KEY` must be set — not both, and not neither.
@@ -131,9 +132,9 @@ docker pull phrontizo/debridmoviemapper:latest
 ```
 
 **Available tags:**
-- `:latest` — latest stable release (updated on version tags like `v1.0.6`)
+- `:latest` — latest stable release (updated on version tags like `v1.0.7`)
 - `:edge` — latest build from `main` branch (may be unstable)
-- `:1.0.6`, `:1.0`, `:1` — pinned to a specific release version
+- `:1.0.7`, `:1.0`, `:1` — pinned to a specific release version
 
 ### 2. Run the container
 ```bash
@@ -157,7 +158,7 @@ Build locally for your current architecture:
 docker build -t debridmoviemapper .
 ```
 
-Multi-platform images are built and pushed automatically by GitHub Actions. Release tags (e.g. `git tag v1.0.6 && git push origin v1.0.6`) update `:latest` and semver tags; pushes to `main` update `:edge`.
+Multi-platform images are built and pushed automatically by GitHub Actions. Release tags (e.g. `git tag v1.0.7 && git push origin v1.0.7`) update `:latest` and semver tags; pushes to `main` update `:edge`.
 
 *Note: The named volume ensures your media identification cache is preserved across container recreations.*
 
@@ -199,7 +200,7 @@ A complete [`compose.yml`](compose.yml) file is provided in the repository that 
 
 ### Notes
 
-- The WebDAV server runs on port 8080 (mapped to 8080 on the host)
+- The WebDAV server runs on port 8080 (bound to `127.0.0.1:8080` on the host by the compose file, so it is reachable only from the local machine; adjust the port mapping if a trusted LAN needs access)
 - A Docker healthcheck ensures rclone only starts after the WebDAV server is ready (prevents empty mount on startup)
 - Media identifications are persisted in a named Docker volume (`metadata`)
 - rclone mounts the WebDAV endpoint to `./rclone` on the host via a bind mount with `rshared` propagation (required for FUSE mounts to be visible to other containers)
@@ -307,6 +308,13 @@ Both operations are **idle-gated**: a slot being actively streamed is never swap
 - `src/provider.rs`: The `DebridProvider` trait and `FileLocator`; startup provider selection (`choose_provider`).
 - `src/scheduler.rs`: Spawns the cooperating background jobs (scan loop always; Trakt cycle + episode monitor when Trakt is configured).
 - `src/tasks.rs`: Background jobs — the scan loop (polls the active provider, identifies new torrents, updates the VFS) plus the Trakt jobs (`sync_trakt`, `reconcile_wanted`, `monitor_episodes`).
+- `src/acquire.rs`: The `AcquisitionEngine` — optimistic add (`acquire`) plus the asynchronous resolver (`observe`) that selects, validates, probes, and finalises each candidate.
+- `src/upgrade.rs`: Daily quality-upgrade + full-season consolidation engine (round-robin budget, idle-gated swap/prune).
+- `src/reacquire.rs`: Shared `materialise` add→poll→select primitive used by both acquisition and repair.
+- `src/scraper.rs`: `Scraper` trait + `TorrentioScraper` — queries a Stremio-compatible addon for candidate streams.
+- `src/release.rs`: Parses candidates into `ReleaseInfo` and scores/ranks them with the quality preferences.
+- `src/probe.rs`: Hand-rolled MKV/MP4 track reader — fetches the first 4 MB of a CDN URL to verify audio/subtitle languages.
+- `src/read_activity.rs`: In-memory proxy read-activity tracker that gates the upgrade engine's idle swaps.
 - `src/trakt_client.rs`: Trakt API client — device-flow OAuth and the watchlist/in-progress/watched reads.
 - `src/wanted.rs`: Pure reconcile-core — diffs the wanted-set against owned content and emits acquire/remove decisions (the removal lifecycle rules).
 - `src/enrolment.rs`: Local-network Trakt enrolment page (`/trakt/accounts`) served on the WebDAV listener.
@@ -318,6 +326,9 @@ Both operations are **idle-gated**: a slot being actively streamed is never swap
 - `src/vfs.rs`: Virtual File System logic for library organisation.
 - `src/dav_fs.rs`: WebDAV filesystem — resolves a `FileLocator` to a CDN URL via the provider; attempts instant repair when a file is unavailable.
 - `src/identification.rs`: Smart media identification and filename cleaning logic.
+- `src/config.rs`: Startup env parsing/validation (`Config`, plus the optional `TraktConfig`/`UpgradeConfig`/`AcquisitionConfig`).
+- `src/app_state.rs`: `AppState` — the cloneable bundle of shared handles carried by the scheduler's jobs.
+- `src/store.rs`: Owns the redb database (schema + migrations, self-healing open) and all typed table accessors.
 - `src/error.rs`: Unified error type (`AppError`) using `thiserror`.
 - `src/jellyfin_client.rs`: Optional Jellyfin notification client for instant library updates.
 - `src/mapper.rs`: Library root (module declarations).
@@ -363,7 +374,7 @@ To fix this, delete the torrent from your debrid account and find an alternative
 ### Error Handling
 
 - **Unavailable file** (a 503 from Real-Debrid, or an uncached file on TorBox): Triggers synchronous instant repair — succeeds inline for cached content, fails for non-cached
-- **429 Rate Limit**: Adaptive token bucket rate limiter shared across the provider's API calls — on 429, the global request interval doubles (max 2s between requests) and Retry-After headers are respected; on success, the interval gradually recovers toward the baseline of 10 req/s
+- **429 Rate Limit**: Adaptive token bucket rate limiter shared across the provider's API calls — on 429, the global request interval doubles (max 30s between requests) and Retry-After headers are respected; on success, the interval gradually recovers toward the baseline of 10 req/s
 - **404 Not Found**: Treated as success for delete operations (idempotent)
 - **Playback Errors**: WebDAV read failures on an unavailable file trigger instant repair (rate-limited to 30s cooldown, max 3 attempts per torrent)
 

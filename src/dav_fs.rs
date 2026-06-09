@@ -385,15 +385,21 @@ impl ProxiedMediaFile {
             // corrupting the read.
             let acceptable = status == reqwest::StatusCode::PARTIAL_CONTENT
                 || (status == reqwest::StatusCode::OK && pos == 0);
-            // A 200 ignored the Range and is returning the whole object. Even at offset 0
-            // (where the bytes line up), refuse it unless Content-Length confirms it fits
-            // the fetch window — otherwise a Range-ignoring CDN would make us buffer a
-            // multi-GB body into memory. An absent Content-Length is treated as oversized.
-            let oversized_whole_object = status == reqwest::StatusCode::OK
-                && resp
+            // Reject by advertised Content-Length as a cheap early-out: a 200 ignored the Range and
+            // is returning the whole object (refuse unless it fits the window; an absent length is
+            // treated as oversized), and a 206 whose Content-Length exceeds the cap is a
+            // non-compliant CDN echoing a huge body as "partial". The bounded read below is the
+            // hard guarantee — Content-Length is attacker-controlled and may lie or be absent.
+            let oversized = match status {
+                reqwest::StatusCode::OK => resp
                     .content_length()
-                    .is_none_or(|cl| cl > MAX_FETCH_SIZE as u64);
-            if !acceptable || oversized_whole_object {
+                    .is_none_or(|cl| cl > MAX_FETCH_SIZE as u64),
+                reqwest::StatusCode::PARTIAL_CONTENT => resp
+                    .content_length()
+                    .is_some_and(|cl| cl > MAX_FETCH_SIZE as u64),
+                _ => false,
+            };
+            if !acceptable || oversized {
                 tracing::warn!(
                     "CDN returned {} for {} at offset {} — clearing cached CDN URL",
                     status,
@@ -410,12 +416,35 @@ impl ProxiedMediaFile {
                 return Err(FsError::GeneralFailure);
             }
 
-            let body = resp.bytes().await.map_err(|e| {
-                tracing::warn!("CDN body read failed for {}: {}", self.name, e);
-                FsError::GeneralFailure
-            })?;
+            // Bounded read: accumulate at most MAX_FETCH_SIZE bytes so a CDN that lies about (or
+            // omits) Content-Length cannot drive an unbounded allocation. Exceeding the cap is
+            // treated as an unusable response (drop the URL, retry/fail like an expired one).
+            let mut resp = resp;
+            let mut body = bytes::BytesMut::new();
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        body.extend_from_slice(&chunk);
+                        if body.len() > MAX_FETCH_SIZE {
+                            tracing::warn!(
+                                "CDN body for {} exceeded {} bytes — clearing cached CDN URL",
+                                self.name,
+                                MAX_FETCH_SIZE
+                            );
+                            self.cdn_url = None;
+                            self.rd_client.invalidate(&self.locator).await;
+                            return Err(FsError::GeneralFailure);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!("CDN body read failed for {}: {}", self.name, e);
+                        return Err(FsError::GeneralFailure);
+                    }
+                }
+            }
 
-            return Ok(body);
+            return Ok(body.freeze());
         }
 
         Err(FsError::GeneralFailure)

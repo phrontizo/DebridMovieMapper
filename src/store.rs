@@ -192,6 +192,65 @@ pub struct WantedRecord {
     pub show_status: Option<crate::tmdb_client::ShowStatus>, // None for movies
 }
 
+/// Why opening the on-disk database failed, split by recovery strategy.
+enum OpenFailure {
+    /// The file is genuinely damaged or format-incompatible (corrupt / needs-repair /
+    /// old-or-newer format) — safe to move aside and recreate. The regenerable `matches` cache
+    /// makes this lossless in practice; non-corrupt upgrades migrate authoritative tables instead.
+    Corrupt(String),
+    /// A transient/operational failure: another instance holds the lock, the path is not writable,
+    /// disk is full, etc. The file is intact — discarding it would lose authoritative data, so the
+    /// caller fails startup and lets the operator fix the underlying condition.
+    Transient(String),
+}
+
+/// `true` for an I/O error kind that means the *file* is malformed/truncated (corruption we can
+/// recover from), as opposed to an operational failure (permissions, disk full, …) that must not
+/// discard a possibly-intact database. redb surfaces a bad header / too-short file as
+/// `Io(InvalidData)`; a truncated file as `Io(UnexpectedEof)`.
+fn io_kind_is_corruption(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// Classify a `Database::create`/open error. Only a positive *corruption* signal moves the file
+/// aside; lock contention (another instance), permission/disk I/O errors, and unknown future
+/// variants are treated as transient so a healthy database is never silently discarded.
+fn db_open_failure(e: redb::DatabaseError) -> OpenFailure {
+    use redb::{DatabaseError, StorageError};
+    let corrupt = match &e {
+        DatabaseError::RepairAborted | DatabaseError::UpgradeRequired(_) => true,
+        DatabaseError::Storage(StorageError::Corrupted(_)) => true,
+        DatabaseError::Storage(StorageError::Io(io)) => io_kind_is_corruption(io.kind()),
+        _ => false,
+    };
+    let msg = format!("open failed: {e}");
+    if corrupt {
+        OpenFailure::Corrupt(msg)
+    } else {
+        OpenFailure::Transient(msg)
+    }
+}
+
+/// Classify an error surfacing during schema read/init on an already-opened database. A corruption
+/// error (or a malformed-file I/O error) means the file is damaged (recover); any other error is
+/// operational (do not discard).
+fn schema_failure(stage: &str, e: redb::Error) -> OpenFailure {
+    let corrupt = match &e {
+        redb::Error::Corrupted(_) => true,
+        redb::Error::Io(io) => io_kind_is_corruption(io.kind()),
+        _ => false,
+    };
+    let msg = format!("{stage}: {e}");
+    if corrupt {
+        OpenFailure::Corrupt(msg)
+    } else {
+        OpenFailure::Transient(msg)
+    }
+}
+
 /// Owns the redb database and all table access. Cheap to clone (the database is an `Arc`).
 #[derive(Clone)]
 pub struct Store {
@@ -201,16 +260,26 @@ pub struct Store {
 impl Store {
     /// Open (or create) the database at `path`, recovering automatically from an
     /// unreadable / incompatible / corrupt / newer-than-binary file rather than
-    /// failing startup. Synchronous — called once at startup.
+    /// failing startup. A *transient* failure (another instance holds the lock, the
+    /// path is not writable, disk full, …) leaves the file intact and fails startup
+    /// instead — discarding a possibly-intact database would lose authoritative data.
+    /// Synchronous — called once at startup.
     pub fn open(path: &str) -> Result<Self, AppError> {
         let db = match Self::try_open(path) {
             Ok(db) => db,
-            Err(reason) => {
+            Err(OpenFailure::Corrupt(reason)) => {
                 warn!(
                     "Database {} is unusable ({}); moving it aside and recreating",
                     path, reason
                 );
                 Self::move_aside_and_create(path)?
+            }
+            Err(OpenFailure::Transient(reason)) => {
+                return Err(AppError::Config(format!(
+                    "Database {path} could not be opened ({reason}). Refusing to discard a \
+                     possibly-intact database — check that no other instance is running and that \
+                     {path} is writable."
+                )));
             }
         };
         Ok(Store { db: Arc::new(db) })
@@ -231,17 +300,21 @@ impl Store {
         Ok(Store { db })
     }
 
-    /// Open the file and bring its schema to the current version. Returns
-    /// `Err(reason)` describing why the file is unusable so the caller can recover.
-    fn try_open(path: &str) -> Result<Database, String> {
-        let db = Database::create(path).map_err(|e| format!("open failed: {e}"))?;
-        let version = Self::read_version(&db).map_err(|e| format!("schema read failed: {e}"))?;
+    /// Open the file and bring its schema to the current version. Returns an
+    /// [`OpenFailure`] classifying *why* it failed so the caller can decide between
+    /// recovering (move aside) and refusing to discard an intact database.
+    fn try_open(path: &str) -> Result<Database, OpenFailure> {
+        let db = Database::create(path).map_err(db_open_failure)?;
+        let version =
+            Self::read_version(&db).map_err(|e| schema_failure("schema read failed", e))?;
         if version > SCHEMA_VERSION {
-            return Err(format!(
+            // Newer-than-binary is an incompatibility we recover from (move aside), per the
+            // documented self-heal contract.
+            return Err(OpenFailure::Corrupt(format!(
                 "schema v{version} is newer than supported v{SCHEMA_VERSION}"
-            ));
+            )));
         }
-        Self::ensure_schema(&db, version).map_err(|e| format!("schema init failed: {e}"))?;
+        Self::ensure_schema(&db, version).map_err(|e| schema_failure("schema init failed", e))?;
         Ok(db)
     }
 
@@ -506,13 +579,26 @@ impl Store {
                 let existing: Option<Vec<u8>> = table
                     .get(hash.as_str())?
                     .map(|guard| guard.value().to_vec());
-                if let Some(raw) = existing {
-                    if let Ok(mut rec) = serde_json::from_slice::<OwnedRecord>(&raw) {
-                        rec.status = status;
-                        if let Ok(bytes) = serde_json::to_vec(&rec) {
-                            table.insert(hash.as_str(), bytes.as_slice())?;
+                match existing {
+                    Some(raw) => match serde_json::from_slice::<OwnedRecord>(&raw) {
+                        Ok(mut rec) => {
+                            rec.status = status;
+                            match serde_json::to_vec(&rec) {
+                                Ok(bytes) => {
+                                    table.insert(hash.as_str(), bytes.as_slice())?;
+                                }
+                                // Effectively unreachable for this plain struct, but never drop a
+                                // write silently — surface it so a lost status change is diagnosable.
+                                Err(e) => error!(
+                                    "set_owned_status: re-serialise failed for {hash} ({e}); status change dropped"
+                                ),
+                            }
                         }
-                    }
+                        Err(e) => error!(
+                            "set_owned_status: corrupt owned record for {hash} ({e}); status change dropped"
+                        ),
+                    },
+                    None => warn!("set_owned_status: no owned record for {hash}; status change dropped"),
                 }
             }
             txn.commit()?;
@@ -1138,6 +1224,49 @@ mod tests {
             .await
             .unwrap();
         assert!(store.get_match("a".to_string()).await.is_some());
+    }
+
+    #[test]
+    fn db_open_failure_keeps_intact_db_on_transient_errors() {
+        // Lock contention (another instance) and I/O / permission errors must NOT move the DB
+        // aside — discarding a possibly-intact database would lose authoritative data.
+        assert!(matches!(
+            db_open_failure(redb::DatabaseError::DatabaseAlreadyOpen),
+            OpenFailure::Transient(_)
+        ));
+        assert!(matches!(
+            db_open_failure(redb::DatabaseError::Storage(redb::StorageError::Io(
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied")
+            ))),
+            OpenFailure::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn db_open_failure_recovers_only_on_genuine_corruption() {
+        // A non-redb / damaged file (redb returns Corrupted "Invalid magic number"), an old format,
+        // or an aborted repair are the only signals that justify moving the file aside.
+        assert!(matches!(
+            db_open_failure(redb::DatabaseError::Storage(redb::StorageError::Corrupted(
+                "Invalid magic number".into()
+            ))),
+            OpenFailure::Corrupt(_)
+        ));
+        // A bad header / too-short file surfaces as Io(InvalidData) — recover, don't propagate.
+        assert!(matches!(
+            db_open_failure(redb::DatabaseError::Storage(redb::StorageError::Io(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "bad header")
+            ))),
+            OpenFailure::Corrupt(_)
+        ));
+        assert!(matches!(
+            db_open_failure(redb::DatabaseError::UpgradeRequired(1)),
+            OpenFailure::Corrupt(_)
+        ));
+        assert!(matches!(
+            db_open_failure(redb::DatabaseError::RepairAborted),
+            OpenFailure::Corrupt(_)
+        ));
     }
 
     #[tokio::test]
