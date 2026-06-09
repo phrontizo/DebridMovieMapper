@@ -12,6 +12,7 @@
 
 use crate::app_state::AppState;
 use crate::tasks::{monitor_episodes, reconcile_wanted, run_scan_loop, sync_trakt, ScanConfig};
+use crate::upgrade::run_upgrade_once;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::info;
@@ -118,7 +119,7 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
             shutdown.clone(),
             move || {
                 let app = upgrade_app.clone();
-                async move { crate::upgrade::run_upgrade_once(&app).await; }
+                async move { run_upgrade_once(&app).await; }
             },
         )));
     } else {
