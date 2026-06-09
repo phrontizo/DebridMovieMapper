@@ -886,7 +886,7 @@ pub(crate) fn aired_pairs(
 /// across them. Best-effort I/O — a failure to enumerate seasons, or to fetch ONE season's air
 /// dates, is logged and skipped rather than failing the whole show. TMDB-driven, so exercised by
 /// the live smoke rather than unit tests.
-async fn aired_episodes(tmdb: &TmdbClient, tmdb_id: u64, today: chrono::NaiveDate) -> Vec<(u32, u32)> {
+pub(crate) async fn aired_episodes(tmdb: &TmdbClient, tmdb_id: u64, today: chrono::NaiveDate) -> Vec<(u32, u32)> {
     let seasons = match tmdb.show_season_numbers(tmdb_id).await {
         Ok(s) => s,
         Err(e) => {
@@ -907,6 +907,15 @@ async fn aired_episodes(tmdb: &TmdbClient, tmdb_id: u64, today: chrono::NaiveDat
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Filter aired pairs to one season's episode numbers (sorted+deduped). PURE — used by the SP3
+/// upgrade consolidation path to ask "what is the full aired set for THIS season?".
+pub(crate) fn season_aired(aired: &[(u32, u32)], season: u32) -> Vec<u32> {
+    let mut v: Vec<u32> = aired.iter().filter(|(s, _)| *s == season).map(|(_, e)| *e).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 /// For each tracked (wanted) SHOW, compute the episodes aired as-of-now from TMDB air dates,

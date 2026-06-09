@@ -16,40 +16,48 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Run one upgrade tick over `app`: re-score a budgeted batch of owned MOVIE titles, stage any
-/// cached meaningful upgrade, and — if the library is idle — swap selection + prune the old torrent.
+/// Run one upgrade tick over `app`: re-score a budgeted batch of owned titles. For MOVIES, stage any
+/// cached meaningful upgrade and — if the library is idle — swap selection + prune the old torrent.
+/// For SHOWS, consolidate scattered per-episode torrents into a full-season cached pack (Task 10).
+/// Each title (movie or show) is one budget unit, ordered least-recently-checked first.
 pub async fn run_upgrade_once(app: &AppState) {
     let budget = app.config.upgrade.budget_per_tick as usize;
     let idle_window = Duration::from_secs(app.config.upgrade.idle_secs);
 
-    // Group owned by tmdb_id (reuse the tasks helper) and pick the least-recently-checked movies.
+    // Group owned by tmdb_id (reuse the tasks helper) and pick the least-recently-checked titles.
     let groups = crate::tasks::group_owned_by_tmdb(&app.store).await;
-    let mut candidates: Vec<(u64, Vec<String>, OwnedRecord)> = Vec::new();
+    let mut candidates: Vec<(u64, MediaType, Vec<String>, OwnedRecord)> = Vec::new();
     for (tmdb_id, g) in &groups {
-        if g.media_type != MediaType::Movie {
-            continue; // Task 10 handles shows/consolidation
-        }
-        // Representative owned record (movies have one hash).
+        // Representative owned record (the movie path uses it; a settled record gates both kinds).
         let Some(hash) = g.hashes.first().cloned() else { continue };
         let Some(rec) = app.store.get_owned(hash.clone()).await else { continue };
         if rec.status != OwnedStatus::Verified {
             continue; // only upgrade settled titles
         }
-        candidates.push((*tmdb_id, g.hashes.clone(), rec));
+        candidates.push((*tmdb_id, g.media_type.clone(), g.hashes.clone(), rec));
     }
     // Least-recently-checked first.
     let mut ordered: Vec<_> = Vec::new();
-    for (id, hashes, rec) in candidates {
+    for (id, media_type, hashes, rec) in candidates {
         let last = app.store.get_upgrade_checked(id).await;
-        ordered.push((last, id, hashes, rec));
+        ordered.push((last, id, media_type, hashes, rec));
     }
     ordered.sort_by_key(|(last, ..)| *last);
     ordered.truncate(budget);
 
-    for (_, tmdb_id, hashes, rec) in ordered {
+    for (_, tmdb_id, media_type, hashes, rec) in ordered {
         app.store.set_upgrade_checked(tmdb_id, now_secs()).await.ok();
-        if let Err(e) = try_upgrade_movie(app, tmdb_id, &hashes, &rec, idle_window).await {
-            warn!("upgrade: tmdb {} skipped: {}", tmdb_id, e);
+        match media_type {
+            MediaType::Movie => {
+                if let Err(e) = try_upgrade_movie(app, tmdb_id, &hashes, &rec, idle_window).await {
+                    warn!("upgrade: tmdb {} skipped: {}", tmdb_id, e);
+                }
+            }
+            MediaType::Show => {
+                if let Err(e) = try_consolidate_show(app, tmdb_id, &hashes, idle_window).await {
+                    warn!("consolidate: tmdb {} skipped: {}", tmdb_id, e);
+                }
+            }
         }
     }
 }
@@ -182,6 +190,186 @@ async fn prune_owned_hash(app: &AppState, hash: &str) {
 async fn base_req_provenance(app: &AppState, tmdb_id: u64) -> crate::store::Provenance {
     let groups = crate::tasks::group_owned_by_tmdb(&app.store).await;
     groups.get(&tmdb_id).map(|g| g.provenance.clone()).unwrap_or_else(crate::store::Provenance::manual)
+}
+
+/// Inputs to the pure consolidation decision for ONE season.
+#[derive(Debug, Clone)]
+pub struct ConsolidationInput {
+    pub season: u32,
+    /// Episodes of this season aired per TMDB (the "full season" target).
+    pub aired_episodes: Vec<u32>,
+    /// (episode, quality) for each episode we currently own INDIVIDUALLY in this season.
+    pub owned_episode_quality: Vec<(u32, QualitySummary)>,
+    pub pack_cached: bool,
+    /// Episodes the candidate pack supplies for this season.
+    pub pack_episodes: Vec<u32>,
+    /// Quality of the pack (per-episode quality is assumed uniform across the pack).
+    pub pack_quality: QualitySummary,
+}
+
+/// Pure: should we consolidate this season's scattered episodes into the candidate pack?
+/// Requires: the pack is CACHED; it is a FULL-season pack (covers every aired episode); and it is
+/// not a quality regression vs ANY episode we currently own (same-or-higher tier AND resolution).
+pub fn consolidation_target(i: &ConsolidationInput) -> bool {
+    if !i.pack_cached {
+        return false;
+    }
+    // Full season: every aired episode must be in the pack.
+    let covers_full_season = i.aired_episodes.iter().all(|e| i.pack_episodes.contains(e));
+    if !covers_full_season || i.aired_episodes.is_empty() {
+        return false;
+    }
+    // No regression vs any owned episode.
+    for (_, owned_q) in &i.owned_episode_quality {
+        let no_regression = i.pack_quality.source_tier >= owned_q.source_tier
+            && i.pack_quality.resolution >= owned_q.resolution;
+        if !no_regression {
+            return false;
+        }
+    }
+    true
+}
+
+/// Consolidate a show's scattered per-episode torrents into a full-season CACHED pack, season by
+/// season. Non-destructive: a pack that fails any gate (not cached / above the resolution ceiling /
+/// not a full season / a quality regression / wrong title) is deleted and the scattered episodes
+/// keep their selection untouched. The idle gate drops the staged pack on defer (no dangling stage).
+async fn try_consolidate_show(
+    app: &AppState,
+    tmdb_id: u64,
+    group_hashes: &[String],
+    idle_window: Duration,
+) -> Result<(), String> {
+    // Owned per-episode records for this show: hash -> OwnedRecord.
+    let mut owned: Vec<(String, OwnedRecord)> = Vec::new();
+    for h in group_hashes {
+        if let Some(r) = app.store.get_owned(h.clone()).await {
+            owned.push((h.clone(), r));
+        }
+    }
+    // A representative request (for imdb id + metadata) — any owned record works.
+    let Some((_, sample)) = owned.first().cloned() else { return Err("no owned records".into()) };
+    let today = chrono::Utc::now().date_naive();
+    let aired = crate::tasks::aired_episodes(&app.tmdb_client, tmdb_id, today).await;
+
+    // Seasons currently held as SCATTERED single-episode torrents (provides.len()==1).
+    let mut seasons: Vec<u32> = owned.iter()
+        .filter(|(_, r)| r.provides.len() == 1)
+        .map(|(_, r)| r.provides[0].0)
+        .collect();
+    seasons.sort_unstable();
+    seasons.dedup();
+
+    for season in seasons {
+        let season_aired = crate::tasks::season_aired(&aired, season);
+        if season_aired.is_empty() { continue; }
+        // Already a full-season pack owned for this season? (any hash whose provides covers it)
+        let already_pack = owned.iter().any(|(_, r)| {
+            let eps: Vec<u32> = r.provides.iter().filter(|(s, _)| *s == season).map(|(_, e)| *e).collect();
+            season_aired.iter().all(|e| eps.contains(e)) && r.provides.len() > 1
+        });
+        if already_pack { continue; }
+
+        // Scrape the season (episode 1 query returns season packs too).
+        let raws = match app.scraper.find(&sample.request.imdb_id, MediaKind::Series, Some(season), Some(1)).await {
+            Ok(r) => r,
+            Err(e) => { warn!("consolidate: scrape s{} failed: {}", season, e); continue; }
+        };
+        // Try cached candidates that look like packs (file_name absent or multiple videos after stage).
+        for raw in &raws {
+            let r = release::parse(raw);
+            if !r.cached { continue; }
+            if app.store.is_blacklisted(tmdb_id, r.info_hash.clone()).await { continue; }
+            if group_hashes.iter().any(|h| h.eq_ignore_ascii_case(&r.info_hash)) { continue; }
+            // Apply the same hard filters as acquisition (resolution ceiling, cam/telesync, dead
+            // seeders): score() returns None for any release that fails them. A full-season pack
+            // above the ceiling (e.g. cached 2160p under a 1080p ceiling) would pass the
+            // no-regression check yet violate the ceiling — never adopt it.
+            if release::score(&r, &app.config.acquisition.prefs).is_none() {
+                continue;
+            }
+
+            // Stage: add + resolve + SE-map files.
+            let magnet = format!("magnet:?xt=urn:btih:{}", r.info_hash);
+            let Ok(added) = app.provider.add_magnet(&magnet).await else { continue };
+            let Ok(info) = app.provider.get_torrent_info(&added.id).await else {
+                let _ = app.provider.delete_torrent(&added.id).await; continue;
+            };
+            if info.status != "downloaded" { let _ = app.provider.delete_torrent(&added.id).await; continue; }
+            // Select all videos so the pack is fully available.
+            let ids: Vec<u32> = info.files.iter().filter(|f| crate::vfs::is_video_file(&f.path)).map(|f| f.id).collect();
+            if !ids.is_empty() {
+                let _ = app.provider.select_files(&added.id, &ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")).await;
+            }
+            let fresh = app.provider.get_torrent_info(&added.id).await.unwrap_or(info);
+            let eps = crate::acquire::episode_files(&fresh); // (s,e,path) — pub(crate) from Task 6
+            let pack_episodes: Vec<u32> = eps.iter().filter(|(s, _, _)| *s == season).map(|(_, e, _)| *e).collect();
+
+            // Owned per-episode quality for this season.
+            let owned_episode_quality: Vec<(u32, QualitySummary)> = owned.iter()
+                .filter(|(_, rec)| rec.provides.len() == 1 && rec.provides[0].0 == season)
+                .map(|(_, rec)| (rec.provides[0].1, rec.quality.clone().unwrap_or_default()))
+                .collect();
+
+            let input = ConsolidationInput {
+                season,
+                aired_episodes: season_aired.clone(),
+                owned_episode_quality,
+                pack_cached: true,
+                pack_episodes: { let mut v = pack_episodes.clone(); v.sort_unstable(); v.dedup(); v },
+                pack_quality: QualitySummary::of(&r, &app.config.acquisition.prefs),
+            };
+            if !consolidation_target(&input) {
+                let _ = app.provider.delete_torrent(&added.id).await; // non-destructive: drop the staged pack
+                continue;
+            }
+            // Validate the show identity on a representative episode file.
+            if let Some((es, ee, path)) = eps.iter().find(|(s, _, _)| *s == season) {
+                let fname = path.rsplit('/').next().unwrap_or(path).to_string();
+                if !app.engine.validate_title(&fname, tmdb_id, MediaKind::Series, Some(*es), Some(*ee)).await {
+                    let _ = app.provider.delete_torrent(&added.id).await;
+                    let _ = app.store.blacklist_add(tmdb_id, r.info_hash.clone(), "WrongTitle", now_secs()).await;
+                    continue;
+                }
+            }
+            // Idle gate. If the library is active, drop the staged pack (no dangling stage) and
+            // retry on a later tick; consolidation re-stages cheaply (the pack is cached).
+            if !app.read_activity.all_idle(idle_window).await {
+                info!("consolidate: tmdb {} s{} deferred (library active); dropping staged pack", tmdb_id, season);
+                let _ = app.provider.delete_torrent(&added.id).await;
+                return Ok(());
+            }
+            // Record the pack owned+verified with full-season provides + sticky provenance.
+            let prov = base_req_provenance(app, tmdb_id).await;
+            let provides: Vec<(u32, u32)> = eps.iter().map(|(s, e, _)| (*s, *e)).collect();
+            let _ = app.store.put_owned(r.info_hash.clone(), OwnedRecord {
+                request: crate::store::AcquireRequest { season: Some(season), episode: Some(1), ..sample.request.clone() },
+                provenance: prov,
+                added_at: now_secs(),
+                status: OwnedStatus::Verified,
+                provides: provides.clone(),
+                quality: Some(QualitySummary::of(&r, &app.config.acquisition.prefs)),
+            }).await;
+            let _ = app.store.put_authoritative(r.info_hash.clone(), sample.request.metadata.clone()).await;
+            // Repoint every episode slot of this season to the pack.
+            for (s, e, path) in &eps {
+                if *s != season { continue; }
+                let _ = app.store.put_selection(
+                    crate::store::episode_slot(tmdb_id, *s, *e),
+                    crate::store::SelectionEntry { hash: r.info_hash.clone(), file_path: path.clone() },
+                ).await;
+            }
+            // Prune the scattered episode torrents for this season.
+            for (h, rec) in &owned {
+                if rec.provides.len() == 1 && rec.provides[0].0 == season {
+                    prune_owned_hash(app, h).await;
+                }
+            }
+            info!("consolidate: tmdb {} season {} -> pack {}", tmdb_id, season, r.info_hash);
+            break; // one pack per season per tick
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -392,4 +580,59 @@ mod tests {
         assert!(store.get_owned("h4k".into()).await.is_none(), "no new owned record for above-ceiling candidate");
         assert_eq!(store.get_selection(movie_slot(27205)).await.unwrap().hash, "hold", "selection unchanged");
     }
+
+    // ── pure consolidation-decision tests (Task 10) ───────────────────────────
+
+    #[test]
+    fn full_cached_season_pack_no_regression_consolidates() {
+        // Owned scattered: E01 (WEB 1080p), E02 (WEB 1080p). Pack: cached BluRay 1080p covering E01-E03.
+        let input = ConsolidationInput {
+            season: 1,
+            aired_episodes: vec![1, 2, 3],
+            owned_episode_quality: vec![
+                (1, crate::release::QualitySummary { cached: true, source_tier: 3_000, resolution: 1080, score: 1 }),
+                (2, crate::release::QualitySummary { cached: true, source_tier: 3_000, resolution: 1080, score: 1 }),
+            ],
+            pack_cached: true,
+            pack_episodes: vec![1, 2, 3],
+            pack_quality: crate::release::QualitySummary { cached: true, source_tier: 6_000, resolution: 1080, score: 5 },
+        };
+        assert!(consolidation_target(&input), "cached full-season pack, no regression → consolidate");
+    }
+
+    #[test]
+    fn partial_season_pack_is_rejected() {
+        let input = ConsolidationInput {
+            season: 1, aired_episodes: vec![1, 2, 3],
+            owned_episode_quality: vec![(1, q1080_web()), (2, q1080_web())],
+            pack_cached: true, pack_episodes: vec![1, 2], // missing E03
+            pack_quality: q1080_bluray(),
+        };
+        assert!(!consolidation_target(&input), "partial-season pack must not consolidate");
+    }
+
+    #[test]
+    fn quality_regression_pack_is_rejected() {
+        let input = ConsolidationInput {
+            season: 1, aired_episodes: vec![1, 2, 3],
+            owned_episode_quality: vec![(1, q2160_remux()), (2, q1080_web())], // E01 is 2160 REMUX
+            pack_cached: true, pack_episodes: vec![1, 2, 3],
+            pack_quality: q1080_bluray(), // worse than E01 → regression
+        };
+        assert!(!consolidation_target(&input), "a pack worse than any owned episode must not consolidate");
+    }
+
+    #[test]
+    fn uncached_pack_is_rejected() {
+        let input = ConsolidationInput {
+            season: 1, aired_episodes: vec![1, 2, 3],
+            owned_episode_quality: vec![(1, q1080_web())],
+            pack_cached: false, pack_episodes: vec![1, 2, 3], pack_quality: q1080_bluray(),
+        };
+        assert!(!consolidation_target(&input));
+    }
+
+    fn q1080_web() -> crate::release::QualitySummary { crate::release::QualitySummary { cached: true, source_tier: 3_000, resolution: 1080, score: 1 } }
+    fn q1080_bluray() -> crate::release::QualitySummary { crate::release::QualitySummary { cached: true, source_tier: 6_000, resolution: 1080, score: 2 } }
+    fn q2160_remux() -> crate::release::QualitySummary { crate::release::QualitySummary { cached: true, source_tier: 8_000, resolution: 2160, score: 9 } }
 }
