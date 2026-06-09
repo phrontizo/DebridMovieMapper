@@ -109,6 +109,22 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
         info!("Trakt sync disabled (no Trakt client configured)");
     }
 
+    if app.config.upgrade.enabled() {
+        let secs = app.config.upgrade.interval_secs;
+        info!("Upgrade engine enabled: re-scoring owned titles every {}s", secs);
+        let upgrade_app = app.clone();
+        handles.push(tokio::spawn(periodic(
+            Duration::from_secs(secs),
+            shutdown.clone(),
+            move || {
+                let app = upgrade_app.clone();
+                async move { crate::upgrade::run_upgrade_once(&app).await; }
+            },
+        )));
+    } else {
+        info!("Upgrade engine disabled (UPGRADE_INTERVAL_SECS=0)");
+    }
+
     for h in handles {
         if let Err(e) = h.await {
             tracing::error!("Background task ended abnormally: {:?}", e);
@@ -216,6 +232,20 @@ mod trakt_gate_tests {
     fn enabled_when_trakt_configured() {
         let app = make_test_app(true);
         assert!(trakt_jobs_enabled(&app), "Trakt gate must be true when both client and config are present");
+    }
+
+    /// `upgrade_gate_follows_config`: default `Config` has the upgrade job enabled (daily);
+    /// swapping in an `UpgradeConfig` with `interval_secs = 0` disables it.
+    #[test]
+    fn upgrade_gate_follows_config() {
+        let mut app = make_test_app(false);
+        // default config has upgrade enabled (daily)
+        assert!(app.config.upgrade.enabled());
+        // a config with interval 0 disables it
+        let mut cfg = (*app.config).clone();
+        cfg.upgrade = crate::config::UpgradeConfig::from_parts(Some("0".into()), None, None, None);
+        app.config = std::sync::Arc::new(cfg);
+        assert!(!app.config.upgrade.enabled());
     }
 
     /// Source-level guard: confirms the temporary `--acquire` CLI trigger has been removed.
