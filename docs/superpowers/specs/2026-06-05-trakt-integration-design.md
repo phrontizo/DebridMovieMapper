@@ -300,8 +300,12 @@ These are captured for context and will each be brainstormed into their own spec
 
 ### SP4 — Web UI
 
-- **`web/` + router:** mount alongside (or in front of) the WebDAV handler;
-  access-controlled (token / LAN-bind).
+- **`web/` + router:** the UI is served on its **own dedicated, access-controlled
+  port** (token / LAN-bind), **separate from the unauthenticated WebDAV proxy
+  port** — the proxy must never have to be network-exposed in order to reach the
+  UI. (Decided 2026-06-09 while refreshing `compose.yml`: today the Trakt
+  enrolment page shares the WebDAV port and is therefore host-local only; SP4
+  splits them.)
 - **Pages/APIs:** Trakt enrolment (full), activity dashboard (additions,
   downloading/queued, now-playing, recent upgrades, errors), match correction
   (override a wrong TMDB match → re-identify), in-UI settings (quality prefs +
@@ -397,6 +401,8 @@ feature. Three layers.
 - Current Real-Debrid active-torrent limit — informational only; the add-and-react
   design does not depend on the number, but worth pinning down for backfill pacing
   (SP1/SP2). Can be web-searched when SP1 is specced.
-- Web UI access-control model (shared token vs LAN-bind vs both) (SP4).
+- Web UI access-control model: token vs LAN-bind vs both (SP4). **Resolved
+  2026-06-09:** the UI gets its **own authenticated port**, distinct from the
+  unauthenticated WebDAV proxy port (see the SP4 sketch above).
 - Whether `authoritative_ids` fully replaces `repair_replacements` or runs
   alongside it during SP1 (decide when generalising repair).

@@ -10,8 +10,12 @@ services:
       # exists only for host-local access/debugging. PORT (in .env) sets the published HOST
       # port; the container always listens on 8080 (rclone and the healthcheck expect it), so
       # do not set a PORT env var below — changing the in-container port breaks the mount.
+      # The Trakt enrolment page (and the future web UI) are served on this SAME port, so they
+      # are reachable only from the host for now (e.g. via an SSH tunnel or a reverse proxy you
+      # add). SP4 splits the UI onto its own authenticated port so the proxy stays host-local.
       - "127.0.0.1:${PORT:-8080}:8080"
     environment:
+      # ── Core ──────────────────────────────────────────────────────────────────
       # Pick a debrid provider by setting EXACTLY ONE of these in .env (or the environment).
       # Both are passed through with an empty default so the unset one is treated as absent;
       # the app selects the provider from whichever is non-empty and errors clearly if
@@ -20,10 +24,49 @@ services:
       - TORBOX_API_KEY=${TORBOX_API_KEY:-}
       - TMDB_API_KEY=${TMDB_API_KEY:?Set TMDB_API_KEY in .env or environment}
       - DB_PATH=/data/metadata.db
-      # Jellyfin notifications (all three required to enable)
+      # Provider poll cadence (seconds; default 60, min 10). Uncomment to override.
+      # - SCAN_INTERVAL_SECS=60
+
+      # ── Jellyfin notifications (all three required to enable) ──────────────────
       - JELLYFIN_URL=http://jellyfin:8096
       - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:-}
       - JELLYFIN_RCLONE_MOUNT_PATH=/media
+
+      # ── Acquisition engine (SP1) ──────────────────────────────────────────────
+      # Tunes how releases are scraped, scored and verified for content the service
+      # acquires (driven by Trakt sync below). An empty value = the documented default.
+      # Override the scraper addon; default auto-templates Torrentio from the provider token.
+      - SCRAPER_ADDON_URL=${SCRAPER_ADDON_URL:-}
+      # Hard resolution ceiling: 720 | 1080 | 2160/4k (default 1080).
+      - MAX_RESOLUTION=${MAX_RESOLUTION:-}
+      # Required audio language: ISO code, or "original" = the title's original language (default original).
+      - AUDIO_LANGUAGE=${AUDIO_LANGUAGE:-}
+      # Required subtitle language: ISO code, or "none" = skip the subtitle check (default none).
+      - SUBTITLE_LANGUAGE=${SUBTITLE_LANGUAGE:-}
+      # Prefer HEVC/x265 (default true) / HDR (default false).
+      - PREFER_HEVC=${PREFER_HEVC:-}
+      - PREFER_HDR=${PREFER_HDR:-}
+      # Numeric knobs (uncomment to override the defaults shown):
+      # - STALL_TIMEOUT_SECS=1800        # no-progress timeout before a Pending acquire is retried
+      # - MAX_ACQUIRE_ATTEMPTS=5         # candidates tried before giving up on a title
+      # - ACQUIRE_DEAD_TIMEOUT_SECS=600  # secs an optimistic add may stay unresolved before reaped (min 120)
+
+      # ── Trakt sync (SP2) ──────────────────────────────────────────────────────
+      # Set BOTH id + secret (from a Trakt API app) to drive the library from users'
+      # watchlists/history; absent → Trakt disabled (account-mirror + repair only).
+      # Then link accounts at the /trakt/accounts page on the published port.
+      - TRAKT_CLIENT_ID=${TRAKT_CLIENT_ID:-}
+      - TRAKT_CLIENT_SECRET=${TRAKT_CLIENT_SECRET:-}
+      # - TRAKT_SYNC_INTERVAL_SECS=900            # sync + reconcile cadence (min 60)
+      # - TRAKT_EPISODE_CHECK_INTERVAL_SECS=3600  # episode-monitor cadence (min 300)
+
+      # ── Upgrade engine (SP3) ──────────────────────────────────────────────────
+      # Daily quality-upgrade + full-season consolidation. On by default; set
+      # UPGRADE_INTERVAL_SECS=0 to disable. Uncomment to override the defaults shown:
+      # - UPGRADE_INTERVAL_SECS=86400    # 0 disables; min 600 when non-zero
+      # - UPGRADE_BUDGET_PER_TICK=20     # owned titles re-scored per tick (min 1)
+      # - UPGRADE_IDLE_SECS=300          # read-inactivity before a swap/prune (min 30)
+      # - UPGRADE_STAGE_MAX_SECS=604800  # reserved (min 3600)
     volumes:
       - metadata:/data
     # Overrides Dockerfile HEALTHCHECK with faster intervals for depends_on startup ordering
