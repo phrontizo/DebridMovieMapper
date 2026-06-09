@@ -277,6 +277,7 @@ impl Store {
     /// trakt_tokens/wanted for v3) are additive and created lazily by `ensure_schema`. Future
     /// non-additive migrations add steps here, keyed on `from_version`, before the version stamp
     /// is written.
+    /// v3→v4: additive (selection, upgrade_checks tables; OwnedRecord.provides/quality serde defaults).
     fn run_migrations(_db: &Database, _from_version: u64) -> Result<(), redb::Error> {
         Ok(())
     }
@@ -740,6 +741,7 @@ impl Store {
             Ok(b) => b,
             Err(e) => { error!("Failed to serialise SelectionEntry for {}: {}", slot, e); return Ok(()); }
         };
+        // Serialise before opening the transaction to avoid partial writes on serde failure.
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
@@ -793,6 +795,7 @@ impl Store {
 
     // ── upgrade_checks cursor (SP3) ───────────────────────────────────────────
 
+    /// Returns the unix-second timestamp of the last upgrade check for `tmdb_id`, or 0 if never checked.
     pub async fn get_upgrade_checked(&self, tmdb_id: u64) -> u64 {
         let key = tmdb_id.to_string();
         let db = self.db.clone();
@@ -1413,7 +1416,10 @@ mod tests {
         let got = store.get_selection(slot.clone()).await.unwrap();
         assert_eq!(got.hash, "h1");
         assert_eq!(got.file_path, "S01E02.mkv");
-        assert_eq!(store.all_selection().await.len(), 1);
+        let all = store.all_selection().await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, slot);
+        assert_eq!(all[0].1.hash, "h1");
         store.remove_selection(slot.clone()).await.unwrap();
         assert!(store.get_selection(slot).await.is_none());
     }
