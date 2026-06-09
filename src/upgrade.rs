@@ -260,6 +260,8 @@ async fn try_consolidate_show(
     seasons.sort_unstable();
     seasons.dedup();
 
+    // Fix B: hoist provenance scan outside the per-season loop (one DB scan per title, not per season).
+    let prov = base_req_provenance(app, tmdb_id).await;
     for season in seasons {
         let season_aired = crate::tasks::season_aired(&aired, season);
         if season_aired.is_empty() { continue; }
@@ -299,10 +301,19 @@ async fn try_consolidate_show(
             // Select all videos so the pack is fully available.
             let ids: Vec<u32> = info.files.iter().filter(|f| crate::vfs::is_video_file(&f.path)).map(|f| f.id).collect();
             if !ids.is_empty() {
-                let _ = app.provider.select_files(&added.id, &ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")).await;
+                if let Err(e) = app.provider.select_files(&added.id, &ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")).await {
+                    warn!("consolidate: select_files for staged pack {} failed: {}", r.info_hash, e);
+                }
             }
             let fresh = app.provider.get_torrent_info(&added.id).await.unwrap_or(info);
             let eps = crate::acquire::episode_files(&fresh); // (s,e,path) — pub(crate) from Task 6
+            // Fix A: consolidation adopts a single-season pack only. A multi-season ("complete series") pack
+            // would leave its other seasons recorded-as-owned but un-repointed/un-pruned — reject it so
+            // provides/selection/prune stay consistent for the target season.
+            if eps.iter().any(|(s, _, _)| *s != season) {
+                let _ = app.provider.delete_torrent(&added.id).await;
+                continue;
+            }
             let pack_episodes: Vec<u32> = eps.iter().filter(|(s, _, _)| *s == season).map(|(_, e, _)| *e).collect();
 
             // Owned per-episode quality for this season.
@@ -340,11 +351,10 @@ async fn try_consolidate_show(
                 return Ok(());
             }
             // Record the pack owned+verified with full-season provides + sticky provenance.
-            let prov = base_req_provenance(app, tmdb_id).await;
             let provides: Vec<(u32, u32)> = eps.iter().map(|(s, e, _)| (*s, *e)).collect();
             let _ = app.store.put_owned(r.info_hash.clone(), OwnedRecord {
-                request: crate::store::AcquireRequest { season: Some(season), episode: Some(1), ..sample.request.clone() },
-                provenance: prov,
+                request: crate::store::AcquireRequest { season: Some(season), episode: Some(1), ..sample.request.clone() }, // episode: Some(1) is a sentinel — the authoritative full-season set is in `provides`.
+                provenance: prov.clone(),
                 added_at: now_secs(),
                 status: OwnedStatus::Verified,
                 provides: provides.clone(),
@@ -630,6 +640,16 @@ mod tests {
             pack_cached: false, pack_episodes: vec![1, 2, 3], pack_quality: q1080_bluray(),
         };
         assert!(!consolidation_target(&input));
+    }
+
+    #[test]
+    fn empty_aired_set_is_rejected() {
+        let input = ConsolidationInput {
+            season: 1, aired_episodes: vec![],
+            owned_episode_quality: vec![], pack_cached: true,
+            pack_episodes: vec![1, 2, 3], pack_quality: q1080_bluray(),
+        };
+        assert!(!consolidation_target(&input), "empty aired set must not consolidate");
     }
 
     fn q1080_web() -> crate::release::QualitySummary { crate::release::QualitySummary { cached: true, source_tier: 3_000, resolution: 1080, score: 1 } }
