@@ -3171,4 +3171,33 @@ mod selection_tests {
         }
         assert_eq!(found.expect("S01E01 present").hash, "h_pack", "per-episode selection wins");
     }
+
+    #[test]
+    fn episode_stale_selection_degrades_to_legacy_dedup() {
+        // A selection entry naming a hash that is NOT in the group is stale; it must NOT hide the
+        // episode — self-healing falls through to the legacy dedup so the episode still appears.
+        let torrent = TorrentInfo {
+            id: "t".into(), hash: "h_live".into(), bytes: 1_000_000_000, status: "downloaded".into(),
+            files: vec![TorrentFile { id: 0, path: "Show.S01E01.1080p.mkv".into(), bytes: 1_000_000_000, selected: 1 }],
+            links: vec!["https://cdn/e1".into()],
+            ..Default::default()
+        };
+        let mut sel = SelectionMap::new();
+        sel.insert(episode_slot(1396, 1, 1), SelectionEntry { hash: "h_gone".into(), file_path: "Show.S01E01.1080p.mkv".into() });
+        let vfs = DebridVfs::build(vec![(torrent, show_meta(1396))], &sel);
+        // Episode S01E01 must still be present under Shows/<show>/Season 01.
+        let mut found = false;
+        if let VfsNode::Directory { children } = &vfs.root {
+            if let Some(VfsNode::Directory { children: shows }) = children.get("Shows") {
+                for show in shows.values() {
+                    if let VfsNode::Directory { children: seasons } = show {
+                        if let Some(VfsNode::Directory { children: eps }) = seasons.get("Season 01") {
+                            if eps.values().any(|n| matches!(n, VfsNode::MediaFile { .. })) { found = true; }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found, "stale selection (absent hash) must not hide the episode");
+    }
 }
