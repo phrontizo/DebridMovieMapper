@@ -115,6 +115,14 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Extract the numeric tmdb id from `MediaMetadata.external_id` (`"tmdb:1396"`).
+fn tmdb_to_u64(m: &crate::vfs::MediaMetadata) -> Option<u64> {
+    m.external_id
+        .as_deref()
+        .and_then(|s| s.strip_prefix("tmdb:"))
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
 pub struct AcquisitionEngine {
     provider: Arc<dyn DebridProvider>,
     scraper: Arc<dyn Scraper>,
@@ -372,8 +380,55 @@ impl AcquisitionEngine {
         }
     }
 
-    /// Called each scan tick with the current torrent list. Probes completed Pending owned
-    /// torrents, and re-acquires owned torrents that have stalled/died/failed verification.
+    /// Write `provides` and the per-slot `selection` entries for a now-Verified owned torrent,
+    /// and update its status. For a movie: one `movie_slot` entry for the selected file. For a
+    /// show: `episode_slot` entries for every SE-mapped selected file, and `provides` is that set.
+    async fn record_verified(&self, hash: &str, req: &AcquireRequest, info: &TorrentInfo, selected_path: &str) {
+        match req.kind {
+            MediaKind::Movie => {
+                if let Some(id) = tmdb_to_u64(&req.metadata) {
+                    let _ = self
+                        .store
+                        .put_selection(
+                            crate::store::movie_slot(id),
+                            crate::store::SelectionEntry {
+                                hash: hash.to_string(),
+                                file_path: selected_path.to_string(),
+                            },
+                        )
+                        .await;
+                }
+            }
+            MediaKind::Series => {
+                let eps = episode_files(info);
+                if let Some(id) = tmdb_to_u64(&req.metadata) {
+                    for (s, e, path) in &eps {
+                        let _ = self
+                            .store
+                            .put_selection(
+                                crate::store::episode_slot(id, *s, *e),
+                                crate::store::SelectionEntry {
+                                    hash: hash.to_string(),
+                                    file_path: path.clone(),
+                                },
+                            )
+                            .await;
+                    }
+                }
+                // Persist provides = the SE-mapped episode set (the churn fix).
+                if let Some(mut rec) = self.store.get_owned(hash.to_string()).await {
+                    rec.provides = eps.iter().map(|(s, e, _)| (*s, *e)).collect();
+                    let _ = self.store.put_owned(hash.to_string(), rec).await;
+                }
+            }
+        }
+        let _ = self.store.set_owned_status(hash.to_string(), OwnedStatus::Verified).await;
+    }
+
+    /// Called each scan tick with the current torrent list. Resolves optimistically-added Pending
+    /// torrents (select files → pack-guard → title-validation → probe → Verified + provides +
+    /// selection), reaps genuinely-dead/never-resolving ones after `dead_timeout`, and recovers by
+    /// re-scraping. No scraping on the happy path.
     pub async fn observe(&self, torrents: &[crate::rd_client::Torrent]) {
         let owned = self.store.all_owned().await;
         // Key by lowercased provider hash so it matches the lowercased candidate hashes we store.
@@ -384,23 +439,109 @@ impl AcquisitionEngine {
 
         for (hash, rec) in &owned {
             let Some(t) = by_hash.get(hash.as_str()).copied() else {
-                continue; // not in the current account listing; leave it
+                // Not in the listing. A Pending torrent that never registered/resolved is dead
+                // once it has been waiting longer than the dead-timeout.
+                if rec.status == OwnedStatus::Pending
+                    && now_secs().saturating_sub(rec.added_at) > self.dead_timeout.as_secs()
+                {
+                    self.fail_and_reacquire(hash, "", &rec.request, "NeverResolved", &rec.provenance).await;
+                }
+                continue;
             };
-            let dead = matches!(t.status.as_str(), "magnet_error" | "dead" | "error" | "virus");
-            if dead {
+            if matches!(t.status.as_str(), "magnet_error" | "dead" | "error" | "virus") {
                 self.fail_and_reacquire(hash, &t.id, &rec.request, "Dead", &rec.provenance).await;
                 continue;
             }
-            if t.status == "downloaded" {
-                if rec.status == OwnedStatus::Pending {
-                    self.verify_pending(hash, &t.id, &rec.request, &rec.provenance).await;
-                }
+            if rec.status == OwnedStatus::Verified {
                 self.progress.lock().await.remove(&t.id);
                 continue;
             }
-            // still downloading — stall check
-            if self.is_stalled(&t.id, t.progress).await {
-                self.fail_and_reacquire(hash, &t.id, &rec.request, "Stalled", &rec.provenance).await;
+            // Pending: fetch info to inspect files.
+            let info = match self.provider.get_torrent_info(&t.id).await {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            let has_files = info.files.iter().any(|f| crate::vfs::is_video_file(&f.path));
+            if !has_files {
+                if now_secs().saturating_sub(rec.added_at) > self.dead_timeout.as_secs() {
+                    self.fail_and_reacquire(hash, &t.id, &rec.request, "NeverResolved", &rec.provenance).await;
+                }
+                continue;
+            }
+            // Ensure something is selected so it downloads (RD: nothing downloads until selected).
+            let none_selected = info.files.iter().all(|f| f.selected != 1);
+            if none_selected {
+                let ids = select_ids_for(rec.request.kind, &info, None, None);
+                if !ids.is_empty() {
+                    let csv = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+                    let _ = self.provider.select_files(&t.id, &csv).await;
+                }
+                continue; // re-inspect next tick after selection settles
+            }
+            // Movie-pack guard (deferred from acquire).
+            if rec.request.kind == MediaKind::Movie && count_feature_videos(&info) > 1 {
+                self.fail_and_reacquire(hash, &t.id, &rec.request, "MoviePack", &rec.provenance).await;
+                continue;
+            }
+            // Choose the representative file to validate + probe. Movie: the feature video.
+            // Series: the file matching the REQUESTED episode (validating a pack's largest file
+            // against the requested (s,e) would misfire — a pack holds many episodes).
+            let selected_path = match rec.request.kind {
+                MediaKind::Movie => select_target(&info, None, None).map(|f| f.path.clone()),
+                MediaKind::Series => episode_files(&info)
+                    .into_iter()
+                    .find(|(s, e, _)| Some(*s) == rec.request.season && Some(*e) == rec.request.episode)
+                    .map(|(_, _, p)| p),
+            };
+            let Some(selected_path) = selected_path else {
+                // The requested episode isn't present (or no video resolved). Past the dead-timeout,
+                // treat it as a wrong/incomplete pick and re-acquire; otherwise wait (metadata may
+                // still be settling).
+                if now_secs().saturating_sub(rec.added_at) > self.dead_timeout.as_secs() {
+                    self.fail_and_reacquire(hash, &t.id, &rec.request, "EpisodeMissing", &rec.provenance).await;
+                }
+                continue;
+            };
+            let file_name = selected_path.rsplit('/').next().unwrap_or(&selected_path).to_string();
+            if !self
+                .validator
+                .validate(&file_name, rec.request.tmdb_id, rec.request.kind, rec.request.season, rec.request.episode)
+                .await
+            {
+                self.fail_and_reacquire(hash, &t.id, &rec.request, "WrongTitle", &rec.provenance).await;
+                continue;
+            }
+            if t.status != "downloaded" {
+                // Still downloading — stall check (uses dead_timeout as the no-progress ceiling).
+                if self.is_stalled(&t.id, t.progress).await {
+                    self.fail_and_reacquire(hash, &t.id, &rec.request, "Stalled", &rec.provenance).await;
+                }
+                continue;
+            }
+            // Downloaded → probe and finalise.
+            let locator = locator_for(&info, hash, &selected_path);
+            match self.verify_file(&locator, &rec.request).await {
+                VerifyResult::Pass | VerifyResult::Accept => {
+                    self.record_verified(hash, &rec.request, &info, &selected_path).await;
+                    self.verify_attempts.lock().await.remove(hash);
+                    self.progress.lock().await.remove(&t.id);
+                }
+                VerifyResult::Defer => {
+                    let n = {
+                        let mut m = self.verify_attempts.lock().await;
+                        let n = m.entry(hash.to_string()).or_insert(0);
+                        *n += 1;
+                        *n
+                    };
+                    if n >= MAX_VERIFY_ATTEMPTS {
+                        warn!("giving up verifying {} after {} deferred probes; accepting unverified", hash, n);
+                        self.record_verified(hash, &rec.request, &info, &selected_path).await;
+                    }
+                }
+                VerifyResult::Reject(reason) => {
+                    self.verify_attempts.lock().await.remove(hash);
+                    self.fail_and_reacquire(hash, &t.id, &rec.request, reason, &rec.provenance).await;
+                }
             }
         }
 
@@ -433,59 +574,6 @@ impl AcquisitionEngine {
         }
     }
 
-    async fn verify_pending(
-        &self,
-        hash: &str,
-        torrent_id: &str,
-        req: &AcquireRequest,
-        provenance: &Provenance,
-    ) {
-        // Bound re-probing: once we've deferred MAX_VERIFY_ATTEMPTS times, stop probing.
-        if self.verify_attempts.lock().await.get(hash).copied().unwrap_or(0) >= MAX_VERIFY_ATTEMPTS {
-            return;
-        }
-        let info = match self.provider.get_torrent_info(torrent_id).await {
-            Ok(i) => i,
-            Err(_) => return,
-        };
-        // No candidate hint here (we work from the owned record), so fall back to the largest video.
-        let Some(path) = select_target(&info, None, None).map(|f| f.path.clone()) else {
-            return;
-        };
-        let locator = locator_for(&info, hash, &path);
-        match self.verify_file(&locator, req).await {
-            VerifyResult::Pass | VerifyResult::Accept => {
-                let _ = self
-                    .store
-                    .set_owned_status(hash.to_string(), OwnedStatus::Verified)
-                    .await;
-                self.verify_attempts.lock().await.remove(hash);
-            }
-            VerifyResult::Defer => {
-                let n = {
-                    let mut m = self.verify_attempts.lock().await;
-                    let n = m.entry(hash.to_string()).or_insert(0);
-                    *n += 1;
-                    *n
-                };
-                if n >= MAX_VERIFY_ATTEMPTS {
-                    warn!(
-                        "giving up verifying {} after {} deferred probes; accepting unverified",
-                        hash, n
-                    );
-                    let _ = self
-                        .store
-                        .set_owned_status(hash.to_string(), OwnedStatus::Verified)
-                        .await;
-                }
-            }
-            VerifyResult::Reject(reason) => {
-                self.verify_attempts.lock().await.remove(hash);
-                self.fail_and_reacquire(hash, torrent_id, req, reason, provenance).await;
-            }
-        }
-    }
-
     async fn fail_and_reacquire(
         &self,
         hash: &str,
@@ -501,7 +589,15 @@ impl AcquisitionEngine {
             .await;
         let _ = self.store.remove_owned(hash.to_string()).await;
         let _ = self.store.remove_authoritative(hash.to_string()).await;
-        let _ = self.provider.delete_torrent(torrent_id).await;
+        // Drop any selection slots this hash represented so the VFS stops showing the dead release.
+        for (slot, entry) in self.store.all_selection().await {
+            if entry.hash.eq_ignore_ascii_case(hash) {
+                let _ = self.store.remove_selection(slot).await;
+            }
+        }
+        if !torrent_id.is_empty() {
+            let _ = self.provider.delete_torrent(torrent_id).await;
+        }
         self.progress.lock().await.remove(torrent_id);
         self.verify_attempts.lock().await.remove(hash);
         // Sticky provenance: re-acquire preserves the failed record's origin (Trigger B correctness).
@@ -615,6 +711,21 @@ mod tests {
         AcquisitionEngine::new(provider, scraper, validator, prober, store, prefs(), 5, Duration::from_secs(1800), Duration::from_secs(600))
     }
 
+    fn engine_dead(
+        provider: Arc<dyn DebridProvider>,
+        scraper: Arc<dyn Scraper>,
+        validator: Arc<dyn TitleValidator>,
+        prober: Arc<dyn Prober>,
+        store: Store,
+        dead_secs: u64,
+    ) -> AcquisitionEngine {
+        AcquisitionEngine::new(provider, scraper, validator, prober, store, prefs(), 5, Duration::from_secs(1800), Duration::from_secs(dead_secs))
+    }
+
+    fn torrent(id: &str, hash: &str, status: &str, progress: f64) -> crate::rd_client::Torrent {
+        crate::rd_client::Torrent { id: id.into(), hash: hash.into(), status: status.into(), progress, ..Default::default() }
+    }
+
     #[tokio::test]
     async fn acquire_records_pending_and_quality_optimistically() {
         let st = store();
@@ -707,5 +818,85 @@ mod tests {
             OwnedStatus::Verified,
             "should accept unverified after MAX deferred probes"
         );
+    }
+
+    #[tokio::test]
+    async fn observe_verifies_pending_cached_and_writes_selection() {
+        let st = store();
+        st.put_owned("h1".into(), OwnedRecord {
+            request: req(), provenance: Provenance::manual(), added_at: now_secs(),
+            status: OwnedStatus::Pending, provides: vec![], quality: None,
+        }).await.unwrap();
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![Track { kind: crate::probe::TrackKind::Audio, language: Some("eng".into()) }]))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)]).await;
+        assert_eq!(st.get_owned("h1".into()).await.unwrap().status, OwnedStatus::Verified);
+        // movie selection slot written for tmdb 27205.
+        assert_eq!(st.get_selection(crate::store::movie_slot(27205)).await.unwrap().hash, "h1");
+    }
+
+    #[tokio::test]
+    async fn observe_wrong_title_blacklists_and_reacquires() {
+        let st = store();
+        st.put_owned("h1".into(), OwnedRecord {
+            request: req(), provenance: Provenance::manual(), added_at: now_secs(),
+            status: OwnedStatus::Pending, provides: vec![], quality: None,
+        }).await.unwrap();
+        // Scraper returns nothing, so re-acquire finds no replacement; the dead hash is blacklisted.
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(false)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)]).await;
+        assert!(st.is_blacklisted(27205, "h1".into()).await);
+        assert!(st.get_owned("h1".into()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn observe_reaps_never_resolved_after_dead_timeout() {
+        let st = store();
+        // added_at far in the past; dead-timeout = 0 ⇒ immediately past it. Not in the listing.
+        st.put_owned("h1".into(), OwnedRecord {
+            request: req(), provenance: Provenance::manual(), added_at: 1,
+            status: OwnedStatus::Pending, provides: vec![], quality: None,
+        }).await.unwrap();
+        let eng = engine_dead(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+            0,
+        );
+        eng.observe(&[]).await; // h1 absent from listing
+        assert!(st.get_owned("h1".into()).await.is_none(), "never-resolved Pending is reaped");
+        assert!(st.is_blacklisted(27205, "h1".into()).await);
+    }
+
+    #[tokio::test]
+    async fn observe_leaves_downloading_with_recent_progress_pending() {
+        let st = store();
+        st.put_owned("h1".into(), OwnedRecord {
+            request: req(), provenance: Provenance::manual(), added_at: now_secs(),
+            status: OwnedStatus::Pending, provides: vec![], quality: None,
+        }).await.unwrap();
+        let eng = engine_dead(
+            provider_returning("downloading", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+            600,
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloading", 12.0)]).await;
+        assert_eq!(st.get_owned("h1".into()).await.unwrap().status, OwnedStatus::Pending, "slow-seed not judged early");
     }
 }
