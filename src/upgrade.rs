@@ -28,6 +28,11 @@ pub async fn run_upgrade_once(app: &AppState) {
     let groups = crate::tasks::group_owned_by_tmdb(&app.store).await;
     let mut candidates: Vec<(u64, MediaType, Vec<String>, OwnedRecord)> = Vec::new();
     for (tmdb_id, g) in &groups {
+        // Manual adds are never auto-managed (invariant M-1): skip upgrade/consolidation for them.
+        if g.provenance.has_manual_entry() {
+            tracing::debug!("upgrade: tmdb {} skipped (manual provenance — never auto-managed)", tmdb_id);
+            continue;
+        }
         // Representative owned record (the movie path uses it; a settled record gates both kinds).
         let Some(hash) = g.hashes.first().cloned() else { continue };
         let Some(rec) = app.store.get_owned(hash.clone()).await else { continue };
@@ -159,6 +164,27 @@ async fn stage_and_verify(
         let _ = app.provider.delete_torrent(&added.id).await;
         let _ = app.store.blacklist_add(tmdb_id, hash.clone(), "WrongTitle", now_secs()).await;
         return Err("title mismatch".into());
+    }
+    // Movie-pack guard (I-2): a candidate that materialises into more than one feature-sized
+    // video is a multi-movie pack (providers like TorBox auto-select all files) — never adopt it.
+    if crate::acquire::count_feature_videos(&info) > 1 {
+        let _ = app.provider.delete_torrent(&added.id).await;
+        return Err("multi-feature pack".into());
+    }
+    // Probe gate (I-1): run the SAME audio/subtitle probe as acquisition before adopting. A
+    // wrong-language/corrupt release is blacklisted + dropped; a transient probe failure is
+    // dropped without blacklisting (retried next tick) so we never degrade the working release.
+    match app.engine.probe_file(&info, &hash, &selected_path, base_req).await {
+        crate::acquire::VerifyResult::Pass | crate::acquire::VerifyResult::Accept => {}
+        crate::acquire::VerifyResult::Reject(reason) => {
+            let _ = app.provider.delete_torrent(&added.id).await;
+            let _ = app.store.blacklist_add(tmdb_id, hash.clone(), reason, now_secs()).await;
+            return Err(format!("probe rejected: {reason}"));
+        }
+        crate::acquire::VerifyResult::Defer => {
+            let _ = app.provider.delete_torrent(&added.id).await;
+            return Err("probe deferred".into());
+        }
     }
     // Record Verified with sticky provenance from the owned record we are upgrading.
     let prov = base_req_provenance(app, tmdb_id).await;
@@ -334,13 +360,33 @@ async fn try_consolidate_show(
                 let _ = app.provider.delete_torrent(&added.id).await; // non-destructive: drop the staged pack
                 continue;
             }
-            // Validate the show identity on a representative episode file.
+            // Validate the show identity on a representative episode file, then apply the SAME
+            // probe gate as acquisition (I-1) on that representative episode before adopting.
             if let Some((es, ee, path)) = eps.iter().find(|(s, _, _)| *s == season) {
                 let fname = path.rsplit('/').next().unwrap_or(path).to_string();
                 if !app.engine.validate_title(&fname, tmdb_id, MediaKind::Series, Some(*es), Some(*ee)).await {
                     let _ = app.provider.delete_torrent(&added.id).await;
                     let _ = app.store.blacklist_add(tmdb_id, r.info_hash.clone(), "WrongTitle", now_secs()).await;
                     continue;
+                }
+                // Per-episode request so the probe's language check uses the right original_language.
+                let probe_req = crate::store::AcquireRequest {
+                    season: Some(*es),
+                    episode: Some(*ee),
+                    ..sample.request.clone()
+                };
+                match app.engine.probe_file(&fresh, &r.info_hash, path, &probe_req).await {
+                    crate::acquire::VerifyResult::Pass | crate::acquire::VerifyResult::Accept => {}
+                    crate::acquire::VerifyResult::Reject(reason) => {
+                        let _ = app.provider.delete_torrent(&added.id).await;
+                        let _ = app.store.blacklist_add(tmdb_id, r.info_hash.clone(), reason, now_secs()).await;
+                        continue;
+                    }
+                    crate::acquire::VerifyResult::Defer => {
+                        // Transient probe failure: drop the staged pack and retry next tick (no blacklist).
+                        let _ = app.provider.delete_torrent(&added.id).await;
+                        continue;
+                    }
                 }
             }
             // Idle gate. If the library is active, drop the staged pack (no dangling stage) and
@@ -369,9 +415,14 @@ async fn try_consolidate_show(
                     crate::store::SelectionEntry { hash: r.info_hash.clone(), file_path: path.clone() },
                 ).await;
             }
-            // Prune the scattered episode torrents for this season.
+            // Prune the scattered episode torrents for this season — but ONLY those the pack
+            // actually covers (M-2). Pruning a held episode the pack doesn't contain would leave
+            // its selection un-repointed → a transient disappearance from the library.
             for (h, rec) in &owned {
-                if rec.provides.len() == 1 && rec.provides[0].0 == season {
+                if rec.provides.len() == 1
+                    && rec.provides[0].0 == season
+                    && eps.iter().any(|(es, ee, _)| *es == season && *ee == rec.provides[0].1)
+                {
                     prune_owned_hash(app, h).await;
                 }
             }
@@ -392,6 +443,7 @@ mod tests {
     use crate::repair::RepairManager;
     use crate::scraper::{MockScraper, Scraper};
     use crate::store::{AcquireRequest, Provenance, SelectionEntry, Store};
+    use crate::probe::{ProbeError, Track, TrackKind};
     use crate::release::RawCandidate;
     use crate::tmdb_client::TmdbClient;
     use crate::vfs::{DebridVfs, MediaMetadata, MediaType};
@@ -430,12 +482,33 @@ mod tests {
         }
     }
 
+    /// Test prober with a canned result (mirrors `acquire.rs`'s `CannedProber`). The upgrade probe
+    /// gate fetches from a real CDN in production; in tests we feed it a fixed track set / error.
+    struct CannedProber(Result<Vec<Track>, ProbeError>);
+    #[async_trait]
+    impl crate::acquire::Prober for CannedProber {
+        async fn probe(&self, _url: &str) -> Result<Vec<Track>, ProbeError> {
+            self.0.clone()
+        }
+    }
+
+    /// Default app: a PASSING prober (Unsupported → `VerifyResult::Accept`) so the staging probe
+    /// gate is satisfied without reaching a real CDN.
     fn app_with(scraper: Arc<dyn Scraper>, provider: Arc<dyn DebridProvider>, store: Store) -> AppState {
+        let prober: Arc<dyn crate::acquire::Prober> = Arc::new(CannedProber(Err(ProbeError::Unsupported)));
+        app_with_prober(scraper, provider, store, prober)
+    }
+
+    fn app_with_prober(
+        scraper: Arc<dyn Scraper>,
+        provider: Arc<dyn DebridProvider>,
+        store: Store,
+        prober: Arc<dyn crate::acquire::Prober>,
+    ) -> AppState {
         let mut config = Config::from_parts(None, Some("tb".into()), Some("k".into()), None, None, None).unwrap();
         config.acquisition = AcquisitionConfig::default();
         let tmdb = Arc::new(TmdbClient::new("k".into()).unwrap());
         let validator: Arc<dyn crate::acquire::TitleValidator> = Arc::new(PassValidator);
-        let prober: Arc<dyn crate::acquire::Prober> = Arc::new(crate::acquire::HttpProber { http: reqwest::Client::new() });
         let engine = Arc::new(crate::acquire::AcquisitionEngine::new(
             provider.clone(), scraper.clone(), validator, prober, store.clone(),
             config.acquisition.prefs.clone(), 5, Duration::from_secs(1800), Duration::from_secs(600),
@@ -497,6 +570,55 @@ mod tests {
         assert!(store.get_owned("hnew".into()).await.is_some(), "new release recorded owned+verified");
         assert!(store.get_owned("hold".into()).await.is_none(), "old release pruned from owned");
         assert!(deleted.lock().unwrap().contains(&"told".to_string()), "old torrent deleted from provider");
+    }
+
+    #[tokio::test]
+    async fn upgrade_blocked_when_probe_rejects() {
+        let store = mem_store();
+        // Owned: cached WEB 1080p movie, Verified, with a selection pointing at it.
+        store.put_owned("hold".into(), OwnedRecord {
+            request: movie_req(), provenance: Provenance::watchlist("a"), added_at: 1, status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: Some(QualitySummary { cached: true, source_tier: 3_000, resolution: 1080, score: 10 }),
+        }).await.unwrap();
+        store.put_selection(movie_slot(27205), SelectionEntry { hash: "hold".into(), file_path: "old.mkv".into() }).await.unwrap();
+
+        // Scraper offers a cached REMUX (a meaningful upgrade that passes scoring + title-validation).
+        let scraper = Arc::new(MockScraper { candidates: vec![remux_candidate()] });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent { id: "told".into(), hash: "hold".into(), status: "downloaded".into(), ..Default::default() },
+                Torrent { id: "tnew".into(), hash: "hnew".into(), status: "downloaded".into(), ..Default::default() },
+            ],
+            add_magnet: Some(AddMagnetResponse { id: "tnew".into(), uri: String::new() }),
+            torrent_info: Some(TorrentInfo {
+                id: "tnew".into(), hash: "hnew".into(), status: "downloaded".into(),
+                files: vec![TorrentFile { id: 0, path: "M.2020.1080p.REMUX.mkv".into(), bytes: 30_000_000_000, selected: 1 }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/new".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        // Prober returns a WRONG-language audio track. movie_req()'s original_language is "eng" and
+        // AcquisitionConfig::default() uses AudioReq::Original, so an "ita"-only audio set is a
+        // positive language violation → probe::verify FailAudio → VerifyResult::Reject("BadAudio").
+        let prober: Arc<dyn crate::acquire::Prober> = Arc::new(CannedProber(Ok(vec![
+            Track { kind: TrackKind::Audio, language: Some("ita".into()) },
+        ])));
+        let app = app_with_prober(scraper, provider, store.clone(), prober);
+
+        // Idle (slot never read) ⇒ staging runs; the probe gate must reject it.
+        run_upgrade_once(&app).await;
+
+        // No swap: selection unchanged, the rejected release is NOT owned, and the OLD torrent is
+        // NOT pruned. The rejected hash IS blacklisted (so it is never re-tried).
+        assert_eq!(store.get_selection(movie_slot(27205)).await.unwrap().hash, "hold", "selection must not swap on probe reject");
+        assert!(store.get_owned("hnew".into()).await.is_none(), "probe-rejected release must not be recorded owned");
+        assert!(!deleted.lock().unwrap().contains(&"told".to_string()), "old torrent must not be pruned when the upgrade is blocked");
+        assert!(store.is_blacklisted(27205, "hnew".into()).await, "probe-rejected hash must be blacklisted");
     }
 
     #[tokio::test]

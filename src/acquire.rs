@@ -208,7 +208,8 @@ pub(crate) fn episode_files(info: &TorrentInfo) -> Vec<(u32, u32, String)> {
 
 /// Count feature-sized video files. A real single-movie release has exactly one; more than one
 /// signals a multi-movie pack. The size floor excludes samples / extras / featurettes.
-fn count_feature_videos(info: &TorrentInfo) -> usize {
+/// `pub(crate)` so the upgrade engine can apply the same movie-pack guard when staging.
+pub(crate) fn count_feature_videos(info: &TorrentInfo) -> usize {
     const FEATURE_MIN_BYTES: u64 = 700_000_000;
     info.files
         .iter()
@@ -242,7 +243,9 @@ fn locator_for(info: &TorrentInfo, hash: &str, path: &str) -> FileLocator {
     }
 }
 
-enum VerifyResult {
+/// The verdict of probing a cached file's tracks against the language requirement.
+/// `pub` so the upgrade/consolidation engine can apply the same probe gate as acquisition.
+pub enum VerifyResult {
     Pass,
     Accept,
     Reject(&'static str),
@@ -360,6 +363,13 @@ impl AcquisitionEngine {
     /// Validate a file name against an expected title (used by the upgrade engine before staging).
     pub async fn validate_title(&self, file_name: &str, tmdb_id: u64, kind: MediaKind, season: Option<u32>, episode: Option<u32>) -> bool {
         self.validator.validate(file_name, tmdb_id, kind, season, episode).await
+    }
+
+    /// Probe a specific selected file (by path) within `info` and return the verify verdict.
+    /// Used by the upgrade/consolidation engine to apply the same probe gate as acquisition.
+    pub async fn probe_file(&self, info: &TorrentInfo, hash: &str, file_path: &str, req: &AcquireRequest) -> VerifyResult {
+        let locator = locator_for(info, hash, file_path);
+        self.verify_file(&locator, req).await
     }
 
     async fn verify_file(&self, locator: &FileLocator, req: &AcquireRequest) -> VerifyResult {
