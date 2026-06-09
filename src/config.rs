@@ -162,6 +162,9 @@ pub struct AcquisitionConfig {
     pub max_acquire_attempts: u32,
     /// Override for the scraper base URL; `None` → template Torrentio from the active provider.
     pub scraper_addon_url: Option<String>,
+    /// Seconds an optimistically-added torrent may stay Pending without resolving/seeding
+    /// before `observe` reaps it as dead (SP3). Default 600.
+    pub acquire_dead_timeout_secs: u64,
 }
 
 impl Default for AcquisitionConfig {
@@ -215,6 +218,7 @@ impl AcquisitionConfig {
                 None => 5,
             },
             scraper_addon_url: None,
+            acquire_dead_timeout_secs: 600,
         }
     }
 
@@ -232,7 +236,73 @@ impl AcquisitionConfig {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        a.acquire_dead_timeout_secs = std::env::var("ACQUIRE_DEAD_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|n| n.max(120))
+            .unwrap_or(600);
         a
+    }
+}
+
+/// Upgrade-engine configuration (SP3). Held by `Config`. The job is spawned only when
+/// `interval_secs > 0` (default 86_400 = daily; set `UPGRADE_INTERVAL_SECS=0` to disable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeConfig {
+    pub interval_secs: u64,
+    pub budget_per_tick: u32,
+    pub idle_secs: u64,
+    pub stage_max_secs: u64,
+}
+
+impl Default for UpgradeConfig {
+    fn default() -> Self {
+        Self::from_parts(None, None, None, None)
+    }
+}
+
+impl UpgradeConfig {
+    /// `true` when the upgrade job should run (interval non-zero).
+    pub fn enabled(&self) -> bool {
+        self.interval_secs > 0
+    }
+
+    /// Pure construction from raw optional values (env-independent, for tests).
+    /// `interval_secs`: 0 disables; otherwise clamped to a 600s minimum. Invalid → 86_400.
+    pub fn from_parts(
+        interval_secs: Option<String>,
+        budget_per_tick: Option<String>,
+        idle_secs: Option<String>,
+        stage_max_secs: Option<String>,
+    ) -> Self {
+        fn num(v: Option<String>, default: u64, min: u64, name: &str) -> u64 {
+            match v {
+                Some(s) => match s.trim().parse::<u64>() {
+                    Ok(0) if name == "UPGRADE_INTERVAL_SECS" => 0, // 0 = disabled (not clamped)
+                    Ok(n) => n.max(min),
+                    Err(_) => {
+                        warn!("Invalid {} value '{}', falling back to {}", name, s, default);
+                        default
+                    }
+                },
+                None => default,
+            }
+        }
+        UpgradeConfig {
+            interval_secs: num(interval_secs, 86_400, 600, "UPGRADE_INTERVAL_SECS"),
+            budget_per_tick: num(budget_per_tick, 20, 1, "UPGRADE_BUDGET_PER_TICK") as u32,
+            idle_secs: num(idle_secs, 300, 30, "UPGRADE_IDLE_SECS"),
+            stage_max_secs: num(stage_max_secs, 604_800, 3600, "UPGRADE_STAGE_MAX_SECS"),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_parts(
+            std::env::var("UPGRADE_INTERVAL_SECS").ok(),
+            std::env::var("UPGRADE_BUDGET_PER_TICK").ok(),
+            std::env::var("UPGRADE_IDLE_SECS").ok(),
+            std::env::var("UPGRADE_STAGE_MAX_SECS").ok(),
+        )
     }
 }
 
@@ -253,6 +323,8 @@ pub struct Config {
     pub acquisition: AcquisitionConfig,
     /// Trakt sync config. `None` when `TRAKT_CLIENT_ID`/`TRAKT_CLIENT_SECRET` are absent.
     pub trakt: Option<TraktConfig>,
+    /// Upgrade-engine config (SP3). Always present; `upgrade.enabled()` gates the job.
+    pub upgrade: UpgradeConfig,
 }
 
 impl Config {
@@ -268,6 +340,7 @@ impl Config {
         )?;
         cfg.acquisition = AcquisitionConfig::from_env();
         cfg.trakt = TraktConfig::from_env();
+        cfg.upgrade = UpgradeConfig::from_env();
         Ok(cfg)
     }
 
@@ -316,6 +389,7 @@ impl Config {
             port,
             acquisition: AcquisitionConfig::default(),
             trakt: None,
+            upgrade: UpgradeConfig::default(),
         })
     }
 }
@@ -532,5 +606,51 @@ mod tests {
     fn config_from_parts_has_trakt_none() {
         let c = parts(Some("rd"), None, Some("tmdb"), None, None, None).unwrap();
         assert_eq!(c.trakt, None);
+    }
+
+    #[test]
+    fn upgrade_config_defaults_to_daily_and_clamps() {
+        // Absent → daily default, all sub-defaults applied.
+        let u = UpgradeConfig::from_parts(None, None, None, None);
+        assert_eq!(u.interval_secs, 86_400);
+        assert_eq!(u.budget_per_tick, 20);
+        assert_eq!(u.idle_secs, 300);
+        assert_eq!(u.stage_max_secs, 604_800);
+        assert!(u.enabled(), "default (daily) is enabled");
+
+        // interval=0 disables the job.
+        let off = UpgradeConfig::from_parts(Some("0".into()), None, None, None);
+        assert_eq!(off.interval_secs, 0);
+        assert!(!off.enabled());
+
+        // Below-min interval (but non-zero) clamps up to 600; sub-knobs clamp to their mins.
+        let clamped = UpgradeConfig::from_parts(
+            Some("60".into()), Some("0".into()), Some("5".into()), Some("10".into()),
+        );
+        assert_eq!(clamped.interval_secs, 600);
+        assert_eq!(clamped.budget_per_tick, 1);
+        assert_eq!(clamped.idle_secs, 30);
+        assert_eq!(clamped.stage_max_secs, 3600);
+
+        // Invalid → defaults.
+        let bad = UpgradeConfig::from_parts(Some("x".into()), Some("y".into()), None, None);
+        assert_eq!(bad.interval_secs, 86_400);
+        assert_eq!(bad.budget_per_tick, 20);
+    }
+
+    #[test]
+    fn acquisition_has_dead_timeout_default_and_override() {
+        let a = AcquisitionConfig::from_parts(None, None, None, None, None, None, None);
+        assert_eq!(a.acquire_dead_timeout_secs, 600);
+        let b = AcquisitionConfig::from_parts(
+            None, None, None, None, None, None, None,
+        );
+        assert_eq!(b.acquire_dead_timeout_secs, 600);
+    }
+
+    #[test]
+    fn config_from_parts_has_upgrade_default() {
+        let c = parts(Some("rd"), None, Some("tmdb"), None, None, None).unwrap();
+        assert_eq!(c.upgrade.interval_secs, 86_400);
     }
 }
