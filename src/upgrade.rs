@@ -159,17 +159,19 @@ async fn stage_and_verify(
     let _ = app.provider.select_files(&added.id, &csv).await;
     let selected_path = file.path.clone();
     let file_name = selected_path.rsplit('/').next().unwrap_or(&selected_path).to_string();
+    // Movie-pack guard (I-2): a candidate that materialises into more than one feature-sized
+    // video is a multi-movie pack (providers like TorBox auto-select all files) — never adopt it.
+    // Run BEFORE title-validation to save a TMDB lookup on a pack that would be rejected anyway.
+    if crate::acquire::count_feature_videos(&info) > 1 {
+        let _ = app.provider.delete_torrent(&added.id).await;
+        let _ = app.store.blacklist_add(tmdb_id, hash.clone(), "MoviePack", now_secs()).await;
+        return Err("multi-feature pack".into());
+    }
     // Title validation (the engine exposes `validate_title` — see below).
     if !app.engine.validate_title(&file_name, tmdb_id, MediaKind::Movie, None, None).await {
         let _ = app.provider.delete_torrent(&added.id).await;
         let _ = app.store.blacklist_add(tmdb_id, hash.clone(), "WrongTitle", now_secs()).await;
         return Err("title mismatch".into());
-    }
-    // Movie-pack guard (I-2): a candidate that materialises into more than one feature-sized
-    // video is a multi-movie pack (providers like TorBox auto-select all files) — never adopt it.
-    if crate::acquire::count_feature_videos(&info) > 1 {
-        let _ = app.provider.delete_torrent(&added.id).await;
-        return Err("multi-feature pack".into());
     }
     // Probe gate (I-1): run the SAME audio/subtitle probe as acquisition before adopting. A
     // wrong-language/corrupt release is blacklisted + dropped; a transient probe failure is
@@ -619,6 +621,7 @@ mod tests {
         assert!(store.get_owned("hnew".into()).await.is_none(), "probe-rejected release must not be recorded owned");
         assert!(!deleted.lock().unwrap().contains(&"told".to_string()), "old torrent must not be pruned when the upgrade is blocked");
         assert!(store.is_blacklisted(27205, "hnew".into()).await, "probe-rejected hash must be blacklisted");
+        assert!(deleted.lock().unwrap().contains(&"tnew".to_string()), "staged torrent must be cleaned up after probe reject");
     }
 
     #[tokio::test]
