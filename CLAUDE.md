@@ -156,6 +156,14 @@ The Trakt cycle + episode monitor are gated on `scheduler::trakt_jobs_enabled` (
   2. Write the minimum code to make the test pass.
   3. Refactor while keeping tests green.
   4. Run `cargo test` after every change to confirm nothing is broken.
+- **Before every commit, run the lint gate (this is CI's `lint` job — fmt + clippy):**
+  ```bash
+  cargo fmt --check && cargo clippy --all-targets -- -D warnings
+  ```
+  CI runs these on the latest stable Rust (`dtolnay/rust-toolchain@stable`), and each new stable
+  can add clippy lints — so keep your local toolchain current (`rustup update stable`), otherwise
+  lint can pass locally yet fail in CI on a lint your older clippy doesn't have. If
+  `cargo fmt --check` fails, run `cargo fmt` to fix; do not hand-format around it.
 - **Before every commit, run all unit and integration tests:**
   ```bash
   cargo test \
