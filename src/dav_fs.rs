@@ -83,9 +83,9 @@ impl DavFileSystem for DebridFileSystem {
     ) -> FsFuture<'a, Box<dyn DavFile>> {
         async move {
             let node = self.find_node(path).await.ok_or(FsError::NotFound)?;
-            let vfs_path = path.as_rel_ospath().to_string_lossy().into_owned();
-            let name = path
-                .as_rel_ospath()
+            let rel = path.as_rel_ospath();
+            let vfs_path = rel.to_string_lossy().into_owned();
+            let name = rel
                 .to_str()
                 .and_then(|s| s.rsplit('/').next())
                 .unwrap_or("")
