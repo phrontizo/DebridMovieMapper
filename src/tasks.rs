@@ -66,7 +66,7 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
     // only captures genuinely new/changed content, not the entire library.
     if !seen_torrents.is_empty() {
         let persisted_data: Vec<_> = seen_torrents.values().cloned().collect();
-        update_vfs(&vfs, &persisted_data, &repair_manager, &None).await;
+        update_vfs(&vfs, &persisted_data, &repair_manager, &None, &store).await;
         info!(
             "Pre-populated VFS with {} persisted entries",
             persisted_data.len()
@@ -212,7 +212,7 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
                             if !pending_db_writes.is_empty() {
                                 flush_db_writes(&store, &mut pending_db_writes).await;
                             }
-                            update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client).await;
+                            update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client, &store).await;
                             return;
                         }
                     } {
@@ -234,12 +234,12 @@ pub async fn run_scan_loop(scan_config: ScanConfig, mut shutdown: tokio::sync::w
                                 "Progress: {}/{} new torrents identified",
                                 processed_new, new_total
                             );
-                            update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client)
+                            update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client, &store)
                                 .await;
                         }
                     }
                 } else {
-                    update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client).await;
+                    update_vfs(&vfs, &current_data, &repair_manager, &jellyfin_client, &store).await;
                 }
 
                 let current_ids: std::collections::HashSet<&str> =
@@ -338,6 +338,7 @@ async fn update_vfs(
     current_data: &[(crate::rd_client::TorrentInfo, MediaMetadata)],
     repair_manager: &Arc<RepairManager>,
     jellyfin_client: &Option<Arc<crate::jellyfin_client::JellyfinClient>>,
+    store: &Store,
 ) {
     let hidden_ids = repair_manager.hidden_torrent_ids().await;
     let filtered: Vec<_> = current_data
@@ -345,8 +346,10 @@ async fn update_vfs(
         .filter(|(torrent_info, _)| !hidden_ids.contains(&torrent_info.id))
         .map(|(torrent_info, metadata)| (torrent_info.clone(), metadata.clone()))
         .collect();
+    // SP3: resolve the live-selection map so build() shows the managed release per slot.
+    let selection: crate::vfs::SelectionMap = store.all_selection().await.into_iter().collect();
     // Build VFS without holding the lock to avoid blocking WebDAV reads during scans
-    let new_vfs = DebridVfs::build(filtered, &crate::vfs::SelectionMap::new());
+    let new_vfs = DebridVfs::build(filtered, &selection);
     // Diff old vs new, then swap
     let mut vfs_lock = vfs.write().await;
     let changes = crate::vfs::diff_trees(&vfs_lock.root, &new_vfs.root, "");
@@ -790,6 +793,12 @@ async fn execute_remove(
         }
         if let Err(e) = store.remove_owned(hash.clone()).await {
             warn!("reconcile: remove_owned {} (tmdb {}) failed: {}", hash, tmdb_id, e);
+        }
+        // SP3: drop any selection slots this hash represented.
+        for (slot, entry) in store.all_selection().await {
+            if entry.hash.eq_ignore_ascii_case(hash) {
+                let _ = store.remove_selection(slot).await;
+            }
         }
     }
 }
@@ -1743,6 +1752,30 @@ mod reconcile_wanted_tests {
     }
 
     // ── execute_remove (mem Store + MockProvider) ─────────────────────────────
+
+    #[tokio::test]
+    async fn execute_remove_drops_owned_and_selection() {
+        use crate::store::{OwnedRecord, OwnedStatus, SelectionEntry, movie_slot};
+        use crate::scraper::MediaKind;
+        use crate::vfs::{MediaMetadata, MediaType};
+        let store = mem_store();
+        let req = AcquireRequest {
+            imdb_id: "tt1".into(), tmdb_id: 27205, kind: MediaKind::Movie, season: None, episode: None,
+            original_language: None,
+            metadata: MediaMetadata { title: "M".into(), year: None, media_type: MediaType::Movie, external_id: Some("tmdb:27205".into()) },
+        };
+        store.put_owned("h1".into(), OwnedRecord { request: req, provenance: Provenance::watchlist("a"), added_at: 1, status: OwnedStatus::Verified, provides: vec![], quality: None }).await.unwrap();
+        store.put_selection(movie_slot(27205), SelectionEntry { hash: "h1".into(), file_path: "m.mkv".into() }).await.unwrap();
+
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent { id: "tid".into(), hash: "h1".into(), status: "downloaded".into(), ..Default::default() }],
+            ..Default::default()
+        });
+        let torrents = provider.get_torrents().await.unwrap();
+        execute_remove(&provider, &torrents, &store, 27205, &["h1".to_string()]).await;
+        assert!(store.get_owned("h1".into()).await.is_none());
+        assert!(store.get_selection(movie_slot(27205)).await.is_none(), "removal must clear the selection slot");
+    }
 
     #[tokio::test]
     async fn execute_remove_deletes_torrent_and_owned_record() {
