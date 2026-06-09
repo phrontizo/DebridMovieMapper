@@ -123,7 +123,11 @@ impl EnrolmentService {
 /// Poll the device-token endpoint until Authorized/terminal; on success fetch the user's slug
 /// and persist the tokens. Returns the stored slug. The loop is bounded by `expires_in_secs`
 /// so it can never spin forever.
-pub(crate) async fn poll_to_completion(
+///
+/// Also used directly by the interactive live integration test
+/// (`tests/trakt_integration_test.rs`) to drive the device flow end-to-end — that test calls
+/// this function after printing the verification URL so a human can approve it in-browser.
+pub async fn poll_to_completion(
     trakt: &Arc<dyn TraktClient>,
     store: &Store,
     device_code: String,

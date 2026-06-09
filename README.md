@@ -258,6 +258,16 @@ Visit `/trakt/accounts` on the server (e.g. `http://localhost:8080/trakt/account
 
 > ⚠️ The enrolment page is **unauthenticated**, just like the WebDAV endpoint — it assumes the port is only reachable on a trusted local network. Do not expose it to an untrusted network. If a linked account later needs re-authorising (e.g. its token was revoked), it is flagged on the accounts page as *needs re-enrolment*.
 
+### Validating Trakt parsing against a live account
+
+An interactive integration test (`tests/trakt_integration_test.rs`) exercises every Trakt parser and `sync_trakt` end-to-end against your real Trakt account — no static token needed. Run:
+
+```bash
+cargo test --test trakt_integration_test -- --ignored --nocapture
+```
+
+The test prints a verification URL and a short code, then waits for you to open the URL and approve it at trakt.tv/activate. Once approved it reads your watchlist, in-progress and watched history, and runs the full `sync_trakt` path, asserting the `wanted` set is populated. Requires `TRAKT_CLIENT_ID`, `TRAKT_CLIENT_SECRET`, and `TMDB_API_KEY` (in `.env` or environment); it skips cleanly if any is absent. Tokens are minted on demand via the device-flow and stored only in a temporary file that the test cleans up afterwards.
+
 ## Technical Details
 
 - **Language**: Rust (2021 edition)
