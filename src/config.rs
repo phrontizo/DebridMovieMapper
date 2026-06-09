@@ -275,10 +275,10 @@ impl UpgradeConfig {
         idle_secs: Option<String>,
         stage_max_secs: Option<String>,
     ) -> Self {
-        fn num(v: Option<String>, default: u64, min: u64, name: &str) -> u64 {
+        fn num(v: Option<String>, default: u64, min: u64, zero_disables: bool, name: &str) -> u64 {
             match v {
                 Some(s) => match s.trim().parse::<u64>() {
-                    Ok(0) if name == "UPGRADE_INTERVAL_SECS" => 0, // 0 = disabled (not clamped)
+                    Ok(0) if zero_disables => 0,
                     Ok(n) => n.max(min),
                     Err(_) => {
                         warn!("Invalid {} value '{}', falling back to {}", name, s, default);
@@ -289,13 +289,15 @@ impl UpgradeConfig {
             }
         }
         UpgradeConfig {
-            interval_secs: num(interval_secs, 86_400, 600, "UPGRADE_INTERVAL_SECS"),
-            budget_per_tick: num(budget_per_tick, 20, 1, "UPGRADE_BUDGET_PER_TICK") as u32,
-            idle_secs: num(idle_secs, 300, 30, "UPGRADE_IDLE_SECS"),
-            stage_max_secs: num(stage_max_secs, 604_800, 3600, "UPGRADE_STAGE_MAX_SECS"),
+            interval_secs: num(interval_secs, 86_400, 600, true, "UPGRADE_INTERVAL_SECS"),
+            budget_per_tick: num(budget_per_tick, 20, 1, false, "UPGRADE_BUDGET_PER_TICK").min(u32::MAX as u64) as u32,
+            idle_secs: num(idle_secs, 300, 30, false, "UPGRADE_IDLE_SECS"),
+            stage_max_secs: num(stage_max_secs, 604_800, 3600, false, "UPGRADE_STAGE_MAX_SECS"),
         }
     }
 
+    /// Read `UPGRADE_INTERVAL_SECS`, `UPGRADE_BUDGET_PER_TICK`, `UPGRADE_IDLE_SECS`,
+    /// and `UPGRADE_STAGE_MAX_SECS` from the process environment, then delegate to `from_parts`.
     pub fn from_env() -> Self {
         Self::from_parts(
             std::env::var("UPGRADE_INTERVAL_SECS").ok(),
@@ -639,13 +641,11 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_has_dead_timeout_default_and_override() {
+    fn acquisition_dead_timeout_defaults_to_600() {
+        // The env-override path (ACQUIRE_DEAD_TIMEOUT_SECS) is exercised via from_env,
+        // which is not unit-testable here without mutating the process environment.
         let a = AcquisitionConfig::from_parts(None, None, None, None, None, None, None);
         assert_eq!(a.acquire_dead_timeout_secs, 600);
-        let b = AcquisitionConfig::from_parts(
-            None, None, None, None, None, None, None,
-        );
-        assert_eq!(b.acquire_dead_timeout_secs, 600);
     }
 
     #[test]
