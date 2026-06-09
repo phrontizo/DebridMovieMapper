@@ -274,27 +274,66 @@ async fn lifecycle_acquire_sintel_by_imdb() {
         .with_max_level(tracing::Level::INFO)
         .with_test_writer()
         .try_init();
-    let outcome = engine
-        .acquire(req, debridmoviemapper::store::Provenance::manual())
-        .await;
-    eprintln!("acquire outcome: {:?}", outcome);
-    assert!(
-        matches!(
-            outcome,
-            debridmoviemapper::acquire::AcquireOutcome::Acquired(_)
-                | debridmoviemapper::acquire::AcquireOutcome::Pending(_)
-        ),
-        "Sintel should be acquirable; got {:?}",
-        outcome
-    );
+    // Optimistic acquire: returns Pending quickly (or Acquired if the cached check is instant).
+    let hash = match engine
+        .acquire(req.clone(), debridmoviemapper::store::Provenance::manual())
+        .await
+    {
+        debridmoviemapper::acquire::AcquireOutcome::Pending(h)
+        | debridmoviemapper::acquire::AcquireOutcome::Acquired(h) => h,
+        other => panic!("unexpected acquire outcome: {other:?}"),
+    };
+    eprintln!("acquire outcome hash: {}", hash);
 
-    // Cleanup: delete every service-owned torrent we just added.
-    for (hash, _rec) in store.all_owned().await {
-        if let Ok(torrents) = provider.get_torrents().await {
-            for t in torrents.iter().filter(|t| t.hash.eq_ignore_ascii_case(&hash)) {
+    // Drive observe until the store shows Verified.
+    // Sintel is a small, widely-cached CC torrent, so it should verify within a few ticks.
+    let mut verified = false;
+    for _ in 0..20 {
+        let torrents = provider.get_torrents().await.expect("get_torrents");
+        engine.observe(&torrents).await;
+        if matches!(
+            store.get_owned(hash.clone()).await.map(|r| r.status),
+            Some(debridmoviemapper::store::OwnedStatus::Verified)
+        ) {
+            verified = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    assert!(verified, "Sintel should verify via observe within the poll window");
+
+    // Build the VFS from the live selection map and assert Sintel appears under Movies/.
+    // `get_torrents` returns Torrent (listing); `build` needs TorrentInfo — fetch full info.
+    let torrents = provider.get_torrents().await.expect("get_torrents for VFS build");
+    let mut filtered = Vec::new();
+    for t in &torrents {
+        if t.status == "downloaded" {
+            if let Ok(info) = provider.get_torrent_info(&t.id).await {
+                let meta = identify_torrent(&info, &tmdb).await;
+                filtered.push((info, meta));
+            }
+        }
+    }
+    let selection: debridmoviemapper::vfs::SelectionMap =
+        store.all_selection().await.into_iter().collect();
+    let vfs = DebridVfs::build(filtered, &selection);
+    assert!(
+        vfs_has_media_file(&vfs.root, ".mp4"),
+        "Sintel .mp4 should appear under Movies/ after verify"
+    );
+    eprintln!("Sintel appears in Movies/ via VFS ✓");
+
+    // Cleanup: delete every service-owned torrent from the provider.
+    for (h, _rec) in store.all_owned().await {
+        if let Ok(ts) = provider.get_torrents().await {
+            for t in ts.iter().filter(|t| t.hash.eq_ignore_ascii_case(&h)) {
                 let _ = provider.delete_torrent(&t.id).await;
             }
         }
+    }
+    // Remove selection entries created by observe from the temp store.
+    for (slot, _entry) in store.all_selection().await {
+        let _ = store.remove_selection(slot).await;
     }
     let _ = std::fs::remove_file(&dbp);
     let _ = std::fs::remove_file(format!("{}.corrupt", dbp.to_str().unwrap()));
