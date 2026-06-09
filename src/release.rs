@@ -297,7 +297,7 @@ pub fn rank(candidates: Vec<ReleaseInfo>, prefs: &QualityPrefs) -> Vec<ReleaseIn
         .into_iter()
         .filter_map(|r| score(&r, prefs).map(|s| (s, r)))
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|s| std::cmp::Reverse(s.0));
     scored.into_iter().map(|(_, r)| r).collect()
 }
 
