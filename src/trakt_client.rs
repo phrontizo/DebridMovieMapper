@@ -118,11 +118,19 @@ impl TraktClientImpl {
     }
 
     /// Build a request carrying the common Trakt headers. Authed reads add `.bearer_auth(..)`.
+    ///
+    /// A `User-Agent` is mandatory: Trakt's API sits behind Cloudflare, which 403s requests with
+    /// no UA, and `reqwest` does not set one by default. Trakt also asks API apps to send a
+    /// descriptive UA identifying the integration.
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         self.http
             .request(method, format!("{}{}", self.base_url, path))
             .header("trakt-api-version", "2")
             .header("trakt-api-key", self.client_id.as_str())
+            .header(
+                reqwest::header::USER_AGENT,
+                concat!("debridmoviemapper/", env!("CARGO_PKG_VERSION")),
+            )
             .header(reqwest::header::CONTENT_TYPE, "application/json")
     }
 
