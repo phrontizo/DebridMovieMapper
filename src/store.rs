@@ -10,7 +10,10 @@ use tracing::{error, info, warn};
 /// v1→v2: additive (owned_hashes, authoritative_ids, blacklist tables).
 /// v2→v3: additive (trakt_tokens, wanted tables).
 /// v3→v4: additive (selection, upgrade_checks tables; OwnedRecord.provides/quality fields).
-pub const SCHEMA_VERSION: u64 = 4;
+/// v4→v5: the `wanted` row key gained a media-type discriminator (movie/show with the same numeric
+///        TMDB id no longer collide). Old `{user}|{tmdb_id}` rows are cleared — regenerated from
+///        Trakt within one sync interval (lossless).
+pub const SCHEMA_VERSION: u64 = 5;
 
 /// TMDB identification cache: torrent id -> serde_json((TorrentInfo, MediaMetadata)).
 /// Same name + value encoding as the pre-Store inline table, so existing databases
@@ -27,8 +30,19 @@ const AUTH_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("authorita
 const BLACKLIST_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blacklist");
 /// Per-user Trakt OAuth tokens: user_slug -> serde_json(TraktTokens).
 const TRAKT_TOKENS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("trakt_tokens");
-/// Materialised per-(user, tmdb_id) wanted-set: "user|tmdb_id" -> serde_json(WantedRecord).
+/// Materialised wanted-set: "user|<m|s>|tmdb_id" -> serde_json(WantedRecord). The media-type
+/// discriminator is required because TMDB movie and TV id-spaces are independent — the same numeric
+/// id can be both a movie and a show, and without it the two would collide on one key.
 const WANTED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wanted");
+
+/// Build a `wanted` row key from (user, media_type, tmdb_id). See [`WANTED_TABLE`].
+fn wanted_key(user: &str, media_type: &crate::vfs::MediaType, tmdb_id: u64) -> String {
+    let disc = match media_type {
+        crate::vfs::MediaType::Movie => 'm',
+        crate::vfs::MediaType::Show => 's',
+    };
+    format!("{}|{}|{}", user, disc, tmdb_id)
+}
 /// SP3 live-selection: slot ("m|tmdb" / "e|tmdb|s|e") -> serde_json(SelectionEntry).
 const SELECTION_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("selection");
 /// SP3 upgrade round-robin cursor: tmdb_id (as string) -> last-checked unix secs.
@@ -362,7 +376,20 @@ impl Store {
     /// non-additive migrations add steps here, keyed on `from_version`, before the version stamp
     /// is written.
     /// v3→v4: additive (selection, upgrade_checks tables; OwnedRecord.provides/quality serde defaults).
-    fn run_migrations(_db: &Database, _from_version: u64) -> Result<(), redb::Error> {
+    /// v4→v5: the `wanted` row key gained a media-type discriminator. Old `{user}|{tmdb_id}` rows are
+    /// unreachable by the new key, so clear the table — it repopulates from Trakt within one sync
+    /// interval (lossless). Only relevant when a pre-v5 DB already has a populated `wanted` table
+    /// (introduced in v3); a fresh DB (from_version 0) has no rows to clear.
+    fn run_migrations(db: &Database, from_version: u64) -> Result<(), redb::Error> {
+        if (3..5).contains(&from_version) {
+            let write_txn = db.begin_write()?;
+            {
+                // Opening creates the table if absent; clearing then is a harmless no-op.
+                let mut t = write_txn.open_table(WANTED_TABLE)?;
+                t.retain(|_, _| false)?;
+            }
+            write_txn.commit()?;
+        }
         Ok(())
     }
 
@@ -848,7 +875,7 @@ impl Store {
                 return Ok(());
             }
         };
-        let key = format!("{}|{}", rec.user, rec.tmdb_id);
+        let key = wanted_key(&rec.user, &rec.media_type, rec.tmdb_id);
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
@@ -863,8 +890,13 @@ impl Store {
         Self::flatten_join(result)
     }
 
-    pub async fn get_wanted(&self, user: String, tmdb_id: u64) -> Option<WantedRecord> {
-        let key = format!("{}|{}", user, tmdb_id);
+    pub async fn get_wanted(
+        &self,
+        user: String,
+        media_type: crate::vfs::MediaType,
+        tmdb_id: u64,
+    ) -> Option<WantedRecord> {
+        let key = wanted_key(&user, &media_type, tmdb_id);
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let txn = db.begin_read().ok()?;
@@ -877,8 +909,13 @@ impl Store {
         .flatten()
     }
 
-    pub async fn remove_wanted(&self, user: String, tmdb_id: u64) -> Result<(), AppError> {
-        let key = format!("{}|{}", user, tmdb_id);
+    pub async fn remove_wanted(
+        &self,
+        user: String,
+        media_type: crate::vfs::MediaType,
+        tmdb_id: u64,
+    ) -> Result<(), AppError> {
+        let key = wanted_key(&user, &media_type, tmdb_id);
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
@@ -1511,7 +1548,7 @@ mod tests {
         store.put_wanted(show_rec.clone()).await.unwrap();
 
         let got_movie = store
-            .get_wanted("alice".to_string(), 27205)
+            .get_wanted("alice".to_string(), MediaType::Movie, 27205)
             .await
             .expect("movie present");
         assert_eq!(got_movie, movie_rec);
@@ -1526,13 +1563,13 @@ mod tests {
         };
         store.put_wanted(updated_movie.clone()).await.unwrap();
         let got_updated = store
-            .get_wanted("alice".to_string(), 27205)
+            .get_wanted("alice".to_string(), MediaType::Movie, 27205)
             .await
             .expect("updated present");
         assert_eq!(got_updated, updated_movie);
 
         let got_show = store
-            .get_wanted("bob".to_string(), 1396)
+            .get_wanted("bob".to_string(), MediaType::Show, 1396)
             .await
             .expect("show present");
         assert_eq!(got_show, show_rec);
@@ -1551,11 +1588,52 @@ mod tests {
         assert!(all.iter().any(|r| r.user == "bob" && r.tmdb_id == 1396));
 
         store
-            .remove_wanted("alice".to_string(), 27205)
+            .remove_wanted("alice".to_string(), MediaType::Movie, 27205)
             .await
             .unwrap();
-        assert!(store.get_wanted("alice".to_string(), 27205).await.is_none());
+        assert!(store
+            .get_wanted("alice".to_string(), MediaType::Movie, 27205)
+            .await
+            .is_none());
         assert_eq!(store.all_wanted().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wanted_movie_and_show_with_same_tmdb_id_coexist() {
+        // TMDB movie and TV id-spaces are independent: a movie and a show with the SAME numeric id
+        // must both persist (the key carries a media-type discriminator), not overwrite each other.
+        let store = mem_store();
+        let movie = movie_wanted("alice", 1396);
+        let show = show_wanted("alice", 1396);
+        store.put_wanted(movie.clone()).await.unwrap();
+        store.put_wanted(show.clone()).await.unwrap();
+
+        assert_eq!(store.all_wanted().await.len(), 2, "both must persist");
+        assert_eq!(
+            store
+                .get_wanted("alice".to_string(), MediaType::Movie, 1396)
+                .await,
+            Some(movie)
+        );
+        assert_eq!(
+            store
+                .get_wanted("alice".to_string(), MediaType::Show, 1396)
+                .await,
+            Some(show)
+        );
+        // Removing the movie leaves the show intact.
+        store
+            .remove_wanted("alice".to_string(), MediaType::Movie, 1396)
+            .await
+            .unwrap();
+        assert!(store
+            .get_wanted("alice".to_string(), MediaType::Movie, 1396)
+            .await
+            .is_none());
+        assert!(store
+            .get_wanted("alice".to_string(), MediaType::Show, 1396)
+            .await
+            .is_some());
     }
 
     #[tokio::test]
@@ -1576,7 +1654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_db_to_v3_preserving_tables() {
+    async fn migrates_v2_db_to_current_preserving_tables() {
         let tmp = TempDb::new("migrate_v2_v3");
         {
             let db = Database::create(&tmp.path).unwrap();
@@ -1647,7 +1725,10 @@ mod tests {
         let wanted_rec = movie_wanted("u", 1);
         store.put_wanted(wanted_rec.clone()).await.unwrap();
         assert_eq!(
-            store.get_wanted("u".to_string(), 1).await.unwrap(),
+            store
+                .get_wanted("u".to_string(), MediaType::Movie, 1)
+                .await
+                .unwrap(),
             wanted_rec
         );
 
@@ -1658,7 +1739,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v1_db_to_v2_preserving_matches() {
+    async fn migrates_v4_db_clears_legacy_wanted_rows_but_keeps_owned() {
+        let tmp = TempDb::new("migrate_v4_v5");
+        {
+            let db = Database::create(&tmp.path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                // A legacy wanted row keyed by the OLD `{user}|{tmdb_id}` format (no media-type
+                // discriminator). Migration to v5 must clear it (it repopulates from Trakt).
+                let wdef: TableDefinition<&str, &[u8]> = TableDefinition::new("wanted");
+                let mut wt = txn.open_table(wdef).unwrap();
+                let legacy = movie_wanted("alice", 27205);
+                wt.insert(
+                    "alice|27205",
+                    serde_json::to_vec(&legacy).unwrap().as_slice(),
+                )
+                .unwrap();
+
+                // An owned row must SURVIVE (authoritative, not regenerable).
+                let odef: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_hashes");
+                let mut ot = txn.open_table(odef).unwrap();
+                let rec = OwnedRecord {
+                    request: req("tt4", 4242),
+                    provenance: Provenance::manual(),
+                    added_at: 7,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                };
+                ot.insert("hash4", serde_json::to_vec(&rec).unwrap().as_slice())
+                    .unwrap();
+
+                let vdef: TableDefinition<&str, u64> = TableDefinition::new("meta");
+                let mut v = txn.open_table(vdef).unwrap();
+                v.insert("schema_version", &4u64).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = Store::open(&tmp.path).unwrap();
+
+        assert!(
+            store.all_wanted().await.is_empty(),
+            "legacy wanted rows must be cleared on the v4→v5 migration"
+        );
+        assert_eq!(
+            store.get_owned("hash4".to_string()).await.unwrap().status,
+            OwnedStatus::Verified,
+            "owned rows must survive the migration"
+        );
+        assert!(
+            !std::path::Path::new(&tmp.corrupt_path()).exists(),
+            "valid v4 DB must not be moved aside"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrates_v1_db_to_current_preserving_matches() {
         let tmp = TempDb::new("migrate");
         {
             let db = Database::create(&tmp.path).unwrap();

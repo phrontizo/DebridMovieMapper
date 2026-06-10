@@ -150,9 +150,16 @@ impl JellyfinClient {
                         }
                     }
                 }
-                Err(e) if e.is_connect() => {
+                Err(e) if e.is_connect() || e.is_timeout() => {
+                    // Connect failures (not started yet) AND timeouts (slow/overloaded Jellyfin)
+                    // are both transient — retry. Only genuinely non-transient errors give up.
                     tracing::warn!(
-                        "Cannot connect to Jellyfin (not started?), attempt {}/{}",
+                        "Transient Jellyfin error ({}), attempt {}/{}",
+                        if e.is_timeout() {
+                            "timeout"
+                        } else {
+                            "cannot connect"
+                        },
                         attempt + 1,
                         MAX_RETRIES
                     );

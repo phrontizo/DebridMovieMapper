@@ -206,24 +206,35 @@ impl AcquisitionConfig {
                 prefer_hevc: Self::parse_bool(prefer_hevc, true),
                 prefer_hdr: Self::parse_bool(prefer_hdr, false),
             },
+            // Clamp to a sane floor: STALL_TIMEOUT_SECS=0 would declare every Pending torrent
+            // stalled instantly, and MAX_ACQUIRE_ATTEMPTS=0 would make the engine never retry —
+            // both footguns, consistent with the other interval knobs which all clamp.
             stall_timeout_secs: match stall_timeout_secs {
-                Some(s) => s.trim().parse().unwrap_or_else(|_| {
-                    warn!(
-                        "Invalid STALL_TIMEOUT_SECS value '{}', falling back to 1800",
-                        s
-                    );
-                    1800
-                }),
+                Some(s) => s
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            "Invalid STALL_TIMEOUT_SECS value '{}', falling back to 1800",
+                            s
+                        );
+                        1800
+                    })
+                    .max(60),
                 None => 1800,
             },
             max_acquire_attempts: match max_acquire_attempts {
-                Some(s) => s.trim().parse().unwrap_or_else(|_| {
-                    warn!(
-                        "Invalid MAX_ACQUIRE_ATTEMPTS value '{}', falling back to 5",
-                        s
-                    );
-                    5
-                }),
+                Some(s) => s
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            "Invalid MAX_ACQUIRE_ATTEMPTS value '{}', falling back to 5",
+                            s
+                        );
+                        5
+                    })
+                    .max(1),
                 None => 5,
             },
             scraper_addon_url: None,
@@ -577,6 +588,23 @@ mod tests {
         assert!(a.prefs.prefer_hdr);
         assert_eq!(a.stall_timeout_secs, 600);
         assert_eq!(a.max_acquire_attempts, 3);
+    }
+
+    #[test]
+    fn acquisition_clamps_zero_footguns() {
+        // STALL_TIMEOUT_SECS=0 (instant-stall) and MAX_ACQUIRE_ATTEMPTS=0 (never retry) are
+        // nonsensical — clamp them to sane floors instead of accepting the footgun.
+        let a = AcquisitionConfig::from_parts(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("0".into()),
+            Some("0".into()),
+        );
+        assert_eq!(a.stall_timeout_secs, 60);
+        assert_eq!(a.max_acquire_attempts, 1);
     }
 
     #[test]

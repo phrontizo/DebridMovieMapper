@@ -30,7 +30,7 @@ pub async fn run_upgrade_once(app: &AppState) {
     // Group owned by tmdb_id (reuse the tasks helper) and pick the least-recently-checked titles.
     let groups = crate::tasks::group_owned_by_tmdb(&app.store).await;
     let mut candidates: Vec<(u64, MediaType, Vec<String>, OwnedRecord)> = Vec::new();
-    for (tmdb_id, g) in &groups {
+    for ((_mt, tmdb_id), g) in &groups {
         // Manual adds are never auto-managed (invariant M-1): skip upgrade/consolidation for them.
         if g.provenance.has_manual_entry() {
             tracing::debug!(
@@ -141,6 +141,16 @@ async fn try_upgrade_movie(
     // 4. Stage the cached candidate: add + validate + record Verified (non-destructive — any failure
     //    leaves the current release untouched). Returns (hash, torrent_id, selected_file_path).
     let staged = stage_and_verify(app, tmdb_id, &owned_rec.request, &cand).await?;
+
+    // 4b. Re-check idle IMMEDIATELY before the destructive swap+prune. Staging above can take many
+    //     seconds (add + select + cached-poll + 4 MB probe), during which a playback read may have
+    //     begun anywhere in the library. If it is no longer idle, fully roll back the freshly-staged
+    //     candidate (delete it + drop its records — non-destructive: the current release is
+    //     untouched) and retry later, so the prune below never interrupts an in-flight stream.
+    if !app.read_activity.all_idle(idle_window).await {
+        prune_owned_hash(app, &staged.0).await;
+        return Err("library became active during staging; deferring upgrade".into());
+    }
 
     // 5. Swap selection → new hash, then prune every old owned hash.
     app.store
@@ -290,7 +300,7 @@ async fn stage_and_verify(
         }
     }
     // Record Verified with sticky provenance from the owned record we are upgrading.
-    let prov = base_req_provenance(app, tmdb_id).await;
+    let prov = base_req_provenance(app, MediaType::Movie, tmdb_id).await;
     let _ = app
         .store
         .put_owned(
@@ -312,15 +322,21 @@ async fn stage_and_verify(
     Ok((hash, added.id, selected_path))
 }
 
-/// Delete a torrent (owned-only) and drop its owned record + authoritative id.
+/// Delete a torrent (owned-only) and drop its owned record + authoritative id. Fetches the provider
+/// listing itself; prefer [`prune_owned_hash_in`] when pruning many hashes in one pass.
 async fn prune_owned_hash(app: &AppState, hash: &str) {
-    if let Ok(torrents) = app.provider.get_torrents().await {
-        for t in torrents
-            .iter()
-            .filter(|t| t.hash.eq_ignore_ascii_case(hash))
-        {
-            let _ = app.provider.delete_torrent(&t.id).await;
-        }
+    let torrents = app.provider.get_torrents().await.unwrap_or_default();
+    prune_owned_hash_in(app, hash, &torrents).await;
+}
+
+/// As [`prune_owned_hash`] but against an already-fetched provider listing, so a caller pruning N
+/// hashes does ONE `get_torrents()` instead of N (consolidation prunes a whole scattered season).
+async fn prune_owned_hash_in(app: &AppState, hash: &str, torrents: &[crate::rd_client::Torrent]) {
+    for t in torrents
+        .iter()
+        .filter(|t| t.hash.eq_ignore_ascii_case(hash))
+    {
+        let _ = app.provider.delete_torrent(&t.id).await;
     }
     let _ = app.store.remove_owned(hash.to_string()).await;
     let _ = app.store.remove_authoritative(hash.to_string()).await;
@@ -328,10 +344,14 @@ async fn prune_owned_hash(app: &AppState, hash: &str) {
 
 /// The provenance to keep on a staged upgrade: the merged provenance of the title's current owned
 /// hashes (sticky — preserves Manual / per-user origins across the swap).
-async fn base_req_provenance(app: &AppState, tmdb_id: u64) -> crate::store::Provenance {
+async fn base_req_provenance(
+    app: &AppState,
+    media_type: MediaType,
+    tmdb_id: u64,
+) -> crate::store::Provenance {
     let groups = crate::tasks::group_owned_by_tmdb(&app.store).await;
     groups
-        .get(&tmdb_id)
+        .get(&(media_type, tmdb_id))
         .map(|g| g.provenance.clone())
         .unwrap_or_else(crate::store::Provenance::manual)
 }
@@ -396,7 +416,12 @@ async fn try_consolidate_show(
         return Err("no owned records".into());
     };
     let today = chrono::Utc::now().date_naive();
-    let aired = crate::tasks::aired_episodes(&app.tmdb_client, tmdb_id, today).await;
+    // Per-season completeness is enough here: a season only ever proceeds below when its
+    // `season_aired` is non-empty, which means that season's air-date lookup succeeded — so
+    // consolidation never prunes against a season whose aired set is unknown.
+    let aired = crate::tasks::aired_episodes(&app.tmdb_client, tmdb_id, today)
+        .await
+        .pairs;
 
     // Seasons currently held as SCATTERED single-episode torrents (provides.len()==1).
     let mut seasons: Vec<u32> = owned
@@ -408,7 +433,7 @@ async fn try_consolidate_show(
     seasons.dedup();
 
     // Fix B: hoist provenance scan outside the per-season loop (one DB scan per title, not per season).
-    let prov = base_req_provenance(app, tmdb_id).await;
+    let prov = base_req_provenance(app, MediaType::Show, tmdb_id).await;
     for season in seasons {
         let season_aired = crate::tasks::season_aired(&aired, season);
         if season_aired.is_empty() {
@@ -644,17 +669,28 @@ async fn try_consolidate_show(
                     )
                     .await;
             }
-            // Prune the scattered episode torrents for this season — but ONLY those the pack
-            // actually covers (M-2). Pruning a held episode the pack doesn't contain would leave
-            // its selection un-repointed → a transient disappearance from the library.
+            // Prune every owned hash this new pack fully supersedes for the season — scattered
+            // single episodes AND any smaller/older pack (e.g. a prior full-season pack that didn't
+            // cover a newly-aired episode). M-2 safety: prune a hash ONLY when EVERY episode it
+            // provides is for this season AND covered by the new pack, so no held episode is left
+            // with an un-repointed selection. Fetch the provider listing ONCE, not once per prune.
+            let pack_eps_for_season: std::collections::HashSet<u32> = eps
+                .iter()
+                .filter(|(s, _, _)| *s == season)
+                .map(|(_, e, _)| *e)
+                .collect();
+            let listing = app.provider.get_torrents().await.unwrap_or_default();
             for (h, rec) in &owned {
-                if rec.provides.len() == 1
-                    && rec.provides[0].0 == season
-                    && eps
+                if h.eq_ignore_ascii_case(&r.info_hash) {
+                    continue; // never prune the pack we just adopted
+                }
+                let superseded = !rec.provides.is_empty()
+                    && rec
+                        .provides
                         .iter()
-                        .any(|(es, ee, _)| *es == season && *ee == rec.provides[0].1)
-                {
-                    prune_owned_hash(app, h).await;
+                        .all(|(s, e)| *s == season && pack_eps_for_season.contains(e));
+                if superseded {
+                    prune_owned_hash_in(app, h, &listing).await;
                 }
             }
             info!(

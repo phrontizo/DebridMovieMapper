@@ -79,7 +79,9 @@ impl AdaptiveRateLimiter {
     /// Proactively pace from a provider's advertised rate-limit window (TorBox sends
     /// `x-ratelimit-remaining` + `x-ratelimit-reset`). When the window is nearly spent, hold the
     /// next request until the reset instant so we never trip a 429. Providers that don't send these
-    /// headers simply never call this, leaving the reactive AIMD path untouched (Real-Debrid).
+    /// headers simply never call this, leaving the reactive back-off/recovery path untouched
+    /// (Real-Debrid). NB: that path is multiplicative both ways (double on 429, halve on success) —
+    /// i.e. MIMD, not the additive recovery of textbook AIMD.
     pub async fn observe_rate_limit(&self, remaining: u64, reset_epoch_secs: f64) {
         if remaining > LOW_REMAINING {
             return;

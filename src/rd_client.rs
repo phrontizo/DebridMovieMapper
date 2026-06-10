@@ -451,11 +451,16 @@ impl RealDebridClient {
                             }
                         }
                         Err(e) => {
+                            // terminal_statuses, 429, and the retryable 502/503/504
+                            // (should_retry_status) are all handled above. Any remaining error
+                            // status is a permanent client/server error (400/401/403/500/…) that
+                            // will not fix itself on retry — return immediately rather than burning
+                            // all 10 rate-limited attempts (and 10 warnings) on, e.g., a bad token.
                             warn!(
-                                "RD API error (attempt {}/{}): {}. Status: {}",
+                                "RD API non-retryable error (attempt {}/{}): {}. Status: {} — not retrying",
                                 attempt, max_attempts, e, status
                             );
-                            last_error = Some(e);
+                            return Err(e);
                         }
                     }
                 }
@@ -618,6 +623,55 @@ mod tests {
         assert!(!RealDebridClient::should_retry_status(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR
         ));
+    }
+
+    // --- fetch_with_retry does not retry permanent (non-retryable) error statuses ---
+
+    /// Spawn a loopback server that replies to EVERY connection with `status_line` + `body`,
+    /// counting how many connections it accepted. Used to assert the retry loop's attempt count.
+    async fn spawn_counting(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = count.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status_line,
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{}/", addr), count)
+    }
+
+    #[tokio::test]
+    async fn fetch_with_retry_does_not_retry_401() {
+        // A persistent 401 (bad/expired token) is permanent — it must be returned on the FIRST
+        // attempt, not retried all 10 times (each preceded by a rate-limiter wait + a warning).
+        let (url, count) =
+            spawn_counting("HTTP/1.1 401 Unauthorized", r#"{"error":"bad_token"}"#).await;
+        let client = RealDebridClient::new("fake".to_string()).unwrap();
+        let r: Result<serde_json::Value, _> = client
+            .fetch_with_retry(|| client.client.get(&url), &[])
+            .await;
+        assert!(r.is_err(), "a 401 must surface as an error");
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a permanent 401 must not be retried"
+        );
     }
 
     // --- Compile-time signature checks for the unified fetch_with_retry ---

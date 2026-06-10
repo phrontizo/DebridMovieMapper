@@ -76,7 +76,6 @@ pub struct ReleaseInfo {
     pub codec: Codec,
     pub hdr: bool,
     pub languages: Vec<String>,
-    pub group: Option<String>,
     pub size_bytes: Option<u64>,
     pub seeders: Option<u32>,
     pub cached: bool,
@@ -88,21 +87,6 @@ static RES_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(\d{3,4})p\b|\b(4k|uhd)\b").unwrap());
 static SIZE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)([\d.]+)\s*(gb|mb)").unwrap());
 static SEED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{1f464}\s*(\d+)").unwrap());
-static GROUP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-([A-Za-z0-9]+)$").unwrap());
-
-/// Extract a trailing `-GROUP` token, rejecting common source/codec tokens that aren't groups.
-fn extract_group(s: &str) -> Option<String> {
-    const GROUP_DENY: &[&str] = &[
-        "dl", "rip", "hevc", "avc", "hdr", "sdr", "cam", "ts", "hdtv", "bluray", "bdrip", "dvdrip",
-        "web", "webdl", "webrip", "x264", "x265", "aac", "ac3", "dts", "ddp",
-    ];
-    let g = GROUP_RE.captures(s.trim())?.get(1)?.as_str();
-    if GROUP_DENY.iter().any(|d| d.eq_ignore_ascii_case(g)) {
-        None
-    } else {
-        Some(g.to_string())
-    }
-}
 
 // Cam / telesync / telecine / screener / R5 / workprint / pre-DVD markers (the quality floor).
 static CAM_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -183,15 +167,6 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
         .captures(&text)
         .and_then(|cap| cap.get(1)?.as_str().parse::<u32>().ok());
 
-    // Release group is the trailing "-GROUP". Prefer the file's stem; fall back to the
-    // release-name line in the description (which usually carries the group).
-    let group = c
-        .file_name
-        .as_deref()
-        .map(|f| f.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(f))
-        .and_then(extract_group)
-        .or_else(|| c.description.lines().next().and_then(extract_group));
-
     let mut languages = Vec::new();
     for (word, code) in LANG_WORDS {
         if lower.contains(word) {
@@ -214,7 +189,6 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
         codec,
         hdr,
         languages,
-        group,
         size_bytes,
         seeders,
         cached,
@@ -330,9 +304,21 @@ impl QualitySummary {
     }
 }
 
-/// A candidate is a meaningful upgrade over the current owned release iff it is CACHED and
-/// represents a concrete category jump: current is uncached, OR a higher source tier, OR a higher
-/// resolution. Marginal score wobble (same tier + resolution) is NOT an upgrade (avoids churn).
+/// A candidate is a meaningful upgrade over the current owned release iff it is CACHED and the
+/// engine's OWN ranking strictly prefers it (`score`), on a concrete category jump:
+/// - current uncached → any cached candidate upgrades it;
+/// - else the candidate must score strictly higher AND improve at least one quality axis (source
+///   tier OR resolution).
+///
+/// The strict-`score` requirement (not a bare "higher tier OR higher resolution") is what prevents
+/// the infinite flip-flop: each swap strictly increases the owned score, which is bounded, so it
+/// converges and never oscillates (e.g. 2160p WEB ↔ 1080p REMUX — only the score-increasing
+/// direction qualifies, so it stabilizes on the higher-scored release). It also keeps the upgrade
+/// engine CONSISTENT with acquisition, which picks by `score`: because resolution dominates the
+/// source-tier band within the ceiling, the engine scores 1080p WEB above 720p BluRay, so that
+/// cross-axis upgrade is allowed (a no-regression-on-both-axes rule would wrongly strand the
+/// library on the 720p BluRay). The category-jump clause still rejects a marginal
+/// same-tier-same-resolution wobble (bitrate/HEVC/HDR/seeders), avoiding churn.
 pub fn is_meaningful_upgrade(current: &QualitySummary, candidate: &QualitySummary) -> bool {
     if !candidate.cached {
         return false;
@@ -340,7 +326,9 @@ pub fn is_meaningful_upgrade(current: &QualitySummary, candidate: &QualitySummar
     if !current.cached {
         return true;
     }
-    candidate.source_tier > current.source_tier || candidate.resolution > current.resolution
+    candidate.score > current.score
+        && (candidate.source_tier > current.source_tier
+            || candidate.resolution > current.resolution)
 }
 
 #[cfg(test)]
@@ -384,7 +372,6 @@ mod tests {
         assert_eq!(r.seeders, Some(42));
         assert!(r.cached);
         assert_eq!(r.container, Container::Mkv);
-        assert_eq!(r.group.as_deref(), Some("GRP"));
     }
 
     #[test]
@@ -608,18 +595,6 @@ mod tests {
     }
 
     #[test]
-    fn group_parsed_from_description_when_no_file_name() {
-        let r = parse(&raw("t", "Movie.2023.1080p.BluRay.x265-GRP", "h", None));
-        assert_eq!(r.group.as_deref(), Some("GRP"));
-    }
-
-    #[test]
-    fn group_rejects_tech_tokens() {
-        let r = parse(&raw("t", "Movie.2023.1080p.WEB-DL", "h", None));
-        assert_eq!(r.group, None, "WEB-DL must not be parsed as group 'DL'");
-    }
-
-    #[test]
     fn meaningful_upgrade_requires_cached_category_jump() {
         use super::{is_meaningful_upgrade, QualitySummary};
         let owned_web_1080_cached = QualitySummary {
@@ -671,5 +646,66 @@ mod tests {
             score: 0,
         };
         assert!(is_meaningful_upgrade(&owned_uncached, &cand_same));
+    }
+
+    #[test]
+    fn meaningful_upgrade_follows_score_no_flip_flop_no_cross_axis_strand() {
+        use super::{is_meaningful_upgrade, QualitySummary};
+        // Realistic scores: cached(1_000_000) + tier + resolution*100 (resolution dominates).
+        let bluray_720 = QualitySummary {
+            cached: true,
+            source_tier: 6_000, // BluRay
+            resolution: 720,
+            score: 1_078_000,
+        };
+        let web_1080 = QualitySummary {
+            cached: true,
+            source_tier: 3_000, // Web
+            resolution: 1080,
+            score: 1_111_000,
+        };
+        let remux_1080 = QualitySummary {
+            cached: true,
+            source_tier: 8_000, // Remux
+            resolution: 1080,
+            score: 1_116_000,
+        };
+        let web_2160 = QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 2160,
+            score: 1_219_000,
+        };
+
+        // Legitimate cross-axis upgrade: 720p BluRay → 1080p WEB scores higher (resolution wins),
+        // so the engine prefers it — must be an upgrade (a no-regression-on-both-axes rule would
+        // wrongly strand the library on the 720p BluRay).
+        assert!(
+            is_meaningful_upgrade(&bluray_720, &web_1080),
+            "higher-scored cross-axis (720p BluRay → 1080p WEB) must upgrade"
+        );
+
+        // No flip-flop on the 2160p WEB ↔ 1080p REMUX pair: only the score-increasing direction
+        // qualifies, so it converges to 2160p WEB and never oscillates.
+        assert!(
+            is_meaningful_upgrade(&remux_1080, &web_2160),
+            "1080p REMUX → 2160p WEB is the higher-scored direction → upgrade (converge)"
+        );
+        assert!(
+            !is_meaningful_upgrade(&web_2160, &remux_1080),
+            "2160p WEB → 1080p REMUX is a score downgrade → NOT an upgrade (no flip-flop)"
+        );
+
+        // Same tier + resolution, higher score (bitrate wobble) → NOT an upgrade (no churn).
+        let web_1080_marginal = QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 1080,
+            score: 1_111_500, // slightly higher than web_1080 but same tier+res
+        };
+        assert!(
+            !is_meaningful_upgrade(&web_1080, &web_1080_marginal),
+            "marginal same-tier-same-resolution score wobble is not an upgrade"
+        );
     }
 }

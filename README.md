@@ -100,8 +100,8 @@ A debrid provider token is required: set **exactly one** of `RD_API_TOKEN` or `T
 | `SUBTITLE_LANGUAGE`          | No       | *(none)*       | Required subtitle language for acquisition: an ISO code, or omit / set to `none` to skip the check. |
 | `PREFER_HEVC`                | No       | `true`         | Prefer HEVC/H.265 encodes when scoring acquisition candidates. |
 | `PREFER_HDR`                 | No       | `false`        | Prefer HDR/Dolby Vision encodes when scoring acquisition candidates. |
-| `STALL_TIMEOUT_SECS`         | No       | `1800`         | Seconds without download progress before a Pending torrent is considered stalled and re-acquired. |
-| `MAX_ACQUIRE_ATTEMPTS`       | No       | `5`            | Maximum number of candidates to try before giving up on a title. |
+| `STALL_TIMEOUT_SECS`         | No       | `1800` (min 60) | Seconds without download progress before a Pending torrent is considered stalled and re-acquired. |
+| `MAX_ACQUIRE_ATTEMPTS`       | No       | `5` (min 1)    | Maximum number of candidates to try before giving up on a title. |
 | `TRAKT_CLIENT_ID`            | No†      | -              | Trakt API app client id. Both this and `TRAKT_CLIENT_SECRET` are required to enable Trakt sync. |
 | `TRAKT_CLIENT_SECRET`        | No†      | -              | Trakt API app client secret. |
 | `TRAKT_SYNC_INTERVAL_SECS`   | No       | `900`          | How often (seconds) to sync each enrolled Trakt account and reconcile the library (minimum: 60). |
@@ -226,7 +226,7 @@ The acquisition engine lets the service find and add content to your debrid acco
 Acquisition uses an **optimistic-add** model (SP3): the engine adds the best candidate and records it `Pending` immediately, then resolves it asynchronously so slow-to-seed torrents are not judged prematurely.
 
 1. **Scrape**: Given an IMDB id and media type, `TorrentioScraper` queries a Stremio-compatible addon (default: Torrentio, URL auto-built from your provider token; override with `SCRAPER_ADDON_URL`) for candidate torrents.
-2. **Score and rank**: Candidates are parsed for resolution, codec, HDR, file size, seeder count, and cached status. A hard ceiling at `MAX_RESOLUTION` excludes anything above it. Remaining candidates are ranked: cached content first, then by source tier (REMUX>BluRay>WEB>HDTV), resolution, HEVC preference, verifiable container, and seeder count. Uncached zero-seeder releases are hard-filtered (undownloadable).
+2. **Score and rank**: Candidates are parsed for resolution, codec, HDR, file size, seeder count, and cached status. A hard ceiling at `MAX_RESOLUTION` excludes anything above it. Remaining candidates are ranked: cached content first, then **resolution** (within the `MAX_RESOLUTION` ceiling — resolution outweighs source tier, so a higher-resolution release wins), then source tier (REMUX>BluRay>WEB>HDTV), HEVC preference, verifiable container, and seeder count. Uncached zero-seeder releases are hard-filtered (undownloadable).
 3. **Optimistic add**: The top non-blacklisted candidate is added to your debrid account by hash, recorded as `Pending`, and control returns immediately — no synchronous wait.
 4. **Asynchronous resolve** (`observe`, runs every scan tick): once the torrent's files appear, the deferred gates run: pack-guard (multi-feature movie packs are rejected) → strict title validation (the file name must identify to the requested TMDB id; mismatches are blacklisted) → file probe (for cached content, the first 4 MB is checked for required audio/subtitle languages; corrupt/wrong-language probes are blacklisted). On pass — marked `Verified`, `provides` (which episodes the hash covers) and a quality snapshot are recorded, and the `selection` entry is written. On fail — hash is blacklisted and the next candidate is tried.
 5. **Dead-torrent reaping**: if a `Pending` torrent remains unresolved beyond `ACQUIRE_DEAD_TIMEOUT_SECS` (default 600 s), or shows a terminal provider error, `observe` reaps it, blacklists the hash, and re-scrapes for the next-best candidate.
@@ -286,7 +286,7 @@ The upgrade engine runs a quality-improvement pass over your library **once a da
 
 Each pass works through owned titles in a round-robin budget (`UPGRADE_BUDGET_PER_TICK`, default 20 titles per tick):
 
-- **Quality upgrades (movies & shows):** re-scrapes the title with Torrentio and checks whether a meaningfully-better **cached** release exists — meaningfully-better means at least one concrete category jump: uncached→cached, a higher source tier (e.g. WEB→BluRay/REMUX), or a higher resolution. Marginal score differences (same tier, same resolution) are never acted on to avoid churn. When a better release is found it is staged (added to the debrid account) and the VFS `selection` for the title is swapped — but only once the **library has been idle for `UPGRADE_IDLE_SECS`** (default 5 minutes without a proxy read anywhere in the library). The superseded torrent is then pruned.
+- **Quality upgrades (movies):** re-scrapes the title with Torrentio and checks whether a meaningfully-better **cached** release exists. "Meaningfully-better" follows the engine's own quality ranking (resolution dominant within the `MAX_RESOLUTION` ceiling, then source tier): the candidate must score strictly higher **and** make a concrete category jump — uncached→cached, a higher resolution, or a higher source tier at the same resolution (e.g. WEB→BluRay/REMUX). Marginal same-tier-same-resolution differences are never acted on (avoids churn), and a higher source tier is **not** chased if it would cost resolution — so the upgrade engine never swaps to a release acquisition itself would rank lower (which also rules out any flip-flop). When a better release is found it is staged (added to the debrid account) and the VFS `selection` for the title is swapped — but only once the **library has been idle for `UPGRADE_IDLE_SECS`** (default 5 minutes without a proxy read anywhere in the library), re-checked immediately before the swap so staging latency can't catch a stream that started meanwhile. The superseded torrent is then pruned. (Shows are not quality-upgraded — only consolidated; see below.)
 - **Full-season consolidation (shows):** when scattered per-episode torrents exist for a season, the engine looks for a **cached** full-season pack that covers every aired episode (per TMDB) at same-or-better source tier and resolution. If one is found, the season's episode `selection` slots are repointed to the pack and the individual episode torrents are pruned — idle-gated in the same way. Partial-season packs are never adopted.
 
 Both operations are **idle-gated**: a slot being actively streamed is never swapped or pruned. After a service restart all slots read as idle (no in-memory handles can survive a restart).
@@ -310,7 +310,7 @@ Both operations are **idle-gated**: a slot being actively streamed is never swap
 - `src/tasks.rs`: Background jobs — the scan loop (polls the active provider, identifies new torrents, updates the VFS) plus the Trakt jobs (`sync_trakt`, `reconcile_wanted`, `monitor_episodes`).
 - `src/acquire.rs`: The `AcquisitionEngine` — optimistic add (`acquire`) plus the asynchronous resolver (`observe`) that selects, validates, probes, and finalises each candidate.
 - `src/upgrade.rs`: Daily quality-upgrade + full-season consolidation engine (round-robin budget, idle-gated swap/prune).
-- `src/reacquire.rs`: Shared `materialise` add→poll→select primitive used by both acquisition and repair.
+- `src/reacquire.rs`: `materialise` add→poll→select primitive — used by the instant-repair path (the SP3 acquisition engine instead adds optimistically in `acquire` and resolves the verdict later in `observe`).
 - `src/scraper.rs`: `Scraper` trait + `TorrentioScraper` — queries a Stremio-compatible addon for candidate streams.
 - `src/release.rs`: Parses candidates into `ReleaseInfo` and scores/ranks them with the quality preferences.
 - `src/probe.rs`: Hand-rolled MKV/MP4 track reader — fetches the first 4 MB of a CDN URL to verify audio/subtitle languages.
@@ -326,7 +326,7 @@ Both operations are **idle-gated**: a slot being actively streamed is never swap
 - `src/vfs.rs`: Virtual File System logic for library organisation.
 - `src/dav_fs.rs`: WebDAV filesystem — resolves a `FileLocator` to a CDN URL via the provider; attempts instant repair when a file is unavailable.
 - `src/identification.rs`: Smart media identification and filename cleaning logic.
-- `src/config.rs`: Startup env parsing/validation (`Config`, plus the optional `TraktConfig`/`UpgradeConfig`/`AcquisitionConfig`).
+- `src/config.rs`: Startup env parsing/validation (`Config`, the optional `TraktConfig`, plus the always-present `UpgradeConfig`/`AcquisitionConfig`).
 - `src/app_state.rs`: `AppState` — the cloneable bundle of shared handles carried by the scheduler's jobs.
 - `src/store.rs`: Owns the redb database (schema + migrations, self-healing open) and all typed table accessors.
 - `src/error.rs`: Unified error type (`AppError`) using `thiserror`.

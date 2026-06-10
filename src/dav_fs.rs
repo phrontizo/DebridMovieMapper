@@ -65,13 +65,11 @@ impl DebridFileSystem {
         Some(current)
     }
 
+    /// Owned-clone resolver — test-only. Production code resolves a `&VfsNode` via `find_node_ref`
+    /// and clones only the small per-file payload it needs (see `open`), never the whole subtree.
+    #[cfg(test)]
     fn find_node_in(vfs: &DebridVfs, path: &DavPath) -> Option<VfsNode> {
         Self::find_node_ref(vfs, path).cloned()
-    }
-
-    async fn find_node(&self, path: &DavPath) -> Option<VfsNode> {
-        let vfs = self.vfs.read().await;
-        Self::find_node_in(&vfs, path)
     }
 }
 
@@ -82,7 +80,6 @@ impl DavFileSystem for DebridFileSystem {
         _options: OpenOptions,
     ) -> FsFuture<'a, Box<dyn DavFile>> {
         async move {
-            let node = self.find_node(path).await.ok_or(FsError::NotFound)?;
             let rel = path.as_rel_ospath();
             let vfs_path = rel.to_string_lossy().into_owned();
             let name = rel
@@ -90,8 +87,29 @@ impl DavFileSystem for DebridFileSystem {
                 .and_then(|s| s.rsplit('/').next())
                 .unwrap_or("")
                 .to_string();
-            match node {
-                VfsNode::MediaFile { file_size, locator } => Ok(Box::new(ProxiedMediaFile {
+            // Resolve under the read lock and clone ONLY the small per-file payload. A directory
+            // match returns Forbidden without `.cloned()`-ing the whole subtree — otherwise a GET
+            // on a large folder (e.g. /Movies) deep-clones thousands of nodes just to reject it.
+            enum Payload {
+                Media {
+                    file_size: u64,
+                    locator: crate::provider::FileLocator,
+                },
+                Virtual(Vec<u8>),
+            }
+            let payload = {
+                let vfs = self.vfs.read().await;
+                match Self::find_node_ref(&vfs, path).ok_or(FsError::NotFound)? {
+                    VfsNode::MediaFile { file_size, locator } => Payload::Media {
+                        file_size: *file_size,
+                        locator: locator.clone(),
+                    },
+                    VfsNode::VirtualFile { content } => Payload::Virtual(content.clone()),
+                    VfsNode::Directory { .. } => return Err(FsError::Forbidden),
+                }
+            };
+            match payload {
+                Payload::Media { file_size, locator } => Ok(Box::new(ProxiedMediaFile {
                     name,
                     locator,
                     file_size,
@@ -104,13 +122,11 @@ impl DavFileSystem for DebridFileSystem {
                     buffer_start: 0,
                     read_activity: self.read_activity.clone(),
                     vfs_path,
-                })
-                    as Box<dyn DavFile>),
-                VfsNode::VirtualFile { content } => Ok(Box::new(VirtualFile {
+                }) as Box<dyn DavFile>),
+                Payload::Virtual(content) => Ok(Box::new(VirtualFile {
                     content: Bytes::from(content),
                     pos: 0,
                 }) as Box<dyn DavFile>),
-                VfsNode::Directory { .. } => Err(FsError::Forbidden),
             }
         }
         .boxed()
@@ -442,6 +458,24 @@ impl ProxiedMediaFile {
                         return Err(FsError::GeneralFailure);
                     }
                 }
+            }
+
+            // A 206/200 that streamed ZERO bytes for a non-empty requested range (range_end >= pos
+            // always holds here) is non-compliant: returning it would surface as a premature
+            // mid-file EOF and silently truncate playback. Treat it like an expired URL — drop it,
+            // retry once with a fresh resolution, then fail rather than truncate.
+            if body.is_empty() {
+                tracing::warn!(
+                    "CDN returned an empty body for {} at offset {} — clearing cached CDN URL",
+                    self.name,
+                    pos
+                );
+                self.cdn_url = None;
+                self.rd_client.invalidate(&self.locator).await;
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(FsError::GeneralFailure);
             }
 
             return Ok(body.freeze());

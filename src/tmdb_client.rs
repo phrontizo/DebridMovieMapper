@@ -254,7 +254,9 @@ impl TmdbClient {
                     }
 
                     match resp.error_for_status() {
-                        Ok(resp) => return resp.json::<T>().await,
+                        // Strip the URL on the decode path too: the request URL carries the
+                        // `api_key` query param, so a body-decode error must not leak it to logs.
+                        Ok(resp) => return resp.json::<T>().await.map_err(|e| e.without_url()),
                         Err(e) => {
                             let e = e.without_url();
                             warn!(

@@ -418,10 +418,13 @@ pub(crate) fn build_wanted(
         watchlist: bool,
         in_progress: bool,
     }
-    // BTreeMap keyed by tmdb_id keeps the output deterministically sorted.
-    let mut agg: std::collections::BTreeMap<u64, Agg> = std::collections::BTreeMap::new();
+    // Keyed by (media_type, tmdb_id): TMDB movie and TV id-spaces are independent, so a movie and a
+    // show that share a numeric id must NOT be merged into one record. BTreeMap keeps the output
+    // deterministically sorted (movies before shows, then by tmdb_id).
+    let mut agg: std::collections::BTreeMap<(MediaType, u64), Agg> =
+        std::collections::BTreeMap::new();
     for item in watchlist {
-        agg.entry(item.tmdb_id)
+        agg.entry((item.media_type.clone(), item.tmdb_id))
             .or_insert_with(|| Agg {
                 media_type: item.media_type.clone(),
                 watchlist: false,
@@ -430,7 +433,7 @@ pub(crate) fn build_wanted(
             .watchlist = true;
     }
     for item in in_progress {
-        agg.entry(item.tmdb_id)
+        agg.entry((item.media_type.clone(), item.tmdb_id))
             .or_insert_with(|| Agg {
                 media_type: item.media_type.clone(),
                 watchlist: false,
@@ -440,7 +443,7 @@ pub(crate) fn build_wanted(
     }
 
     agg.into_iter()
-        .map(|(tmdb_id, a)| {
+        .map(|((_mt, tmdb_id), a)| {
             let (watched_state, status) = match a.media_type {
                 MediaType::Movie => (
                     WatchedState::Movie {
@@ -571,17 +574,22 @@ async fn sync_trakt_user(
 
     // Build the user's new wanted-set and write it: prune rows no longer wanted, then upsert.
     let new = build_wanted(slug, &watchlist, &in_progress, &watched, &statuses);
-    let existing_ids: Vec<u64> = store
+    // Prune rows no longer wanted, keyed by (media_type, tmdb_id) so a movie and a show that share
+    // a numeric id are tracked independently.
+    let existing: Vec<(MediaType, u64)> = store
         .all_wanted()
         .await
         .into_iter()
         .filter(|r| r.user == slug)
-        .map(|r| r.tmdb_id)
+        .map(|r| (r.media_type.clone(), r.tmdb_id))
         .collect();
-    let new_ids: std::collections::HashSet<u64> = new.iter().map(|r| r.tmdb_id).collect();
-    for id in existing_ids {
-        if !new_ids.contains(&id) {
-            store.remove_wanted(slug.to_string(), id).await?;
+    let new_keys: std::collections::HashSet<(MediaType, u64)> = new
+        .iter()
+        .map(|r| (r.media_type.clone(), r.tmdb_id))
+        .collect();
+    for (mt, id) in existing {
+        if !new_keys.contains(&(mt.clone(), id)) {
+            store.remove_wanted(slug.to_string(), mt, id).await?;
         }
     }
     for rec in new {
@@ -706,19 +714,22 @@ pub(crate) struct OwnedGroup {
 /// per-title aggregation lives in exactly one place.
 pub(crate) async fn group_owned_by_tmdb(
     store: &Store,
-) -> std::collections::BTreeMap<u64, OwnedGroup> {
+) -> std::collections::BTreeMap<(MediaType, u64), OwnedGroup> {
     use std::collections::BTreeMap;
-    let mut owned_by: BTreeMap<u64, OwnedGroup> = BTreeMap::new();
+    let mut owned_by: BTreeMap<(MediaType, u64), OwnedGroup> = BTreeMap::new();
     for (hash, rec) in store.all_owned().await {
+        // Key by (media_type, tmdb_id): a movie and a show with the same numeric id are distinct
+        // titles and must not be grouped together.
+        let mt = media_type_of(rec.request.kind);
         let group = owned_by
-            .entry(rec.request.tmdb_id)
+            .entry((mt.clone(), rec.request.tmdb_id))
             .or_insert_with(|| OwnedGroup {
                 hashes: Vec::new(),
                 provenance: Provenance {
                     entries: Vec::new(),
                 },
                 owned_episodes: Vec::new(),
-                media_type: media_type_of(rec.request.kind),
+                media_type: mt.clone(),
             });
         group.hashes.push(hash.to_ascii_lowercase());
         group.provenance.merge(&rec.provenance);
@@ -743,11 +754,14 @@ pub(crate) async fn group_owned_by_tmdb(
 /// `plan_reconcile_ops` and `monitor_episodes` so the wanted-grouping lives in one place.
 pub(crate) async fn group_wanted_by_tmdb(
     store: &Store,
-) -> std::collections::BTreeMap<u64, Vec<WantedRecord>> {
+) -> std::collections::BTreeMap<(MediaType, u64), Vec<WantedRecord>> {
     use std::collections::BTreeMap;
-    let mut wanted_by: BTreeMap<u64, Vec<WantedRecord>> = BTreeMap::new();
+    let mut wanted_by: BTreeMap<(MediaType, u64), Vec<WantedRecord>> = BTreeMap::new();
     for r in store.all_wanted().await {
-        wanted_by.entry(r.tmdb_id).or_default().push(r);
+        wanted_by
+            .entry((r.media_type.clone(), r.tmdb_id))
+            .or_default()
+            .push(r);
     }
     wanted_by
 }
@@ -774,29 +788,17 @@ pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> V
         .map(|t| t.hash.to_ascii_lowercase())
         .collect();
 
-    let mut ids: BTreeSet<u64> = BTreeSet::new();
-    ids.extend(wanted_by.keys().copied());
-    ids.extend(owned_by.keys().copied());
+    // Titles are keyed by (media_type, tmdb_id), so each title has a single unambiguous media_type
+    // (no movie/show id collision possible) — taken straight from the key.
+    let mut keys: BTreeSet<(MediaType, u64)> = BTreeSet::new();
+    keys.extend(wanted_by.keys().cloned());
+    keys.extend(owned_by.keys().cloned());
 
     let mut ops = Vec::new();
-    for tmdb_id in ids {
-        let wanted = wanted_by.get(&tmdb_id).cloned().unwrap_or_default();
-        let owned_group = owned_by.get(&tmdb_id);
-
-        // Prefer the wanted rows' media_type; else fall back to the owned group's.
-        let wanted_type = wanted.first().map(|r| r.media_type.clone());
-        if let (Some(wt), Some(og)) = (&wanted_type, owned_group) {
-            if *wt != og.media_type {
-                warn!(
-                    "reconcile: tmdb {} media_type skew: wanted={:?} owned={:?}",
-                    tmdb_id, wt, og.media_type
-                );
-            }
-        }
-        let Some(media_type) = wanted_type.or_else(|| owned_group.map(|g| g.media_type.clone()))
-        else {
-            continue;
-        };
+    for key in keys {
+        let (media_type, tmdb_id) = key.clone();
+        let wanted = wanted_by.get(&key).cloned().unwrap_or_default();
+        let owned_group = owned_by.get(&key);
 
         // available = ANY owned hash for this title is present in the listing.
         let available = owned_group
@@ -881,6 +883,9 @@ async fn execute_remove(
     // of being silently orphaned on the provider. MockProvider::delete_torrent always returns Ok,
     // so this path is exercised only in integration/production; no unit test added for the failure
     // branch — the code fix is self-evident.
+    //
+    // Read the selection table ONCE (we only ever remove from it below), not per-hash.
+    let selection = store.all_selection().await;
     for hash in hashes {
         if let Some(t) = torrents.iter().find(|t| t.hash.eq_ignore_ascii_case(hash)) {
             if let Err(e) = provider.delete_torrent(&t.id).await {
@@ -896,9 +901,9 @@ async fn execute_remove(
             continue;
         }
         // SP3: drop any selection slots this hash represented.
-        for (slot, entry) in store.all_selection().await {
+        for (slot, entry) in &selection {
             if entry.hash.eq_ignore_ascii_case(hash) {
-                let _ = store.remove_selection(slot).await;
+                let _ = store.remove_selection(slot.clone()).await;
             }
         }
     }
@@ -978,39 +983,75 @@ pub(crate) fn aired_pairs(
         .collect()
 }
 
+/// The aired-episode set for a show, plus whether it could be determined in FULL. `complete` is
+/// `false` if season enumeration failed (→ `pairs` empty) or ANY season's air-date lookup failed
+/// (→ `pairs` is missing that season). An incomplete set must NOT be trusted for removal (Trigger A
+/// goes vacuously true on an empty/partial set), only for best-effort acquisition of the episodes
+/// we DID confirm aired. See `guard_removal_on_incomplete_aired`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AiredEpisodes {
+    pub pairs: Vec<(u32, u32)>,
+    pub complete: bool,
+}
+
 /// All aired `(season, episode)` pairs for a show as of `today`: enumerate the show's
 /// (non-Specials) seasons, fetch each season's episode air dates, and collect `aired_pairs`
 /// across them. Best-effort I/O — a failure to enumerate seasons, or to fetch ONE season's air
-/// dates, is logged and skipped rather than failing the whole show. TMDB-driven, so exercised by
-/// the live smoke rather than unit tests.
+/// dates, is logged and skipped rather than failing the whole show, but the returned `complete`
+/// flag records whether any lookup failed so callers can refuse to act on a partial set.
+/// TMDB-driven, so the I/O is exercised by the live smoke rather than unit tests.
 pub(crate) async fn aired_episodes(
     tmdb: &TmdbClient,
     tmdb_id: u64,
     today: chrono::NaiveDate,
-) -> Vec<(u32, u32)> {
+) -> AiredEpisodes {
     let seasons = match tmdb.show_season_numbers(tmdb_id).await {
         Ok(s) => s,
         Err(e) => {
             warn!(
-                "monitor_episodes: show_season_numbers({}) failed: {}; skipping show",
+                "monitor_episodes: show_season_numbers({}) failed: {}; aired set unknown (no removal this tick)",
                 tmdb_id, e
             );
-            return Vec::new();
+            return AiredEpisodes::default(); // pairs empty, complete=false
         }
     };
     let mut out = Vec::new();
+    let mut complete = true;
     for season in seasons {
         match tmdb.season_air_dates(tmdb_id, season).await {
             Ok(eps) => out.extend(aired_pairs(&eps, today)),
-            Err(e) => warn!(
-                "monitor_episodes: season_air_dates({}, {}) failed: {}; skipping season",
-                tmdb_id, season, e
-            ),
+            Err(e) => {
+                complete = false;
+                warn!(
+                    "monitor_episodes: season_air_dates({}, {}) failed: {}; skipping season (no removal this tick)",
+                    tmdb_id, season, e
+                );
+            }
         }
     }
     out.sort_unstable();
     out.dedup();
-    out
+    AiredEpisodes {
+        pairs: out,
+        complete,
+    }
+}
+
+/// When the aired set is INCOMPLETE (a TMDB lookup failed), drop any `Remove` action: a partial or
+/// empty aired set must never let Trigger A vacuously fire and delete a still-wanted show on a
+/// transient external blip ("a failed fetch must NOT cause removal"). Acquisition actions are
+/// always kept — acquiring only the episodes we confirmed aired is safe even from a partial set.
+pub(crate) fn guard_removal_on_incomplete_aired(
+    actions: Vec<crate::wanted::Action>,
+    aired_complete: bool,
+) -> Vec<crate::wanted::Action> {
+    if aired_complete {
+        return actions;
+    }
+    actions
+        .into_iter()
+        .filter(|a| !matches!(a, crate::wanted::Action::Remove { .. }))
+        .collect()
 }
 
 /// Filter aired pairs to one season's episode numbers (sorted+deduped). PURE — used by the SP3
@@ -1060,7 +1101,7 @@ pub async fn monitor_episodes(
         }
     };
 
-    // Group wanted rows by tmdb_id.
+    // Group wanted rows by (media_type, tmdb_id).
     let wanted_by = group_wanted_by_tmdb(store).await;
 
     // Same owned-grouping + availability logic as plan_reconcile_ops (shared helper).
@@ -1070,18 +1111,20 @@ pub async fn monitor_episodes(
         .map(|t| t.hash.to_ascii_lowercase())
         .collect();
 
-    // Only tmdb_ids that a wanted row marks as a Show. (Owned-but-unwanted shows are handled by
-    // reconcile_wanted's Trigger-B path; monitor_episodes is the wanted-set's air-date driver.)
-    for (&tmdb_id, wanted) in &wanted_by {
-        if !wanted.iter().any(|r| r.media_type == MediaType::Show) {
+    // Only Show titles. (Owned-but-unwanted shows are handled by reconcile_wanted's Trigger-B path;
+    // monitor_episodes is the wanted-set's air-date driver.)
+    for ((media_type, tmdb_id), wanted) in &wanted_by {
+        if *media_type != MediaType::Show {
             continue;
         }
-        let owned_group = owned_by.get(&tmdb_id);
+        let tmdb_id = *tmdb_id;
+        let owned_group = owned_by.get(&(MediaType::Show, tmdb_id));
         let available = owned_group
             .map(|g| g.hashes.iter().any(|h| present.contains(h)))
             .unwrap_or(false);
 
         let aired = aired_episodes(tmdb, tmdb_id, today).await;
+        let aired_complete = aired.complete;
 
         let view = TitleView {
             tmdb_id,
@@ -1093,10 +1136,13 @@ pub async fn monitor_episodes(
                 available,
                 owned_episodes: g.owned_episodes.clone(),
             }),
-            aired_episodes: aired,
+            aired_episodes: aired.pairs,
         };
 
-        for action in reconcile_title(&view) {
+        // Guard: a TMDB hiccup that left the aired set partial/empty must not delete a still-wanted
+        // show (an empty `aired` makes Trigger A's "all aired watched" clause vacuously true).
+        let actions = guard_removal_on_incomplete_aired(reconcile_title(&view), aired_complete);
+        for action in actions {
             match action {
                 Action::AcquireEpisode {
                     tmdb_id,
@@ -1273,7 +1319,7 @@ mod tests {
             .unwrap();
 
         let groups = group_owned_by_tmdb(&store).await;
-        let g = groups.get(&1396).unwrap();
+        let g = groups.get(&(MediaType::Show, 1396)).unwrap();
         let mut eps = g.owned_episodes.clone();
         eps.sort_unstable();
         assert_eq!(
@@ -1476,6 +1522,36 @@ mod trakt_sync_tests {
     }
 
     #[test]
+    fn build_wanted_movie_and_show_with_same_tmdb_id_are_separate_records() {
+        // A movie and a show that share a numeric TMDB id must NOT be merged into one record.
+        let mut status = HashMap::new();
+        status.insert(1396u64, ShowStatus::Ended);
+        let got = build_wanted(
+            "alice",
+            &[item(MediaType::Movie, 1396)],
+            &[item(MediaType::Show, 1396)],
+            &WatchedData::default(),
+            &status,
+        );
+        assert_eq!(got.len(), 2, "movie and show must be distinct records");
+        let movie = got
+            .iter()
+            .find(|r| r.media_type == MediaType::Movie)
+            .expect("movie record");
+        let show = got
+            .iter()
+            .find(|r| r.media_type == MediaType::Show)
+            .expect("show record");
+        assert_eq!(movie.tmdb_id, 1396);
+        assert!(movie.sources.watchlist && !movie.sources.in_progress);
+        assert_eq!(show.tmdb_id, 1396);
+        assert!(show.sources.in_progress && !show.sources.watchlist);
+        // Movies sort before shows (Ord by MediaType declaration order).
+        assert_eq!(got[0].media_type, MediaType::Movie);
+        assert_eq!(got[1].media_type, MediaType::Show);
+    }
+
+    #[test]
     fn build_wanted_title_in_both_sources_sets_both_flags() {
         let got = build_wanted(
             "alice",
@@ -1573,7 +1649,7 @@ mod trakt_sync_tests {
         sync_trakt(&trakt, &tmdb, &store).await;
 
         let w = store
-            .get_wanted("alice".to_string(), 27205)
+            .get_wanted("alice".to_string(), MediaType::Movie, 27205)
             .await
             .expect("wanted present");
         assert!(w.sources.watchlist);
@@ -1613,7 +1689,10 @@ mod trakt_sync_tests {
             tok.access, "REFRESHED",
             "refresh must have run and persisted"
         );
-        assert!(store.get_wanted("alice".to_string(), 27205).await.is_some());
+        assert!(store
+            .get_wanted("alice".to_string(), MediaType::Movie, 27205)
+            .await
+            .is_some());
     }
 
     #[tokio::test]
@@ -1634,7 +1713,9 @@ mod trakt_sync_tests {
         sync_trakt(&trakt, &tmdb, &store).await;
 
         assert_eq!(
-            store.get_wanted("alice".to_string(), 999).await,
+            store
+                .get_wanted("alice".to_string(), MediaType::Movie, 999)
+                .await,
             Some(preexisting),
             "a fetch failure must leave existing wanted rows untouched"
         );
@@ -1668,11 +1749,17 @@ mod trakt_sync_tests {
         sync_trakt(&trakt, &tmdb, &store).await;
 
         assert!(
-            store.get_wanted("alice".to_string(), 27205).await.is_some(),
+            store
+                .get_wanted("alice".to_string(), MediaType::Movie, 27205)
+                .await
+                .is_some(),
             "new title present"
         );
         assert!(
-            store.get_wanted("alice".to_string(), 999).await.is_none(),
+            store
+                .get_wanted("alice".to_string(), MediaType::Movie, 999)
+                .await
+                .is_none(),
             "stale title pruned"
         );
     }
@@ -1756,7 +1843,10 @@ mod trakt_sync_tests {
             "alice must be flagged after refresh failure"
         );
         assert!(
-            store.get_wanted("alice".to_string(), 27205).await.is_none(),
+            store
+                .get_wanted("alice".to_string(), MediaType::Movie, 27205)
+                .await
+                .is_none(),
             "alice's wanted must be empty — error occurred before any read"
         );
 
@@ -1764,7 +1854,10 @@ mod trakt_sync_tests {
         let bob_tok = store.get_trakt_tokens("bob".to_string()).await.unwrap();
         assert!(!bob_tok.needs_reenrolment, "bob must NOT be flagged");
         assert!(
-            store.get_wanted("bob".to_string(), 27205).await.is_some(),
+            store
+                .get_wanted("bob".to_string(), MediaType::Movie, 27205)
+                .await
+                .is_some(),
             "bob's wanted must be populated"
         );
     }
@@ -1800,7 +1893,10 @@ mod trakt_sync_tests {
         assert!(!tok.refresh.is_empty(), "refresh token must not be blanked");
         // No wanted rows: the error occurred before any Trakt read
         assert!(
-            store.get_wanted("alice".to_string(), 27205).await.is_none(),
+            store
+                .get_wanted("alice".to_string(), MediaType::Movie, 27205)
+                .await
+                .is_none(),
             "no wanted rows must have been written"
         );
     }
@@ -2402,5 +2498,66 @@ mod monitor_episodes_tests {
     fn aired_pairs_empty_input_is_empty() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 8).unwrap();
         assert_eq!(aired_pairs(&[], today), Vec::<(u32, u32)>::new());
+    }
+
+    // ── guard_removal_on_incomplete_aired (the data-loss guard) ────────────────
+
+    #[test]
+    fn incomplete_aired_drops_remove_actions() {
+        use crate::wanted::Action;
+        let actions = vec![
+            Action::Remove {
+                tmdb_id: 7,
+                hash: "abc".into(),
+            },
+            Action::AcquireEpisode {
+                tmdb_id: 7,
+                season: 1,
+                episode: 2,
+            },
+        ];
+        // complete == false (a TMDB lookup failed): the Remove must be dropped, the acquire kept.
+        let kept = guard_removal_on_incomplete_aired(actions, false);
+        assert_eq!(
+            kept,
+            vec![Action::AcquireEpisode {
+                tmdb_id: 7,
+                season: 1,
+                episode: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn complete_aired_keeps_remove_actions() {
+        use crate::wanted::Action;
+        let actions = vec![Action::Remove {
+            tmdb_id: 7,
+            hash: "abc".into(),
+        }];
+        // complete == true: a genuine Trigger-A removal is preserved.
+        let kept = guard_removal_on_incomplete_aired(actions.clone(), true);
+        assert_eq!(kept, actions);
+    }
+
+    #[test]
+    fn incomplete_aired_keeps_pure_acquire_set() {
+        use crate::wanted::Action;
+        let actions = vec![
+            Action::AcquireEpisode {
+                tmdb_id: 9,
+                season: 1,
+                episode: 1,
+            },
+            Action::AcquireEpisode {
+                tmdb_id: 9,
+                season: 1,
+                episode: 2,
+            },
+        ];
+        assert_eq!(
+            guard_removal_on_incomplete_aired(actions.clone(), false),
+            actions
+        );
     }
 }

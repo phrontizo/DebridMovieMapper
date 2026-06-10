@@ -1,7 +1,8 @@
 //! In-memory proxy read-activity tracker (SP3). The WebDAV read path stamps a path on every
-//! `read_bytes`; the upgrade engine consults `is_idle` before swapping/pruning a slot so a file
-//! that is being streamed is never pulled out from under a player. Best-effort and in-memory only:
-//! after a restart everything reads idle (there are no pre-existing open handles to disturb).
+//! `read_bytes`; the upgrade engine consults `all_idle` (a library-wide check) before
+//! swapping/pruning a slot so a file that is being streamed is never pulled out from under a
+//! player. Best-effort and in-memory only: after a restart everything reads idle (there are no
+//! pre-existing open handles to disturb).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,24 +25,31 @@ impl ReadActivity {
     }
 
     /// Record that `path` was just read. Cheap; called on every proxy read. When the map exceeds
-    /// `MAX_TRACKED`, the least-recently-read entries are evicted down to the cap. Eviction removes
-    /// only the *oldest* entries, so `most_recent`/`all_idle` (which key off the newest read) are
-    /// provably unaffected, and an evicted entry only ever reads *more* idle, never less.
+    /// `MAX_TRACKED`, the least-recently-read entries are batch-evicted down to a lower watermark
+    /// (3/4 of the cap) so the eviction pass amortizes over many inserts rather than re-running on
+    /// every distinct path once at the cap. Eviction removes only the *oldest* entries, so
+    /// `most_recent`/`all_idle` (which key off the newest read) are provably unaffected, and an
+    /// evicted entry only ever reads *more* idle, never less.
     pub async fn touch(&self, path: &str) {
+        const WATERMARK: usize = MAX_TRACKED * 3 / 4;
         let mut map = self.last_read.write().await;
         map.insert(path.to_string(), Instant::now());
         if map.len() > MAX_TRACKED {
-            let excess = map.len() - MAX_TRACKED;
+            let excess = map.len() - WATERMARK;
             let mut entries: Vec<(String, Instant)> =
                 map.iter().map(|(k, v)| (k.clone(), *v)).collect();
-            entries.sort_unstable_by_key(|(_, t)| *t); // oldest first
+            // Partition the `excess` oldest entries to the front in O(n) (no full sort needed).
+            entries.select_nth_unstable_by_key(excess, |(_, t)| *t);
             for (k, _) in entries.into_iter().take(excess) {
                 map.remove(&k);
             }
         }
     }
 
-    /// `true` if `path` has had no read within `window` (never-read counts as idle).
+    /// `true` if `path` has had no read within `window` (never-read counts as idle). The per-path
+    /// sibling of [`all_idle`](Self::all_idle); the upgrade engine deliberately gates on `all_idle`
+    /// (library-wide) rather than this, so `is_idle` is retained as the per-path query for tests and
+    /// a future per-slot idle gate. Kept intentionally; not dead code.
     pub async fn is_idle(&self, path: &str, window: Duration) -> bool {
         match self.last_read.read().await.get(path) {
             Some(t) => t.elapsed() >= window,

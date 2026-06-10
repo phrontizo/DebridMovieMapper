@@ -15,13 +15,15 @@ pub struct FileLocator {
     pub link: Option<String>,
 }
 
-/// Abstraction over a debrid provider (Real-Debrid today, TorBox in a later phase).
+/// Abstraction over a debrid provider. Real-Debrid and TorBox both implement it; exactly one is
+/// active per deployment (chosen at startup by `choose_provider`).
 ///
-/// The method set mirrors the Real-Debrid operations the codebase calls today so
-/// this phase is a pure refactor. It is widened/reshaped in later phases.
+/// Beyond the basic torrent operations it exposes the provider-neutral file-resolution surface
+/// (`resolve_url`/`invalidate`/`evict_expired_cache`) the VFS and repair paths depend on, so no
+/// component needs to know which concrete client is behind the `Arc<dyn DebridProvider>`.
 ///
-/// `Debug` is a supertrait so a future `Arc<dyn DebridProvider>` can live inside
-/// `Debug`-deriving structs like `RepairManager` (migrated in a later phase).
+/// `Debug` is a supertrait so an `Arc<dyn DebridProvider>` can live inside `Debug`-deriving
+/// structs like `RepairManager`.
 #[async_trait::async_trait]
 pub trait DebridProvider: Send + Sync + std::fmt::Debug {
     /// Stable, human-readable provider identifier (e.g. "real-debrid").

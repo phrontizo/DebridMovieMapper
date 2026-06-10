@@ -61,6 +61,10 @@ struct TbTorrent {
     download_finished: bool,
     #[serde(default, deserialize_with = "null_to_default")]
     download_state: String,
+    // ISO-8601 creation timestamp; mapped to the canonical `added` so the VFS date tiebreak works
+    // cross-provider (parse_rd_date falls back to UNIX_EPOCH for any unparseable/empty value).
+    #[serde(default, deserialize_with = "null_to_default")]
+    created_at: String,
     #[serde(default, deserialize_with = "null_to_default")]
     files: Vec<TbFile>,
 }
@@ -120,7 +124,7 @@ fn to_torrent(t: &TbTorrent) -> Torrent {
         hash: t.hash.clone(),
         bytes: clamp_size(t.size),
         status: tb_status(t),
-        added: String::new(),
+        added: t.created_at.clone(),
         links: Vec::new(),
         ended: None,
         ..Default::default()
@@ -135,7 +139,7 @@ fn to_torrent_info(t: &TbTorrent) -> TorrentInfo {
         hash: t.hash.clone(),
         bytes: clamp_size(t.size),
         status: tb_status(t),
-        added: String::new(),
+        added: t.created_at.clone(),
         files: t.files.iter().map(to_torrent_file).collect(),
         links: Vec::new(),
         ended: None,

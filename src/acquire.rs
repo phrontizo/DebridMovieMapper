@@ -323,9 +323,31 @@ impl AcquisitionEngine {
         }
         let ranked = release::rank(parsed, &self.prefs);
 
+        // Live provider listing (lazily fetched once, only when an owned candidate is hit). Outer
+        // Option = "fetched?", inner = "fetch succeeded?". Used to distinguish "already acquired"
+        // from a lapsed/externally-deleted owned record that must be RE-added.
+        let mut present: Option<Option<std::collections::HashSet<String>>> = None;
         for cand in ranked.into_iter().take(self.max_attempts as usize) {
             if self.store.get_owned(cand.info_hash.clone()).await.is_some() {
-                return AcquireOutcome::Acquired(cand.info_hash.clone()); // idempotent
+                if present.is_none() {
+                    present = Some(self.provider.get_torrents().await.ok().map(|ts| {
+                        ts.iter()
+                            .map(|t| t.hash.to_ascii_lowercase())
+                            .collect::<std::collections::HashSet<String>>()
+                    }));
+                }
+                // Short-circuit as idempotent "already acquired" ONLY when the torrent is confirmed
+                // PRESENT on the provider. If the listing is unavailable, preserve the old idempotent
+                // behaviour (avoid spurious re-adds on a transient listing failure). If confirmed
+                // ABSENT, fall through to re-add — the title lapsed (cache lost / externally deleted),
+                // which is exactly the documented availability-re-acquire case.
+                let confirmed_absent = match present.as_ref().expect("just fetched") {
+                    Some(p) => !p.contains(&cand.info_hash.to_ascii_lowercase()),
+                    None => false,
+                };
+                if !confirmed_absent {
+                    return AcquireOutcome::Acquired(cand.info_hash.clone());
+                }
             }
             let magnet = format!("magnet:?xt=urn:btih:{}", cand.info_hash);
             let added = match self.provider.add_magnet(&magnet).await {
@@ -564,6 +586,21 @@ impl AcquisitionEngine {
                         .join(",");
                     let _ = self.provider.select_files(&t.id, &csv).await;
                 }
+                // If selection never takes effect across the whole dead-timeout window, the hash is
+                // genuinely stuck (the provider lists files but won't honour select_files for it) —
+                // reap + re-acquire rather than retrying selection forever, consistent with the
+                // !has_files / missing-selected-path branches. A provider OUTAGE instead fails the
+                // get_torrent_info above and skips this branch, so this only fires on a stuck hash.
+                if now_secs().saturating_sub(rec.added_at) > self.dead_timeout.as_secs() {
+                    self.fail_and_reacquire(
+                        hash,
+                        &t.id,
+                        &rec.request,
+                        "SelectStuck",
+                        &rec.provenance,
+                    )
+                    .await;
+                }
                 continue; // re-inspect next tick after selection settles
             }
             // Movie-pack guard (deferred from acquire).
@@ -600,6 +637,18 @@ impl AcquisitionEngine {
                 }
                 continue;
             };
+            if t.status != "downloaded" {
+                // Still downloading — stall check only (uses stall_timeout as the no-progress
+                // ceiling). Defer title-validation + probe until the torrent is downloaded so we
+                // don't burn a TMDB lookup (and a 4 MB CDN probe) on EVERY scan tick for the whole
+                // download. A wrong-title torrent is still caught — just once it finishes.
+                if self.is_stalled(&t.id, t.progress).await {
+                    self.fail_and_reacquire(hash, &t.id, &rec.request, "Stalled", &rec.provenance)
+                        .await;
+                }
+                continue;
+            }
+            // Downloaded → validate the title, then probe and finalise.
             let file_name = selected_path
                 .rsplit('/')
                 .next()
@@ -620,15 +669,6 @@ impl AcquisitionEngine {
                     .await;
                 continue;
             }
-            if t.status != "downloaded" {
-                // Still downloading — stall check (uses stall_timeout as the no-progress ceiling).
-                if self.is_stalled(&t.id, t.progress).await {
-                    self.fail_and_reacquire(hash, &t.id, &rec.request, "Stalled", &rec.provenance)
-                        .await;
-                }
-                continue;
-            }
-            // Downloaded → probe and finalise.
             let locator = locator_for(&info, hash, &selected_path);
             match self.verify_file(&locator, &rec.request).await {
                 VerifyResult::Pass | VerifyResult::Accept => {
@@ -782,6 +822,9 @@ mod tests {
     }
     fn provider_returning(status: &str, hash: &str) -> Arc<dyn DebridProvider> {
         Arc::new(MockProvider {
+            // List the torrent so `get_torrents()` reports the hash as PRESENT — an owned+present
+            // title short-circuits as idempotent, whereas an owned-but-absent (lapsed) one re-adds.
+            torrents: vec![torrent(&format!("tid_{hash}"), hash, status, 100.0)],
             add_magnet: Some(AddMagnetResponse {
                 id: format!("tid_{hash}"),
                 uri: String::new(),
@@ -914,7 +957,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquire_idempotent_when_already_owned() {
+    async fn acquire_idempotent_when_already_owned_and_present() {
+        // Owned AND present in the provider listing (provider_returning lists the hash) → idempotent.
         let st = store();
         st.put_owned(
             "h1".into(),
@@ -941,6 +985,55 @@ mod tests {
         assert_eq!(
             eng.acquire(req(), Provenance::manual()).await,
             AcquireOutcome::Acquired("h1".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_reacquires_owned_but_absent_title() {
+        // Owned (Verified) record exists, but the torrent is NOT in the provider listing — it lapsed
+        // (cache lost / externally deleted). acquire must RE-add it (Pending), not short-circuit as
+        // already-acquired (the documented availability re-acquire). Regression guard.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::watchlist("alice"),
+                added_at: 1,
+                status: OwnedStatus::Verified,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        // Provider lists NOTHING (h1 absent), but add_magnet/info succeed.
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_h1".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TI {
+                id: "tid_h1".into(),
+                hash: "h1".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper {
+                candidates: vec![cand("h1", true)],
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        assert_eq!(
+            eng.acquire(req(), Provenance::watchlist("alice")).await,
+            AcquireOutcome::Pending("h1".into()),
+            "an owned-but-absent title must be re-acquired, not treated as already-acquired"
         );
     }
 
@@ -1102,6 +1195,61 @@ mod tests {
         assert!(
             st.get_owned("h1".into()).await.is_none(),
             "never-resolved Pending is reaped"
+        );
+        assert!(st.is_blacklisted(27205, "h1".into()).await);
+    }
+
+    #[tokio::test]
+    async fn observe_reaps_stuck_unselected_after_dead_timeout() {
+        // Files are present but the provider never honours selection (selected stays 0). Past the
+        // dead-timeout this genuinely-stuck hash must be reaped + blacklisted, not retried forever.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: 1,
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![torrent("tid_h1", "h1", "downloaded", 100.0)],
+            torrent_info: Some(TI {
+                id: "tid_h1".into(),
+                hash: "h1".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "Movie.2023.1080p.x265.mkv".into(),
+                    bytes: 10,
+                    selected: 0, // never selected
+                }],
+                ..Default::default()
+            }),
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_h1".into(),
+                uri: String::new(),
+            }),
+            ..Default::default()
+        });
+        let eng = engine_dead(
+            provider,
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+            0,
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await;
+        assert!(
+            st.get_owned("h1".into()).await.is_none(),
+            "stuck-unselected Pending is reaped past the dead-timeout"
         );
         assert!(st.is_blacklisted(27205, "h1".into()).await);
     }

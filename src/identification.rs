@@ -20,8 +20,13 @@ static STOP_RE: LazyLock<Regex> = LazyLock::new(|| {
 static YEAR_RANGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(19|20)\d{2}[\s-]+(19|20)\d{2}\b").unwrap());
 
+// Word-anchored show markers. The looser alternatives are bounded so a movie filename does not
+// trip them: `\b\d{1,2}x\d{1,3}\b` (episode form like 1x01) excludes a resolution such as
+// 1920x1080, and `\be\d{1,3}\b` (episode marker E05) excludes embedded matches like the `e7` in
+// "Se7en". The SxxExx alternative is leading-`\b`-anchored but intentionally NOT trailing-anchored,
+// so contiguous multi-episode and version markers (S01E01E02, S01E13v2) still match.
 static SHOW_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)s(\d+)\.?e(\d+)|s(\d+)|(\d+)x(\d+)|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|e\d+").unwrap()
+    Regex::new(r"(?i)\bs\d+\.?e\d+|\bs\d+\b|\b\d{1,2}x\d{1,3}\b|\bseasons?\s*\d+|\b\d+\s*seasons?|\btemporada\s*\d+|\bsaison\s*\d+|\be\d{1,3}\b").unwrap()
 });
 
 static GENERIC_RE: LazyLock<Regex> =
@@ -1535,5 +1540,48 @@ mod tests {
             is_show_guess(&files),
             "Episode pattern in filename should be guessed as show"
         );
+    }
+
+    fn one_file(name: &str) -> Vec<TorrentFile> {
+        vec![TorrentFile {
+            id: 1,
+            path: format!("/{name}"),
+            bytes: 1_000_000_000,
+            selected: 1,
+        }]
+    }
+
+    #[test]
+    fn is_show_guess_detects_real_episode_markers() {
+        for name in [
+            "Show.S01E01.1080p.mkv",
+            "Show.S1.mkv",
+            "Show.1x01.mkv",
+            "Show.E05.mkv",
+            "Show.Season 2.mkv",
+            // Contiguous multi-episode + version markers must still register as shows (the SxxExx
+            // alternative is intentionally not trailing-anchored).
+            "Friends.S10E17E18.720p.mkv",
+            "Show.S01E01E02.1080p.mkv",
+            "Anime.S01E13v2.mkv",
+        ] {
+            assert!(is_show_guess(&one_file(name)), "{name} should be a show");
+        }
+    }
+
+    #[test]
+    fn is_show_guess_does_not_misclassify_movies() {
+        // A resolution (1920x1080) must not trip the NxM episode form, and an embedded `e7`
+        // (Se7en) must not trip the lone-episode form.
+        for name in [
+            "Se7en.1995.1080p.BluRay.x264.mkv",
+            "Movie.1920x1080.HDR.mkv",
+            "Code8.2019.2160p.mkv",
+        ] {
+            assert!(
+                !is_show_guess(&one_file(name)),
+                "{name} should NOT be a show"
+            );
+        }
     }
 }

@@ -80,13 +80,15 @@ impl TorrentioScraper {
     }
 }
 
-// A 40-hex infohash as a slash-delimited path segment. Case-sensitive (lowercase) so a
-// mixed-case debrid token in the same URL can't be mistaken for the hash.
-static RESOLVE_HASH_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"/([0-9a-f]{40})/").unwrap());
-// The fileIdx following the hash: `/<hash>/<season:episode|null>/<fileidx>`.
-static RESOLVE_IDX_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"/[0-9a-f]{40}/[^/]*/(\d+)").unwrap());
+// The infohash + fileIdx in a Torrentio debrid-resolve path: `/<infohash>/<season:episode|null>/
+// <fileidx>/`. The fileIdx must be a COMPLETE numeric segment — `(\d+)` followed by `/` or
+// end-of-string — which is what distinguishes the infohash from the debrid token that precedes it:
+// the token is followed by `/<infohash>/<season:episode|null>`, and a `season:episode` like `1:2`
+// is NOT a complete numeric segment (the trailing `/` anchor rejects the `1` prefix), while `null`
+// is not numeric at all. So even a token that is exactly 40 lowercase-hex chars never matches here.
+// Lowercase-only also guards against a mixed-case token. Hash and idx come from the SAME match.
+static RESOLVE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/([0-9a-f]{40})/[^/]*/(\d+)(?:/|$)").unwrap());
 
 /// Recover `(infohash, fileIdx)` from a Torrentio debrid-resolve URL of the form
 /// `.../resolve/<provider>/<token>/<infohash>/<season:episode|null>/<fileidx>/<filename>`.
@@ -95,11 +97,9 @@ static RESOLVE_IDX_RE: LazyLock<Regex> =
 /// Note: only 40-hex (BitTorrent v1) infohashes are recovered; a 32-char base32 hash (rare, and
 /// not emitted by debrid-keyed Torrentio) would not match and the stream would be skipped.
 fn hash_idx_from_url(url: &str) -> Option<(String, Option<usize>)> {
-    let hash = RESOLVE_HASH_RE.captures(url)?.get(1)?.as_str().to_string();
-    let idx = RESOLVE_IDX_RE
-        .captures(url)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse::<usize>().ok());
+    let c = RESOLVE_RE.captures(url)?;
+    let hash = c.get(1)?.as_str().to_string();
+    let idx = c.get(2).and_then(|m| m.as_str().parse::<usize>().ok());
     Some((hash, idx))
 }
 
@@ -162,15 +162,28 @@ impl Scraper for TorrentioScraper {
         episode: Option<u32>,
     ) -> Result<Vec<RawCandidate>, AppError> {
         let url = Self::stream_url(&self.base_url, imdb_id, kind, season, episode);
-        let resp = self.http.get(&url).send().await.map_err(AppError::Http)?;
+        // The base URL embeds the provider token in its path, so any reqwest error here would
+        // carry it (reqwest only redacts userinfo, not the path). Strip the URL from every error
+        // before it can reach a log line — mirrors tmdb_client/torbox_client.
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| AppError::Http(e.without_url()))?;
         // 404 = unknown id (genuinely no streams). Any other non-success (429/5xx) is a
         // retriable addon error — surface it so the engine treats it as TemporarilyUnavailable
         // rather than silently seeing zero candidates.
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(Vec::new());
         }
-        let resp = resp.error_for_status().map_err(AppError::Http)?;
-        let v: serde_json::Value = resp.json().await.map_err(AppError::Http)?;
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| AppError::Http(e.without_url()))?;
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Http(e.without_url()))?;
         Ok(parse_streams(&v))
     }
 }
@@ -317,6 +330,29 @@ mod tests {
             "aabbccddeeff00112233445566778899aabbccdd"
         );
         assert_eq!(cands[0].file_idx, Some(3));
+    }
+
+    #[test]
+    fn recovers_real_hash_when_token_is_also_40_lowercase_hex() {
+        // Pathological: the debrid token is itself exactly 40 lowercase-hex chars. The structural
+        // anchor (hash followed by `/<segment>/<digits>/`) must still pick the REAL infohash. Cover
+        // BOTH a movie (`null`) AND a series (`1:2`) — the series segment is the tricky case: `(\d+)`
+        // would otherwise match the `1` prefix of `1:2` and capture the TOKEN as the hash.
+        let token = "0000000000000000000000000000000000000000";
+        let real = "64877b5490208c3015c0f5121287949d62622e54";
+        for (seg, idx) in [("null", 0usize), ("1:2", 3usize)] {
+            let url = format!(
+                "https://torrentio.strem.fun/resolve/realdebrid/{token}/{real}/{seg}/{idx}/X.mkv"
+            );
+            let json = serde_json::json!({"streams": [{"name": "x", "title": "y", "url": url}]});
+            let cands = parse_streams(&json);
+            assert_eq!(cands.len(), 1, "seg={seg}");
+            assert_eq!(
+                cands[0].info_hash, real,
+                "must recover the real hash, not the token (seg={seg})"
+            );
+            assert_eq!(cands[0].file_idx, Some(idx), "seg={seg}");
+        }
     }
 
     #[test]

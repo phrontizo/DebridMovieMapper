@@ -66,7 +66,10 @@ pub fn parse_rd_date(s: &str) -> SystemTime {
         let is_leap =
             |yr: i64| yr.rem_euclid(4) == 0 && (yr.rem_euclid(100) != 0 || yr.rem_euclid(400) == 0);
         let days_before_month: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-        if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        // Reject an absurd (non-4-digit) year up front: a realistic date is 1..=9999, and bounding
+        // it here makes every arithmetic below overflow-free (a crafted huge year string in a
+        // provider response would otherwise overflow the i64 `(y - 1970) * 365`).
+        if !(1..=9999).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
             return None;
         }
 
@@ -162,7 +165,7 @@ pub struct VfsChange {
     pub update_type: UpdateType,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
 pub enum MediaType {
     Movie,
     Show,
@@ -277,6 +280,10 @@ impl DebridVfs {
                 MediaType::Show => (&mut used_show_names, &mut shows_nodes),
             };
 
+            // The dedup suffix is only *committed* once we know the folder is actually inserted
+            // (an archive-only / empty group must not consume a number and leave a "Title (1)" gap
+            // with no "Title"). `dedup_base` carries the base name to bump after insertion.
+            let mut dedup_base: Option<String> = None;
             let folder_name = if let Some(id) = &metadata.external_id {
                 if let Some((source, raw_id)) = id.split_once(':') {
                     format!("{} [{}id-{}]", base_name, source, raw_id)
@@ -284,14 +291,13 @@ impl DebridVfs {
                     format!("{} [id={}]", base_name, id)
                 }
             } else {
-                let count = used_names.entry(base_name.clone()).or_insert(0);
-                let name = if *count == 0 {
+                let count = *used_names.get(&base_name).unwrap_or(&0);
+                dedup_base = Some(base_name.clone());
+                if count == 0 {
                     base_name.clone()
                 } else {
                     format!("{} ({})", base_name, count)
-                };
-                *count += 1;
-                name
+                }
             };
             // Sanitize the whole folder name: the `[<source>id-<id>]` suffix is derived from
             // `external_id`, so a crafted/cached value containing a path separator must not be
@@ -319,6 +325,7 @@ impl DebridVfs {
                 }
             }
 
+            let mut folder_inserted = false;
             match metadata.media_type {
                 MediaType::Movie => {
                     let mut children = BTreeMap::new();
@@ -334,7 +341,7 @@ impl DebridVfs {
                         .or_else(|| torrents.first());
                     if let Some(torrent) = chosen {
                         let torrent_ts = parse_rd_date(&torrent.added);
-                        Self::add_torrent_files(&mut children, torrent, None);
+                        Self::add_torrent_files(&mut children, torrent);
                         if !children.is_empty() {
                             let prefix = format!("Movies/{}", folder_name);
                             for name in children.keys() {
@@ -349,6 +356,7 @@ impl DebridVfs {
                             );
                             timestamps.insert(format!("{}/movie.nfo", prefix), torrent_ts);
                             nodes.insert(folder_name, VfsNode::Directory { children });
+                            folder_inserted = true;
                         }
                     }
                 }
@@ -500,7 +508,14 @@ impl DebridVfs {
                                 children: show_children,
                             },
                         );
+                        folder_inserted = true;
                     }
+                }
+            }
+            // Commit the dedup number only if this group produced a folder (see `dedup_base`).
+            if folder_inserted {
+                if let Some(b) = dedup_base {
+                    *used_names.entry(b).or_insert(0) += 1;
                 }
             }
         }
@@ -632,11 +647,7 @@ impl DebridVfs {
         nfo.into_bytes()
     }
 
-    fn add_torrent_files(
-        destination: &mut BTreeMap<String, VfsNode>,
-        torrent: &TorrentInfo,
-        path_prefix: Option<&str>,
-    ) {
+    fn add_torrent_files(destination: &mut BTreeMap<String, VfsNode>, torrent: &TorrentInfo) {
         let selected_count = torrent.files.iter().filter(|f| f.selected == 1).count();
         if !torrent.links.is_empty() && selected_count != torrent.links.len() {
             tracing::warn!(
@@ -653,14 +664,9 @@ impl DebridVfs {
                     let link = torrent.links.get(link_idx).cloned();
                     if link.is_some() || torrent.links.is_empty() {
                         let filename = file.path.split('/').next_back().unwrap_or(&file.path);
-                        let path = if let Some(prefix) = path_prefix {
-                            format!("{}/{}", prefix, filename.trim_start_matches('/'))
-                        } else {
-                            filename.to_string()
-                        };
                         Self::add_path_to_tree(
                             destination,
-                            &path,
+                            filename,
                             file.bytes,
                             FileLocator {
                                 hash: torrent.hash.clone(),
@@ -677,57 +683,36 @@ impl DebridVfs {
         }
     }
 
-    /// Insert a video file into the tree as a MediaFile node. Returns the final filename.
+    /// Insert a video file into `children` as a MediaFile node, keyed by its filename. Callers pass
+    /// a basename (the VFS tree is one level deep — Season directories are created by the caller),
+    /// so the leading path, if any, is stripped. On a name collision (two selected files sharing a
+    /// basename) a " (N)" suffix is appended before the extension. Returns the final name used.
     fn add_path_to_tree(
-        root: &mut BTreeMap<String, VfsNode>,
+        children: &mut BTreeMap<String, VfsNode>,
         path: &str,
         size: u64,
         locator: FileLocator,
     ) -> String {
-        let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-        let mut current_children = root;
-
-        for i in 0..parts.len() {
-            let part = parts[i].to_string();
-            if i == parts.len() - 1 {
-                // Keep original filename and extension
-                let mut final_name = part.clone();
-                let mut counter = 1;
-                while current_children.contains_key(&final_name) {
-                    if let Some(pos) = part.rfind('.') {
-                        let base = &part[..pos];
-                        let ext = &part[pos..];
-                        final_name = format!("{} ({}){}", base, counter, ext);
-                    } else {
-                        final_name = format!("{} ({})", part, counter);
-                    }
-                    counter += 1;
-                }
-
-                let ret = final_name.clone();
-                current_children.insert(
-                    final_name,
-                    VfsNode::MediaFile {
-                        file_size: size,
-                        locator: locator.clone(),
-                    },
-                );
-                return ret;
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let mut final_name = name.to_string();
+        let mut counter = 1;
+        while children.contains_key(&final_name) {
+            if let Some(pos) = name.rfind('.') {
+                let (base, ext) = (&name[..pos], &name[pos..]);
+                final_name = format!("{} ({}){}", base, counter, ext);
             } else {
-                let entry = current_children
-                    .entry(part)
-                    .or_insert_with(|| VfsNode::Directory {
-                        children: BTreeMap::new(),
-                    });
-                if let VfsNode::Directory { children } = entry {
-                    current_children = children;
-                } else {
-                    // This should not happen if paths are consistent
-                    return String::new();
-                }
+                final_name = format!("{} ({})", name, counter);
             }
+            counter += 1;
         }
-        String::new()
+        children.insert(
+            final_name.clone(),
+            VfsNode::MediaFile {
+                file_size: size,
+                locator,
+            },
+        );
+        final_name
     }
 }
 
@@ -747,7 +732,14 @@ fn sanitize_filename(name: &str) -> String {
             _ => replaced.push(c),
         }
     }
-    replaced.split_whitespace().collect::<Vec<_>>().join(" ")
+    let cleaned = replaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    // A name that sanitizes to empty, "." or ".." would create a junk/unusable directory key
+    // ("."/".." are also path-navigation names). Fold them to a stable placeholder. Only reachable
+    // for unidentified content (identified titles carry a real TMDB-derived name).
+    match cleaned.as_str() {
+        "" | "." | ".." => "untitled".to_string(),
+        _ => cleaned,
+    }
 }
 
 /// Regex matching filenames that should be excluded from the VFS.
@@ -1886,6 +1878,15 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_filename_folds_dot_and_empty_names_to_placeholder() {
+        // Names that would otherwise become "", "." or ".." — junk/path-navigation directory keys.
+        assert_eq!(sanitize_filename(".."), "untitled");
+        assert_eq!(sanitize_filename("."), "untitled");
+        assert_eq!(sanitize_filename("***"), "untitled");
+        assert_eq!(sanitize_filename("   "), "untitled");
+    }
+
+    #[test]
     fn build_sanitizes_title_with_slash() {
         let torrents = vec![(
             TorrentInfo {
@@ -2445,6 +2446,20 @@ mod tests {
         assert_ne!(parse_rd_date("2024-02-29"), std::time::UNIX_EPOCH);
         // Last valid day of a 30-day month must still parse.
         assert_ne!(parse_rd_date("2023-04-30"), std::time::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn parse_rd_date_absurd_year_falls_back_without_overflow() {
+        // A crafted huge (non-4-digit) year must fall back to UNIX_EPOCH, not overflow the i64
+        // day arithmetic (which would panic in debug builds).
+        assert_eq!(
+            parse_rd_date("25000000000000000-01-01"),
+            std::time::UNIX_EPOCH
+        );
+        assert_eq!(parse_rd_date("99999-01-01"), std::time::UNIX_EPOCH);
+        assert_eq!(parse_rd_date("0-01-01"), std::time::UNIX_EPOCH);
+        // The maximum 4-digit year still parses.
+        assert_ne!(parse_rd_date("9999-12-31"), std::time::UNIX_EPOCH);
     }
 
     #[test]

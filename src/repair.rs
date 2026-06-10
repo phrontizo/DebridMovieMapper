@@ -27,17 +27,18 @@ pub struct TorrentHealth {
 #[derive(Debug)]
 pub struct RepairManager {
     health_status: Arc<RwLock<HashMap<String, TorrentHealth>>>,
-    rd_client: Arc<dyn DebridProvider>,
+    /// The active debrid provider (Real-Debrid or TorBox) — repair is provider-neutral.
+    provider: Arc<dyn DebridProvider>,
     /// Maps new_torrent_id -> old_torrent_id for successful repairs.
     /// The scan loop consumes this to reuse old TMDB identifications.
     repair_replacements: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl RepairManager {
-    pub fn new(rd_client: Arc<dyn DebridProvider>) -> Self {
+    pub fn new(provider: Arc<dyn DebridProvider>) -> Self {
         Self {
             health_status: Arc::new(RwLock::new(HashMap::new())),
-            rd_client,
+            provider,
             repair_replacements: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -50,13 +51,13 @@ impl RepairManager {
     }
 
     /// Delete a torrent that was created by add_magnet but whose repair failed.
-    /// Prevents duplicate torrents from accumulating in Real-Debrid.
+    /// Prevents duplicate torrents from accumulating in the debrid account.
     async fn cleanup_leaked_torrent(&self, new_torrent_id: &str) {
         warn!(
             "Cleaning up leaked torrent {} after failed repair",
             new_torrent_id
         );
-        if let Err(e) = self.rd_client.delete_torrent(new_torrent_id).await {
+        if let Err(e) = self.provider.delete_torrent(new_torrent_id).await {
             error!(
                 "Failed to clean up leaked torrent {}: {}",
                 new_torrent_id, e
@@ -68,6 +69,19 @@ impl RepairManager {
         let mut health_map = self.health_status.write().await;
         if let Some(health) = health_map.get_mut(torrent_id) {
             health.state = RepairState::Failed;
+        }
+    }
+
+    /// Revert a torrent to `Broken` after a TRANSIENT repair failure (a re-add/info HTTP error, or
+    /// the re-added torrent's file list not resolving within the poll window). Unlike
+    /// `set_repair_failed`, this preserves `repair_attempts`/`last_repair_trigger`, so the 30s
+    /// cooldown and 3-attempt budget in `check_and_begin_repair` govern whether — and when — repair
+    /// retries. Without this, a single external hiccup would mark a perfectly repairable torrent
+    /// permanently `Failed` (hidden from WebDAV until the process restarts).
+    async fn set_repair_broken(&self, torrent_id: &str) {
+        let mut health_map = self.health_status.write().await;
+        if let Some(health) = health_map.get_mut(torrent_id) {
+            health.state = RepairState::Broken;
         }
     }
 
@@ -151,7 +165,7 @@ impl RepairManager {
         Ok(attempt_num)
     }
 
-    /// Add magnet, wait for RD to process, get new torrent info, match files by path, select them.
+    /// Add magnet, wait for the provider to process, get new torrent info, match files by path, select them.
     /// Returns (new_torrent_id, new_torrent_info) on success.
     /// On failure, cleans up the leaked torrent and marks the old torrent as failed.
     async fn add_and_select_files(
@@ -179,7 +193,7 @@ impl RepairManager {
         // Repair keeps the single-poll behaviour (max_wait == settle): the re-added torrent is a
         // known-good hash whose metadata should already be available.
         match crate::reacquire::materialise(
-            &*self.rd_client,
+            &*self.provider,
             &old_info.hash,
             wait_duration,
             wait_duration,
@@ -189,7 +203,10 @@ impl RepairManager {
         {
             Ok(pair) => Ok(pair),
             Err(e) => {
-                self.set_repair_failed(old_torrent_id).await;
+                // A materialise failure is transient (re-add HTTP error, or the file list not
+                // resolving within the poll window) — revert to Broken so the cooldown + attempt
+                // budget govern retries, rather than hiding the item forever on one hiccup.
+                self.set_repair_broken(old_torrent_id).await;
                 Err(e.to_string())
             }
         }
@@ -198,7 +215,7 @@ impl RepairManager {
     /// Delete old torrent, update health_map (remove old, insert new as Healthy), record replacement.
     async fn complete_repair(&self, old_torrent_id: &str, new_torrent_id: &str) {
         // Delete old broken torrent
-        if let Err(e) = self.rd_client.delete_torrent(old_torrent_id).await {
+        if let Err(e) = self.provider.delete_torrent(old_torrent_id).await {
             warn!("Failed to delete old torrent {}: {}", old_torrent_id, e);
         }
 
@@ -245,14 +262,14 @@ impl RepairManager {
             torrent_info.hash
         );
 
-        info!("Step 1: Adding magnet to Real-Debrid...");
+        info!("Step 1: Adding magnet to the debrid provider...");
         let (new_torrent_id, _new_info) = match self
             .add_and_select_files(&torrent_info.id, torrent_info, Duration::from_secs(2))
             .await
         {
             Ok((new_id, new_info)) => {
                 info!("Step 1 complete: Re-added torrent with new ID: {}", new_id);
-                info!("Step 2: Waiting 2 seconds for RD to process torrent... complete");
+                info!("Step 2: Waiting 2 seconds for the provider to process torrent... complete");
                 info!("Step 3: Fetching new torrent info... complete");
                 let original_selected_count = torrent_info
                     .files
@@ -305,15 +322,6 @@ impl RepairManager {
         Ok(())
     }
 
-    /// Fetch torrent info fresh and attempt repair. Called on-demand when a broken
-    /// link is detected during WebDAV file read.
-    pub async fn repair_by_id(&self, torrent_id: &str) -> Result<(), String> {
-        match self.rd_client.get_torrent_info(torrent_id).await {
-            Ok(info) => self.repair_torrent(&info).await,
-            Err(e) => Err(format!("Failed to fetch torrent info for repair: {}", e)),
-        }
-    }
-
     /// Build a `FileLocator` for the file at `file_path` within `info`. The per-file
     /// restricted link is paired by position among selected files (Real-Debrid); for
     /// providers with no per-file link array (TorBox) `links` is empty so `link` is
@@ -358,10 +366,12 @@ impl RepairManager {
         );
 
         // Fetch old torrent info to know which files were selected (for re-selection).
-        let old_info = match self.rd_client.get_torrent_info(torrent_id).await {
+        let old_info = match self.provider.get_torrent_info(torrent_id).await {
             Ok(info) => info,
             Err(e) => {
-                self.set_repair_failed(torrent_id).await;
+                // Transient listing failure — revert to Broken (cooldown/attempt budget govern
+                // retries) rather than permanently Failed.
+                self.set_repair_broken(torrent_id).await;
                 return Err(format!("Failed to get torrent info: {}", e));
             }
         };
@@ -375,11 +385,13 @@ impl RepairManager {
         // Brief wait for the provider to process file selection.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let final_info = match self.rd_client.get_torrent_info(&new_torrent_id).await {
+        let final_info = match self.provider.get_torrent_info(&new_torrent_id).await {
             Ok(info) => info,
             Err(e) => {
                 self.cleanup_leaked_torrent(&new_torrent_id).await;
-                self.set_repair_failed(torrent_id).await;
+                // Transient listing failure on the replacement — revert to Broken so the next read
+                // retries within budget instead of permanently failing.
+                self.set_repair_broken(torrent_id).await;
                 return Err(format!("Failed to get final torrent info: {}", e));
             }
         };
@@ -411,7 +423,7 @@ impl RepairManager {
                 torrent_id, final_info.status, new_torrent_id
             );
 
-            if let Err(e) = self.rd_client.delete_torrent(torrent_id).await {
+            if let Err(e) = self.provider.delete_torrent(torrent_id).await {
                 warn!("Failed to delete old torrent {}: {}", torrent_id, e);
             }
 
@@ -536,12 +548,6 @@ mod tests {
         let provider: std::sync::Arc<dyn DebridProvider> =
             std::sync::Arc::new(MockProvider::default());
         let _manager = RepairManager::new(provider);
-    }
-
-    /// Compile-time check: repair_by_id exists with the correct signature.
-    #[allow(dead_code)]
-    async fn _assert_repair_by_id_signature(manager: &RepairManager) {
-        let _: Result<(), String> = manager.repair_by_id("some_id").await;
     }
 
     /// Compile-time check: try_instant_repair exists with the correct signature.

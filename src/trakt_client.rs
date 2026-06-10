@@ -157,9 +157,13 @@ impl TraktClientImpl {
                 return Ok(resp);
             }
             // Retry transient server errors without signalling the rate limiter — a 5xx is not
-            // a rate-limit event; wait_for_token already paces each attempt.
+            // a rate-limit event. Add a short exponential backoff (the limiter is NOT signalled
+            // here, so otherwise the retries would fire only ~100ms apart and hammer a flapping
+            // upstream).
             if status.is_server_error() {
                 if attempt < MAX_ATTEMPTS {
+                    let backoff_ms = 200u64.saturating_mul(1u64 << (attempt - 1).min(5));
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     continue;
                 }
                 return Ok(resp);

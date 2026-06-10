@@ -6,7 +6,7 @@ license = "MIT"
 
 [dependencies]
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -28,9 +28,10 @@ chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 urlencoding = "2"
-# Enables tokio's paused-clock test harness (#[tokio::test(start_paused = true)]).
-# Dev-only: with the edition-2021 feature resolver this does not reach release builds.
-tokio = { version = "1", features = ["test-util"] }
+# test-util enables tokio's paused-clock harness; io-util (AsyncReadExt/AsyncWriteExt) is used only
+# by the loopback-server test helpers. Both are dev-only: with the edition-2021 feature resolver
+# they do not reach release builds.
+tokio = { version = "1", features = ["test-util", "io-util"] }
 
 [lib]
 name = "debridmoviemapper"

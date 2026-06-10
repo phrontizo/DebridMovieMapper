@@ -3,7 +3,9 @@ use crate::provider::DebridProvider;
 use crate::rd_client::TorrentInfo;
 use std::time::{Duration, Instant};
 
-/// Shared add→select primitive used by both repair (same-hash) and acquisition (candidate).
+/// Add→poll→select primitive used by the instant-repair path (same-hash re-add). (The SP3
+/// acquisition engine no longer calls this — it adds optimistically in `acquire` and resolves the
+/// verdict later in `observe`; only `repair.rs` materialises.)
 /// Adds the magnet for `hash`, then **polls** for the file list — a freshly-added uncached torrent
 /// can take several seconds to resolve its metadata, so every `settle` it re-fetches info and asks
 /// `select` which file ids to select, retrying until `select` returns something or `max_wait`

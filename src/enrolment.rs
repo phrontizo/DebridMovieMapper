@@ -42,13 +42,30 @@ impl EnrolmentService {
         let path = req.uri().path().to_string();
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
+        // CSRF guard: the state-changing POST routes are unauthenticated, so the trusted-LAN
+        // model alone does not stop a drive-by cross-origin form POST from a page a LAN browser
+        // visits. Reject any POST a browser flags as cross-origin (non-browser clients send
+        // neither header and are allowed, consistent with the trusted-LAN model).
+        if method == Method::POST && is_cross_origin(&req) {
+            warn!("Rejecting cross-origin POST to {} (CSRF guard)", path);
+            return html(
+                StatusCode::FORBIDDEN,
+                "<h1>403 Forbidden</h1><p>Cross-origin request rejected.</p>".to_string(),
+            );
+        }
+
         match (&method, segments.as_slice()) {
             (&Method::POST, ["trakt", "enrol"]) => self.start_enrolment().await,
             (&Method::GET, ["trakt"]) | (&Method::GET, ["trakt", "accounts"]) => {
                 self.accounts_page().await
             }
             (&Method::POST, ["trakt", "accounts", slug, "refresh"]) => {
-                let _ = self.refresh_account(slug).await;
+                if let Err(e) = self.refresh_account(slug).await {
+                    // refresh_account already logs + flags the account on a Trakt-refresh failure;
+                    // the only error surfaced here is a token-store write failure, which would
+                    // otherwise be lost silently (unlike the `remove` arm below).
+                    warn!("Trakt token refresh persist failed for '{}': {}", slug, e);
+                }
                 redirect("/trakt/accounts")
             }
             (&Method::POST, ["trakt", "accounts", slug, "remove"]) => {
@@ -193,6 +210,32 @@ pub async fn poll_to_completion(
 
 // --- Pure HTML builders ---------------------------------------------------------------------
 
+/// Best-effort same-origin guard for the unauthenticated, state-changing POST routes. Modern
+/// browsers attach `Sec-Fetch-Site` and `Origin` to form submissions, so a cross-origin drive-by
+/// POST is detectable: reject when `Sec-Fetch-Site` is `cross-site`, or when `Origin`'s host:port
+/// does not match the request `Host`. A request with neither header (curl, tests, very old
+/// browsers) is treated as same-origin — acceptable under the trusted-LAN model.
+fn is_cross_origin<B>(req: &hyper::Request<B>) -> bool {
+    let headers = req.headers();
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        if site.eq_ignore_ascii_case("cross-site") || site.eq_ignore_ascii_case("cross-origin") {
+            return true;
+        }
+    }
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        // Strip the scheme to compare host[:port] against the Host header.
+        let origin_host = origin.split_once("://").map(|(_, rest)| rest).unwrap_or("");
+        let host = headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !origin_host.is_empty() && !host.is_empty() && !origin_host.eq_ignore_ascii_case(host) {
+            return true;
+        }
+    }
+    false
+}
+
 /// HTML-escape `s` for safe use in both element text and double-quoted attributes (`href="..."`,
 /// `action="..."`). Covers `&`, `<`, `>`, and `"` (`&` first to avoid double-escaping).
 fn esc(s: &str) -> String {
@@ -204,15 +247,25 @@ fn esc(s: &str) -> String {
 
 /// The enrolment instructions page (shows the device user_code + verification URL).
 fn enrol_html(dc: &DeviceCode) -> String {
+    // Defensive: only render a clickable link for an http(s) URL. The value is from Trakt's
+    // authenticated API (always https://trakt.tv/activate), but escaping alone would not stop a
+    // `javascript:`/`data:` href from executing on click if that ever changed — so a non-web
+    // value is shown as escaped text only.
+    let url = &dc.verification_url;
+    let link = if url.starts_with("https://") || url.starts_with("http://") {
+        format!("<a href=\"{u}\">{u}</a>", u = esc(url))
+    } else {
+        esc(url)
+    };
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Link a Trakt account</title></head>\
          <body><h1>Link a Trakt account</h1>\
-         <ol><li>Open <a href=\"{url}\">{url}</a></li>\
+         <ol><li>Open {link}</li>\
          <li>Enter this code: <strong>{code}</strong></li>\
          <li>Approve the request on Trakt.</li></ol>\
          <p>This device finishes linking automatically once you approve it. \
          Then return to <a href=\"/trakt/accounts\">the accounts page</a>.</p></body></html>",
-        url = esc(&dc.verification_url),
+        link = link,
         code = esc(&dc.user_code),
     )
 }
@@ -516,5 +569,82 @@ mod tests {
         assert!(page.contains("/trakt/accounts/alice/refresh"));
         assert!(page.contains("/trakt/accounts/bob/remove"));
         assert!(page.contains("/trakt/enrol"));
+    }
+
+    // ── security: HTML-escaping (XSS) ─────────────────────────────────────────
+
+    #[test]
+    fn esc_neutralises_html_metacharacters() {
+        assert_eq!(
+            esc(r#"<script>alert("1")&'</script>"#),
+            "&lt;script&gt;alert(&quot;1&quot;)&amp;'&lt;/script&gt;"
+        );
+    }
+
+    #[test]
+    fn accounts_html_escapes_account_fields() {
+        // A hostile username/slug (e.g. from a compromised Trakt response) must not break out of
+        // the HTML — assert the raw markup never appears and the escaped form does.
+        let accounts = vec![(
+            "ev<il".to_string(),
+            tokens_fixture("AT", "<script>alert(1)</script>"),
+        )];
+        let page = accounts_html(&accounts);
+        assert!(!page.contains("<script>alert(1)</script>"));
+        assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(page.contains("ev&lt;il"));
+    }
+
+    #[test]
+    fn enrol_html_escapes_and_guards_non_web_verification_url() {
+        let dc = DeviceCode {
+            device_code: "dc".into(),
+            user_code: "<b>X</b>".into(),
+            verification_url: "javascript:alert(1)".into(),
+            interval: 5,
+            expires_in: 600,
+        };
+        let html = enrol_html(&dc);
+        // The user_code is escaped...
+        assert!(html.contains("&lt;b&gt;X&lt;/b&gt;"));
+        // ...and a non-http(s) verification URL is NEVER rendered as a clickable href (it is shown
+        // as escaped text only, so the `javascript:` scheme cannot execute on click).
+        assert!(!html.contains("href=\"javascript:"));
+        assert!(html.contains("javascript:alert(1)")); // present, but as plain text
+    }
+
+    // ── security: CSRF same-origin guard ──────────────────────────────────────
+
+    fn post_req(headers: &[(&str, &str)]) -> hyper::Request<()> {
+        let mut b = hyper::Request::builder()
+            .method(Method::POST)
+            .uri("http://host.local/trakt/enrol");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(()).unwrap()
+    }
+
+    #[test]
+    fn cross_origin_post_is_rejected() {
+        // Sec-Fetch-Site: cross-site → cross-origin.
+        let req = post_req(&[("host", "host.local"), ("sec-fetch-site", "cross-site")]);
+        assert!(is_cross_origin(&req));
+        // Mismatched Origin host → cross-origin.
+        let req = post_req(&[("host", "host.local"), ("origin", "https://evil.example")]);
+        assert!(is_cross_origin(&req));
+    }
+
+    #[test]
+    fn same_origin_and_headerless_post_allowed() {
+        // Same Origin host:port as Host → same-origin.
+        let req = post_req(&[("host", "host.local"), ("origin", "http://host.local")]);
+        assert!(!is_cross_origin(&req));
+        // Sec-Fetch-Site: same-origin → allowed.
+        let req = post_req(&[("host", "host.local"), ("sec-fetch-site", "same-origin")]);
+        assert!(!is_cross_origin(&req));
+        // No CSRF-relevant headers (curl/tests) → allowed under the trusted-LAN model.
+        let req = post_req(&[("host", "host.local")]);
+        assert!(!is_cross_origin(&req));
     }
 }

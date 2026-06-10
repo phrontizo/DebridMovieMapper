@@ -319,7 +319,10 @@ fn read_box_header(buf: &[u8], pos: usize) -> Result<([u8; 4], usize, usize), Pr
     let typ = [buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]];
     let (payload_start, box_end) = if size32 == 1 {
         if pos + 16 > buf.len() {
-            return Err(ProbeError::Corrupt);
+            // The 16-byte 64-bit-largesize header straddles the fetched-buffer boundary: that is
+            // an under-fetch (truncated ranged read), not a broken structure — defer + retry
+            // (Transient) rather than blacklisting the release as Corrupt.
+            return Err(overrun_error(pos + 16, buf.len()));
         }
         let big = u64::from_be_bytes(buf[pos + 8..pos + 16].try_into().unwrap());
         // A crafted 64-bit largesize must not overflow usize (input is untrusted CDN bytes).
@@ -655,6 +658,15 @@ mod tests {
         assert_eq!(overrun_error(120, 100), ProbeError::Transient); // past the fetched buffer
         assert_eq!(overrun_error(80, 100), ProbeError::Corrupt); // within buffer, past a parent
         assert_eq!(overrun_error(100, 100), ProbeError::Corrupt); // exactly at end, not past
+    }
+    #[test]
+    fn read_box_header_truncated_largesize_is_transient() {
+        // size32 == 1 signals a 64-bit largesize, but only 12 of the 16 header bytes were fetched
+        // — an under-fetch (truncated ranged read), so this must defer (Transient), not blacklist.
+        let mut buf = vec![0u8; 12];
+        buf[0..4].copy_from_slice(&1u32.to_be_bytes());
+        buf[4..8].copy_from_slice(b"moov");
+        assert_eq!(read_box_header(&buf, 0), Err(ProbeError::Transient));
     }
     #[test]
     fn mp4_tracks_front_moov() {

@@ -23,22 +23,29 @@ const MAX_CONNECTIONS: usize = 256;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Healthcheck mode: verify the WebDAV server is listening, then exit
+    // Load .env FIRST so the healthcheck resolves PORT identically to the server (which loads
+    // .env then trim-parses PORT via Config). Without this, a PORT set only in .env — or one with
+    // surrounding whitespace from quoted compose YAML — made the healthcheck probe 8080 while the
+    // server listened elsewhere, reporting a healthy container as unhealthy.
+    dotenvy::dotenv().ok();
+
+    // Healthcheck mode: verify the WebDAV server is listening, then exit.
     if std::env::args().any(|a| a == "--healthcheck") {
         let port: u16 = std::env::var("PORT")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.trim().parse().ok())
             .unwrap_or(8080);
-        std::process::exit(
-            if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
-                0
-            } else {
-                1
-            },
-        );
+        let ok = format!("127.0.0.1:{}", port)
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|addr| {
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))
+                    .is_ok()
+            })
+            .unwrap_or(false);
+        std::process::exit(if ok { 0 } else { 1 });
     }
 
-    dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
     let config = Config::from_env().unwrap_or_else(|e| {
