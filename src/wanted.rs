@@ -85,7 +85,19 @@ pub fn user_finished(r: &WantedRecord, aired: &[(u32, u32)]) -> bool {
 
 /// Trigger A: every user who currently wants this title has finished it.
 /// Requires at least one wanting user — with no wanters this returns `false` (Trigger B's job).
+///
+/// A **watchlisted** title is an explicit "keep this available" signal and is NEVER finished-removed:
+/// re-adding a title you've already watched to your watchlist means you want to (re)watch it, so it
+/// must stay acquired regardless of watched state. So Trigger A does not fire while ANY user
+/// watchlists the title — it only reclaims *in-progress-only* titles (scrobbled but not watchlisted)
+/// once everyone watching them has finished. A watchlisted title is removed solely via Trigger B
+/// (un-watchlisted AND nobody wants it). Without this guard, a watched + watchlisted title oscillates
+/// every reconcile tick — acquired (acquire ignores watched) then deleted (Trigger A) — flapping the
+/// library.
 pub fn trigger_a_finished(wanted: &[WantedRecord], aired: &[(u32, u32)]) -> bool {
+    if wanted.iter().any(|r| r.sources.watchlist) {
+        return false;
+    }
     let mut any_wanter = false;
     for r in wanted.iter().filter(|r| wants(r)) {
         any_wanter = true;
@@ -278,10 +290,14 @@ mod tests {
 
     #[test]
     fn finished_movie_is_removed_trigger_a() {
+        // An IN-PROGRESS-only (not watchlisted) movie that's been watched is reclaimed by Trigger A.
         let t = movie_title(
             1,
-            vec![watchlist_movie_record("alice", 1, true)],
-            Some(owned("h", Provenance::watchlist("alice"), true, vec![])),
+            vec![movie_record(
+                "alice", 1, /*watchlist*/ false, /*in_progress*/ true,
+                /*watched*/ true,
+            )],
+            Some(owned("h", Provenance::in_progress("alice"), true, vec![])),
         );
         assert!(should_remove(&t));
         assert_eq!(
@@ -294,21 +310,35 @@ mod tests {
     }
 
     #[test]
+    fn watchlisted_watched_movie_is_kept_not_trigger_a() {
+        // A movie you've watched but kept on your watchlist must STAY acquired (re-watch): Trigger A
+        // must not fire, and reconcile must not remove or (since owned+available) re-acquire it.
+        let t = movie_title(
+            1,
+            vec![watchlist_movie_record("alice", 1, /*watched*/ true)],
+            Some(owned("h", Provenance::watchlist("alice"), true, vec![])),
+        );
+        assert!(!should_remove(&t));
+        assert_eq!(reconcile_title(&t), vec![]);
+    }
+
+    #[test]
     fn finished_ended_show_is_removed() {
+        // An IN-PROGRESS-only (not watchlisted) ended show, fully watched, is reclaimed by Trigger A.
         let aired = vec![(1, 1), (1, 2)];
         let t = show_title(
             2,
             vec![show_record(
                 "alice",
                 2,
-                true,
-                false,
+                /*watchlisted*/ false,
+                /*in_progress*/ true,
                 vec![(1, 1), (1, 2)],
                 ShowStatus::Ended,
             )],
             Some(owned(
                 "h",
-                Provenance::watchlist("alice"),
+                Provenance::in_progress("alice"),
                 true,
                 vec![(1, 1), (1, 2)],
             )),
@@ -700,23 +730,30 @@ mod tests {
         ));
         // empty list → false
         assert!(!trigger_a_finished(&[], &aired));
-        // single wanter, finished → true
-        assert!(trigger_a_finished(
-            &[movie_record("a", 1, true, false, true)],
+        // a WATCHLISTED title is never finished-removed, even fully watched → false (keep it)
+        assert!(!trigger_a_finished(
+            &[movie_record(
+                "a", 1, /*watchlist*/ true, false, /*watched*/ true
+            )],
             &aired
         ));
-        // one wanter unfinished → false
+        // single IN-PROGRESS-only wanter, finished → true
+        assert!(trigger_a_finished(
+            &[movie_record("a", 1, false, /*in_progress*/ true, true)],
+            &aired
+        ));
+        // one in-progress wanter unfinished → false
         assert!(!trigger_a_finished(
             &[
-                movie_record("a", 1, true, false, true),
-                movie_record("b", 1, true, false, false),
+                movie_record("a", 1, false, true, true),
+                movie_record("b", 1, false, true, false),
             ],
             &aired
         ));
         // a non-wanter who is unfinished must NOT block (only wanters count)
         assert!(trigger_a_finished(
             &[
-                movie_record("a", 1, true, false, true),   // wanter, finished
+                movie_record("a", 1, false, true, true), // in-progress wanter, finished
                 movie_record("b", 1, false, false, false), // not a wanter, ignored
             ],
             &aired
@@ -751,11 +788,13 @@ mod tests {
         let titles = vec![
             // wanted, not owned → AcquireMovie
             movie_title(10, vec![watchlist_movie_record("a", 10, false)], None),
-            // finished + owned (non-manual) → Remove
+            // finished + owned (non-manual), in-progress-only (not watchlisted) → Remove
             movie_title(
                 1,
-                vec![watchlist_movie_record("a", 1, true)],
-                Some(owned("h", Provenance::watchlist("a"), true, vec![])),
+                vec![movie_record(
+                    "a", 1, /*watchlist*/ false, /*in_progress*/ true, true,
+                )],
+                Some(owned("h", Provenance::in_progress("a"), true, vec![])),
             ),
             // nothing wanted, not owned → no actions
             movie_title(12, vec![], None),

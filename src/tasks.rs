@@ -2261,15 +2261,15 @@ mod reconcile_wanted_tests {
     #[tokio::test]
     async fn plan_finished_owned_movie_removes_trigger_a() {
         let store = mem_store();
-        // all wanters watched + owned hash present → Trigger A.
+        // all in-progress (not watchlisted) wanters watched + owned hash present → Trigger A.
         store
-            .put_wanted(wanted_movie("alice", 27205, true, false, true))
+            .put_wanted(wanted_movie("alice", 27205, false, true, true))
             .await
             .unwrap();
         store
             .put_owned(
                 "abc".into(),
-                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+                owned_record(27205, MediaKind::Movie, Provenance::in_progress("alice")),
             )
             .await
             .unwrap();
@@ -2281,6 +2281,33 @@ mod reconcile_wanted_tests {
                 tmdb_id: 27205,
                 hashes: vec!["abc".into()]
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_watchlisted_watched_movie_is_kept_not_removed() {
+        // The Oldboy case: a movie watched but still on the watchlist must NOT be removed (and,
+        // since owned + present, not re-acquired) — it stays available for a re-watch. Without the
+        // Trigger-A watchlist guard this oscillated acquire/remove every reconcile tick.
+        let store = mem_store();
+        store
+            .put_wanted(wanted_movie(
+                "alice", 27205, /*watchlist*/ true, false, /*watched*/ true,
+            ))
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "abc".into(),
+                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+            )
+            .await
+            .unwrap();
+        let torrents = vec![torrent("t1", "ABC")];
+        let ops = plan_reconcile_ops(&store, &torrents).await;
+        assert!(
+            ops.is_empty(),
+            "watchlisted+watched owned title must be kept, got {ops:?}"
         );
     }
 
@@ -2353,15 +2380,15 @@ mod reconcile_wanted_tests {
     #[tokio::test]
     async fn plan_lapsed_and_finished_movie_removes_not_reacquires() {
         let store = mem_store();
-        // alice has watched the movie and it's on her watchlist (Trigger A conditions met)
+        // alice has watched the movie and it's an in-progress-only (not watchlisted) title → Trigger A.
         store
-            .put_wanted(wanted_movie("alice", 27205, true, false, true))
+            .put_wanted(wanted_movie("alice", 27205, false, true, true))
             .await
             .unwrap();
         store
             .put_owned(
                 "abc".into(),
-                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+                owned_record(27205, MediaKind::Movie, Provenance::in_progress("alice")),
             )
             .await
             .unwrap();
@@ -2464,22 +2491,22 @@ mod reconcile_wanted_tests {
     #[tokio::test]
     async fn plan_multi_hash_remove_lists_all_hashes() {
         let store = mem_store();
-        // finished movie owned under TWO hashes → one Remove op listing BOTH.
+        // finished in-progress-only movie owned under TWO hashes → one Remove op listing BOTH.
         store
-            .put_wanted(wanted_movie("alice", 27205, true, false, true))
+            .put_wanted(wanted_movie("alice", 27205, false, true, true))
             .await
             .unwrap();
         store
             .put_owned(
                 "aaa".into(),
-                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+                owned_record(27205, MediaKind::Movie, Provenance::in_progress("alice")),
             )
             .await
             .unwrap();
         store
             .put_owned(
                 "bbb".into(),
-                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+                owned_record(27205, MediaKind::Movie, Provenance::in_progress("alice")),
             )
             .await
             .unwrap();
