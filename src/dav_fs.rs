@@ -282,43 +282,54 @@ impl ProxiedMediaFile {
                     "Resolve unavailable for {} — attempting instant repair",
                     self.name
                 );
-                match self.repair_manager.try_instant_repair(&self.locator).await {
-                    Ok(new_locator) => {
-                        tracing::info!(
-                            "Instant repair succeeded for {} — new torrent {}",
-                            self.name,
-                            new_locator.torrent_id
-                        );
-                        let old_locator = std::mem::replace(&mut self.locator, new_locator);
-                        self.buffer = Bytes::new();
-                        self.buffer_start = 0;
-                        self.rd_client.invalidate(&old_locator).await;
-                        match self.rd_client.resolve_url(&self.locator).await {
-                            Ok(url) => {
-                                self.cdn_url = Some(url.clone());
-                                return Ok(url);
-                            }
-                            Err(e2) => {
-                                tracing::error!(
-                                    "Failed to resolve repaired locator for {}: {}",
-                                    self.name,
-                                    e2
-                                );
-                            }
-                        }
-                    }
-                    Err(reason) => {
-                        tracing::error!(
-                            "Instant repair failed for {}: {} — file unavailable",
-                            self.name,
-                            reason
-                        );
-                    }
-                }
-                Err(FsError::GeneralFailure)
+                self.attempt_instant_repair().await
             }
             Err(e) => {
                 tracing::warn!("Resolve failed for {} (not repairing): {}", self.name, e);
+                Err(FsError::GeneralFailure)
+            }
+        }
+    }
+
+    /// Re-add the torrent by hash and, if a cached replacement is found, swap to the repaired
+    /// locator and return a fresh CDN url. Drives both the resolve-time `Unavailable` path and the
+    /// byte-fetch persistent-5xx path (a server error on the bytes means the file is broken on the
+    /// provider, not merely an expired URL). The repair state machine's cooldown / attempt cap
+    /// keeps repeated reads of the same broken file from storming re-adds.
+    async fn attempt_instant_repair(&mut self) -> Result<String, FsError> {
+        match self.repair_manager.try_instant_repair(&self.locator).await {
+            Ok(new_locator) => {
+                tracing::info!(
+                    "Instant repair succeeded for {} — new torrent {}",
+                    self.name,
+                    new_locator.torrent_id
+                );
+                let old_locator = std::mem::replace(&mut self.locator, new_locator);
+                self.buffer = Bytes::new();
+                self.buffer_start = 0;
+                self.cdn_url = None;
+                self.rd_client.invalidate(&old_locator).await;
+                match self.rd_client.resolve_url(&self.locator).await {
+                    Ok(url) => {
+                        self.cdn_url = Some(url.clone());
+                        Ok(url)
+                    }
+                    Err(e2) => {
+                        tracing::error!(
+                            "Failed to resolve repaired locator for {}: {}",
+                            self.name,
+                            e2
+                        );
+                        Err(FsError::GeneralFailure)
+                    }
+                }
+            }
+            Err(reason) => {
+                tracing::error!(
+                    "Instant repair failed for {}: {} — file unavailable",
+                    self.name,
+                    reason
+                );
                 Err(FsError::GeneralFailure)
             }
         }
@@ -369,7 +380,10 @@ impl ProxiedMediaFile {
     ///   fresh URL.  `resolve_cdn_url` will call `resolve_url`, which blocks on
     ///   the adaptive rate-limiter (up to `MAX_INTERVAL_MS` / 2 s under 429 storm).
     async fn fetch_cdn_range(&mut self, pos: u64, range_end: u64) -> Result<Bytes, FsError> {
-        for attempt in 0..2u8 {
+        // Three attempts: original url, one cheap fresh-url retry, then (only if a 5xx persisted) one
+        // post-instant-repair fetch. `repaired` caps the repair escalation at once per call.
+        let mut repaired = false;
+        for attempt in 0..3u8 {
             let cdn_url = self.resolve_cdn_url().await?;
 
             let resp = match self
@@ -430,10 +444,22 @@ impl ProxiedMediaFile {
                     self.name,
                     pos
                 );
-                // Expired URL (403/410/5xx) or a Range-ignoring 200 on a seek: drop the cached
-                // URL and resolution so the next attempt fetches a fresh one.
+                // Expired URL (403/410) or a Range-ignoring 200 on a seek: drop the cached URL and
+                // resolution so the next attempt fetches a fresh one.
                 self.cdn_url = None;
                 self.rd_client.invalidate(&self.locator).await;
+                // A persistent server error (5xx) is NOT a stale URL — the file is broken on the
+                // provider. Once a fresh-URL retry (attempt > 0) still 5xxs, escalate to instant
+                // repair (re-add by hash) ONCE, exactly like resolve-time `Unavailable`: a cached
+                // replacement fixes playback inline; otherwise the read fails (instead of the player
+                // retry-storming a 500 forever). The repair cooldown bounds re-add attempts.
+                if status.is_server_error() && attempt > 0 && !repaired {
+                    repaired = true;
+                    if self.attempt_instant_repair().await.is_ok() {
+                        continue; // fetch again against the repaired torrent's fresh url
+                    }
+                    return Err(FsError::GeneralFailure);
+                }
                 if attempt == 0 {
                     continue;
                 }
@@ -1281,5 +1307,70 @@ mod provider_abstraction_tests {
         assert_eq!(f.locator.torrent_id, "new_tid");
         // ...and the stale resolution for the old locator was invalidated.
         assert!(invalidate_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_cdn_range_persistent_5xx_escalates_to_instant_repair() {
+        // A file that resolves fine but whose CDN persistently returns 500 on the bytes is broken on
+        // the provider, not a stale URL. After the cheap fresh-URL retry still 5xxs, the byte-fetch
+        // path must escalate to instant repair (re-add by hash) — swapping the locator — rather than
+        // failing forever and letting the player retry-storm the 500.
+        use crate::provider::FileLocator;
+        use crate::rd_client::{AddMagnetResponse, TorrentFile, TorrentInfo};
+
+        // The CDN always 500s (both the original and the re-resolved/repaired URL point here).
+        let url = spawn_always_status("500 Internal Server Error").await;
+        let mock = MockProvider {
+            // resolve_url succeeds (NOT Unavailable) — we exercise the byte-fetch 5xx path.
+            resolved_url: Some(url.clone()),
+            add_magnet: Some(AddMagnetResponse {
+                id: "new_tid".to_string(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "new_tid".to_string(),
+                hash: "H".to_string(),
+                status: "downloaded".to_string(),
+                files: vec![TorrentFile {
+                    id: 5,
+                    path: "/Movie.mkv".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                }],
+                links: vec!["https://rd/newlink".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let provider: Arc<dyn DebridProvider> = Arc::new(mock);
+        let repair = Arc::new(RepairManager::new(provider.clone()));
+        let mut f = ProxiedMediaFile {
+            name: "Movie.mkv".to_string(),
+            locator: FileLocator {
+                hash: "H".to_string(),
+                torrent_id: "old_tid".to_string(),
+                file_id: 1,
+                file_path: "/Movie.mkv".to_string(),
+                link: Some("https://rd/oldlink".to_string()),
+            },
+            file_size: 1000,
+            repair_manager: repair,
+            rd_client: provider,
+            http_client: reqwest::Client::new(),
+            pos: 0,
+            cdn_url: Some(url),
+            buffer: bytes::Bytes::new(),
+            buffer_start: 0,
+            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            vfs_path: String::new(),
+        };
+
+        // The read still fails (the repaired CDN also 500s), but repair must have been attempted —
+        // proven by the locator swapping to the repaired torrent.
+        let _ = f.fetch_bytes(8).await;
+        assert_eq!(
+            f.locator.torrent_id, "new_tid",
+            "a persistent CDN 5xx on the bytes must escalate to instant repair (locator swapped)"
+        );
     }
 }

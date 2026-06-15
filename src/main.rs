@@ -281,7 +281,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         // hyper 1.x does not expose is_incomplete_message() — use string check
                         // This handles clients that disconnect mid-request (common with WebDAV)
-                        if format!("{:?}", err).contains("IncompleteMessage") {
+                        let dbg = format!("{:?}", err);
+                        if dbg.contains("IncompleteMessage") {
+                            return;
+                        }
+                        // A `User(Body)` error is our response-body stream failing (e.g. a CDN fetch
+                        // returning `GeneralFailure`). The body-producing layer (`dav_fs`) already
+                        // logs the concrete cause at WARN, so logging it again here at ERROR is just
+                        // duplicate noise — and a broken file the player retries would spam it. Demote.
+                        if dbg.contains("User(Body)") {
+                            tracing::debug!("Connection body error (cause logged upstream): {}", dbg);
                             return;
                         }
                         tracing::error!("Error serving connection: {:?}", err);
