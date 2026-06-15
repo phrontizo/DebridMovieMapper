@@ -510,7 +510,15 @@ impl AcquisitionEngine {
     async fn verify_file(&self, locator: &FileLocator, req: &AcquireRequest) -> VerifyResult {
         let url = match self.provider.resolve_url(locator).await {
             Ok(u) => u,
-            Err(_) => return VerifyResult::Defer, // can't reach it now; observe retries
+            Err(e) => {
+                // Distinguish a resolve failure (provider/requestdl) from a probe fetch failure —
+                // both defer, but only this branch means we never even got a CDN url.
+                debug!(
+                    "verify: resolve_url failed for tmdb {} hash {} (torrent_id={} file_id={}): {} — defer",
+                    req.tmdb_id, locator.hash, locator.torrent_id, locator.file_id, e
+                );
+                return VerifyResult::Defer;
+            }
         };
         let langreq = probe::LangReq {
             audio: self.prefs.audio.clone(),
@@ -526,7 +534,13 @@ impl AcquisitionEngine {
             },
             Err(ProbeError::Corrupt) => VerifyResult::Reject("Corrupt"),
             Err(ProbeError::Unsupported) | Err(ProbeError::TracksNotFound) => VerifyResult::Accept,
-            Err(ProbeError::Transient) => VerifyResult::Defer,
+            Err(ProbeError::Transient) => {
+                debug!(
+                    "verify: probe transient for tmdb {} hash {} (file_id={}) — fetched url ok but the probe window read failed; defer",
+                    req.tmdb_id, locator.hash, locator.file_id
+                );
+                VerifyResult::Defer
+            }
         }
     }
 

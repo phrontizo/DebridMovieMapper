@@ -1,4 +1,5 @@
 use crate::config::{AudioReq, SubReq};
+use tracing::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackKind {
@@ -513,11 +514,19 @@ async fn read_body(
     accept_200_from_start: bool,
 ) -> Result<Vec<u8>, ProbeError> {
     if !probe_status_ok(resp.status(), accept_200_from_start) {
+        debug!(
+            "probe: unusable response status {} (accept_200_from_start={})",
+            resp.status(),
+            accept_200_from_start
+        );
         return Err(ProbeError::Transient);
     }
     let mut resp = resp;
     let mut buf = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(|_| ProbeError::Transient)? {
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        debug!("probe: body read error: {}", e.without_url());
+        ProbeError::Transient
+    })? {
         buf.extend_from_slice(&chunk);
         if buf.len() >= want {
             buf.truncate(want);
@@ -541,7 +550,13 @@ async fn fetch_range(
         .header("Range", format!("bytes={}-{}", start, end))
         .send()
         .await
-        .map_err(|_| ProbeError::Transient)?;
+        .map_err(|e| {
+            debug!(
+                "probe: fetch send error (range {start}-{end}): {}",
+                e.without_url()
+            );
+            ProbeError::Transient
+        })?;
     let want = (end - start + 1) as usize;
     // Offset-0 (front) read: a Range-ignoring 200 streams from byte 0, which is exactly our window.
     read_body(resp, want, start == 0).await
@@ -553,7 +568,10 @@ async fn fetch_suffix(http: &reqwest::Client, url: &str, len: u64) -> Result<Vec
         .header("Range", format!("bytes=-{}", len))
         .send()
         .await
-        .map_err(|_| ProbeError::Transient)?;
+        .map_err(|e| {
+            debug!("probe: suffix fetch send error: {}", e.without_url());
+            ProbeError::Transient
+        })?;
     // A suffix read needs the TAIL; a Range-ignoring 200 gives the head → reject (206 only).
     read_body(resp, len as usize, false).await
 }

@@ -266,8 +266,10 @@ impl ProxiedMediaFile {
 
         match self.rd_client.resolve_url(&self.locator).await {
             Ok(url) => {
-                // Never log the URL itself (it's an unrestricted, sensitive CDN link).
-                tracing::debug!(
+                // Never log the URL itself (it's an unrestricted, sensitive CDN link). `trace`, not
+                // `debug` — this fires on EVERY file open (the resolution itself is cached), so a
+                // player/Jellyfin scan re-opening files would otherwise flood the debug log.
+                tracing::trace!(
                     "dav: resolved {} (hash {}) → CDN url",
                     self.name,
                     self.locator.hash
