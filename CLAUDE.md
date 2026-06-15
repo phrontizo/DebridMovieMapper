@@ -56,6 +56,7 @@ docker compose up -d
 - `SCAN_INTERVAL_SECS` (default: 60, minimum: 10) — how often to poll Real-Debrid
 - `DB_PATH` (default: `metadata.db`) — path to the redb database file
 - `PORT` (default: 8080) — WebDAV server listen port
+- `RUST_LOG` (default: `info`) — log verbosity via a `tracing-subscriber` `EnvFilter` directive (the `env-filter` feature is enabled). Unset → `info` (unchanged behaviour); a malformed directive falls back to `info` rather than crashing startup. Scope it to this crate to avoid dependency noise, e.g. `RUST_LOG=debridmoviemapper=debug`, or target one module: `RUST_LOG=debridmoviemapper::acquire=debug,info`. Takes effect on (re)start.
 - `JELLYFIN_URL` — Jellyfin server URL (e.g. `http://jellyfin:8096`)
 - `JELLYFIN_API_KEY` — Jellyfin API key
 - `JELLYFIN_RCLONE_MOUNT_PATH` — rclone mount path as seen by Jellyfin (e.g. `/media`)

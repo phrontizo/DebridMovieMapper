@@ -14,7 +14,9 @@ dav-server = { version = "0.11", default-features = false }
 futures-util = "0.3"
 regex = "1"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+# `env-filter` lets the log level be set at runtime via RUST_LOG (e.g. RUST_LOG=debridmoviemapper=debug);
+# without it `fmt::init()` is pinned to INFO. Pulls in `matchers` (tiny); `regex` is already a dependency.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Only the server + HTTP/1 stack is used (see src/main.rs); `body`/`service`/`Request`/`Response`
 # are core and need no feature. hyper-util is used solely for `rt::TokioIo` (the `tokio` feature).
 hyper = { version = "1", features = ["server", "http1"] }

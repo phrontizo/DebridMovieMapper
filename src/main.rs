@@ -21,6 +21,16 @@ use tracing::info;
 
 const MAX_CONNECTIONS: usize = 256;
 
+/// The log-filter directive: `RUST_LOG` when set to something non-empty, else `info` (the prior
+/// default, so logging is unchanged when the var is unset). Parsing/validation of the directive is
+/// left to `EnvFilter` at the call site (a malformed value falls back to `info`).
+fn log_directive(rust_log: Option<String>) -> String {
+    rust_log
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "info".to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env FIRST so the healthcheck resolves PORT identically to the server (which loads
@@ -46,7 +56,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(if ok { 0 } else { 1 });
     }
 
-    tracing_subscriber::fmt::init();
+    // Honour RUST_LOG (e.g. `RUST_LOG=debridmoviemapper=debug`); default to INFO when unset so
+    // behaviour is unchanged. A malformed directive falls back to INFO rather than crashing startup.
+    let directive = log_directive(std::env::var("RUST_LOG").ok());
+    let filter = tracing_subscriber::EnvFilter::try_new(&directive)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let config = Config::from_env().unwrap_or_else(|e| {
         eprintln!("Configuration error: {}", e);
@@ -288,4 +303,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Shutdown complete.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_directive;
+
+    #[test]
+    fn log_directive_defaults_to_info_and_honours_rust_log() {
+        // Unset / blank → the prior INFO default (behaviour unchanged when RUST_LOG isn't set).
+        assert_eq!(log_directive(None), "info");
+        assert_eq!(log_directive(Some(String::new())), "info");
+        assert_eq!(log_directive(Some("   ".into())), "info");
+        // Set → used verbatim (trimmed), so a scoped or plain directive both work.
+        assert_eq!(log_directive(Some("debug".into())), "debug");
+        assert_eq!(
+            log_directive(Some("  debridmoviemapper=debug  ".into())),
+            "debridmoviemapper=debug"
+        );
+    }
+
+    #[test]
+    fn log_directive_is_a_valid_env_filter() {
+        // The default and a scoped directive must both parse as EnvFilter (no startup crash).
+        for d in [
+            "info",
+            "debridmoviemapper=debug",
+            "debridmoviemapper::acquire=debug,info",
+        ] {
+            assert!(tracing_subscriber::EnvFilter::try_new(d).is_ok(), "{d}");
+        }
+    }
 }

@@ -50,6 +50,7 @@ TMDB_API_KEY=your_tmdb_api_key
 SCAN_INTERVAL_SECS=60       # How often to scan for new torrents (default: 60, minimum: 10)
 DB_PATH=metadata.db         # Path to the redb database file (default: metadata.db)
 PORT=8080                   # WebDAV server listen port (default: 8080)
+RUST_LOG=info               # Log verbosity (default: info). e.g. RUST_LOG=debridmoviemapper=debug
 
 # Optional: Jellyfin integration (all three required to enable)
 JELLYFIN_URL=http://jellyfin:8096
@@ -92,6 +93,7 @@ A debrid provider token is required: set **exactly one** of `RD_API_TOKEN` or `T
 | `SCAN_INTERVAL_SECS`         | No       | 60             | Interval between torrent library scans in seconds (minimum: 10, runs immediately on startup) |
 | `DB_PATH`                    | No       | `metadata.db`  | Path to the redb database file. If the file is unreadable, corrupt, or from an incompatible schema version, it is automatically moved to `<DB_PATH>.corrupt` and recreated — upgrades never crash-loop. |
 | `PORT`                       | No       | 8080           | WebDAV server listen port                                            |
+| `RUST_LOG`                   | No       | `info`         | Log verbosity (`tracing-subscriber` `EnvFilter` directive). Scope it to avoid dependency noise, e.g. `debridmoviemapper=debug`, or target a module: `debridmoviemapper::acquire=debug,info`. A malformed value falls back to `info`. Takes effect on (re)start. |
 | `JELLYFIN_URL`               | No       | -              | Jellyfin server URL for library update notifications                 |
 | `JELLYFIN_API_KEY`           | No       | -              | Jellyfin API key for authentication                                  |
 | `JELLYFIN_RCLONE_MOUNT_PATH` | No       | -              | rclone mount path as seen by Jellyfin (e.g. `/media`)                |
