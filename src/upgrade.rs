@@ -10,7 +10,7 @@ use crate::scraper::MediaKind;
 use crate::store::{movie_slot, OwnedRecord, OwnedStatus};
 use crate::vfs::MediaType;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -68,12 +68,14 @@ pub async fn run_upgrade_once(app: &AppState) {
         match media_type {
             MediaType::Movie => {
                 if let Err(e) = try_upgrade_movie(app, tmdb_id, &hashes, &rec, idle_window).await {
-                    warn!("upgrade: tmdb {} skipped: {}", tmdb_id, e);
+                    // "no meaningful upgrade" is the normal outcome for most titles, so this is a
+                    // debug detail, not a warning — keeps the default-level log clean.
+                    debug!("upgrade: tmdb {} skipped: {}", tmdb_id, e);
                 }
             }
             MediaType::Show => {
                 if let Err(e) = try_consolidate_show(app, tmdb_id, &hashes, idle_window).await {
-                    warn!("consolidate: tmdb {} skipped: {}", tmdb_id, e);
+                    debug!("consolidate: tmdb {} skipped: {}", tmdb_id, e);
                 }
             }
         }

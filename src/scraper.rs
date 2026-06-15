@@ -4,6 +4,7 @@ use crate::release::RawCandidate;
 use async_trait::async_trait;
 use regex::Regex;
 use std::sync::LazyLock;
+use tracing::debug;
 
 /// Movie vs series — the two Stremio stream endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -207,6 +208,10 @@ impl Scraper for TorrentioScraper {
         // retriable addon error — surface it so the engine treats it as TemporarilyUnavailable
         // rather than silently seeing zero candidates.
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            debug!(
+                "scrape: {} {:?} s={:?} e={:?} → 404 (no streams)",
+                imdb_id, kind, season, episode
+            );
             return Ok(Vec::new());
         }
         let resp = resp
@@ -216,7 +221,17 @@ impl Scraper for TorrentioScraper {
             .json()
             .await
             .map_err(|e| AppError::Http(e.without_url()))?;
-        Ok(parse_streams(&v))
+        let cands = parse_streams(&v);
+        // NB: never log the URL/base_url — it embeds the provider token in its path.
+        debug!(
+            "scrape: {} {:?} s={:?} e={:?} → {} candidates",
+            imdb_id,
+            kind,
+            season,
+            episode,
+            cands.len()
+        );
+        Ok(cands)
     }
 }
 

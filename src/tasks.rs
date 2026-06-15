@@ -587,6 +587,13 @@ async fn sync_trakt_user(
 
     // Build the user's new wanted-set and write it: prune rows no longer wanted, then upsert.
     let new = build_wanted(slug, &watchlist, &in_progress, &watched, &statuses);
+    debug!(
+        "trakt: {} — watchlist={} in_progress={} → {} wanted titles",
+        slug,
+        watchlist.len(),
+        in_progress.len(),
+        new.len()
+    );
     // Prune rows no longer wanted, keyed by (media_type, tmdb_id) so a movie and a show that share
     // a numeric id are tracked independently.
     let existing: Vec<(MediaType, u64)> = store
@@ -997,6 +1004,19 @@ pub async fn reconcile_wanted(
         }
     };
     let ops = plan_reconcile_ops(store, &torrents).await;
+    if !ops.is_empty() {
+        let acquires = ops
+            .iter()
+            .filter(|o| matches!(o, ReconcileOp::Acquire { .. }))
+            .count();
+        debug!(
+            "reconcile: planned {} op(s) — {} acquire, {} remove (over {} provider torrents)",
+            ops.len(),
+            acquires,
+            ops.len() - acquires,
+            torrents.len()
+        );
+    }
     for op in ops {
         match op {
             ReconcileOp::Remove { tmdb_id, hashes } => {

@@ -266,6 +266,12 @@ impl ProxiedMediaFile {
 
         match self.rd_client.resolve_url(&self.locator).await {
             Ok(url) => {
+                // Never log the URL itself (it's an unrestricted, sensitive CDN link).
+                tracing::debug!(
+                    "dav: resolved {} (hash {}) → CDN url",
+                    self.name,
+                    self.locator.hash
+                );
                 self.cdn_url = Some(url.clone());
                 Ok(url)
             }

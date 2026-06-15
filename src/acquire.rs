@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcquireOutcome {
@@ -120,6 +120,23 @@ fn tmdb_to_u64(m: &crate::vfs::MediaMetadata) -> Option<u64> {
         .as_deref()
         .and_then(|s| s.strip_prefix("tmdb:"))
         .and_then(|s| s.parse::<u64>().ok())
+}
+
+/// One-line summary of a ranked candidate for debug logs (short hash + the ranking-relevant
+/// signals). Contains no token/URL — safe to log.
+fn release_summary(r: &ReleaseInfo) -> String {
+    let short = r.info_hash.get(..8).unwrap_or(r.info_hash.as_str());
+    format!(
+        "{short}({} {} {:?} s={})",
+        if r.cached { "cached" } else { "uncached" },
+        r.resolution
+            .map(|p| format!("{p}p"))
+            .unwrap_or_else(|| "?".into()),
+        r.source,
+        r.seeders
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "?".into()),
+    )
 }
 
 pub struct AcquisitionEngine {
@@ -332,7 +349,14 @@ impl AcquisitionEngine {
                 return AcquireOutcome::TemporarilyUnavailable;
             }
         };
+        debug!(
+            "acquire: tmdb {} ({}) — scraped {} candidates",
+            req.tmdb_id,
+            req.imdb_id,
+            candidates.len()
+        );
         let mut parsed: Vec<ReleaseInfo> = Vec::new();
+        let mut blacklisted = 0usize;
         for c in &candidates {
             let r = release::parse(c);
             if self
@@ -340,11 +364,24 @@ impl AcquisitionEngine {
                 .is_blacklisted(req.tmdb_id, r.info_hash.clone())
                 .await
             {
+                blacklisted += 1;
                 continue;
             }
             parsed.push(r);
         }
         let ranked = release::rank(parsed, &self.prefs);
+        debug!(
+            "acquire: tmdb {} — {} ranked after filters ({} blacklisted); top: [{}]",
+            req.tmdb_id,
+            ranked.len(),
+            blacklisted,
+            ranked
+                .iter()
+                .take(3)
+                .map(release_summary)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
         // Live provider listing (lazily fetched once, only when an owned candidate is hit). Outer
         // Option = "fetched?", inner = "fetch succeeded?". Used to distinguish "already acquired"
@@ -369,9 +406,22 @@ impl AcquisitionEngine {
                     None => false,
                 };
                 if !confirmed_absent {
+                    debug!(
+                        "acquire: tmdb {} — {} already owned + present (idempotent, no re-add)",
+                        req.tmdb_id, cand.info_hash
+                    );
                     return AcquireOutcome::Acquired(cand.info_hash.clone());
                 }
+                debug!(
+                    "acquire: tmdb {} — owned {} is absent (lapsed) — re-adding",
+                    req.tmdb_id, cand.info_hash
+                );
             }
+            debug!(
+                "acquire: tmdb {} — adding {}",
+                req.tmdb_id,
+                release_summary(&cand)
+            );
             let magnet = format!("magnet:?xt=urn:btih:{}", cand.info_hash);
             let added = match self.provider.add_magnet(&magnet).await {
                 Ok(a) => a,
@@ -421,6 +471,11 @@ impl AcquisitionEngine {
             }
             return AcquireOutcome::Pending(cand.info_hash);
         }
+        debug!(
+            "acquire: tmdb {} — no acceptable release ({} scraped, none passed filters/attempts)",
+            req.tmdb_id,
+            candidates.len()
+        );
         AcquireOutcome::NoAcceptableRelease
     }
 
@@ -548,17 +603,23 @@ impl AcquisitionEngine {
             let Some(t) = by_hash.get(hash.as_str()).copied() else {
                 // Not in the listing. A Pending torrent that never registered/resolved is dead
                 // once it has been waiting longer than the dead-timeout.
-                if rec.status == OwnedStatus::Pending
-                    && now_secs().saturating_sub(rec.added_at) > self.dead_timeout.as_secs()
-                {
-                    self.fail_and_reacquire(
-                        hash,
-                        "",
-                        &rec.request,
-                        "NeverResolved",
-                        &rec.provenance,
-                    )
-                    .await;
+                if rec.status == OwnedStatus::Pending {
+                    let age = now_secs().saturating_sub(rec.added_at);
+                    if age > self.dead_timeout.as_secs() {
+                        self.fail_and_reacquire(
+                            hash,
+                            "",
+                            &rec.request,
+                            "NeverResolved",
+                            &rec.provenance,
+                        )
+                        .await;
+                    } else {
+                        debug!(
+                            "observe: tmdb {} hash {} absent from listing ({}s/{}s before reap) — waiting",
+                            rec.request.tmdb_id, hash, age, self.dead_timeout.as_secs()
+                        );
+                    }
                 }
                 continue;
             };
@@ -566,6 +627,10 @@ impl AcquisitionEngine {
                 t.status.as_str(),
                 "magnet_error" | "dead" | "error" | "virus"
             ) {
+                debug!(
+                    "observe: tmdb {} hash {} provider status={:?} — dead",
+                    rec.request.tmdb_id, hash, t.status
+                );
                 self.fail_and_reacquire(hash, &t.id, &rec.request, "Dead", &rec.provenance)
                     .await;
                 continue;
@@ -577,14 +642,21 @@ impl AcquisitionEngine {
             // Pending: fetch info to inspect files.
             let info = match self.provider.get_torrent_info(&t.id).await {
                 Ok(i) => i,
-                Err(_) => continue,
+                Err(e) => {
+                    debug!(
+                        "observe: hash {} get_torrent_info({}) failed: {} — retry next tick",
+                        hash, t.id, e
+                    );
+                    continue;
+                }
             };
             let has_files = info
                 .files
                 .iter()
                 .any(|f| crate::vfs::is_video_file(&f.path));
             if !has_files {
-                if now_secs().saturating_sub(rec.added_at) > self.dead_timeout.as_secs() {
+                let age = now_secs().saturating_sub(rec.added_at);
+                if age > self.dead_timeout.as_secs() {
                     self.fail_and_reacquire(
                         hash,
                         &t.id,
@@ -593,6 +665,13 @@ impl AcquisitionEngine {
                         &rec.provenance,
                     )
                     .await;
+                } else {
+                    debug!(
+                        "observe: hash {} no video files yet ({}s/{}s before reap) — waiting",
+                        hash,
+                        age,
+                        self.dead_timeout.as_secs()
+                    );
                 }
                 continue;
             }
@@ -601,6 +680,11 @@ impl AcquisitionEngine {
             if none_selected {
                 // No candidate hint preserved in OwnedRecord; use the kind-appropriate fallback (largest video for movies, all videos for series).
                 let ids = select_ids_for(rec.request.kind, &info, None, None);
+                debug!(
+                    "observe: hash {} nothing selected yet — selecting {} file(s)",
+                    hash,
+                    ids.len()
+                );
                 if !ids.is_empty() {
                     let csv = ids
                         .iter()
@@ -657,6 +741,11 @@ impl AcquisitionEngine {
                         &rec.provenance,
                     )
                     .await;
+                } else {
+                    debug!(
+                        "observe: tmdb {} hash {} target file (s={:?} e={:?}) not present yet — waiting",
+                        rec.request.tmdb_id, hash, rec.request.season, rec.request.episode
+                    );
                 }
                 continue;
             };
@@ -668,6 +757,11 @@ impl AcquisitionEngine {
                 if self.is_stalled(&t.id, t.progress).await {
                     self.fail_and_reacquire(hash, &t.id, &rec.request, "Stalled", &rec.provenance)
                         .await;
+                } else {
+                    debug!(
+                        "observe: tmdb {} hash {} downloading (status={:?}, progress={:.0}%) — waiting",
+                        rec.request.tmdb_id, hash, t.status, t.progress
+                    );
                 }
                 continue;
             }
@@ -691,6 +785,12 @@ impl AcquisitionEngine {
                     continue;
                 }
                 if defer_state.is_some_and(|st| st.last_probe.elapsed() < VERIFY_BACKOFF) {
+                    debug!(
+                        "observe: tmdb {} hash {} probe still deferring (attempts={}) — backing off",
+                        rec.request.tmdb_id,
+                        hash,
+                        defer_state.map(|s| s.attempts).unwrap_or(0)
+                    );
                     continue; // within the back-off window — wait before re-probing
                 }
             }
@@ -718,6 +818,10 @@ impl AcquisitionEngine {
             let locator = locator_for(&info, hash, &selected_path);
             match self.verify_file(&locator, &rec.request).await {
                 VerifyResult::Pass | VerifyResult::Accept => {
+                    info!(
+                        "observe: tmdb {} hash {} verified ({}) — recording selection",
+                        rec.request.tmdb_id, hash, file_name
+                    );
                     self.record_verified(hash, &rec.request, &info, &selected_path)
                         .await;
                     self.verify_attempts.lock().await.remove(hash);
@@ -736,6 +840,12 @@ impl AcquisitionEngine {
                     });
                     st.attempts += 1;
                     st.last_probe = Instant::now();
+                    let attempts = st.attempts;
+                    drop(m);
+                    debug!(
+                        "observe: tmdb {} hash {} probe deferred (attempt {}) — CDN transient, will re-probe",
+                        rec.request.tmdb_id, hash, attempts
+                    );
                 }
                 VerifyResult::Reject(reason) => {
                     self.fail_and_reacquire(hash, &t.id, &rec.request, reason, &rec.provenance)
