@@ -260,11 +260,18 @@ fn find_ebml_child(
                 .checked_add(size as usize)
                 .ok_or(ProbeError::Corrupt)?
         };
+        if id == target_id {
+            // A matched container legitimately extends past the fetched window — the top-level MKV
+            // Segment declares the size of the WHOLE (multi-GB) file, far beyond our 4 MB front
+            // read. That is NOT a truncated read: return it capped to what we have and let the
+            // caller scan its children within the buffer. (Checking this before the overrun guard
+            // below is the fix for the probe deferring on every large MKV.)
+            return Ok(Some((payload_start, payload_end.min(buf.len()))));
+        }
+        // Not the target: reaching the next sibling means skipping this whole element. If it runs
+        // past the fetched buffer we genuinely can't — a truncated read (defer) or a broken size.
         if payload_end > end {
             return Err(overrun_error(payload_end, buf.len()));
-        }
-        if id == target_id {
-            return Ok(Some((payload_start, payload_end)));
         }
         pos = payload_end;
     }
@@ -618,6 +625,15 @@ mod tests {
         out.extend_from_slice(payload);
         out
     }
+    fn ebml_elem_sized(id: u32, declared_size: u64, payload: &[u8]) -> Vec<u8> {
+        // Like `ebml_elem` but stamps an explicit (here: deliberately oversized) data size rather
+        // than the payload's real length — models a top-level Segment whose size spans the whole
+        // multi-GB file, far beyond the bytes actually fetched into the front window.
+        let mut out = id_bytes(id);
+        out.extend(vint(declared_size));
+        out.extend_from_slice(payload);
+        out
+    }
     fn mkv_with(audio_lang: &str, sub_lang: Option<&str>) -> Vec<u8> {
         let mut audio = Vec::new();
         audio.extend(ebml_elem(0x83, &[2]));
@@ -686,6 +702,32 @@ mod tests {
         assert!(tracks
             .iter()
             .any(|t| t.kind == TrackKind::Subtitle && t.language.as_deref() == Some("fre")));
+    }
+    #[test]
+    fn mkv_known_size_segment_larger_than_buffer_parses() {
+        // Regression: a real MKV's top-level Segment declares the size of the WHOLE (multi-GB)
+        // file, which dwarfs our 4 MB front read — yet the Tracks header still sits inside the
+        // fetched window. The parser must NOT mistake the oversized Segment for a truncated read
+        // (`Transient`); it must cap the Segment to the buffer and find Tracks within it. Before
+        // the fix this deferred essentially every large MKV (the overrun guard fired on the
+        // Segment itself, before the id match).
+        let mut audio = Vec::new();
+        audio.extend(ebml_elem(0x83, &[2]));
+        audio.extend(ebml_elem(0x22B59C, b"eng"));
+        let tracks = ebml_elem(0xAE, &audio);
+        let tracks_elem = ebml_elem(0x1654AE6B, &tracks);
+        // Segment claims ~8 GB — orders of magnitude beyond the bytes actually present.
+        let segment = ebml_elem_sized(0x18538067, 8_000_000_000, &tracks_elem);
+        let mut bytes = ebml_elem(0x1A45DFA3, &[]);
+        bytes.extend(segment);
+
+        let parsed = parse_mkv_tracks(&bytes).expect("oversized-Segment MKV must parse, not defer");
+        assert!(
+            parsed
+                .iter()
+                .any(|t| t.kind == TrackKind::Audio && t.language.as_deref() == Some("eng")),
+            "expected the in-window audio track to be parsed from the oversized-Segment MKV"
+        );
     }
     #[test]
     fn mkv_truncated_is_transient() {
