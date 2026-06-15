@@ -588,11 +588,20 @@ async fn sync_trakt_user(
     // Build the user's new wanted-set and write it: prune rows no longer wanted, then upsert.
     let new = build_wanted(slug, &watchlist, &in_progress, &watched, &statuses);
     debug!(
-        "trakt: {} — watchlist={} in_progress={} → {} wanted titles",
+        "trakt: {} — watchlist={} in_progress={} → {} wanted titles; in_progress=[{}]; wanted_shows={:?}",
         slug,
         watchlist.len(),
         in_progress.len(),
-        new.len()
+        new.len(),
+        in_progress
+            .iter()
+            .map(|i| format!("{:?}:{}", i.media_type, i.tmdb_id))
+            .collect::<Vec<_>>()
+            .join(", "),
+        new.iter()
+            .filter(|r| r.media_type == MediaType::Show)
+            .map(|r| r.tmdb_id)
+            .collect::<Vec<_>>()
     );
     // Prune rows no longer wanted, keyed by (media_type, tmdb_id) so a movie and a show that share
     // a numeric id are tracked independently.
@@ -1187,6 +1196,15 @@ pub async fn monitor_episodes(
 
     // Only Show titles. (Owned-but-unwanted shows are handled by reconcile_wanted's Trigger-B path;
     // monitor_episodes is the wanted-set's air-date driver.)
+    let show_count = wanted_by
+        .keys()
+        .filter(|(mt, _)| *mt == MediaType::Show)
+        .count();
+    debug!(
+        "monitor_episodes: {} wanted show(s) to check (of {} wanted titles)",
+        show_count,
+        wanted_by.len()
+    );
     for ((media_type, tmdb_id), wanted) in &wanted_by {
         if *media_type != MediaType::Show {
             continue;
@@ -1199,6 +1217,8 @@ pub async fn monitor_episodes(
 
         let aired = aired_episodes(tmdb, tmdb_id, today).await;
         let aired_complete = aired.complete;
+        let aired_count = aired.pairs.len();
+        let owned_eps = owned_group.map(|g| g.owned_episodes.len()).unwrap_or(0);
 
         let view = TitleView {
             tmdb_id,
@@ -1216,6 +1236,20 @@ pub async fn monitor_episodes(
         // Guard: a TMDB hiccup that left the aired set partial/empty must not delete a still-wanted
         // show (an empty `aired` makes Trigger A's "all aired watched" clause vacuously true).
         let actions = guard_removal_on_incomplete_aired(reconcile_title(&view), aired_complete);
+        let acquires = actions
+            .iter()
+            .filter(|a| matches!(a, Action::AcquireEpisode { .. }))
+            .count();
+        debug!(
+            "monitor_episodes: tmdb {} — aired={} (complete={}), owned_eps={}, available={} → {} episode acquire(s), {} remove(s)",
+            tmdb_id,
+            aired_count,
+            aired_complete,
+            owned_eps,
+            available,
+            acquires,
+            actions.len() - acquires
+        );
         for action in actions {
             match action {
                 Action::AcquireEpisode {
