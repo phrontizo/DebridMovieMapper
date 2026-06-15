@@ -136,8 +136,9 @@ pub struct AcquisitionEngine {
     dead_timeout: Duration,
     /// torrent_id -> (last progress, when first seen at that progress) for stall detection.
     progress: Arc<Mutex<HashMap<String, (f64, Instant)>>>,
-    /// hash -> consecutive deferred-probe count, to bound re-probing of stuck-Pending torrents.
-    verify_attempts: Arc<Mutex<HashMap<String, u32>>>,
+    /// hash -> deferred-probe state (count + last-probe time): bounds the initial fast re-probe
+    /// burst then backs off. A transient-deferring probe is never accepted unverified.
+    verify_attempts: Arc<Mutex<HashMap<String, DeferState>>>,
 }
 
 /// The single target media file for a candidate: the addon's named/index file, else the largest
@@ -260,9 +261,31 @@ pub enum VerifyResult {
     Defer,
 }
 
-/// Max consecutive deferred probes for a downloaded-but-Pending torrent before `observe`
-/// stops re-probing it and accepts it unverified (bounds transient-CDN probe retries).
+/// Number of consecutive deferred (transient-CDN) probes for a downloaded-but-Pending torrent
+/// before `observe` stops re-probing it every scan tick and switches to the `VERIFY_BACKOFF`
+/// cadence. The release is NEVER accepted unverified — accepting could freeze a wrong-language
+/// release into the library; see the `VerifyResult::Defer` arm in `observe`.
 const MAX_VERIFY_ATTEMPTS: u32 = 5;
+
+/// Back-off between deferred re-probes once the initial fast burst (`MAX_VERIFY_ATTEMPTS`) is
+/// spent, so a momentarily-unprobeable torrent isn't re-fetched (4 MB CDN read) every scan tick.
+const VERIFY_BACKOFF: Duration = Duration::from_secs(3600);
+
+/// Hard ceiling (anchored on the persisted `added_at`) on how long a downloaded-but-unprobeable
+/// torrent may stay Pending before `observe` treats it as effectively broken and replaces it
+/// (blacklist + re-acquire). Long enough to ride out an extended provider/CDN outage without
+/// churning good releases, short enough that a genuinely-dead release is eventually swapped out.
+const VERIFY_DEADLINE_SECS: u64 = 24 * 3600;
+
+/// Per-hash deferred-probe state for transient (CDN-unavailable) probes: how many times we've
+/// probed-and-deferred (to bound the fast burst) and when we last probed (to back off afterwards).
+/// In-memory only — reset on restart; the hard deadline is anchored on the persisted `added_at`,
+/// so a restart can't extend a release's grace period without bound.
+#[derive(Clone, Copy)]
+struct DeferState {
+    attempts: u32,
+    last_probe: Instant,
+}
 
 impl AcquisitionEngine {
     #[allow(clippy::too_many_arguments)]
@@ -648,6 +671,29 @@ impl AcquisitionEngine {
                 }
                 continue;
             }
+            // Deferred-probe back-off + hard deadline. A downloaded torrent whose probe keeps
+            // coming back Transient (CDN momentarily unavailable) is re-probed every tick for the
+            // first MAX_VERIFY_ATTEMPTS (to catch a quick blip), then only on a back-off (so we
+            // don't re-fetch 4 MB every tick). It is NEVER accepted unverified; if it stays
+            // unfetchable past the deadline it is treated as effectively broken and replaced
+            // (blacklist + re-acquire), bounded by the blacklist so it can't churn.
+            let defer_state = self.verify_attempts.lock().await.get(hash).copied();
+            if defer_state.is_some_and(|st| st.attempts >= MAX_VERIFY_ATTEMPTS) {
+                if now_secs().saturating_sub(rec.added_at) > VERIFY_DEADLINE_SECS {
+                    self.fail_and_reacquire(
+                        hash,
+                        &t.id,
+                        &rec.request,
+                        "ProbeUnfetchable",
+                        &rec.provenance,
+                    )
+                    .await;
+                    continue;
+                }
+                if defer_state.is_some_and(|st| st.last_probe.elapsed() < VERIFY_BACKOFF) {
+                    continue; // within the back-off window — wait before re-probing
+                }
+            }
             // Downloaded → validate the title, then probe and finalise.
             let file_name = selected_path
                 .rsplit('/')
@@ -678,20 +724,18 @@ impl AcquisitionEngine {
                     self.progress.lock().await.remove(&t.id);
                 }
                 VerifyResult::Defer => {
-                    let n = {
-                        let mut m = self.verify_attempts.lock().await;
-                        let n = m.entry(hash.to_string()).or_insert(0);
-                        *n += 1;
-                        *n
-                    };
-                    if n >= MAX_VERIFY_ATTEMPTS {
-                        warn!(
-                            "giving up verifying {} after {} deferred probes; accepting unverified",
-                            hash, n
-                        );
-                        self.record_verified(hash, &rec.request, &info, &selected_path)
-                            .await;
-                    }
+                    // Record the deferred attempt + when we probed (drives the back-off/deadline
+                    // gate above). Crucially we do NOT accept-unverified: the record stays Pending
+                    // (so the upgrade engine's Verified gate skips it and the VFS keeps the prior
+                    // selection), is re-probed on the back-off, and is replaced only past the
+                    // deadline. This prevents freezing a wrong-language release into the library.
+                    let mut m = self.verify_attempts.lock().await;
+                    let st = m.entry(hash.to_string()).or_insert(DeferState {
+                        attempts: 0,
+                        last_probe: Instant::now(),
+                    });
+                    st.attempts += 1;
+                    st.last_probe = Instant::now();
                 }
                 VerifyResult::Reject(reason) => {
                     self.fail_and_reacquire(hash, &t.id, &rec.request, reason, &rec.provenance)
@@ -1053,14 +1097,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observe_caps_deferred_probes_and_accepts() {
+    async fn observe_deferred_probes_never_accept_unverified() {
+        // A recently-added torrent whose probe keeps deferring (CDN momentarily unavailable) must
+        // NEVER be marked Verified — accepting it could freeze a wrong-language release into the
+        // library. Within the deadline it stays Pending (re-probed on a back-off), full stop.
         let st = store();
         st.put_owned(
             "h1".into(),
             OwnedRecord {
                 request: req(),
                 provenance: Provenance::manual(),
-                added_at: 1,
+                added_at: now_secs(), // recent ⇒ well within the verify deadline
                 status: OwnedStatus::Pending,
                 provides: vec![],
                 quality: None,
@@ -1068,29 +1115,68 @@ mod tests {
         )
         .await
         .unwrap();
-        let scraper = Arc::new(MockScraper { candidates: vec![] });
         let prober = Arc::new(CannedProber(Err(ProbeError::Transient))); // always defers
         let eng = engine(
             provider_returning("downloaded", "h1"),
-            scraper,
+            Arc::new(MockScraper { candidates: vec![] }),
             Arc::new(OkValidator(true)),
             prober,
             st.clone(),
         );
-        let torrents = vec![crate::rd_client::Torrent {
-            id: "tid_h1".into(),
-            hash: "h1".into(),
-            status: "downloaded".into(),
-            progress: 100.0,
-            ..Default::default()
-        }];
-        for _ in 0..MAX_VERIFY_ATTEMPTS {
+        let torrents = vec![torrent("tid_h1", "h1", "downloaded", 100.0)];
+        for _ in 0..(MAX_VERIFY_ATTEMPTS + 5) {
             eng.observe(&torrents).await;
         }
+        let rec = st.get_owned("h1".into()).await.expect("still owned");
         assert_eq!(
-            st.get_owned("h1".into()).await.unwrap().status,
-            OwnedStatus::Verified,
-            "should accept unverified after MAX deferred probes"
+            rec.status,
+            OwnedStatus::Pending,
+            "a perpetually-deferring probe must stay Pending, never accepted unverified"
+        );
+        assert!(
+            !st.is_blacklisted(27205, "h1".into()).await,
+            "and not yet replaced — it is still within the verify deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_unfetchable_past_deadline_replaces() {
+        // A torrent whose probe has been deferring since long before the verify deadline is treated
+        // as effectively broken: blacklisted + re-acquired (not accepted, not left forever).
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: 1, // epoch ⇒ far past the verify deadline
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let prober = Arc::new(CannedProber(Err(ProbeError::Transient))); // always defers
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }), // no replacement ⇒ hash blacklisted, record removed
+            Arc::new(OkValidator(true)),
+            prober,
+            st.clone(),
+        );
+        let torrents = vec![torrent("tid_h1", "h1", "downloaded", 100.0)];
+        // Fast burst first (probes every tick while attempts < MAX), then the deadline fires.
+        for _ in 0..(MAX_VERIFY_ATTEMPTS + 1) {
+            eng.observe(&torrents).await;
+        }
+        assert!(
+            st.is_blacklisted(27205, "h1".into()).await,
+            "an unfetchable release past the deadline should be blacklisted"
+        );
+        assert!(
+            st.get_owned("h1".into()).await.is_none(),
+            "and its owned record replaced (removed pending re-acquire)"
         );
     }
 
