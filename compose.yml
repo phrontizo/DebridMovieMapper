@@ -37,6 +37,9 @@ services:
       # acquires (driven by Trakt sync below). An empty value = the documented default.
       # Override the scraper addon; default auto-templates Torrentio from the provider token.
       - SCRAPER_ADDON_URL=${SCRAPER_ADDON_URL:-}
+      # Route the SCRAPER's traffic (Torrentio/addon) through an HTTP(S) proxy, e.g.
+      # http://[user:pass@]host:port. Applies only to the scraper — not the CDN/TMDB/provider.
+      - SCRAPER_PROXY_URL=${SCRAPER_PROXY_URL:-}
       # Hard resolution ceiling: 720 | 1080 | 2160/4k (default 1080).
       - MAX_RESOLUTION=${MAX_RESOLUTION:-}
       # Required audio language: ISO code, or "original" = the title's original language (default original).

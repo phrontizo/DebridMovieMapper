@@ -12,6 +12,38 @@ pub enum MediaKind {
     Series,
 }
 
+/// Build the HTTP client used by the scraper. When `proxy_url` is `Some`, ALL of the scraper's
+/// requests (HTTP and HTTPS — HTTPS via the proxy's CONNECT tunnel) are routed through that
+/// HTTP(S) proxy, so only the scraper's Torrentio/addon traffic is proxied — never the debrid CDN
+/// media reads, TMDB, or the provider APIs, which keep their own direct clients. A set-but-invalid
+/// proxy URL is a hard error: we never silently fall back to a direct connection (that would leak
+/// the real IP, defeating the proxy). The error message deliberately omits the URL value, which may
+/// carry `user:pass@` credentials.
+///
+/// Only http(s) proxy schemes are supported (no `socks` reqwest feature is enabled). The scheme is
+/// validated here rather than relying on `reqwest::Proxy::all`, which is lenient enough to accept a
+/// malformed value at construction and only fail at request time — we want a misconfigured proxy to
+/// fail FAST at startup with a clear message, not silently fail every scrape later.
+pub fn build_http_client(proxy_url: Option<&str>) -> Result<reqwest::Client, AppError> {
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
+    if let Some(url) = proxy_url {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            // Deliberately omit the value (it may carry `user:pass@` credentials).
+            return Err(AppError::Config(
+                "SCRAPER_PROXY_URL must be an http(s) proxy URL like \
+                 http://[user:pass@]host:port (socks is not supported)"
+                    .to_string(),
+            ));
+        }
+        let proxy = reqwest::Proxy::all(url)
+            .map_err(|_| AppError::Config("Invalid SCRAPER_PROXY_URL".to_string()))?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|e| AppError::Config(format!("Failed to build scraper HTTP client: {}", e)))
+}
+
 /// Abstraction over a Stremio-addon scraper. `TorrentioScraper` is the default impl.
 #[async_trait]
 pub trait Scraper: Send + Sync {
@@ -216,6 +248,38 @@ mod tests {
     fn templates_realdebrid_url_from_provider_and_token() {
         let base = TorrentioScraper::build_base_url(None, ProviderKind::RealDebrid, "TOKEN123");
         assert_eq!(base, "https://torrentio.strem.fun/realdebrid=TOKEN123");
+    }
+
+    #[test]
+    fn build_http_client_without_proxy_succeeds() {
+        assert!(build_http_client(None).is_ok());
+    }
+
+    #[test]
+    fn build_http_client_with_valid_http_and_https_proxy_succeeds() {
+        // An HTTP proxy URL (HTTPS targets tunnel through it via CONNECT), with and without creds.
+        assert!(build_http_client(Some("http://127.0.0.1:8888")).is_ok());
+        assert!(build_http_client(Some("https://proxy.example:3128")).is_ok());
+        assert!(build_http_client(Some("http://user:pass@proxy.example:8080")).is_ok());
+    }
+
+    #[test]
+    fn build_http_client_rejects_unsupported_proxy_scheme_without_leaking_value() {
+        // An unsupported proxy scheme (e.g. ftp, or socks without the `socks` feature) must error —
+        // we never silently bypass a configured proxy — and the error message must NOT echo the
+        // value (it could contain credentials).
+        let err = build_http_client(Some("ftp://user:secret@proxy.example:21"))
+            .expect_err("unsupported proxy scheme must error");
+        let msg = err.to_string();
+        assert!(msg.contains("SCRAPER_PROXY_URL"), "msg: {msg}");
+        assert!(
+            !msg.contains("secret"),
+            "must not echo the proxy value: {msg}"
+        );
+        assert!(
+            !msg.contains("proxy.example"),
+            "must not echo the proxy value: {msg}"
+        );
     }
 
     #[test]

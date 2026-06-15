@@ -165,6 +165,10 @@ pub struct AcquisitionConfig {
     pub max_acquire_attempts: u32,
     /// Override for the scraper base URL; `None` → template Torrentio from the active provider.
     pub scraper_addon_url: Option<String>,
+    /// Optional HTTP(S) proxy URL applied to the SCRAPER's requests only (Torrentio / addon) — not
+    /// the debrid CDN media reads, TMDB, or provider APIs. `None` → direct connection. Set by
+    /// `from_env` (`SCRAPER_PROXY_URL`), not `from_parts`.
+    pub scraper_proxy_url: Option<String>,
     /// Seconds an optimistically-added torrent may stay Pending without resolving/seeding
     /// before `observe` reaps it as dead (SP3). Default 600.
     pub acquire_dead_timeout_secs: u64,
@@ -238,6 +242,7 @@ impl AcquisitionConfig {
                 None => 5,
             },
             scraper_addon_url: None,
+            scraper_proxy_url: None,
             acquire_dead_timeout_secs: 600,
         }
     }
@@ -253,6 +258,10 @@ impl AcquisitionConfig {
             std::env::var("MAX_ACQUIRE_ATTEMPTS").ok(),
         );
         a.scraper_addon_url = std::env::var("SCRAPER_ADDON_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        a.scraper_proxy_url = std::env::var("SCRAPER_PROXY_URL")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -568,6 +577,7 @@ mod tests {
         assert_eq!(a.stall_timeout_secs, 1800);
         assert_eq!(a.max_acquire_attempts, 5);
         assert_eq!(a.scraper_addon_url, None);
+        assert_eq!(a.scraper_proxy_url, None);
     }
 
     #[test]

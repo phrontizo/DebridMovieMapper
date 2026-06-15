@@ -84,12 +84,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .expect("Failed to build CDN HTTP client");
 
+    // The scraper gets its OWN client so an optional proxy applies to Torrentio/addon traffic only
+    // — never the CDN media reads, TMDB, or provider APIs (which keep the direct `http_client`).
+    let scraper_http = debridmoviemapper::scraper::build_http_client(
+        config.acquisition.scraper_proxy_url.as_deref(),
+    )?;
+    if config.acquisition.scraper_proxy_url.is_some() {
+        // Don't log the URL — it may contain proxy credentials.
+        info!("Scraper requests routed through the configured HTTP proxy");
+    }
     let scraper: Arc<dyn debridmoviemapper::scraper::Scraper> =
         Arc::new(debridmoviemapper::scraper::TorrentioScraper::new(
             config.acquisition.scraper_addon_url.clone(),
             config.provider_kind,
             &config.provider_token,
-            http_client.clone(),
+            scraper_http,
         ));
     let validator: Arc<dyn debridmoviemapper::acquire::TitleValidator> =
         Arc::new(debridmoviemapper::acquire::TmdbTitleValidator {

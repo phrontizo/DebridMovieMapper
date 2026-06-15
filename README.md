@@ -70,6 +70,7 @@ JELLYFIN_RCLONE_MOUNT_PATH=/media
 
 # Optional: acquisition preferences (see Acquisition section below)
 # SCRAPER_ADDON_URL=https://torrentio.strem.fun/realdebrid=TOKEN   # override scraper URL
+# SCRAPER_PROXY_URL=http://user:pass@proxy:8080   # proxy the scraper (Torrentio) traffic only
 # MAX_RESOLUTION=1080        # 720 | 1080 | 2160
 # AUDIO_LANGUAGE=original    # original | eng | ...
 # SUBTITLE_LANGUAGE=         # none (default) | eng | ...
@@ -95,6 +96,7 @@ A debrid provider token is required: set **exactly one** of `RD_API_TOKEN` or `T
 | `JELLYFIN_API_KEY`           | No       | -              | Jellyfin API key for authentication                                  |
 | `JELLYFIN_RCLONE_MOUNT_PATH` | No       | -              | rclone mount path as seen by Jellyfin (e.g. `/media`)                |
 | `SCRAPER_ADDON_URL`          | No       | *(auto)*       | Override the Torrentio scraper base URL. Defaults to a URL auto-built from your provider token (`https://torrentio.strem.fun/<provider>=<token>`). |
+| `SCRAPER_PROXY_URL`          | No       | -              | Route the **scraper's** requests (Torrentio / custom addon) through an HTTP(S) proxy — e.g. `http://[user:pass@]host:port`. Applies **only** to scraper traffic; the debrid CDN media reads, TMDB, and provider APIs stay direct. A set-but-invalid value (non-http(s) scheme; socks is not supported) is a startup error rather than a silent direct fallback. |
 | `MAX_RESOLUTION`             | No       | `1080`         | Hard resolution ceiling for acquisition: `720`, `1080`, `2160` / `4k`. Candidates above this height are excluded. |
 | `AUDIO_LANGUAGE`             | No       | `original`     | Required audio language for acquisition: an ISO code (e.g. `eng`) or `original` (uses the title's original language from TMDB). |
 | `SUBTITLE_LANGUAGE`          | No       | *(none)*       | Required subtitle language for acquisition: an ISO code, or omit / set to `none` to skip the check. |
