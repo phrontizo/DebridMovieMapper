@@ -164,12 +164,17 @@ fn bound_cache(cache: &mut HashMap<(String, u32), CachedUrl>, max: usize) {
     }
 }
 
-/// Transient server-side statuses worth retrying (mirrors the RD client). A 500 is NOT
-/// retried — it usually indicates a genuine error rather than a transient blip.
+/// The standard retryable 5xx set — 500/502/503/504 — worth retrying within the bounded loop
+/// (mirrors the RD client). A 500 is the server failing, which is usually transient: TorBox itself
+/// returns `500 DATABASE_ERROR … "Please try again later."`. The bounded attempts + backoff ride
+/// out the transient ones and give up on a deterministic one (which the next scan re-attempts). The
+/// DETERMINISTIC 5xx — 501 Not Implemented / 505 HTTP Version Not Supported — are NOT retried (a
+/// retry can't fix them), and 4xx are terminal (the request itself is wrong).
 fn is_transient_status(status: reqwest::StatusCode) -> bool {
     matches!(
         status,
-        reqwest::StatusCode::BAD_GATEWAY
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            | reqwest::StatusCode::BAD_GATEWAY
             | reqwest::StatusCode::SERVICE_UNAVAILABLE
             | reqwest::StatusCode::GATEWAY_TIMEOUT
     )
@@ -582,17 +587,24 @@ mod tests {
 
     #[test]
     fn is_transient_status_matches_retryable_5xx_only() {
+        // The standard retryable 5xx set: 500/502/503/504 (a 500 is the server failing — usually
+        // transient; TorBox itself returns `500 DATABASE_ERROR … "try again later"`).
+        assert!(is_transient_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
         assert!(is_transient_status(reqwest::StatusCode::BAD_GATEWAY));
         assert!(is_transient_status(
             reqwest::StatusCode::SERVICE_UNAVAILABLE
         ));
         assert!(is_transient_status(reqwest::StatusCode::GATEWAY_TIMEOUT));
-        // 500 is not transient; nor are success/client errors.
+        // The DETERMINISTIC 5xx (a retry can't fix them) and 2xx/4xx are NOT transient.
+        assert!(!is_transient_status(reqwest::StatusCode::NOT_IMPLEMENTED)); // 501
         assert!(!is_transient_status(
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        ));
+            reqwest::StatusCode::HTTP_VERSION_NOT_SUPPORTED
+        )); // 505
         assert!(!is_transient_status(reqwest::StatusCode::OK));
         assert!(!is_transient_status(reqwest::StatusCode::NOT_FOUND));
+        assert!(!is_transient_status(reqwest::StatusCode::UNAUTHORIZED));
     }
 
     #[test]

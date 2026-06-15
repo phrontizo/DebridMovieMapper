@@ -197,11 +197,14 @@ impl RealDebridClient {
         }
     }
 
-    /// Helper to check if a status code should trigger a retry.
-    /// Note: callers can override this via `terminal_statuses` in `fetch_with_retry`,
-    /// which are checked first and abort without retrying (e.g. 503 for unrestrict_link).
+    /// Whether a status should trigger a retry: 429 plus the standard retryable 5xx set
+    /// (500/502/503/504). A 500 is a server-side failure, usually transient, so it joins the
+    /// bounded-retry set; 4xx (and the deterministic 5xx 501/505) are terminal — a retry can't fix
+    /// the request. Callers can still override via `terminal_statuses` in `fetch_with_retry`, which
+    /// are checked first and abort without retrying (e.g. 503 for `unrestrict_link`).
     fn should_retry_status(status: reqwest::StatusCode) -> bool {
         status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
             || status == reqwest::StatusCode::BAD_GATEWAY
             || status == reqwest::StatusCode::GATEWAY_TIMEOUT
@@ -451,11 +454,12 @@ impl RealDebridClient {
                             }
                         }
                         Err(e) => {
-                            // terminal_statuses, 429, and the retryable 502/503/504
-                            // (should_retry_status) are all handled above. Any remaining error
-                            // status is a permanent client/server error (400/401/403/500/…) that
-                            // will not fix itself on retry — return immediately rather than burning
-                            // all 10 rate-limited attempts (and 10 warnings) on, e.g., a bad token.
+                            // terminal_statuses, 429, and the retryable 5xx (500/502/503/504, via
+                            // should_retry_status) are all handled above. Any remaining error status
+                            // is a terminal client error (4xx — 400/401/403/…) or a deterministic
+                            // 5xx (501/505) that will not fix itself on retry — return immediately
+                            // rather than burning all 10 rate-limited attempts (and 10 warnings) on,
+                            // e.g., a bad token.
                             warn!(
                                 "RD API non-retryable error (attempt {}/{}): {}. Status: {} — not retrying",
                                 attempt, max_attempts, e, status
@@ -619,8 +623,10 @@ mod tests {
     }
 
     #[test]
-    fn should_retry_status_does_not_retry_500() {
-        assert!(!RealDebridClient::should_retry_status(
+    fn should_retry_status_retries_500() {
+        // A 500 is a server-side failure — usually transient — so it joins the bounded-retry 5xx
+        // set (500/502/503/504). 4xx stay terminal (the request itself is wrong).
+        assert!(RealDebridClient::should_retry_status(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR
         ));
     }
