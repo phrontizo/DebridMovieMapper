@@ -491,25 +491,43 @@ pub async fn probe_tracks(http: &reqwest::Client, cdn_url: &str) -> Result<Vec<T
 /// never drive an unbounded allocation in the probe path.
 const MAX_PROBE_FETCH: usize = 8 * 1024 * 1024;
 
-/// Read a ranged response body for the probe. Requires `206 Partial Content` — a `200` means the
-/// CDN ignored the `Range` header and is streaming the entire (potentially multi-GB) object, which
-/// is both wrong (for a suffix request) and an OOM risk. Anything other than 206, a read error, or
-/// a body exceeding `MAX_PROBE_FETCH` maps to `Transient` (defer + retry; we never blacklist a
-/// release merely because we couldn't fetch a probe window). Media files are always far larger than
-/// `FRONT`, so a well-behaved CDN always answers these requests with 206.
-async fn read_partial_body(resp: reqwest::Response) -> Result<Vec<u8>, ProbeError> {
-    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+/// Whether a probe fetch's response status is usable. `206 Partial Content` always is. A `200 OK`
+/// means the CDN ignored the `Range` header and is streaming the whole object **from byte 0** —
+/// usable ONLY for a front (offset-0) read, where the first window is exactly what we want; for a
+/// suffix read a `200` returns the wrong bytes (the head, not the tail) so it's rejected. TorBox's
+/// CDN does exactly this (replies `200`, ignoring `Range`) — without accepting it the probe defers
+/// forever, even though playback works (`dav_fs::fetch_cdn_range` already accepts a `pos == 0` 200).
+fn probe_status_ok(status: reqwest::StatusCode, accept_200_from_start: bool) -> bool {
+    status == reqwest::StatusCode::PARTIAL_CONTENT
+        || (status == reqwest::StatusCode::OK && accept_200_from_start)
+}
+
+/// Read up to `want` bytes of a ranged response body for the probe. On a `200` (Range-ignoring CDN
+/// streaming the whole multi-GB object) we stop and drop the connection as soon as we have `want`
+/// bytes, so we never download more than a window. Status mismatch, a read error, or a body that
+/// runs past `MAX_PROBE_FETCH` before reaching `want` → `Transient` (defer + retry; we never
+/// blacklist a release merely because a probe window couldn't be fetched).
+async fn read_body(
+    resp: reqwest::Response,
+    want: usize,
+    accept_200_from_start: bool,
+) -> Result<Vec<u8>, ProbeError> {
+    if !probe_status_ok(resp.status(), accept_200_from_start) {
         return Err(ProbeError::Transient);
     }
     let mut resp = resp;
     let mut buf = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(|_| ProbeError::Transient)? {
         buf.extend_from_slice(&chunk);
+        if buf.len() >= want {
+            buf.truncate(want);
+            return Ok(buf); // got the window — drop the connection, don't drain the whole object
+        }
         if buf.len() > MAX_PROBE_FETCH {
             return Err(ProbeError::Transient);
         }
     }
-    Ok(buf)
+    Ok(buf) // 206 whose range was shorter than `want` (e.g. a small file) — return what we got
 }
 
 async fn fetch_range(
@@ -524,7 +542,9 @@ async fn fetch_range(
         .send()
         .await
         .map_err(|_| ProbeError::Transient)?;
-    read_partial_body(resp).await
+    let want = (end - start + 1) as usize;
+    // Offset-0 (front) read: a Range-ignoring 200 streams from byte 0, which is exactly our window.
+    read_body(resp, want, start == 0).await
 }
 
 async fn fetch_suffix(http: &reqwest::Client, url: &str, len: u64) -> Result<Vec<u8>, ProbeError> {
@@ -534,12 +554,28 @@ async fn fetch_suffix(http: &reqwest::Client, url: &str, len: u64) -> Result<Vec
         .send()
         .await
         .map_err(|_| ProbeError::Transient)?;
-    read_partial_body(resp).await
+    // A suffix read needs the TAIL; a Range-ignoring 200 gives the head → reject (206 only).
+    read_body(resp, len as usize, false).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_status_ok_accepts_206_always_and_200_only_from_start() {
+        use reqwest::StatusCode;
+        // 206 Partial Content is always usable (well-behaved CDN).
+        assert!(probe_status_ok(StatusCode::PARTIAL_CONTENT, true));
+        assert!(probe_status_ok(StatusCode::PARTIAL_CONTENT, false));
+        // 200 OK = CDN ignored Range, streaming from byte 0 (TorBox): usable for a front read only.
+        assert!(probe_status_ok(StatusCode::OK, true));
+        assert!(!probe_status_ok(StatusCode::OK, false)); // suffix read → 200 is the wrong bytes
+                                                          // Anything else (expired URL, error) → not usable → Transient.
+        assert!(!probe_status_ok(StatusCode::NOT_FOUND, true));
+        assert!(!probe_status_ok(StatusCode::FORBIDDEN, true));
+        assert!(!probe_status_ok(StatusCode::INTERNAL_SERVER_ERROR, true));
+    }
 
     fn vint(size: u64) -> Vec<u8> {
         for len in 1u32..=8 {

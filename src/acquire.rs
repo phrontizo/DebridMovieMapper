@@ -244,7 +244,8 @@ pub(crate) fn count_feature_videos(info: &TorrentInfo) -> usize {
 }
 
 /// Build a FileLocator for `path` within `info` (pairs the per-file link by position among selected).
-fn locator_for(info: &TorrentInfo, hash: &str, path: &str) -> FileLocator {
+/// `pub` so integration tests can resolve a real file's CDN URL through the exact engine logic.
+pub fn locator_for(info: &TorrentInfo, hash: &str, path: &str) -> FileLocator {
     let mut link_idx = 0;
     for f in &info.files {
         if f.selected == 1 {
