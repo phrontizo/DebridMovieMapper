@@ -269,9 +269,10 @@ pub async fn run_scan_loop(
                 }
 
                 // Account-mirror: record every identified present torrent the engine doesn't already
-                // track as a Manual-provenance owned record, so the reconciler sees the user's
-                // pre-existing library (no duplicate re-acquire; season-pack episodes count owned).
-                record_mirror_owned(&store, &current_data).await;
+                // track as an owned record (empty provenance — owned + upgradeable, not a protected
+                // manual class), so the reconciler sees the user's pre-existing library (no duplicate
+                // re-acquire; season-pack episodes count owned).
+                record_mirror_owned(&store, &tmdb_client, &current_data).await;
 
                 let current_ids: std::collections::HashSet<&str> =
                     deduped_torrents.iter().map(|t| t.id.as_str()).collect();
@@ -788,25 +789,34 @@ fn meta_tmdb_id(metadata: &MediaMetadata) -> Option<u64> {
         .and_then(|s| s.parse::<u64>().ok())
 }
 
-/// Record every identified, present provider torrent the engine doesn't already track as a
-/// **`Manual`-provenance owned record** (the "account mirror"). This makes the reconciler aware of
-/// the user's pre-existing library so it never re-acquires a title that is already present (the
-/// duplicate fix) and so a season pack's episodes count as owned (kills `monitor_episodes` churn).
+/// Record every identified, present provider torrent the engine doesn't already track as an
+/// **owned record** (the "account mirror"). This makes the reconciler aware of the user's
+/// pre-existing library so it never re-acquires a title that is already present (the duplicate fix)
+/// and so a season pack's episodes count as owned (kills `monitor_episodes` churn).
+///
+/// There is **no protected "manual" class**: a mirrored torrent is recorded with **empty
+/// provenance** (no `Manual` entry), so it is owned exactly like an engine-acquired title — eligible
+/// for the daily quality-upgrade / consolidation path — while still being kept (empty provenance +
+/// no Trakt wanter means neither removal trigger fires). The IMDB id is resolved from TMDB so the
+/// upgrade engine (IMDB-keyed) can actually re-scrape it; a per-title cache avoids repeat lookups in
+/// a pass, and a resolution failure is non-fatal (the record is still written, just not upgradeable
+/// until a later pass fills the id).
 ///
 /// Idempotent and non-destructive: a hash the engine already owns (or a previously-recorded mirror
 /// hash) is left untouched, so an in-flight `Pending` acquisition or an engine record's
-/// provenance/quality/`provides` is never clobbered. `Manual` provenance means the lifecycle
-/// reconciler never auto-removes these (`Provenance::has_manual_entry`). `provides` for a show is
-/// the SE-parsed set of its selected video files (a movie's is empty); `quality` is `None` (no
-/// scraped release info for a mirror torrent — the upgrade engine tolerates `None`).
+/// provenance/quality/`provides` is never clobbered. `provides` for a show is the SE-parsed set of
+/// its selected video files (a movie's is empty); `quality` is `None`.
 pub(crate) async fn record_mirror_owned(
     store: &Store,
+    tmdb: &TmdbClient,
     current_data: &[(crate::rd_client::TorrentInfo, MediaMetadata)],
 ) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // Resolve each title's IMDB id at most once per pass (many torrents can share a tmdb_id).
+    let mut imdb_cache: HashMap<(MediaType, u64), String> = HashMap::new();
     let mut recorded = 0usize;
     for (info, metadata) in current_data {
         let Some(tmdb_id) = meta_tmdb_id(metadata) else {
@@ -821,7 +831,8 @@ pub(crate) async fn record_mirror_owned(
         if store.get_owned(hash.clone()).await.is_some() {
             continue;
         }
-        let kind = kind_of(&metadata.media_type);
+        let media_type = metadata.media_type.clone();
+        let kind = kind_of(&media_type);
         let provides: Vec<(u32, u32)> = match kind {
             MediaKind::Series => crate::acquire::episode_files(info)
                 .into_iter()
@@ -829,12 +840,22 @@ pub(crate) async fn record_mirror_owned(
                 .collect(),
             MediaKind::Movie => Vec::new(),
         };
+        // Best-effort IMDB resolution (cached per title) so the upgrade engine can re-scrape it.
+        let imdb_id = match imdb_cache.entry((media_type.clone(), tmdb_id)) {
+            std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let resolved = tmdb
+                    .external_imdb_id(tmdb_id, media_type.clone())
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                e.insert(resolved).clone()
+            }
+        };
         let rec = OwnedRecord {
             request: AcquireRequest {
-                // No scraped IMDB id for a mirror torrent; left empty. A `Manual` record is never
-                // re-acquired by `observe` (it skips manual-provenance torrents), so the empty id
-                // is never used to scrape.
-                imdb_id: String::new(),
+                imdb_id,
                 tmdb_id,
                 kind,
                 season: None,
@@ -842,7 +863,10 @@ pub(crate) async fn record_mirror_owned(
                 original_language: None,
                 metadata: metadata.clone(),
             },
-            provenance: Provenance::manual(),
+            // Empty provenance: owned + upgradeable, NOT a protected manual class. No Trakt wanter
+            // and no watchlist provenance means neither removal trigger fires, so the user's
+            // pre-existing library is kept while still following the normal upgrade path.
+            provenance: Provenance { entries: vec![] },
             added_at: now,
             status: OwnedStatus::Verified,
             provides,
@@ -1649,7 +1673,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_mirror_owned_adds_manual_records_and_preserves_engine() {
+    async fn record_mirror_owned_adds_owned_records_and_preserves_engine() {
         use crate::scraper::MediaKind;
         use crate::store::{AcquireRequest, OwnedRecord, OwnedStatus, Provenance, Store};
         use crate::vfs::{MediaMetadata, MediaType};
@@ -1659,6 +1683,8 @@ mod tests {
                 .unwrap(),
         ))
         .unwrap();
+        // Fake key → external_imdb_id fails → empty imdb (record still written, just not upgradeable).
+        let tmdb = TmdbClient::new("k".into()).unwrap();
 
         // An engine-owned hash already tracked — the mirror pass must NOT clobber it.
         store
@@ -1739,13 +1765,15 @@ mod tests {
             },
         );
 
-        record_mirror_owned(&store, &[movie, pack, eng]).await;
+        record_mirror_owned(&store, &tmdb, &[movie, pack, eng]).await;
 
         let m = store
             .get_owned("moviehash".into())
             .await
             .expect("movie recorded");
-        assert!(m.provenance.has_manual_entry());
+        // Empty provenance — owned + upgradeable, NOT a protected manual class.
+        assert!(!m.provenance.has_manual_entry());
+        assert!(m.provenance.entries.is_empty());
         assert_eq!(m.status, OwnedStatus::Verified);
         assert_eq!(m.request.tmdb_id, 603);
         assert!(m.provides.is_empty(), "a movie provides no episodes");
@@ -1754,7 +1782,7 @@ mod tests {
             .get_owned("packhash".into())
             .await
             .expect("pack recorded");
-        assert!(p.provenance.has_manual_entry());
+        assert!(!p.provenance.has_manual_entry());
         let mut eps = p.provides.clone();
         eps.sort_unstable();
         assert_eq!(
@@ -1763,9 +1791,8 @@ mod tests {
             "pack provides = SE-parsed episode files (Menu Art skipped)"
         );
 
-        // Engine record untouched (still Watchlist, never overwritten to Manual).
+        // Engine record untouched (still Watchlist, never overwritten).
         let e = store.get_owned("eng".into()).await.expect("engine present");
-        assert!(!e.provenance.has_manual_entry());
         assert_eq!(e.provenance, Provenance::watchlist("alice"));
     }
 }
