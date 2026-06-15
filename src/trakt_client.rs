@@ -60,10 +60,25 @@ pub enum DeviceTokenPoll {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchedShow {
     pub tmdb_id: u64,
+    /// The show's **Trakt** numeric id (`show.ids.trakt`) — the key the `/shows/{id}/progress`
+    /// endpoint takes (it does not accept a TMDB id). `None` if Trakt omitted it; the catch-up
+    /// "behind?" check then conservatively includes the show. Distinct from `tmdb_id`.
+    pub trakt_id: Option<u64>,
     pub watched_episodes: Vec<(u32, u32)>,
     /// When the user last watched any episode of this show, as a Unix timestamp (seconds). `None`
     /// if Trakt omitted/malformed `last_watched_at`. Drives the catch-up lookback window (SP2.5).
     pub last_watched_at: Option<i64>,
+}
+
+/// A user's watched-progress snapshot for one show (`GET /shows/{id}/progress/watched`). `behind`
+/// is the precise catch-up gate: `true` iff there is at least one **aired** episode the user has not
+/// watched (Trakt's `next_episode` is non-null), i.e. they are not caught up. `aired`/`completed`
+/// are kept for logging. Specials and hidden seasons are excluded from the counts.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ShowProgress {
+    pub aired: u32,
+    pub completed: u32,
+    pub behind: bool,
 }
 
 /// A user's watched history.
@@ -89,6 +104,13 @@ pub trait TraktClient: Send + Sync {
     async fn in_progress(&self, access_token: &str) -> Result<Vec<TraktItem>, AppError>;
     /// GET /sync/watched/movies + /sync/watched/shows — watched movies + per-show watched episodes.
     async fn watched(&self, access_token: &str) -> Result<WatchedData, AppError>;
+    /// GET /shows/{trakt_id}/progress/watched — whether the user has unwatched *aired* episodes
+    /// (the precise catch-up gate). `trakt_id` is the show's Trakt numeric id, not its TMDB id.
+    async fn show_progress(
+        &self,
+        access_token: &str,
+        trakt_id: u64,
+    ) -> Result<ShowProgress, AppError>;
 }
 
 const DEFAULT_BASE_URL: &str = "https://api.trakt.tv";
@@ -278,6 +300,21 @@ impl TraktClient for TraktClientImpl {
             shows: parse_watched_shows(&shows),
         })
     }
+
+    async fn show_progress(
+        &self,
+        access_token: &str,
+        trakt_id: u64,
+    ) -> Result<ShowProgress, AppError> {
+        // Exclude specials and hidden seasons so `aired`/`completed`/`next_episode` reflect the
+        // canonical run — a user who's watched every regular episode reads as caught up.
+        let path = format!(
+            "/shows/{}/progress/watched?hidden=false&specials=false&count_specials=false",
+            trakt_id
+        );
+        let v = self.authed_get_json(&path, access_token).await?;
+        Ok(parse_show_progress(&v))
+    }
 }
 
 // --- Pure request/body builders -------------------------------------------------------------
@@ -330,6 +367,13 @@ fn u64_field(v: &serde_json::Value, key: &str) -> u64 {
 fn tmdb_id_of(obj: &serde_json::Value) -> Option<u64> {
     obj.get("ids")
         .and_then(|i| i.get("tmdb"))
+        .and_then(|t| t.as_u64())
+}
+
+/// The `obj.ids.trakt` numeric extraction (the id the `/shows/{id}/progress` endpoint takes).
+fn trakt_id_of(obj: &serde_json::Value) -> Option<u64> {
+    obj.get("ids")
+        .and_then(|i| i.get("trakt"))
         .and_then(|t| t.as_u64())
 }
 
@@ -481,6 +525,7 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
     arr.iter()
         .filter_map(|e| {
             let tmdb_id = e.get("show").and_then(tmdb_id_of)?;
+            let trakt_id = e.get("show").and_then(trakt_id_of);
             let mut watched_episodes = Vec::new();
             if let Some(seasons) = e.get("seasons").and_then(|s| s.as_array()) {
                 for season in seasons {
@@ -512,11 +557,30 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
                 .map(|dt| dt.timestamp());
             Some(WatchedShow {
                 tmdb_id,
+                trakt_id,
                 watched_episodes,
                 last_watched_at,
             })
         })
         .collect()
+}
+
+/// Parse a `/shows/{id}/progress/watched` response. `behind` is taken from `next_episode` (Trakt's
+/// authoritative "there is an aired episode to watch" signal — non-null ⇒ behind, explicit null ⇒
+/// caught up); if the field is absent (malformed body) it falls back to `completed < aired`.
+pub fn parse_show_progress(v: &serde_json::Value) -> ShowProgress {
+    let aired = v.get("aired").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let completed = v.get("completed").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let behind = match v.get("next_episode") {
+        Some(ne) if !ne.is_null() => true, // an aired episode awaits → behind
+        Some(_) => false,                  // explicit null → caught up
+        None => completed < aired,         // field missing → fall back to the counts
+    };
+    ShowProgress {
+        aired,
+        completed,
+        behind,
+    }
 }
 
 // --- Test-only mock -------------------------------------------------------------------------
@@ -534,6 +598,9 @@ pub struct MockTrakt {
     pub watchlist: Vec<TraktItem>,
     pub in_progress: Vec<TraktItem>,
     pub watched: WatchedData,
+    /// Canned `show_progress` responses keyed by Trakt show id. A show with no entry returns the
+    /// default (`behind: false` = caught up), so a catch-up candidate is excluded unless set.
+    pub progress: std::collections::HashMap<u64, ShowProgress>,
     /// When true, `watchlist`/`in_progress`/`watched` return `Err`.
     pub fail_reads: bool,
     /// When true, `refresh` returns `Err`.
@@ -585,6 +652,15 @@ impl TraktClient for MockTrakt {
             return Err(Self::read_error());
         }
         Ok(self.watched.clone())
+    }
+    async fn show_progress(
+        &self,
+        _access_token: &str,
+        trakt_id: u64,
+    ) -> Result<ShowProgress, AppError> {
+        // Best-effort supplementary call: not gated on `fail_reads` (its failure is handled
+        // gracefully by the caller). Returns the canned entry, or the caught-up default.
+        Ok(self.progress.get(&trakt_id).cloned().unwrap_or_default())
     }
 }
 
@@ -847,14 +923,14 @@ mod tests {
         let v = serde_json::json!([
             {
                 "last_watched_at": "2021-01-01T00:00:00.000Z",
-                "show": { "ids": { "tmdb": 1396 } },
+                "show": { "ids": { "tmdb": 1396, "trakt": 1390 } },
                 "seasons": [
                     { "number": 1, "episodes": [{ "number": 1 }, { "number": 2 }] },
                     { "number": 2, "episodes": [{ "number": 1 }] },
                 ]
             },
             {
-                // no last_watched_at → None (still parsed)
+                // no last_watched_at → None; no trakt id → None (both still parsed)
                 "show": { "ids": { "tmdb": 1399 } },
                 "seasons": [{ "number": 1, "episodes": [{ "number": 1 }] }]
             }
@@ -864,15 +940,63 @@ mod tests {
             vec![
                 WatchedShow {
                     tmdb_id: 1396,
+                    trakt_id: Some(1390),
                     watched_episodes: vec![(1, 1), (1, 2), (2, 1)],
                     last_watched_at: Some(1_609_459_200), // 2021-01-01T00:00:00Z
                 },
                 WatchedShow {
                     tmdb_id: 1399,
+                    trakt_id: None,
                     watched_episodes: vec![(1, 1)],
                     last_watched_at: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn parse_show_progress_behind_from_next_episode_then_falls_back_to_counts() {
+        // next_episode present (non-null) → behind, regardless of counts.
+        let behind = serde_json::json!({
+            "aired": 10, "completed": 10,
+            "next_episode": { "season": 2, "number": 1 }
+        });
+        assert_eq!(
+            parse_show_progress(&behind),
+            ShowProgress {
+                aired: 10,
+                completed: 10,
+                behind: true
+            }
+        );
+        // next_episode explicitly null → caught up, even if counts look short.
+        let caught_up = serde_json::json!({ "aired": 10, "completed": 9, "next_episode": null });
+        assert_eq!(
+            parse_show_progress(&caught_up),
+            ShowProgress {
+                aired: 10,
+                completed: 9,
+                behind: false
+            }
+        );
+        // next_episode field absent (malformed) → fall back to completed < aired.
+        let missing = serde_json::json!({ "aired": 10, "completed": 7 });
+        assert_eq!(
+            parse_show_progress(&missing),
+            ShowProgress {
+                aired: 10,
+                completed: 7,
+                behind: true
+            }
+        );
+        // empty body → all zero, not behind.
+        assert_eq!(
+            parse_show_progress(&serde_json::json!({})),
+            ShowProgress {
+                aired: 0,
+                completed: 0,
+                behind: false
+            }
         );
     }
 
@@ -910,6 +1034,7 @@ mod tests {
                 movies: vec![3],
                 shows: vec![],
             },
+            progress: std::collections::HashMap::new(),
             fail_reads: false,
             fail_refresh: false,
         };

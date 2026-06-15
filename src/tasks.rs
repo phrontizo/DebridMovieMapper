@@ -404,8 +404,12 @@ const REFRESH_BUFFER_SECS: u64 = 86_400;
 /// `WatchedState` variant always agree.
 /// `catchup_cutoff`: a Unix timestamp (seconds) bounding the **catch-up** source — a show you've
 /// watched is auto-wanted (to catch up on episodes aired since) only if you last watched it at/after
-/// this instant. `None` = all-time (every watched show qualifies). The "behind?" decision (are there
-/// unwatched aired episodes) is the reconciler's, made later with TMDB air dates.
+/// this instant. `None` = all-time (every watched show qualifies the lookback gate).
+/// `catchup_behind`: the precise "behind?" gate — the set of show `tmdb_id`s Trakt reports as having
+/// ≥1 unwatched aired episode. `Some(set)` ⇒ a within-lookback watched show is caught up (and so NOT
+/// wanted) unless it's in the set, so fully-watched shows no longer bloat the wanted-set. `None` ⇒
+/// fall back to lookback-only (the pure path / when progress is unavailable). Either way the
+/// reconciler still filters which episodes to acquire with TMDB air dates.
 pub(crate) fn build_wanted(
     user: &str,
     watchlist: &[crate::trakt_client::TraktItem],
@@ -413,6 +417,7 @@ pub(crate) fn build_wanted(
     watched: &crate::trakt_client::WatchedData,
     show_status: &std::collections::HashMap<u64, crate::tmdb_client::ShowStatus>,
     catchup_cutoff: Option<i64>,
+    catchup_behind: Option<&std::collections::HashSet<u64>>,
 ) -> Vec<crate::store::WantedRecord> {
     use crate::store::{WantedRecord, WantedSources, WatchedState};
     use crate::vfs::MediaType;
@@ -467,20 +472,28 @@ pub(crate) fn build_wanted(
             None => true,
             Some(cutoff) => show.last_watched_at.is_some_and(|ts| ts >= cutoff),
         };
-        if within_lookback {
-            let a = agg
-                .entry((MediaType::Show, show.tmdb_id))
-                .or_insert_with(|| Agg {
-                    media_type: MediaType::Show,
-                    watchlist: false,
-                    in_progress: false,
-                    imdb_id: None,
-                });
-            // A watchlisted show already wants its whole run, so catch-up is redundant there — only
-            // mark shows that aren't already on the watchlist.
-            if !a.watchlist {
-                a.in_progress = true;
-            }
+        if !within_lookback {
+            continue;
+        }
+        // Precise "behind?" gate: when a behind-set is supplied, a within-lookback watched show is
+        // caught up to acquire only if it has ≥1 unwatched aired episode. Without it (pure path /
+        // progress unavailable) fall back to lookback-only.
+        let behind = catchup_behind.is_none_or(|b| b.contains(&show.tmdb_id));
+        if !behind {
+            continue;
+        }
+        let a = agg
+            .entry((MediaType::Show, show.tmdb_id))
+            .or_insert_with(|| Agg {
+                media_type: MediaType::Show,
+                watchlist: false,
+                in_progress: false,
+                imdb_id: None,
+            });
+        // A watchlisted show already wants its whole run, so catch-up is redundant there — only
+        // mark shows that aren't already on the watchlist.
+        if !a.watchlist {
+            a.in_progress = true;
         }
     }
 
@@ -604,26 +617,65 @@ async fn sync_trakt_user(
     let in_progress = trakt.in_progress(&tokens.access).await?;
     let watched = trakt.watched(&tokens.access).await?;
 
-    // Per-show TMDB status. A TMDB failure must NOT fail the whole sync — skip that show
-    // (→ build_wanted yields show_status: None, which the reconciler treats conservatively).
-    let mut show_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    for item in watchlist.iter().chain(in_progress.iter()) {
-        if item.media_type == MediaType::Show {
-            show_ids.insert(item.tmdb_id);
-        }
-    }
-    // Catch-up shows (watched within the lookback window) also need their TMDB status fetched so the
-    // reconciler can apply the finished gate. `cutoff` = last-watched must be at/after this instant.
+    // Shows already wanted via watchlist/in-progress are wanted regardless of catch-up progress.
+    let wl_ip_shows: std::collections::HashSet<u64> = watchlist
+        .iter()
+        .chain(in_progress.iter())
+        .filter(|i| i.media_type == MediaType::Show)
+        .map(|i| i.tmdb_id)
+        .collect();
+
+    // Precise catch-up gate: for each watched show within the lookback window that isn't already
+    // wanted, ask Trakt whether the user has an unwatched *aired* episode (`show_progress`). Only
+    // genuinely-behind shows enter `behind` (and so the catch-up wanted-set) — a fully-watched show
+    // no longer bloats the set or drives a fruitless reconcile each cycle. On a missing Trakt id or a
+    // progress error we conservatively include the show (degrade to the old lookback-only behaviour
+    // rather than silently dropping a possibly-behind title; it self-corrects next sync).
     let catchup_cutoff: Option<i64> = catchup_lookback_secs.map(|s| now.saturating_sub(s) as i64);
+    let mut behind: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for show in &watched.shows {
         let within = match catchup_cutoff {
             None => true,
             Some(c) => show.last_watched_at.is_some_and(|ts| ts >= c),
         };
-        if within {
-            show_ids.insert(show.tmdb_id);
+        if !within || wl_ip_shows.contains(&show.tmdb_id) {
+            continue;
+        }
+        let is_behind = match show.trakt_id {
+            Some(tid) => match trakt.show_progress(&tokens.access, tid).await {
+                Ok(p) => {
+                    debug!(
+                        "trakt: {} catch-up tmdb {} progress {}/{} behind={}",
+                        slug, show.tmdb_id, p.completed, p.aired, p.behind
+                    );
+                    p.behind
+                }
+                Err(e) => {
+                    warn!(
+                        "trakt: {} show_progress(tmdb {}, trakt {}) failed: {}; treating as behind",
+                        slug, show.tmdb_id, tid, e
+                    );
+                    true
+                }
+            },
+            None => {
+                debug!(
+                    "trakt: {} catch-up tmdb {} has no Trakt id; treating as behind",
+                    slug, show.tmdb_id
+                );
+                true
+            }
+        };
+        if is_behind {
+            behind.insert(show.tmdb_id);
         }
     }
+
+    // Per-show TMDB status, only for shows that will actually be wanted (watchlist/in-progress +
+    // behind catch-up shows). A TMDB failure must NOT fail the whole sync — skip that show
+    // (→ build_wanted yields show_status: None, which the reconciler treats conservatively).
+    let mut show_ids: std::collections::HashSet<u64> = wl_ip_shows.clone();
+    show_ids.extend(behind.iter().copied());
     let mut statuses: std::collections::HashMap<u64, crate::tmdb_client::ShowStatus> =
         std::collections::HashMap::new();
     for tmdb_id in show_ids {
@@ -646,6 +698,7 @@ async fn sync_trakt_user(
         &watched,
         &statuses,
         catchup_cutoff,
+        Some(&behind),
     );
     debug!(
         "trakt: {} — watchlist={} in_progress={} → {} wanted titles; in_progress=[{}]; wanted_shows={:?}",
@@ -1648,6 +1701,7 @@ mod trakt_sync_tests {
             &WatchedData::default(),
             &HashMap::new(),
             None,
+            None,
         );
         assert_eq!(
             got,
@@ -1672,6 +1726,7 @@ mod trakt_sync_tests {
             movies: vec![],
             shows: vec![WatchedShow {
                 tmdb_id: 1396,
+                trakt_id: None,
                 watched_episodes: vec![(1, 1), (1, 2)],
                 last_watched_at: None,
             }],
@@ -1684,6 +1739,7 @@ mod trakt_sync_tests {
             &[],
             &watched,
             &status,
+            None,
             None,
         );
         assert_eq!(
@@ -1717,6 +1773,7 @@ mod trakt_sync_tests {
             &WatchedData::default(),
             &status,
             None,
+            None,
         );
         assert_eq!(got.len(), 2, "movie and show must be distinct records");
         let movie = got
@@ -1745,6 +1802,7 @@ mod trakt_sync_tests {
             &WatchedData::default(),
             &HashMap::new(),
             None,
+            None,
         );
         assert_eq!(got.len(), 1);
         assert_eq!(
@@ -1764,6 +1822,7 @@ mod trakt_sync_tests {
             &[item(MediaType::Show, 200)],
             &WatchedData::default(),
             &HashMap::new(),
+            None,
             None,
         );
         assert_eq!(
@@ -1794,6 +1853,7 @@ mod trakt_sync_tests {
             &WatchedData::default(),
             &HashMap::new(),
             None,
+            None,
         );
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].imdb_id, Some("tt1375666".into()));
@@ -1812,6 +1872,7 @@ mod trakt_sync_tests {
             &watched,
             &HashMap::new(),
             None,
+            None,
         );
         assert_eq!(got[0].watched_state, WatchedState::Movie { watched: true });
     }
@@ -1823,14 +1884,16 @@ mod trakt_sync_tests {
             movies: vec![],
             shows: vec![WatchedShow {
                 tmdb_id: 1396,
+                trakt_id: Some(1390),
                 watched_episodes: vec![(1, 1)],
                 last_watched_at: Some(1_000_000),
             }],
         };
         let mut status = HashMap::new();
         status.insert(1396u64, ShowStatus::Returning);
-        // all-time (None) → the watched show is wanted via catch-up (in_progress, not watchlist)
-        let all = build_wanted("alice", &[], &[], &watched, &status, None);
+        // all-time (None) + no behind-gate (None) → lookback-only: the watched show is wanted via
+        // catch-up (in_progress, not watchlist)
+        let all = build_wanted("alice", &[], &[], &watched, &status, None, None);
         assert_eq!(all.len(), 1);
         assert_eq!(
             (all[0].tmdb_id, &all[0].media_type),
@@ -1838,12 +1901,37 @@ mod trakt_sync_tests {
         );
         assert!(all[0].sources.in_progress && !all[0].sources.watchlist);
         // cutoff AFTER last_watched_at → excluded (watched too long ago)
-        assert!(build_wanted("alice", &[], &[], &watched, &status, Some(2_000_000)).is_empty());
+        assert!(
+            build_wanted("alice", &[], &[], &watched, &status, Some(2_000_000), None).is_empty()
+        );
         // cutoff BEFORE last_watched_at → included
         assert_eq!(
-            build_wanted("alice", &[], &[], &watched, &status, Some(500_000)).len(),
+            build_wanted("alice", &[], &[], &watched, &status, Some(500_000), None).len(),
             1
         );
+    }
+
+    #[test]
+    fn build_wanted_catchup_behind_gate_excludes_caught_up_show() {
+        use crate::trakt_client::{WatchedData, WatchedShow};
+        let watched = WatchedData {
+            movies: vec![],
+            shows: vec![WatchedShow {
+                tmdb_id: 1396,
+                trakt_id: Some(1390),
+                watched_episodes: vec![(1, 1)],
+                last_watched_at: Some(1_000_000),
+            }],
+        };
+        let status = HashMap::new();
+        // Behind-set EXCLUDES this show (caught up) → not wanted, even within lookback.
+        let empty: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        assert!(build_wanted("alice", &[], &[], &watched, &status, None, Some(&empty)).is_empty());
+        // Behind-set INCLUDES this show → wanted via catch-up.
+        let behind: std::collections::HashSet<u64> = [1396].into_iter().collect();
+        let got = build_wanted("alice", &[], &[], &watched, &status, None, Some(&behind));
+        assert_eq!(got.len(), 1);
+        assert!(got[0].sources.in_progress && !got[0].sources.watchlist);
     }
 
     #[test]
@@ -1859,6 +1947,7 @@ mod trakt_sync_tests {
             &[],
             &WatchedData::default(),
             &HashMap::new(),
+            None,
             None,
         );
         assert_eq!(
@@ -1899,6 +1988,78 @@ mod trakt_sync_tests {
                 .await
                 .unwrap()
                 .needs_reenrolment
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_trakt_catchup_excludes_caught_up_includes_behind_show() {
+        use crate::trakt_client::{ShowProgress, WatchedShow};
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".to_string(), tokens("acc", 9_999_999_999, false))
+            .await
+            .unwrap();
+        // Two watched shows: tmdb 500 (Trakt 100) is caught up; tmdb 600 (Trakt 200) is behind.
+        let watched = WatchedData {
+            movies: vec![],
+            shows: vec![
+                WatchedShow {
+                    tmdb_id: 500,
+                    trakt_id: Some(100),
+                    watched_episodes: vec![(1, 1)],
+                    last_watched_at: Some(1_000_000),
+                },
+                WatchedShow {
+                    tmdb_id: 600,
+                    trakt_id: Some(200),
+                    watched_episodes: vec![(1, 1)],
+                    last_watched_at: Some(1_000_000),
+                },
+            ],
+        };
+        let progress = [
+            (
+                100u64,
+                ShowProgress {
+                    aired: 10,
+                    completed: 10,
+                    behind: false,
+                },
+            ),
+            (
+                200u64,
+                ShowProgress {
+                    aired: 10,
+                    completed: 4,
+                    behind: true,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            watched,
+            progress,
+            ..Default::default()
+        });
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+
+        // All-time lookback (None): the gate is purely "behind?".
+        sync_trakt(&trakt, &tmdb, &store, None).await;
+
+        assert!(
+            store
+                .get_wanted("alice".to_string(), MediaType::Show, 600)
+                .await
+                .is_some_and(|w| w.sources.in_progress),
+            "the behind show must be caught up (wanted via in_progress)"
+        );
+        assert!(
+            store
+                .get_wanted("alice".to_string(), MediaType::Show, 500)
+                .await
+                .is_none(),
+            "the caught-up show must NOT be wanted (no fruitless catch-up)"
         );
     }
 
