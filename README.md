@@ -62,6 +62,7 @@ JELLYFIN_RCLONE_MOUNT_PATH=/media
 # TRAKT_CLIENT_SECRET=your_trakt_client_secret
 # TRAKT_SYNC_INTERVAL_SECS=900            # Trakt sync + reconcile cadence (default: 900, minimum: 60)
 # TRAKT_EPISODE_CHECK_INTERVAL_SECS=3600  # episode-monitor cadence (default: 3600, minimum: 300)
+# TRAKT_CATCHUP_LOOKBACK=                  # catch-up window for watched shows: 90d/12w/6mo; unset=all-time
 
 # Optional: auto-upgrade engine (SP3 — on by default; set UPGRADE_INTERVAL_SECS=0 to disable)
 # UPGRADE_INTERVAL_SECS=86400    # how often to run the quality-upgrade + consolidation pass (default: daily; 0=off)
@@ -110,6 +111,7 @@ A debrid provider token is required: set **exactly one** of `RD_API_TOKEN` or `T
 | `TRAKT_CLIENT_SECRET`        | No†      | -              | Trakt API app client secret. |
 | `TRAKT_SYNC_INTERVAL_SECS`   | No       | `900`          | How often (seconds) to sync each enrolled Trakt account and reconcile the library (minimum: 60). |
 | `TRAKT_EPISODE_CHECK_INTERVAL_SECS` | No | `3600`      | How often (seconds) to check tracked shows for newly aired episodes (minimum: 300). |
+| `TRAKT_CATCHUP_LOOKBACK`     | No       | all-time       | Catch-up window: a show you've *watched* is auto-acquired to catch up on episodes aired since, if you last watched it within this window. `90d` / `12w` / `6mo` (or a bare number = days); `0`/unset = all-time. Anchored on Trakt's per-show `last_watched_at`. |
 | `UPGRADE_INTERVAL_SECS`      | No       | `86400`        | How often (seconds) to run the quality-upgrade + full-season consolidation pass. `0` disables the upgrade engine entirely. Default is daily (86 400 s); minimum 600 when non-zero. |
 | `UPGRADE_BUDGET_PER_TICK`    | No       | `20`           | Maximum number of owned titles re-scored per upgrade tick (round-robin across the library; minimum: 1). |
 | `UPGRADE_IDLE_SECS`          | No       | `300`          | Seconds of proxy read inactivity before a slot is considered idle enough to swap/prune (minimum: 30). Prevents swapping a file that is being actively streamed. |

@@ -61,6 +61,9 @@ pub enum DeviceTokenPoll {
 pub struct WatchedShow {
     pub tmdb_id: u64,
     pub watched_episodes: Vec<(u32, u32)>,
+    /// When the user last watched any episode of this show, as a Unix timestamp (seconds). `None`
+    /// if Trakt omitted/malformed `last_watched_at`. Drives the catch-up lookback window (SP2.5).
+    pub last_watched_at: Option<i64>,
 }
 
 /// A user's watched history.
@@ -502,9 +505,15 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
                     }
                 }
             }
+            let last_watched_at = e
+                .get("last_watched_at")
+                .and_then(|t| t.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp());
             Some(WatchedShow {
                 tmdb_id,
                 watched_episodes,
+                last_watched_at,
             })
         })
         .collect()
@@ -834,22 +843,36 @@ mod tests {
     }
 
     #[test]
-    fn parse_watched_shows_collects_episode_pairs_across_seasons() {
+    fn parse_watched_shows_collects_episode_pairs_and_last_watched_at() {
         let v = serde_json::json!([
             {
+                "last_watched_at": "2021-01-01T00:00:00.000Z",
                 "show": { "ids": { "tmdb": 1396 } },
                 "seasons": [
                     { "number": 1, "episodes": [{ "number": 1 }, { "number": 2 }] },
                     { "number": 2, "episodes": [{ "number": 1 }] },
                 ]
+            },
+            {
+                // no last_watched_at → None (still parsed)
+                "show": { "ids": { "tmdb": 1399 } },
+                "seasons": [{ "number": 1, "episodes": [{ "number": 1 }] }]
             }
         ]);
         assert_eq!(
             parse_watched_shows(&v),
-            vec![WatchedShow {
-                tmdb_id: 1396,
-                watched_episodes: vec![(1, 1), (1, 2), (2, 1)]
-            }]
+            vec![
+                WatchedShow {
+                    tmdb_id: 1396,
+                    watched_episodes: vec![(1, 1), (1, 2), (2, 1)],
+                    last_watched_at: Some(1_609_459_200), // 2021-01-01T00:00:00Z
+                },
+                WatchedShow {
+                    tmdb_id: 1399,
+                    watched_episodes: vec![(1, 1)],
+                    last_watched_at: None,
+                },
+            ]
         );
     }
 

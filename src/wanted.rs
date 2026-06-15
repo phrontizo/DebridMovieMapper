@@ -173,16 +173,42 @@ pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
                 vec![]
             }
         }
-        MediaType::Show => title
-            .aired_episodes
-            .iter()
-            .filter(|e| !episode_covered(title, e))
-            .map(|&(season, episode)| Action::AcquireEpisode {
-                tmdb_id: title.tmdb_id,
-                season,
-                episode,
-            })
-            .collect(),
+        MediaType::Show => {
+            // Symmetry with removal: don't acquire a show every watcher has finished (an ended
+            // show, fully watched). The Trigger-A watchlist guard means a watchlisted show is never
+            // "finished", so it still acquires — only in-progress-only finished shows are skipped.
+            if trigger_a_finished(&title.wanted, &title.aired_episodes) {
+                return vec![];
+            }
+            // Acquire aired episodes we don't already own. For a CATCH-UP show (wanted because it's
+            // been watched, not via the watchlist) skip episodes already watched — you only want to
+            // catch up on what you haven't seen. A WATCHLISTED show is an explicit "keep the whole
+            // show", so it acquires every aired episode regardless of watched state.
+            let watchlisted = title.wanted.iter().any(|r| r.sources.watchlist);
+            let watched: std::collections::HashSet<(u32, u32)> = if watchlisted {
+                std::collections::HashSet::new()
+            } else {
+                title
+                    .wanted
+                    .iter()
+                    .flat_map(|r| match &r.watched_state {
+                        WatchedState::Show { watched_episodes } => watched_episodes.clone(),
+                        WatchedState::Movie { .. } => Vec::new(),
+                    })
+                    .collect()
+            };
+            title
+                .aired_episodes
+                .iter()
+                .filter(|e| !episode_covered(title, e))
+                .filter(|e| !watched.contains(e))
+                .map(|&(season, episode)| Action::AcquireEpisode {
+                    tmdb_id: title.tmdb_id,
+                    season,
+                    episode,
+                })
+                .collect()
+        }
     }
 }
 
@@ -384,6 +410,91 @@ mod tests {
             vec![],
             "all aired owned+available → nothing to acquire"
         );
+    }
+
+    #[test]
+    fn catchup_show_acquires_only_unwatched_aired_episodes() {
+        // A show wanted via the CATCH-UP source (in-progress, not watchlisted): you've watched
+        // s1e1+s1e2; s1e3 has since aired. Acquire ONLY the unwatched episode (catch up), not the
+        // ones you've already seen.
+        let aired = vec![(1, 1), (1, 2), (1, 3)];
+        let t = show_title(
+            5,
+            vec![show_record(
+                "alice",
+                5,
+                /*watchlisted*/ false,
+                /*in_progress*/ true,
+                vec![(1, 1), (1, 2)],
+                ShowStatus::Returning,
+            )],
+            None,
+            aired,
+        );
+        assert_eq!(
+            reconcile_title(&t),
+            vec![Action::AcquireEpisode {
+                tmdb_id: 5,
+                season: 1,
+                episode: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn watchlisted_show_acquires_all_aired_even_already_watched() {
+        // A WATCHLISTED show is "keep the whole show": acquire every aired episode, including ones
+        // already watched (for a re-watch), unlike the catch-up source.
+        let aired = vec![(1, 1), (1, 2)];
+        let t = show_title(
+            6,
+            vec![show_record(
+                "alice",
+                6,
+                /*watchlisted*/ true,
+                /*in_progress*/ false,
+                vec![(1, 1)], // watched s1e1
+                ShowStatus::Returning,
+            )],
+            None,
+            aired,
+        );
+        assert_eq!(
+            reconcile_title(&t),
+            vec![
+                Action::AcquireEpisode {
+                    tmdb_id: 6,
+                    season: 1,
+                    episode: 1
+                },
+                Action::AcquireEpisode {
+                    tmdb_id: 6,
+                    season: 1,
+                    episode: 2
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn catchup_finished_ended_show_is_not_acquired() {
+        // A fully-watched ENDED show surfaced only via catch-up is finished → don't acquire it (the
+        // symmetry guard), so it can't oscillate acquire/remove.
+        let aired = vec![(1, 1), (1, 2)];
+        let t = show_title(
+            7,
+            vec![show_record(
+                "alice",
+                7,
+                /*watchlisted*/ false,
+                /*in_progress*/ true,
+                vec![(1, 1), (1, 2)], // all aired watched
+                ShowStatus::Ended,
+            )],
+            None,
+            aired,
+        );
+        assert_eq!(reconcile_title(&t), vec![]);
     }
 
     #[test]

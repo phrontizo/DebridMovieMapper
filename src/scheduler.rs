@@ -74,7 +74,12 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
                     let app = trakt_app.clone();
                     async move {
                         if let Some(trakt) = &app.trakt_client {
-                            sync_trakt(trakt, &app.tmdb_client, &app.store).await;
+                            let catchup = app
+                                .config
+                                .trakt
+                                .as_ref()
+                                .and_then(|t| t.catchup_lookback_secs);
+                            sync_trakt(trakt, &app.tmdb_client, &app.store, catchup).await;
                             reconcile_wanted(
                                 app.engine.as_ref(),
                                 &app.provider,
@@ -172,6 +177,7 @@ fn make_test_app(with_trakt: bool) -> crate::app_state::AppState {
         config.trakt = crate::config::TraktConfig::from_parts(
             Some("client_id".to_string()),
             Some("client_secret".to_string()),
+            None,
             None,
             None,
         );

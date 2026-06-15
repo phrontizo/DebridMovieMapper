@@ -87,6 +87,38 @@ pub struct TraktConfig {
     pub sync_interval_secs: u64,
     /// How often (seconds) to check for new episodes of tracked shows. Default 3600, min 300.
     pub episode_check_interval_secs: u64,
+    /// Catch-up lookback window (seconds): a show you've watched is auto-acquired (to catch up on
+    /// episodes aired since) only if you last watched it within this many seconds. `None` = all-time
+    /// (the default) — every show you've ever watched with unwatched aired episodes qualifies.
+    /// Parsed from `TRAKT_CATCHUP_LOOKBACK` (e.g. `90d`, `12w`, `6mo`; `0`/unset = all-time).
+    pub catchup_lookback_secs: Option<u64>,
+}
+
+/// Parse a catch-up lookback like `90d`, `12w`, `6mo` (or a bare number = days) into seconds.
+/// Empty / unset / `0` → `None` (all-time, no limit). An unparseable value warns and is treated as
+/// all-time rather than failing startup.
+pub fn parse_lookback(raw: &str) -> Option<u64> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, unit_secs): (&str, u64) = if let Some(n) = s.strip_suffix("mo") {
+        (n, 30 * 86_400)
+    } else if let Some(n) = s.strip_suffix('w') {
+        (n, 7 * 86_400)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86_400)
+    } else {
+        (s.as_str(), 86_400) // bare number → days
+    };
+    match num.trim().parse::<u64>() {
+        Ok(0) => None,
+        Ok(n) => Some(n.saturating_mul(unit_secs)),
+        Err(_) => {
+            warn!("Invalid TRAKT_CATCHUP_LOOKBACK value '{raw}'; treating as all-time");
+            None
+        }
+    }
 }
 
 impl TraktConfig {
@@ -99,6 +131,7 @@ impl TraktConfig {
         client_secret: Option<String>,
         sync_interval_secs: Option<String>,
         episode_check_interval_secs: Option<String>,
+        catchup_lookback: Option<String>,
     ) -> Option<TraktConfig> {
         let client_id = client_id
             .map(|s| s.trim().to_string())
@@ -136,11 +169,14 @@ impl TraktConfig {
         }
         .max(MIN_EPISODE);
 
+        let catchup_lookback_secs = catchup_lookback.as_deref().and_then(parse_lookback);
+
         Some(TraktConfig {
             client_id,
             client_secret,
             sync_interval_secs,
             episode_check_interval_secs,
+            catchup_lookback_secs,
         })
     }
 
@@ -153,6 +189,7 @@ impl TraktConfig {
             std::env::var("TRAKT_CLIENT_SECRET").ok(),
             std::env::var("TRAKT_SYNC_INTERVAL_SECS").ok(),
             std::env::var("TRAKT_EPISODE_CHECK_INTERVAL_SECS").ok(),
+            std::env::var("TRAKT_CATCHUP_LOOKBACK").ok(),
         )
     }
 }
@@ -649,7 +686,37 @@ mod tests {
             secret.map(String::from),
             sync.map(String::from),
             episode.map(String::from),
+            None, // catchup lookback: covered by its own tests
         )
+    }
+
+    #[test]
+    fn parse_lookback_units_and_defaults() {
+        assert_eq!(parse_lookback(""), None); // unset → all-time
+        assert_eq!(parse_lookback("  "), None);
+        assert_eq!(parse_lookback("0"), None); // explicit 0 → all-time
+        assert_eq!(parse_lookback("90"), Some(90 * 86_400)); // bare → days
+        assert_eq!(parse_lookback("90d"), Some(90 * 86_400));
+        assert_eq!(parse_lookback("12w"), Some(12 * 7 * 86_400));
+        assert_eq!(parse_lookback("6mo"), Some(6 * 30 * 86_400));
+        assert_eq!(parse_lookback("3MO"), Some(3 * 30 * 86_400)); // case-insensitive
+        assert_eq!(parse_lookback("garbage"), None); // unparseable → all-time
+    }
+
+    #[test]
+    fn trakt_catchup_lookback_parsed_into_config() {
+        let t = TraktConfig::from_parts(
+            Some("id".into()),
+            Some("sec".into()),
+            None,
+            None,
+            Some("6mo".into()),
+        )
+        .unwrap();
+        assert_eq!(t.catchup_lookback_secs, Some(6 * 30 * 86_400));
+        // unset → all-time (None)
+        let t2 = trakt(Some("id"), Some("sec"), None, None).unwrap();
+        assert_eq!(t2.catchup_lookback_secs, None);
     }
 
     #[test]

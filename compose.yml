@@ -65,6 +65,9 @@ services:
       - TRAKT_CLIENT_SECRET=${TRAKT_CLIENT_SECRET:-}
       # - TRAKT_SYNC_INTERVAL_SECS=900            # sync + reconcile cadence (min 60)
       # - TRAKT_EPISODE_CHECK_INTERVAL_SECS=3600  # episode-monitor cadence (min 300)
+      # Catch-up: auto-acquire episodes aired since you last watched a show. Lookback window —
+      # 90d / 12w / 6mo (or a bare number = days); unset/0 = all-time (default).
+      - TRAKT_CATCHUP_LOOKBACK=${TRAKT_CATCHUP_LOOKBACK:-}
 
       # ── Upgrade engine (SP3) ──────────────────────────────────────────────────
       # Daily quality-upgrade + full-season consolidation. On by default; set
