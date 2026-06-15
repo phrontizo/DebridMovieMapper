@@ -43,6 +43,9 @@ pub async fn run_scan_loop(
     scan_config: ScanConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Keep a clone of the whole bundle (all Arcs) for helpers that take `&AppState` (e.g. the
+    // duplicate-dedup pass), then destructure the original for the hot-path locals.
+    let app = scan_config.app.clone();
     let AppState {
         provider,
         tmdb_client,
@@ -273,6 +276,11 @@ pub async fn run_scan_loop(
                 // manual class), so the reconciler sees the user's pre-existing library (no duplicate
                 // re-acquire; season-pack episodes count owned).
                 record_mirror_owned(&store, &tmdb_client, &current_data).await;
+
+                // Duplicate-dedup: now the whole library is owned, plan + (if enabled, idle-gated)
+                // remove redundant duplicate torrents. Dry-run (log only) unless
+                // DEDUP_REMOVE_DUPLICATES is set.
+                dedup_owned(&app).await;
 
                 let current_ids: std::collections::HashSet<&str> =
                     deduped_torrents.iter().map(|t| t.id.as_str()).collect();
@@ -1040,6 +1048,202 @@ pub(crate) async fn group_owned_by_tmdb(
     owned_by
 }
 
+/// One title's deduplication decision: keep these owned hashes, remove these redundant ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DedupPlan {
+    pub media_type: MediaType,
+    pub tmdb_id: u64,
+    pub keep: Vec<String>,
+    pub remove: Vec<String>,
+}
+
+/// PURE duplicate planner. Within each `(media_type, tmdb_id)` group of **present** owned hashes,
+/// choose a minimal keep-set that still covers all owned content and mark fully-redundant
+/// duplicates for removal:
+/// - **Movie**: every hash is the same film → keep the single top-priority hash, remove the rest.
+/// - **Show**: a greedy set-cover over the episodes each hash `provides` — keep a hash only if it
+///   adds an episode not already covered by a higher-priority kept hash; a hash whose every episode
+///   is already covered is redundant → remove. Complementary packs/episodes are therefore all kept.
+///   A show hash with **empty `provides`** (unknown coverage) is **always kept** — never removed on
+///   a guess.
+///
+/// Keep-priority (highest kept first): currently-served (`selected`) > higher `quality.score` (an
+/// absent summary ranks lowest) > more episodes provided > lexicographically-smallest hash
+/// (deterministic). Only groups with at least one removal are returned. Absent (not-`present`)
+/// hashes are ignored entirely — they're already gone, never a removal target or coverage source.
+pub(crate) fn plan_dedup(
+    owned: &[(String, OwnedRecord)],
+    present: &std::collections::HashSet<String>,
+    selected: &std::collections::HashSet<String>,
+) -> Vec<DedupPlan> {
+    use std::collections::{BTreeMap, HashSet};
+    let mut groups: BTreeMap<(MediaType, u64), Vec<(String, &OwnedRecord)>> = BTreeMap::new();
+    for (hash, rec) in owned {
+        let h = hash.to_ascii_lowercase();
+        if !present.contains(&h) {
+            continue;
+        }
+        let mt = media_type_of(rec.request.kind);
+        groups
+            .entry((mt, rec.request.tmdb_id))
+            .or_default()
+            .push((h, rec));
+    }
+
+    let mut plans = Vec::new();
+    for ((media_type, tmdb_id), mut hashes) in groups {
+        if hashes.len() < 2 {
+            continue; // no possible duplicate
+        }
+        // Sort by keep-priority DESC; deterministic tie-break on hash ASC.
+        hashes.sort_by(|(ha, ra), (hb, rb)| {
+            let key = |h: &str, r: &OwnedRecord| {
+                (
+                    selected.contains(h),
+                    r.quality.as_ref().map(|q| q.score).unwrap_or(i64::MIN),
+                    r.provides.len(),
+                )
+            };
+            key(hb, rb).cmp(&key(ha, ra)).then_with(|| ha.cmp(hb))
+        });
+
+        let mut keep = Vec::new();
+        let mut remove = Vec::new();
+        match media_type {
+            MediaType::Movie => {
+                keep.push(hashes[0].0.clone());
+                for (h, _) in &hashes[1..] {
+                    remove.push(h.clone());
+                }
+            }
+            MediaType::Show => {
+                let mut covered: HashSet<(u32, u32)> = HashSet::new();
+                for (h, r) in &hashes {
+                    if r.provides.is_empty() {
+                        keep.push(h.clone()); // unknown coverage → never remove on a guess
+                        continue;
+                    }
+                    if r.provides.iter().any(|e| !covered.contains(e)) {
+                        keep.push(h.clone());
+                        covered.extend(r.provides.iter().copied());
+                    } else {
+                        remove.push(h.clone());
+                    }
+                }
+            }
+        }
+        if !remove.is_empty() {
+            plans.push(DedupPlan {
+                media_type,
+                tmdb_id,
+                keep,
+                remove,
+            });
+        }
+    }
+    plans
+}
+
+/// Run the duplicate-dedup pass over the current owned set + provider listing. Computes a
+/// [`plan_dedup`] and either logs it (dry-run) or executes removals. Destructive removal is gated on
+/// `config.dedup_remove_duplicates` (default `false` = dry-run, so the plan can be reviewed first)
+/// AND on the library being idle (`upgrade.idle_secs`), so a removal never interrupts an active
+/// stream — a redundant torrent being read is left until the next idle pass. Execution: delete each
+/// redundant torrent from the provider, drop its owned record, and clear any `selection` slot that
+/// pointed at it (the VFS re-derives the slot from the kept covering hash on the next scan).
+pub(crate) async fn dedup_owned(app: &AppState) {
+    let torrents = match app.provider.get_torrents().await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("dedup: get_torrents failed: {} — skipping this pass", e);
+            return;
+        }
+    };
+    let present: std::collections::HashSet<String> = torrents
+        .iter()
+        .map(|t| t.hash.to_ascii_lowercase())
+        .collect();
+    let id_by_hash: HashMap<String, String> = torrents
+        .iter()
+        .map(|t| (t.hash.to_ascii_lowercase(), t.id.clone()))
+        .collect();
+    let owned = app.store.all_owned().await;
+    let selection = app.store.all_selection().await;
+    let selected: std::collections::HashSet<String> = selection
+        .iter()
+        .map(|(_, e)| e.hash.to_ascii_lowercase())
+        .collect();
+
+    let plans = plan_dedup(&owned, &present, &selected);
+    if plans.is_empty() {
+        return;
+    }
+    let total: usize = plans.iter().map(|p| p.remove.len()).sum();
+    let removing = app.config.dedup_remove_duplicates;
+    info!(
+        "dedup: {} title(s) with duplicates, {} redundant torrent(s) — {}",
+        plans.len(),
+        total,
+        if removing {
+            "REMOVING"
+        } else {
+            "DRY RUN (set DEDUP_REMOVE_DUPLICATES=true to remove)"
+        }
+    );
+    let short = |h: &str| h.get(..8).unwrap_or(h).to_string();
+    for plan in &plans {
+        debug!(
+            "dedup: tmdb {} ({:?}) keep [{}] remove [{}]",
+            plan.tmdb_id,
+            plan.media_type,
+            plan.keep
+                .iter()
+                .map(|h| short(h))
+                .collect::<Vec<_>>()
+                .join(","),
+            plan.remove
+                .iter()
+                .map(|h| short(h))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    if !removing {
+        return;
+    }
+    // Idle-gate the destructive removals (don't interrupt an active stream).
+    let idle_window = Duration::from_secs(app.config.upgrade.idle_secs);
+    if !app.read_activity.all_idle(idle_window).await {
+        debug!("dedup: library not idle — deferring removals to a later pass");
+        return;
+    }
+    let mut removed = 0usize;
+    for plan in &plans {
+        for h in &plan.remove {
+            if let Some(id) = id_by_hash.get(h) {
+                if let Err(e) = app.provider.delete_torrent(id).await {
+                    warn!(
+                        "dedup: delete torrent for {} failed: {} — skipping",
+                        short(h),
+                        e
+                    );
+                    continue;
+                }
+            }
+            let _ = app.store.remove_owned(h.clone()).await;
+            // Clear any selection slot that pointed at the removed hash (the VFS re-derives it from
+            // the kept covering hash on the next scan).
+            for (slot, entry) in &selection {
+                if entry.hash.eq_ignore_ascii_case(h) {
+                    let _ = app.store.remove_selection(slot.clone()).await;
+                }
+            }
+            removed += 1;
+        }
+    }
+    info!("dedup: removed {} redundant torrent(s)", removed);
+}
+
 /// Group every wanted record by its `tmdb_id` into a `BTreeMap`. Shared by
 /// `plan_reconcile_ops` and `monitor_episodes` so the wanted-grouping lives in one place.
 pub(crate) async fn group_wanted_by_tmdb(
@@ -1794,6 +1998,158 @@ mod tests {
         // Engine record untouched (still Watchlist, never overwritten).
         let e = store.get_owned("eng".into()).await.expect("engine present");
         assert_eq!(e.provenance, Provenance::watchlist("alice"));
+    }
+
+    // ── plan_dedup (pure) ─────────────────────────────────────────────────────
+
+    fn dedup_rec(
+        kind: crate::scraper::MediaKind,
+        tmdb: u64,
+        provides: Vec<(u32, u32)>,
+        score: Option<i64>,
+    ) -> OwnedRecord {
+        use crate::vfs::MediaMetadata;
+        OwnedRecord {
+            request: AcquireRequest {
+                imdb_id: String::new(),
+                tmdb_id: tmdb,
+                kind,
+                season: None,
+                episode: None,
+                original_language: None,
+                metadata: MediaMetadata {
+                    title: "T".into(),
+                    year: None,
+                    media_type: media_type_of(kind),
+                    external_id: Some(format!("tmdb:{tmdb}")),
+                },
+            },
+            provenance: Provenance { entries: vec![] },
+            added_at: 0,
+            status: OwnedStatus::Verified,
+            provides,
+            quality: score.map(|s| crate::release::QualitySummary {
+                cached: true,
+                source_tier: 0,
+                resolution: 1080,
+                score: s,
+            }),
+        }
+    }
+
+    fn hset(items: &[&str]) -> std::collections::HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn plan_dedup_movie_keeps_highest_quality_removes_rest() {
+        use crate::scraper::MediaKind;
+        let owned = vec![
+            (
+                "a".to_string(),
+                dedup_rec(MediaKind::Movie, 1, vec![], Some(100)),
+            ),
+            (
+                "b".to_string(),
+                dedup_rec(MediaKind::Movie, 1, vec![], None),
+            ),
+            (
+                "c".to_string(),
+                dedup_rec(MediaKind::Movie, 1, vec![], Some(50)),
+            ),
+        ];
+        let plans = plan_dedup(&owned, &hset(&["a", "b", "c"]), &hset(&[]));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].keep, vec!["a"], "the highest-score hash is kept");
+        let mut rm = plans[0].remove.clone();
+        rm.sort();
+        assert_eq!(rm, vec!["b", "c"]);
+    }
+
+    #[test]
+    fn plan_dedup_movie_prefers_currently_served() {
+        use crate::scraper::MediaKind;
+        // `selected` outranks quality: keep the served (lower-score) hash to avoid disrupting playback.
+        let owned = vec![
+            (
+                "served".to_string(),
+                dedup_rec(MediaKind::Movie, 1, vec![], Some(10)),
+            ),
+            (
+                "better".to_string(),
+                dedup_rec(MediaKind::Movie, 1, vec![], Some(99)),
+            ),
+        ];
+        let plans = plan_dedup(&owned, &hset(&["served", "better"]), &hset(&["served"]));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].keep, vec!["served"]);
+        assert_eq!(plans[0].remove, vec!["better"]);
+    }
+
+    #[test]
+    fn plan_dedup_show_pack_supersedes_redundant_single() {
+        use crate::scraper::MediaKind;
+        let owned = vec![
+            (
+                "pack".to_string(),
+                dedup_rec(MediaKind::Series, 2, vec![(1, 1), (1, 2), (1, 3)], Some(10)),
+            ),
+            (
+                "single".to_string(),
+                dedup_rec(MediaKind::Series, 2, vec![(1, 1)], Some(5)),
+            ),
+        ];
+        let plans = plan_dedup(&owned, &hset(&["pack", "single"]), &hset(&[]));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].keep, vec!["pack"]);
+        assert_eq!(
+            plans[0].remove,
+            vec!["single"],
+            "the single is fully covered by the pack → redundant"
+        );
+    }
+
+    #[test]
+    fn plan_dedup_show_keeps_complementary_and_empty_provides() {
+        use crate::scraper::MediaKind;
+        // Complementary episode sets are NOT duplicates; an empty-provides hash is never removed.
+        let owned = vec![
+            (
+                "a".to_string(),
+                dedup_rec(MediaKind::Series, 3, vec![(1, 1), (1, 2)], Some(10)),
+            ),
+            (
+                "b".to_string(),
+                dedup_rec(MediaKind::Series, 3, vec![(1, 3), (1, 4)], Some(10)),
+            ),
+            (
+                "unknown".to_string(),
+                dedup_rec(MediaKind::Series, 3, vec![], None),
+            ),
+        ];
+        let plans = plan_dedup(&owned, &hset(&["a", "b", "unknown"]), &hset(&[]));
+        assert!(
+            plans.is_empty(),
+            "complementary packs + an unknown-coverage hash yield no removals"
+        );
+    }
+
+    #[test]
+    fn plan_dedup_ignores_absent_hashes_and_singletons() {
+        use crate::scraper::MediaKind;
+        let owned = vec![
+            (
+                "a".to_string(),
+                dedup_rec(MediaKind::Movie, 1, vec![], Some(10)),
+            ),
+            (
+                "b".to_string(),
+                dedup_rec(MediaKind::Movie, 1, vec![], Some(5)),
+            ),
+        ];
+        // Only `a` is present → no duplicate to act on (`b` is already gone from the provider).
+        let plans = plan_dedup(&owned, &hset(&["a"]), &hset(&[]));
+        assert!(plans.is_empty());
     }
 }
 

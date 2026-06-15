@@ -403,6 +403,10 @@ pub struct Config {
     pub trakt: Option<TraktConfig>,
     /// Upgrade-engine config (SP3). Always present; `upgrade.enabled()` gates the job.
     pub upgrade: UpgradeConfig,
+    /// When `true`, the duplicate-dedup pass actually DELETES redundant torrents from the provider.
+    /// Default `false` = dry-run (logs the plan only). Set `DEDUP_REMOVE_DUPLICATES=true` to enable
+    /// destructive removal once the logged plan has been reviewed.
+    pub dedup_remove_duplicates: bool,
 }
 
 impl Config {
@@ -419,6 +423,14 @@ impl Config {
         cfg.acquisition = AcquisitionConfig::from_env();
         cfg.trakt = TraktConfig::from_env();
         cfg.upgrade = UpgradeConfig::from_env();
+        cfg.dedup_remove_duplicates = std::env::var("DEDUP_REMOVE_DUPLICATES")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
         Ok(cfg)
     }
 
@@ -473,6 +485,7 @@ impl Config {
             acquisition: AcquisitionConfig::default(),
             trakt: None,
             upgrade: UpgradeConfig::default(),
+            dedup_remove_duplicates: false,
         })
     }
 }

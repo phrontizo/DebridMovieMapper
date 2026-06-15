@@ -69,6 +69,7 @@ JELLYFIN_RCLONE_MOUNT_PATH=/media
 # UPGRADE_BUDGET_PER_TICK=20     # max titles re-scored per tick (default: 20)
 # UPGRADE_IDLE_SECS=300          # proxy-read inactivity window before a slot may be swapped (default: 300)
 # ACQUIRE_DEAD_TIMEOUT_SECS=600  # seconds before an unresolved Pending torrent is reaped + re-scraped (default: 600)
+# DEDUP_REMOVE_DUPLICATES=false  # actually delete redundant duplicate torrents (default: false = dry-run / log only)
 
 # Optional: acquisition preferences (see Acquisition section below)
 # SCRAPER_ADDON_URL=https://torrentio.strem.fun/realdebrid=TOKEN   # override scraper URL
@@ -117,6 +118,7 @@ A debrid provider token is required: set **exactly one** of `RD_API_TOKEN` or `T
 | `UPGRADE_IDLE_SECS`          | No       | `300`          | Seconds of proxy read inactivity before a slot is considered idle enough to swap/prune (minimum: 30). Prevents swapping a file that is being actively streamed. |
 | `UPGRADE_STAGE_MAX_SECS`     | No       | `604800`       | Reserved/informational: maximum age of a staged upgrade before it is abandoned (minimum: 3600). |
 | `ACQUIRE_DEAD_TIMEOUT_SECS`  | No       | `600`          | Seconds an optimistically-added `Pending` torrent may remain unresolved before `observe` reaps it as dead, blacklists its hash, and re-scrapes (minimum: 120). |
+| `DEDUP_REMOVE_DUPLICATES`    | No       | `false`        | When `true`, the duplicate-dedup pass **deletes** redundant torrents (a title covered by more than one torrent → keep one, remove the rest, only ever removing a torrent whose content is fully covered by a kept one). Default `false` = dry-run (logs the plan only). Idle-gated like upgrades, so it never interrupts an active stream. |
 
 \* Exactly one of `RD_API_TOKEN` / `TORBOX_API_KEY` must be set — not both, and not neither.
 
