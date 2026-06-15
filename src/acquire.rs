@@ -642,6 +642,16 @@ impl AcquisitionEngine {
                 t.status.as_str(),
                 "magnet_error" | "dead" | "error" | "virus"
             ) {
+                // A Manual-provenance torrent (the account mirror / a hand-added title) is never
+                // auto-deleted+re-acquired: it carries no scraped IMDB id to re-scrape from, and
+                // "manual adds are never auto-removed". Leave it for on-read repair (dav_fs) instead.
+                if rec.provenance.has_manual_entry() {
+                    debug!(
+                        "observe: tmdb {} hash {} provider status={:?} but Manual — leaving in place",
+                        rec.request.tmdb_id, hash, t.status
+                    );
+                    continue;
+                }
                 debug!(
                     "observe: tmdb {} hash {} provider status={:?} — dead",
                     rec.request.tmdb_id, hash, t.status

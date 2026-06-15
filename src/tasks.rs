@@ -6,7 +6,9 @@ use crate::provider::DebridProvider;
 use crate::rd_client::Torrent;
 use crate::repair::RepairManager;
 use crate::scraper::MediaKind;
-use crate::store::{AcquireRequest, Provenance, ProvenanceEntry, Store, WantedRecord};
+use crate::store::{
+    AcquireRequest, OwnedRecord, OwnedStatus, Provenance, ProvenanceEntry, Store, WantedRecord,
+};
 use crate::tmdb_client::TmdbClient;
 use crate::vfs::{DebridVfs, MediaMetadata, MediaType};
 use futures_util::StreamExt;
@@ -265,6 +267,11 @@ pub async fn run_scan_loop(
                     )
                     .await;
                 }
+
+                // Account-mirror: record every identified present torrent the engine doesn't already
+                // track as a Manual-provenance owned record, so the reconciler sees the user's
+                // pre-existing library (no duplicate re-acquire; season-pack episodes count owned).
+                record_mirror_owned(&store, &current_data).await;
 
                 let current_ids: std::collections::HashSet<&str> =
                     deduped_torrents.iter().map(|t| t.id.as_str()).collect();
@@ -761,6 +768,96 @@ fn media_type_of(kind: MediaKind) -> MediaType {
     match kind {
         MediaKind::Movie => MediaType::Movie,
         MediaKind::Series => MediaType::Show,
+    }
+}
+
+/// Inverse of [`media_type_of`]: the VFS `MediaType` → scraper `MediaKind`.
+fn kind_of(media_type: &MediaType) -> MediaKind {
+    match media_type {
+        MediaType::Movie => MediaKind::Movie,
+        MediaType::Show => MediaKind::Series,
+    }
+}
+
+/// The numeric tmdb id from a `MediaMetadata.external_id` like `"tmdb:1396"` (else `None`).
+fn meta_tmdb_id(metadata: &MediaMetadata) -> Option<u64> {
+    metadata
+        .external_id
+        .as_deref()
+        .and_then(|s| s.strip_prefix("tmdb:"))
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+/// Record every identified, present provider torrent the engine doesn't already track as a
+/// **`Manual`-provenance owned record** (the "account mirror"). This makes the reconciler aware of
+/// the user's pre-existing library so it never re-acquires a title that is already present (the
+/// duplicate fix) and so a season pack's episodes count as owned (kills `monitor_episodes` churn).
+///
+/// Idempotent and non-destructive: a hash the engine already owns (or a previously-recorded mirror
+/// hash) is left untouched, so an in-flight `Pending` acquisition or an engine record's
+/// provenance/quality/`provides` is never clobbered. `Manual` provenance means the lifecycle
+/// reconciler never auto-removes these (`Provenance::has_manual_entry`). `provides` for a show is
+/// the SE-parsed set of its selected video files (a movie's is empty); `quality` is `None` (no
+/// scraped release info for a mirror torrent — the upgrade engine tolerates `None`).
+pub(crate) async fn record_mirror_owned(
+    store: &Store,
+    current_data: &[(crate::rd_client::TorrentInfo, MediaMetadata)],
+) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut recorded = 0usize;
+    for (info, metadata) in current_data {
+        let Some(tmdb_id) = meta_tmdb_id(metadata) else {
+            continue;
+        };
+        let hash = info.hash.to_ascii_lowercase();
+        if hash.is_empty() {
+            continue;
+        }
+        // Engine-owned OR already-mirrored → leave untouched (idempotent; never clobber an
+        // in-flight Pending acquisition or an engine record's provenance/provides/quality).
+        if store.get_owned(hash.clone()).await.is_some() {
+            continue;
+        }
+        let kind = kind_of(&metadata.media_type);
+        let provides: Vec<(u32, u32)> = match kind {
+            MediaKind::Series => crate::acquire::episode_files(info)
+                .into_iter()
+                .map(|(s, e, _)| (s, e))
+                .collect(),
+            MediaKind::Movie => Vec::new(),
+        };
+        let rec = OwnedRecord {
+            request: AcquireRequest {
+                // No scraped IMDB id for a mirror torrent; left empty. A `Manual` record is never
+                // re-acquired by `observe` (it skips manual-provenance torrents), so the empty id
+                // is never used to scrape.
+                imdb_id: String::new(),
+                tmdb_id,
+                kind,
+                season: None,
+                episode: None,
+                original_language: None,
+                metadata: metadata.clone(),
+            },
+            provenance: Provenance::manual(),
+            added_at: now,
+            status: OwnedStatus::Verified,
+            provides,
+            quality: None,
+        };
+        match store.put_owned(hash.clone(), rec).await {
+            Ok(()) => recorded += 1,
+            Err(e) => warn!("mirror: failed to record owned {}: {}", hash, e),
+        }
+    }
+    if recorded > 0 {
+        info!(
+            "mirror: recorded {} pre-existing torrent(s) as owned",
+            recorded
+        );
     }
 }
 
@@ -1549,6 +1646,127 @@ mod tests {
             vec![(1, 1), (1, 2), (1, 3)],
             "owned_episodes is the union of provides, not the request's single (s,e)"
         );
+    }
+
+    #[tokio::test]
+    async fn record_mirror_owned_adds_manual_records_and_preserves_engine() {
+        use crate::scraper::MediaKind;
+        use crate::store::{AcquireRequest, OwnedRecord, OwnedStatus, Provenance, Store};
+        use crate::vfs::{MediaMetadata, MediaType};
+        let store = Store::from_database(std::sync::Arc::new(
+            redb::Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        ))
+        .unwrap();
+
+        // An engine-owned hash already tracked — the mirror pass must NOT clobber it.
+        store
+            .put_owned(
+                "eng".into(),
+                OwnedRecord {
+                    request: AcquireRequest {
+                        imdb_id: "tt1".into(),
+                        tmdb_id: 27205,
+                        kind: MediaKind::Movie,
+                        season: None,
+                        episode: None,
+                        original_language: None,
+                        metadata: MediaMetadata {
+                            title: "Inception".into(),
+                            year: Some("2010".into()),
+                            media_type: MediaType::Movie,
+                            external_id: Some("tmdb:27205".into()),
+                        },
+                    },
+                    provenance: Provenance::watchlist("alice"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let file = |id: u32, path: &str| crate::rd_client::TorrentFile {
+            id,
+            path: path.into(),
+            bytes: 100,
+            selected: 1,
+        };
+        let movie = (
+            crate::rd_client::TorrentInfo {
+                hash: "MOVIEHASH".into(),
+                files: vec![file(0, "The Matrix (1999).mkv")],
+                ..Default::default()
+            },
+            MediaMetadata {
+                title: "The Matrix".into(),
+                year: Some("1999".into()),
+                media_type: MediaType::Movie,
+                external_id: Some("tmdb:603".into()),
+            },
+        );
+        let pack = (
+            crate::rd_client::TorrentInfo {
+                hash: "PACKHASH".into(),
+                files: vec![
+                    file(0, "Show - S01E01.mkv"),
+                    file(1, "Show - S01E02.mkv"),
+                    file(2, "Menu Art.mkv"), // no SxxExx → skipped from provides
+                ],
+                ..Default::default()
+            },
+            MediaMetadata {
+                title: "Show".into(),
+                year: None,
+                media_type: MediaType::Show,
+                external_id: Some("tmdb:1396".into()),
+            },
+        );
+        // The engine hash re-appears in the listing (upper-cased) — must stay as the engine left it.
+        let eng = (
+            crate::rd_client::TorrentInfo {
+                hash: "ENG".into(),
+                ..Default::default()
+            },
+            MediaMetadata {
+                title: "Inception".into(),
+                year: Some("2010".into()),
+                media_type: MediaType::Movie,
+                external_id: Some("tmdb:27205".into()),
+            },
+        );
+
+        record_mirror_owned(&store, &[movie, pack, eng]).await;
+
+        let m = store
+            .get_owned("moviehash".into())
+            .await
+            .expect("movie recorded");
+        assert!(m.provenance.has_manual_entry());
+        assert_eq!(m.status, OwnedStatus::Verified);
+        assert_eq!(m.request.tmdb_id, 603);
+        assert!(m.provides.is_empty(), "a movie provides no episodes");
+
+        let p = store
+            .get_owned("packhash".into())
+            .await
+            .expect("pack recorded");
+        assert!(p.provenance.has_manual_entry());
+        let mut eps = p.provides.clone();
+        eps.sort_unstable();
+        assert_eq!(
+            eps,
+            vec![(1, 1), (1, 2)],
+            "pack provides = SE-parsed episode files (Menu Art skipped)"
+        );
+
+        // Engine record untouched (still Watchlist, never overwritten to Manual).
+        let e = store.get_owned("eng".into()).await.expect("engine present");
+        assert!(!e.provenance.has_manual_entry());
+        assert_eq!(e.provenance, Provenance::watchlist("alice"));
     }
 }
 
