@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Resolve a torrent's metadata: an authoritative `hash -> MediaMetadata` (recorded by the
 /// acquisition engine for content we chose) wins over filename-based TMDB identification.
@@ -417,6 +417,8 @@ pub(crate) fn build_wanted(
         media_type: MediaType,
         watchlist: bool,
         in_progress: bool,
+        /// First non-empty IMDB id seen for this title across its source rows.
+        imdb_id: Option<String>,
     }
     // Keyed by (media_type, tmdb_id): TMDB movie and TV id-spaces are independent, so a movie and a
     // show that share a numeric id must NOT be merged into one record. BTreeMap keeps the output
@@ -424,22 +426,32 @@ pub(crate) fn build_wanted(
     let mut agg: std::collections::BTreeMap<(MediaType, u64), Agg> =
         std::collections::BTreeMap::new();
     for item in watchlist {
-        agg.entry((item.media_type.clone(), item.tmdb_id))
+        let a = agg
+            .entry((item.media_type.clone(), item.tmdb_id))
             .or_insert_with(|| Agg {
                 media_type: item.media_type.clone(),
                 watchlist: false,
                 in_progress: false,
-            })
-            .watchlist = true;
+                imdb_id: None,
+            });
+        a.watchlist = true;
+        if a.imdb_id.is_none() {
+            a.imdb_id = item.imdb_id.clone();
+        }
     }
     for item in in_progress {
-        agg.entry((item.media_type.clone(), item.tmdb_id))
+        let a = agg
+            .entry((item.media_type.clone(), item.tmdb_id))
             .or_insert_with(|| Agg {
                 media_type: item.media_type.clone(),
                 watchlist: false,
                 in_progress: false,
-            })
-            .in_progress = true;
+                imdb_id: None,
+            });
+        a.in_progress = true;
+        if a.imdb_id.is_none() {
+            a.imdb_id = item.imdb_id.clone();
+        }
     }
 
     agg.into_iter()
@@ -474,6 +486,7 @@ pub(crate) fn build_wanted(
                 },
                 watched_state,
                 show_status: status,
+                imdb_id: a.imdb_id,
             }
         })
         .collect()
@@ -660,6 +673,8 @@ pub(crate) enum ReconcileOp {
         season: Option<u32>,
         episode: Option<u32>,
         provenance: Provenance,
+        /// IMDB id Trakt supplied for this title (preferred over re-deriving from TMDB).
+        imdb_id: Option<String>,
     },
     Remove {
         tmdb_id: u64,
@@ -667,23 +682,48 @@ pub(crate) enum ReconcileOp {
     },
 }
 
-/// Build the `AcquireRequest` for `tmdb_id`: resolve the IMDB id and (title, year,
-/// original_language) from TMDB. Any TMDB failure → `Err` (the caller logs and skips).
-/// TMDB-dependent, so it is exercised by the live smoke rather than unit tests.
+/// The IMDB id Trakt supplied for a title (first non-empty across its wanted rows). Preferred over
+/// re-deriving from TMDB, whose `external_ids` are incomplete for some titles (e.g. a TVDB-only
+/// show), which would otherwise leave the title permanently unacquirable.
+fn imdb_hint_from_wanted(wanted: &[WantedRecord]) -> Option<String> {
+    wanted
+        .iter()
+        .find_map(|r| r.imdb_id.clone().filter(|s| !s.trim().is_empty()))
+}
+
+/// Pick the IMDB id to scrape with: Trakt's (preferred — present whenever Trakt knows the title)
+/// else TMDB's `external_ids` (can be missing for TVDB-only titles). `None` ⇒ no IMDB id anywhere,
+/// so the title is unacquirable via the IMDB-keyed scraper and is skipped (not an error).
+fn choose_imdb(trakt_hint: Option<String>, tmdb_external: Option<String>) -> Option<String> {
+    trakt_hint
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| tmdb_external.filter(|s| !s.trim().is_empty()))
+}
+
+/// Build the `AcquireRequest` for `tmdb_id`: resolve the IMDB id (preferring Trakt's `imdb_hint`
+/// over TMDB's `external_ids`) and (title, year, original_language) from TMDB. Returns `Ok(None)`
+/// when no IMDB id exists anywhere — the title can't be scraped (Torrentio is IMDB-keyed) and is
+/// skipped quietly. Any TMDB failure → `Err` (the caller logs and skips). TMDB-dependent, so the
+/// happy path is exercised by the live smoke rather than unit tests.
 async fn build_acquire_request(
     tmdb: &TmdbClient,
     tmdb_id: u64,
     kind: MediaKind,
     season: Option<u32>,
     episode: Option<u32>,
-) -> Result<AcquireRequest, AppError> {
+    imdb_hint: Option<String>,
+) -> Result<Option<AcquireRequest>, AppError> {
     let media_type = media_type_of(kind);
-    let imdb_id = tmdb
-        .external_imdb_id(tmdb_id, media_type.clone())
-        .await?
-        .ok_or_else(|| AppError::Config(format!("no IMDB id for tmdb {}", tmdb_id)))?;
+    // Only hit TMDB's external_ids when Trakt didn't already give us an IMDB id.
+    let tmdb_external = match &imdb_hint {
+        Some(_) => None,
+        None => tmdb.external_imdb_id(tmdb_id, media_type.clone()).await?,
+    };
+    let Some(imdb_id) = choose_imdb(imdb_hint, tmdb_external) else {
+        return Ok(None);
+    };
     let (title, year, original_language) = tmdb.details(tmdb_id, media_type.clone()).await?;
-    Ok(AcquireRequest {
+    Ok(Some(AcquireRequest {
         imdb_id,
         tmdb_id,
         kind,
@@ -696,7 +736,7 @@ async fn build_acquire_request(
             media_type,
             external_id: Some(format!("tmdb:{}", tmdb_id)),
         },
-    })
+    }))
 }
 
 /// An aggregated view of every owned record sharing a `tmdb_id`: all (lowercased) hashes, the
@@ -834,6 +874,7 @@ pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> V
                                 season: None,
                                 episode: None,
                                 provenance: prov,
+                                imdb_id: imdb_hint_from_wanted(&wanted),
                             });
                         }
                         // Delete EVERY owned hash for this tmdb_id (the Action's `hash` is a representative).
@@ -909,8 +950,10 @@ async fn execute_remove(
     }
 }
 
-/// Execute an `Acquire`: build the request from TMDB, then drive the SP1 engine, recording the
-/// supplied provenance. TMDB/engine-dependent — exercised by the live smoke.
+/// Execute an `Acquire`: build the request from TMDB (preferring Trakt's `imdb_hint`), then drive
+/// the SP1 engine, recording the supplied provenance. A title with no IMDB id anywhere is skipped
+/// quietly (it can't be scraped). TMDB/engine-dependent — exercised by the live smoke.
+#[allow(clippy::too_many_arguments)]
 async fn execute_acquire(
     engine: &AcquisitionEngine,
     tmdb: &TmdbClient,
@@ -919,12 +962,17 @@ async fn execute_acquire(
     season: Option<u32>,
     episode: Option<u32>,
     provenance: Provenance,
+    imdb_hint: Option<String>,
 ) {
-    match build_acquire_request(tmdb, tmdb_id, kind, season, episode).await {
-        Ok(req) => {
+    match build_acquire_request(tmdb, tmdb_id, kind, season, episode, imdb_hint).await {
+        Ok(Some(req)) => {
             let outcome = engine.acquire(req, provenance).await;
             info!("reconcile: acquire tmdb {} -> {:?}", tmdb_id, outcome);
         }
+        Ok(None) => debug!(
+            "reconcile: skip tmdb {} — no IMDB id from Trakt or TMDB (unacquirable via IMDB-keyed scraper)",
+            tmdb_id
+        ),
         Err(e) => warn!(
             "reconcile: build_acquire_request for tmdb {} failed: {}",
             tmdb_id, e
@@ -960,7 +1008,13 @@ pub async fn reconcile_wanted(
                 season,
                 episode,
                 provenance,
-            } => execute_acquire(engine, tmdb, tmdb_id, kind, season, episode, provenance).await,
+                imdb_id,
+            } => {
+                execute_acquire(
+                    engine, tmdb, tmdb_id, kind, season, episode, provenance, imdb_id,
+                )
+                .await
+            }
         }
     }
 }
@@ -1163,6 +1217,7 @@ pub async fn monitor_episodes(
                         Some(season),
                         Some(episode),
                         prov,
+                        imdb_hint_from_wanted(wanted),
                     )
                     .await;
                 }
@@ -1431,6 +1486,15 @@ mod trakt_sync_tests {
         TraktItem {
             media_type,
             tmdb_id,
+            imdb_id: None,
+        }
+    }
+
+    fn item_imdb(media_type: MediaType, tmdb_id: u64, imdb_id: &str) -> TraktItem {
+        TraktItem {
+            media_type,
+            tmdb_id,
+            imdb_id: Some(imdb_id.to_string()),
         }
     }
 
@@ -1455,6 +1519,7 @@ mod trakt_sync_tests {
             },
             watched_state: WatchedState::Movie { watched: false },
             show_status: None,
+            imdb_id: None,
         }
     }
 
@@ -1481,6 +1546,7 @@ mod trakt_sync_tests {
                 },
                 watched_state: WatchedState::Movie { watched: false },
                 show_status: None,
+                imdb_id: None,
             }]
         );
     }
@@ -1517,6 +1583,7 @@ mod trakt_sync_tests {
                     watched_episodes: vec![(1, 1), (1, 2)]
                 },
                 show_status: Some(ShowStatus::Ended),
+                imdb_id: None,
             }]
         );
     }
@@ -1593,8 +1660,22 @@ mod trakt_sync_tests {
                     watched_episodes: vec![]
                 },
                 show_status: None,
+                imdb_id: None,
             }]
         );
+    }
+
+    #[test]
+    fn build_wanted_carries_imdb_from_trakt_item() {
+        let got = build_wanted(
+            "alice",
+            &[item_imdb(MediaType::Movie, 27205, "tt1375666")],
+            &[],
+            &WatchedData::default(),
+            &HashMap::new(),
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].imdb_id, Some("tt1375666".into()));
     }
 
     #[test]
@@ -1936,6 +2017,7 @@ mod reconcile_wanted_tests {
             },
             watched_state: WatchedState::Movie { watched },
             show_status: None,
+            imdb_id: None,
         }
     }
 
@@ -1952,6 +2034,7 @@ mod reconcile_wanted_tests {
                 watched_episodes: vec![],
             },
             show_status: Some(ShowStatus::Returning),
+            imdb_id: None,
         }
     }
 
@@ -2053,8 +2136,72 @@ mod reconcile_wanted_tests {
                 season: None,
                 episode: None,
                 provenance: Provenance::watchlist("alice"),
+                imdb_id: None,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn plan_acquire_carries_trakt_imdb_hint() {
+        // A wanted movie whose Trakt row carries an IMDB id must surface that id on the Acquire op,
+        // so acquisition can use it directly instead of re-deriving from TMDB (which can be empty).
+        let store = mem_store();
+        store
+            .put_wanted(WantedRecord {
+                imdb_id: Some("tt1375666".into()),
+                ..wanted_movie("alice", 27205, true, false, false)
+            })
+            .await
+            .unwrap();
+        let ops = plan_reconcile_ops(&store, &[]).await;
+        assert_eq!(
+            ops,
+            vec![ReconcileOp::Acquire {
+                tmdb_id: 27205,
+                kind: MediaKind::Movie,
+                season: None,
+                episode: None,
+                provenance: Provenance::watchlist("alice"),
+                imdb_id: Some("tt1375666".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn choose_imdb_prefers_trakt_then_tmdb_then_none() {
+        // Trakt hint wins when present.
+        assert_eq!(
+            choose_imdb(Some("tt_trakt".into()), Some("tt_tmdb".into())),
+            Some("tt_trakt".into())
+        );
+        // Falls back to TMDB's external id when Trakt has none.
+        assert_eq!(
+            choose_imdb(None, Some("tt_tmdb".into())),
+            Some("tt_tmdb".into())
+        );
+        // Blank Trakt hint is ignored (falls through to TMDB).
+        assert_eq!(
+            choose_imdb(Some("  ".into()), Some("tt_tmdb".into())),
+            Some("tt_tmdb".into())
+        );
+        // No id anywhere → None (caller skips the title quietly — it can't be scraped).
+        assert_eq!(choose_imdb(None, None), None);
+    }
+
+    #[test]
+    fn imdb_hint_from_wanted_picks_first_non_empty() {
+        let rows = vec![
+            WantedRecord {
+                imdb_id: None,
+                ..wanted_movie("alice", 27205, true, false, false)
+            },
+            WantedRecord {
+                imdb_id: Some("tt1375666".into()),
+                ..wanted_movie("bob", 27205, false, true, false)
+            },
+        ];
+        assert_eq!(imdb_hint_from_wanted(&rows), Some("tt1375666".into()));
+        assert_eq!(imdb_hint_from_wanted(&[]), None);
     }
 
     #[tokio::test]
@@ -2107,6 +2254,7 @@ mod reconcile_wanted_tests {
                 season: None,
                 episode: None,
                 provenance: Provenance::watchlist("alice"),
+                imdb_id: None,
             }]
         );
     }

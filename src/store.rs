@@ -204,6 +204,13 @@ pub struct WantedRecord {
     pub sources: WantedSources,
     pub watched_state: WatchedState,
     pub show_status: Option<crate::tmdb_client::ShowStatus>, // None for movies
+    /// The IMDB id Trakt supplied for this title (`tt…`), if any. Preferred over re-deriving the
+    /// id from TMDB's `external_ids` when acquiring, because TMDB's mapping is incomplete for some
+    /// titles (e.g. a TVDB-only show), which would otherwise leave the title permanently
+    /// unacquirable. `#[serde(default)]` keeps pre-existing rows (which lack it) readable; they are
+    /// backfilled on the next Trakt sync, which rewrites the whole wanted-set.
+    #[serde(default)]
+    pub imdb_id: Option<String>,
 }
 
 /// Why opening the on-disk database failed, split by recovery strategy.
@@ -1460,6 +1467,7 @@ mod tests {
             },
             watched_state: WatchedState::Movie { watched: false },
             show_status: None,
+            imdb_id: None,
         }
     }
 
@@ -1476,7 +1484,21 @@ mod tests {
                 watched_episodes: vec![(1, 1), (1, 2), (2, 1)],
             },
             show_status: Some(ShowStatus::Ended),
+            imdb_id: None,
         }
+    }
+
+    #[test]
+    fn wanted_record_legacy_row_without_imdb_field_reads_back_as_none() {
+        // Backward-compat: rows persisted before the additive `imdb_id` field must still
+        // deserialize (as None) so an existing DB isn't broken — they're rewritten with the field
+        // on the next Trakt sync. Simulate a legacy row by dropping the key from the JSON.
+        let rec = movie_wanted("alice", 27205);
+        let mut val = serde_json::to_value(&rec).unwrap();
+        val.as_object_mut().unwrap().remove("imdb_id");
+        let back: WantedRecord = serde_json::from_value(val).expect("legacy row must read back");
+        assert_eq!(back.imdb_id, None);
+        assert_eq!(back, rec);
     }
 
     #[tokio::test]

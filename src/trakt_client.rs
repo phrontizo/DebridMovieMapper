@@ -8,11 +8,14 @@ use crate::ratelimit::AdaptiveRateLimiter;
 use crate::vfs::MediaType;
 use async_trait::async_trait;
 
-/// A movie or show identified by its TMDB id (a watchlist or playback entry).
+/// A movie or show identified by its TMDB id (a watchlist or playback entry). Also carries the
+/// IMDB id Trakt provided (`tt…`), if present, so acquisition can prefer it over re-deriving from
+/// TMDB's (sometimes-incomplete) `external_ids`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraktItem {
     pub media_type: MediaType,
     pub tmdb_id: u64,
+    pub imdb_id: Option<String>,
 }
 
 /// Device-flow code response (`POST /oauth/device/code`).
@@ -327,6 +330,16 @@ fn tmdb_id_of(obj: &serde_json::Value) -> Option<u64> {
         .and_then(|t| t.as_u64())
 }
 
+/// The IMDB id (`tt…`) from a Trakt item's `ids` object, if present and non-empty.
+fn imdb_id_of(obj: &serde_json::Value) -> Option<String> {
+    obj.get("ids")
+        .and_then(|i| i.get("imdb"))
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Parse the `POST /oauth/device/code` response.
 pub fn parse_device_code(v: &serde_json::Value) -> DeviceCode {
     DeviceCode {
@@ -400,10 +413,12 @@ pub fn parse_watchlist(v: &serde_json::Value, media_type: MediaType) -> Vec<Trak
     };
     arr.iter()
         .filter_map(|e| {
-            let tmdb_id = tmdb_id_of(e.get(key)?)?;
+            let obj = e.get(key)?;
+            let tmdb_id = tmdb_id_of(obj)?;
             Some(TraktItem {
                 media_type: media_type.clone(),
                 tmdb_id,
+                imdb_id: imdb_id_of(obj),
             })
         })
         .collect()
@@ -419,16 +434,19 @@ pub fn parse_playback(v: &serde_json::Value) -> Vec<TraktItem> {
     let mut out: Vec<TraktItem> = Vec::new();
     for e in arr {
         let item = match e.get("type").and_then(|t| t.as_str()) {
-            Some("movie") => e
-                .get("movie")
-                .and_then(tmdb_id_of)
-                .map(|tmdb_id| TraktItem {
+            Some("movie") => e.get("movie").and_then(|m| {
+                Some(TraktItem {
                     media_type: MediaType::Movie,
-                    tmdb_id,
-                }),
-            Some("episode") => e.get("show").and_then(tmdb_id_of).map(|tmdb_id| TraktItem {
-                media_type: MediaType::Show,
-                tmdb_id,
+                    tmdb_id: tmdb_id_of(m)?,
+                    imdb_id: imdb_id_of(m),
+                })
+            }),
+            Some("episode") => e.get("show").and_then(|s| {
+                Some(TraktItem {
+                    media_type: MediaType::Show,
+                    tmdb_id: tmdb_id_of(s)?,
+                    imdb_id: imdb_id_of(s),
+                })
             }),
             _ => None,
         };
@@ -739,9 +757,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_watchlist_movies_extracts_tmdb_and_skips_missing() {
+    fn parse_watchlist_movies_extracts_tmdb_and_imdb_and_skips_missing() {
         let v = serde_json::json!([
-            { "movie": { "title": "Inception", "ids": { "tmdb": 27205 } } },
+            { "movie": { "title": "Inception", "ids": { "tmdb": 27205, "imdb": "tt1375666" } } },
             { "movie": { "title": "No TMDB", "ids": { "imdb": "tt1" } } },
             { "movie": { "title": "String TMDB", "ids": { "tmdb": "27205" } } }, // string → as_u64() returns None → skipped
         ]);
@@ -749,31 +767,42 @@ mod tests {
             parse_watchlist(&v, MediaType::Movie),
             vec![TraktItem {
                 media_type: MediaType::Movie,
-                tmdb_id: 27205
+                tmdb_id: 27205,
+                imdb_id: Some("tt1375666".into()),
             }]
         );
     }
 
     #[test]
-    fn parse_watchlist_shows_sets_show_media_type() {
+    fn parse_watchlist_shows_sets_show_media_type_and_carries_imdb() {
         let v = serde_json::json!([
-            { "show": { "title": "Breaking Bad", "ids": { "tmdb": 1396 } } },
+            { "show": { "title": "Breaking Bad", "ids": { "tmdb": 1396, "imdb": "tt0903747" } } },
+            // A TVDB-only show (no imdb in ids) still parses — imdb_id is None, to be resolved later.
+            { "show": { "title": "TVDB Only", "ids": { "tmdb": 1397, "tvdb": 478508 } } },
         ]);
         assert_eq!(
             parse_watchlist(&v, MediaType::Show),
-            vec![TraktItem {
-                media_type: MediaType::Show,
-                tmdb_id: 1396
-            }]
+            vec![
+                TraktItem {
+                    media_type: MediaType::Show,
+                    tmdb_id: 1396,
+                    imdb_id: Some("tt0903747".into()),
+                },
+                TraktItem {
+                    media_type: MediaType::Show,
+                    tmdb_id: 1397,
+                    imdb_id: None,
+                },
+            ]
         );
     }
 
     #[test]
-    fn parse_playback_dedupes_show_and_keeps_movie() {
+    fn parse_playback_dedupes_show_and_keeps_movie_with_imdb() {
         let v = serde_json::json!([
-            { "type": "movie", "movie": { "ids": { "tmdb": 100 } } },
-            { "type": "episode", "show": { "ids": { "tmdb": 200 } } },
-            { "type": "episode", "show": { "ids": { "tmdb": 200 } } },
+            { "type": "movie", "movie": { "ids": { "tmdb": 100 } } }, // no imdb → None
+            { "type": "episode", "show": { "ids": { "tmdb": 200, "imdb": "tt0944947" } } },
+            { "type": "episode", "show": { "ids": { "tmdb": 200, "imdb": "tt0944947" } } },
             { "type": "episode", "show": { "ids": { "imdb": "tt9" } } }, // no tmdb → skipped
             { "movie": { "ids": { "tmdb": 999 } } },                     // no "type" field → skipped
         ]);
@@ -782,11 +811,13 @@ mod tests {
             vec![
                 TraktItem {
                     media_type: MediaType::Movie,
-                    tmdb_id: 100
+                    tmdb_id: 100,
+                    imdb_id: None,
                 },
                 TraktItem {
                     media_type: MediaType::Show,
-                    tmdb_id: 200
+                    tmdb_id: 200,
+                    imdb_id: Some("tt0944947".into()),
                 },
             ]
         );
@@ -845,10 +876,12 @@ mod tests {
             watchlist: vec![TraktItem {
                 media_type: MediaType::Movie,
                 tmdb_id: 1,
+                imdb_id: None,
             }],
             in_progress: vec![TraktItem {
                 media_type: MediaType::Show,
                 tmdb_id: 2,
+                imdb_id: None,
             }],
             watched: WatchedData {
                 movies: vec![3],
@@ -878,14 +911,16 @@ mod tests {
             client.watchlist("ignored").await.unwrap(),
             vec![TraktItem {
                 media_type: MediaType::Movie,
-                tmdb_id: 1
+                tmdb_id: 1,
+                imdb_id: None,
             }]
         );
         assert_eq!(
             client.in_progress("ignored").await.unwrap(),
             vec![TraktItem {
                 media_type: MediaType::Show,
-                tmdb_id: 2
+                tmdb_id: 2,
+                imdb_id: None,
             }]
         );
         assert_eq!(client.watched("ignored").await.unwrap().movies, vec![3]);
@@ -897,6 +932,7 @@ mod tests {
             watchlist: vec![TraktItem {
                 media_type: MediaType::Movie,
                 tmdb_id: 1,
+                imdb_id: None,
             }],
             fail_reads: true,
             fail_refresh: true,

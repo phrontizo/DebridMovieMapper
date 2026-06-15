@@ -211,6 +211,7 @@ mod tests {
             },
             watched_state: WatchedState::Movie { watched },
             show_status: None,
+            imdb_id: None,
         }
     }
 
@@ -235,6 +236,7 @@ mod tests {
                 watched_episodes: watched_eps,
             },
             show_status: Some(status),
+            imdb_id: None,
         }
     }
 
@@ -807,6 +809,7 @@ mod tests {
                 watched_episodes: vec![(1, 1)],
             }, // … but state is Show
             show_status: Some(ShowStatus::Ended),
+            imdb_id: None,
         };
         // Show branch: Ended + all aired [(1,1)] are in watched_episodes → finished = true.
         assert!(
