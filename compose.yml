@@ -57,6 +57,7 @@ services:
       # - MAX_ACQUIRE_ATTEMPTS=5         # candidates tried before giving up on a title
       # - ACQUIRE_DEAD_TIMEOUT_SECS=600  # secs an optimistic add may stay unresolved before reaped (min 120)
       # - DEDUP_REMOVE_DUPLICATES=false  # true = actually delete redundant duplicate torrents (default: dry-run/log only)
+      # - REMOVE_FINISHED_SHOWS=false    # true = auto-remove fully-watched ended non-watchlisted shows (default: preview/log only)
 
       # ── Trakt sync (SP2) ──────────────────────────────────────────────────────
       # Set BOTH id + secret (from a Trakt API app) to drive the library from users'

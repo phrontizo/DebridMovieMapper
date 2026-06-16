@@ -407,6 +407,11 @@ pub struct Config {
     /// Default `false` = dry-run (logs the plan only). Set `DEDUP_REMOVE_DUPLICATES=true` to enable
     /// destructive removal once the logged plan has been reviewed.
     pub dedup_remove_duplicates: bool,
+    /// When `true`, a fully-watched ENDED show that isn't watchlisted is auto-removed (Trigger-A
+    /// finish cleanup) — including ones already in the library. Default `false` only *logs* the
+    /// finish-removal candidates (a preview) without removing. Set `REMOVE_FINISHED_SHOWS=true` to
+    /// enable removal once the logged candidates have been reviewed.
+    pub remove_finished_shows: bool,
 }
 
 impl Config {
@@ -423,14 +428,18 @@ impl Config {
         cfg.acquisition = AcquisitionConfig::from_env();
         cfg.trakt = TraktConfig::from_env();
         cfg.upgrade = UpgradeConfig::from_env();
-        cfg.dedup_remove_duplicates = std::env::var("DEDUP_REMOVE_DUPLICATES")
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
+        fn env_flag(name: &str) -> bool {
+            std::env::var(name)
+                .map(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        }
+        cfg.dedup_remove_duplicates = env_flag("DEDUP_REMOVE_DUPLICATES");
+        cfg.remove_finished_shows = env_flag("REMOVE_FINISHED_SHOWS");
         Ok(cfg)
     }
 
@@ -486,6 +495,7 @@ impl Config {
             trakt: None,
             upgrade: UpgradeConfig::default(),
             dedup_remove_duplicates: false,
+            remove_finished_shows: false,
         })
     }
 }

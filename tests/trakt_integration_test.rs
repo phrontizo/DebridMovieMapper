@@ -87,7 +87,7 @@ async fn trakt_live_device_flow_and_sync() {
         me.username
     );
 
-    sync_trakt(&trakt, &tmdb, &store, None).await;
+    sync_trakt(&trakt, &tmdb, &store, None, false).await;
     let wanted = store.all_wanted().await;
     eprintln!("sync_trakt wrote {} wanted row(s)", wanted.len());
     if !wl.is_empty() || !ip.is_empty() {

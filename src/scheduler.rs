@@ -79,7 +79,14 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
                                 .trakt
                                 .as_ref()
                                 .and_then(|t| t.catchup_lookback_secs);
-                            sync_trakt(trakt, &app.tmdb_client, &app.store, catchup).await;
+                            sync_trakt(
+                                trakt,
+                                &app.tmdb_client,
+                                &app.store,
+                                catchup,
+                                app.config.remove_finished_shows,
+                            )
+                            .await;
                             reconcile_wanted(
                                 app.engine.as_ref(),
                                 &app.provider,

@@ -556,11 +556,41 @@ pub(crate) fn build_wanted(
 /// for re-enrolment (`needs_reenrolment = true`); because `sync_trakt_user` performs all of its
 /// `wanted` writes only after every fetch has succeeded, a failure leaves that user's existing
 /// `wanted` rows untouched.
+/// The subset of caught-up, owned shows that are **Ended** (`ShowStatus::Ended`) — the finish-cleanup
+/// candidates. An unknown/absent status is treated conservatively as not-Ended (never finish-removed
+/// on a TMDB hiccup), as is any Returning/in-production show (it may still get more episodes). PURE.
+fn finished_ended_candidates(
+    caught_up_owned: &std::collections::HashSet<u64>,
+    statuses: &std::collections::HashMap<u64, crate::tmdb_client::ShowStatus>,
+) -> std::collections::HashSet<u64> {
+    caught_up_owned
+        .iter()
+        .copied()
+        .filter(|id| statuses.get(id) == Some(&crate::tmdb_client::ShowStatus::Ended))
+        .collect()
+}
+
+/// The shows to fold into the wanted-set: always the `behind` (catch-up) shows; plus the
+/// `finished_ended` owned shows ONLY when finish-removal is enabled (otherwise they're preview-only
+/// and must NOT be folded, so nothing is removed). PURE.
+fn shows_to_fold(
+    behind: &std::collections::HashSet<u64>,
+    finished_ended: &std::collections::HashSet<u64>,
+    remove_finished_shows: bool,
+) -> std::collections::HashSet<u64> {
+    let mut fold = behind.clone();
+    if remove_finished_shows {
+        fold.extend(finished_ended.iter().copied());
+    }
+    fold
+}
+
 pub async fn sync_trakt(
     trakt: &std::sync::Arc<dyn crate::trakt_client::TraktClient>,
     tmdb: &crate::tmdb_client::TmdbClient,
     store: &crate::store::Store,
     catchup_lookback_secs: Option<u64>,
+    remove_finished_shows: bool,
 ) {
     for (slug, tokens) in store.all_trakt_tokens().await {
         if let Err(e) = sync_trakt_user(
@@ -570,6 +600,7 @@ pub async fn sync_trakt(
             &slug,
             tokens.clone(),
             catchup_lookback_secs,
+            remove_finished_shows,
         )
         .await
         {
@@ -605,6 +636,7 @@ async fn sync_trakt_user(
     slug: &str,
     mut tokens: crate::store::TraktTokens,
     catchup_lookback_secs: Option<u64>,
+    remove_finished_shows: bool,
 ) -> Result<(), crate::error::AppError> {
     use crate::store::TraktTokens;
     use crate::vfs::MediaType;
@@ -647,8 +679,20 @@ async fn sync_trakt_user(
     // no longer bloats the set or drives a fruitless reconcile each cycle. On a missing Trakt id or a
     // progress error we conservatively include the show (degrade to the old lookback-only behaviour
     // rather than silently dropping a possibly-behind title; it self-corrects next sync).
+    // The owned show library (after the account mirror, this is the user's whole library) — used to
+    // identify finished-ended shows that are owned and so candidates for finish-cleanup.
+    let owned_show_ids: std::collections::HashSet<u64> = store
+        .all_owned()
+        .await
+        .into_iter()
+        .filter(|(_, r)| matches!(r.request.kind, MediaKind::Series))
+        .map(|(_, r)| r.request.tmdb_id)
+        .collect();
+
     let catchup_cutoff: Option<i64> = catchup_lookback_secs.map(|s| now.saturating_sub(s) as i64);
     let mut behind: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Owned, caught-up (per Trakt progress) shows — finish-cleanup candidates IF they're Ended.
+    let mut caught_up_owned: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for show in &watched.shows {
         let within = match catchup_cutoff {
             None => true,
@@ -684,14 +728,19 @@ async fn sync_trakt_user(
         };
         if is_behind {
             behind.insert(show.tmdb_id);
+        } else if owned_show_ids.contains(&show.tmdb_id) {
+            // Caught up (all aired watched) AND owned → a finish-cleanup candidate if it's Ended.
+            caught_up_owned.insert(show.tmdb_id);
         }
     }
 
-    // Per-show TMDB status, only for shows that will actually be wanted (watchlist/in-progress +
-    // behind catch-up shows). A TMDB failure must NOT fail the whole sync — skip that show
-    // (→ build_wanted yields show_status: None, which the reconciler treats conservatively).
+    // Per-show TMDB status for shows that will be wanted (watchlist/in-progress + behind catch-up)
+    // PLUS the caught-up-owned shows (so we can tell which are Ended → finish-cleanup candidates). A
+    // TMDB failure must NOT fail the whole sync — skip that show (→ show_status None, treated
+    // conservatively as not-Ended, so it's never finish-removed on an unknown status).
     let mut show_ids: std::collections::HashSet<u64> = wl_ip_shows.clone();
     show_ids.extend(behind.iter().copied());
+    show_ids.extend(caught_up_owned.iter().copied());
     let mut statuses: std::collections::HashMap<u64, crate::tmdb_client::ShowStatus> =
         std::collections::HashMap::new();
     for tmdb_id in show_ids {
@@ -706,6 +755,38 @@ async fn sync_trakt_user(
         }
     }
 
+    // Finish-cleanup candidates = caught-up + owned + ENDED. These aren't "behind" (so they're not
+    // caught up for acquisition), but folding them into the wanted-set lets the reconciler's
+    // Trigger-A finish removal fire (the acquire path acquires nothing — every episode is watched).
+    // Gated on `remove_finished_shows`: when OFF we only LOG the candidates (a preview) and do NOT
+    // fold them, so nothing is removed; when ON they fold and are removed.
+    let finished_ended = finished_ended_candidates(&caught_up_owned, &statuses);
+    if !finished_ended.is_empty() {
+        info!(
+            "trakt: {} — {} finished+ended owned show(s) {} ({})",
+            slug,
+            finished_ended.len(),
+            if remove_finished_shows {
+                "to remove"
+            } else {
+                "would be removed"
+            },
+            if remove_finished_shows {
+                "REMOVING"
+            } else {
+                "preview — set REMOVE_FINISHED_SHOWS=true to remove"
+            }
+        );
+        debug!(
+            "trakt: {} finished+ended owned tmdb ids: {:?}",
+            slug, finished_ended
+        );
+    }
+
+    // Shows to fold into the wanted-set: always the behind (catch-up) shows; plus the finished+ended
+    // owned shows ONLY when removal is enabled.
+    let fold = shows_to_fold(&behind, &finished_ended, remove_finished_shows);
+
     // Build the user's new wanted-set and write it: prune rows no longer wanted, then upsert.
     let new = build_wanted(
         slug,
@@ -714,7 +795,7 @@ async fn sync_trakt_user(
         &watched,
         &statuses,
         catchup_cutoff,
-        Some(&behind),
+        Some(&fold),
     );
     debug!(
         "trakt: {} — watchlist={} in_progress={} → {} wanted titles; in_progress=[{}]; wanted_shows={:?}",
@@ -2513,6 +2594,35 @@ mod trakt_sync_tests {
     }
 
     #[test]
+    fn finished_ended_candidates_keeps_only_ended() {
+        use crate::tmdb_client::ShowStatus;
+        let caught_up: std::collections::HashSet<u64> = [1, 2, 3, 4].into_iter().collect();
+        let mut statuses = HashMap::new();
+        statuses.insert(1u64, ShowStatus::Ended);
+        statuses.insert(2u64, ShowStatus::Returning);
+        statuses.insert(3u64, ShowStatus::Other);
+        // 4 has no status (TMDB hiccup) → treated as not-Ended.
+        let got = finished_ended_candidates(&caught_up, &statuses);
+        assert_eq!(got, [1u64].into_iter().collect());
+    }
+
+    #[test]
+    fn shows_to_fold_includes_finished_only_when_enabled() {
+        let behind: std::collections::HashSet<u64> = [10].into_iter().collect();
+        let finished: std::collections::HashSet<u64> = [20].into_iter().collect();
+        // Disabled → only the behind catch-up shows fold (finished-ended are preview-only).
+        assert_eq!(
+            shows_to_fold(&behind, &finished, false),
+            [10u64].into_iter().collect()
+        );
+        // Enabled → finished-ended owned shows also fold (so Trigger-A removes them).
+        assert_eq!(
+            shows_to_fold(&behind, &finished, true),
+            [10u64, 20u64].into_iter().collect()
+        );
+    }
+
+    #[test]
     fn build_wanted_catchup_behind_gate_excludes_caught_up_show() {
         use crate::trakt_client::{WatchedData, WatchedShow};
         let watched = WatchedData {
@@ -2576,7 +2686,7 @@ mod trakt_sync_tests {
         });
         let tmdb = TmdbClient::new("k".into()).unwrap();
 
-        sync_trakt(&trakt, &tmdb, &store, None).await;
+        sync_trakt(&trakt, &tmdb, &store, None, false).await;
 
         let w = store
             .get_wanted("alice".to_string(), MediaType::Movie, 27205)
@@ -2646,7 +2756,7 @@ mod trakt_sync_tests {
         let tmdb = TmdbClient::new("k".into()).unwrap();
 
         // All-time lookback (None): the gate is purely "behind?".
-        sync_trakt(&trakt, &tmdb, &store, None).await;
+        sync_trakt(&trakt, &tmdb, &store, None, false).await;
 
         assert!(
             store
@@ -2684,7 +2794,7 @@ mod trakt_sync_tests {
         });
         let tmdb = TmdbClient::new("k".into()).unwrap();
 
-        sync_trakt(&trakt, &tmdb, &store, None).await;
+        sync_trakt(&trakt, &tmdb, &store, None, false).await;
 
         let tok = store.get_trakt_tokens("alice".to_string()).await.unwrap();
         assert_eq!(
@@ -2712,7 +2822,7 @@ mod trakt_sync_tests {
         });
         let tmdb = TmdbClient::new("k".into()).unwrap();
 
-        sync_trakt(&trakt, &tmdb, &store, None).await;
+        sync_trakt(&trakt, &tmdb, &store, None, false).await;
 
         assert_eq!(
             store
@@ -2748,7 +2858,7 @@ mod trakt_sync_tests {
         });
         let tmdb = TmdbClient::new("k".into()).unwrap();
 
-        sync_trakt(&trakt, &tmdb, &store, None).await;
+        sync_trakt(&trakt, &tmdb, &store, None, false).await;
 
         assert!(
             store
@@ -2780,7 +2890,7 @@ mod trakt_sync_tests {
         });
         let tmdb = TmdbClient::new("k".into()).unwrap();
 
-        sync_trakt(&trakt, &tmdb, &store, None).await;
+        sync_trakt(&trakt, &tmdb, &store, None, false).await;
 
         assert!(
             !store
@@ -2836,7 +2946,7 @@ mod trakt_sync_tests {
         });
         let tmdb = TmdbClient::new("k".into()).unwrap();
 
-        sync_trakt(&trakt, &tmdb, &store, None).await;
+        sync_trakt(&trakt, &tmdb, &store, None, false).await;
 
         // alice: refresh failed → flagged, no wanted rows written
         let alice_tok = store.get_trakt_tokens("alice".to_string()).await.unwrap();
@@ -2888,7 +2998,7 @@ mod trakt_sync_tests {
         });
         let tmdb = TmdbClient::new("k".into()).unwrap();
 
-        sync_trakt(&trakt, &tmdb, &store, None).await;
+        sync_trakt(&trakt, &tmdb, &store, None, false).await;
 
         let tok = store.get_trakt_tokens("alice".to_string()).await.unwrap();
         assert!(tok.needs_reenrolment, "account must be flagged");
