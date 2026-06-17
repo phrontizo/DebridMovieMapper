@@ -1463,6 +1463,22 @@ pub(crate) fn plan_dedup(
 /// redundant torrent from the provider, drop its owned record, and clear any `selection` slot that
 /// pointed at it (the VFS re-derives the slot from the kept covering hash on the next scan).
 ///
+/// Groups `(media_type, tmdb_id)` that have an owned record added within `idle_secs` of `now`. Such a
+/// group may have an upgrade stage in flight (the new hash is recorded owned before the selection is
+/// repointed + the old hash pruned), so dedup must SKIP it to avoid deleting the just-staged copy
+/// mid-swap. Pure, for testability.
+pub(crate) fn fresh_dedup_groups(
+    owned: &[(String, OwnedRecord)],
+    now: u64,
+    idle_secs: u64,
+) -> std::collections::HashSet<(MediaType, u64)> {
+    owned
+        .iter()
+        .filter(|(_, r)| now.saturating_sub(r.added_at) < idle_secs)
+        .map(|(_, r)| (media_type_of(r.request.kind), r.request.tmdb_id))
+        .collect()
+}
+
 /// Takes the provider listing already fetched by the scan tick (rather than re-fetching it) so the
 /// scan loop makes one `get_torrents` call per tick, not two.
 pub(crate) async fn dedup_owned(app: &AppState, torrents: &[crate::rd_client::Torrent]) {
@@ -1481,7 +1497,15 @@ pub(crate) async fn dedup_owned(app: &AppState, torrents: &[crate::rd_client::To
         .map(|(_, e)| e.hash.to_ascii_lowercase())
         .collect();
 
-    let plans = plan_dedup(&owned, &present, &selected);
+    let mut plans = plan_dedup(&owned, &present, &selected);
+    // Don't dedup a title with a FRESHLY-staged copy. The upgrade engine adds a new (better) hash and
+    // records it owned BEFORE it repoints the selection + prunes the old hash; a concurrent dedup tick
+    // (separate task) that saw both copies would keep the still-selected OLD hash and delete the
+    // just-staged new one — and the upgrade then prunes the old hash too, losing BOTH copies
+    // (permanent for a pure-mirror title). Skipping any group touched within the idle window lets an
+    // in-flight swap finish; a genuine duplicate is reclaimed on a later pass once the stage settles.
+    let fresh = fresh_dedup_groups(&owned, crate::now_unix_secs(), app.config.upgrade.idle_secs);
+    plans.retain(|p| !fresh.contains(&(p.media_type.clone(), p.tmdb_id)));
     if plans.is_empty() {
         return;
     }
@@ -2718,6 +2742,27 @@ mod tests {
         assert!(
             plans.is_empty(),
             "complementary packs + an unknown-coverage hash yield no removals"
+        );
+    }
+
+    #[test]
+    fn fresh_dedup_groups_flags_recently_staged_titles_only() {
+        use crate::scraper::MediaKind;
+        // A title with a record added "now" is fresh (an upgrade stage may be in flight → skip dedup);
+        // a title whose records are all older than the idle window is not.
+        let mut staged = dedup_rec(MediaKind::Movie, 100, vec![], Some(10));
+        staged.added_at = 10_000; // "now"
+        let mut old = dedup_rec(MediaKind::Movie, 200, vec![], Some(10));
+        old.added_at = 1; // long ago
+        let owned = vec![("a".to_string(), staged), ("b".to_string(), old)];
+        let fresh = fresh_dedup_groups(&owned, /*now*/ 10_100, /*idle_secs*/ 300);
+        assert!(
+            fresh.contains(&(MediaType::Movie, 100)),
+            "a title staged within the idle window is fresh"
+        );
+        assert!(
+            !fresh.contains(&(MediaType::Movie, 200)),
+            "a title untouched for longer than the idle window is not fresh"
         );
     }
 

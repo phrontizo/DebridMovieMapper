@@ -92,6 +92,13 @@ struct TbCreate {
 /// Normalised status: a finished download (cached OR Inactive/uncached but owned) maps to
 /// "downloaded" so it appears in the library and re-acquires on playback; otherwise the raw
 /// download_state (e.g. "downloading") is kept so the scan loop excludes not-yet-ready items.
+///
+/// We deliberately do NOT map TorBox states to Real-Debrid's terminal vocabulary
+/// (`magnet_error`/`dead`/`error`/`virus`, which `observe` instant-reaps). TorBox's libtorrent-style
+/// states (`downloading`/`stalled`/`stalled (no seeds)`/`metaDL`/…) are RECOVERABLE, not
+/// unambiguously terminal — a no-seeds torrent can resume when seeds return — so a "dead" mapping
+/// would risk a false reap. A genuinely-stuck TorBox torrent is instead reaped by `observe`'s
+/// dead-timeout / stall-timeout (a latency difference vs RD, by design, not a leak).
 fn tb_status(t: &TbTorrent) -> String {
     if t.download_finished {
         "downloaded".to_string()
@@ -313,6 +320,16 @@ impl TorBoxClient {
         }
     }
 
+    /// Redact the account API key from a string before logging. A TorBox error body can echo the
+    /// token-bearing `requestdl` URL (`?token=<key>`), so log the detail but never the secret.
+    fn redact(&self, s: &str) -> String {
+        if self.api_key.is_empty() {
+            s.to_string()
+        } else {
+            s.replace(&self.api_key, "<token>")
+        }
+    }
+
     /// Send a request, rate-limited with 429/transient retry, returning the envelope's `data`.
     /// Synthesises a Bad Gateway reqwest error when `success` is false or `data` is missing.
     async fn send_data<T, F>(&self, make: F) -> Result<T, reqwest::Error>
@@ -367,7 +384,7 @@ impl TorBoxClient {
             if let Err(e) = resp.error_for_status_ref() {
                 // Surface TorBox's error detail (e.g. why createtorrent 400s) before discarding it.
                 let body = resp.text().await.unwrap_or_default();
-                warn!("TorBox {} error body: {:.300}", status, body);
+                warn!("TorBox {} error body: {:.300}", status, self.redact(&body));
                 return Err(e.without_url());
             }
             // Scrub the URL from a body-read error: the `requestdl` URL carries the token, and the
@@ -458,7 +475,7 @@ impl TorBoxClient {
             let status = resp.status();
             if let Err(e) = resp.error_for_status_ref() {
                 let body = resp.text().await.unwrap_or_default();
-                warn!("TorBox {} error body: {:.300}", status, body);
+                warn!("TorBox {} error body: {:.300}", status, self.redact(&body));
                 return Err(e.without_url());
             }
             // A 200 can still carry `{"success":false}` (TorBox soft failure, e.g. controltorrent
@@ -689,6 +706,22 @@ mod tests {
         assert!(!is_transient_status(reqwest::StatusCode::OK));
         assert!(!is_transient_status(reqwest::StatusCode::NOT_FOUND));
         assert!(!is_transient_status(reqwest::StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn redact_scrubs_the_api_key_from_a_logged_body() {
+        // A TorBox error body can echo the token-bearing requestdl URL; the redaction must remove the
+        // key before it reaches a log line (the other branches already log only lengths).
+        let c = TorBoxClient::new("SECRET123".to_string()).unwrap();
+        let body = r#"{"error":"bad request to /requestdl?token=SECRET123&id=5"}"#;
+        let red = c.redact(body);
+        assert!(
+            !red.contains("SECRET123"),
+            "the api key must be scrubbed: {red}"
+        );
+        assert!(red.contains("<token>"));
+        // A body that doesn't contain the key is unchanged.
+        assert_eq!(c.redact("plain detail"), "plain detail");
     }
 
     #[test]

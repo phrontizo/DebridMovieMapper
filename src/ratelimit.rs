@@ -83,6 +83,13 @@ impl AdaptiveRateLimiter {
     /// (Real-Debrid). NB: that path is multiplicative both ways (double on 429, halve on success) —
     /// i.e. MIMD, not the additive recovery of textbook AIMD.
     pub async fn observe_rate_limit(&self, remaining: u64, reset_epoch_secs: f64) {
+        // A non-finite reset (a header parsed as `inf`/`nan` — both accepted by `f64::from_str`) means
+        // "no usable pacing info", NOT "wait the maximum": `inf.min(300)` and `nan.min(300)` both
+        // collapse to 300, so without this guard one garbage header would park ALL provider traffic
+        // (the limiter is shared) for the full cap. Ignore it. (Also avoids a `from_secs_f64(NaN)`.)
+        if !reset_epoch_secs.is_finite() {
+            return;
+        }
         if remaining > LOW_REMAINING {
             return;
         }
@@ -230,6 +237,21 @@ mod tests {
         limiter.observe_rate_limit(50, now_unix_secs() + 60.0).await;
         let state = limiter.state.lock().await;
         assert_eq!(state.next_allowed, before_na);
+    }
+
+    #[tokio::test]
+    async fn observe_rate_limit_ignores_a_non_finite_reset() {
+        // A garbage/non-finite `x-ratelimit-reset` (inf/nan) must be ignored, NOT treated as a
+        // max-length (300s) wait that parks all shared provider traffic.
+        let limiter = AdaptiveRateLimiter::new();
+        let before = { limiter.state.lock().await.next_allowed };
+        limiter.observe_rate_limit(0, f64::INFINITY).await;
+        limiter.observe_rate_limit(0, f64::NAN).await;
+        let state = limiter.state.lock().await;
+        assert_eq!(
+            state.next_allowed, before,
+            "a non-finite reset must not delay the next request"
+        );
     }
 
     #[tokio::test]

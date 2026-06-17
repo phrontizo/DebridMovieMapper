@@ -776,13 +776,20 @@ impl Store {
             if let Ok(txn) = db.begin_read() {
                 if let Ok(table) = txn.open_table(OWNED_TABLE) {
                     if let Ok(iter) = table.iter() {
-                        for entry in iter.flatten() {
-                            let (k, v) = entry;
+                        for entry in iter {
+                            // owned_hashes is authoritative + non-regenerable: a silently-dropped row
+                            // becomes an invisible torrent (duplicate re-acquire / lost provenance /
+                            // remove churn) that is undiagnosable — so log BOTH a per-row read error
+                            // (which `.flatten()` would have swallowed) and a deserialise error.
+                            let (k, v) = match entry {
+                                Ok(kv) => kv,
+                                Err(e) => {
+                                    error!("owned_hashes row read failed (skipped): {}", e);
+                                    continue;
+                                }
+                            };
                             match serde_json::from_slice::<OwnedRecord>(v.value()) {
                                 Ok(rec) => out.push((k.value().to_string(), rec)),
-                                // owned_hashes is authoritative + non-regenerable: a silently-dropped
-                                // row becomes an invisible torrent (duplicate re-acquire / lost
-                                // provenance / remove churn) that is undiagnosable. Log it.
                                 Err(e) => error!(
                                     "owned_hashes row {} failed to deserialise (skipped): {}",
                                     k.value(),
@@ -1089,10 +1096,23 @@ impl Store {
             if let Ok(txn) = db.begin_read() {
                 if let Ok(table) = txn.open_table(TRAKT_TOKENS_TABLE) {
                     if let Ok(iter) = table.iter() {
-                        for entry in iter.flatten() {
-                            let (k, v) = entry;
-                            if let Ok(tokens) = serde_json::from_slice::<TraktTokens>(v.value()) {
-                                out.push((k.value().to_string(), tokens));
+                        for entry in iter {
+                            // Authoritative table: log a per-row read error rather than `.flatten()`
+                            // silently dropping it (a lost token row = an account that stops syncing).
+                            let (k, v) = match entry {
+                                Ok(kv) => kv,
+                                Err(e) => {
+                                    error!("trakt_tokens row read failed (skipped): {}", e);
+                                    continue;
+                                }
+                            };
+                            match serde_json::from_slice::<TraktTokens>(v.value()) {
+                                Ok(tokens) => out.push((k.value().to_string(), tokens)),
+                                Err(e) => error!(
+                                    "trakt_tokens row {} failed to deserialise (skipped): {}",
+                                    k.value(),
+                                    e
+                                ),
                             }
                         }
                     }
@@ -1181,8 +1201,16 @@ impl Store {
             if let Ok(txn) = db.begin_read() {
                 if let Ok(table) = txn.open_table(WANTED_TABLE) {
                     if let Ok(iter) = table.iter() {
-                        for entry in iter.flatten() {
-                            let (k, v) = entry;
+                        for entry in iter {
+                            // Authoritative table: log a per-row read error (a swallowed wanted row
+                            // would silently drop a user's desired title from the reconcile set).
+                            let (k, v) = match entry {
+                                Ok(kv) => kv,
+                                Err(e) => {
+                                    error!("wanted row read failed (skipped): {}", e);
+                                    continue;
+                                }
+                            };
                             match serde_json::from_slice::<WantedRecord>(v.value()) {
                                 Ok(rec) => out.push(rec),
                                 Err(e) => error!(
@@ -1260,8 +1288,16 @@ impl Store {
             if let Ok(txn) = db.begin_read() {
                 if let Ok(table) = txn.open_table(SELECTION_TABLE) {
                     if let Ok(iter) = table.iter() {
-                        for entry in iter.flatten() {
-                            let (k, v) = entry;
+                        for entry in iter {
+                            // Authoritative table: log a per-row read error (a swallowed selection row
+                            // would silently revert that slot to the largest-bytes VFS fallback).
+                            let (k, v) = match entry {
+                                Ok(kv) => kv,
+                                Err(e) => {
+                                    error!("selection row read failed (skipped): {}", e);
+                                    continue;
+                                }
+                            };
                             match serde_json::from_slice::<SelectionEntry>(v.value()) {
                                 Ok(rec) => out.push((k.value().to_string(), rec)),
                                 Err(e) => error!(
