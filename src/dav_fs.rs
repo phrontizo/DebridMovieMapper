@@ -55,12 +55,20 @@ impl DebridFileSystem {
 
     /// Resolve a path to a VfsNode reference without cloning.
     fn find_node_ref<'v>(vfs: &'v DebridVfs, path: &DavPath) -> Option<&'v VfsNode> {
-        let mut current = &vfs.root;
         let path_osstr = path.as_rel_ospath();
         let path_str = path_osstr.to_str()?;
+        Self::walk_components(&vfs.root, path_str)
+    }
+
+    /// Walk `/`-separated `path_str` from `root`, returning the node it names (or `None`). A `..`
+    /// component is REJECTED (returns `None`) as defense-in-depth — DavPath already normalises `..`
+    /// away before `find_node_ref` sees it, but this guards any future caller that bypasses DavPath.
+    /// Pure (`&str` in) so the traversal-rejection is unit-testable without constructing a DavPath.
+    fn walk_components<'v>(root: &'v VfsNode, path_str: &str) -> Option<&'v VfsNode> {
         if path_str == "." || path_str.is_empty() {
-            return Some(current);
+            return Some(root);
         }
+        let mut current = root;
         for component in path_str.split('/') {
             if component.is_empty() || component == "." {
                 continue;
@@ -781,20 +789,24 @@ mod tests {
     fn find_node_in_rejects_dotdot_traversal() {
         let vfs = DebridVfs::new();
 
-        // Verify normal lookup works
-        let path = DavPath::new("/Movies").unwrap();
-        let result = DebridFileSystem::find_node_in(&vfs, &path);
-        assert!(result.is_some(), "Normal path should resolve");
-
-        // DavPath normalizes paths containing "..", so /Movies/../etc/passwd
-        // becomes /etc/passwd. Our find_node_in guard is defense-in-depth
-        // against any future code path that might bypass DavPath construction.
-        // Verify the guard exists in the source code.
-        let source = include_str!("dav_fs.rs");
+        // Normal lookup works (DebridVfs::new seeds a "Movies" directory).
         assert!(
-            source.contains(r#"if component == ".." {"#),
-            "find_node_in must contain the .. traversal guard"
+            DebridFileSystem::walk_components(&vfs.root, "Movies").is_some(),
+            "a normal path must resolve"
         );
+        assert!(
+            DebridFileSystem::walk_components(&vfs.root, "").is_some(),
+            "the empty (root) path resolves to root"
+        );
+        // The `..` traversal guard, tested BEHAVIOURALLY (not by grepping the source): DavPath
+        // normalises `..` away before find_node_ref, but this guards any future caller that bypasses
+        // it — a `..` component anywhere in the path must return None.
+        assert!(
+            DebridFileSystem::walk_components(&vfs.root, "Movies/../etc").is_none(),
+            "a `..` component must be rejected"
+        );
+        assert!(DebridFileSystem::walk_components(&vfs.root, "..").is_none());
+        assert!(DebridFileSystem::walk_components(&vfs.root, "../secret").is_none());
     }
 
     #[test]

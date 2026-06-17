@@ -1657,6 +1657,17 @@ mod tests {
             store.get_upgrade_checked(&MediaType::Movie, 27205).await > 0,
             "a fully-evaluated no-upgrade title must advance the cursor"
         );
+        // And prove it advanced via the genuine no-upgrade path, NOT a staging failure: the candidate
+        // ("hweb") must never have been staged/recorded, and the owned record is untouched.
+        assert!(
+            store.get_owned("hweb".into()).await.is_none(),
+            "a same-quality candidate must NOT be staged"
+        );
+        assert_eq!(
+            store.get_owned("hold".into()).await.unwrap().status,
+            OwnedStatus::Verified,
+            "the existing owned record must be untouched (no swap)"
+        );
     }
 
     #[tokio::test]

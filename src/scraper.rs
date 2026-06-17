@@ -516,4 +516,78 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].info_hash, "h");
     }
+
+    /// A loopback HTTP server that answers every request with a fixed status + body.
+    async fn spawn_status_server(status: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn find_maps_404_to_empty_5xx_to_err_and_parses_200() {
+        // The 404-vs-other status classification in `find` is load-bearing (404 → "no streams",
+        // anything else retriable → Err so the engine retries rather than seeing silent zero
+        // candidates) and was only covered by the live test. Pin it offline against a loopback server.
+        let s = |url: String| {
+            TorrentioScraper::new(
+                Some(url),
+                ProviderKind::RealDebrid,
+                "tok",
+                reqwest::Client::new(),
+            )
+        };
+        // 404 = unknown id → Ok(empty).
+        let s404 = s(spawn_status_server("404 Not Found", "").await);
+        assert!(s404
+            .find("tt1", MediaKind::Movie, None, None)
+            .await
+            .unwrap()
+            .is_empty());
+        // 503 = retriable addon error → Err (NOT a silent empty).
+        let s503 = s(spawn_status_server("503 Service Unavailable", "").await);
+        assert!(s503
+            .find("tt1", MediaKind::Movie, None, None)
+            .await
+            .is_err());
+        // 403 = permanent addon error → also Err (warns separately; engine still doesn't see empty).
+        let s403 = s(spawn_status_server("403 Forbidden", "").await);
+        assert!(s403
+            .find("tt1", MediaKind::Movie, None, None)
+            .await
+            .is_err());
+        // 200 with valid stream JSON → parses the candidate.
+        let s200 = s(spawn_status_server(
+            "200 OK",
+            r#"{"streams":[{"name":"x","title":"y","infoHash":"abcdef0123456789abcdef0123456789abcdef01"}]}"#,
+        )
+        .await);
+        let cands = s200
+            .find("tt1", MediaKind::Movie, None, None)
+            .await
+            .unwrap();
+        assert_eq!(cands.len(), 1);
+        assert_eq!(
+            cands[0].info_hash,
+            "abcdef0123456789abcdef0123456789abcdef01"
+        );
+    }
 }
