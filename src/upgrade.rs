@@ -184,7 +184,11 @@ async fn try_upgrade_movie(
         {
             continue;
         }
-        if app.store.is_blacklisted(tmdb_id, r.info_hash.clone()).await {
+        if app
+            .store
+            .is_blacklisted(MediaKind::Movie, tmdb_id, r.info_hash.clone())
+            .await
+        {
             continue;
         }
         // Apply the same hard filters as acquisition (resolution ceiling, cam/telesync, dead seeders):
@@ -377,7 +381,13 @@ async fn stage_and_verify(
         let _ = app.provider.delete_torrent(&added.id).await;
         let _ = app
             .store
-            .blacklist_add(tmdb_id, hash.clone(), "MoviePack", now_secs())
+            .blacklist_add(
+                MediaKind::Movie,
+                tmdb_id,
+                hash.clone(),
+                "MoviePack",
+                now_secs(),
+            )
             .await;
         return Err(UpgradeSkip::NoChange("multi-feature pack".into()));
     }
@@ -390,7 +400,13 @@ async fn stage_and_verify(
         let _ = app.provider.delete_torrent(&added.id).await;
         let _ = app
             .store
-            .blacklist_add(tmdb_id, hash.clone(), "WrongTitle", now_secs())
+            .blacklist_add(
+                MediaKind::Movie,
+                tmdb_id,
+                hash.clone(),
+                "WrongTitle",
+                now_secs(),
+            )
             .await;
         return Err(UpgradeSkip::NoChange("title mismatch".into()));
     }
@@ -407,7 +423,7 @@ async fn stage_and_verify(
             let _ = app.provider.delete_torrent(&added.id).await;
             let _ = app
                 .store
-                .blacklist_add(tmdb_id, hash.clone(), reason, now_secs())
+                .blacklist_add(MediaKind::Movie, tmdb_id, hash.clone(), reason, now_secs())
                 .await;
             return Err(UpgradeSkip::NoChange(format!("probe rejected: {reason}")));
         }
@@ -672,7 +688,11 @@ async fn try_consolidate_show(
             if !r.cached {
                 continue;
             }
-            if app.store.is_blacklisted(tmdb_id, r.info_hash.clone()).await {
+            if app
+                .store
+                .is_blacklisted(MediaKind::Series, tmdb_id, r.info_hash.clone())
+                .await
+            {
                 continue;
             }
             if group_hashes
@@ -777,7 +797,13 @@ async fn try_consolidate_show(
                     let _ = app.provider.delete_torrent(&added.id).await;
                     let _ = app
                         .store
-                        .blacklist_add(tmdb_id, r.info_hash.clone(), "WrongTitle", now_secs())
+                        .blacklist_add(
+                            MediaKind::Series,
+                            tmdb_id,
+                            r.info_hash.clone(),
+                            "WrongTitle",
+                            now_secs(),
+                        )
                         .await;
                     continue;
                 }
@@ -797,7 +823,13 @@ async fn try_consolidate_show(
                         let _ = app.provider.delete_torrent(&added.id).await;
                         let _ = app
                             .store
-                            .blacklist_add(tmdb_id, r.info_hash.clone(), reason, now_secs())
+                            .blacklist_add(
+                                MediaKind::Series,
+                                tmdb_id,
+                                r.info_hash.clone(),
+                                reason,
+                                now_secs(),
+                            )
                             .await;
                         continue;
                     }
@@ -1404,7 +1436,9 @@ mod tests {
             "old torrent must not be pruned when the upgrade is blocked"
         );
         assert!(
-            store.is_blacklisted(27205, "hnew".into()).await,
+            store
+                .is_blacklisted(MediaKind::Movie, 27205, "hnew".into())
+                .await,
             "probe-rejected hash must be blacklisted"
         );
         assert!(

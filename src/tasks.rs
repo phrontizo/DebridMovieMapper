@@ -2461,7 +2461,13 @@ mod tests {
         // delete it (or a concurrent scan caught it mid-staging). The mirror pass must NOT resurrect
         // it as a Verified empty-provenance record (which removal triggers can't reclaim).
         store
-            .blacklist_add(27205, "badhash".into(), "BadAudio", 1)
+            .blacklist_add(
+                crate::scraper::MediaKind::Movie,
+                27205,
+                "badhash".into(),
+                "BadAudio",
+                1,
+            )
             .await
             .unwrap();
         let rejected = (
@@ -2532,7 +2538,13 @@ mod tests {
             .await
             .unwrap();
         store
-            .blacklist_add(999, "phantom".into(), "WrongTitle", 1)
+            .blacklist_add(
+                crate::scraper::MediaKind::Movie,
+                999,
+                "phantom".into(),
+                "WrongTitle",
+                1,
+            )
             .await
             .unwrap();
         // An ENGINE record (non-empty provenance) that is also blacklisted must NOT be reaped — its
@@ -2542,7 +2554,13 @@ mod tests {
             .await
             .unwrap();
         store
-            .blacklist_add(603, "engine".into(), "BadAudio", 1)
+            .blacklist_add(
+                crate::scraper::MediaKind::Movie,
+                603,
+                "engine".into(),
+                "BadAudio",
+                1,
+            )
             .await
             .unwrap();
 

@@ -10,13 +10,16 @@ use tracing::{error, info, warn};
 //
 // v6: the `upgrade_checks` cursor key gained a media-type discriminator (`upgrade_check_key`),
 //     orphaning old bare-`tmdb_id` rows; the v5→v6 migration clears the (regenerable) cursor.
+// v7: the `blacklist` key gained a media-type discriminator (`blacklist_key`) so a movie and a show
+//     sharing a numeric TMDB id no longer cross-contaminate rejections; the v6→v7 migration clears
+//     the (regenerable) blacklist.
 /// v1→v2: additive (owned_hashes, authoritative_ids, blacklist tables).
 /// v2→v3: additive (trakt_tokens, wanted tables).
 /// v3→v4: additive (selection, upgrade_checks tables; OwnedRecord.provides/quality fields).
 /// v4→v5: the `wanted` row key gained a media-type discriminator (movie/show with the same numeric
 ///        TMDB id no longer collide). Old `{user}|{tmdb_id}` rows are cleared — regenerated from
 ///        Trakt within one sync interval (lossless).
-pub const SCHEMA_VERSION: u64 = 6;
+pub const SCHEMA_VERSION: u64 = 7;
 
 /// TMDB identification cache: torrent id -> serde_json((TorrentInfo, MediaMetadata)).
 /// Same name + value encoding as the pre-Store inline table, so existing databases
@@ -29,8 +32,22 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 const OWNED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_hashes");
 /// Authoritative identification override: infohash -> serde_json(MediaMetadata).
 const AUTH_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("authoritative_ids");
-/// Blacklisted (tmdb_id, hash) pairs: "tmdbid|hash" -> serde_json({reason, at}).
+/// Blacklisted (media_type, tmdb_id, hash) triples: "<m|s>|tmdbid|hash" -> serde_json({reason, at}).
+/// The media-type discriminator is required for the same reason as `WANTED_TABLE`'s: TMDB movie and
+/// TV id-spaces are independent, so a hash rejected for the movie with id N must NOT also suppress
+/// the unrelated SHOW with id N (which is a different title that may legitimately want that hash).
 const BLACKLIST_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blacklist");
+
+/// Build a `blacklist` key from (media_type, tmdb_id, hash). The hash is lowercased so the table is
+/// case-insensitive (consistent with `all_blacklisted_hashes`). `MediaKind` is used (not `MediaType`)
+/// because every caller — the acquisition/upgrade engines — works in `MediaKind`.
+fn blacklist_key(kind: crate::scraper::MediaKind, tmdb_id: u64, hash: &str) -> String {
+    let disc = match kind {
+        crate::scraper::MediaKind::Movie => 'm',
+        crate::scraper::MediaKind::Series => 's',
+    };
+    format!("{}|{}|{}", disc, tmdb_id, hash.to_ascii_lowercase())
+}
 /// Per-user Trakt OAuth tokens: user_slug -> serde_json(TraktTokens).
 const TRAKT_TOKENS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("trakt_tokens");
 /// Materialised wanted-set: "user|<m|s>|tmdb_id" -> serde_json(WantedRecord). The media-type
@@ -410,6 +427,11 @@ impl Store {
     /// (`upgrade_check_key`). Old bare-`tmdb_id` rows are unreachable by the new key, so clear the
     /// table — it is a regenerable round-robin cursor, so clearing it just resets the cursor once
     /// (lossless). Cleared for any pre-v6 DB; a fresh DB has no rows to clear.
+    /// v6→v7: the `blacklist` key gained a media-type discriminator (`blacklist_key`) so a movie and a
+    /// show sharing a numeric TMDB id no longer cross-contaminate each other's rejection history. Old
+    /// `{tmdb_id}|{hash}` rows are unreachable by the new key, so clear the table — the blacklist is
+    /// regenerable (a rejected hash is simply re-probed and re-blacklisted), so clearing it is lossless
+    /// in practice. Cleared for any pre-v7 DB; a fresh DB has no rows to clear.
     fn run_migrations(db: &Database, from_version: u64) -> Result<(), redb::Error> {
         if (3..5).contains(&from_version) {
             let write_txn = db.begin_write()?;
@@ -425,6 +447,15 @@ impl Store {
             {
                 // Opening creates the table if absent; clearing then is a harmless no-op.
                 let mut t = write_txn.open_table(UPGRADE_CHECKS_TABLE)?;
+                t.retain(|_, _| false)?;
+            }
+            write_txn.commit()?;
+        }
+        if from_version < 7 {
+            let write_txn = db.begin_write()?;
+            {
+                // Opening creates the table if absent; clearing then is a harmless no-op.
+                let mut t = write_txn.open_table(BLACKLIST_TABLE)?;
                 t.retain(|_, _| false)?;
             }
             write_txn.commit()?;
@@ -776,22 +807,18 @@ impl Store {
 
     pub async fn blacklist_add(
         &self,
+        kind: crate::scraper::MediaKind,
         tmdb_id: u64,
         hash: String,
         reason: &str,
         at: u64,
     ) -> Result<(), AppError> {
-        // Key on the lowercased hash so the table is case-insensitive and consistent with
-        // `all_blacklisted_hashes` (which lowercases on read) — a hash stored in one case can never
-        // be missed by an `is_blacklisted` check in another.
-        let key = format!("{}|{}", tmdb_id, hash.to_ascii_lowercase());
+        // Keyed by (media_type, tmdb_id, lowercased hash) — see `blacklist_key`.
+        let key = blacklist_key(kind, tmdb_id, &hash);
         let bytes = match serde_json::to_vec(&serde_json::json!({"reason": reason, "at": at})) {
             Ok(b) => b,
             Err(e) => {
-                error!(
-                    "Failed to serialise blacklist entry {}|{}: {}",
-                    tmdb_id, hash, e
-                );
+                error!("Failed to serialise blacklist entry {}: {}", key, e);
                 return Ok(());
             }
         };
@@ -809,8 +836,13 @@ impl Store {
         Self::flatten_join(result)
     }
 
-    pub async fn is_blacklisted(&self, tmdb_id: u64, hash: String) -> bool {
-        let key = format!("{}|{}", tmdb_id, hash.to_ascii_lowercase());
+    pub async fn is_blacklisted(
+        &self,
+        kind: crate::scraper::MediaKind,
+        tmdb_id: u64,
+        hash: String,
+    ) -> bool {
+        let key = blacklist_key(kind, tmdb_id, &hash);
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let txn = match db.begin_read() {
@@ -827,10 +859,11 @@ impl Store {
         .unwrap_or(false)
     }
 
-    /// Every blacklisted infohash (lowercased), across ALL tmdb_ids. Used by the account mirror to
-    /// avoid re-adopting a hash the engine rejected — a hash-scoped check (the blacklist key is
-    /// `tmdb_id|hash`) so it still catches a torrent that re-identifies to a DIFFERENT tmdb_id than
-    /// the one it was blacklisted under (the wrong-title case). One read per scan tick.
+    /// Every blacklisted infohash (lowercased), across ALL media types and tmdb_ids. Used by the
+    /// account mirror to avoid re-adopting a hash the engine rejected — deliberately media-type- and
+    /// tmdb-agnostic (the key is `<m|s>|tmdb_id|hash`, so the hash is the segment after the LAST `|`)
+    /// so it still catches a torrent that re-identifies to a DIFFERENT title than the one it was
+    /// blacklisted under (the wrong-title case). One read per scan tick.
     pub async fn all_blacklisted_hashes(&self) -> std::collections::HashSet<String> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
@@ -840,8 +873,8 @@ impl Store {
                     if let Ok(iter) = table.iter() {
                         for entry in iter.flatten() {
                             let (k, _) = entry;
-                            // key = "tmdb_id|hash" → keep the hash part after the first '|'.
-                            if let Some((_, hash)) = k.value().split_once('|') {
+                            // key = "<m|s>|tmdb_id|hash" → the hash is everything after the LAST '|'.
+                            if let Some((_, hash)) = k.value().rsplit_once('|') {
                                 out.insert(hash.to_ascii_lowercase());
                             }
                         }
@@ -904,12 +937,18 @@ impl Store {
         .unwrap_or(0)
     }
 
-    /// Every blacklisted infohash (lowercased) for a SINGLE `tmdb_id` — the per-title rejected set
-    /// the acquisition engine filters candidates against. One read instead of one `is_blacklisted`
-    /// per scraped candidate. The trailing `|` in the prefix prevents a tmdb_id-prefix collision
-    /// (e.g. `12|…` must not match `123|…`).
-    pub async fn blacklisted_hashes_for(&self, tmdb_id: u64) -> std::collections::HashSet<String> {
-        let prefix = format!("{}|", tmdb_id);
+    /// Every blacklisted infohash (lowercased) for a SINGLE `(media_type, tmdb_id)` title — the
+    /// per-title rejected set the acquisition engine filters candidates against. One read instead of
+    /// one `is_blacklisted` per scraped candidate. The media-type discriminator + trailing `|` in the
+    /// prefix scope it to exactly this title (so the movie with id N doesn't see the show-N rejects)
+    /// and prevent a tmdb_id-prefix collision (e.g. `m|12|…` must not match `m|123|…`).
+    pub async fn blacklisted_hashes_for(
+        &self,
+        kind: crate::scraper::MediaKind,
+        tmdb_id: u64,
+    ) -> std::collections::HashSet<String> {
+        // Reuse the key builder with an empty hash to get the exact `<m|s>|tmdb_id|` prefix.
+        let prefix = blacklist_key(kind, tmdb_id, "");
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let mut out = std::collections::HashSet::new();
@@ -1640,14 +1679,51 @@ mod tests {
     #[tokio::test]
     async fn blacklist_add_and_check() {
         let store = mem_store();
-        assert!(!store.is_blacklisted(27205, "h1".to_string()).await);
+        let m = MediaKind::Movie;
+        assert!(!store.is_blacklisted(m, 27205, "h1".to_string()).await);
         store
-            .blacklist_add(27205, "h1".to_string(), "WrongTitle", 100)
+            .blacklist_add(m, 27205, "h1".to_string(), "WrongTitle", 100)
             .await
             .unwrap();
-        assert!(store.is_blacklisted(27205, "h1".to_string()).await);
-        assert!(!store.is_blacklisted(27205, "h2".to_string()).await);
-        assert!(!store.is_blacklisted(99999, "h1".to_string()).await);
+        assert!(store.is_blacklisted(m, 27205, "h1".to_string()).await);
+        assert!(!store.is_blacklisted(m, 27205, "h2".to_string()).await);
+        assert!(!store.is_blacklisted(m, 99999, "h1".to_string()).await);
+    }
+
+    #[tokio::test]
+    async fn blacklist_is_scoped_by_media_type() {
+        // A movie and a show sharing a numeric TMDB id must keep INDEPENDENT rejection histories —
+        // a hash rejected for the movie must not suppress the unrelated show (which may legitimately
+        // want it), and vice versa.
+        let store = mem_store();
+        store
+            .blacklist_add(MediaKind::Movie, 1396, "h".to_string(), "WrongTitle", 1)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .is_blacklisted(MediaKind::Movie, 1396, "h".to_string())
+                .await
+        );
+        assert!(
+            !store
+                .is_blacklisted(MediaKind::Series, 1396, "h".to_string())
+                .await,
+            "the show with the same tmdb_id must not inherit the movie's rejection"
+        );
+        assert!(
+            store
+                .blacklisted_hashes_for(MediaKind::Series, 1396)
+                .await
+                .is_empty(),
+            "the per-title set for the show must not include the movie's blacklisted hash"
+        );
+        assert!(store
+            .blacklisted_hashes_for(MediaKind::Movie, 1396)
+            .await
+            .contains("h"));
+        // The mirror's hash-scoped view still sees it (media-type-agnostic, by design).
+        assert!(store.all_blacklisted_hashes().await.contains("h"));
     }
 
     #[tokio::test]
@@ -1655,14 +1731,15 @@ mod tests {
         // A hash added in one case must be found when queried in another (and vice versa), so a
         // rejected hash can never be silently re-added on a case mismatch.
         let store = mem_store();
+        let m = MediaKind::Movie;
         let upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF01".to_string();
         let lower = upper.to_ascii_lowercase();
         store
-            .blacklist_add(27205, upper.clone(), "WrongTitle", 100)
+            .blacklist_add(m, 27205, upper.clone(), "WrongTitle", 100)
             .await
             .unwrap();
-        assert!(store.is_blacklisted(27205, lower.clone()).await);
-        assert!(store.is_blacklisted(27205, upper.clone()).await);
+        assert!(store.is_blacklisted(m, 27205, lower.clone()).await);
+        assert!(store.is_blacklisted(m, 27205, upper.clone()).await);
         // `all_blacklisted_hashes` returns the lowercased form.
         assert!(store.all_blacklisted_hashes().await.contains(&lower));
     }
@@ -1670,20 +1747,21 @@ mod tests {
     #[tokio::test]
     async fn prune_blacklist_before_removes_only_stale_rows() {
         let store = mem_store();
+        let m = MediaKind::Movie;
         store
-            .blacklist_add(1, "old".into(), "WrongTitle", 100)
+            .blacklist_add(m, 1, "old".into(), "WrongTitle", 100)
             .await
             .unwrap();
         store
-            .blacklist_add(1, "recent".into(), "Corrupt", 5_000)
+            .blacklist_add(m, 1, "recent".into(), "Corrupt", 5_000)
             .await
             .unwrap();
         // Prune everything stamped before 1_000: only "old" (at=100) qualifies.
         let removed = store.prune_blacklist_before(1_000).await;
         assert_eq!(removed, 1);
-        assert!(!store.is_blacklisted(1, "old".into()).await);
+        assert!(!store.is_blacklisted(m, 1, "old".into()).await);
         assert!(
-            store.is_blacklisted(1, "recent".into()).await,
+            store.is_blacklisted(m, 1, "recent".into()).await,
             "a row newer than the cutoff must survive"
         );
     }
@@ -1691,25 +1769,26 @@ mod tests {
     #[tokio::test]
     async fn blacklisted_hashes_for_is_scoped_to_tmdb_and_lowercased() {
         let store = mem_store();
+        let m = MediaKind::Movie;
         store
-            .blacklist_add(12, "AAA".into(), "WrongTitle", 1)
+            .blacklist_add(m, 12, "AAA".into(), "WrongTitle", 1)
             .await
             .unwrap();
         store
-            .blacklist_add(12, "bbb".into(), "Corrupt", 2)
+            .blacklist_add(m, 12, "bbb".into(), "Corrupt", 2)
             .await
             .unwrap();
         // A different tmdb_id that shares the "12" prefix must NOT leak in (the trailing `|` guards).
         store
-            .blacklist_add(123, "ccc".into(), "WrongTitle", 3)
+            .blacklist_add(m, 123, "ccc".into(), "WrongTitle", 3)
             .await
             .unwrap();
-        let set = store.blacklisted_hashes_for(12).await;
+        let set = store.blacklisted_hashes_for(m, 12).await;
         assert_eq!(set.len(), 2);
         assert!(set.contains("aaa")); // lowercased
         assert!(set.contains("bbb"));
         assert!(!set.contains("ccc")); // belongs to tmdb 123, not 12
-        assert!(store.blacklisted_hashes_for(999).await.is_empty());
+        assert!(store.blacklisted_hashes_for(m, 999).await.is_empty());
     }
 
     // ── SP2 Task 3 tests (trakt_tokens + wanted) ─────────────────────────────
@@ -2198,6 +2277,70 @@ mod tests {
             ut.iter().unwrap().count(),
             0,
             "the legacy bare-key upgrade_checks row must be cleared by the v5→v6 migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrates_v6_db_clears_legacy_blacklist_but_keeps_owned() {
+        let tmp = TempDb::new("migrate_v6_v7");
+        {
+            let db = Database::create(&tmp.path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                // A legacy blacklist row keyed by the OLD `{tmdb_id}|{hash}` format (no media-type
+                // discriminator). Migration to v7 must clear it — the blacklist is regenerable
+                // (a rejected hash is simply re-probed), so a one-time reset is lossless.
+                let bdef: TableDefinition<&str, &[u8]> = TableDefinition::new("blacklist");
+                let mut bt = txn.open_table(bdef).unwrap();
+                bt.insert(
+                    "1396|deadbeef",
+                    serde_json::to_vec(&serde_json::json!({"reason":"WrongTitle","at":1}))
+                        .unwrap()
+                        .as_slice(),
+                )
+                .unwrap();
+
+                // An owned row must SURVIVE (authoritative, not regenerable).
+                let odef: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_hashes");
+                let mut ot = txn.open_table(odef).unwrap();
+                let rec = OwnedRecord {
+                    request: req("tt6", 1396),
+                    provenance: Provenance::manual(),
+                    added_at: 11,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                };
+                ot.insert("hash6", serde_json::to_vec(&rec).unwrap().as_slice())
+                    .unwrap();
+
+                let vdef: TableDefinition<&str, u64> = TableDefinition::new("meta");
+                let mut v = txn.open_table(vdef).unwrap();
+                v.insert("schema_version", &6u64).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = Store::open(&tmp.path).unwrap();
+        assert_eq!(
+            store.get_owned("hash6".to_string()).await.unwrap().status,
+            OwnedStatus::Verified,
+            "owned rows must survive the migration"
+        );
+        assert!(
+            !std::path::Path::new(&tmp.corrupt_path()).exists(),
+            "valid v6 DB must not be moved aside"
+        );
+        // Verify the clear directly against the raw table (the new key is `<m|s>|1396|hash`, so a
+        // typed lookup couldn't distinguish "cleared" from "unreachable by the new key").
+        drop(store);
+        let db = Database::create(&tmp.path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let bdef: TableDefinition<&str, &[u8]> = TableDefinition::new("blacklist");
+        let bt = txn.open_table(bdef).unwrap();
+        assert_eq!(
+            bt.iter().unwrap().count(),
+            0,
+            "the legacy bare-key blacklist row must be cleared by the v6→v7 migration"
         );
     }
 

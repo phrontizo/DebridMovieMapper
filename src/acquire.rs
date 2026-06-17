@@ -427,7 +427,10 @@ impl AcquisitionEngine {
         );
         // Fetch the per-title blacklist ONCE and test membership in memory, rather than one awaited
         // redb read per candidate (Torrentio commonly returns dozens of streams per title).
-        let blacklist = self.store.blacklisted_hashes_for(req.tmdb_id).await;
+        let blacklist = self
+            .store
+            .blacklisted_hashes_for(req.kind, req.tmdb_id)
+            .await;
         let mut parsed: Vec<ReleaseInfo> = Vec::new();
         let mut blacklisted = 0usize;
         for c in &candidates {
@@ -1009,7 +1012,7 @@ impl AcquisitionEngine {
         );
         let _ = self
             .store
-            .blacklist_add(req.tmdb_id, hash.to_string(), reason, now_secs())
+            .blacklist_add(req.kind, req.tmdb_id, hash.to_string(), reason, now_secs())
             .await;
         // Delete the provider torrent BEFORE dropping the store records (the `execute_remove`
         // ordering). On a transient delete failure, KEEP the records so the next `observe` tick
@@ -1511,7 +1514,8 @@ mod tests {
             "a perpetually-deferring probe must stay Pending, never accepted unverified"
         );
         assert!(
-            !st.is_blacklisted(27205, "h1".into()).await,
+            !st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await,
             "and not yet replaced — it is still within the verify deadline"
         );
     }
@@ -1548,7 +1552,8 @@ mod tests {
             eng.observe(&torrents).await;
         }
         assert!(
-            st.is_blacklisted(27205, "h1".into()).await,
+            st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await,
             "an unfetchable release past the deadline should be blacklisted"
         );
         assert!(
@@ -1625,7 +1630,10 @@ mod tests {
         );
         eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
             .await;
-        assert!(st.is_blacklisted(27205, "h1".into()).await);
+        assert!(
+            st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await
+        );
         assert!(st.get_owned("h1".into()).await.is_none());
     }
 
@@ -1667,7 +1675,8 @@ mod tests {
             "the Verified record must survive (resolved to the downloaded duplicate)"
         );
         assert!(
-            !st.is_blacklisted(27205, "h1".into()).await,
+            !st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await,
             "a title with a healthy downloaded copy must not be blacklisted"
         );
     }
@@ -1702,7 +1711,10 @@ mod tests {
             st.get_owned("h1".into()).await.is_none(),
             "never-resolved Pending is reaped"
         );
-        assert!(st.is_blacklisted(27205, "h1".into()).await);
+        assert!(
+            st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await
+        );
     }
 
     #[tokio::test]
@@ -1757,7 +1769,10 @@ mod tests {
             st.get_owned("h1".into()).await.is_none(),
             "stuck-unselected Pending is reaped past the dead-timeout"
         );
-        assert!(st.is_blacklisted(27205, "h1".into()).await);
+        assert!(
+            st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await
+        );
     }
 
     #[tokio::test]
@@ -1854,7 +1869,8 @@ mod tests {
             "movie-pack record must be removed"
         );
         assert!(
-            st.is_blacklisted(27205, "h1".into()).await,
+            st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await,
             "movie-pack hash must be blacklisted"
         );
     }
