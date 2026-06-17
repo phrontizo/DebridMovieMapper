@@ -732,8 +732,16 @@ impl Store {
                     if let Ok(iter) = table.iter() {
                         for entry in iter.flatten() {
                             let (k, v) = entry;
-                            if let Ok(rec) = serde_json::from_slice::<OwnedRecord>(v.value()) {
-                                out.push((k.value().to_string(), rec));
+                            match serde_json::from_slice::<OwnedRecord>(v.value()) {
+                                Ok(rec) => out.push((k.value().to_string(), rec)),
+                                // owned_hashes is authoritative + non-regenerable: a silently-dropped
+                                // row becomes an invisible torrent (duplicate re-acquire / lost
+                                // provenance / remove churn) that is undiagnosable. Log it.
+                                Err(e) => error!(
+                                    "owned_hashes row {} failed to deserialise (skipped): {}",
+                                    k.value(),
+                                    e
+                                ),
                             }
                         }
                     }
@@ -1128,9 +1136,14 @@ impl Store {
                 if let Ok(table) = txn.open_table(WANTED_TABLE) {
                     if let Ok(iter) = table.iter() {
                         for entry in iter.flatten() {
-                            let (_, v) = entry;
-                            if let Ok(rec) = serde_json::from_slice::<WantedRecord>(v.value()) {
-                                out.push(rec);
+                            let (k, v) = entry;
+                            match serde_json::from_slice::<WantedRecord>(v.value()) {
+                                Ok(rec) => out.push(rec),
+                                Err(e) => error!(
+                                    "wanted row {} failed to deserialise (skipped): {}",
+                                    k.value(),
+                                    e
+                                ),
                             }
                         }
                     }
@@ -1203,8 +1216,13 @@ impl Store {
                     if let Ok(iter) = table.iter() {
                         for entry in iter.flatten() {
                             let (k, v) = entry;
-                            if let Ok(rec) = serde_json::from_slice::<SelectionEntry>(v.value()) {
-                                out.push((k.value().to_string(), rec));
+                            match serde_json::from_slice::<SelectionEntry>(v.value()) {
+                                Ok(rec) => out.push((k.value().to_string(), rec)),
+                                Err(e) => error!(
+                                    "selection row {} failed to deserialise (skipped): {}",
+                                    k.value(),
+                                    e
+                                ),
                             }
                         }
                     }

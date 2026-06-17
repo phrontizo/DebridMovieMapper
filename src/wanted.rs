@@ -845,17 +845,33 @@ mod tests {
 
     #[test]
     fn trigger_a_blocked_by_midwatch_user() {
+        // IN-PROGRESS-only records (no watchlist) so the watchlist guard does NOT short-circuit
+        // `trigger_a_finished` — the block must come from the user_finished loop seeing bob unfinished.
         let t = movie_title(
             9,
             vec![
-                watchlist_movie_record("alice", 9, true), // finished
-                watchlist_movie_record("bob", 9, false),  // mid-watch
+                movie_record("alice", 9, false, true, true), // in-progress, finished
+                movie_record("bob", 9, false, true, false),  // in-progress, mid-watch
             ],
-            Some(owned("h", Provenance::watchlist("alice"), true, vec![])),
+            Some(owned("h", Provenance::in_progress("alice"), true, vec![])),
         );
         assert!(
             !should_remove(&t),
-            "bob hasn't finished → Trigger A blocked"
+            "an unfinished in-progress wanter (bob) must block Trigger A (not the watchlist guard)"
+        );
+        // Sanity: with bob ALSO finished, Trigger A fires (proving the block above was bob, not a
+        // structural always-false) — this is the discriminating case the old all-watchlist test missed.
+        let all_finished = movie_title(
+            9,
+            vec![
+                movie_record("alice", 9, false, true, true),
+                movie_record("bob", 9, false, true, true),
+            ],
+            Some(owned("h", Provenance::in_progress("alice"), true, vec![])),
+        );
+        assert!(
+            should_remove(&all_finished),
+            "all in-progress wanters finished → Trigger A removes"
         );
         assert_eq!(
             reconcile_title(&t),

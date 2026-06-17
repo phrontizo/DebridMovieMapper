@@ -112,11 +112,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Honour RUST_LOG (e.g. `RUST_LOG=debridmoviemapper=debug`); default to INFO when unset so
-    // behaviour is unchanged. A malformed directive falls back to INFO rather than crashing startup.
+    // behaviour is unchanged. A malformed directive falls back to INFO rather than crashing startup —
+    // but is surfaced (after the subscriber is initialised) so an operator's typo isn't silent.
     let directive = log_directive(std::env::var("RUST_LOG").ok());
-    let filter = tracing_subscriber::EnvFilter::try_new(&directive)
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let (filter, directive_error) = match tracing_subscriber::EnvFilter::try_new(&directive) {
+        Ok(f) => (f, None),
+        Err(e) => (tracing_subscriber::EnvFilter::new("info"), Some(e)),
+    };
     tracing_subscriber::fmt().with_env_filter(filter).init();
+    if let Some(e) = directive_error {
+        tracing::warn!("Invalid RUST_LOG directive {directive:?} ({e}); falling back to info");
+    }
 
     let config = Config::from_env().unwrap_or_else(|e| {
         eprintln!("Configuration error: {}", e);

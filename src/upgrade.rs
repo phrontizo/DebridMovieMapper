@@ -622,6 +622,16 @@ async fn try_consolidate_show(
     seasons.sort_unstable();
     seasons.dedup();
 
+    // We have scattered episodes to consolidate but TMDB returned no aired episodes — almost
+    // certainly a transient air-date lookup failure (`aired_episodes` swallows TMDB errors as empty).
+    // Defer rather than stamp the cursor (which would skip this show for a full cursor wrap on a daily
+    // job), mirroring the movie path's transient-failure handling.
+    if !seasons.is_empty() && aired.is_empty() {
+        return Err(UpgradeSkip::Deferred(
+            "aired-episode lookup empty (likely transient TMDB failure)".into(),
+        ));
+    }
+
     // Fix B: hoist provenance scan outside the per-season loop (one DB scan per title, not per season).
     let prov = base_req_provenance(app, MediaType::Show, tmdb_id).await;
     for season in seasons {
@@ -678,8 +688,12 @@ async fn try_consolidate_show(
         {
             Ok(r) => r,
             Err(e) => {
-                warn!("consolidate: scrape s{} failed: {}", season, e);
-                continue;
+                // A scrape failure is transient → Deferred (don't stamp the cursor), matching the
+                // movie path. Earlier seasons already consolidated this tick are durable; remaining
+                // seasons are retried next tick (an already-consolidated season skips via already_pack).
+                return Err(UpgradeSkip::Deferred(format!(
+                    "s{season} scrape failed: {e}"
+                )));
             }
         };
         // Try cached candidates that look like packs (file_name absent or multiple videos after stage).
