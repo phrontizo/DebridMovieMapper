@@ -166,8 +166,11 @@ impl TraktConfig {
         const DEFAULT_EPISODE: u64 = 3600;
         const MIN_EPISODE: u64 = 300;
 
-        let sync_interval_secs = match sync_interval_secs {
-            Some(s) => s.trim().parse::<u64>().unwrap_or_else(|_| {
+        let sync_interval_secs = match sync_interval_secs
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
                 warn!(
                     "Invalid TRAKT_SYNC_INTERVAL_SECS value '{}', falling back to {}",
                     s, DEFAULT_SYNC
@@ -178,8 +181,11 @@ impl TraktConfig {
         }
         .max(MIN_SYNC);
 
-        let episode_check_interval_secs = match episode_check_interval_secs {
-            Some(s) => s.trim().parse::<u64>().unwrap_or_else(|_| {
+        let episode_check_interval_secs = match episode_check_interval_secs
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
                 warn!(
                     "Invalid TRAKT_EPISODE_CHECK_INTERVAL_SECS value '{}', falling back to {}",
                     s, DEFAULT_EPISODE
@@ -309,9 +315,11 @@ impl AcquisitionConfig {
             // Clamp to a sane floor: STALL_TIMEOUT_SECS=0 would declare every Pending torrent
             // stalled instantly, and MAX_ACQUIRE_ATTEMPTS=0 would make the engine never retry —
             // both footguns, consistent with the other interval knobs which all clamp.
-            stall_timeout_secs: match stall_timeout_secs {
+            stall_timeout_secs: match stall_timeout_secs
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
                 Some(s) => s
-                    .trim()
                     .parse::<u64>()
                     .unwrap_or_else(|_| {
                         warn!(
@@ -323,9 +331,11 @@ impl AcquisitionConfig {
                     .max(60),
                 None => 1800,
             },
-            max_acquire_attempts: match max_acquire_attempts {
+            max_acquire_attempts: match max_acquire_attempts
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
                 Some(s) => s
-                    .trim()
                     .parse::<u32>()
                     .unwrap_or_else(|_| {
                         warn!(
@@ -364,9 +374,12 @@ impl AcquisitionConfig {
         // Warn (don't silently fall back) on an unparseable value, matching the other interval
         // knobs — a typo like `ACQUIRE_DEAD_TIMEOUT_SECS=10m` should be visible, not indistinguishable
         // from unset.
-        a.acquire_dead_timeout_secs = match std::env::var("ACQUIRE_DEAD_TIMEOUT_SECS").ok() {
+        a.acquire_dead_timeout_secs = match std::env::var("ACQUIRE_DEAD_TIMEOUT_SECS")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
             Some(s) => s
-                .trim()
                 .parse::<u64>()
                 .unwrap_or_else(|_| {
                     warn!(
@@ -413,8 +426,10 @@ impl UpgradeConfig {
         stage_max_secs: Option<String>,
     ) -> Self {
         fn num(v: Option<String>, default: u64, min: u64, zero_disables: bool, name: &str) -> u64 {
-            match v {
-                Some(s) => match s.trim().parse::<u64>() {
+            // Treat unset OR blank as "use the default" (consistent with how blank string knobs are
+            // treated as unset) — only a non-blank unparseable value warns.
+            match v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                Some(s) => match s.parse::<u64>() {
                     Ok(0) if zero_disables => 0,
                     Ok(n) => n.max(min),
                     Err(_) => {
@@ -549,8 +564,12 @@ impl Config {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| AppError::Config("TMDB_API_KEY must be set".to_string()))?;
 
-        let scan_interval_secs = match scan_interval_secs {
-            Some(s) => s.trim().parse::<u64>().unwrap_or_else(|_| {
+        // Treat unset OR blank as the default (consistent with `db_path` below and the string knobs).
+        let scan_interval_secs = match scan_interval_secs
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
                 warn!(
                     "Invalid SCAN_INTERVAL_SECS value '{}', falling back to 60",
                     s
@@ -569,8 +588,8 @@ impl Config {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "metadata.db".to_string());
 
-        let port = match port {
-            Some(s) => s.trim().parse::<u16>().unwrap_or_else(|_| {
+        let port = match port.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            Some(s) => s.parse::<u16>().unwrap_or_else(|_| {
                 warn!("Invalid PORT value '{}', falling back to 8080", s);
                 8080
             }),
