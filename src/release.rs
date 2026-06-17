@@ -1077,6 +1077,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_detects_hdr_and_dolby_vision_variants_without_false_positives() {
+        // HDR / Dolby-Vision tags drive the PREFER_HDR scoring bonus. The `dovi` and separator-bounded
+        // ` dv ` forms must be detected; a `dvdscr` (DVD-screener) token contains "dv" but must NOT
+        // be mistaken for Dolby Vision (it's a screener source, filtered separately).
+        let dovi = raw("x", "Movie.2020.2160p.WEB-DL.DoVi.HDR10-GRP", "a", None);
+        assert!(parse(&dovi).hdr, "DoVi → hdr");
+        let dv = raw("x", "Movie.2020.2160p.WEB-DL dv HEVC-GRP", "b", None);
+        assert!(parse(&dv).hdr, "separator-bounded ' dv ' → hdr");
+        let dolby = raw("x", "Movie 2020 2160p Dolby Vision WEB-DL GRP", "c", None);
+        assert!(parse(&dolby).hdr, "spaced 'dolby vision' → hdr");
+        let screener = raw("x", "Movie.2020.DVDSCR.x264-GRP", "d", None);
+        assert!(
+            !parse(&screener).hdr,
+            "DVDSCR contains 'dv' but must NOT be read as Dolby Vision"
+        );
+    }
+
+    #[test]
     fn is_meaningful_upgrade_requires_strictly_greater_score_at_equal_score() {
         // The flip-flop-prevention guarantee rests on the score comparison being STRICT (`>`). Two
         // cached releases with an EQUAL score but a genuine tier/resolution category jump must NOT be

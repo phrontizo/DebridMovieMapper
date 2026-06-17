@@ -1515,6 +1515,18 @@ mod tests {
     }
 
     #[test]
+    fn io_kind_is_corruption_matches_only_truncation_and_bad_data() {
+        // A truncated DB (UnexpectedEof) and a bad header (InvalidData) are corruption signals → move
+        // aside. An operational I/O error (permission, would-block, …) must NOT be — discarding a
+        // healthy-but-temporarily-unreadable DB would lose authoritative data.
+        assert!(io_kind_is_corruption(std::io::ErrorKind::UnexpectedEof));
+        assert!(io_kind_is_corruption(std::io::ErrorKind::InvalidData));
+        assert!(!io_kind_is_corruption(std::io::ErrorKind::PermissionDenied));
+        assert!(!io_kind_is_corruption(std::io::ErrorKind::WouldBlock));
+        assert!(!io_kind_is_corruption(std::io::ErrorKind::NotFound));
+    }
+
+    #[test]
     fn db_open_failure_recovers_only_on_genuine_corruption() {
         // A non-redb / damaged file (redb returns Corrupted "Invalid magic number"), an old format,
         // or an aborted repair are the only signals that justify moving the file aside.

@@ -268,7 +268,9 @@ async fn try_upgrade_movie(
     // 5. Swap selection → new hash, then prune every old owned hash. If the selection repoint did
     //    NOT persist, do NOT prune — pruning the old torrents while the selection still points at one
     //    of them would leave the slot resolving to a hash we're about to delete (a stale DB row at
-    //    best). Defer instead; the next tick retries cleanly.
+    //    best). Defer the prune; the staged copy stays owned and is reclaimed by the duplicate-dedup
+    //    pass (a put_selection failure is a rare redb-write/disk error that triggers DB self-heal
+    //    anyway). Strictly safer than pruning behind a stale selection.
     if let Err(e) = app
         .store
         .put_selection(
@@ -924,9 +926,10 @@ async fn try_consolidate_show(
                 .await;
             // Repoint every episode slot of this season to the pack. If any repoint fails to
             // persist, DEFER the prune below: deleting a scattered episode whose slot still points at
-            // the old (about-to-be-deleted) hash would break that episode's playback. Next tick
-            // retries the (idempotent) repoint + prune cleanly; the pack is already recorded owned, so
-            // nothing is lost by waiting.
+            // the old (about-to-be-deleted) hash would break that episode's playback. The pack is
+            // already recorded owned, so nothing is lost — a later consolidation re-runs the
+            // idempotent repoint, and the duplicate-dedup pass reclaims the now-redundant scattered
+            // episodes either way. (A put_selection failure is a rare redb-write/disk error.)
             let mut repoint_ok = true;
             for (s, e, path) in &eps {
                 if *s != season {
@@ -1246,6 +1249,191 @@ mod tests {
         assert!(
             deleted.lock().unwrap().contains(&"told".to_string()),
             "old torrent deleted from provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn movie_upgrade_rolls_back_staged_candidate_when_listing_unavailable() {
+        // After staging the upgrade, if the provider listing for the prune is UNAVAILABLE, the engine
+        // must ROLL BACK the freshly-staged candidate (delete it + drop its records) and DEFER — never
+        // prune (which would treat the still-present old torrent as gone) and never leave an orphaned
+        // present-but-untracked torrent (re-adopted as a duplicate). Cursor stays unstamped.
+        let store = mem_store();
+        store
+            .put_owned(
+                "hold".into(),
+                OwnedRecord {
+                    request: movie_req(),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(QualitySummary {
+                        cached: true,
+                        source_tier: 3_000,
+                        resolution: 1080,
+                        score: 10,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "hold".into(),
+                    file_path: "old.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![remux_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            // get_torrents is only called AFTER staging (for the prune listing) → fail it there.
+            fail_get_torrents: true,
+            add_magnet: Some(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tnew".into(),
+                hash: "hnew".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "M.2020.1080p.REMUX.mkv".into(),
+                    bytes: 30_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/new".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+        run_upgrade_once(&app).await;
+
+        assert!(
+            store.get_owned("hnew".into()).await.is_none(),
+            "the staged record must be rolled back when the listing is unavailable"
+        );
+        assert!(
+            deleted.lock().unwrap().contains(&"tnew".to_string()),
+            "the staged torrent must be deleted on rollback"
+        );
+        assert!(
+            store.get_owned("hold".into()).await.is_some(),
+            "the current release must be untouched"
+        );
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hold",
+            "the selection must NOT be swapped (no prune happened)"
+        );
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Movie, 27205).await,
+            0,
+            "a deferred title keeps its cursor unstamped"
+        );
+    }
+
+    #[tokio::test]
+    async fn movie_upgrade_keeps_old_record_when_prune_delete_fails() {
+        // The swap succeeds (selection → new hash), but pruning the old torrent's delete FAILS. The
+        // old owned record must be KEPT (not dropped) so a later tick retries — otherwise a
+        // present-but-untracked old torrent would be re-adopted by record_mirror_owned as a DUPLICATE.
+        let store = mem_store();
+        store
+            .put_owned(
+                "hold".into(),
+                OwnedRecord {
+                    request: movie_req(),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(QualitySummary {
+                        cached: true,
+                        source_tier: 3_000,
+                        resolution: 1080,
+                        score: 10,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "hold".into(),
+                    file_path: "old.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![remux_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "told".into(),
+                    hash: "hold".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tnew".into(),
+                    hash: "hnew".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tnew".into(),
+                hash: "hnew".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "M.2020.1080p.REMUX.mkv".into(),
+                    bytes: 30_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/new".into()),
+            deleted: deleted.clone(),
+            fail_delete: true, // the prune's delete_torrent fails
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+        run_upgrade_once(&app).await;
+
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hnew",
+            "the selection still swaps to the upgraded release"
+        );
+        assert!(
+            deleted.lock().unwrap().contains(&"told".to_string()),
+            "the prune must ATTEMPT to delete the old torrent"
+        );
+        assert!(
+            store.get_owned("hold".into()).await.is_some(),
+            "on a failed delete the old owned record is KEPT for retry (no orphan re-adoption)"
         );
     }
 

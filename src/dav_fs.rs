@@ -1736,6 +1736,72 @@ mod provider_abstraction_tests {
     }
 
     #[tokio::test]
+    async fn read_bytes_short_circuits_on_a_hidden_torrent_without_io_or_stamp() {
+        // A Broken/hidden torrent must short-circuit read_bytes BEFORE any I/O — so it can never
+        // re-trigger repair (which would trap it until restart) and never even stamps read-activity.
+        use crate::read_activity::ReadActivity;
+        let ra = Arc::new(ReadActivity::new());
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            resolved_url: Some("http://127.0.0.1:0/none".into()),
+            invalidate_calls: counter.clone(),
+            ..Default::default()
+        });
+        let repair = Arc::new(RepairManager::new(provider.clone()));
+        repair.mark_broken("t").await; // hide the torrent
+        let mut f = ProxiedMediaFile {
+            name: "x.mkv".to_string(),
+            locator: crate::provider::FileLocator {
+                torrent_id: "t".into(),
+                ..Default::default()
+            },
+            file_size: 10,
+            repair_manager: repair,
+            rd_client: provider,
+            http_client: reqwest::Client::new(),
+            pos: 0,
+            cdn_url: None,
+            buffer: bytes::Bytes::new(),
+            buffer_start: 0,
+            read_activity: ra.clone(),
+            vfs_path: "Movies/X/x.mkv".to_string(),
+            modified_time: SystemTime::UNIX_EPOCH,
+            confirmed_read: false,
+        };
+        assert!(
+            f.read_bytes(4).await.is_err(),
+            "a hidden torrent's read must fail fast"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no I/O (no invalidate) on a hidden torrent"
+        );
+        assert!(
+            ra.is_idle("Movies/X/x.mkv", std::time::Duration::from_secs(300))
+                .await,
+            "read-activity must NOT be stamped for a short-circuited read"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_cdn_range_rejects_an_empty_body_on_an_acceptable_response() {
+        // A 206/offset-0-200 that streams ZERO bytes for a non-empty range must be rejected (drop the
+        // URL, retry, then fail) rather than surfaced as a premature mid-file EOF that silently
+        // truncates playback. `spawn_always_status` replies 206 with Content-Length: 0.
+        let url = spawn_always_status("206 Partial Content").await;
+        let (mut f, invalidate_calls) = proxied_with_counter(url, 0, 1000);
+        assert!(
+            f.fetch_bytes(8).await.is_err(),
+            "an empty body for a non-empty range must not be served"
+        );
+        assert!(
+            invalidate_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "an empty-body response must invalidate the cached resolution"
+        );
+    }
+
+    #[tokio::test]
     async fn proxied_media_file_seek_resolves_offsets_and_guards_underflow() {
         // ProxiedMediaFile has its OWN seek impl (separate from VirtualFile's): Start/Current/End and
         // the checked_add underflow guards on Current/End must all be exercised here.

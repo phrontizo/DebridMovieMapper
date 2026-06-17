@@ -371,14 +371,16 @@ impl AcquisitionConfig {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        // Warn (don't silently fall back) on an unparseable value, matching the other interval
-        // knobs — a typo like `ACQUIRE_DEAD_TIMEOUT_SECS=10m` should be visible, not indistinguishable
-        // from unset.
-        a.acquire_dead_timeout_secs = match std::env::var("ACQUIRE_DEAD_TIMEOUT_SECS")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
+        a.acquire_dead_timeout_secs =
+            Self::parse_dead_timeout(std::env::var("ACQUIRE_DEAD_TIMEOUT_SECS").ok());
+        a
+    }
+
+    /// Parse `ACQUIRE_DEAD_TIMEOUT_SECS`: unset/blank → 600, an unparseable value warns + falls back
+    /// to 600 (matching the other interval knobs — a typo like `10m` must be visible, not silently
+    /// treated as unset), and any value is clamped up to the 120s floor. Pure for unit-testability.
+    fn parse_dead_timeout(raw: Option<String>) -> u64 {
+        match raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
             Some(s) => s
                 .parse::<u64>()
                 .unwrap_or_else(|_| {
@@ -390,8 +392,7 @@ impl AcquisitionConfig {
                 })
                 .max(120),
             None => 600,
-        };
-        a
+        }
     }
 }
 
@@ -851,6 +852,29 @@ mod tests {
         );
         assert_eq!(a.stall_timeout_secs, 60);
         assert_eq!(a.max_acquire_attempts, 1);
+    }
+
+    #[test]
+    fn acquire_dead_timeout_parses_clamps_and_falls_back() {
+        // unset/blank → 600; below the floor → 120; valid → as given; non-numeric/typo → 600.
+        assert_eq!(AcquisitionConfig::parse_dead_timeout(None), 600);
+        assert_eq!(
+            AcquisitionConfig::parse_dead_timeout(Some("  ".into())),
+            600
+        );
+        assert_eq!(
+            AcquisitionConfig::parse_dead_timeout(Some("30".into())),
+            120
+        );
+        assert_eq!(
+            AcquisitionConfig::parse_dead_timeout(Some("900".into())),
+            900
+        );
+        assert_eq!(
+            AcquisitionConfig::parse_dead_timeout(Some("10m".into())),
+            600,
+            "a typo must warn-and-default, not be treated as a tiny timeout"
+        );
     }
 
     #[test]
