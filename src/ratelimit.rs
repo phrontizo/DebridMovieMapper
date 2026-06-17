@@ -210,9 +210,15 @@ mod tests {
         // 1 request left in the window, which resets in ~10s.
         limiter.observe_rate_limit(1, now_unix_secs() + 10.0).await;
         let state = limiter.state.lock().await;
+        // Bound BOTH sides: the pause must be ~the ~10s reset window, so an over-pause (an uncapped
+        // or doubled wait) is caught too — a one-sided `>= 8s` would pass a runaway pause.
         assert!(
             state.next_allowed >= before + Duration::from_secs(8),
-            "should pause until reset"
+            "should pause until the window reset"
+        );
+        assert!(
+            state.next_allowed <= before + Duration::from_secs(12),
+            "must not pause materially LONGER than the ~10s reset window (no uncapped/doubled wait)"
         );
     }
 
