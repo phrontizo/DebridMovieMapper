@@ -125,8 +125,9 @@ async fn run_player_simulation(provider: Arc<dyn DebridProvider>, label: &str) {
     }
 
     // Select a few movies and shows at random
-    use rand::seq::SliceRandom;
-    let mut rng = rand::thread_rng();
+    // rand 0.9 moved `choose` from `SliceRandom` to the `IndexedRandom` trait.
+    use rand::seq::IndexedRandom;
+    let mut rng = rand::rng();
 
     let movies: Vec<_> = video_files
         .iter()
