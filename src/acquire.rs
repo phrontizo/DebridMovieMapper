@@ -699,13 +699,19 @@ impl AcquisitionEngine {
             }
         }
 
+        // A completely empty listing is untrustworthy as a reap signal: a spurious empty-but-OK
+        // provider response (eventual consistency) would otherwise mark EVERY in-flight Pending
+        // "absent" and, past the dead-timeout, blacklist + reap it. Treat empty like a failed listing
+        // for reaping (the reconciler already skips a *failed* get_torrents tick for the same reason).
+        let listing_empty = torrents.is_empty();
         for (hash, rec) in &owned {
             let Some(t) = by_hash.get(hash.as_str()).copied() else {
                 // Not in the listing. A Pending torrent that never registered/resolved is dead
-                // once it has been waiting longer than the dead-timeout.
+                // once it has been waiting longer than the dead-timeout — but only trust "absent"
+                // when the listing isn't wholesale empty.
                 if rec.status == OwnedStatus::Pending {
                     let age = now_secs().saturating_sub(rec.added_at);
-                    if age > self.dead_timeout.as_secs() {
+                    if age > self.dead_timeout.as_secs() && !listing_empty {
                         self.fail_and_reacquire(
                             hash,
                             "",
@@ -716,8 +722,8 @@ impl AcquisitionEngine {
                         .await;
                     } else {
                         debug!(
-                            "observe: tmdb {} hash {} absent from listing ({}s/{}s before reap) — waiting",
-                            rec.request.tmdb_id, hash, age, self.dead_timeout.as_secs()
+                            "observe: tmdb {} hash {} absent from listing ({}s/{}s before reap, listing_empty={}) — waiting",
+                            rec.request.tmdb_id, hash, age, self.dead_timeout.as_secs(), listing_empty
                         );
                     }
                 }
@@ -1684,7 +1690,8 @@ mod tests {
     #[tokio::test]
     async fn observe_reaps_never_resolved_after_dead_timeout() {
         let st = store();
-        // added_at far in the past; dead-timeout = 0 ⇒ immediately past it. Not in the listing.
+        // added_at far in the past; dead-timeout = 0 ⇒ immediately past it. Genuinely absent: the
+        // listing is NON-empty (other torrents present) but doesn't contain h1.
         st.put_owned(
             "h1".into(),
             OwnedRecord {
@@ -1706,7 +1713,9 @@ mod tests {
             st.clone(),
             0,
         );
-        eng.observe(&[]).await; // h1 absent from listing
+        // Non-empty listing lacking h1 ⇒ h1 is genuinely absent ⇒ reaped past the dead-timeout.
+        eng.observe(&[torrent("other_id", "otherhash", "downloaded", 100.0)])
+            .await;
         assert!(
             st.get_owned("h1".into()).await.is_none(),
             "never-resolved Pending is reaped"
@@ -1714,6 +1723,45 @@ mod tests {
         assert!(
             st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
                 .await
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_does_not_reap_pending_on_empty_listing() {
+        // A spurious empty-but-OK provider listing must NOT reap an in-flight Pending acquisition,
+        // even past the dead-timeout — an empty listing is an untrustworthy "absent" signal (provider
+        // eventual consistency), so the record is kept for a later tick with a real listing.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: 1,
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let eng = engine_dead(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+            0, // dead-timeout 0 ⇒ would reap immediately IF empty were trusted
+        );
+        eng.observe(&[]).await; // empty listing
+        assert!(
+            st.get_owned("h1".into()).await.is_some(),
+            "an empty listing must NOT reap an in-flight Pending"
+        );
+        assert!(
+            !st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await,
+            "an empty listing must NOT blacklist an in-flight Pending"
         );
     }
 
