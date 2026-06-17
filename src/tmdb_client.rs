@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use crate::ratelimit::MAX_RETRY_AFTER_SECS;
 use rand::Rng;
 use reqwest::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
@@ -7,8 +8,6 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::{error, warn};
-
-const MAX_RETRY_AFTER_SECS: u64 = 300; // Cap Retry-After to 5 minutes
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TmdbSearchResult {

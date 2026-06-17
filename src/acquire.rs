@@ -8,7 +8,7 @@ use crate::store::{AcquireRequest, OwnedRecord, OwnedStatus, Provenance, Store};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -172,21 +172,9 @@ fn parse_se_all(name: &str) -> Vec<(u32, u32)> {
     Vec::new()
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+use crate::now_unix_secs as now_secs;
 
 /// Extract the numeric tmdb id from `MediaMetadata.external_id` (`"tmdb:1396"`).
-fn tmdb_to_u64(m: &crate::vfs::MediaMetadata) -> Option<u64> {
-    m.external_id
-        .as_deref()
-        .and_then(|s| s.strip_prefix("tmdb:"))
-        .and_then(|s| s.parse::<u64>().ok())
-}
-
 /// One-line summary of a ranked candidate for debug logs (short hash + the ranking-relevant
 /// signals). Contains no token/URL — safe to log.
 fn release_summary(r: &ReleaseInfo) -> String {
@@ -642,7 +630,7 @@ impl AcquisitionEngine {
     ) {
         match req.kind {
             MediaKind::Movie => {
-                if let Some(id) = tmdb_to_u64(&req.metadata) {
+                if let Some(id) = crate::vfs::tmdb_id_of(&req.metadata) {
                     let _ = self
                         .store
                         .put_selection(
@@ -657,7 +645,7 @@ impl AcquisitionEngine {
             }
             MediaKind::Series => {
                 let eps = episode_files(info);
-                if let Some(id) = tmdb_to_u64(&req.metadata) {
+                if let Some(id) = crate::vfs::tmdb_id_of(&req.metadata) {
                     for (s, e, path) in &eps {
                         let _ = self
                             .store

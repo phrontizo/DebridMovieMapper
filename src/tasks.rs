@@ -14,7 +14,7 @@ use crate::vfs::{DebridVfs, MediaMetadata, MediaType};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -102,10 +102,7 @@ pub async fn run_scan_loop(
             return;
         }
         if tick.is_multiple_of(prune_every_ticks) {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let now = crate::now_unix_secs();
             let pruned = store
                 .prune_blacklist_before(now.saturating_sub(BLACKLIST_TTL_SECS))
                 .await;
@@ -698,10 +695,7 @@ async fn sync_trakt_user(
     use crate::vfs::MediaType;
 
     // Refresh if at/near expiry, persisting the fresh tokens before using them.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = crate::now_unix_secs();
     if tokens.expires_at <= now + REFRESH_BUFFER_SECS {
         let r = trakt.refresh(&tokens.refresh).await?;
         // Match `enrolment::refresh_account`: keep the existing refresh token if Trakt returns an
@@ -1021,10 +1015,7 @@ pub(crate) async fn record_mirror_owned(
     prefs: &crate::config::QualityPrefs,
     current_data: &[(crate::rd_client::TorrentInfo, MediaMetadata)],
 ) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = crate::now_unix_secs();
     // Resolve each title's IMDB id at most once per pass (many torrents can share a tmdb_id).
     let mut imdb_cache: HashMap<(MediaType, u64), String> = HashMap::new();
     // Snapshot the owned-hash set in ONE read transaction up front, rather than a separate

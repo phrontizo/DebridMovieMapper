@@ -247,6 +247,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dav_handler = DavHandler::builder()
         .filesystem(Box::new(dav_fs))
         .locksystem(dav_server::fakels::FakeLs::new())
+        // Request reads in whole-buffer (2 MB) chunks rather than dav-server's 16 KB default, so each
+        // 2 MB read-ahead is drained in one `read_bytes` call instead of ~128 — collapsing the
+        // per-read lock/async overhead (repair health + read-activity) by the same factor under the
+        // many concurrent rclone readers. `fetch_bytes` already clamps the fetch to BUFFER_SIZE, so
+        // sizing is unchanged; a buffer hit just returns more of the existing refcounted slice.
+        .read_buf_size(debridmoviemapper::dav_fs::BUFFER_SIZE)
         .build_handler();
 
     // Local-network Trakt enrolment routes (no auth — trusted LAN), present only when Trakt is

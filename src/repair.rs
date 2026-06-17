@@ -6,6 +6,13 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+/// Minimum seconds between repair triggers for one torrent — bounds a per-read repair storm on a
+/// still-broken-on-CDN cached file (a fresh re-add each read would otherwise hammer the provider).
+const REPAIR_COOLDOWN_SECS: u64 = 30;
+/// Maximum consecutive failed repairs before a torrent is marked permanently `Failed`. Counts only
+/// *consecutive* failures — a confirmed good read (`note_read_success`) resets the budget.
+const MAX_REPAIR_ATTEMPTS: u32 = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepairState {
     Healthy,
@@ -144,7 +151,7 @@ impl RepairManager {
                     return Err("Repair already in progress".to_string());
                 }
                 if let Some(last_trigger) = health.last_repair_trigger {
-                    if last_trigger.elapsed().as_secs() < 30 {
+                    if last_trigger.elapsed().as_secs() < REPAIR_COOLDOWN_SECS {
                         debug!(
                             "Repair recently triggered for torrent {} ({}s ago), skipping",
                             torrent_id,
@@ -159,10 +166,10 @@ impl RepairManager {
         // Write-side: set state to Repairing and increment attempt count
         let mut health_map = self.health_status.write().await;
         let attempt_num = if let Some(health) = health_map.get_mut(torrent_id) {
-            if health.repair_attempts >= 3 {
+            if health.repair_attempts >= MAX_REPAIR_ATTEMPTS {
                 error!(
-                    "Torrent {} has failed repair 3 times, marking as permanently FAILED",
-                    torrent_id
+                    "Torrent {} has failed repair {} times, marking as permanently FAILED",
+                    torrent_id, MAX_REPAIR_ATTEMPTS
                 );
                 health.state = RepairState::Failed;
                 return Err("Maximum repair attempts exceeded".to_string());
@@ -176,7 +183,7 @@ impl RepairManager {
                 return Err("Repair already in progress".to_string());
             }
             if let Some(last_trigger) = health.last_repair_trigger {
-                if last_trigger.elapsed().as_secs() < 30 {
+                if last_trigger.elapsed().as_secs() < REPAIR_COOLDOWN_SECS {
                     return Err("Repair rate limited".to_string());
                 }
             }
@@ -421,10 +428,11 @@ impl RepairManager {
                     // (`note_transient_repair_failure`), exactly like the other transient arms
                     // (info-fetch / materialise failure): trapping it `Failed`/hidden with no
                     // replacement is unrecoverable (hidden → no reads → `note_read_success` never
-                    // fires → never reset; still listed → never pruned), and for a SAME-id (TorBox)
-                    // re-add `set_repair_healthy` would NOT reset attempts, so three cooldown-spaced
-                    // reads would still hit the 3-attempt cap and trap the real torrent. The 30s
-                    // cooldown still rate-limits retries. For a genuinely-new id (RD) also delete the
+                    // fires → never reset; still listed → never pruned), and a SAME-id (TorBox)
+                    // re-add does NOT itself reset attempts (only a confirmed good read via
+                    // `note_read_success` does), so three cooldown-spaced reads would still hit the
+                    // attempt cap and trap the real torrent. The cooldown still rate-limits retries.
+                    // For a genuinely-new id (RD) also delete the
                     // leaked replacement (TorBox's same-id re-add IS the real torrent — never delete).
                     if !same_torrent {
                         self.cleanup_leaked_torrent(&new_torrent_id).await;

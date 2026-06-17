@@ -9,8 +9,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
-/// 2 MB read-ahead buffer per open file
-const BUFFER_SIZE: usize = 2 * 1024 * 1024;
+/// 2 MB read-ahead buffer per open file. Exported so the WebDAV handler can be told to request
+/// reads in `BUFFER_SIZE` chunks (`read_buf_size`): without that, dav-server drains each 2 MB buffer
+/// via ~128 separate 16 KB `read_bytes` calls, taking the per-read locks (repair health, read
+/// activity) ~128× more often than the read-ahead design intends.
+pub const BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
 /// Maximum single CDN fetch to prevent unbounded memory growth (16 MB)
 const MAX_FETCH_SIZE: usize = 16 * 1024 * 1024;

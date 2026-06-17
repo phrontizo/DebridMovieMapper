@@ -1,3 +1,12 @@
+/// Seconds since the Unix epoch (saturating to 0 if the system clock is before 1970 — never panics).
+/// The single canonical "now" used across the acquisition/upgrade/Trakt timestamp logic.
+pub fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub mod acquire;
 pub mod app_state;
 pub mod config;

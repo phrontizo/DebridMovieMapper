@@ -35,7 +35,7 @@ fn parse_se(name: &str) -> Option<(u32, u32)> {
 }
 
 /// Extract the numeric tmdb id from a `MediaMetadata.external_id` like `"tmdb:1396"`.
-fn tmdb_id_of(metadata: &MediaMetadata) -> Option<u64> {
+pub(crate) fn tmdb_id_of(metadata: &MediaMetadata) -> Option<u64> {
     metadata
         .external_id
         .as_deref()

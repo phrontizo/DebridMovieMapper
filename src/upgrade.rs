@@ -5,19 +5,13 @@
 //! degrades the working release.
 
 use crate::app_state::AppState;
+use crate::now_unix_secs as now_secs;
 use crate::release::{self, QualitySummary};
 use crate::scraper::MediaKind;
 use crate::store::{movie_slot, OwnedRecord, OwnedStatus};
 use crate::vfs::MediaType;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tracing::{debug, info, warn};
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// Why an upgrade/consolidation attempt made no change. The distinction matters for the round-robin
 /// cursor: a `Deferred` title was NOT actually evaluated (the library went active mid-stage, or the
@@ -271,8 +265,12 @@ async fn try_upgrade_movie(
         ));
     }
 
-    // 5. Swap selection → new hash, then prune every old owned hash.
-    app.store
+    // 5. Swap selection → new hash, then prune every old owned hash. If the selection repoint did
+    //    NOT persist, do NOT prune — pruning the old torrents while the selection still points at one
+    //    of them would leave the slot resolving to a hash we're about to delete (a stale DB row at
+    //    best). Defer instead; the next tick retries cleanly.
+    if let Err(e) = app
+        .store
         .put_selection(
             movie_slot(tmdb_id),
             crate::store::SelectionEntry {
@@ -281,7 +279,11 @@ async fn try_upgrade_movie(
             },
         )
         .await
-        .ok();
+    {
+        return Err(UpgradeSkip::Deferred(format!(
+            "selection write failed; deferring prune: {e}"
+        )));
+    }
     for old in owned_hashes {
         if old.eq_ignore_ascii_case(&staged.0) {
             continue;
@@ -920,12 +922,17 @@ async fn try_consolidate_show(
                 .store
                 .put_authoritative(r.info_hash.clone(), sample.request.metadata.clone())
                 .await;
-            // Repoint every episode slot of this season to the pack.
+            // Repoint every episode slot of this season to the pack. If any repoint fails to
+            // persist, DEFER the prune below: deleting a scattered episode whose slot still points at
+            // the old (about-to-be-deleted) hash would break that episode's playback. Next tick
+            // retries the (idempotent) repoint + prune cleanly; the pack is already recorded owned, so
+            // nothing is lost by waiting.
+            let mut repoint_ok = true;
             for (s, e, path) in &eps {
                 if *s != season {
                     continue;
                 }
-                let _ = app
+                if app
                     .store
                     .put_selection(
                         crate::store::episode_slot(tmdb_id, *s, *e),
@@ -934,7 +941,16 @@ async fn try_consolidate_show(
                             file_path: path.clone(),
                         },
                     )
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    repoint_ok = false;
+                }
+            }
+            if !repoint_ok {
+                return Err(UpgradeSkip::Deferred(format!(
+                    "s{season} selection repoint failed; deferring prune"
+                )));
             }
             // Prune every owned hash this new pack fully supersedes for the season — scattered
             // single episodes AND any smaller/older pack (e.g. a prior full-season pack that didn't
