@@ -854,6 +854,24 @@ mod tests {
     }
 
     #[test]
+    fn acquisition_non_numeric_strings_fall_back_to_defaults() {
+        // A non-numeric STALL_TIMEOUT_SECS / MAX_ACQUIRE_ATTEMPTS must warn-and-default (1800 / 5),
+        // symmetric with SCAN_INTERVAL_SECS="abc"→60. Without this an operator typo could silently
+        // produce a 0/garbage timeout.
+        let a = AcquisitionConfig::from_parts(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("abc".into()),
+            Some("xyz".into()),
+        );
+        assert_eq!(a.stall_timeout_secs, 1800);
+        assert_eq!(a.max_acquire_attempts, 5);
+    }
+
+    #[test]
     fn max_resolution_parse_and_invalid_falls_back() {
         assert_eq!(MaxResolution::parse("720"), MaxResolution::P720);
         assert_eq!(MaxResolution::parse("1080"), MaxResolution::P1080);

@@ -1689,4 +1689,68 @@ mod provider_abstraction_tests {
             "a persistent CDN 5xx on the bytes must escalate to instant repair (locator swapped)"
         );
     }
+
+    #[tokio::test]
+    async fn fetch_bytes_serves_from_read_ahead_buffer_without_network() {
+        // A read fully inside the 2 MB read-ahead buffer must be served from it — no CDN fetch, no
+        // invalidate — with correct offset math. This core buffer-hit branch had no coverage (every
+        // other test starts with an empty buffer).
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            resolved_url: None, // any network attempt would surface (no URL to fetch)
+            invalidate_calls: counter.clone(),
+            ..Default::default()
+        });
+        let repair = Arc::new(RepairManager::new(provider.clone()));
+        let mut f = ProxiedMediaFile {
+            name: "Movie.mkv".to_string(),
+            locator: crate::provider::FileLocator::default(),
+            file_size: 10_000,
+            repair_manager: repair,
+            rd_client: provider,
+            http_client: reqwest::Client::new(),
+            pos: 104,
+            cdn_url: None,
+            buffer: bytes::Bytes::from_static(b"ABCDEFGHIJ"), // [100, 110)
+            buffer_start: 100,
+            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            vfs_path: String::new(),
+            modified_time: SystemTime::UNIX_EPOCH,
+            confirmed_read: false,
+        };
+        let data = f
+            .fetch_bytes(4)
+            .await
+            .expect("a buffer hit must serve bytes");
+        assert_eq!(
+            &data[..],
+            b"EFGH",
+            "served from buffer at offset (104-100)=4"
+        );
+        assert_eq!(f.pos, 108, "pos advances by the bytes served");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a buffer hit must not touch the network / invalidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxied_media_file_seek_resolves_offsets_and_guards_underflow() {
+        // ProxiedMediaFile has its OWN seek impl (separate from VirtualFile's): Start/Current/End and
+        // the checked_add underflow guards on Current/End must all be exercised here.
+        use std::io::SeekFrom;
+        let (mut f, _) = proxied_with_counter("http://x/".to_string(), 0, 1000);
+        assert_eq!(f.seek(SeekFrom::Start(500)).await.unwrap(), 500);
+        assert_eq!(f.seek(SeekFrom::Current(10)).await.unwrap(), 510);
+        assert_eq!(f.seek(SeekFrom::End(-8)).await.unwrap(), 992); // file_size - 8
+        assert!(
+            f.seek(SeekFrom::Current(-100_000)).await.is_err(),
+            "a Current seek before byte 0 must error, not underflow"
+        );
+        assert!(
+            f.seek(SeekFrom::End(-100_000)).await.is_err(),
+            "an End seek before byte 0 must error, not underflow"
+        );
+    }
 }

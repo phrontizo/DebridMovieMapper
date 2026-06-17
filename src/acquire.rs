@@ -2140,6 +2140,269 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observe_reaps_a_stalled_download() {
+        // A `downloading` torrent with no progress for `stall_timeout` must be reaped + blacklisted
+        // (the "Stalled" path), else a stuck download strands a Pending record forever. Uses
+        // stall_timeout=0 so the no-progress tick trips immediately.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let eng = AcquisitionEngine::new(
+            provider_returning("downloading", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+            prefs(),
+            5,
+            Duration::ZERO, // stall_timeout=0 → any no-progress tick is stalled
+            Duration::from_secs(600),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloading", 10.0)])
+            .await;
+        assert!(
+            st.get_owned("h1".into()).await.is_none(),
+            "a stalled download must be reaped"
+        );
+        assert!(
+            st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await,
+            "a stalled hash must be blacklisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_corrupt_probe_blacklists_and_reacquires() {
+        // A definitive corrupt-probe verdict reaps + blacklists on the first downloaded tick (no
+        // two-strikes — unlike the title validator, a Corrupt structure is unambiguous). This is the
+        // gate that keeps a broken file out of playback.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Err(ProbeError::Corrupt))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await;
+        assert!(
+            st.get_owned("h1".into()).await.is_none(),
+            "a corrupt probe must reap the record"
+        );
+        assert!(
+            st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_wrong_audio_probe_blacklists_and_reacquires() {
+        // A wrong-audio-language probe (required = original "eng", file carries only "fra") must be
+        // rejected → reaped + blacklisted, so a wrong-language release can't freeze into the library.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(), // original_language = Some("eng"); prefs.audio = Original
+                provenance: Provenance::manual(),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![Track {
+                kind: crate::probe::TrackKind::Audio,
+                language: Some("fra".into()),
+            }]))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await;
+        assert!(
+            st.get_owned("h1".into()).await.is_none(),
+            "a wrong-audio probe must reap the record"
+        );
+        assert!(
+            st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_skips_a_blacklisted_candidate_and_picks_the_next() {
+        // `acquire` must filter a known-bad hash from the candidate set and add the next-best instead,
+        // not re-add the blacklisted hash on every reconcile tick.
+        let st = store();
+        st.blacklist_add(
+            crate::scraper::MediaKind::Movie,
+            27205,
+            "h1".into(),
+            "WrongTitle",
+            now_secs(),
+        )
+        .await
+        .unwrap();
+        let eng = engine(
+            provider_returning("downloaded", "h2"),
+            Arc::new(MockScraper {
+                candidates: vec![cand("h1", true), cand("h2", true)],
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        let outcome = eng.acquire(req(), Provenance::manual()).await;
+        assert_eq!(
+            outcome,
+            AcquireOutcome::Pending("h2".into()),
+            "the blacklisted h1 is skipped; h2 is added"
+        );
+        assert!(
+            st.get_owned("h1".into()).await.is_none(),
+            "a blacklisted hash must never be added"
+        );
+        assert!(st.get_owned("h2".into()).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn acquire_returns_no_acceptable_release_when_all_candidates_blacklisted() {
+        let st = store();
+        for h in ["h1", "h2"] {
+            st.blacklist_add(
+                crate::scraper::MediaKind::Movie,
+                27205,
+                h.into(),
+                "WrongTitle",
+                now_secs(),
+            )
+            .await
+            .unwrap();
+        }
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper {
+                candidates: vec![cand("h1", true), cand("h2", true)],
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        assert_eq!(
+            eng.acquire(req(), Provenance::manual()).await,
+            AcquireOutcome::NoAcceptableRelease,
+            "all candidates blacklisted → nothing acquirable"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_series_reaps_pack_missing_requested_episode() {
+        // A downloaded series torrent that does NOT contain the requested (season, episode) must,
+        // past the dead-timeout, be reaped + blacklisted as "EpisodeMissing" (a wrong/incomplete
+        // pack must be replaced, not stuck forever).
+        let st = store();
+        let series_req = AcquireRequest {
+            imdb_id: "tt1".into(),
+            tmdb_id: 27205,
+            kind: MediaKind::Series,
+            season: Some(1),
+            episode: Some(1),
+            original_language: Some("eng".into()),
+            metadata: MediaMetadata {
+                title: "Show".into(),
+                year: Some("2023".into()),
+                media_type: MediaType::Show,
+                external_id: Some("tmdb:27205".into()),
+            },
+        };
+        st.put_owned(
+            "hp".into(),
+            OwnedRecord {
+                request: series_req.clone(),
+                provenance: Provenance::manual(),
+                added_at: now_secs().saturating_sub(10), // older than the (0s) dead-timeout
+                status: OwnedStatus::Pending,
+                provides: vec![(1, 1)],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        // The pack contains only S01E05 — the requested S01E01 is absent.
+        let wrong_pack: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_hp".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TI {
+                id: "tid_hp".into(),
+                hash: "hp".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "Show.S01E05.1080p.mkv".into(),
+                    bytes: 1_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/e05".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/e05".into()),
+            ..Default::default()
+        });
+        let eng = engine_dead(
+            wrong_pack,
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+            0,
+        );
+        eng.observe(&[torrent("tid_hp", "hp", "downloaded", 100.0)])
+            .await;
+        assert!(
+            st.get_owned("hp".into()).await.is_none(),
+            "a pack missing the requested episode must be reaped past the dead-timeout"
+        );
+        assert!(
+            st.is_blacklisted(crate::scraper::MediaKind::Series, 27205, "hp".into())
+                .await,
+            "the wrong-pack hash must be blacklisted"
+        );
+    }
+
+    #[tokio::test]
     async fn observe_movie_pack_guard_rejects_and_reacquires() {
         let st = store();
         st.put_owned(

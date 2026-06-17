@@ -2716,6 +2716,32 @@ mod tests {
     }
 
     #[test]
+    fn plan_dedup_show_prefers_currently_served_over_higher_quality() {
+        use crate::scraper::MediaKind;
+        // Show set-cover keep-priority: `selected` outranks quality, exactly like the movie path. Two
+        // packs with IDENTICAL coverage — the actively-served (lower-score) one must be KEPT and the
+        // higher-score one removed, so dedup never tears down the pack a player is reading.
+        let owned = vec![
+            (
+                "served".to_string(),
+                dedup_rec(MediaKind::Series, 2, vec![(1, 1), (1, 2)], Some(10)),
+            ),
+            (
+                "better".to_string(),
+                dedup_rec(MediaKind::Series, 2, vec![(1, 1), (1, 2)], Some(99)),
+            ),
+        ];
+        let plans = plan_dedup(
+            &owned,
+            &hset(&["served", "better"]),
+            /*selected*/ &hset(&["served"]),
+        );
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].keep, vec!["served"], "the served pack is kept");
+        assert_eq!(plans[0].remove, vec!["better"]);
+    }
+
+    #[test]
     fn plan_dedup_ignores_absent_hashes_and_singletons() {
         use crate::scraper::MediaKind;
         let owned = vec![
@@ -4134,6 +4160,33 @@ mod reconcile_wanted_tests {
         };
         assert!(removal_hashes(&pure_mirror, RemoveReason::Finished, true).is_empty());
         assert!(removal_hashes(&pure_mirror, RemoveReason::Finished, false).is_empty());
+    }
+
+    #[test]
+    fn removal_hashes_pure_mirror_show_is_reclaimed_only_with_flag_on() {
+        use crate::wanted::RemoveReason;
+        // The HEADLINE finish-cleanup case: a SHOW that exists ONLY as a pre-existing library copy
+        // (empty engine_hashes) must be reclaimed by Trigger A when REMOVE_FINISHED_SHOWS is on (the
+        // documented "incl. shows already in the library" cleanup). If the arm regressed to require a
+        // non-empty engine_hashes, this common case would silently no-op.
+        let g = OwnedGroup {
+            hashes: vec!["mirror".into()],
+            engine_hashes: vec![],
+            provenance: Provenance { entries: vec![] },
+            owned_episodes: vec![],
+            media_type: MediaType::Show,
+        };
+        assert_eq!(
+            removal_hashes(&g, RemoveReason::Finished, /*flag*/ true),
+            vec!["mirror".to_string()],
+            "flag on → a pure-mirror ended show is reclaimed"
+        );
+        assert!(
+            removal_hashes(&g, RemoveReason::Finished, /*flag*/ false).is_empty(),
+            "flag off → a pure-mirror show is never finish-removed"
+        );
+        // Trigger B never reclaims a mirror copy regardless of the flag.
+        assert!(removal_hashes(&g, RemoveReason::Abandoned, true).is_empty());
     }
 
     #[tokio::test]
