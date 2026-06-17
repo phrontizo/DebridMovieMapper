@@ -1020,4 +1020,99 @@ mod tests {
             "marginal same-tier-same-resolution score wobble is not an upgrade"
         );
     }
+
+    #[test]
+    fn parse_detects_torbox_and_lightning_cached_markers() {
+        // Dual-provider: TorBox's `TB+` marker and Torrentio's ⚡ (U+26A1) instant-availability glyph
+        // must both read as cached, exactly like Real-Debrid's `RD+`. If `tb+` detection regressed,
+        // EVERY TorBox cached release would read as uncached — acquisition would not prefer the cached
+        // copy and the upgrade engine would treat all TorBox releases as never-an-upgrade.
+        let tb = raw(
+            "Torrentio\n1080p",
+            "Movie.2023.1080p.WEB-DL.x264-GRP\nTB+",
+            "h1",
+            Some("Movie.2023.1080p.WEB-DL.x264-GRP.mkv"),
+        );
+        assert!(parse(&tb).cached, "TB+ must be detected as cached");
+        let lightning = raw(
+            "Torrentio\n1080p",
+            "Movie.2023.1080p.WEB-DL.x264-GRP \u{26a1} Instant",
+            "h2",
+            Some("Movie.2023.1080p.WEB-DL.x264-GRP.mkv"),
+        );
+        assert!(
+            parse(&lightning).cached,
+            "the ⚡ (U+26A1) instant-availability glyph must be detected as cached"
+        );
+        // And a cached marker scores a release above an otherwise-identical uncached one.
+        let cached_score = score(&parse(&tb), &prefs()).unwrap();
+        let uncached = raw(
+            "Torrentio\n1080p",
+            "Movie.2023.1080p.WEB-DL.x264-GRP\n\u{1f464} 50",
+            "h3",
+            Some("Movie.2023.1080p.WEB-DL.x264-GRP.mkv"),
+        );
+        assert!(
+            cached_score > score(&parse(&uncached), &prefs()).unwrap(),
+            "a cached TB+ release must outscore an identical uncached one"
+        );
+    }
+
+    #[test]
+    fn parse_classifies_streaming_provider_and_rip_source_aliases() {
+        // Scene releases often carry only a streaming-provider tag (AMZN/DSNP/NF) with no literal
+        // `web` token; these must map to Source::Web (tier 3000), not Source::Other (tier 0, below
+        // HDTV), else the documented HDTV→WEB upgrade path breaks and a large fraction of the
+        // catalogue is misranked. BDRip/BRRip must map to BluRay.
+        let amzn = raw("x", "Movie.2020.1080p.AMZN.DDP5.1.H264-GRP", "a", None);
+        assert_eq!(parse(&amzn).source, Source::Web, "AMZN → Web");
+        let dsnp = raw("x", "Movie.2020.1080p.DSNP.DDP5.1.H264-GRP", "b", None);
+        assert_eq!(parse(&dsnp).source, Source::Web, "DSNP → Web");
+        let nf = raw("x", "Movie.2020.1080p.NF.WEB.H264-GRP", "c", None);
+        assert_eq!(parse(&nf).source, Source::Web, "NF.WEB → Web");
+        let bdrip = raw("x", "Movie.2020.1080p.BDRip.x264-GRP", "d", None);
+        assert_eq!(parse(&bdrip).source, Source::BluRay, "BDRip → BluRay");
+        let brrip = raw("x", "Movie.2020.1080p.BRRip.x264-GRP", "e", None);
+        assert_eq!(parse(&brrip).source, Source::BluRay, "BRRip → BluRay");
+    }
+
+    #[test]
+    fn is_meaningful_upgrade_requires_strictly_greater_score_at_equal_score() {
+        // The flip-flop-prevention guarantee rests on the score comparison being STRICT (`>`). Two
+        // cached releases with an EQUAL score but a genuine tier/resolution category jump must NOT be
+        // upgrades of each other — if this regressed to `>=`, the upgrade engine would swap+prune
+        // forever each idle tick (churn + a torn-down stream).
+        let cur_tier = QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 1080,
+            score: 100,
+        };
+        let cand_higher_tier = QualitySummary {
+            cached: true,
+            source_tier: 8_000, // a real tier jump…
+            resolution: 1080,
+            score: 100, // …but identical score
+        };
+        assert!(
+            !is_meaningful_upgrade(&cur_tier, &cand_higher_tier),
+            "equal score + tier jump must NOT be an upgrade (strict > guards against flip-flop)"
+        );
+        let cur_res = QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 1080,
+            score: 200,
+        };
+        let cand_higher_res = QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 2160, // a real resolution jump…
+            score: 200,       // …but identical score
+        };
+        assert!(
+            !is_meaningful_upgrade(&cur_res, &cand_higher_res),
+            "equal score + resolution jump must NOT be an upgrade"
+        );
+    }
 }

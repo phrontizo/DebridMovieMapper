@@ -1278,4 +1278,85 @@ mod tests {
             "user_finished dispatches on watched_state (Show branch), not media_type"
         );
     }
+
+    #[test]
+    fn empty_provenance_mirror_with_no_wanter_is_kept() {
+        // The steady state of the SP3 account-mirror: most of a user's library is on NOBODY's Trakt.
+        // A mirror hash carries EMPTY provenance (NOT manual) and is kept purely by the absence of a
+        // removal trigger — a different path from manual protection. If Trigger B were ever refactored
+        // to fire on empty provenance, or Trigger A lost its no-wanter guard, the WHOLE mirrored
+        // library would be deleted with no other failing test. Pin both movie and show.
+        let movie = movie_title(
+            7,
+            vec![], // nobody wants it
+            Some(owned(
+                "mirror",
+                Provenance { entries: vec![] },
+                true,
+                vec![],
+            )),
+        );
+        assert!(
+            !should_remove(&movie),
+            "an unwanted empty-provenance mirror movie must be KEPT"
+        );
+        assert_eq!(
+            reconcile_title(&movie),
+            vec![],
+            "an unwanted, owned, available mirror movie needs no action"
+        );
+
+        let show = show_title(
+            8,
+            vec![],
+            Some(owned(
+                "mirror",
+                Provenance { entries: vec![] },
+                true,
+                vec![(1, 1), (1, 2)],
+            )),
+            vec![(1, 1), (1, 2)],
+        );
+        assert!(
+            !should_remove(&show),
+            "an unwanted empty-provenance mirror show must be KEPT"
+        );
+        assert_eq!(reconcile_title(&show), vec![]);
+    }
+
+    #[test]
+    fn fully_watched_ended_watchlisted_show_is_kept_not_trigger_a() {
+        // The show analogue of `watchlisted_watched_movie_is_kept_not_trigger_a`: a fully-watched
+        // ENDED show that is still WATCHLISTED must NOT be finish-removed (the watchlist is an explicit
+        // "keep available" signal for a re-watch). This isolates the watchlist short-circuit in
+        // `trigger_a_finished` — a Returning-status case would pass even if that guard were deleted
+        // (status alone keeps it), so an Ended-status case is required to catch the regression.
+        let t = show_title(
+            5,
+            vec![show_record(
+                "alice",
+                5,
+                /*watchlisted*/ true,
+                /*in_progress*/ false,
+                /*watched_eps*/ vec![(1, 1), (1, 2)],
+                ShowStatus::Ended,
+            )],
+            Some(owned(
+                "h",
+                Provenance::watchlist("alice"),
+                true,
+                vec![(1, 1), (1, 2)],
+            )),
+            vec![(1, 1), (1, 2)],
+        );
+        assert!(
+            !should_remove(&t),
+            "a fully-watched ENDED but watchlisted show must be KEPT (no Trigger A)"
+        );
+        assert_eq!(
+            reconcile_title(&t),
+            vec![],
+            "kept + owned + available → no acquire, no remove (no flip-flop)"
+        );
+    }
 }

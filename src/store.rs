@@ -1676,6 +1676,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_owned_status_on_missing_hash_is_a_noop_not_a_phantom_record() {
+        // A status change for a hash with no owned record must be a silent no-op (Ok), NOT create a
+        // phantom record — a phantom owned row is an invisible/duplicate torrent in the lifecycle.
+        let store = mem_store();
+        store
+            .set_owned_status("ghost".to_string(), OwnedStatus::Verified)
+            .await
+            .expect("a missing-hash status change must return Ok, not error");
+        assert!(store.get_owned("ghost".to_string()).await.is_none());
+        assert!(
+            store.all_owned().await.is_empty(),
+            "no phantom owned record may be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_owned_skips_a_corrupt_row_and_keeps_good_rows() {
+        // owned_hashes is authoritative + non-regenerable: one un-deserialisable row must NOT abort
+        // iteration (that would make the WHOLE library invisible → mass duplicate re-acquire). It is
+        // skipped; the good rows survive.
+        let store = mem_store();
+        // Inject a garbage row directly into the owned table.
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(OWNED_TABLE).unwrap();
+                t.insert("bad", b"this is not a valid OwnedRecord".as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        store
+            .put_owned(
+                "good".to_string(),
+                OwnedRecord {
+                    request: req("tt1", 27205),
+                    provenance: Provenance::manual(),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                },
+            )
+            .await
+            .unwrap();
+        let all = store.all_owned().await;
+        assert_eq!(
+            all.len(),
+            1,
+            "the corrupt row must be skipped, the good kept"
+        );
+        assert_eq!(all[0].0, "good");
+    }
+
+    #[tokio::test]
+    async fn prune_blacklist_before_is_strict_at_the_cutoff_boundary() {
+        // The TTL prune uses a STRICT `<`: a row stamped exactly AT the cutoff is NOT pruned (it
+        // becomes retryable one second later). Guards an off-by-one (`<` → `<=`) that would change
+        // when a rejected hash becomes re-acquirable.
+        let store = mem_store();
+        let m = MediaKind::Movie;
+        let cutoff = 1_000u64;
+        store
+            .blacklist_add(m, 1, "before".into(), "WrongTitle", cutoff - 1)
+            .await
+            .unwrap();
+        store
+            .blacklist_add(m, 1, "at".into(), "WrongTitle", cutoff)
+            .await
+            .unwrap();
+        store
+            .blacklist_add(m, 1, "after".into(), "WrongTitle", cutoff + 1)
+            .await
+            .unwrap();
+        let removed = store.prune_blacklist_before(cutoff).await;
+        assert_eq!(
+            removed, 1,
+            "only the row strictly before the cutoff is pruned"
+        );
+        assert!(!store.is_blacklisted(m, 1, "before".into()).await);
+        assert!(
+            store.is_blacklisted(m, 1, "at".into()).await,
+            "a row stamped exactly AT the cutoff must survive (strict <)"
+        );
+        assert!(store.is_blacklisted(m, 1, "after".into()).await);
+    }
+
+    #[tokio::test]
+    async fn open_refuses_to_discard_an_intact_db_on_a_transient_lock_error() {
+        // A transient open failure (e.g. a second instance holding the lock → DatabaseAlreadyOpen)
+        // must FAIL startup, NOT move the (intact) DB aside. Regression guard for the data-loss path:
+        // discarding a locked-but-fine database would lose authoritative owned/wanted/token data.
+        let tmp = TempDb::new("transient_open");
+        let store1 = Store::open(&tmp.path).expect("first open succeeds");
+        store1
+            .put_matches(vec![("a".to_string(), info("a"), movie("A"))])
+            .await
+            .unwrap();
+        // Second open while store1 still holds the lock → transient → Err, file NOT moved aside.
+        let second = Store::open(&tmp.path);
+        assert!(
+            matches!(second, Err(AppError::Config(_))),
+            "a transient open failure must surface as Err, not recover"
+        );
+        assert!(
+            !std::path::Path::new(&tmp.corrupt_path()).exists(),
+            "an intact-but-locked DB must NOT be moved aside"
+        );
+        assert!(
+            store1.get_match("a".to_string()).await.is_some(),
+            "the original DB is intact and still readable"
+        );
+    }
+
+    #[test]
+    fn from_database_refuses_a_newer_than_supported_schema() {
+        // `from_database` (unlike `open`, which move-aside-recovers) must REFUSE a schema newer than
+        // this binary supports rather than run against it — opposite behaviours, both must be pinned.
+        let db = Database::builder()
+            .create_with_backend(InMemoryBackend::new())
+            .unwrap();
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut m = txn.open_table(META_TABLE).unwrap();
+                m.insert("schema_version", &999u64).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let r = Store::from_database(Arc::new(db));
+        assert!(
+            matches!(r, Err(AppError::Config(_))),
+            "a newer-than-supported schema must be refused by from_database"
+        );
+    }
+
+    #[tokio::test]
     async fn authoritative_round_trip() {
         let store = mem_store();
         store
