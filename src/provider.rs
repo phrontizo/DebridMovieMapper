@@ -178,11 +178,13 @@ mod tests {
 
     #[tokio::test]
     async fn mock_provider_returns_canned_values() {
+        let invalidate_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mock = MockProvider {
             torrents: vec![Torrent {
                 id: "t1".to_string(),
                 ..Default::default()
             }],
+            invalidate_calls: invalidate_calls.clone(),
             ..Default::default()
         };
         let provider: Arc<dyn DebridProvider> = Arc::new(mock);
@@ -193,7 +195,12 @@ mod tests {
         // Methods with no canned value return defaults / no-ops.
         assert_eq!(provider.get_torrent_info("x").await.unwrap().id, "");
         provider.invalidate(&FileLocator::default()).await;
-        provider.evict_expired_cache().await;
+        provider.evict_expired_cache().await; // no-op, must not panic
+        assert_eq!(
+            invalidate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "invalidate must record the call (not a silent no-op)"
+        );
     }
 
     #[test]

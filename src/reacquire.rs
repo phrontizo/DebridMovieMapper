@@ -317,4 +317,28 @@ mod tests {
             provider.deleted.lock().unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn materialise_cleanup_delete_fires_when_not_protected() {
+        // The positive counterpart: with `protect_id = None`, a failed materialise (no matching files)
+        // MUST delete the leaked torrent so a rejected/failed candidate doesn't linger as a dead
+        // "checking" torrent.
+        let provider = Arc::new(DeleteRecordingProvider::default());
+        let p: Arc<dyn DebridProvider> = provider.clone();
+        let r = materialise(
+            &*p,
+            "H",
+            Duration::from_millis(0),
+            Duration::from_millis(0),
+            None, // not protected → cleanup must fire
+            |_| Vec::<u32>::new(),
+        )
+        .await;
+        assert!(r.is_err(), "no matching files → Err");
+        assert_eq!(
+            *provider.deleted.lock().unwrap(),
+            vec!["tid".to_string()],
+            "an unprotected failed materialise must delete the leaked torrent"
+        );
+    }
 }

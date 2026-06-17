@@ -487,19 +487,22 @@ mod tests {
 
     #[test]
     fn score_prefers_verifiable_container_and_hevc() {
-        let mkv = parse(&raw(
-            "Torrentio\n1080p",
-            "A.1080p.x265",
-            "h1",
-            Some("A.1080p.mkv"),
-        ));
-        let avi = parse(&raw(
-            "Torrentio\n1080p",
-            "A.1080p.x264",
-            "h2",
-            Some("A.1080p.avi"),
-        ));
-        assert!(score(&mkv, &prefs()).unwrap() > score(&avi, &prefs()).unwrap());
+        // Vary ONE axis at a time — the old single mkv(x265)>avi(x264) assertion passed if EITHER the
+        // container OR the HEVC bonus existed, masking a regression in the other.
+        // (a) Container only: same codec (x265), .mkv (verifiable) vs .avi (not).
+        let mkv = parse(&raw("T\n1080p", "A.1080p.x265", "h1", Some("A.1080p.mkv")));
+        let avi = parse(&raw("T\n1080p", "A.1080p.x265", "h2", Some("A.1080p.avi")));
+        assert!(
+            score(&mkv, &prefs()).unwrap() > score(&avi, &prefs()).unwrap(),
+            "a verifiable container (.mkv) must outscore a non-verifiable (.avi) at equal codec"
+        );
+        // (b) Codec only: same container (.mkv), HEVC (x265) vs AVC (x264).
+        let hevc = parse(&raw("T\n1080p", "A.1080p.x265", "h3", Some("A.1080p.mkv")));
+        let avc = parse(&raw("T\n1080p", "A.1080p.x264", "h4", Some("A.1080p.mkv")));
+        assert!(
+            score(&hevc, &prefs()).unwrap() > score(&avc, &prefs()).unwrap(),
+            "HEVC must outscore AVC at equal container (PREFER_HEVC default true)"
+        );
     }
 
     #[test]

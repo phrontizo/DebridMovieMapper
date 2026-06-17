@@ -1514,6 +1514,19 @@ mod tests {
             eng.acquire(req(), Provenance::manual()).await,
             AcquireOutcome::Acquired("h1".into())
         );
+        // Idempotent means the existing record is UNTOUCHED — a spurious re-add would overwrite it
+        // (reset status to Pending, bump added_at, drop the manual provenance). Assert it's intact.
+        let rec = st.get_owned("h1".into()).await.expect("record kept");
+        assert_eq!(
+            rec.status,
+            OwnedStatus::Verified,
+            "status must not be reset"
+        );
+        assert_eq!(rec.added_at, 1, "added_at must not be bumped (no re-add)");
+        assert!(
+            rec.provenance.has_manual_entry(),
+            "the manual provenance must be preserved"
+        );
     }
 
     #[tokio::test]
