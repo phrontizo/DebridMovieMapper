@@ -4592,3 +4592,202 @@ mod monitor_episodes_tests {
         );
     }
 }
+
+// ── dedup_owned (async wrapper: idle-gate + removal + cleanup) ────────────────────────────────
+#[cfg(test)]
+mod dedup_owned_tests {
+    use super::*;
+    use crate::app_state::AppState;
+    use crate::config::Config;
+    use crate::provider::{DebridProvider, MockProvider};
+    use crate::rd_client::Torrent;
+    use crate::repair::RepairManager;
+    use crate::scraper::MediaKind;
+    use crate::store::{
+        movie_slot, AcquireRequest, OwnedRecord, OwnedStatus, Provenance, SelectionEntry, Store,
+    };
+    use crate::tmdb_client::TmdbClient;
+    use crate::vfs::{DebridVfs, MediaMetadata, MediaType};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn mem_store() -> Store {
+        let db = Arc::new(
+            redb::Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        );
+        Store::from_database(db).unwrap()
+    }
+
+    fn build_app(store: Store, provider: Arc<dyn DebridProvider>, remove_dupes: bool) -> AppState {
+        let mut config =
+            Config::from_parts(None, Some("tb".into()), Some("k".into()), None, None, None)
+                .unwrap();
+        config.dedup_remove_duplicates = remove_dupes;
+        let scraper: Arc<dyn crate::scraper::Scraper> =
+            Arc::new(crate::scraper::TorrentioScraper::new(
+                None,
+                crate::provider::ProviderKind::TorBox,
+                "tok",
+                reqwest::Client::new(),
+            ));
+        let validator: Arc<dyn crate::acquire::TitleValidator> =
+            Arc::new(crate::acquire::TmdbTitleValidator {
+                tmdb: Arc::new(TmdbClient::new("k".into()).unwrap()),
+            });
+        let prober: Arc<dyn crate::acquire::Prober> = Arc::new(crate::acquire::HttpProber {
+            http: reqwest::Client::new(),
+        });
+        let engine = Arc::new(crate::acquire::AcquisitionEngine::new(
+            provider.clone(),
+            scraper.clone(),
+            validator,
+            prober,
+            store.clone(),
+            config.acquisition.prefs.clone(),
+            5,
+            std::time::Duration::from_secs(1800),
+            std::time::Duration::from_secs(600),
+        ));
+        AppState {
+            provider: provider.clone(),
+            tmdb_client: Arc::new(TmdbClient::new("k".into()).unwrap()),
+            vfs: Arc::new(RwLock::new(DebridVfs::new())),
+            store,
+            repair_manager: Arc::new(RepairManager::new(provider)),
+            config: Arc::new(config),
+            jellyfin_client: None,
+            http_client: reqwest::Client::new(),
+            scraper,
+            engine,
+            trakt_client: None,
+            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+        }
+    }
+
+    fn movie_owned(tmdb: u64, score: i64) -> OwnedRecord {
+        OwnedRecord {
+            request: AcquireRequest {
+                imdb_id: String::new(),
+                tmdb_id: tmdb,
+                kind: MediaKind::Movie,
+                season: None,
+                episode: None,
+                original_language: None,
+                metadata: MediaMetadata {
+                    title: "M".into(),
+                    year: None,
+                    media_type: MediaType::Movie,
+                    external_id: Some(format!("tmdb:{tmdb}")),
+                },
+            },
+            provenance: Provenance { entries: vec![] }, // mirror (empty) — dedup operates on these
+            added_at: 0,
+            status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: Some(crate::release::QualitySummary {
+                cached: true,
+                source_tier: 0,
+                resolution: 1080,
+                score,
+            }),
+        }
+    }
+
+    fn torrent(id: &str, hash: &str) -> Torrent {
+        Torrent {
+            id: id.into(),
+            hash: hash.into(),
+            status: "downloaded".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Two present copies of the same title; selection points at the kept (better) one so quality
+    /// decides. Build the store + a MockProvider listing both, plus the deleted-id sink.
+    async fn fixture() -> (
+        Store,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Vec<Torrent>,
+        Arc<dyn DebridProvider>,
+    ) {
+        let store = mem_store();
+        store
+            .put_owned("better".into(), movie_owned(27205, 100))
+            .await
+            .unwrap();
+        store
+            .put_owned("worse".into(), movie_owned(27205, 50))
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "better".into(),
+                    file_path: "m.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![torrent("t_better", "better"), torrent("t_worse", "worse")],
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let torrents = provider.get_torrents().await.unwrap();
+        (store, deleted, torrents, provider)
+    }
+
+    #[tokio::test]
+    async fn removes_redundant_duplicate_when_idle_and_enabled() {
+        let (store, deleted, torrents, provider) = fixture().await;
+        let app = build_app(store.clone(), provider, true);
+        dedup_owned(&app, &torrents).await;
+        assert_eq!(
+            *deleted.lock().unwrap(),
+            vec!["t_worse".to_string()],
+            "the lower-quality duplicate's torrent is deleted"
+        );
+        assert!(store.get_owned("worse".into()).await.is_none());
+        assert!(
+            store.get_owned("better".into()).await.is_some(),
+            "the kept copy survives"
+        );
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "better",
+            "the kept copy's selection is intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn defers_when_library_active() {
+        let (store, deleted, torrents, provider) = fixture().await;
+        let app = build_app(store.clone(), provider, true);
+        app.read_activity.touch("Movies/anything.mkv").await; // active stream anywhere
+        dedup_owned(&app, &torrents).await;
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "an active library must defer the destructive dedup removal"
+        );
+        assert!(
+            store.get_owned("worse".into()).await.is_some(),
+            "deferred → the owned record is kept for a later idle pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_default_logs_but_does_not_remove() {
+        let (store, deleted, torrents, provider) = fixture().await;
+        let app = build_app(store.clone(), provider, false); // DEDUP_REMOVE_DUPLICATES unset
+        dedup_owned(&app, &torrents).await;
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "dry-run (default) must not delete anything"
+        );
+        assert!(store.get_owned("worse".into()).await.is_some());
+    }
+}
