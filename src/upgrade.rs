@@ -583,6 +583,31 @@ fn season_has_scatter(owned: &[(String, OwnedRecord)], season: u32) -> bool {
         >= 2
 }
 
+/// Rank scraped consolidation candidates: keep only the CACHED, in-ceiling (score-passing) packs not
+/// already owned, sorted best-`score`-first. So consolidation adopts the BEST pack — consistent with
+/// the movie upgrade path's max-by-score ranking — instead of the first acceptable one in raw scraper
+/// order (which, once adopted, the `already_pack` short-circuit would strand the season on). The
+/// async blacklist filter is applied by the caller (it can't be pure). Pure → unit-testable.
+fn rank_cached_pack_candidates(
+    raws: &[crate::release::RawCandidate],
+    prefs: &crate::config::QualityPrefs,
+    owned_hashes: &[String],
+) -> Vec<release::ReleaseInfo> {
+    let mut scored: Vec<(release::ReleaseInfo, i64)> = raws
+        .iter()
+        .map(release::parse)
+        .filter(|r| r.cached)
+        .filter(|r| {
+            !owned_hashes
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(&r.info_hash))
+        })
+        .filter_map(|r| release::score(&r, prefs).map(|s| (r, s)))
+        .collect();
+    scored.sort_by_key(|(_, s)| std::cmp::Reverse(*s)); // best score first
+    scored.into_iter().map(|(r, _)| r).collect()
+}
+
 /// Consolidate a show's scattered per-episode torrents into a full-season CACHED pack, season by
 /// season. Non-destructive: a pack that fails any gate (not cached / above the resolution ceiling /
 /// not a full season / a quality regression / wrong title) is deleted and the scattered episodes
@@ -703,30 +728,15 @@ async fn try_consolidate_show(
                 )));
             }
         };
-        // Try cached candidates that look like packs (file_name absent or multiple videos after stage).
-        for raw in &raws {
-            let r = release::parse(raw);
-            if !r.cached {
-                continue;
-            }
+        // Try the CACHED, in-ceiling, not-owned candidate packs BEST-SCORE-FIRST (the hard filters —
+        // resolution ceiling, cam/telesync, dead seeders — are applied by `score()` inside the helper:
+        // a pack above the ceiling would pass the no-regression check yet violate it, so it's excluded).
+        for r in rank_cached_pack_candidates(&raws, &app.config.acquisition.prefs, group_hashes) {
             if app
                 .store
                 .is_blacklisted(MediaKind::Series, tmdb_id, r.info_hash.clone())
                 .await
             {
-                continue;
-            }
-            if group_hashes
-                .iter()
-                .any(|h| h.eq_ignore_ascii_case(&r.info_hash))
-            {
-                continue;
-            }
-            // Apply the same hard filters as acquisition (resolution ceiling, cam/telesync, dead
-            // seeders): score() returns None for any release that fails them. A full-season pack
-            // above the ceiling (e.g. cached 2160p under a 1080p ceiling) would pass the
-            // no-regression check yet violate the ceiling — never adopt it.
-            if release::score(&r, &app.config.acquisition.prefs).is_none() {
                 continue;
             }
 
@@ -2045,6 +2055,40 @@ mod tests {
         assert!(
             season_owned_quality(&owned2, 1).is_none(),
             "an unknown-quality contributor forces a conservative skip"
+        );
+    }
+
+    #[test]
+    fn rank_cached_pack_candidates_orders_by_score_and_drops_uncached_and_owned() {
+        use crate::config::AcquisitionConfig;
+        let prefs = AcquisitionConfig::default().prefs;
+        let uncached = RawCandidate {
+            name: "Torrentio".into(),
+            description: "Show.S01.1080p.BluRay.x265".into(), // no RD+/⚡ → uncached → dropped
+            info_hash: "hunc".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let owned_pack = RawCandidate {
+            name: "Torrentio".into(),
+            description: "Show.S01.1080p.WEB-DL.x265\nRD+".into(),
+            info_hash: "howned".into(), // already owned → dropped
+            file_idx: None,
+            file_name: None,
+        };
+        // remux_candidate (REMUX, hnew) outscores web_1080_candidate (WEB, hweb); both cached.
+        let raws = vec![
+            web_1080_candidate(),
+            remux_candidate(),
+            uncached,
+            owned_pack,
+        ];
+        let ranked = rank_cached_pack_candidates(&raws, &prefs, &["howned".into()]);
+        let hashes: Vec<_> = ranked.iter().map(|r| r.info_hash.clone()).collect();
+        assert_eq!(
+            hashes,
+            vec!["hnew", "hweb"],
+            "best-score (REMUX) first, WEB second; uncached + already-owned excluded"
         );
     }
 
