@@ -221,6 +221,13 @@ pub struct AcquisitionEngine {
     /// hash -> deferred-probe state (count + last-probe time): bounds the initial fast re-probe
     /// burst then backs off. A transient-deferring probe is never accepted unverified.
     verify_attempts: Arc<Mutex<HashMap<String, DeferState>>>,
+    /// hash -> consecutive title-validation failures. `validate` makes a live TMDB call and returns
+    /// `false` on a transient TMDB outage (indistinguishable from a genuine title mismatch), so a
+    /// single failure must NOT immediately blacklist+delete a possibly-correct cached release — we
+    /// require two CONSECUTIVE failures (≥2 scan ticks apart) before treating it as a real WrongTitle.
+    /// A single-tick TMDB blip (incl. the first observe after a restart, when this map is empty) thus
+    /// rides out; a genuine mismatch is still rejected one tick later. In-memory (best-effort).
+    validate_fails: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 /// The single target media file for a candidate: the addon's named/index file, else the largest
@@ -399,6 +406,7 @@ impl AcquisitionEngine {
             dead_timeout,
             progress: Arc::new(Mutex::new(HashMap::new())),
             verify_attempts: Arc::new(Mutex::new(HashMap::new())),
+            validate_fails: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -920,8 +928,8 @@ impl AcquisitionEngine {
             // call, and a transient TMDB failure makes it return `false`, which would `fail_and_reacquire`
             // (blacklist + delete) an already-validated, correct, cached release. A probe only runs
             // after validation passes, so a recorded `defer_state` already implies a prior pass.
-            if defer_state.is_none()
-                && !self
+            if defer_state.is_none() {
+                let ok = self
                     .validator
                     .validate(
                         &file_name,
@@ -930,11 +938,40 @@ impl AcquisitionEngine {
                         rec.request.season,
                         rec.request.episode,
                     )
-                    .await
-            {
-                self.fail_and_reacquire(hash, &t.id, &rec.request, "WrongTitle", &rec.provenance)
                     .await;
-                continue;
+                if ok {
+                    // Passed → clear any prior transient-failure count and fall through to the probe.
+                    self.validate_fails.lock().await.remove(hash);
+                } else {
+                    // `validate` can't distinguish a transient TMDB outage from a real mismatch, so
+                    // only blacklist+delete after TWO CONSECUTIVE failures (a single-tick blip — incl.
+                    // the first observe after a restart — rides out); a genuine WrongTitle is rejected
+                    // on the next tick. The record stays Pending (invisible — no selection written yet)
+                    // meanwhile, so the one-tick delay is harmless.
+                    let fails = {
+                        let mut m = self.validate_fails.lock().await;
+                        let c = m.entry(hash.to_string()).or_insert(0);
+                        *c += 1;
+                        *c
+                    };
+                    if fails >= 2 {
+                        self.validate_fails.lock().await.remove(hash);
+                        self.fail_and_reacquire(
+                            hash,
+                            &t.id,
+                            &rec.request,
+                            "WrongTitle",
+                            &rec.provenance,
+                        )
+                        .await;
+                    } else {
+                        debug!(
+                            "observe: tmdb {} hash {} title-validation failed ({}/2) — re-checking next tick (transient TMDB?)",
+                            rec.request.tmdb_id, hash, fails
+                        );
+                    }
+                    continue;
+                }
             }
             let locator = locator_for(&info, hash, &selected_path);
             match self.verify_file(&locator, &rec.request).await {
@@ -1291,6 +1328,26 @@ mod tests {
             self.0
         }
     }
+    /// Validator that returns `false` for its first `fail_first` calls, then `true` — simulates a
+    /// transient TMDB outage that recovers (B5).
+    struct FailThenPassValidator {
+        fail_first: u32,
+        calls: std::sync::atomic::AtomicU32,
+    }
+    #[async_trait]
+    impl TitleValidator for FailThenPassValidator {
+        async fn validate(
+            &self,
+            _f: &str,
+            _t: u64,
+            _k: MediaKind,
+            _s: Option<u32>,
+            _e: Option<u32>,
+        ) -> bool {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            n >= self.fail_first
+        }
+    }
     struct CannedProber(Result<Vec<Track>, ProbeError>);
     #[async_trait]
     impl Prober for CannedProber {
@@ -1634,6 +1691,16 @@ mod tests {
             Arc::new(CannedProber(Ok(vec![]))),
             st.clone(),
         );
+        // First tick: validation fails ONCE — not yet blacklisted (could be a transient TMDB blip).
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await;
+        assert!(
+            !st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await,
+            "a single validation failure must not blacklist (transient-TMDB tolerance)"
+        );
+        assert!(st.get_owned("h1".into()).await.is_some());
+        // Second consecutive failure → genuine WrongTitle → blacklist + reap.
         eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
             .await;
         assert!(
@@ -1641,6 +1708,54 @@ mod tests {
                 .await
         );
         assert!(st.get_owned("h1".into()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn observe_transient_validate_failure_recovers_without_blacklist() {
+        // B5: validation fails on the first tick (transient TMDB outage) then passes on the second.
+        // The record must NOT be blacklisted — it recovers and verifies. This is the restart window
+        // (in-memory defer state lost → re-validate) made safe by the two-consecutive-failures rule.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(FailThenPassValidator {
+                fail_first: 1,
+                calls: std::sync::atomic::AtomicU32::new(0),
+            }),
+            Arc::new(CannedProber(Ok(vec![]))), // probe Accepts (unknown tracks) → Verified
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await; // tick 1: validate fails (1/2)
+        assert!(
+            st.get_owned("h1".into()).await.is_some(),
+            "a transient validate failure must not reap the record"
+        );
+        assert!(
+            !st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await; // tick 2: validate passes → verified
+        assert_eq!(
+            st.get_owned("h1".into()).await.unwrap().status,
+            OwnedStatus::Verified,
+            "once validation recovers, the record verifies (not blacklisted)"
+        );
     }
 
     #[tokio::test]
