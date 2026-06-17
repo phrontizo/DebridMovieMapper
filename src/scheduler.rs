@@ -1,8 +1,9 @@
 //! Background-job scheduler (SP2 Task 10). Splits the single `run_scan_loop` spawn into
 //! cooperating periodic tasks over a shared [`AppState`]:
 //!
-//! - **Scan task** = `run_scan_loop` (UNCHANGED): `sync_account` (VFS mirror) + `verify_acquisitions`
-//!   (`engine.observe`), sharing one `get_torrents` per tick. Cadence: `SCAN_INTERVAL_SECS`.
+//! - **Scan task** = `run_scan_loop` (UNCHANGED): the account sync (VFS mirror) + acquisition
+//!   verification (`engine.observe`) — both inlined in `run_scan_loop`, sharing one `get_torrents`
+//!   per tick. Cadence: `SCAN_INTERVAL_SECS`.
 //! - **Trakt cycle task** = `sync_trakt` THEN `reconcile_wanted`, sequentially each tick (so the
 //!   reconciler sees the just-synced wanted set). Cadence: `TRAKT_SYNC_INTERVAL_SECS`.
 //! - **Episode monitor task** = `monitor_episodes`. Cadence: `TRAKT_EPISODE_CHECK_INTERVAL_SECS`.
@@ -124,7 +125,8 @@ where
 pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
     let mut handles = Vec::new();
 
-    // Scan task (sync_account + verify_acquisitions) — unchanged behaviour, own internal cadence.
+    // Scan task (account sync + acquisition verification, both inlined in run_scan_loop) —
+    // unchanged behaviour, own internal cadence.
     // Supervised so a panic in a single tick can't silently freeze the most important subsystem
     // (VFS refresh + observe + repair-replacement processing + account-mirror/dedup) for the process
     // lifetime — it is restarted after a short backoff, mirroring the per-tick `catch_unwind`
