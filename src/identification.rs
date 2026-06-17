@@ -361,10 +361,15 @@ pub async fn identify_name(
         }
     }
 
-    // If still no results, try stripping leading words (handles franchise prefixes like "Bond 50 Goldfinger")
+    // If still no results, try stripping leading words (handles franchise prefixes like "Bond 50
+    // Goldfinger"). Cap the strip depth at the first few words: a real franchise/garbage prefix is
+    // short, while deep strips of a long title both waste rate-limited TMDB calls (2 per attempt) and
+    // risk matching an unrelated short title from the title's tail.
     if tv_results.is_empty() && movie_results.is_empty() {
+        const MAX_STRIP_PREFIX_WORDS: usize = 3;
         let words: Vec<&str> = cleaned_name.split_whitespace().collect();
-        for start in 1..words.len() {
+        let max_start = words.len().min(MAX_STRIP_PREFIX_WORDS + 1);
+        for start in 1..max_start {
             let stripped = words[start..].join(" ");
             if stripped.is_empty() || is_generic_title(&stripped) {
                 continue;

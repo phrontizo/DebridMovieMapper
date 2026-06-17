@@ -604,6 +604,29 @@ pub fn parse_mp4_tracks(buf: &[u8]) -> Result<Vec<Track>, ProbeError> {
     Err(ProbeError::TracksNotFound)
 }
 
+/// If a top-level `moov` box is present at the front but its declared extent runs PAST the fetched
+/// buffer (a faststart MP4 whose `moov` is larger than the front window), return that declared end
+/// (absolute byte offset). `None` if no such moov is found — no moov here, the moov fits, or the
+/// truncation is in an earlier box / the moov header itself (a genuine transient under-fetch). Lets
+/// `probe_tracks` issue ONE targeted larger fetch instead of deferring on the same 4 MB front forever.
+fn front_moov_extent(buf: &[u8]) -> Option<u64> {
+    let mut pos = 0;
+    while pos + 8 <= buf.len() {
+        let (typ, _p_start, b_end) = read_box_header(buf, pos).ok()?;
+        if &typ == b"moov" {
+            // moov fully present → not the large-moov case (the normal parser handles it).
+            return (b_end > buf.len()).then_some(b_end as u64);
+        }
+        // A pre-moov box truncated at the boundary, or a malformed/zero-advance size → let the normal
+        // parser/transient path handle it.
+        if b_end > buf.len() || b_end <= pos {
+            return None;
+        }
+        pos = b_end;
+    }
+    None
+}
+
 fn parse_mp4_moov(buf: &[u8], start: usize, end: usize) -> Result<Vec<Track>, ProbeError> {
     let mut out = Vec::new();
     let mut pos = start;
@@ -717,6 +740,23 @@ pub async fn probe_tracks(http: &reqwest::Client, cdn_url: &str) -> Result<Vec<T
                 // TODO(SP1+): scan the tail for the `moov` box signature for reliable handling.
                 let tail = fetch_suffix(http, cdn_url, FRONT).await?;
                 parse_mp4_tracks(&tail).or(Err(ProbeError::TracksNotFound))
+            }
+            Err(ProbeError::Transient) => {
+                // A faststart `moov` at the FRONT whose declared extent runs past the 4 MB window
+                // (common for long 4K titles with large sample tables) returns `Transient`. Without
+                // this, re-probing fetches the same 4 MB front and defers forever — churning a valid
+                // file after the verify deadline. Issue ONE targeted fetch covering the moov extent
+                // (capped at MAX_PROBE_FETCH) and re-parse. If the moov is larger than the cap, accept
+                // (can't verify language → unknown) rather than churn; if the truncation isn't a
+                // front moov, it's a genuine under-fetch → propagate `Transient` (defer + retry).
+                match front_moov_extent(&front) {
+                    Some(end) if end <= MAX_PROBE_FETCH as u64 => {
+                        let bigger = fetch_range(http, cdn_url, 0, end - 1).await?;
+                        parse_mp4_tracks(&bigger)
+                    }
+                    Some(_) => Err(ProbeError::TracksNotFound), // moov > cap → accept, don't churn
+                    None => Err(ProbeError::Transient),
+                }
             }
             other => other,
         },
@@ -992,6 +1032,22 @@ mod tests {
             parse_mp4_tracks(&bytes),
             Err(ProbeError::Transient)
         ));
+    }
+    #[test]
+    fn front_moov_extent_reports_declared_end_of_a_truncated_front_moov() {
+        // A faststart MP4 whose front `moov` runs past the fetched window must report its full
+        // declared end so probe_tracks can issue ONE larger targeted fetch instead of deferring.
+        let full = mp4_with(&[(b"soun", packed("eng"))]);
+        let full_len = full.len() as u64;
+        let mut truncated = full.clone();
+        truncated.truncate(truncated.len() - 4); // ftyp intact, moov declared past the buffer
+        assert_eq!(front_moov_extent(&truncated), Some(full_len));
+        // A fully-present moov is handled by the normal parser → None.
+        assert_eq!(front_moov_extent(&full), None);
+        // A truncated PRE-moov box (ftyp) is a genuine under-fetch, not the large-moov case → None.
+        let mut ftyp_partial = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+        ftyp_partial.truncate(ftyp_partial.len() - 2);
+        assert_eq!(front_moov_extent(&ftyp_partial), None);
     }
     #[test]
     fn overrun_classifies_under_fetch_vs_malformed() {
