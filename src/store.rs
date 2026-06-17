@@ -2015,6 +2015,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrates_v3_db_clears_legacy_wanted_rows_but_keeps_owned() {
+        // v3 is the version `wanted` was introduced in; the `(3..5)` migration branch must clear it
+        // too (not just v4). Sibling to the v4 test, asserting the v3 path of the same branch.
+        let tmp = TempDb::new("migrate_v3_current");
+        {
+            let db = Database::create(&tmp.path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let wdef: TableDefinition<&str, &[u8]> = TableDefinition::new("wanted");
+                let mut wt = txn.open_table(wdef).unwrap();
+                let legacy = movie_wanted("alice", 27205);
+                wt.insert(
+                    "alice|27205",
+                    serde_json::to_vec(&legacy).unwrap().as_slice(),
+                )
+                .unwrap();
+
+                let odef: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_hashes");
+                let mut ot = txn.open_table(odef).unwrap();
+                let rec = OwnedRecord {
+                    request: req("tt3", 3333),
+                    provenance: Provenance::manual(),
+                    added_at: 5,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                };
+                ot.insert("hash3", serde_json::to_vec(&rec).unwrap().as_slice())
+                    .unwrap();
+
+                let vdef: TableDefinition<&str, u64> = TableDefinition::new("meta");
+                let mut v = txn.open_table(vdef).unwrap();
+                v.insert("schema_version", &3u64).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = Store::open(&tmp.path).unwrap();
+
+        assert!(
+            store.all_wanted().await.is_empty(),
+            "legacy wanted rows must be cleared on the v3→current migration"
+        );
+        assert_eq!(
+            store.get_owned("hash3".to_string()).await.unwrap().status,
+            OwnedStatus::Verified,
+            "owned rows must survive the migration"
+        );
+        assert!(
+            !std::path::Path::new(&tmp.corrupt_path()).exists(),
+            "valid v3 DB must not be moved aside"
+        );
+    }
+
+    #[tokio::test]
     async fn migrates_v5_db_clears_legacy_upgrade_checks_but_keeps_owned() {
         let tmp = TempDb::new("migrate_v5_v6");
         {
