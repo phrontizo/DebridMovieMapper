@@ -22,16 +22,19 @@ struct Envelope<T> {
     data: Option<T>,
 }
 
-/// Deserialize a field that TorBox may send as JSON `null` (or omit) into the type's
-/// default, instead of failing the whole response decode. TorBox's `mylist` is loose: a
-/// single torrent with e.g. `"files": null` or `"size": -1` (item still resolving metadata)
-/// must not be allowed to poison the decode and hide the entire library.
+/// Deserialize a field that TorBox may send as JSON `null`, omit, OR send with the WRONG TYPE (e.g.
+/// a stringized number, or `download_state` as a number) into the type's default, instead of failing
+/// the whole response decode. TorBox's `mylist` is loose: a single torrent with e.g. `"files": null`,
+/// `"size": -1` (item still resolving metadata), or a type-mismatched field must not poison the decode
+/// and hide the ENTIRE library. We route through `serde_json::Value` so a type mismatch degrades to the
+/// default rather than erroring the surrounding `Vec<TbTorrent>` decode.
 fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
-    T: Deserialize<'de> + Default,
+    T: serde::de::DeserializeOwned + Default,
 {
-    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value::<T>(value).unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -897,6 +900,28 @@ mod tests {
         // A whole list where one entry has null files must still decode.
         let arr: Vec<TbTorrent> = serde_json::from_str(&format!("[{},{}]", MYLIST_ITEM, json))
             .expect("a list containing null files must still decode");
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn type_mismatched_fields_decode_to_defaults_not_failing_the_list() {
+        // TorBox occasionally sends a field with the WRONG type (e.g. a stringized id, or
+        // download_state as a number). That must degrade to the default for that field, NOT fail the
+        // whole list decode (which would hide the entire library for the tick).
+        let bad = r#"{
+            "id": "35928498", "hash": 123, "name": "Sintel", "size": "100",
+            "download_finished": "yes", "download_state": 7, "progress": "0.5", "files": "nope"
+        }"#;
+        let t: TbTorrent =
+            serde_json::from_str(bad).expect("type-mismatched fields must decode to defaults");
+        let info = to_torrent_info(&t);
+        // Each mismatched field fell back to its default rather than erroring.
+        assert_eq!(info.id, "0"); // stringized id → default 0
+        assert_eq!(info.filename, "Sintel"); // a correctly-typed field is still parsed
+        assert!(info.files.is_empty()); // "files": "nope" → default empty
+                                        // A whole list where one entry is type-mismatched must still decode the good entries.
+        let arr: Vec<TbTorrent> = serde_json::from_str(&format!("[{},{}]", MYLIST_ITEM, bad))
+            .expect("one type-mismatched entry must not fail the whole list");
         assert_eq!(arr.len(), 2);
     }
 

@@ -12,7 +12,7 @@ use debridmoviemapper::vfs::DebridVfs;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::Request;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -47,6 +47,19 @@ fn log_directive(rust_log: Option<String>) -> String {
 /// timeout, spamming at ERROR) the wrong errors. (io-level kinds are handled separately, by downcast.)
 fn dbg_is_ignorable_disconnect(dbg: &str) -> bool {
     dbg.contains("IncompleteMessage") || dbg.contains("HeaderTimeout") || dbg.contains("timed out")
+}
+
+/// The shared HTTP/1 server-connection builder. Extracted so a test can drive a real
+/// `serve_connection` through the EXACT config production uses: `header_read_timeout` is only honoured
+/// when a `Timer` is also set, and hyper otherwise **panics inside `serve_connection`** ("timeout set,
+/// but no timer set") — a panic that no `cargo test` would catch unless a test actually serves a
+/// connection (see `http1_builder_serves_a_connection`). `TokioTimer` comes from hyper-util's `tokio`
+/// feature (already enabled for `TokioIo`).
+fn http1_builder() -> http1::Builder {
+    let mut b = http1::Builder::new();
+    b.timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    b
 }
 
 /// Docker liveness probe. Actually exercises the request/handler path (a minimal HTTP request),
@@ -305,8 +318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 tokio::task::spawn(async move {
                     let _permit = permit; // Hold permit until connection closes
-                    if let Err(err) = http1::Builder::new()
-                        .header_read_timeout(HEADER_READ_TIMEOUT)
+                    if let Err(err) = http1_builder()
                         .serve_connection(
                             io,
                             service_fn(move |req: Request<hyper::body::Incoming>| {
@@ -388,7 +400,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dbg_is_ignorable_disconnect, healthcheck, log_directive};
+    use super::{dbg_is_ignorable_disconnect, healthcheck, http1_builder, log_directive};
+
+    #[tokio::test]
+    async fn http1_builder_serves_a_connection() {
+        // Regression: `header_read_timeout` PANICS inside serve_connection unless a `Timer` is also
+        // set. Drive a real connection through the SAME builder production uses and assert a response
+        // comes back — without the `.timer(...)` this fails (the served task panics, client reads 0
+        // bytes), which no other test catches.
+        use hyper::service::service_fn;
+        use hyper::{Request, Response};
+        use hyper_util::rt::TokioIo;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let _ = http1_builder()
+                .serve_connection(
+                    io,
+                    service_fn(|_req: Request<hyper::body::Incoming>| async {
+                        Ok::<_, hyper::Error>(Response::new(dav_server::body::Body::from(
+                            "ok".to_string(),
+                        )))
+                    }),
+                )
+                .await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        assert!(
+            buf.starts_with(b"HTTP/"),
+            "expected an HTTP response (builder must not panic), got: {:?}",
+            String::from_utf8_lossy(&buf)
+        );
+        let _ = server.await;
+    }
 
     #[test]
     fn healthcheck_requires_an_http_response() {

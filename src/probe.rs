@@ -839,7 +839,9 @@ async fn fetch_range(
             );
             ProbeError::Transient
         })?;
-    let want = (end - start + 1) as usize;
+    // Saturating: all current callers pass start <= end (start = 0), but harden against a future
+    // caller so an inverted range can never underflow-panic (debug) / wrap (release).
+    let want = end.saturating_sub(start).saturating_add(1) as usize;
     // Offset-0 (front) read: a Range-ignoring 200 streams from byte 0, which is exactly our window.
     read_body(resp, want, start == 0).await
 }
