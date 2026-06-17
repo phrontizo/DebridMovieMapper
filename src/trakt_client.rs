@@ -605,6 +605,10 @@ pub struct MockTrakt {
     pub fail_reads: bool,
     /// When true, `refresh` returns `Err`.
     pub fail_refresh: bool,
+    /// Number of transient `poll_token` errors to inject before returning the canned `poll`
+    /// (decrements on each call). Default 0 = never errors. Lets tests exercise the transient-retry
+    /// path in `enrolment::poll_to_completion`.
+    pub poll_errors_before_ok: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[cfg(test)]
@@ -621,6 +625,11 @@ impl TraktClient for MockTrakt {
         Ok(self.device_code.clone())
     }
     async fn poll_token(&self, _device_code: &str) -> Result<DeviceTokenPoll, AppError> {
+        use std::sync::atomic::Ordering;
+        if self.poll_errors_before_ok.load(Ordering::SeqCst) > 0 {
+            self.poll_errors_before_ok.fetch_sub(1, Ordering::SeqCst);
+            return Err(AppError::Config("mock transient poll error".to_string()));
+        }
         Ok(self.poll.clone())
     }
     async fn refresh(&self, _refresh_token: &str) -> Result<TraktTokenResponse, AppError> {
@@ -1037,6 +1046,7 @@ mod tests {
             progress: std::collections::HashMap::new(),
             fail_reads: false,
             fail_refresh: false,
+            poll_errors_before_ok: Default::default(),
         };
         let client: Arc<dyn TraktClient> = Arc::new(mock);
         assert_eq!(client.device_code().await.unwrap().user_code, "CODE");

@@ -206,12 +206,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
         {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("Failed to register SIGTERM handler");
-            tokio::select! {
-                _ = ctrl_c => info!("Received SIGINT, shutting down..."),
-                _ = sigterm.recv() => info!("Received SIGTERM, shutting down..."),
+            // SIGTERM registration essentially never fails, but a panic here would bypass the
+            // graceful-shutdown machinery entirely. On the off chance it fails, log and fall back to
+            // SIGINT-only handling rather than tearing down the process.
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    tokio::select! {
+                        _ = ctrl_c => info!("Received SIGINT, shutting down..."),
+                        _ = sigterm.recv() => info!("Received SIGTERM, shutting down..."),
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to register SIGTERM handler ({e}); falling back to SIGINT only"
+                    );
+                    ctrl_c.await.ok();
+                    info!("Received SIGINT, shutting down...");
+                }
             }
         }
         #[cfg(not(unix))]

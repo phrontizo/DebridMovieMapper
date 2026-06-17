@@ -330,7 +330,17 @@ impl TorBoxClient {
                     .and_then(|s| s.parse::<u64>().ok());
                 self.rate_limiter.record_throttle(retry_after).await;
                 warn!("TorBox 429 (attempt {})", attempt);
-                continue;
+                if attempt < max_attempts {
+                    continue;
+                }
+                // Final attempt still throttled: surface the real 429 (with the token-bearing URL
+                // scrubbed) rather than the synthetic 502 below, so a sustained throttle isn't
+                // misattributed to a contract failure.
+                return Err(resp
+                    .error_for_status_ref()
+                    .err()
+                    .map(|e| e.without_url())
+                    .unwrap_or_else(synthetic_bad_gateway));
             }
             // Retry transient 5xx (502/503/504) with a short backoff before giving up.
             if is_transient_status(resp.status()) && attempt < max_attempts {
@@ -415,7 +425,15 @@ impl TorBoxClient {
                     .and_then(|h| h.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok());
                 self.rate_limiter.record_throttle(retry_after).await;
-                continue;
+                if attempt < max_attempts {
+                    continue;
+                }
+                // Final attempt still throttled: surface the real 429, not the synthetic 502 below.
+                return Err(resp
+                    .error_for_status_ref()
+                    .err()
+                    .map(|e| e.without_url())
+                    .unwrap_or_else(synthetic_bad_gateway));
             }
             if is_transient_status(resp.status()) && attempt < max_attempts {
                 warn!("TorBox {} (attempt {}), retrying", resp.status(), attempt);

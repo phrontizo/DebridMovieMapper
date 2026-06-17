@@ -136,6 +136,12 @@ async fn try_upgrade_movie(
     let Some(current) = best_owned_quality(app, owned_hashes).await else {
         return Err("current quality unknown/mixed; not upgrading (avoids regression)".into());
     };
+    // Torrentio is IMDB-keyed: a mirror record whose IMDB id never resolved (stored empty) can't be
+    // scraped, so skip before the network call rather than issuing a fruitless empty-key request
+    // every budgeted tick (mirrors `build_acquire_request`'s skip on the acquisition path).
+    if owned_rec.request.imdb_id.is_empty() {
+        return Err("no imdb id; cannot scrape for upgrade".into());
+    }
     // 2. Scrape fresh candidates for this title, then pick the best cached meaningful upgrade not
     //    already owned/blacklisted.
     let raws = app
@@ -539,6 +545,12 @@ async fn try_consolidate_show(
     let Some((_, sample)) = owned.first().cloned() else {
         return Err("no owned records".into());
     };
+    // Torrentio is IMDB-keyed: a mirror show whose IMDB id never resolved can't be scraped for a
+    // consolidation pack, so skip before the TMDB aired-episode lookup + per-season scrapes rather
+    // than issuing fruitless empty-key requests each tick.
+    if sample.request.imdb_id.is_empty() {
+        return Err("no imdb id; cannot scrape for consolidation".into());
+    }
     let today = chrono::Utc::now().date_naive();
     // Per-season completeness is enough here: a season only ever proceeds below when its
     // `season_aired` is non-empty, which means that season's air-date lookup succeeded — so

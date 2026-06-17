@@ -394,8 +394,19 @@ async fn update_vfs(
         .collect();
     // SP3: resolve the live-selection map so build() shows the managed release per slot.
     let selection: crate::vfs::SelectionMap = store.all_selection().await.into_iter().collect();
-    // Build VFS without holding the lock to avoid blocking WebDAV reads during scans
-    let new_vfs = DebridVfs::build(filtered, &selection);
+    // Build the VFS off the async runtime: `build` is CPU-bound (groups + sorts + regex-matches every
+    // file across the whole library), and the scan loop shares its runtime with the WebDAV server, so
+    // doing it inline would stall byte-serving for large libraries. (The lock is also not held during
+    // the build — only the cheap diff+swap below is.) A panic in the build task is logged and this
+    // update is skipped, keeping the previous VFS rather than tearing down the scan.
+    let new_vfs =
+        match tokio::task::spawn_blocking(move || DebridVfs::build(filtered, &selection)).await {
+            Ok(v) => v,
+            Err(e) => {
+                error!("VFS build task failed: {e:?}; keeping previous VFS for this tick");
+                return;
+            }
+        };
     // Diff old vs new, then swap
     let mut vfs_lock = vfs.write().await;
     let changes = crate::vfs::diff_trees(&vfs_lock.root, &new_vfs.root, "");
@@ -519,6 +530,11 @@ pub(crate) fn build_wanted(
         }
     }
 
+    // Index the watched shows by tmdb_id once so the per-entry lookup below is O(1), not a linear
+    // scan per show (which made the final map O(shows²)).
+    let watched_by_id: std::collections::HashMap<u64, &_> =
+        watched.shows.iter().map(|s| (s.tmdb_id, s)).collect();
+
     agg.into_iter()
         .map(|((_mt, tmdb_id), a)| {
             let (watched_state, status) = match a.media_type {
@@ -529,10 +545,8 @@ pub(crate) fn build_wanted(
                     None,
                 ),
                 MediaType::Show => {
-                    let watched_episodes = watched
-                        .shows
-                        .iter()
-                        .find(|s| s.tmdb_id == tmdb_id)
+                    let watched_episodes = watched_by_id
+                        .get(&tmdb_id)
                         .map(|s| s.watched_episodes.clone())
                         .unwrap_or_default();
                     (

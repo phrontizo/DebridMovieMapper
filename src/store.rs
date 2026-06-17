@@ -781,7 +781,10 @@ impl Store {
         reason: &str,
         at: u64,
     ) -> Result<(), AppError> {
-        let key = format!("{}|{}", tmdb_id, hash);
+        // Key on the lowercased hash so the table is case-insensitive and consistent with
+        // `all_blacklisted_hashes` (which lowercases on read) — a hash stored in one case can never
+        // be missed by an `is_blacklisted` check in another.
+        let key = format!("{}|{}", tmdb_id, hash.to_ascii_lowercase());
         let bytes = match serde_json::to_vec(&serde_json::json!({"reason": reason, "at": at})) {
             Ok(b) => b,
             Err(e) => {
@@ -807,7 +810,7 @@ impl Store {
     }
 
     pub async fn is_blacklisted(&self, tmdb_id: u64, hash: String) -> bool {
-        let key = format!("{}|{}", tmdb_id, hash);
+        let key = format!("{}|{}", tmdb_id, hash.to_ascii_lowercase());
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let txn = match db.begin_read() {
@@ -839,6 +842,33 @@ impl Store {
                             let (k, _) = entry;
                             // key = "tmdb_id|hash" → keep the hash part after the first '|'.
                             if let Some((_, hash)) = k.value().split_once('|') {
+                                out.insert(hash.to_ascii_lowercase());
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// Every blacklisted infohash (lowercased) for a SINGLE `tmdb_id` — the per-title rejected set
+    /// the acquisition engine filters candidates against. One read instead of one `is_blacklisted`
+    /// per scraped candidate. The trailing `|` in the prefix prevents a tmdb_id-prefix collision
+    /// (e.g. `12|…` must not match `123|…`).
+    pub async fn blacklisted_hashes_for(&self, tmdb_id: u64) -> std::collections::HashSet<String> {
+        let prefix = format!("{}|", tmdb_id);
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut out = std::collections::HashSet::new();
+            if let Ok(txn) = db.begin_read() {
+                if let Ok(table) = txn.open_table(BLACKLIST_TABLE) {
+                    if let Ok(iter) = table.iter() {
+                        for entry in iter.flatten() {
+                            let (k, _) = entry;
+                            if let Some(hash) = k.value().strip_prefix(&prefix) {
                                 out.insert(hash.to_ascii_lowercase());
                             }
                         }
@@ -1568,6 +1598,47 @@ mod tests {
         assert!(store.is_blacklisted(27205, "h1".to_string()).await);
         assert!(!store.is_blacklisted(27205, "h2".to_string()).await);
         assert!(!store.is_blacklisted(99999, "h1".to_string()).await);
+    }
+
+    #[tokio::test]
+    async fn blacklist_is_case_insensitive_on_hash() {
+        // A hash added in one case must be found when queried in another (and vice versa), so a
+        // rejected hash can never be silently re-added on a case mismatch.
+        let store = mem_store();
+        let upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF01".to_string();
+        let lower = upper.to_ascii_lowercase();
+        store
+            .blacklist_add(27205, upper.clone(), "WrongTitle", 100)
+            .await
+            .unwrap();
+        assert!(store.is_blacklisted(27205, lower.clone()).await);
+        assert!(store.is_blacklisted(27205, upper.clone()).await);
+        // `all_blacklisted_hashes` returns the lowercased form.
+        assert!(store.all_blacklisted_hashes().await.contains(&lower));
+    }
+
+    #[tokio::test]
+    async fn blacklisted_hashes_for_is_scoped_to_tmdb_and_lowercased() {
+        let store = mem_store();
+        store
+            .blacklist_add(12, "AAA".into(), "WrongTitle", 1)
+            .await
+            .unwrap();
+        store
+            .blacklist_add(12, "bbb".into(), "Corrupt", 2)
+            .await
+            .unwrap();
+        // A different tmdb_id that shares the "12" prefix must NOT leak in (the trailing `|` guards).
+        store
+            .blacklist_add(123, "ccc".into(), "WrongTitle", 3)
+            .await
+            .unwrap();
+        let set = store.blacklisted_hashes_for(12).await;
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("aaa")); // lowercased
+        assert!(set.contains("bbb"));
+        assert!(!set.contains("ccc")); // belongs to tmdb 123, not 12
+        assert!(store.blacklisted_hashes_for(999).await.is_empty());
     }
 
     // ── SP2 Task 3 tests (trakt_tokens + wanted) ─────────────────────────────

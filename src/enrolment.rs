@@ -183,8 +183,33 @@ pub async fn poll_to_completion(
 ) -> Result<String, AppError> {
     let interval = interval_secs.max(1);
     let mut elapsed: u64 = 0;
+    // A transient poll error (dropped connection/timeout) must not abort the whole enrolment after a
+    // single blip — retry it like `Pending`. Bounded by both `expires_in_secs` AND a consecutive-error
+    // cap, so a genuinely persistent error (e.g. a bad client id) still fails reasonably fast rather
+    // than spinning until expiry. The counter resets on any successful poll.
+    const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 5;
+    let mut consecutive_errors: u32 = 0;
     loop {
-        match trakt.poll_token(&device_code).await? {
+        let poll = match trakt.poll_token(&device_code).await {
+            Ok(p) => {
+                consecutive_errors = 0;
+                p
+            }
+            Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS || elapsed >= expires_in_secs {
+                    return Err(e);
+                }
+                warn!(
+                    "Trakt poll_token transient error {}/{} (retrying): {}",
+                    consecutive_errors, MAX_CONSECUTIVE_POLL_ERRORS, e
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                elapsed = elapsed.saturating_add(interval);
+                continue;
+            }
+        };
+        match poll {
             DeviceTokenPoll::Authorized(tok) => {
                 let user = trakt.me(&tok.access_token).await?;
                 let tokens = TraktTokens {
@@ -390,6 +415,45 @@ mod tests {
         assert_eq!(tok.username, "Alice");
         assert!(!tok.needs_reenrolment);
         assert_eq!(tok.expires_at, 1_050); // created_at + expires_in
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_to_completion_retries_transient_poll_errors() {
+        // Two transient poll errors then Authorized → enrolment must succeed, not abort on the blip.
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            poll: DeviceTokenPoll::Authorized(TraktTokenResponse {
+                access_token: "AT".into(),
+                refresh_token: "RT".into(),
+                expires_in: 50,
+                created_at: 1_000,
+            }),
+            user: TraktUser {
+                slug: "bob".into(),
+                username: "Bob".into(),
+            },
+            poll_errors_before_ok: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2)),
+            ..Default::default()
+        });
+        let store = mem_store();
+        let slug = poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
+            .await
+            .unwrap();
+        assert_eq!(slug, "bob");
+        assert!(store.get_trakt_tokens("bob".into()).await.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_to_completion_gives_up_after_too_many_consecutive_errors() {
+        // Persistent poll errors (more than the consecutive cap) must fail rather than spin to expiry.
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            poll_errors_before_ok: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(100)),
+            ..Default::default()
+        });
+        let store = mem_store();
+        assert!(poll_to_completion(&trakt, &store, "dc".into(), 1, 300)
+            .await
+            .is_err());
+        assert!(store.all_trakt_tokens().await.is_empty());
     }
 
     #[tokio::test]

@@ -18,14 +18,18 @@ impl MaxResolution {
             MaxResolution::P2160 => 2160,
         }
     }
+    /// Parse "720"/"1080"/"2160"/"4k" into a known ceiling; `None` if unrecognised.
+    pub fn try_parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "720" | "720p" => Some(MaxResolution::P720),
+            "1080" | "1080p" => Some(MaxResolution::P1080),
+            "2160" | "2160p" | "4k" | "uhd" => Some(MaxResolution::P2160),
+            _ => None,
+        }
+    }
     /// Parse "720"/"1080"/"2160"/"4k"; anything else → default 1080p.
     pub fn parse(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "720" | "720p" => MaxResolution::P720,
-            "1080" | "1080p" => MaxResolution::P1080,
-            "2160" | "2160p" | "4k" | "uhd" => MaxResolution::P2160,
-            _ => MaxResolution::P1080,
-        }
+        Self::try_parse(s).unwrap_or(MaxResolution::P1080)
     }
 }
 
@@ -281,9 +285,22 @@ impl AcquisitionConfig {
     ) -> Self {
         AcquisitionConfig {
             prefs: QualityPrefs {
-                max_resolution: max_resolution
-                    .map(|s| MaxResolution::parse(&s))
-                    .unwrap_or(MaxResolution::P1080),
+                // A non-empty but unrecognised MAX_RESOLUTION warns (consistent with the other
+                // numeric knobs) so a typo like `4` or `2160i` isn't silently treated as 1080p;
+                // unset/empty defaults quietly to 1080p.
+                max_resolution: match max_resolution {
+                    Some(s) if !s.trim().is_empty() => {
+                        MaxResolution::try_parse(&s).unwrap_or_else(|| {
+                            warn!(
+                                "Invalid MAX_RESOLUTION value '{}', falling back to 1080p \
+                                 (expected 720/1080/2160/4k)",
+                                s
+                            );
+                            MaxResolution::P1080
+                        })
+                    }
+                    _ => MaxResolution::P1080,
+                },
                 audio: AudioReq::parse(audio_language),
                 subtitle: SubReq::parse(subtitle_language),
                 prefer_hevc: Self::parse_bool(prefer_hevc, true),
@@ -809,6 +826,15 @@ mod tests {
         assert_eq!(MaxResolution::parse("2160"), MaxResolution::P2160);
         assert_eq!(MaxResolution::parse("4k"), MaxResolution::P2160);
         assert_eq!(MaxResolution::parse("garbage"), MaxResolution::P1080);
+        // try_parse distinguishes "unrecognised" (None) from a real ceiling, which the env-read
+        // site uses to warn rather than silently default.
+        assert_eq!(MaxResolution::try_parse("garbage"), None);
+        assert_eq!(MaxResolution::try_parse("2160i"), None);
+        assert_eq!(MaxResolution::try_parse("720"), Some(MaxResolution::P720));
+        // An unrecognised env value still yields the 1080p default (the warn is a side effect).
+        let a =
+            AcquisitionConfig::from_parts(Some("2160i".into()), None, None, None, None, None, None);
+        assert_eq!(a.prefs.max_resolution, MaxResolution::P1080);
     }
 
     #[test]

@@ -6,13 +6,28 @@ use crate::rd_client::{AddMagnetResponse, Torrent, TorrentInfo};
 /// a re-acquire). `link` is the provider's per-file restricted link when it has
 /// one (Real-Debrid); `None` for providers that resolve by `(torrent_id, file_id)`
 /// (TorBox).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct FileLocator {
     pub hash: String,
     pub torrent_id: String,
     pub file_id: u32,
     pub file_path: String,
     pub link: Option<String>,
+}
+
+// Hand-written so a stray `{:?}` (e.g. inside a `Debug`-deriving struct or an error log) can never
+// leak the Real-Debrid restricted-capability `link`; it is printed as a presence flag only. This
+// matches the redaction both provider clients apply in their own `Debug` impls.
+impl std::fmt::Debug for FileLocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileLocator")
+            .field("hash", &self.hash)
+            .field("torrent_id", &self.torrent_id)
+            .field("file_id", &self.file_id)
+            .field("file_path", &self.file_path)
+            .field("link", &self.link.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// Abstraction over a debrid provider. Real-Debrid and TorBox both implement it; exactly one is
@@ -187,6 +202,26 @@ mod tests {
         assert_eq!(cloned, loc);
         assert_eq!(cloned.file_id, 10);
         assert_eq!(cloned.link.as_deref(), Some("https://rd/restricted"));
+    }
+
+    #[test]
+    fn file_locator_debug_redacts_the_restricted_link() {
+        let loc = FileLocator {
+            hash: "abc".to_string(),
+            torrent_id: "t1".to_string(),
+            file_id: 10,
+            file_path: "Movie/Movie.mkv".to_string(),
+            link: Some("https://rd/restricted-capability-secret".to_string()),
+        };
+        let dbg = format!("{loc:?}");
+        assert!(
+            !dbg.contains("restricted-capability-secret"),
+            "the restricted RD link must never appear in Debug output: {dbg}"
+        );
+        assert!(dbg.contains("<redacted>"));
+        // A None link is shown as None, not as a redaction marker.
+        let none = FileLocator { link: None, ..loc };
+        assert!(format!("{none:?}").contains("link: None"));
     }
 
     #[test]

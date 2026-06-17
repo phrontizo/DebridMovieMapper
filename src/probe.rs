@@ -505,11 +505,18 @@ fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, 
         }
         match id {
             0x83 => {
-                kind = match buf.get(pos).copied() {
-                    Some(2) => TrackKind::Audio,
-                    Some(17) => TrackKind::Subtitle,
-                    Some(1) => TrackKind::Video,
-                    _ => TrackKind::Other,
+                // Read the TrackType byte only from THIS element's payload. A spec-violating
+                // zero-size TrackType (p_end == pos) would otherwise read the *next* element's
+                // first byte and mis-classify the track; guard so it stays `Other`.
+                kind = if pos < p_end {
+                    match buf.get(pos).copied() {
+                        Some(2) => TrackKind::Audio,
+                        Some(17) => TrackKind::Subtitle,
+                        Some(1) => TrackKind::Video,
+                        _ => TrackKind::Other,
+                    }
+                } else {
+                    TrackKind::Other
                 };
             }
             0x22B59C => {

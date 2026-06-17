@@ -29,7 +29,11 @@ static TITLE_BRACKET_YEAR_RE: LazyLock<Regex> =
 static YEAR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(19|20)\d{2}\b").unwrap());
 
 static STOP_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(1080p|720p|2160p|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d+x\d+|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web-dl|h264|h265|x264|x265|remux|multi|vff|custom|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack|completa|complete|pol|eng|ita|ger|fra|spa|esp|rus|ukr)\b").unwrap()
+    // NB: bare 3-letter ISO language codes (pol|eng|ita|ger|fra|spa|esp|rus|ukr) are deliberately
+    // NOT stop words — they collide with real standalone title words ("Spa Night", "Pol Pot") and
+    // would truncate/mangle the TMDB query. Audio/subtitle language is verified by `probe`, not by
+    // filename cleaning, so dropping them costs nothing in identification value.
+    Regex::new(r"(?i)\b(1080p|720p|2160p|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d+x\d+|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web-dl|h264|h265|x264|x265|remux|multi|vff|custom|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack|completa|complete)\b").unwrap()
 });
 
 static YEAR_RANGE_RE: LazyLock<Regex> =
@@ -868,6 +872,19 @@ mod tests {
         assert_eq!(clean_name("Custom").0, "Custom");
         // Normal trailing-metadata stripping is unaffected.
         assert_eq!(clean_name("The Matrix 1080p").0, "The Matrix");
+    }
+
+    #[test]
+    fn clean_name_does_not_strip_title_words_that_are_language_codes() {
+        // 3-letter ISO language codes (spa/ita/ger/…) are NOT stop words: they collide with real
+        // title words and would mangle the search. Audio language is verified by probe, not here.
+        // Regression: the 2016 film "Spa Night" must not clean to "Night".
+        let (title, year) = clean_name("Spa Night 2016 1080p");
+        assert_eq!(title, "Spa Night");
+        assert_eq!(year.as_deref(), Some("2016"));
+        // A genuine trailing language token next to other metadata is still removed by the year /
+        // resolution truncation that follows it.
+        assert_eq!(clean_name("Some Movie 2020 ITA 1080p").0, "Some Movie");
     }
 
     #[test]

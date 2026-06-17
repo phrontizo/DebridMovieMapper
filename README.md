@@ -23,7 +23,7 @@ This was 100% vibe coded using a mix of Claude and Junie as further AI experimen
 - **Season Grouping**: Automatically groups TV show episodes into `Season XX` folders.
 - **Real-Debrid *and* TorBox**: One codebase, either provider. Set `RD_API_TOKEN` for Real-Debrid or `TORBOX_API_KEY` for TorBox (exactly one) — everything else works the same.
 - **WebDAV Endpoint**: Exposes a WebDAV server (port 8080) serving proxied media files with real file sizes and extensions. Media bytes are fetched on demand from the provider's CDN. Mount via rclone for use with Jellyfin/Plex.
-- **On-Demand Repair**: Detects unavailable files at playback time (a 503 from Real-Debrid, an uncached/expired file on TorBox, or a persistent CDN 5xx on the byte fetch) and attempts instant synchronous repair by re-adding the torrent. For cached content, playback continues after a ~1-2s delay; otherwise a fresh download is started automatically.
+- **On-Demand Repair**: Detects unavailable files at playback time (a 5xx from Real-Debrid on unrestrict, an uncached/expired file on TorBox, or a persistent CDN 5xx on the byte fetch) and attempts instant synchronous repair by re-adding the torrent. For cached content, playback continues after a ~1-2s delay; otherwise a fresh download is started automatically.
 - **Trakt Integration (optional)**: Drive the library from your Trakt account(s) — watchlisted and in-progress movies/shows are auto-acquired, new episodes of tracked shows are picked up as they air, and content is automatically removed once everyone who wanted it has finished (or abandoned) it. Link one or more accounts via a local-network enrolment page. Disabled by default; when not configured the service runs exactly as before.
 - **Persistent Cache**: Uses an embedded database (`redb`) to cache media identifications, reducing API calls and speeding up restarts.
 - **Configurable Scan Interval**: Customizable scan interval via environment variable.
@@ -362,7 +362,7 @@ A scheduler spawns cooperating periodic jobs (each runs immediately on startup, 
 There is no background repair loop. Instead, repair is triggered synchronously at playback time:
 
 - When a media file is read, `dav_fs` resolves it through the provider for a fresh CDN URL (a per-file resolution cache makes this free when the content is healthy)
-- If resolution reports the file is unavailable (a 503 from Real-Debrid, or an uncached/expired file on TorBox → `AppError::Unavailable`), `try_instant_repair` runs synchronously: re-adds the torrent by hash, matches the same file by path, and checks whether the replacement is already cached
+- If resolution reports the file is unavailable (any 5xx from Real-Debrid on unrestrict — failed fast, not retried for minutes — or an uncached/expired file on TorBox → `AppError::Unavailable`), `try_instant_repair` runs synchronously: re-adds the torrent by hash, matches the same file by path, and checks whether the replacement is already cached
 - A persistent CDN **5xx on the byte fetch** (the file resolved but is broken on the provider) also escalates to the same instant repair, once per read after a cheap fresh-URL retry still 5xxs — so a broken file is no longer an endless player retry-storm
 - **Cached content** (most common): repair completes in ~1-2 seconds and the replacement file is resolved inline — playback continues after a brief delay
 - **Non-cached content** (Real-Debrid, where the re-add mints a new id): the file returns an error, the old torrent is deleted, and the new torrent is left to download (the scan loop picks it up automatically). On TorBox the re-add by hash returns the **same** torrent (re-downloading), so it is left in place and stays visible — the scan loop surfaces it once it finishes downloading
@@ -384,7 +384,7 @@ To fix this, delete the torrent from your debrid account and find an alternative
 
 ### Error Handling
 
-- **Unavailable file** (a 503 from Real-Debrid, or an uncached file on TorBox): Triggers synchronous instant repair — succeeds inline for cached content, fails for non-cached
+- **Unavailable file** (a 5xx from Real-Debrid on unrestrict, or an uncached file on TorBox): Triggers synchronous instant repair — succeeds inline for cached content, fails for non-cached
 - **429 Rate Limit**: Adaptive token bucket rate limiter shared across the provider's API calls — on 429, the global request interval doubles (max 30s between requests) and Retry-After headers are respected; on success, the interval **halves** back toward the baseline of 10 req/s (multiplicative recovery, so a throttle burst doesn't leave later requests crawling)
 - **404 Not Found**: Treated as success for delete operations (idempotent)
 - **Playback Errors**: WebDAV read failures on an unavailable file (or a persistent CDN 5xx) trigger instant repair (rate-limited to 30s cooldown, max 3 attempts per torrent)

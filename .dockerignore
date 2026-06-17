@@ -4,4 +4,12 @@ metadata.db/
 .env
 .git/
 .idea/
-run.log
+# Logs (any *.log, not just the old run.log name) — keeps stray logs out of the build context.
+*.log
+# Repo content the build never COPYs — excluded to shrink the context sent to the daemon.
+docs/
+examples/
+tests/
+.claude/
+.github/
+rclone/

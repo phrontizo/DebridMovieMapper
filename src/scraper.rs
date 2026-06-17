@@ -131,7 +131,11 @@ static RESOLVE_RE: LazyLock<Regex> =
 /// not emitted by debrid-keyed Torrentio) would not match and the stream would be skipped.
 fn hash_idx_from_url(url: &str) -> Option<(String, Option<usize>)> {
     let c = RESOLVE_RE.captures(url)?;
-    let hash = c.get(1)?.as_str().to_string();
+    // Lowercase the recovered hash to match every other write path (the explicit-`infoHash` branch
+    // and `record_mirror_owned` both store lowercase) so an owned/blacklist lookup keyed on this
+    // hash can never miss on case. (The regex already only matches lowercase hex, so this is a
+    // belt-and-braces consistency guard.)
+    let hash = c.get(1)?.as_str().to_ascii_lowercase();
     let idx = c.get(2).and_then(|m| m.as_str().parse::<usize>().ok());
     Some((hash, idx))
 }

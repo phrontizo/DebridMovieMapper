@@ -214,14 +214,20 @@ impl TmdbClient {
                 tokio::time::sleep(Duration::from_millis(backoff + jitter)).await;
             }
 
-            // Proactive rate limiting: wait until MIN_REQUEST_INTERVAL since last request
-            {
+            // Proactive rate limiting: pace requests MIN_REQUEST_INTERVAL apart. RESERVE the next
+            // slot under the lock and release it BEFORE sleeping, so concurrent callers (e.g. the
+            // `tokio::join!`ed search_tv + search_movie) serialise on the cheap reservation rather
+            // than blocking on the lock held across the pacing sleep — preserving real concurrency
+            // while still spacing the actual requests. (Mirrors `ratelimit::AdaptiveRateLimiter`.)
+            let wait = {
                 let mut last = self.last_request.lock().await;
-                let elapsed = last.elapsed();
-                if elapsed < MIN_REQUEST_INTERVAL {
-                    tokio::time::sleep(MIN_REQUEST_INTERVAL - elapsed).await;
-                }
-                *last = Instant::now();
+                let now = Instant::now();
+                let next = (*last + MIN_REQUEST_INTERVAL).max(now);
+                *last = next;
+                next.saturating_duration_since(now)
+            };
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
             }
 
             match make_request().send().await {

@@ -514,7 +514,8 @@ impl RepairManager {
             .collect()
     }
 
-    /// Get summary of repair status
+    /// Summary of repair status as `(healthy, repairing, failed)`, where "repairing" counts both
+    /// `Broken` and `Repairing`. Used by `repair_integration_test` to assert post-repair state.
     pub async fn get_status_summary(&self) -> (usize, usize, usize) {
         let health_map = self.health_status.read().await;
         let healthy = health_map

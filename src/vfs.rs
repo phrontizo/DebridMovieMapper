@@ -435,14 +435,16 @@ impl DebridVfs {
                                     if link.is_some() || torrent.links.is_empty() {
                                         let filename =
                                             file.path.split('/').next_back().unwrap_or(&file.path);
+                                        // Parse the SxxExx / absolute-code once and reuse it for
+                                        // both the selection gate and the season-folder placement
+                                        // below (the regex match is not free).
+                                        let se = parse_se(filename);
                                         // SP3 selection gate: if this episode has a managed
                                         // selection, only the selected (hash, file_path) is used;
                                         // any other torrent's copy of the episode is skipped. With
                                         // no selection entry, the legacy first/largest-wins dedup
                                         // below applies unchanged.
-                                        if let (Some(tmdb), Some((se_s, se_e))) =
-                                            (show_tmdb, parse_se(filename))
-                                        {
+                                        if let (Some(tmdb), Some((se_s, se_e))) = (show_tmdb, se) {
                                             if let Some(sel) = selection
                                                 .get(&crate::store::episode_slot(tmdb, se_s, se_e))
                                             {
@@ -472,7 +474,7 @@ impl DebridVfs {
                                         // right Season folder. Fall back to SEASON_RE for the
                                         // patterns parse_se doesn't cover ("1x09", "Season 4",
                                         // "Part 2"), then default to season 1.
-                                        let season = parse_se(filename)
+                                        let season = se
                                             .map(|(s, _)| s)
                                             .or_else(|| {
                                                 SEASON_RE

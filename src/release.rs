@@ -102,7 +102,11 @@ static CAM_RE: LazyLock<Regex> = LazyLock::new(|| {
 // A bare `ts` telesync tag, but NOT a trailing `.ts` container extension. Requiring a trailing
 // separator means `…1080p.HDTV.ts` (a real transport-stream file) is treated as a container, while a
 // mid-name telesync tag (`…1080p.TS.x265`, ` ts `, `-ts-`) is still caught by the quality floor.
-static TS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[ .\-_])ts[ .\-_]").unwrap());
+// The LEADING boundary class includes `\n` (the separator joining `name`+`description` in `parse`)
+// so a telesync tag at the start of the description is caught — matching the sibling `WEB_RE`/
+// `MULTI_RE`. The TRAILING class deliberately omits `\n`/`$` to preserve the `.ts`-container guard
+// (a name ending `.ts` is joined as `.ts\n…`, which a trailing `\n` would wrongly cam-reject).
+static TS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[ .\-_\n])ts[ .\-_]").unwrap());
 
 // A bare `web` source token (the canonical scene tag, e.g. `…1080p.WEB.H264-GROUP`) that the
 // explicit `web-dl`/`webrip`/etc. checks miss. Separator-bounded (start/space/`.`/`-`/`_`/newline on
@@ -188,10 +192,17 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
         .captures(&text)
         .and_then(|cap| cap.get(1)?.as_str().parse::<u32>().ok());
 
-    let mut languages = Vec::new();
-    for (word, code) in LANG_WORDS {
-        if lower.contains(word) {
-            languages.push((*code).to_string());
+    // Language words are matched as SEPARATOR-BOUNDED tokens (`\b…\b`), not raw substrings, so a
+    // longer word that merely *contains* a language name doesn't inject a spurious code (e.g.
+    // "Germany" must not tag `ger`, "Frenchman" must not tag `fre`). This mirrors the bounded
+    // `MULTI_RE`/`WEB_RE` matching and keeps the wrong-audio penalty in `score` honest.
+    let mut languages: Vec<String> = Vec::new();
+    for cap in LANG_RE.captures_iter(&lower) {
+        if let Some((_, code)) = LANG_WORDS.iter().find(|(w, _)| *w == &cap[1]) {
+            let code = (*code).to_string();
+            if !languages.contains(&code) {
+                languages.push(code);
+            }
         }
     }
     // `multi` (multi-language) is matched as a SEPARATOR-BOUNDED token, not a raw substring, because
@@ -239,6 +250,17 @@ const LANG_WORDS: &[(&str, &str)] = &[
     // `multi` is intentionally NOT here — it's matched separator-bounded via `MULTI_RE` (see `parse`)
     // because its `mul` code is a wildcard in `score`.
 ];
+
+// Word-boundary alternation of the `LANG_WORDS` names, built once from the table above so the two
+// can never drift. Matched against the lowercased text in `parse`.
+static LANG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    let alt = LANG_WORDS
+        .iter()
+        .map(|(w, _)| *w)
+        .collect::<Vec<_>>()
+        .join("|");
+    Regex::new(&format!(r"\b({alt})\b")).unwrap()
+});
 
 /// Score a release against prefs. `None` = excluded by a hard rule (resolution ceiling,
 /// cam/telesync source, or an uncached zero-seeder release). Higher is better.
@@ -539,6 +561,65 @@ mod tests {
             score(&subs, &p).unwrap() < score(&untagged, &p).unwrap(),
             "German+MultiSubs must NOT escape the wrong-audio penalty via a spurious `mul` tag"
         );
+    }
+
+    #[test]
+    fn language_words_are_separator_bounded_not_substrings() {
+        // A language NAME embedded in a longer word must NOT inject a spurious code: "Germany" is a
+        // place, not German audio; "Frenchman" is not French audio. Without bounding, a wrong-audio
+        // release could escape the penalty for a concrete-AUDIO_LANGUAGE user.
+        let germany = parse(&raw(
+            "t",
+            "Germany.Year.Zero.1948.1080p",
+            "h1",
+            Some("f.mkv"),
+        ));
+        assert!(
+            !germany.languages.iter().any(|l| l == "ger"),
+            "\"Germany\" (place) must not be tagged as German audio"
+        );
+        let frenchman = parse(&raw("t", "The.Frenchman.2019.1080p", "h2", Some("f.mkv")));
+        assert!(
+            !frenchman.languages.iter().any(|l| l == "fre"),
+            "\"Frenchman\" must not be tagged as French audio"
+        );
+        // A genuine standalone language token is still tagged.
+        let german = parse(&raw(
+            "t",
+            "Film.2020.German.1080p.x265",
+            "h3",
+            Some("f.mkv"),
+        ));
+        assert!(german.languages.iter().any(|l| l == "ger"));
+        // Repeated mentions don't duplicate the code.
+        let twice = parse(&raw(
+            "t",
+            "English.Film.2020 English.1080p",
+            "h4",
+            Some("f.mkv"),
+        ));
+        assert_eq!(
+            twice.languages.iter().filter(|l| *l == "eng").count(),
+            1,
+            "a repeated language word must not produce duplicate codes"
+        );
+    }
+
+    #[test]
+    fn telesync_tag_at_start_of_description_is_caught() {
+        // The `\n` joining name+description is a real token boundary; a `TS` telesync tag at the
+        // start of the description must still hit the cam/telesync quality floor (source = Cam).
+        let c = raw(
+            "Movie.2020.1080p",
+            "TS.x264-GRP\n\u{1f464} 5",
+            "h",
+            Some("Movie.mkv"),
+        );
+        assert_eq!(parse(&c).source, Source::Cam);
+        // A real `.ts` transport-stream container (name ends `.ts`, joined as `.ts\n…`) must NOT
+        // be cam-rejected.
+        let container = raw("Movie.1080p.HDTV.ts", "desc", "h2", Some("Movie.ts"));
+        assert_ne!(parse(&container).source, Source::Cam);
     }
 
     #[test]

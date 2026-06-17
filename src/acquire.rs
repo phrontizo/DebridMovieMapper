@@ -425,15 +425,14 @@ impl AcquisitionEngine {
             req.imdb_id,
             candidates.len()
         );
+        // Fetch the per-title blacklist ONCE and test membership in memory, rather than one awaited
+        // redb read per candidate (Torrentio commonly returns dozens of streams per title).
+        let blacklist = self.store.blacklisted_hashes_for(req.tmdb_id).await;
         let mut parsed: Vec<ReleaseInfo> = Vec::new();
         let mut blacklisted = 0usize;
         for c in &candidates {
             let r = release::parse(c);
-            if self
-                .store
-                .is_blacklisted(req.tmdb_id, r.info_hash.clone())
-                .await
-            {
+            if blacklist.contains(&r.info_hash.to_ascii_lowercase()) {
                 blacklisted += 1;
                 continue;
             }

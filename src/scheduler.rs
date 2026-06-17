@@ -78,15 +78,72 @@ pub(crate) fn trakt_jobs_enabled(app: &AppState) -> bool {
     app.trakt_client.is_some() && app.config.trakt.is_some()
 }
 
+/// Backoff before restarting a panicked scan loop — long enough to avoid a tight respawn storm on a
+/// deterministic panic, short enough that the library refreshes again promptly.
+const SCAN_RESTART_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Run the future produced by `make` on its own task; if it panics, log and re-run it after
+/// `backoff` (respecting `shutdown`). A clean return (`Ok(())`) or a non-panic `JoinError`
+/// (cancellation) ends supervision. Generic over the loop factory so it can be unit-tested without
+/// the real scan loop.
+async fn supervise<F, Fut>(mut shutdown: watch::Receiver<bool>, backoff: Duration, mut make: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        match tokio::spawn(make()).await {
+            Ok(()) => return,
+            Err(e) if e.is_panic() => {
+                if *shutdown.borrow() {
+                    return;
+                }
+                tracing::error!(
+                    "Supervised task panicked ({:?}); restarting in {}s",
+                    e,
+                    backoff.as_secs()
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    // shutdown signalled or sender dropped — stop supervising either way.
+                    _ = shutdown.changed() => return,
+                }
+            }
+            Err(e) => {
+                tracing::error!("Supervised task ended abnormally (not a panic): {:?}", e);
+                return;
+            }
+        }
+    }
+}
+
 /// Spawn all background jobs over `app`, returning when all have stopped (after shutdown).
 pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
     let mut handles = Vec::new();
 
     // Scan task (sync_account + verify_acquisitions) — unchanged behaviour, own internal cadence.
-    handles.push(tokio::spawn(run_scan_loop(
-        ScanConfig { app: app.clone() },
-        shutdown.clone(),
-    )));
+    // Supervised so a panic in a single tick can't silently freeze the most important subsystem
+    // (VFS refresh + observe + repair-replacement processing + account-mirror/dedup) for the process
+    // lifetime — it is restarted after a short backoff, mirroring the per-tick `catch_unwind`
+    // resilience the `periodic` jobs already have. (The scan loop maintains cross-tick state and its
+    // own shutdown-aware awaits, so it isn't built on `periodic`; supervision gives the same guarantee
+    // without restructuring the loop body.)
+    let scan_app = app.clone();
+    let scan_shutdown = shutdown.clone();
+    handles.push(tokio::spawn(async move {
+        supervise(scan_shutdown.clone(), SCAN_RESTART_BACKOFF, move || {
+            run_scan_loop(
+                ScanConfig {
+                    app: scan_app.clone(),
+                },
+                scan_shutdown.clone(),
+            )
+        })
+        .await;
+    }));
 
     if trakt_jobs_enabled(&app) {
         // trakt_jobs_enabled guarantees config.trakt is Some
@@ -396,6 +453,52 @@ mod tests {
             1,
             "job runs exactly once (the immediate run) before shutdown"
         );
+    }
+
+    /// `supervise` restarts a panicking loop until it returns cleanly (the panic-resilience the
+    /// scan task relies on). The factory panics on its first two runs, then returns `Ok(())`.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_restarts_after_panic_until_clean_return() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (_tx, rx) = watch::channel(false);
+        let r = runs.clone();
+        supervise(rx, Duration::from_millis(1), move || {
+            let r = r.clone();
+            async move {
+                let n = r.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    panic!("simulated scan-tick panic");
+                }
+                // third run returns cleanly → supervisor stops
+            }
+        })
+        .await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            3,
+            "loop should run 3 times: two panics then a clean return"
+        );
+    }
+
+    /// `supervise` stops restarting once shutdown is signalled, even if the loop keeps panicking.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_stops_on_shutdown_after_panic() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = watch::channel(false);
+        let r = runs.clone();
+        // Signal shutdown up front: after the first panicked run the supervisor must observe it and
+        // not restart again.
+        tx.send(true).unwrap();
+        supervise(rx, Duration::from_secs(3600), move || {
+            let r = r.clone();
+            async move {
+                r.fetch_add(1, Ordering::SeqCst);
+                panic!("always panics");
+            }
+        })
+        .await;
+        // With shutdown already set, the loop guard returns before running at all.
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
     }
 
     /// A shutdown signalled MID-tick cancels the in-flight job promptly, rather than waiting for a

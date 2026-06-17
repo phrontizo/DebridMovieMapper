@@ -553,7 +553,11 @@ impl ProxiedMediaFile {
             // omits) Content-Length cannot drive an unbounded allocation. Exceeding the cap is
             // treated as an unusable response (drop the URL, retry/fail like an expired one).
             let mut resp = resp;
-            let mut body = bytes::BytesMut::new();
+            // Preallocate the requested window (capped at the hard byte ceiling) so the read-ahead
+            // accumulation doesn't repeatedly reallocate-and-copy as chunks arrive. The bounded
+            // loop below still enforces MAX_FETCH_SIZE regardless of what the CDN actually sends.
+            let want = range_end.saturating_sub(pos).saturating_add(1);
+            let mut body = bytes::BytesMut::with_capacity(want.min(MAX_FETCH_SIZE as u64) as usize);
             loop {
                 match resp.chunk().await {
                     Ok(Some(chunk)) => {

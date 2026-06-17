@@ -310,13 +310,24 @@ impl RealDebridClient {
             }
         }
 
-        // Not in cache or expired, fetch from API
-        // Special handling: 503 on unrestrict means broken torrent, no retries
+        // Not in cache or expired, fetch from API.
+        // Any 5xx on unrestrict is terminal (no retries): this is the synchronous on-read playback
+        // resolve path, so a persistent 500/502/504 must NOT run the full ~10-attempt exponential
+        // backoff (~3 min) inside the WebDAV read — that surfaces to the player as a hang. A 5xx here
+        // means the file isn't servable right now; `resolve_url` maps it to `AppError::Unavailable` so
+        // `dav_fs` fast-fails to instant repair (re-add by hash; a cached replacement fixes playback
+        // inline, bounded by the repair cooldown) instead of stalling. (503 was already terminal —
+        // 500/502/504 now join it for the same reason.)
         let url = "https://api.real-debrid.com/rest/1.0/unrestrict/link";
         let response: UnrestrictResponse = self
             .fetch_with_retry(
                 || self.client.post(url).form(&[("link", link)]),
-                &[reqwest::StatusCode::SERVICE_UNAVAILABLE],
+                &[
+                    reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                    reqwest::StatusCode::BAD_GATEWAY,
+                    reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    reqwest::StatusCode::GATEWAY_TIMEOUT,
+                ],
             )
             .await?;
 
@@ -607,7 +618,10 @@ impl crate::provider::DebridProvider for RealDebridClient {
             .ok_or(crate::error::AppError::Unavailable)?;
         match self.unrestrict_link(link).await {
             Ok(resp) => Ok(resp.download),
-            Err(e) if e.status() == Some(reqwest::StatusCode::SERVICE_UNAVAILABLE) => {
+            // Any server error (5xx) on unrestrict → the bytes aren't currently available; signal
+            // re-acquire/repair rather than a hard failure (unrestrict makes 5xx terminal, so this
+            // returns promptly instead of after the full retry budget).
+            Err(e) if e.status().is_some_and(|s| s.is_server_error()) => {
                 Err(crate::error::AppError::Unavailable)
             }
             Err(e) => Err(crate::error::AppError::Http(e)),
