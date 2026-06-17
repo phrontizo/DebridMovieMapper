@@ -19,6 +19,16 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Why an upgrade/consolidation attempt made no change. The distinction matters for the round-robin
+/// cursor: a `Deferred` title was NOT actually evaluated (the library went active mid-stage, or the
+/// provider/scraper was momentarily unavailable) and must be reconsidered next tick — its cursor is
+/// left UNSTAMPED. A `NoChange` title WAS evaluated to completion (no meaningful upgrade exists, or
+/// the chosen candidate didn't pan out) and its cursor is stamped so the budget rotates onward.
+enum UpgradeSkip {
+    Deferred(String),
+    NoChange(String),
+}
+
 /// Run one upgrade tick over `app`: re-score a budgeted batch of owned titles. For MOVIES, stage any
 /// cached meaningful upgrade and — if the library is idle — swap selection + prune the old torrent.
 /// For SHOWS, consolidate scattered per-episode torrents into a full-season cached pack (Task 10).
@@ -75,22 +85,34 @@ pub async fn run_upgrade_once(app: &AppState) {
             );
             break;
         }
-        app.store
-            .set_upgrade_checked(&media_type, tmdb_id, now_secs())
-            .await
-            .ok();
-        match media_type {
-            MediaType::Movie => {
-                if let Err(e) = try_upgrade_movie(app, tmdb_id, &hashes, &rec, idle_window).await {
-                    // "no meaningful upgrade" is the normal outcome for most titles, so this is a
-                    // debug detail, not a warning — keeps the default-level log clean.
-                    debug!("upgrade: tmdb {} skipped: {}", tmdb_id, e);
-                }
+        let outcome = match media_type {
+            MediaType::Movie => try_upgrade_movie(app, tmdb_id, &hashes, &rec, idle_window).await,
+            MediaType::Show => try_consolidate_show(app, tmdb_id, &hashes, idle_window).await,
+        };
+        match outcome {
+            // Evaluated to completion (success or a genuine no-upgrade): advance the cursor.
+            Ok(()) => {
+                app.store
+                    .set_upgrade_checked(&media_type, tmdb_id, now_secs())
+                    .await
+                    .ok();
             }
-            MediaType::Show => {
-                if let Err(e) = try_consolidate_show(app, tmdb_id, &hashes, idle_window).await {
-                    debug!("consolidate: tmdb {} skipped: {}", tmdb_id, e);
-                }
+            Err(UpgradeSkip::NoChange(reason)) => {
+                // "no meaningful upgrade" is the normal outcome for most titles, so this is a debug
+                // detail, not a warning — keeps the default-level log clean.
+                debug!("upgrade: tmdb {} skipped: {}", tmdb_id, reason);
+                app.store
+                    .set_upgrade_checked(&media_type, tmdb_id, now_secs())
+                    .await
+                    .ok();
+            }
+            // NOT evaluated (library active mid-stage / provider unavailable): leave the cursor
+            // unstamped so this title is reconsidered next tick rather than skipped for a full wrap.
+            Err(UpgradeSkip::Deferred(reason)) => {
+                debug!(
+                    "upgrade: tmdb {} deferred: {} (cursor unchanged)",
+                    tmdb_id, reason
+                );
             }
         }
     }
@@ -121,7 +143,7 @@ async fn try_upgrade_movie(
     owned_hashes: &[String],
     owned_rec: &OwnedRecord,
     idle_window: Duration,
-) -> Result<(), String> {
+) -> Result<(), UpgradeSkip> {
     // 1. Baseline = the BEST quality across ALL owned copies of this title — NOT an arbitrary one.
     //    The swap below prunes EVERY owned hash, so if a title has multiple present copies (the
     //    default state: account-mirror records them all and dedup is dry-run by default), comparing
@@ -134,21 +156,25 @@ async fn try_upgrade_movie(
     //    scrape so unupgradeable titles don't waste a scrape every tick. (`owned_rec` is still used
     //    below for the request's imdb_id/metadata — only the quality BASELINE is widened here.)
     let Some(current) = best_owned_quality(app, owned_hashes).await else {
-        return Err("current quality unknown/mixed; not upgrading (avoids regression)".into());
+        return Err(UpgradeSkip::NoChange(
+            "current quality unknown/mixed; not upgrading (avoids regression)".into(),
+        ));
     };
     // Torrentio is IMDB-keyed: a mirror record whose IMDB id never resolved (stored empty) can't be
     // scraped, so skip before the network call rather than issuing a fruitless empty-key request
     // every budgeted tick (mirrors `build_acquire_request`'s skip on the acquisition path).
     if owned_rec.request.imdb_id.is_empty() {
-        return Err("no imdb id; cannot scrape for upgrade".into());
+        return Err(UpgradeSkip::NoChange(
+            "no imdb id; cannot scrape for upgrade".into(),
+        ));
     }
     // 2. Scrape fresh candidates for this title, then pick the best cached meaningful upgrade not
-    //    already owned/blacklisted.
+    //    already owned/blacklisted. A scrape failure is transient → Deferred (retry next tick).
     let raws = app
         .scraper
         .find(&owned_rec.request.imdb_id, MediaKind::Movie, None, None)
         .await
-        .map_err(|e| format!("scrape failed: {e}"))?;
+        .map_err(|e| UpgradeSkip::Deferred(format!("scrape failed: {e}")))?;
     let mut best: Option<(release::ReleaseInfo, QualitySummary)> = None;
     for raw in &raws {
         let r = release::parse(raw);
@@ -179,7 +205,7 @@ async fn try_upgrade_movie(
         }
     }
     let Some((cand, _q)) = best else {
-        return Err("no meaningful upgrade".into());
+        return Err(UpgradeSkip::NoChange("no meaningful upgrade".into()));
     };
 
     // 3. Idle gate FIRST. Upgrade targets are cached-only (instant to add), so there is no benefit
@@ -188,12 +214,18 @@ async fn try_upgrade_movie(
     //    `UPGRADE_STAGE_MAX_SECS` is config-only/reserved on this cached path (kept for forward-compat
     //    with a future speculative-download upgrade mode; not consulted here).
     if !app.read_activity.all_idle(idle_window).await {
-        return Err("library active; deferring upgrade".into());
+        return Err(UpgradeSkip::Deferred(
+            "library active; deferring upgrade".into(),
+        ));
     }
 
     // 4. Stage the cached candidate: add + validate + record Verified (non-destructive — any failure
     //    leaves the current release untouched). Returns (hash, torrent_id, selected_file_path).
-    let staged = stage_and_verify(app, tmdb_id, &owned_rec.request, &cand).await?;
+    //    A staging failure is candidate-specific (not cached / failed validation) → NoChange (the
+    //    title was evaluated; re-scrape on the next cursor wrap).
+    let staged = stage_and_verify(app, tmdb_id, &owned_rec.request, &cand)
+        .await
+        .map_err(UpgradeSkip::NoChange)?;
 
     // Fetch the provider listing for the prune ONCE, and BEFORE the idle re-check below, so there is
     // NO network round-trip between the idle confirmation and the destructive prune — a read
@@ -211,7 +243,9 @@ async fn try_upgrade_movie(
                 let _ = app.store.remove_owned(staged.0.clone()).await;
                 let _ = app.store.remove_authoritative(staged.0.clone()).await;
             }
-            return Err("provider listing unavailable; deferring upgrade".into());
+            return Err(UpgradeSkip::Deferred(
+                "provider listing unavailable; deferring upgrade".into(),
+            ));
         }
     };
 
@@ -230,7 +264,9 @@ async fn try_upgrade_movie(
             let _ = app.store.remove_owned(staged.0.clone()).await;
             let _ = app.store.remove_authoritative(staged.0.clone()).await;
         }
-        return Err("library became active during staging; deferring upgrade".into());
+        return Err(UpgradeSkip::Deferred(
+            "library became active during staging; deferring upgrade".into(),
+        ));
     }
 
     // 5. Swap selection → new hash, then prune every old owned hash.
@@ -533,7 +569,7 @@ async fn try_consolidate_show(
     tmdb_id: u64,
     group_hashes: &[String],
     idle_window: Duration,
-) -> Result<(), String> {
+) -> Result<(), UpgradeSkip> {
     // Owned per-episode records for this show: hash -> OwnedRecord.
     let mut owned: Vec<(String, OwnedRecord)> = Vec::new();
     for h in group_hashes {
@@ -543,13 +579,15 @@ async fn try_consolidate_show(
     }
     // A representative request (for imdb id + metadata) — any owned record works.
     let Some((_, sample)) = owned.first().cloned() else {
-        return Err("no owned records".into());
+        return Err(UpgradeSkip::NoChange("no owned records".into()));
     };
     // Torrentio is IMDB-keyed: a mirror show whose IMDB id never resolved can't be scraped for a
     // consolidation pack, so skip before the TMDB aired-episode lookup + per-season scrapes rather
     // than issuing fruitless empty-key requests each tick.
     if sample.request.imdb_id.is_empty() {
-        return Err("no imdb id; cannot scrape for consolidation".into());
+        return Err(UpgradeSkip::NoChange(
+            "no imdb id; cannot scrape for consolidation".into(),
+        ));
     }
     let today = chrono::Utc::now().date_naive();
     // Per-season completeness is enough here: a season only ever proceeds below when its
@@ -781,23 +819,19 @@ async fn try_consolidate_show(
             let listing = match app.provider.get_torrents().await {
                 Ok(l) => l,
                 Err(_) => {
-                    info!(
-                        "consolidate: tmdb {} s{} deferred (provider listing unavailable); dropping staged pack",
-                        tmdb_id, season
-                    );
                     let _ = app.provider.delete_torrent(&added.id).await;
-                    return Ok(());
+                    return Err(UpgradeSkip::Deferred(format!(
+                        "s{season} provider listing unavailable; dropped staged pack"
+                    )));
                 }
             };
             // Idle gate. If the library is active, drop the staged pack (no dangling stage) and
             // retry on a later tick; consolidation re-stages cheaply (the pack is cached).
             if !app.read_activity.all_idle(idle_window).await {
-                info!(
-                    "consolidate: tmdb {} s{} deferred (library active); dropping staged pack",
-                    tmdb_id, season
-                );
                 let _ = app.provider.delete_torrent(&added.id).await;
-                return Ok(());
+                return Err(UpgradeSkip::Deferred(format!(
+                    "s{season} library active; dropped staged pack"
+                )));
             }
             // Record the pack owned+verified with full-season provides + sticky provenance.
             let provides: Vec<(u32, u32)> = eps.iter().map(|(s, e, _)| (*s, *e)).collect();
@@ -956,6 +990,22 @@ mod tests {
             _e: Option<u32>,
         ) -> bool {
             true
+        }
+    }
+
+    /// A scraper that always errors — exercises the transient "scrape failed" → `Deferred` path
+    /// (the title must NOT advance the round-robin cursor on a transient failure).
+    struct FailScraper;
+    #[async_trait]
+    impl Scraper for FailScraper {
+        async fn find(
+            &self,
+            _i: &str,
+            _k: MediaKind,
+            _s: Option<u32>,
+            _e: Option<u32>,
+        ) -> Result<Vec<RawCandidate>, crate::error::AppError> {
+            Err(crate::error::AppError::Config("scrape boom".into()))
         }
     }
 
@@ -1453,6 +1503,94 @@ mod tests {
             store.get_upgrade_checked(&MediaType::Movie, 27205).await,
             0,
             "an idle-deferred title must keep its cursor unstamped"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_defer_keeps_cursor_unstamped_even_when_library_idle() {
+        // The library is IDLE (outer gate passes), but the handler defers (here: a transient scrape
+        // failure). The cursor must stay unstamped so the title is reconsidered next tick, not
+        // skipped for a full cursor wrap. (Before the Deferred/NoChange split this stamped the cursor.)
+        let store = mem_store();
+        store
+            .put_owned(
+                "hold".into(),
+                OwnedRecord {
+                    request: movie_req(),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(QualitySummary {
+                        cached: true,
+                        source_tier: 3_000,
+                        resolution: 1080,
+                        score: 10,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent {
+                id: "told".into(),
+                hash: "hold".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let app = app_with(Arc::new(FailScraper), provider, store.clone());
+        // No reads ⇒ library idle ⇒ the outer gate passes and the handler is actually invoked.
+        run_upgrade_once(&app).await;
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Movie, 27205).await,
+            0,
+            "a handler-deferred (transient) title must keep its cursor unstamped"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_meaningful_upgrade_stamps_the_cursor() {
+        // A genuine "no upgrade exists" outcome (library idle, scraper offers only a same-quality
+        // release) IS evaluated to completion → the cursor advances so the budget rotates onward.
+        let store = mem_store();
+        store
+            .put_owned(
+                "hold".into(),
+                OwnedRecord {
+                    request: movie_req(),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(QualitySummary {
+                        cached: true,
+                        source_tier: 3_000,
+                        resolution: 1080,
+                        score: 10,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![web_1080_candidate()], // same tier+resolution → not a meaningful upgrade
+        });
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent {
+                id: "told".into(),
+                hash: "hold".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+        run_upgrade_once(&app).await;
+        assert!(
+            store.get_upgrade_checked(&MediaType::Movie, 27205).await > 0,
+            "a fully-evaluated no-upgrade title must advance the cursor"
         );
     }
 
