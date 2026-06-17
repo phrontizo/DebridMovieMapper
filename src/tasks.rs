@@ -275,12 +275,18 @@ pub async fn run_scan_loop(
                 // track as an owned record (empty provenance — owned + upgradeable, not a protected
                 // manual class), so the reconciler sees the user's pre-existing library (no duplicate
                 // re-acquire; season-pack episodes count owned).
-                record_mirror_owned(&store, &tmdb_client, &current_data).await;
+                record_mirror_owned(
+                    &store,
+                    &tmdb_client,
+                    &config.acquisition.prefs,
+                    &current_data,
+                )
+                .await;
 
                 // Duplicate-dedup: now the whole library is owned, plan + (if enabled, idle-gated)
                 // remove redundant duplicate torrents. Dry-run (log only) unless
                 // DEDUP_REMOVE_DUPLICATES is set.
-                dedup_owned(&app).await;
+                dedup_owned(&app, &torrents).await;
 
                 let current_ids: std::collections::HashSet<&str> =
                     deduped_torrents.iter().map(|t| t.id.as_str()).collect();
@@ -610,7 +616,13 @@ pub async fn sync_trakt(
             );
             // A successful refresh inside sync_trakt_user persists a fresh (single-use) token before a
             // later read can fail; re-read so we don't clobber it with the stale pre-refresh snapshot.
-            let current = store.get_trakt_tokens(slug.clone()).await.unwrap_or(tokens);
+            // If the account is GONE (the operator clicked "Remove" on the enrolment page since this
+            // pass snapshotted the token list), do NOT resurrect it from the stale snapshot — skip.
+            let Some(current) = store.get_trakt_tokens(slug.clone()).await else {
+                // The account was removed since this pass snapshotted the token list — don't
+                // resurrect it from the stale snapshot.
+                continue;
+            };
             let flagged = crate::store::TraktTokens {
                 needs_reenrolment: true,
                 ..current
@@ -648,13 +660,28 @@ async fn sync_trakt_user(
         .unwrap_or(0);
     if tokens.expires_at <= now + REFRESH_BUFFER_SECS {
         let r = trakt.refresh(&tokens.refresh).await?;
+        // Match `enrolment::refresh_account`: keep the existing refresh token if Trakt returns an
+        // empty one (don't blank a still-valid token and force re-enrolment), and use
+        // `saturating_add` for the expiry so a pathological `created_at + expires_in` can't overflow.
+        let refresh = if r.refresh_token.is_empty() {
+            tokens.refresh.clone()
+        } else {
+            r.refresh_token
+        };
         tokens = TraktTokens {
             access: r.access_token,
-            refresh: r.refresh_token,
-            expires_at: r.created_at + r.expires_in,
+            refresh,
+            expires_at: r.created_at.saturating_add(r.expires_in),
             username: tokens.username.clone(),
             needs_reenrolment: false,
         };
+        // Only persist (and continue syncing) if the account still exists: if it was removed during
+        // the refresh network window (a concurrent `/remove` on the enrolment page), do NOT resurrect
+        // it by writing the refreshed token back — skip the rest of this user's sync (same lost-DELETE
+        // guard as `sync_trakt`'s failure path and `enrolment::refresh_account`).
+        if store.get_trakt_tokens(slug.to_string()).await.is_none() {
+            return Ok(());
+        }
         store
             .put_trakt_tokens(slug.to_string(), tokens.clone())
             .await?;
@@ -878,6 +905,51 @@ fn meta_tmdb_id(metadata: &MediaMetadata) -> Option<u64> {
         .and_then(|s| s.parse::<u64>().ok())
 }
 
+/// Derive a `QualitySummary` for a mirror record from the torrent's representative (largest) video
+/// file. The torrent is present in the provider listing, so it is treated as `cached` (available).
+/// Returns `None` (→ the upgrade path skips it conservatively) when ANY of:
+/// - there is no video file;
+/// - the file fails the hard quality filters (e.g. resolution above the configured ceiling);
+/// - the filename does not tag BOTH the resolution AND the source tier.
+///
+/// The last case is the important one: a partially/un-tagged name (e.g. `The Matrix (1999).mkv`)
+/// parses to `resolution: 0` and/or `source_tier: 0` — UNKNOWN on an axis the upgrade comparison
+/// (`is_meaningful_upgrade`) uses. Recording such a record would let a scraped candidate "upgrade"
+/// (potentially DOWNGRADE) it on the unknown axis, deleting a possibly-better original. We only
+/// record a quality we can compare safely on both axes.
+fn mirror_quality(
+    info: &crate::rd_client::TorrentInfo,
+    prefs: &crate::config::QualityPrefs,
+) -> Option<crate::release::QualitySummary> {
+    let file = info
+        .files
+        .iter()
+        .filter(|f| crate::vfs::is_video_file(&f.path))
+        .max_by_key(|f| f.bytes)?;
+    let name = file
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&file.path)
+        .to_string();
+    let mut r = crate::release::parse(&crate::release::RawCandidate {
+        name: name.clone(),
+        description: String::new(),
+        info_hash: info.hash.clone(),
+        file_idx: None,
+        file_name: Some(name),
+    });
+    r.cached = true; // present in the provider listing == available
+                     // Only record a quality the engine can safely compare; a hard-filtered release has no score.
+    crate::release::score(&r, prefs)?;
+    let summary = crate::release::QualitySummary::of(&r, prefs);
+    // Both axes the upgrade comparison uses must be known, else an "upgrade" could be a downgrade.
+    if summary.resolution == 0 || summary.source_tier == 0 {
+        return None;
+    }
+    Some(summary)
+}
+
 /// Record every identified, present provider torrent the engine doesn't already track as an
 /// **owned record** (the "account mirror"). This makes the reconciler aware of the user's
 /// pre-existing library so it never re-acquires a title that is already present (the duplicate fix)
@@ -888,16 +960,21 @@ fn meta_tmdb_id(metadata: &MediaMetadata) -> Option<u64> {
 /// for the daily quality-upgrade / consolidation path — while still being kept (empty provenance +
 /// no Trakt wanter means neither removal trigger fires). The IMDB id is resolved from TMDB so the
 /// upgrade engine (IMDB-keyed) can actually re-scrape it; a per-title cache avoids repeat lookups in
-/// a pass, and a resolution failure is non-fatal (the record is still written, just not upgradeable
-/// until a later pass fills the id).
+/// a pass. A resolution failure is non-fatal — the record is still written, but with an empty
+/// `imdb_id` it is then kept yet NOT upgrade/re-acquire-eligible (both need an IMDB id) until the
+/// hash is re-mirrored; TMDB lookup failures are rare/transient and playback still works via
+/// on-read repair, so this degrades gracefully rather than failing the mirror.
 ///
 /// Idempotent and non-destructive: a hash the engine already owns (or a previously-recorded mirror
 /// hash) is left untouched, so an in-flight `Pending` acquisition or an engine record's
 /// provenance/quality/`provides` is never clobbered. `provides` for a show is the SE-parsed set of
-/// its selected video files (a movie's is empty); `quality` is `None`.
+/// its selected video files (a movie's is empty); `quality` is derived from the representative
+/// (largest) video file via [`mirror_quality`] (or `None` when there is no video / it is above the
+/// resolution ceiling, in which case the upgrade path skips it conservatively).
 pub(crate) async fn record_mirror_owned(
     store: &Store,
     tmdb: &TmdbClient,
+    prefs: &crate::config::QualityPrefs,
     current_data: &[(crate::rd_client::TorrentInfo, MediaMetadata)],
 ) {
     let now = SystemTime::now()
@@ -906,6 +983,54 @@ pub(crate) async fn record_mirror_owned(
         .unwrap_or(0);
     // Resolve each title's IMDB id at most once per pass (many torrents can share a tmdb_id).
     let mut imdb_cache: HashMap<(MediaType, u64), String> = HashMap::new();
+    // Snapshot the owned-hash set in ONE read transaction up front, rather than a separate
+    // `get_owned` per present torrent (N sequential redb round-trips every scan tick — costly for a
+    // large library). Each provider torrent has a unique hash, so this pass never inserts a hash it
+    // would also need to re-check, making the snapshot safe for the whole pass.
+    let all_owned = store.all_owned().await;
+    let owned: std::collections::HashSet<String> = all_owned
+        .iter()
+        .map(|(h, _)| h.to_ascii_lowercase())
+        .collect();
+    // Hashes the engine has REJECTED (wrong title / bad audio / corrupt / multi-pack / dead). Never
+    // re-adopt one as a mirror copy: a torrent that `observe`/upgrade-staging rejected (and
+    // blacklisted) but couldn't immediately delete — or that a concurrent scan caught mid-staging —
+    // must not be resurrected as a `Verified` empty-provenance record (which removal triggers can't
+    // reclaim). Loaded once per tick; hash-scoped so it catches a wrong-title re-identification too.
+    let blacklisted: std::collections::HashSet<String> = store.all_blacklisted_hashes().await;
+    // Consistency reaper: a blacklisted hash must never be a MIRROR (empty-provenance) owned record.
+    // Such a phantom can arise from a narrow race — a concurrent scan adopting a torrent that
+    // upgrade-staging is about to reject+blacklist+delete (the blacklisting gates: WrongTitle /
+    // MoviePack / probe-Reject) — leaving a Verified empty-provenance record for a now-absent (or
+    // rejected) hash that nothing else cleans (dedup/observe ignore absent/mirror records). Reap it
+    // (store-only — no provider handle here; a still-present blacklisted torrent simply stays
+    // un-adopted via the skip below). Engine records (non-empty provenance) are left alone —
+    // `fail_and_reacquire` owns their lifecycle and may deliberately keep one for a delete-retry.
+    // (A non-blacklisting transient staging failure, e.g. probe-Defer, self-heals: the still-valid
+    // candidate is re-staged and swapped on a later upgrade tick.)
+    let phantoms: Vec<String> = all_owned
+        .iter()
+        .filter(|(h, rec)| {
+            rec.provenance.entries.is_empty() && blacklisted.contains(&h.to_ascii_lowercase())
+        })
+        .map(|(h, _)| h.clone())
+        .collect();
+    if !phantoms.is_empty() {
+        let selection = store.all_selection().await;
+        for h in &phantoms {
+            let _ = store.remove_owned(h.clone()).await;
+            let _ = store.remove_authoritative(h.clone()).await;
+            for (slot, entry) in &selection {
+                if entry.hash.eq_ignore_ascii_case(h) {
+                    let _ = store.remove_selection(slot.clone()).await;
+                }
+            }
+        }
+        info!(
+            "mirror: reaped {} blacklisted phantom owned record(s)",
+            phantoms.len()
+        );
+    }
     let mut recorded = 0usize;
     for (info, metadata) in current_data {
         let Some(tmdb_id) = meta_tmdb_id(metadata) else {
@@ -917,7 +1042,11 @@ pub(crate) async fn record_mirror_owned(
         }
         // Engine-owned OR already-mirrored → leave untouched (idempotent; never clobber an
         // in-flight Pending acquisition or an engine record's provenance/provides/quality).
-        if store.get_owned(hash.clone()).await.is_some() {
+        if owned.contains(&hash) {
+            continue;
+        }
+        // Engine-rejected → never re-adopt (see `blacklisted` above).
+        if blacklisted.contains(&hash) {
             continue;
         }
         let media_type = metadata.media_type.clone();
@@ -959,8 +1088,20 @@ pub(crate) async fn record_mirror_owned(
             added_at: now,
             status: OwnedStatus::Verified,
             provides,
-            quality: None,
+            // Derived from the representative (largest) video file so the record is comparable on
+            // the upgrade/consolidation path. `None` when there is no video file or the file is
+            // above the resolution ceiling (the upgrade path then skips it conservatively).
+            quality: mirror_quality(info, prefs),
         };
+        // Re-check immediately before writing: the per-title TMDB lookup above is an await point, so
+        // a concurrent `engine.acquire` (separate scheduler task) could have written a
+        // provenance-bearing record for this hash since the snapshot was taken. `put_owned` is a
+        // blind overwrite, so without this the mirror could clobber real provenance with an empty one
+        // (silently making an engine-acquired title an un-removable mirror copy). Only hashes that
+        // passed the snapshot reach here (≈0 in steady state), so this adds ≈0 reads per tick.
+        if store.get_owned(hash.clone()).await.is_some() {
+            continue;
+        }
         match store.put_owned(hash.clone(), rec).await {
             Ok(()) => recorded += 1,
             Err(e) => warn!("mirror: failed to record owned {}: {}", hash, e),
@@ -1083,6 +1224,16 @@ async fn build_acquire_request(
 /// `media_type` taken from the records' requests. Built by [`group_owned_by_tmdb`].
 pub(crate) struct OwnedGroup {
     pub hashes: Vec<String>,
+    /// The subset of `hashes` that are ENGINE-acquired — i.e. their owned record carries at least
+    /// one provenance entry (Trakt watchlist/in-progress, or Manual). Account-mirror records (the
+    /// user's pre-existing library) are recorded with EMPTY provenance and are therefore excluded.
+    /// Trigger **B** (abandoned watchlist) removal targets ONLY these hashes, so a pre-existing mirror
+    /// copy that happens to share a `tmdb_id` with a watchlist-acquired episode is never deleted when
+    /// the watchlist is abandoned. Trigger **A** finish-removal likewise targets only these hashes —
+    /// the FULL set (incl. mirror copies) is reclaimed in exactly ONE case: a **show** finish-cleanup
+    /// when `REMOVE_FINISHED_SHOWS` is on (see [`removal_hashes`]). `hashes` (the full set) is also
+    /// used for availability, the dedup pass, and `owned_episodes`.
+    pub engine_hashes: Vec<String>,
     pub provenance: Provenance,
     pub owned_episodes: Vec<(u32, u32)>,
     pub media_type: MediaType,
@@ -1104,13 +1255,20 @@ pub(crate) async fn group_owned_by_tmdb(
             .entry((mt.clone(), rec.request.tmdb_id))
             .or_insert_with(|| OwnedGroup {
                 hashes: Vec::new(),
+                engine_hashes: Vec::new(),
                 provenance: Provenance {
                     entries: Vec::new(),
                 },
                 owned_episodes: Vec::new(),
                 media_type: mt.clone(),
             });
-        group.hashes.push(hash.to_ascii_lowercase());
+        let lc = hash.to_ascii_lowercase();
+        // An owned record with NO provenance entries is an account-mirror (pre-existing) record;
+        // only records with provenance are engine-acquired and thus lifecycle-removable.
+        if !rec.provenance.entries.is_empty() {
+            group.engine_hashes.push(lc.clone());
+        }
+        group.hashes.push(lc);
         group.provenance.merge(&rec.provenance);
         // SP3: prefer the recorded `provides` (a pack supplies many episodes); fall back to the
         // request's single (season, episode) for pre-SP3 records that have no `provides` yet.
@@ -1127,6 +1285,37 @@ pub(crate) async fn group_owned_by_tmdb(
         g.owned_episodes.dedup();
     }
     owned_by
+}
+
+/// The owned hashes to delete for a lifecycle removal, per the trigger reason. Pre-existing
+/// account-mirror copies (empty provenance — the user's own library, in `hashes` but NOT
+/// `engine_hashes`) are **protected by default** and reclaimed in exactly one Trigger-A case:
+/// - `Finished` (Trigger A) **for a show with `REMOVE_FINISHED_SHOWS` on**: the FULL set — this is
+///   the opt-in "remove a fully-watched ended show, incl. ones already in the library" cleanup, which
+///   folds such shows into the wanted-set so this trigger fires; the mirror copy IS the thing to
+///   reclaim, so a blanket `engine_hashes` here would make it a no-op.
+/// - `Finished` otherwise (a **movie**, which `REMOVE_FINISHED_SHOWS` never folds; or a **show with
+///   the flag off**): only the engine-acquired hashes. A genuine in-progress re-watch (the title is
+///   in Trakt `/sync/playback` AND already watched) must NOT delete the user's pre-existing library
+///   — that destroys content the engine never acquired.
+/// - `Abandoned` (Trigger B): only the engine-acquired hashes — un-watchlisting a Trakt title must
+///   never delete content the user added to their debrid account themselves (the mirror "kept"
+///   guarantee). A mirror copy of an earlier season survives abandonment of a later-season watchlist.
+fn removal_hashes(
+    g: &OwnedGroup,
+    reason: crate::wanted::RemoveReason,
+    remove_finished_shows: bool,
+) -> Vec<String> {
+    match reason {
+        crate::wanted::RemoveReason::Finished
+            if g.media_type == MediaType::Show && remove_finished_shows =>
+        {
+            g.hashes.clone()
+        }
+        crate::wanted::RemoveReason::Finished | crate::wanted::RemoveReason::Abandoned => {
+            g.engine_hashes.clone()
+        }
+    }
 }
 
 /// One title's deduplication decision: keep these owned hashes, remove these redundant ones.
@@ -1232,14 +1421,10 @@ pub(crate) fn plan_dedup(
 /// stream — a redundant torrent being read is left until the next idle pass. Execution: delete each
 /// redundant torrent from the provider, drop its owned record, and clear any `selection` slot that
 /// pointed at it (the VFS re-derives the slot from the kept covering hash on the next scan).
-pub(crate) async fn dedup_owned(app: &AppState) {
-    let torrents = match app.provider.get_torrents().await {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("dedup: get_torrents failed: {} — skipping this pass", e);
-            return;
-        }
-    };
+///
+/// Takes the provider listing already fetched by the scan tick (rather than re-fetching it) so the
+/// scan loop makes one `get_torrents` call per tick, not two.
+pub(crate) async fn dedup_owned(app: &AppState, torrents: &[crate::rd_client::Torrent]) {
     let present: std::collections::HashSet<String> = torrents
         .iter()
         .map(|t| t.hash.to_ascii_lowercase())
@@ -1412,13 +1597,24 @@ pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> V
                                 imdb_id: imdb_hint_from_wanted(&wanted),
                             });
                         }
-                        // Delete EVERY owned hash for this tmdb_id (the Action's `hash` is a representative).
-                        Action::Remove { tmdb_id, .. } => {
+                        // Finished (Trigger A) = full cleanup incl. mirror copies; Abandoned
+                        // (Trigger B) = engine-acquired hashes only (keep the user's own library).
+                        // (The Action's `hash` is just a representative.)
+                        Action::Remove {
+                            tmdb_id, reason, ..
+                        } => {
                             if let Some(g) = owned_group {
-                                ops.push(ReconcileOp::Remove {
-                                    tmdb_id,
-                                    hashes: g.hashes.clone(),
-                                });
+                                // Movies are never folded by `REMOVE_FINISHED_SHOWS`, so a movie
+                                // mirror copy is never finish-reclaimed (pass `false`): a genuine
+                                // in-progress re-watch must not delete the user's pre-existing
+                                // library. `removal_hashes` enforces this via the group's media_type.
+                                let hashes = removal_hashes(g, reason, false);
+                                // A mirror-only movie resolves to zero hashes — don't emit a no-op
+                                // Remove every tick (it would just churn an empty op + a full
+                                // selection-table read in `execute_remove`).
+                                if !hashes.is_empty() {
+                                    ops.push(ReconcileOp::Remove { tmdb_id, hashes });
+                                }
                             }
                         }
                         Action::AcquireEpisode { .. } => {} // movies never produce this
@@ -1431,10 +1627,15 @@ pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> V
                     if !g.provenance.has_manual_entry()
                         && trigger_b_abandoned(&wanted, &g.provenance)
                     {
-                        ops.push(ReconcileOp::Remove {
-                            tmdb_id,
-                            hashes: g.hashes.clone(),
-                        });
+                        // Only the engine-acquired hashes — a pre-existing mirror copy of an earlier
+                        // season must survive abandonment of a watchlist that acquired later episodes.
+                        // Route through `removal_hashes` (single source of truth for trigger→hashes)
+                        // and skip a no-op empty removal.
+                        let hashes =
+                            removal_hashes(g, crate::wanted::RemoveReason::Abandoned, false);
+                        if !hashes.is_empty() {
+                            ops.push(ReconcileOp::Remove { tmdb_id, hashes });
+                        }
                     }
                 }
                 // Task 9 handles show-episode acquire + Trigger-A finish removal (air-date dependent).
@@ -1454,6 +1655,12 @@ async fn execute_remove(
     tmdb_id: u64,
     hashes: &[String],
 ) {
+    // A reason-scoped removal can resolve to zero hashes (e.g. a Trigger-A finish on a mirror-only
+    // title that protects every pre-existing copy). Skip early so we don't read the whole selection
+    // table just to iterate an empty list.
+    if hashes.is_empty() {
+        return;
+    }
     // NOTE: on a delete failure we skip remove_owned so the next reconcile tick retries — leaving
     // the owned record intact means the Remove op is re-derived and the torrent is retried instead
     // of being silently orphaned on the provider. MockProvider::delete_torrent always returns Ok,
@@ -1639,15 +1846,22 @@ pub(crate) async fn aired_episodes(
     }
 }
 
-/// When the aired set is INCOMPLETE (a TMDB lookup failed), drop any `Remove` action: a partial or
-/// empty aired set must never let Trigger A vacuously fire and delete a still-wanted show on a
-/// transient external blip ("a failed fetch must NOT cause removal"). Acquisition actions are
+/// Drop any `Remove` action unless the aired set is BOTH complete AND non-empty: a partial set (a
+/// TMDB lookup failed) OR an empty set must never let Trigger A vacuously fire and delete a
+/// still-wanted show on a transient/quirky external signal ("a failed fetch must NOT cause
+/// removal"). An EMPTY aired set is the subtle case: `aired_episodes` returns `pairs=[], complete=true`
+/// when TMDB reports no non-Specials seasons, or every episode has a null air date — and
+/// `user_finished`'s `aired.iter().all(..)` is then VACUOUSLY true for an Ended show, so without this
+/// guard an in-progress-only Ended show whose TMDB data momentarily looks empty would be removed and
+/// (via the acquire-side symmetry guard) not re-fetched. An Ended show with zero aired episodes is
+/// never genuinely finishable, so refusing removal there is always safe. Acquisition actions are
 /// always kept — acquiring only the episodes we confirmed aired is safe even from a partial set.
 pub(crate) fn guard_removal_on_incomplete_aired(
     actions: Vec<crate::wanted::Action>,
     aired_complete: bool,
+    aired_empty: bool,
 ) -> Vec<crate::wanted::Action> {
-    if aired_complete {
+    if aired_complete && !aired_empty {
         return actions;
     }
     actions
@@ -1688,6 +1902,7 @@ pub async fn monitor_episodes(
     provider: &Arc<dyn DebridProvider>,
     tmdb: &TmdbClient,
     store: &Store,
+    remove_finished_shows: bool,
 ) {
     use crate::wanted::{reconcile_title, Action, Owned, TitleView};
     use std::collections::HashSet;
@@ -1752,9 +1967,13 @@ pub async fn monitor_episodes(
             aired_episodes: aired.pairs,
         };
 
-        // Guard: a TMDB hiccup that left the aired set partial/empty must not delete a still-wanted
+        // Guard: a TMDB hiccup that left the aired set partial OR empty must not delete a still-wanted
         // show (an empty `aired` makes Trigger A's "all aired watched" clause vacuously true).
-        let actions = guard_removal_on_incomplete_aired(reconcile_title(&view), aired_complete);
+        let actions = guard_removal_on_incomplete_aired(
+            reconcile_title(&view),
+            aired_complete,
+            aired_count == 0,
+        );
         let acquires = actions
             .iter()
             .filter(|a| matches!(a, Action::AcquireEpisode { .. }))
@@ -1794,10 +2013,20 @@ pub async fn monitor_episodes(
                     )
                     .await;
                 }
-                // Delete EVERY owned hash for this tmdb_id (the Action's `hash` is a representative).
-                Action::Remove { tmdb_id, .. } => {
+                // Trigger A (Finished) reclaims pre-existing mirror copies (empty-provenance records
+                // for a show already in the library) ONLY when `REMOVE_FINISHED_SHOWS` is on — the
+                // opt-in finish-cleanup folds such shows in for exactly this. With the flag off, a
+                // Trigger-A removal can only come from a genuine in-progress re-watch, so it removes
+                // only the engine-acquired hashes and keeps the user's own library. Trigger B
+                // (Abandoned) always keeps mirror copies. (`hash` is a representative.)
+                Action::Remove {
+                    tmdb_id, reason, ..
+                } => {
                     if let Some(g) = owned_group {
-                        execute_remove(provider, &torrents, store, tmdb_id, &g.hashes).await;
+                        let hashes = removal_hashes(g, reason, remove_finished_shows);
+                        if !hashes.is_empty() {
+                            execute_remove(provider, &torrents, store, tmdb_id, &hashes).await;
+                        }
                     }
                 }
                 Action::AcquireMovie { .. } => {} // unreachable for a Show
@@ -1957,6 +2186,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mirror_quality_requires_known_resolution_and_source() {
+        let prefs = crate::config::AcquisitionConfig::default().prefs;
+        let info = |path: &str| crate::rd_client::TorrentInfo {
+            hash: "h".into(),
+            files: vec![crate::rd_client::TorrentFile {
+                id: 0,
+                path: path.into(),
+                bytes: 2_000_000_000,
+                selected: 1,
+            }],
+            ..Default::default()
+        };
+        // Untagged filename → unknown on both axes → None (so the upgrade path won't risk a swap).
+        assert!(mirror_quality(&info("The Matrix (1999).mkv"), &prefs).is_none());
+        // Resolution tagged but no source → still unknown on an axis → None.
+        assert!(mirror_quality(&info("Movie.1080p.mkv"), &prefs).is_none());
+        // Both resolution and source tagged → Some, cached, with known axes.
+        let q = mirror_quality(&info("Movie.2020.1080p.BluRay.x264.mkv"), &prefs)
+            .expect("a fully-tagged file yields a comparable quality");
+        assert!(q.cached);
+        assert_eq!(q.resolution, 1080);
+        assert!(q.source_tier > 0);
+        // No video file at all → None.
+        let no_video = crate::rd_client::TorrentInfo {
+            hash: "h".into(),
+            files: vec![crate::rd_client::TorrentFile {
+                id: 0,
+                path: "readme.txt".into(),
+                bytes: 1,
+                selected: 1,
+            }],
+            ..Default::default()
+        };
+        assert!(mirror_quality(&no_video, &prefs).is_none());
+    }
+
+    #[test]
+    fn season_aired_filters_sorts_and_dedups() {
+        // Pure helper feeding the consolidation/prune gate (`season_aired.iter().all(...)`): it must
+        // return only the season's episodes, sorted and de-duplicated, and empty for an absent season.
+        let aired = vec![(1, 3), (2, 1), (1, 1), (1, 3), (1, 2), (3, 5)];
+        assert_eq!(
+            season_aired(&aired, 1),
+            vec![1, 2, 3],
+            "season 1 episodes, sorted + deduped"
+        );
+        assert_eq!(season_aired(&aired, 2), vec![1]);
+        assert!(
+            season_aired(&aired, 9).is_empty(),
+            "an absent season yields no episodes"
+        );
+        assert!(season_aired(&[], 1).is_empty(), "empty input yields empty");
+    }
+
     #[tokio::test]
     async fn record_mirror_owned_adds_owned_records_and_preserves_engine() {
         use crate::scraper::MediaKind;
@@ -2050,7 +2334,8 @@ mod tests {
             },
         );
 
-        record_mirror_owned(&store, &tmdb, &[movie, pack, eng]).await;
+        let prefs = crate::config::AcquisitionConfig::default().prefs;
+        record_mirror_owned(&store, &tmdb, &prefs, &[movie, pack, eng]).await;
 
         let m = store
             .get_owned("moviehash".into())
@@ -2079,6 +2364,120 @@ mod tests {
         // Engine record untouched (still Watchlist, never overwritten).
         let e = store.get_owned("eng".into()).await.expect("engine present");
         assert_eq!(e.provenance, Provenance::watchlist("alice"));
+    }
+
+    #[tokio::test]
+    async fn record_mirror_owned_skips_blacklisted_hashes() {
+        use crate::store::Store;
+        use crate::vfs::{MediaMetadata, MediaType};
+        let store = Store::from_database(std::sync::Arc::new(
+            redb::Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        ))
+        .unwrap();
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+        // The engine rejected + blacklisted this hash (under tmdb 27205) but couldn't immediately
+        // delete it (or a concurrent scan caught it mid-staging). The mirror pass must NOT resurrect
+        // it as a Verified empty-provenance record (which removal triggers can't reclaim).
+        store
+            .blacklist_add(27205, "badhash".into(), "BadAudio", 1)
+            .await
+            .unwrap();
+        let rejected = (
+            crate::rd_client::TorrentInfo {
+                hash: "BADHASH".into(),
+                files: vec![crate::rd_client::TorrentFile {
+                    id: 0,
+                    path: "The Matrix (1999).mkv".into(),
+                    bytes: 100,
+                    selected: 1,
+                }],
+                ..Default::default()
+            },
+            // Re-identifies to a DIFFERENT tmdb (603) than it was blacklisted under (27205): the
+            // hash-scoped blacklist must STILL catch it (the wrong-title re-identification case).
+            MediaMetadata {
+                title: "The Matrix".into(),
+                year: Some("1999".into()),
+                media_type: MediaType::Movie,
+                external_id: Some("tmdb:603".into()),
+            },
+        );
+        let prefs = crate::config::AcquisitionConfig::default().prefs;
+        record_mirror_owned(&store, &tmdb, &prefs, &[rejected]).await;
+        assert!(
+            store.get_owned("badhash".into()).await.is_none(),
+            "a blacklisted (engine-rejected) hash must never be re-adopted as a mirror copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_mirror_owned_reaps_blacklisted_phantom_mirror_records() {
+        use crate::scraper::MediaKind;
+        use crate::store::{AcquireRequest, OwnedRecord, OwnedStatus, Provenance, Store};
+        use crate::vfs::{MediaMetadata, MediaType};
+        let store = Store::from_database(std::sync::Arc::new(
+            redb::Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        ))
+        .unwrap();
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+        let rec = |prov: Provenance| OwnedRecord {
+            request: AcquireRequest {
+                imdb_id: String::new(),
+                tmdb_id: 603,
+                kind: MediaKind::Movie,
+                season: None,
+                episode: None,
+                original_language: None,
+                metadata: MediaMetadata {
+                    title: "Movie".into(),
+                    year: None,
+                    media_type: MediaType::Movie,
+                    external_id: Some("tmdb:603".into()),
+                },
+            },
+            provenance: prov,
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: None,
+        };
+        // A phantom: a MIRROR (empty-provenance) owned record whose hash is blacklisted (e.g. left by
+        // a staging-reject race). Must be reaped.
+        store
+            .put_owned("phantom".into(), rec(Provenance { entries: vec![] }))
+            .await
+            .unwrap();
+        store
+            .blacklist_add(999, "phantom".into(), "WrongTitle", 1)
+            .await
+            .unwrap();
+        // An ENGINE record (non-empty provenance) that is also blacklisted must NOT be reaped — its
+        // lifecycle belongs to `fail_and_reacquire` (which may keep it for a delete-retry).
+        store
+            .put_owned("engine".into(), rec(Provenance::watchlist("alice")))
+            .await
+            .unwrap();
+        store
+            .blacklist_add(603, "engine".into(), "BadAudio", 1)
+            .await
+            .unwrap();
+
+        let prefs = crate::config::AcquisitionConfig::default().prefs;
+        // No present torrents — the reaper runs over the owned table regardless of current_data.
+        record_mirror_owned(&store, &tmdb, &prefs, &[]).await;
+
+        assert!(
+            store.get_owned("phantom".into()).await.is_none(),
+            "a blacklisted mirror (empty-provenance) phantom record must be reaped"
+        );
+        assert!(
+            store.get_owned("engine".into()).await.is_some(),
+            "a blacklisted ENGINE record must be left for fail_and_reacquire to manage"
+        );
     }
 
     // ── plan_dedup (pure) ─────────────────────────────────────────────────────
@@ -3262,6 +3661,32 @@ mod reconcile_wanted_tests {
     }
 
     #[tokio::test]
+    async fn plan_finished_mirror_only_movie_emits_no_remove_op() {
+        // A movie the user already had in their library (mirror copy, EMPTY provenance) that they
+        // re-watch (in-progress + watched on Trakt) triggers Trigger-A, but `removal_hashes` protects
+        // the mirror copy (movies are never folded). The planner must NOT emit a no-op empty Remove
+        // op each tick — it would churn an empty op and a full selection-table read in execute_remove.
+        let store = mem_store();
+        store
+            .put_wanted(wanted_movie("alice", 27205, false, true, true))
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "mirror".into(),
+                owned_record(27205, MediaKind::Movie, Provenance { entries: vec![] }),
+            )
+            .await
+            .unwrap();
+        let torrents = vec![torrent("t1", "MIRROR")];
+        let ops = plan_reconcile_ops(&store, &torrents).await;
+        assert!(
+            ops.is_empty(),
+            "a finished mirror-only movie protects its hash, so no Remove op should be emitted: {ops:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn plan_watchlisted_watched_movie_is_kept_not_removed() {
         // The Oldboy case: a movie watched but still on the watchlist must NOT be removed (and,
         // since owned + present, not re-acquired) — it stays available for a re-watch. Without the
@@ -3443,6 +3868,106 @@ mod reconcile_wanted_tests {
                 hashes: vec!["abc".into()]
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn plan_show_trigger_b_keeps_pre_existing_mirror_hash() {
+        // A pre-existing mirror copy (EMPTY provenance — e.g. an S01 pack the user already had) and a
+        // watchlist-acquired episode (e.g. S02) share tmdb 1396. When the watchlist is abandoned
+        // (nobody wants it now), Trigger B must remove ONLY the engine-acquired hash and KEEP the
+        // mirror copy — otherwise the user's pre-existing library is silently deleted.
+        let store = mem_store();
+        store
+            .put_owned(
+                "mirror".into(),
+                owned_record(1396, MediaKind::Series, Provenance { entries: vec![] }),
+            )
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "engine".into(),
+                owned_record(1396, MediaKind::Series, Provenance::watchlist("alice")),
+            )
+            .await
+            .unwrap();
+        let torrents = vec![torrent("t1", "MIRROR"), torrent("t2", "ENGINE")];
+        let ops = plan_reconcile_ops(&store, &torrents).await;
+        assert_eq!(
+            ops,
+            vec![ReconcileOp::Remove {
+                tmdb_id: 1396,
+                hashes: vec!["engine".into()]
+            }],
+            "Trigger-B must delete only the engine-acquired hash, never the pre-existing mirror copy"
+        );
+    }
+
+    #[test]
+    fn removal_hashes_finished_show_includes_mirror_only_when_flag_on() {
+        use crate::wanted::RemoveReason;
+        // A SHOW group with one pre-existing mirror hash (empty provenance, only in `hashes`) and one
+        // engine-acquired hash (in both `hashes` and `engine_hashes`).
+        let g = OwnedGroup {
+            hashes: vec!["engine".into(), "mirror".into()],
+            engine_hashes: vec!["engine".into()],
+            provenance: Provenance::watchlist("alice"),
+            owned_episodes: vec![],
+            media_type: MediaType::Show,
+        };
+        // Trigger A (Finished) reclaims the WHOLE title — incl. the pre-existing mirror copy — ONLY
+        // when REMOVE_FINISHED_SHOWS is on (the opt-in library finish-cleanup). (Regression guard: a
+        // blanket `engine_hashes` here would make finish-removal of a mirror show a no-op.)
+        let mut fin_on = removal_hashes(&g, RemoveReason::Finished, /*flag*/ true);
+        fin_on.sort();
+        assert_eq!(fin_on, vec!["engine".to_string(), "mirror".to_string()]);
+        // With the flag OFF, a Trigger-A removal can only be a genuine in-progress re-watch, which
+        // must KEEP the user's pre-existing mirror copy — only the engine hash is reclaimed.
+        assert_eq!(
+            removal_hashes(&g, RemoveReason::Finished, /*flag*/ false),
+            vec!["engine".to_string()]
+        );
+        // Trigger B (Abandoned watchlist) keeps the mirror copy regardless of the flag.
+        assert_eq!(
+            removal_hashes(&g, RemoveReason::Abandoned, true),
+            vec!["engine".to_string()]
+        );
+        assert_eq!(
+            removal_hashes(&g, RemoveReason::Abandoned, false),
+            vec!["engine".to_string()]
+        );
+    }
+
+    #[test]
+    fn removal_hashes_movie_mirror_is_never_finish_reclaimed() {
+        use crate::wanted::RemoveReason;
+        // A MOVIE group with a pre-existing mirror copy. REMOVE_FINISHED_SHOWS never folds movies, so
+        // a movie mirror must NEVER be Trigger-A reclaimed — even with the flag on — or a re-watched
+        // (in /sync/playback + watched) pre-existing movie would be deleted from the user's library.
+        let g = OwnedGroup {
+            hashes: vec!["engine".into(), "mirror".into()],
+            engine_hashes: vec!["engine".into()],
+            provenance: Provenance::in_progress("alice"),
+            owned_episodes: vec![],
+            media_type: MediaType::Movie,
+        };
+        for flag in [true, false] {
+            assert_eq!(
+                removal_hashes(&g, RemoveReason::Finished, flag),
+                vec!["engine".to_string()],
+                "movie mirror must survive finish-removal (flag={flag})"
+            );
+        }
+        // A PURE mirror movie (no engine hash) is therefore never finish-removed at all.
+        let pure_mirror = OwnedGroup {
+            hashes: vec!["mirror".into()],
+            engine_hashes: vec![],
+            provenance: Provenance { entries: vec![] },
+            owned_episodes: vec![],
+            media_type: MediaType::Movie,
+        };
+        assert!(removal_hashes(&pure_mirror, RemoveReason::Finished, true).is_empty());
+        assert!(removal_hashes(&pure_mirror, RemoveReason::Finished, false).is_empty());
     }
 
     #[tokio::test]
@@ -3710,11 +4235,12 @@ mod monitor_episodes_tests {
 
     #[test]
     fn incomplete_aired_drops_remove_actions() {
-        use crate::wanted::Action;
+        use crate::wanted::{Action, RemoveReason};
         let actions = vec![
             Action::Remove {
                 tmdb_id: 7,
                 hash: "abc".into(),
+                reason: RemoveReason::Finished,
             },
             Action::AcquireEpisode {
                 tmdb_id: 7,
@@ -3723,7 +4249,7 @@ mod monitor_episodes_tests {
             },
         ];
         // complete == false (a TMDB lookup failed): the Remove must be dropped, the acquire kept.
-        let kept = guard_removal_on_incomplete_aired(actions, false);
+        let kept = guard_removal_on_incomplete_aired(actions, false, false);
         assert_eq!(
             kept,
             vec![Action::AcquireEpisode {
@@ -3736,14 +4262,34 @@ mod monitor_episodes_tests {
 
     #[test]
     fn complete_aired_keeps_remove_actions() {
-        use crate::wanted::Action;
+        use crate::wanted::{Action, RemoveReason};
         let actions = vec![Action::Remove {
             tmdb_id: 7,
             hash: "abc".into(),
+            reason: RemoveReason::Finished,
         }];
-        // complete == true: a genuine Trigger-A removal is preserved.
-        let kept = guard_removal_on_incomplete_aired(actions.clone(), true);
+        // complete == true AND non-empty: a genuine Trigger-A removal is preserved.
+        let kept = guard_removal_on_incomplete_aired(actions.clone(), true, false);
         assert_eq!(kept, actions);
+    }
+
+    #[test]
+    fn empty_but_complete_aired_drops_remove_actions() {
+        use crate::wanted::{Action, RemoveReason};
+        // The subtle data-loss case: complete == true but the aired set is EMPTY (TMDB reported no
+        // non-Specials seasons, or all air dates null). `user_finished`'s `all()` over an empty set
+        // is vacuously true for an Ended show, so a Remove must NOT be honoured — an Ended show with
+        // zero aired episodes is never genuinely finishable.
+        let actions = vec![Action::Remove {
+            tmdb_id: 7,
+            hash: "abc".into(),
+            reason: RemoveReason::Finished,
+        }];
+        assert!(
+            guard_removal_on_incomplete_aired(actions, /*complete*/ true, /*empty*/ true)
+                .is_empty(),
+            "an empty aired set must never vacuously remove a show"
+        );
     }
 
     #[test]
@@ -3762,7 +4308,7 @@ mod monitor_episodes_tests {
             },
         ];
         assert_eq!(
-            guard_removal_on_incomplete_aired(actions.clone(), false),
+            guard_removal_on_incomplete_aired(actions.clone(), false, true),
             actions
         );
     }

@@ -33,6 +33,12 @@ impl ReadActivity {
     pub async fn touch(&self, path: &str) {
         const WATERMARK: usize = MAX_TRACKED * 3 / 4;
         let mut map = self.last_read.write().await;
+        // The common case under rclone read-ahead is re-touching an already-tracked path: update it
+        // in place (no `String` allocation, no eviction check). Only a brand-new path falls through.
+        if let Some(t) = map.get_mut(path) {
+            *t = Instant::now();
+            return;
+        }
         map.insert(path.to_string(), Instant::now());
         if map.len() > MAX_TRACKED {
             let excess = map.len() - WATERMARK;

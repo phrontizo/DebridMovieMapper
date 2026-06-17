@@ -49,30 +49,232 @@ pub struct LangReq {
     pub original_language: Option<String>,
 }
 
-/// Minimal ISO 639-1 → 639-2/B map; passes through 3-letter codes and unknown 2-letter codes.
+/// Normalise a language code to ISO 639-2/B (bibliographic). Maps the COMPLETE ISO 639-1 (2-letter)
+/// set to /B — TMDB's `original_language` is 2-letter and the default `AudioReq::Original` compares
+/// it against a 3-letter track tag, so an incomplete map would FailAudio-blacklist correctly-tagged
+/// foreign releases — and canonicalises the 20 ISO 639-2/T (terminological) 3-letter codes to their
+/// /B equivalents so a /T-tagged track unifies with a /B want. Unknown/already-/B 3-letter and
+/// unknown 2-letter codes pass through unchanged.
 pub fn to_iso639_2(code: &str) -> String {
     let c = code.trim().to_ascii_lowercase();
     if c.len() == 3 {
-        return c;
+        // ISO 639-2/T → /B for the 20 languages whose B and T codes differ. The rest of the
+        // pipeline (the 639-1 map below, TMDB original_language) speaks /B; muxers like ffmpeg emit
+        // /T (e.g. `deu`/`fra`/`zho`/`nld`), so without this a correct German/French/… release is
+        // wrongly blacklisted by the probe. B==T codes (jpn, rus, spa, …) need no entry.
+        return match c.as_str() {
+            "sqi" => "alb",
+            "hye" => "arm",
+            "eus" => "baq",
+            "mya" => "bur",
+            "zho" => "chi",
+            "ces" => "cze",
+            "nld" => "dut",
+            "fra" => "fre",
+            "kat" => "geo",
+            "deu" => "ger",
+            "ell" => "gre",
+            "isl" => "ice",
+            "mkd" => "mac",
+            "mri" => "mao",
+            "msa" => "may",
+            "fas" => "per",
+            "ron" => "rum",
+            "slk" => "slo",
+            "bod" => "tib",
+            "cym" => "wel",
+            _ => return c, // already /B, or an unknown 3-letter code
+        }
+        .to_string();
     }
+    // Complete ISO 639-1 → 639-2/B table. For the 20 languages whose /B and /T differ, this uses
+    // the /B form (the /T 3-letter form is folded to /B by the block above), so all three
+    // representations of a language compare equal.
     match c.as_str() {
-        "en" => "eng",
-        "fr" => "fre",
-        "de" => "ger",
-        "es" => "spa",
-        "it" => "ita",
-        "ru" => "rus",
-        "hi" => "hin",
-        "ja" => "jpn",
-        "ko" => "kor",
-        "pt" => "por",
-        "zh" => "chi",
-        "nl" => "dut",
-        "sv" => "swe",
-        "no" => "nor",
+        "aa" => "aar",
+        "ab" => "abk",
+        "ae" => "ave",
+        "af" => "afr",
+        "ak" => "aka",
+        "am" => "amh",
+        "an" => "arg",
+        "ar" => "ara",
+        "as" => "asm",
+        "av" => "ava",
+        "ay" => "aym",
+        "az" => "aze",
+        "ba" => "bak",
+        "be" => "bel",
+        "bg" => "bul",
+        "bh" => "bih",
+        "bi" => "bis",
+        "bm" => "bam",
+        "bn" => "ben",
+        "bo" => "tib",
+        "br" => "bre",
+        "bs" => "bos",
+        "ca" => "cat",
+        "ce" => "che",
+        "ch" => "cha",
+        "co" => "cos",
+        "cr" => "cre",
+        "cs" => "cze",
+        "cu" => "chu",
+        "cv" => "chv",
+        "cy" => "wel",
         "da" => "dan",
+        "de" => "ger",
+        "dv" => "div",
+        "dz" => "dzo",
+        "ee" => "ewe",
+        "el" => "gre",
+        "en" => "eng",
+        "eo" => "epo",
+        "es" => "spa",
+        "et" => "est",
+        "eu" => "baq",
+        "fa" => "per",
+        "ff" => "ful",
         "fi" => "fin",
+        "fj" => "fij",
+        "fo" => "fao",
+        "fr" => "fre",
+        "fy" => "fry",
+        "ga" => "gle",
+        "gd" => "gla",
+        "gl" => "glg",
+        "gn" => "grn",
+        "gu" => "guj",
+        "gv" => "glv",
+        "ha" => "hau",
+        "he" => "heb",
+        "hi" => "hin",
+        "ho" => "hmo",
+        "hr" => "hrv",
+        "ht" => "hat",
+        "hu" => "hun",
+        "hy" => "arm",
+        "hz" => "her",
+        "ia" => "ina",
+        "id" => "ind",
+        "ie" => "ile",
+        "ig" => "ibo",
+        "ii" => "iii",
+        "ik" => "ipk",
+        "io" => "ido",
+        "is" => "ice",
+        "it" => "ita",
+        "iu" => "iku",
+        "ja" => "jpn",
+        "jv" => "jav",
+        "ka" => "geo",
+        "kg" => "kon",
+        "ki" => "kik",
+        "kj" => "kua",
+        "kk" => "kaz",
+        "kl" => "kal",
+        "km" => "khm",
+        "kn" => "kan",
+        "ko" => "kor",
+        "kr" => "kau",
+        "ks" => "kas",
+        "ku" => "kur",
+        "kv" => "kom",
+        "kw" => "cor",
+        "ky" => "kir",
+        "la" => "lat",
+        "lb" => "ltz",
+        "lg" => "lug",
+        "li" => "lim",
+        "ln" => "lin",
+        "lo" => "lao",
+        "lt" => "lit",
+        "lu" => "lub",
+        "lv" => "lav",
+        "mg" => "mlg",
+        "mh" => "mah",
+        "mi" => "mao",
+        "mk" => "mac",
+        "ml" => "mal",
+        "mn" => "mon",
+        "mr" => "mar",
+        "ms" => "may",
+        "mt" => "mlt",
+        "my" => "bur",
+        "na" => "nau",
+        "nb" => "nob",
+        "nd" => "nde",
+        "ne" => "nep",
+        "ng" => "ndo",
+        "nl" => "dut",
+        "nn" => "nno",
+        "no" => "nor",
+        "nr" => "nbl",
+        "nv" => "nav",
+        "ny" => "nya",
+        "oc" => "oci",
+        "oj" => "oji",
+        "om" => "orm",
+        "or" => "ori",
+        "os" => "oss",
+        "pa" => "pan",
+        "pi" => "pli",
         "pl" => "pol",
+        "ps" => "pus",
+        "pt" => "por",
+        "qu" => "que",
+        "rm" => "roh",
+        "rn" => "run",
+        "ro" => "rum",
+        "ru" => "rus",
+        "rw" => "kin",
+        "sa" => "san",
+        "sc" => "srd",
+        "sd" => "snd",
+        "se" => "sme",
+        "sg" => "sag",
+        "si" => "sin",
+        "sk" => "slo",
+        "sl" => "slv",
+        "sm" => "smo",
+        "sn" => "sna",
+        "so" => "som",
+        "sq" => "alb",
+        "sr" => "srp",
+        "ss" => "ssw",
+        "st" => "sot",
+        "su" => "sun",
+        "sv" => "swe",
+        "sw" => "swa",
+        "ta" => "tam",
+        "te" => "tel",
+        "tg" => "tgk",
+        "th" => "tha",
+        "ti" => "tir",
+        "tk" => "tuk",
+        "tl" => "tgl",
+        "tn" => "tsn",
+        "to" => "ton",
+        "tr" => "tur",
+        "ts" => "tso",
+        "tt" => "tat",
+        "tw" => "twi",
+        "ty" => "tah",
+        "ug" => "uig",
+        "uk" => "ukr",
+        "ur" => "urd",
+        "uz" => "uzb",
+        "ve" => "ven",
+        "vi" => "vie",
+        "vo" => "vol",
+        "wa" => "wln",
+        "wo" => "wol",
+        "xh" => "xho",
+        "yi" => "yid",
+        "yo" => "yor",
+        "za" => "zha",
+        "zh" => "chi",
+        "zu" => "zul",
         _ => return c,
     }
     .to_string()
@@ -115,9 +317,9 @@ fn check_lang(tracks: &[Track], kind: TrackKind, want: &str) -> LangCheck {
 /// absent). Untagged tracks (no language metadata) are inconclusive — not a failure — so a
 /// correct-but-untagged release isn't wrongly rejected. This deliberately also accepts a
 /// non-matching *tagged* track when an untagged track is present alongside it (the untagged one
-/// could be the wanted language). Note: MKV tracks that omit the Language element are
-/// pre-resolved to `eng` by the parser (Matroska's spec default), so only MP4 untagged audio
-/// (`language: None`) actually reaches the inconclusive branch.
+/// could be the wanted language). Note: MKV tracks that OMIT the Language element are pre-resolved
+/// to `eng` by the parser (Matroska's spec default); an MKV track tagged `und`/empty (undetermined)
+/// or an MP4 untagged track resolves to `language: None` and reaches the inconclusive branch.
 pub fn verify(tracks: &[Track], req: &LangReq) -> Verify {
     if tracks.is_empty() {
         return Verify::Inconclusive;
@@ -204,6 +406,14 @@ fn read_ebml_size(buf: &[u8], pos: &mut usize) -> Option<u64> {
     }
 }
 
+/// `base + size` as a `usize`, or `None` on overflow. `usize::try_from` first so a declared `size`
+/// (a `u64` read from untrusted bytes) larger than `usize::MAX` can't truncate on a 32-bit target
+/// and silently wrap past the overrun guard (the deployment targets are 64-bit, where `try_from` is
+/// always Ok, so this is hardening, not a behaviour change).
+fn ebml_end(base: usize, size: u64) -> Option<usize> {
+    usize::try_from(size).ok().and_then(|s| base.checked_add(s))
+}
+
 /// Parse MKV track languages. `Corrupt` on a structurally-broken header,
 /// `TracksNotFound` if no `Tracks` element is present in the buffer.
 pub fn parse_mkv_tracks(buf: &[u8]) -> Result<Vec<Track>, ProbeError> {
@@ -228,7 +438,7 @@ pub fn parse_mkv_tracks(buf: &[u8]) -> Result<Vec<Track>, ProbeError> {
         let end = if size == u64::MAX {
             t_end
         } else {
-            pos.checked_add(size as usize).ok_or(ProbeError::Corrupt)?
+            ebml_end(pos, size).ok_or(ProbeError::Corrupt)?
         };
         if end > buf.len() || end > t_end {
             return Err(overrun_error(end, buf.len()));
@@ -256,9 +466,7 @@ fn find_ebml_child(
         let payload_end = if size == u64::MAX {
             end // unknown/streaming size → spans to the end of the search region
         } else {
-            payload_start
-                .checked_add(size as usize)
-                .ok_or(ProbeError::Corrupt)?
+            ebml_end(payload_start, size).ok_or(ProbeError::Corrupt)?
         };
         if id == target_id {
             // A matched container legitimately extends past the fetched window — the top-level MKV
@@ -281,6 +489,9 @@ fn find_ebml_child(
 fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, ProbeError> {
     let mut kind = TrackKind::Other;
     let mut language: Option<String> = None;
+    // Whether a Language element was present at all — distinguishes a genuinely-absent element (which
+    // Matroska's spec defaults to "eng") from a present-but-`und`/empty one (inconclusive, NOT eng).
+    let mut saw_language = false;
     let mut pos = start;
     while pos < end {
         let id = read_ebml_id(buf, &mut pos).ok_or(ProbeError::Corrupt)?;
@@ -288,7 +499,7 @@ fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, 
         if size == u64::MAX {
             return Err(ProbeError::Corrupt);
         }
-        let p_end = pos.checked_add(size as usize).ok_or(ProbeError::Corrupt)?;
+        let p_end = ebml_end(pos, size).ok_or(ProbeError::Corrupt)?;
         if p_end > end {
             return Err(overrun_error(p_end, buf.len()));
         }
@@ -302,9 +513,18 @@ fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, 
                 };
             }
             0x22B59C => {
+                saw_language = true;
                 language = std::str::from_utf8(&buf[pos..p_end])
                     .ok()
-                    .map(|s| s.trim().to_string());
+                    .map(|s| s.trim().to_string())
+                    // "und" (ISO-639 *undetermined*) and empty are INCONCLUSIVE, not a positive
+                    // tag — treat them like an absent code (`None`) so `check_lang` doesn't count
+                    // them as a wrong-language match (mirrors the MP4 `parse_mdhd_language` path).
+                    // They are deliberately NOT defaulted to "eng" below — only a genuinely-absent
+                    // element is (the Matroska spec default). Case-insensitive on `und` for exact
+                    // parity with the always-lowercased MP4 path (Matroska mandates lowercase, so a
+                    // stray "UND" is non-spec but must not slip through as a wrong-language tag).
+                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("und"));
             }
             _ => {}
         }
@@ -312,7 +532,14 @@ fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, 
     }
     Ok(Track {
         kind,
-        language: language.or_else(|| Some("eng".to_string())),
+        // Matroska spec: a track with NO Language element is "eng". A present-but-`und`/empty element
+        // stays `None` (inconclusive), so it is never miscounted as a wrong-language tag nor wrongly
+        // auto-passed as "eng".
+        language: if saw_language {
+            language
+        } else {
+            Some("eng".to_string())
+        },
     })
 }
 
@@ -334,10 +561,7 @@ fn read_box_header(buf: &[u8], pos: usize) -> Result<([u8; 4], usize, usize), Pr
         }
         let big = u64::from_be_bytes(buf[pos + 8..pos + 16].try_into().unwrap());
         // A crafted 64-bit largesize must not overflow usize (input is untrusted CDN bytes).
-        let end = usize::try_from(big)
-            .ok()
-            .and_then(|b| pos.checked_add(b))
-            .ok_or(ProbeError::Corrupt)?;
+        let end = ebml_end(pos, big).ok_or(ProbeError::Corrupt)?;
         (pos + 16, end)
     } else if size32 == 0 {
         (pos + 8, buf.len())
@@ -512,9 +736,11 @@ fn probe_status_ok(status: reqwest::StatusCode, accept_200_from_start: bool) -> 
 
 /// Read up to `want` bytes of a ranged response body for the probe. On a `200` (Range-ignoring CDN
 /// streaming the whole multi-GB object) we stop and drop the connection as soon as we have `want`
-/// bytes, so we never download more than a window. Status mismatch, a read error, or a body that
-/// runs past `MAX_PROBE_FETCH` before reaching `want` → `Transient` (defer + retry; we never
-/// blacklist a release merely because a probe window couldn't be fetched).
+/// bytes, so we never download more than a window. A status mismatch or a read error → `Transient`
+/// (defer + retry; we never blacklist a release merely because a probe window couldn't be fetched).
+/// The `MAX_PROBE_FETCH` cap is a defensive backstop on total allocation: with the current callers
+/// `want` (4 MB) is below it so the `>= want` early-return fires first, but it bounds the buffer
+/// should a future caller request a window larger than the cap.
 async fn read_body(
     resp: reqwest::Response,
     want: usize,
@@ -540,6 +766,8 @@ async fn read_body(
             return Ok(buf); // got the window — drop the connection, don't drain the whole object
         }
         if buf.len() > MAX_PROBE_FETCH {
+            // Defensive backstop only — unreachable while `want <= MAX_PROBE_FETCH` (the `>= want`
+            // check above returns first). Guards against a future caller requesting a larger window.
             return Err(ProbeError::Transient);
         }
     }
@@ -586,6 +814,15 @@ async fn fetch_suffix(http: &reqwest::Client, url: &str, len: u64) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ebml_end_adds_and_guards_overflow() {
+        assert_eq!(ebml_end(10, 5), Some(15));
+        assert_eq!(ebml_end(0, 0), Some(0));
+        // base + size overflowing usize → None (rejected as Corrupt by callers).
+        assert_eq!(ebml_end(usize::MAX, 1), None);
+        assert_eq!(ebml_end(usize::MAX - 2, 5), None);
+    }
 
     #[test]
     fn probe_status_ok_accepts_206_always_and_200_only_from_start() {
@@ -868,6 +1105,66 @@ mod tests {
     }
 
     #[test]
+    fn mkv_und_and_empty_language_are_inconclusive_not_a_wrong_match() {
+        // A present `und` (ISO-639 undetermined) or empty Language element must resolve to None
+        // (inconclusive — like an MP4 untagged track), NOT a positively-tagged wrong language and
+        // NOT the "eng" default. Otherwise a (very common) und-tagged MKV release is wrongly
+        // rejected as wrong-language, asymmetric with the MP4 path.
+        let bytes = mkv_with("und", Some(""));
+        let tracks = parse_mkv_tracks(&bytes).expect("parse");
+        let audio = tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio)
+            .expect("audio");
+        assert_eq!(
+            audio.language, None,
+            "und audio must be inconclusive (None), not Some(\"und\") or \"eng\""
+        );
+        let sub = tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Subtitle)
+            .expect("sub");
+        assert_eq!(
+            sub.language, None,
+            "empty subtitle language must be inconclusive (None)"
+        );
+        // An eng-audio requirement must NOT reject a release whose only audio is `und`.
+        let req = LangReq {
+            audio: AudioReq::Lang("eng".into()),
+            subtitle: SubReq::None,
+            original_language: None,
+        };
+        assert_ne!(
+            verify(&tracks, &req),
+            Verify::FailAudio,
+            "und audio must be inconclusive, never a wrong-language rejection"
+        );
+    }
+
+    #[test]
+    fn mkv_absent_language_element_defaults_to_eng() {
+        // Matroska spec: a track that OMITS the Language element is "eng" (distinct from a present
+        // `und`, which is inconclusive — see the test above).
+        let mut audio = Vec::new();
+        audio.extend(ebml_elem(0x83, &[2])); // audio track type, NO Language element
+        let tracks_inner = ebml_elem(0xAE, &audio);
+        let tracks_elem = ebml_elem(0x1654AE6B, &tracks_inner);
+        let segment = ebml_elem(0x18538067, &tracks_elem);
+        let mut bytes = ebml_elem(0x1A45DFA3, &[]);
+        bytes.extend(segment);
+        let tracks = parse_mkv_tracks(&bytes).expect("parse");
+        let audio = tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio)
+            .expect("audio");
+        assert_eq!(
+            audio.language.as_deref(),
+            Some("eng"),
+            "an absent Language element defaults to eng (Matroska spec)"
+        );
+    }
+
+    #[test]
     fn verify_tagged_wrong_audio_still_fails() {
         // A track positively tagged with a non-matching language is still rejected (a real dub).
         let tracks = vec![Track {
@@ -942,5 +1239,97 @@ mod tests {
         assert_eq!(to_iso639_2("en"), "eng");
         assert_eq!(to_iso639_2("eng"), "eng");
         assert_eq!(to_iso639_2("ja"), "jpn");
+    }
+
+    #[test]
+    fn iso_639_1_map_covers_common_originals() {
+        // The default AudioReq::Original compares TMDB's 2-letter original_language against a
+        // 3-letter track tag, so every realistic original language must canonicalise to its /B
+        // 3-letter form (regression guard for previously-missing originals).
+        assert_eq!(to_iso639_2("tr"), "tur"); // Turkish
+        assert_eq!(to_iso639_2("ar"), "ara"); // Arabic
+        assert_eq!(to_iso639_2("th"), "tha"); // Thai
+        assert_eq!(to_iso639_2("he"), "heb"); // Hebrew
+        assert_eq!(to_iso639_2("uk"), "ukr"); // Ukrainian
+        assert_eq!(to_iso639_2("hu"), "hun"); // Hungarian
+        assert_eq!(to_iso639_2("id"), "ind"); // Indonesian
+        assert_eq!(to_iso639_2("vi"), "vie"); // Vietnamese
+        assert_eq!(to_iso639_2("ta"), "tam"); // Tamil
+        assert_eq!(to_iso639_2("te"), "tel"); // Telugu
+        assert_eq!(to_iso639_2("uz"), "uzb"); // Uzbek
+        assert_eq!(to_iso639_2("hr"), "hrv"); // Croatian
+        assert_eq!(to_iso639_2("sr"), "srp"); // Serbian
+        assert_eq!(to_iso639_2("bg"), "bul"); // Bulgarian
+                                              // Unknown / non-language tokens still pass through unchanged.
+        assert_eq!(to_iso639_2("zz"), "zz");
+    }
+
+    #[test]
+    fn iso_639_b_t_and_1_all_unify() {
+        // For every language whose /B and /T codes differ, the 639-1, /B, and /T forms must all
+        // canonicalise to the same /B value (cross-checks the 639-1 map against the /T map, so a
+        // typo in either table is caught here).
+        let triples = [
+            ("sq", "alb", "sqi"),
+            ("hy", "arm", "hye"),
+            ("eu", "baq", "eus"),
+            ("my", "bur", "mya"),
+            ("zh", "chi", "zho"),
+            ("cs", "cze", "ces"),
+            ("nl", "dut", "nld"),
+            ("fr", "fre", "fra"),
+            ("ka", "geo", "kat"),
+            ("de", "ger", "deu"),
+            ("el", "gre", "ell"),
+            ("is", "ice", "isl"),
+            ("mk", "mac", "mkd"),
+            ("mi", "mao", "mri"),
+            ("ms", "may", "msa"),
+            ("fa", "per", "fas"),
+            ("ro", "rum", "ron"),
+            ("sk", "slo", "slk"),
+            ("bo", "tib", "bod"),
+            ("cy", "wel", "cym"),
+        ];
+        for (iso1, b, t) in triples {
+            assert_eq!(to_iso639_2(iso1), b, "639-1 {iso1} → {b}");
+            assert_eq!(to_iso639_2(t), b, "/T {t} → {b}");
+            assert!(lang_eq(iso1, t), "{iso1} should equal {t}");
+            assert!(lang_eq(b, t), "{b} should equal {t}");
+        }
+    }
+
+    #[test]
+    fn iso_639_2t_canonicalises_to_2b() {
+        // /T (terminological) codes unify with their /B (bibliographic) equivalents.
+        assert_eq!(to_iso639_2("deu"), "ger");
+        assert_eq!(to_iso639_2("fra"), "fre");
+        assert_eq!(to_iso639_2("zho"), "chi");
+        assert_eq!(to_iso639_2("nld"), "dut");
+        assert_eq!(to_iso639_2("ces"), "cze");
+        // /B and B==T codes pass through unchanged.
+        assert_eq!(to_iso639_2("ger"), "ger");
+        assert_eq!(to_iso639_2("jpn"), "jpn");
+        assert_eq!(to_iso639_2("eng"), "eng");
+        // 639-1 want and a /T-tagged track now compare equal across all three forms.
+        assert!(lang_eq("de", "deu"));
+        assert!(lang_eq("deu", "ger"));
+        assert!(lang_eq("de", "ger"));
+    }
+
+    #[test]
+    fn verify_t_tagged_audio_matches_b_or_iso1_want() {
+        // A German-original title (TMDB original_language = "de") with a single audio track tagged
+        // ISO 639-2/T "deu" (the form ffmpeg/MP4 muxers emit) must PASS, not be FailAudio-blacklisted.
+        let tracks = vec![Track {
+            kind: TrackKind::Audio,
+            language: Some("deu".into()),
+        }];
+        let req = LangReq {
+            audio: AudioReq::Original,
+            subtitle: SubReq::None,
+            original_language: Some("de".into()),
+        };
+        assert_eq!(verify(&tracks, &req), Verify::Pass);
     }
 }

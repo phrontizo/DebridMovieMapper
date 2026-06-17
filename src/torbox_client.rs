@@ -61,6 +61,13 @@ struct TbTorrent {
     download_finished: bool,
     #[serde(default, deserialize_with = "null_to_default")]
     download_state: String,
+    // Download progress as a 0.0–1.0 fraction. Mapped to the canonical `Torrent.progress` (scaled to
+    // a 0–100 percentage to match Real-Debrid) so the acquisition engine's stall detector sees a
+    // CHANGING signal for an actively-downloading uncached torrent. Without it `progress` stayed a
+    // constant 0.0, turning stall detection into a flat timer that falsely reaped + blacklisted
+    // legitimately-downloading TorBox releases once `STALL_TIMEOUT_SECS` elapsed.
+    #[serde(default, deserialize_with = "null_to_default")]
+    progress: f64,
     // ISO-8601 creation timestamp; mapped to the canonical `added` so the VFS date tiebreak works
     // cross-provider (parse_rd_date falls back to UNIX_EPOCH for any unparseable/empty value).
     #[serde(default, deserialize_with = "null_to_default")]
@@ -125,8 +132,7 @@ fn to_torrent(t: &TbTorrent) -> Torrent {
         bytes: clamp_size(t.size),
         status: tb_status(t),
         added: t.created_at.clone(),
-        links: Vec::new(),
-        ended: None,
+        progress: t.progress * 100.0, // 0.0–1.0 fraction → 0–100 percent (RD scale) for stall detection
         ..Default::default()
     }
 }
@@ -140,9 +146,8 @@ fn to_torrent_info(t: &TbTorrent) -> TorrentInfo {
         bytes: clamp_size(t.size),
         status: tb_status(t),
         added: t.created_at.clone(),
+        progress: t.progress * 100.0, // see `to_torrent`
         files: t.files.iter().map(to_torrent_file).collect(),
-        links: Vec::new(),
-        ended: None,
         ..Default::default()
     }
 }
@@ -244,10 +249,6 @@ impl TorBoxClient {
         })
     }
 
-    pub fn provider_name(&self) -> &'static str {
-        "torbox"
-    }
-
     async fn cache_get(&self, loc: &FileLocator) -> Option<String> {
         let key = (loc.torrent_id.clone(), loc.file_id);
         let cache = self.resolve_cache.read().await;
@@ -344,25 +345,40 @@ impl TorBoxClient {
                 warn!("TorBox {} error body: {:.300}", status, body);
                 return Err(e.without_url());
             }
-            let text = resp.text().await?;
+            // Scrub the URL from a body-read error: the `requestdl` URL carries the token, and the
+            // comment below promises send_data/send_ok never surface it. (`error_for_status_ref`
+            // errors are already scrubbed above.)
+            let text = resp.text().await.map_err(|e| e.without_url())?;
             match serde_json::from_str::<Envelope<T>>(&text) {
                 Ok(env) if env.success => {
-                    // Only a genuinely successful envelope counts as success for the
-                    // rate limiter — a 200 with `success:false` is a soft failure.
-                    self.rate_limiter.record_success().await;
                     if let Some(data) = env.data {
+                        // Only a genuinely useful response (success AND data) counts as success for
+                        // the rate limiter — a 200 with `success:false`, or `success:true` carrying
+                        // no `data`, is a soft failure we must not reward by speeding the limiter up.
+                        self.rate_limiter.record_success().await;
                         return Ok(data);
                     }
-                    warn!("TorBox response success but no data: {:.160}", text);
+                    // Redact the body: `send_data::<String>` serves `requestdl` (the resolved CDN
+                    // URL is the data), so a malformed body could carry a capability URL — never log
+                    // it. The structured `detail` (below) is safe; the length flags a schema change.
+                    warn!(
+                        "TorBox response success but no data ({} bytes, redacted)",
+                        text.len()
+                    );
                 }
                 Ok(env) => {
                     warn!(
-                        "TorBox response not success: {:?} body {:.160}",
-                        env.detail, text
+                        "TorBox response not success: {:?} (body {} bytes, redacted)",
+                        env.detail,
+                        text.len()
                     );
                 }
                 Err(e) => {
-                    warn!("TorBox decode failed: {} body {:.160}", e, text);
+                    warn!(
+                        "TorBox decode failed: {} (body {} bytes, redacted)",
+                        e,
+                        text.len()
+                    );
                 }
             }
             break;
@@ -415,7 +431,10 @@ impl TorBoxClient {
             // A 200 can still carry `{"success":false}` (TorBox soft failure, e.g. controltorrent
             // rejecting a delete) — that is NOT success. Parse the envelope and require `success`,
             // so a caller's "delete the leaked torrent" invariant isn't defeated by a silent no-op.
-            let text = resp.text().await?;
+            // Scrub the URL from a body-read error: the `requestdl` URL carries the token, and the
+            // comment below promises send_data/send_ok never surface it. (`error_for_status_ref`
+            // errors are already scrubbed above.)
+            let text = resp.text().await.map_err(|e| e.without_url())?;
             match serde_json::from_str::<Envelope<serde_json::Value>>(&text) {
                 Ok(env) if env.success => {
                     self.rate_limiter.record_success().await;
@@ -423,12 +442,17 @@ impl TorBoxClient {
                 }
                 Ok(env) => {
                     warn!(
-                        "TorBox response not success: {:?} body {:.160}",
-                        env.detail, text
+                        "TorBox response not success: {:?} (body {} bytes, redacted)",
+                        env.detail,
+                        text.len()
                     );
                 }
                 Err(e) => {
-                    warn!("TorBox decode failed: {} body {:.160}", e, text);
+                    warn!(
+                        "TorBox decode failed: {} (body {} bytes, redacted)",
+                        e,
+                        text.len()
+                    );
                 }
             }
             break;
@@ -498,6 +522,13 @@ impl TorBoxClient {
         // issue a delete against an unintended torrent and report success.
         let torrent_id: i64 = id.parse().map_err(|_| synthetic_bad_gateway())?;
         let body = serde_json::json!({ "torrent_id": torrent_id, "operation": "delete" });
+        // NOTE: unlike Real-Debrid (which maps a 404 on delete to `Ok(())` for idempotency), TorBox
+        // has no clean "already gone" signal here — controltorrent returns `success:false` with an
+        // unstable detail string, so a delete of an already-removed torrent surfaces as `Err`. We do
+        // NOT blanket-treat delete failures as success (that would hide genuine auth/network errors).
+        // It is safe in practice: every caller that gates an owned-record removal on delete success
+        // first filters to torrents present in the listing, and best-effort prune paths use `let _`;
+        // the only residual window (torrent vanishes between listing fetch and delete) self-heals.
         self.send_ok(|| self.client.post(&url).json(&body)).await
     }
 
@@ -621,6 +652,9 @@ mod tests {
             Some("aabbccddeeff00112233445566778899aabbccdd".to_string())
         );
         assert_eq!(magnet_infohash("magnet:?dn=NoHash"), None);
+        // A `btih:` that is PRESENT but too short (< 32 chars) is rejected by the length guard, so a
+        // truncated/garbage infohash can't be used to recover an existing torrent id.
+        assert_eq!(magnet_infohash("magnet:?xt=urn:btih:abc&dn=x"), None);
     }
 
     #[test]
@@ -687,8 +721,9 @@ mod tests {
 
     #[test]
     fn torbox_client_constructs() {
+        use crate::provider::DebridProvider;
         let c = TorBoxClient::new("fake".to_string()).unwrap();
-        assert_eq!(c.provider_name(), "torbox");
+        assert_eq!(c.name(), "torbox");
     }
 
     #[test]
@@ -784,6 +819,27 @@ mod tests {
         assert_eq!(lt.id, "35821241");
         assert_eq!(lt.status, "downloaded");
         assert!(lt.links.is_empty());
+    }
+
+    #[test]
+    fn maps_download_progress_so_stall_detection_sees_change() {
+        // An actively-downloading uncached torrent must carry a CHANGING `progress` (TorBox sends a
+        // 0.0–1.0 fraction → mapped to 0–100 percent). Without this it stayed 0.0 and the engine's
+        // stall detector — which only resets on a progress delta — falsely reaped the download.
+        let json = r#"{
+            "id": 7, "hash": "h", "name": "Big.Movie.2024.2160p", "size": 50000000000,
+            "download_finished": false, "download_state": "downloading", "progress": 0.42,
+            "files": [{"id": 0, "name": "Big.Movie.2024.2160p.mkv", "size": 50000000000}]
+        }"#;
+        let t: TbTorrent = serde_json::from_str(json).expect("downloading item must decode");
+        assert_eq!(to_torrent(&t).status, "downloading");
+        assert!((to_torrent(&t).progress - 42.0).abs() < 1e-9);
+        assert!((to_torrent_info(&t).progress - 42.0).abs() < 1e-9);
+        // A missing/null progress still decodes (defensive) and defaults to 0.0.
+        let no_prog = r#"{"id": 8, "hash": "h2", "name": "X", "size": 1,
+            "download_finished": false, "download_state": "downloading", "files": []}"#;
+        let t2: TbTorrent = serde_json::from_str(no_prog).expect("missing progress must decode");
+        assert_eq!(to_torrent(&t2).progress, 0.0);
     }
 
     #[test]

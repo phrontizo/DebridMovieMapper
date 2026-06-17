@@ -1,9 +1,25 @@
 use debridmoviemapper::identification::identify_torrent;
-use debridmoviemapper::rd_client::RealDebridClient;
+use debridmoviemapper::provider::FileLocator;
+use debridmoviemapper::rd_client::{RealDebridClient, TorrentInfo};
 use debridmoviemapper::repair::RepairManager;
 use debridmoviemapper::tmdb_client::TmdbClient;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
+
+/// Build a `FileLocator` for a torrent's first selected file — the modern on-demand repair entry
+/// point (`try_instant_repair`) is keyed on a `FileLocator`, not a whole `TorrentInfo`.
+fn first_locator(info: &TorrentInfo) -> Option<FileLocator> {
+    info.files
+        .iter()
+        .find(|f| f.selected == 1)
+        .map(|f| FileLocator {
+            hash: info.hash.clone(),
+            torrent_id: info.id.clone(),
+            file_id: f.id,
+            file_path: f.path.clone(),
+            link: info.links.first().cloned(),
+        })
+}
 
 #[tokio::test]
 #[ignore]
@@ -68,31 +84,28 @@ async fn test_repair_process_integration() {
     // Test 1: Mark a torrent as broken and verify it can be detected
     println!("\n=== Test 2: Mark Broken ===");
     if let Some((info, _)) = torrent_data.first() {
-        if let Some(first_link) = info.links.first() {
-            println!("Marking torrent as broken: {}", info.filename);
-            repair_manager.mark_broken(&info.id, first_link).await;
+        println!("Marking torrent as broken: {}", info.filename);
+        repair_manager.mark_broken(&info.id).await;
 
-            sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
-            // Check if torrent should be hidden
-            let should_hide = repair_manager.should_hide_torrent(&info.id).await;
-            println!("  Should hide torrent: {}", should_hide);
-            assert!(should_hide, "Broken torrent should be hidden from WebDAV");
-            println!("  ✓ Torrent successfully marked as broken");
-        }
+        // Check if torrent should be hidden
+        let should_hide = repair_manager.should_hide_torrent(&info.id).await;
+        println!("  Should hide torrent: {}", should_hide);
+        assert!(should_hide, "Broken torrent should be hidden from WebDAV");
+        println!("  ✓ Torrent successfully marked as broken");
     }
 
     // Test 3: Repair a broken torrent
     println!("\n=== Test 3: Repair Broken Torrent ===");
     if let Some((info, _)) = torrent_data.first() {
         println!("Attempting to repair torrent: {}", info.filename);
-        match repair_manager.repair_torrent(info).await {
-            Ok(_) => {
-                println!("  ✓ Repair completed successfully");
-            }
-            Err(e) => {
-                println!("  Repair failed (expected for some torrents): {}", e);
-            }
+        match first_locator(info) {
+            Some(locator) => match repair_manager.try_instant_repair(&locator).await {
+                Ok(_) => println!("  ✓ Repair completed successfully"),
+                Err(e) => println!("  Repair failed (expected for some torrents): {}", e),
+            },
+            None => println!("  No selected file to repair; skipping"),
         }
     }
 
@@ -180,40 +193,37 @@ async fn test_503_triggers_immediate_repair() {
     println!("Using test torrent: {}", info.filename);
 
     // Simulate a 503 error by marking as broken (this is what happens in WebDAV on 503)
-    if let Some(first_link) = info.links.first() {
-        println!("Simulating 503 error during playback...");
-        repair_manager
-            .mark_broken(&test_torrent.id, first_link)
-            .await;
+    println!("Simulating 503 error during playback...");
+    repair_manager.mark_broken(&test_torrent.id).await;
 
-        // Check immediately
-        sleep(Duration::from_millis(100)).await;
+    // Check immediately
+    sleep(Duration::from_millis(100)).await;
 
-        // Verify torrent should be hidden
-        let should_hide = repair_manager.should_hide_torrent(&test_torrent.id).await;
-        println!("Should hide after 503: {}", should_hide);
-        assert!(should_hide, "Torrent should be immediately hidden on 503");
-        println!("  ✓ Torrent immediately marked as broken and hidden");
+    // Verify torrent should be hidden
+    let should_hide = repair_manager.should_hide_torrent(&test_torrent.id).await;
+    println!("Should hide after 503: {}", should_hide);
+    assert!(should_hide, "Torrent should be immediately hidden on 503");
+    println!("  ✓ Torrent immediately marked as broken and hidden");
 
-        // Now trigger repair
-        println!("Triggering immediate repair...");
-        match repair_manager.repair_torrent(&info).await {
-            Ok(_) => {
-                println!("  ✓ Repair completed successfully");
-            }
+    // Now trigger repair
+    println!("Triggering immediate repair...");
+    match first_locator(&info) {
+        Some(locator) => match repair_manager.try_instant_repair(&locator).await {
+            Ok(_) => println!("  ✓ Repair completed successfully"),
             Err(e) => {
                 println!("  Repair failed (expected for some torrents): {}", e);
                 println!("  ✓ Repair was attempted immediately");
             }
-        }
-
-        // Check status summary
-        let (_, repairing, failed) = repair_manager.get_status_summary().await;
-        println!(
-            "Status after repair: Repairing/Broken: {}, Failed: {}",
-            repairing, failed
-        );
+        },
+        None => println!("  No selected file to repair; skipping"),
     }
+
+    // Check status summary
+    let (_, repairing, failed) = repair_manager.get_status_summary().await;
+    println!(
+        "Status after repair: Repairing/Broken: {}, Failed: {}",
+        repairing, failed
+    );
 
     println!("\n=== Test Passed: 503 Triggers Immediate Repair ===");
 }
@@ -271,15 +281,13 @@ async fn test_broken_torrents_hidden_from_webdav() {
             }
         };
 
-        if let Some(link) = info.links.first() {
-            println!(
-                "Marking torrent {} as broken: {}",
-                marked_ids.len() + 1,
-                info.filename
-            );
-            repair_manager.mark_broken(&torrent.id, link).await;
-            marked_ids.push(torrent.id.clone());
-        }
+        println!(
+            "Marking torrent {} as broken: {}",
+            marked_ids.len() + 1,
+            info.filename
+        );
+        repair_manager.mark_broken(&torrent.id).await;
+        marked_ids.push(torrent.id.clone());
     }
 
     if marked_ids.len() < 2 {

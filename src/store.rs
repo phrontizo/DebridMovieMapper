@@ -7,13 +7,16 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 /// Current on-disk schema version. Bump when a migration is added in `run_migrations`.
+//
+// v6: the `upgrade_checks` cursor key gained a media-type discriminator (`upgrade_check_key`),
+//     orphaning old bare-`tmdb_id` rows; the v5→v6 migration clears the (regenerable) cursor.
 /// v1→v2: additive (owned_hashes, authoritative_ids, blacklist tables).
 /// v2→v3: additive (trakt_tokens, wanted tables).
 /// v3→v4: additive (selection, upgrade_checks tables; OwnedRecord.provides/quality fields).
 /// v4→v5: the `wanted` row key gained a media-type discriminator (movie/show with the same numeric
 ///        TMDB id no longer collide). Old `{user}|{tmdb_id}` rows are cleared — regenerated from
 ///        Trakt within one sync interval (lossless).
-pub const SCHEMA_VERSION: u64 = 5;
+pub const SCHEMA_VERSION: u64 = 6;
 
 /// TMDB identification cache: torrent id -> serde_json((TorrentInfo, MediaMetadata)).
 /// Same name + value encoding as the pre-Store inline table, so existing databases
@@ -42,6 +45,16 @@ fn wanted_key(user: &str, media_type: &crate::vfs::MediaType, tmdb_id: u64) -> S
         crate::vfs::MediaType::Show => 's',
     };
     format!("{}|{}|{}", user, disc, tmdb_id)
+}
+
+/// Key for the `upgrade_checks` round-robin cursor — discriminated by media type so a movie and a
+/// show sharing a numeric TMDB id keep independent cursors (mirrors `wanted_key`'s discriminator).
+fn upgrade_check_key(media_type: &crate::vfs::MediaType, tmdb_id: u64) -> String {
+    let disc = match media_type {
+        crate::vfs::MediaType::Movie => 'm',
+        crate::vfs::MediaType::Show => 's',
+    };
+    format!("{}|{}", disc, tmdb_id)
 }
 /// SP3 live-selection: slot ("m|tmdb" / "e|tmdb|s|e") -> serde_json(SelectionEntry).
 const SELECTION_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("selection");
@@ -360,6 +373,12 @@ impl Store {
         if version < SCHEMA_VERSION {
             Self::run_migrations(db, version)?;
         }
+        // INVARIANT: migrations commit in their own transaction(s) BEFORE the version stamp below,
+        // so a crash between the two re-runs `run_migrations` on the next boot. Every migration step
+        // MUST therefore be idempotent (both current steps — the `3..5` `wanted` clear and the `<6`
+        // `upgrade_checks` clear, each `t.retain(|_,_| false)` — are). A future non-idempotent
+        // migration must instead fold its work into the same write txn that stamps `SCHEMA_VERSION`
+        // (below) so the two commit atomically.
         let write_txn = db.begin_write()?;
         {
             write_txn.open_table(MATCHES_TABLE)?; // create if absent
@@ -387,12 +406,25 @@ impl Store {
     /// unreachable by the new key, so clear the table — it repopulates from Trakt within one sync
     /// interval (lossless). Only relevant when a pre-v5 DB already has a populated `wanted` table
     /// (introduced in v3); a fresh DB (from_version 0) has no rows to clear.
+    /// v5→v6: the `upgrade_checks` cursor key likewise gained a media-type discriminator
+    /// (`upgrade_check_key`). Old bare-`tmdb_id` rows are unreachable by the new key, so clear the
+    /// table — it is a regenerable round-robin cursor, so clearing it just resets the cursor once
+    /// (lossless). Cleared for any pre-v6 DB; a fresh DB has no rows to clear.
     fn run_migrations(db: &Database, from_version: u64) -> Result<(), redb::Error> {
         if (3..5).contains(&from_version) {
             let write_txn = db.begin_write()?;
             {
                 // Opening creates the table if absent; clearing then is a harmless no-op.
                 let mut t = write_txn.open_table(WANTED_TABLE)?;
+                t.retain(|_, _| false)?;
+            }
+            write_txn.commit()?;
+        }
+        if from_version < 6 {
+            let write_txn = db.begin_write()?;
+            {
+                // Opening creates the table if absent; clearing then is a harmless no-op.
+                let mut t = write_txn.open_table(UPGRADE_CHECKS_TABLE)?;
                 t.retain(|_, _| false)?;
             }
             write_txn.commit()?;
@@ -543,9 +575,11 @@ impl Store {
         Self::flatten_join(result)
     }
 
-    /// Collapse a `spawn_blocking` result: a redb error propagates; a join (panic)
-    /// is logged and swallowed so the scan loop keeps running (matching prior
-    /// "log and continue" behaviour).
+    /// Collapse a `spawn_blocking` result for a WRITE accessor: a redb error propagates, and a join
+    /// failure (the blocking task panicked or was cancelled) is logged AND returned as an error.
+    /// Returning `Err` here — rather than the old log-and-swallow `Ok(())` — is important for writes:
+    /// swallowing a join failure would report a persistence success that never happened (silent write
+    /// loss). Callers that genuinely want best-effort semantics opt in explicitly with `.ok()`.
     fn flatten_join(
         result: Result<Result<(), redb::Error>, tokio::task::JoinError>,
     ) -> Result<(), AppError> {
@@ -553,8 +587,10 @@ impl Store {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(AppError::Db(e)),
             Err(e) => {
-                error!("redb blocking task did not complete: {:?}", e);
-                Ok(())
+                error!("redb blocking write task did not complete: {:?}", e);
+                Err(AppError::Task(format!(
+                    "redb blocking task did not complete: {e}"
+                )))
             }
         }
     }
@@ -786,6 +822,33 @@ impl Store {
         })
         .await
         .unwrap_or(false)
+    }
+
+    /// Every blacklisted infohash (lowercased), across ALL tmdb_ids. Used by the account mirror to
+    /// avoid re-adopting a hash the engine rejected — a hash-scoped check (the blacklist key is
+    /// `tmdb_id|hash`) so it still catches a torrent that re-identifies to a DIFFERENT tmdb_id than
+    /// the one it was blacklisted under (the wrong-title case). One read per scan tick.
+    pub async fn all_blacklisted_hashes(&self) -> std::collections::HashSet<String> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut out = std::collections::HashSet::new();
+            if let Ok(txn) = db.begin_read() {
+                if let Ok(table) = txn.open_table(BLACKLIST_TABLE) {
+                    if let Ok(iter) = table.iter() {
+                        for entry in iter.flatten() {
+                            let (k, _) = entry;
+                            // key = "tmdb_id|hash" → keep the hash part after the first '|'.
+                            if let Some((_, hash)) = k.value().split_once('|') {
+                                out.insert(hash.to_ascii_lowercase());
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        })
+        .await
+        .unwrap_or_default()
     }
 
     // ── trakt_tokens accessors ────────────────────────────────────────────────
@@ -1036,9 +1099,16 @@ impl Store {
 
     // ── upgrade_checks cursor (SP3) ───────────────────────────────────────────
 
-    /// Returns the unix-second timestamp of the last upgrade check for `tmdb_id`, or 0 if never checked.
-    pub async fn get_upgrade_checked(&self, tmdb_id: u64) -> u64 {
-        let key = tmdb_id.to_string();
+    /// Returns the unix-second timestamp of the last upgrade check for `(media_type, tmdb_id)`, or 0
+    /// if never checked. Keyed by media-type discriminator + id (like `wanted`) because a movie and a
+    /// show can share a numeric TMDB id; without it, checking one would falsely advance the other's
+    /// round-robin cursor and starve it of upgrade/consolidation passes.
+    pub async fn get_upgrade_checked(
+        &self,
+        media_type: &crate::vfs::MediaType,
+        tmdb_id: u64,
+    ) -> u64 {
+        let key = upgrade_check_key(media_type, tmdb_id);
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let txn = match db.begin_read() {
@@ -1060,8 +1130,13 @@ impl Store {
         .unwrap_or(0)
     }
 
-    pub async fn set_upgrade_checked(&self, tmdb_id: u64, at: u64) -> Result<(), AppError> {
-        let key = tmdb_id.to_string();
+    pub async fn set_upgrade_checked(
+        &self,
+        media_type: &crate::vfs::MediaType,
+        tmdb_id: u64,
+        at: u64,
+    ) -> Result<(), AppError> {
+        let key = upgrade_check_key(media_type, tmdb_id);
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
@@ -1089,6 +1164,22 @@ mod tests {
             .create_with_backend(InMemoryBackend::new())
             .unwrap();
         Store::from_database(Arc::new(db)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn flatten_join_surfaces_write_task_failure_as_err() {
+        // A panic (or cancellation) in a write accessor's blocking task must surface as an error,
+        // NOT a swallowed Ok(()) that would report a persistence success that never happened.
+        let joined: Result<Result<(), redb::Error>, tokio::task::JoinError> =
+            tokio::task::spawn_blocking(|| -> Result<(), redb::Error> {
+                panic!("simulated redb write-task panic")
+            })
+            .await;
+        assert!(joined.is_err(), "the panicking task must yield a JoinError");
+        assert!(
+            matches!(Store::flatten_join(joined), Err(AppError::Task(_))),
+            "a write-task join failure must map to AppError::Task, not Ok(())"
+        );
     }
 
     fn movie(title: &str) -> MediaMetadata {
@@ -1310,6 +1401,43 @@ mod tests {
         assert!(matches!(
             db_open_failure(redb::DatabaseError::RepairAborted),
             OpenFailure::Corrupt(_)
+        ));
+    }
+
+    #[test]
+    fn schema_failure_classifies_corrupt_vs_transient() {
+        // The sibling of db_open_failure, for errors during schema read/init: a corruption signal
+        // (or a malformed-file Io) means recover; any other (operational) error must KEEP the
+        // possibly-intact DB rather than discard it.
+        assert!(matches!(
+            schema_failure("stamp", redb::Error::Corrupted("bad".into())),
+            OpenFailure::Corrupt(_)
+        ));
+        assert!(matches!(
+            schema_failure(
+                "stamp",
+                redb::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bad header"
+                )),
+            ),
+            OpenFailure::Corrupt(_)
+        ));
+        // A transient Io (permission) must NOT discard the DB.
+        assert!(matches!(
+            schema_failure(
+                "stamp",
+                redb::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied"
+                )),
+            ),
+            OpenFailure::Transient(_)
+        ));
+        // A non-Io / non-corruption redb error is operational → keep the DB.
+        assert!(matches!(
+            schema_failure("stamp", redb::Error::ValueTooLarge(1)),
+            OpenFailure::Transient(_)
         ));
     }
 
@@ -1816,6 +1944,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrates_v5_db_clears_legacy_upgrade_checks_but_keeps_owned() {
+        let tmp = TempDb::new("migrate_v5_v6");
+        {
+            let db = Database::create(&tmp.path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                // A legacy upgrade_checks row keyed by the OLD bare-`tmdb_id` format (no media-type
+                // discriminator). Migration to v6 must clear it — it's a regenerable round-robin
+                // cursor, so a one-time reset is lossless.
+                let udef: TableDefinition<&str, u64> = TableDefinition::new("upgrade_checks");
+                let mut ut = txn.open_table(udef).unwrap();
+                ut.insert("1396", &1_700_000_000u64).unwrap();
+
+                // An owned row must SURVIVE (authoritative, not regenerable).
+                let odef: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_hashes");
+                let mut ot = txn.open_table(odef).unwrap();
+                let rec = OwnedRecord {
+                    request: req("tt5", 1396),
+                    provenance: Provenance::manual(),
+                    added_at: 9,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                };
+                ot.insert("hash5", serde_json::to_vec(&rec).unwrap().as_slice())
+                    .unwrap();
+
+                let vdef: TableDefinition<&str, u64> = TableDefinition::new("meta");
+                let mut v = txn.open_table(vdef).unwrap();
+                v.insert("schema_version", &5u64).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = Store::open(&tmp.path).unwrap();
+
+        assert_eq!(
+            store.get_owned("hash5".to_string()).await.unwrap().status,
+            OwnedStatus::Verified,
+            "owned rows must survive the migration"
+        );
+        assert!(
+            !std::path::Path::new(&tmp.corrupt_path()).exists(),
+            "valid v5 DB must not be moved aside"
+        );
+
+        // Verify the clear DIRECTLY against the raw table — a `get_upgrade_checked` lookup would
+        // return 0 whether or not the migration ran (the new key is `s|1396`, not the legacy
+        // `1396`), so it can't prove the orphaned row was removed. Drop the store to release the
+        // single-writer lock, reopen raw, and assert the table is empty.
+        drop(store);
+        let db = Database::create(&tmp.path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let udef: TableDefinition<&str, u64> = TableDefinition::new("upgrade_checks");
+        let ut = txn.open_table(udef).unwrap();
+        assert_eq!(
+            ut.iter().unwrap().count(),
+            0,
+            "the legacy bare-key upgrade_checks row must be cleared by the v5→v6 migration"
+        );
+    }
+
+    #[tokio::test]
     async fn migrates_v1_db_to_current_preserving_matches() {
         let tmp = TempDb::new("migrate");
         {
@@ -1979,13 +2169,27 @@ mod tests {
 
     #[tokio::test]
     async fn upgrade_checked_cursor_round_trip() {
+        use crate::vfs::MediaType;
         let store = mem_store();
-        assert_eq!(store.get_upgrade_checked(1396).await, 0, "absent → 0");
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Show, 1396).await,
+            0,
+            "absent → 0"
+        );
         store
-            .set_upgrade_checked(1396, 1_700_000_000)
+            .set_upgrade_checked(&MediaType::Show, 1396, 1_700_000_000)
             .await
             .unwrap();
-        assert_eq!(store.get_upgrade_checked(1396).await, 1_700_000_000);
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Show, 1396).await,
+            1_700_000_000
+        );
+        // A movie sharing the same numeric id keeps an INDEPENDENT cursor (no collision).
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Movie, 1396).await,
+            0,
+            "movie cursor is independent of the show cursor for the same id"
+        );
     }
 
     #[test]

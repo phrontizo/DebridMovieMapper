@@ -54,15 +54,29 @@ pub async fn run_upgrade_once(app: &AppState) {
     // Least-recently-checked first.
     let mut ordered: Vec<_> = Vec::new();
     for (id, media_type, hashes, rec) in candidates {
-        let last = app.store.get_upgrade_checked(id).await;
+        let last = app.store.get_upgrade_checked(&media_type, id).await;
         ordered.push((last, id, media_type, hashes, rec));
     }
     ordered.sort_by_key(|(last, ..)| *last);
     ordered.truncate(budget);
 
     for (_, tmdb_id, media_type, hashes, rec) in ordered {
+        // Library-wide idle gate BEFORE stamping the cursor. The actual swap/prune is idle-gated
+        // inside each handler, but stamping `upgrade_checked` for a title we then defer (library
+        // active) would advance the round-robin cursor past it — so on a frequently-streamed library
+        // a title could wait a full cursor wrap (library_size / budget ticks) before being
+        // reconsidered even once the library goes idle. Since the gate is library-wide, an active
+        // library blocks the whole remaining batch: break without stamping so no title is marked
+        // "checked" while it could not actually be upgraded. (The handlers keep their own idle
+        // re-check as the read-vs-prune race guard for activity that starts mid-tick.)
+        if !app.read_activity.all_idle(idle_window).await {
+            debug!(
+                "upgrade: library active; deferring remaining titles this tick (cursor unchanged)"
+            );
+            break;
+        }
         app.store
-            .set_upgrade_checked(tmdb_id, now_secs())
+            .set_upgrade_checked(&media_type, tmdb_id, now_secs())
             .await
             .ok();
         match media_type {
@@ -82,6 +96,24 @@ pub async fn run_upgrade_once(app: &AppState) {
     }
 }
 
+/// The best (highest-`score`) quality across ALL owned copies of a title, or `None` if ANY owned
+/// copy has unknown quality (a legacy/untagged mirror record). Used as the upgrade baseline so a
+/// swap that prunes every copy can only proceed against the BEST one it would delete — never
+/// downgrading by comparing against a worse duplicate. `None` (unknown copy present) is a
+/// conservative skip: we can't prove a candidate beats an unmeasured copy, so we don't risk
+/// deleting it.
+async fn best_owned_quality(app: &AppState, owned_hashes: &[String]) -> Option<QualitySummary> {
+    let mut best: Option<QualitySummary> = None;
+    for h in owned_hashes {
+        let rec = app.store.get_owned(h.clone()).await?;
+        let q = rec.quality?; // any unknown-quality owned copy → conservative skip (None)
+        if best.as_ref().map(|b| q.score > b.score).unwrap_or(true) {
+            best = Some(q);
+        }
+    }
+    best
+}
+
 /// Stage + (idle-gated) swap a single movie title. Returns Err(reason) on a non-fatal skip.
 async fn try_upgrade_movie(
     app: &AppState,
@@ -90,14 +122,27 @@ async fn try_upgrade_movie(
     owned_rec: &OwnedRecord,
     idle_window: Duration,
 ) -> Result<(), String> {
-    // 1. Scrape fresh candidates for this title.
+    // 1. Baseline = the BEST quality across ALL owned copies of this title — NOT an arbitrary one.
+    //    The swap below prunes EVERY owned hash, so if a title has multiple present copies (the
+    //    default state: account-mirror records them all and dedup is dry-run by default), comparing
+    //    against only the representative (lexicographically-first) copy could "upgrade" past the
+    //    worse copy yet DELETE a better one — e.g. own {WEB 1080p, REMUX 1080p}, baseline off WEB,
+    //    adopt a BluRay 1080p, prune the REMUX → a downgrade + loss. `best_owned_quality` returns
+    //    `None` (→ skip) if ANY owned copy's quality is unknown (a legacy/untagged mirror record, or
+    //    above the ceiling): comparing against a default (uncached/tier-0) would treat any cached
+    //    candidate as an upgrade and could delete a possibly-better unknown copy. Checked BEFORE the
+    //    scrape so unupgradeable titles don't waste a scrape every tick. (`owned_rec` is still used
+    //    below for the request's imdb_id/metadata — only the quality BASELINE is widened here.)
+    let Some(current) = best_owned_quality(app, owned_hashes).await else {
+        return Err("current quality unknown/mixed; not upgrading (avoids regression)".into());
+    };
+    // 2. Scrape fresh candidates for this title, then pick the best cached meaningful upgrade not
+    //    already owned/blacklisted.
     let raws = app
         .scraper
         .find(&owned_rec.request.imdb_id, MediaKind::Movie, None, None)
         .await
         .map_err(|e| format!("scrape failed: {e}"))?;
-    let current = owned_rec.quality.clone().unwrap_or_default();
-    // 2. Best cached meaningful upgrade not already owned/blacklisted.
     let mut best: Option<(release::ReleaseInfo, QualitySummary)> = None;
     for raw in &raws {
         let r = release::parse(raw);
@@ -144,13 +189,41 @@ async fn try_upgrade_movie(
     //    leaves the current release untouched). Returns (hash, torrent_id, selected_file_path).
     let staged = stage_and_verify(app, tmdb_id, &owned_rec.request, &cand).await?;
 
+    // Fetch the provider listing for the prune ONCE, and BEFORE the idle re-check below, so there is
+    // NO network round-trip between the idle confirmation and the destructive prune — a read
+    // starting in that window could otherwise have the old torrent deleted out from under it (the
+    // same ordering the consolidation path uses). Also avoids a per-hash re-fetch.
+    // Distinguish a FETCH FAILURE from a genuinely-empty account: `unwrap_or_default()` would make a
+    // failed `get_torrents` look empty, so `prune_owned_hash_in` (which treats "hash absent from the
+    // listing" as "already gone → drop the record") would drop the old hashes' records while leaving
+    // the still-present torrents orphaned → re-adopted as duplicates. On an `Err`, roll back the
+    // staged candidate and defer (mirrors the idle-defer rollback below).
+    let listing = match app.provider.get_torrents().await {
+        Ok(l) => l,
+        Err(_) => {
+            if app.provider.delete_torrent(&staged.1).await.is_ok() {
+                let _ = app.store.remove_owned(staged.0.clone()).await;
+                let _ = app.store.remove_authoritative(staged.0.clone()).await;
+            }
+            return Err("provider listing unavailable; deferring upgrade".into());
+        }
+    };
+
     // 4b. Re-check idle IMMEDIATELY before the destructive swap+prune. Staging above can take many
     //     seconds (add + select + cached-poll + 4 MB probe), during which a playback read may have
     //     begun anywhere in the library. If it is no longer idle, fully roll back the freshly-staged
     //     candidate (delete it + drop its records — non-destructive: the current release is
     //     untouched) and retry later, so the prune below never interrupts an in-flight stream.
     if !app.read_activity.all_idle(idle_window).await {
-        prune_owned_hash(app, &staged.0).await;
+        // Roll back by the KNOWN torrent id, not the listing snapshot: the just-staged torrent may
+        // not have propagated into `listing` yet. Only drop the store records when the delete
+        // SUCCEEDED — on a transient delete failure, KEEP them so a later tick retries rather than
+        // leaving a present-but-untracked torrent that `record_mirror_owned` would re-adopt as a
+        // DUPLICATE (the `execute_remove`/`prune_owned_hash_in` keep-on-failure discipline).
+        if app.provider.delete_torrent(&staged.1).await.is_ok() {
+            let _ = app.store.remove_owned(staged.0.clone()).await;
+            let _ = app.store.remove_authoritative(staged.0.clone()).await;
+        }
         return Err("library became active during staging; deferring upgrade".into());
     }
 
@@ -169,7 +242,7 @@ async fn try_upgrade_movie(
         if old.eq_ignore_ascii_case(&staged.0) {
             continue;
         }
-        prune_owned_hash(app, old).await;
+        prune_owned_hash_in(app, old, &listing).await;
     }
     info!("upgrade: tmdb {} swapped to {}", tmdb_id, staged.0);
     Ok(())
@@ -324,24 +397,28 @@ async fn stage_and_verify(
     Ok((hash, added.id, selected_path))
 }
 
-/// Delete a torrent (owned-only) and drop its owned record + authoritative id. Fetches the provider
-/// listing itself; prefer [`prune_owned_hash_in`] when pruning many hashes in one pass.
-async fn prune_owned_hash(app: &AppState, hash: &str) {
-    let torrents = app.provider.get_torrents().await.unwrap_or_default();
-    prune_owned_hash_in(app, hash, &torrents).await;
-}
-
-/// As [`prune_owned_hash`] but against an already-fetched provider listing, so a caller pruning N
-/// hashes does ONE `get_torrents()` instead of N (consolidation prunes a whole scattered season).
+/// Delete a torrent (owned-only) and drop its owned record + authoritative id, against an
+/// already-fetched provider listing — so a caller pruning N hashes does ONE `get_torrents()` instead
+/// of N (the movie swap and the consolidation prune both fetch the listing once and reuse it).
 async fn prune_owned_hash_in(app: &AppState, hash: &str, torrents: &[crate::rd_client::Torrent]) {
+    // Delete the provider torrent(s) FIRST; only drop the store records when the provider side is
+    // gone (deleted now, or already absent from the listing). On a transient delete failure, KEEP
+    // the records so a later tick retries rather than orphaning a present-but-untracked torrent that
+    // `record_mirror_owned` would re-adopt as a duplicate of the just-superseded release (mirrors
+    // `execute_remove`).
+    let mut all_gone = true;
     for t in torrents
         .iter()
         .filter(|t| t.hash.eq_ignore_ascii_case(hash))
     {
-        let _ = app.provider.delete_torrent(&t.id).await;
+        if app.provider.delete_torrent(&t.id).await.is_err() {
+            all_gone = false;
+        }
     }
-    let _ = app.store.remove_owned(hash.to_string()).await;
-    let _ = app.store.remove_authoritative(hash.to_string()).await;
+    if all_gone {
+        let _ = app.store.remove_owned(hash.to_string()).await;
+        let _ = app.store.remove_authoritative(hash.to_string()).await;
+    }
 }
 
 /// The provenance to keep on a staged upgrade: the merged provenance of the title's current owned
@@ -394,6 +471,51 @@ pub fn consolidation_target(i: &ConsolidationInput) -> bool {
         }
     }
     true
+}
+
+/// Per-episode owned quality for one season, gathered from EVERY owned record that supplies an
+/// episode of it — scattered singletons AND multi-episode/partial packs alike. The consolidation
+/// prune below supersedes *any* in-season-covered record (not just singletons), so the
+/// no-regression gate must see all of them, expanded per-episode. Returns `None` if any
+/// contributing record has unknown quality (`quality == None`, e.g. a legacy mirror pack): we then
+/// cannot prove the candidate pack isn't a regression, so the caller must skip the season rather
+/// than risk downgrading a held higher-quality pack.
+fn season_owned_quality(
+    owned: &[(String, OwnedRecord)],
+    season: u32,
+) -> Option<Vec<(u32, QualitySummary)>> {
+    let mut out = Vec::new();
+    for (_, rec) in owned {
+        let in_season: Vec<u32> = rec
+            .provides
+            .iter()
+            .filter(|(s, _)| *s == season)
+            .map(|(_, e)| *e)
+            .collect();
+        if in_season.is_empty() {
+            continue;
+        }
+        let q = rec.quality.as_ref()?; // unknown quality → cannot prove no-regression
+        for e in in_season {
+            out.push((e, q.clone()));
+        }
+    }
+    Some(out)
+}
+
+/// Pure: is `season` worth consolidating? Only when ≥2 owned records supply episodes of it (genuine
+/// scatter to merge). With a single owned record (e.g. a one-aired-episode season held as a
+/// singleton), adopting an equal-quality single-episode "pack" is a lateral move, not a
+/// consolidation — and because the no-regression gate is `>=` (not a strict gain), two equal cached
+/// releases would swap A→B→A every daily tick (add + 4 MB probe + delete + selection churn →
+/// spurious Jellyfin re-notify). Once episodes accumulate into ≥2 records the season consolidates; a
+/// single record is left for the acquisition path to fill.
+fn season_has_scatter(owned: &[(String, OwnedRecord)], season: u32) -> bool {
+    owned
+        .iter()
+        .filter(|(_, r)| r.provides.iter().any(|(s, _)| *s == season))
+        .count()
+        >= 2
 }
 
 /// Consolidate a show's scattered per-episode torrents into a full-season CACHED pack, season by
@@ -454,6 +576,28 @@ async fn try_consolidate_show(
         if already_pack {
             continue;
         }
+
+        // Consolidation only makes sense when there are ≥2 owned records to MERGE for this season.
+        // With a single owned record (e.g. a one-aired-episode season held as a singleton), adopting
+        // an equal-quality single-episode "pack" is a lateral move, not a consolidation — and because
+        // the no-regression gate is `>=` (not a strict gain), two equal cached releases would swap
+        // A→B→A every daily tick (add + 4 MB probe + delete + selection churn → spurious Jellyfin
+        // re-notify). Require genuine scatter to merge. (Once episodes accumulate into ≥2 records the
+        // season is consolidated; a single record is left for the acquisition path to fill.)
+        if !season_has_scatter(&owned, season) {
+            continue;
+        }
+
+        // Per-episode owned quality across ALL records that supply an episode of this season (the
+        // prune below supersedes any of them). Unknown quality on any contributor → skip the season
+        // (can't prove the candidate pack isn't a regression).
+        let Some(season_owned_q) = season_owned_quality(&owned, season) else {
+            debug!(
+                "consolidate: tmdb {} s{} skipped (an owned record has unknown quality)",
+                tmdb_id, season
+            );
+            continue;
+        };
 
         // Scrape the season (episode 1 query returns season packs too).
         let raws = match app
@@ -554,17 +698,10 @@ async fn try_consolidate_show(
                 .map(|(_, e, _)| *e)
                 .collect();
 
-            // Owned per-episode quality for this season.
-            let owned_episode_quality: Vec<(u32, QualitySummary)> = owned
-                .iter()
-                .filter(|(_, rec)| rec.provides.len() == 1 && rec.provides[0].0 == season)
-                .map(|(_, rec)| (rec.provides[0].1, rec.quality.clone().unwrap_or_default()))
-                .collect();
-
             let input = ConsolidationInput {
                 season,
                 aired_episodes: season_aired.clone(),
-                owned_episode_quality,
+                owned_episode_quality: season_owned_q.clone(),
                 pack_cached: true,
                 pack_episodes: {
                     let mut v = pack_episodes.clone();
@@ -621,6 +758,25 @@ async fn try_consolidate_show(
                     }
                 }
             }
+            // Fetch the provider listing for the prune BEFORE the idle gate, so there is NO network
+            // round-trip between the idle check and the destructive repoint+prune below — a stream
+            // starting in that window could otherwise have its old episode torrent deleted out from
+            // under it. One wasted listing on a deferred tick is negligible for a daily job.
+            // Distinguish a FETCH FAILURE from an empty account: an `unwrap_or_default()` empty would
+            // make `prune_owned_hash_in` drop the old episode records while orphaning their still-
+            // present torrents (re-adopted as duplicates). On `Err`, drop the staged pack (nothing is
+            // recorded yet) and defer — mirrors the idle-defer below.
+            let listing = match app.provider.get_torrents().await {
+                Ok(l) => l,
+                Err(_) => {
+                    info!(
+                        "consolidate: tmdb {} s{} deferred (provider listing unavailable); dropping staged pack",
+                        tmdb_id, season
+                    );
+                    let _ = app.provider.delete_torrent(&added.id).await;
+                    return Ok(());
+                }
+            };
             // Idle gate. If the library is active, drop the staged pack (no dangling stage) and
             // retry on a later tick; consolidation re-stages cheaply (the pack is cached).
             if !app.read_activity.all_idle(idle_window).await {
@@ -675,13 +831,13 @@ async fn try_consolidate_show(
             // single episodes AND any smaller/older pack (e.g. a prior full-season pack that didn't
             // cover a newly-aired episode). M-2 safety: prune a hash ONLY when EVERY episode it
             // provides is for this season AND covered by the new pack, so no held episode is left
-            // with an un-repointed selection. Fetch the provider listing ONCE, not once per prune.
+            // with an un-repointed selection. (The provider listing was fetched once at the top of
+            // this consolidation block, before the idle gate — reused here for all prunes.)
             let pack_eps_for_season: std::collections::HashSet<u32> = eps
                 .iter()
                 .filter(|(s, _, _)| *s == season)
                 .map(|(_, e, _)| *e)
                 .collect();
-            let listing = app.provider.get_torrents().await.unwrap_or_default();
             for (h, rec) in &owned {
                 if h.eq_ignore_ascii_case(&r.info_hash) {
                     continue; // never prune the pack we just adopted
@@ -1279,6 +1435,63 @@ mod tests {
             "hold",
             "selection unchanged"
         );
+        // The round-robin cursor must NOT advance for a title deferred because the library is active
+        // — otherwise it would be marked "checked" and skipped for a full cursor wrap once idle.
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Movie, 27205).await,
+            0,
+            "an idle-deferred title must keep its cursor unstamped"
+        );
+    }
+
+    #[tokio::test]
+    async fn best_owned_quality_picks_best_copy_and_skips_unknown() {
+        let store = mem_store();
+        let rec = |tier: i64, score: i64| OwnedRecord {
+            request: movie_req(),
+            provenance: Provenance::watchlist("a"),
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: Some(QualitySummary {
+                cached: true,
+                source_tier: tier,
+                resolution: 1080,
+                score,
+            }),
+        };
+        // "aweb" sorts BEFORE "zremux" — the old code baselined off the first (worse) copy.
+        store
+            .put_owned("aweb".into(), rec(3_000, 1_003_000))
+            .await
+            .unwrap();
+        store
+            .put_owned("zremux".into(), rec(8_000, 1_008_000))
+            .await
+            .unwrap();
+        let app = app_with(
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(MockProvider::default()),
+            store.clone(),
+        );
+        let best = best_owned_quality(&app, &["aweb".into(), "zremux".into()])
+            .await
+            .expect("both qualities known");
+        assert_eq!(
+            best.source_tier, 8_000,
+            "baseline must be the BEST owned copy (REMUX), not the lexicographically-first (WEB)"
+        );
+
+        // Any unknown-quality owned copy → None (conservative skip — can't prove a candidate beats it).
+        let mut unknown = rec(3_000, 1_003_000);
+        unknown.quality = None;
+        store.put_owned("bunknown".into(), unknown).await.unwrap();
+        assert!(
+            best_owned_quality(&app, &["aweb".into(), "bunknown".into(), "zremux".into()])
+                .await
+                .is_none(),
+            "an unknown-quality copy forces a conservative skip"
+        );
     }
 
     #[tokio::test]
@@ -1514,6 +1727,155 @@ mod tests {
         assert!(
             !consolidation_target(&input),
             "empty aired set must not consolidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_movie_with_unknown_quality_is_not_upgraded() {
+        let store = mem_store();
+        // A mirror-style record: Verified, empty provenance, but quality UNKNOWN (None) — e.g. a
+        // legacy record written before quality capture. The upgrade engine must NOT swap/prune it:
+        // an unknown current quality compared against a cached candidate would otherwise treat ANY
+        // cached release as an upgrade and could delete a better existing copy (regression).
+        store
+            .put_owned(
+                "hold".into(),
+                OwnedRecord {
+                    request: movie_req(),
+                    provenance: Provenance { entries: vec![] },
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "hold".into(),
+                    file_path: "old.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        // A cached REMUX candidate that WOULD be a meaningful upgrade if the current quality were known.
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![remux_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        run_upgrade_once(&app).await;
+
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "must not prune a record whose current quality is unknown"
+        );
+        assert!(
+            store.get_owned("hnew".into()).await.is_none(),
+            "must not stage an upgrade over an unknown current quality"
+        );
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hold",
+            "selection unchanged"
+        );
+    }
+
+    #[test]
+    fn season_owned_quality_includes_packs_and_flags_unknown() {
+        let rec = |provides: Vec<(u32, u32)>, quality: Option<QualitySummary>| OwnedRecord {
+            request: movie_req(),
+            provenance: Provenance { entries: vec![] },
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides,
+            quality,
+        };
+        // An 8-episode REMUX pack (E1..E8) plus scattered WEB singletons E9, E10.
+        let owned = vec![
+            (
+                "hp".to_string(),
+                rec((1..=8).map(|e| (1u32, e)).collect(), Some(q2160_remux())),
+            ),
+            ("h9".to_string(), rec(vec![(1, 9)], Some(q1080_web()))),
+            ("h10".to_string(), rec(vec![(1, 10)], Some(q1080_web()))),
+        ];
+        let q = season_owned_quality(&owned, 1).expect("all qualities known");
+        assert_eq!(
+            q.len(),
+            10,
+            "every in-season episode (multi-episode pack + singletons) is represented"
+        );
+        assert!(
+            q.iter()
+                .any(|(e, sq)| *e == 1 && sq.source_tier == q2160_remux().source_tier),
+            "the multi-episode REMUX pack's episodes must be included, not just singletons"
+        );
+
+        // A candidate WEB full-season pack would downgrade E1..E8 (REMUX) → must be rejected.
+        let input = ConsolidationInput {
+            season: 1,
+            aired_episodes: (1..=10).collect(),
+            owned_episode_quality: q,
+            pack_cached: true,
+            pack_episodes: (1..=10).collect(),
+            pack_quality: q1080_web(),
+        };
+        assert!(
+            !consolidation_target(&input),
+            "a WEB pack must not supersede a held higher-quality REMUX pack"
+        );
+
+        // Unknown quality on any contributor → None (caller must skip the season conservatively).
+        let mut owned2 = owned;
+        owned2.push(("hx".to_string(), rec(vec![(1, 11)], None)));
+        assert!(
+            season_owned_quality(&owned2, 1).is_none(),
+            "an unknown-quality contributor forces a conservative skip"
+        );
+    }
+
+    #[test]
+    fn season_has_scatter_requires_two_in_season_records() {
+        let rec = |provides: Vec<(u32, u32)>| OwnedRecord {
+            request: movie_req(),
+            provenance: Provenance { entries: vec![] },
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides,
+            quality: Some(q1080_web()),
+        };
+        // A single in-season record → no scatter to merge (consolidating it is a lateral A→B→A churn).
+        let one = vec![("h1".to_string(), rec(vec![(1, 1)]))];
+        assert!(
+            !season_has_scatter(&one, 1),
+            "one in-season record is not scatter — must not consolidate (avoids daily flip-flop)"
+        );
+        // Two scattered singletons of the same season → genuine scatter, consolidate.
+        let two = vec![
+            ("h1".to_string(), rec(vec![(1, 1)])),
+            ("h2".to_string(), rec(vec![(1, 2)])),
+        ];
+        assert!(
+            season_has_scatter(&two, 1),
+            "two in-season records are scatter"
+        );
+        // Records of a DIFFERENT season don't count toward this season's scatter.
+        let other = vec![
+            ("h1".to_string(), rec(vec![(1, 1)])),
+            ("h2".to_string(), rec(vec![(2, 1)])),
+        ];
+        assert!(
+            !season_has_scatter(&other, 1),
+            "a different season's record must not count toward this season's scatter"
         );
     }
 

@@ -89,16 +89,36 @@ static SIZE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)([\d.]+)\s*(
 static SEED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{1f464}\s*(\d+)").unwrap());
 
 // Cam / telesync / telecine / screener / R5 / workprint / pre-DVD markers (the quality floor).
+// NOTE: bare `ts` is handled by `TS_RE` (below), NOT here — `\bts\b` would match the `.ts`/`.m2ts`
+// transport-stream CONTAINER extension (both are served video formats), wrongly cam-rejecting a
+// legitimate `.ts` release. `hd-?ts` stays here (unambiguous — never a container extension).
 static CAM_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"\b(cam|cam-?rip|hd-?cam|hq-?cam|ts|hd-?ts|tele-?sync|hd-?tc|tele-?cine|scr|screener|dvd-?scr|bd-?scr|work-?print|r5|pre-?dvd|predvd)\b",
+        r"\b(cam|cam-?rip|hd-?cam|hq-?cam|hd-?ts|tele-?sync|hd-?tc|tele-?cine|scr|screener|dvd-?scr|bd-?scr|work-?print|r5|pre-?dvd|predvd)\b",
     )
     .unwrap()
 });
 
+// A bare `ts` telesync tag, but NOT a trailing `.ts` container extension. Requiring a trailing
+// separator means `…1080p.HDTV.ts` (a real transport-stream file) is treated as a container, while a
+// mid-name telesync tag (`…1080p.TS.x265`, ` ts `, `-ts-`) is still caught by the quality floor.
+static TS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[ .\-_])ts[ .\-_]").unwrap());
+
+// A bare `web` source token (the canonical scene tag, e.g. `…1080p.WEB.H264-GROUP`) that the
+// explicit `web-dl`/`webrip`/etc. checks miss. Separator-bounded (start/space/`.`/`-`/`_`/newline on
+// both sides) so it matches `WEB` as a standalone token but not a substring of another word
+// (`webrip` is handled explicitly; `spiderweb` won't match). Without this, a bare-`WEB` release falls
+// to `Source::Other` (tier 0) — scoring BELOW HDTV and blocking a legitimate HDTV→WEB upgrade.
+static WEB_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|[ ._\n-])web(?:[ ._\n-]|$)").unwrap());
+
+// A separator-bounded `multi` (multi-language) token — see the language-parsing loop in `parse`.
+static MULTI_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|[ ._\n-])multi(?:[ ._\n-]|$)").unwrap());
+
 /// Classify the release source from its (lowercased) name/description.
 fn detect_source(lower: &str) -> Source {
-    if CAM_RE.is_match(lower) {
+    if CAM_RE.is_match(lower) || TS_RE.is_match(lower) {
         Source::Cam
     } else if lower.contains("remux") {
         Source::Remux
@@ -116,6 +136,7 @@ fn detect_source(lower: &str) -> Source {
         || lower.contains("amzn")
         || lower.contains("dsnp")
         || lower.contains("nf.web")
+        || WEB_RE.is_match(lower)
     {
         Source::Web
     } else if lower.contains("hdtv") {
@@ -173,6 +194,13 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
             languages.push((*code).to_string());
         }
     }
+    // `multi` (multi-language) is matched as a SEPARATOR-BOUNDED token, not a raw substring, because
+    // its `mul` code is a WILDCARD in `score` (`|| l == "mul"` satisfies any required AUDIO_LANGUAGE).
+    // A raw `contains("multi")` would mis-tag `MultiSubs`/`multichannel` as multi-language and let a
+    // wrong-audio release escape the language penalty for a non-default `AUDIO_LANGUAGE` user.
+    if MULTI_RE.is_match(&lower) {
+        languages.push("mul".to_string());
+    }
 
     let container = c
         .file_name
@@ -208,7 +236,8 @@ const LANG_WORDS: &[(&str, &str)] = &[
     ("japanese", "jpn"),
     ("korean", "kor"),
     ("portuguese", "por"),
-    ("multi", "mul"),
+    // `multi` is intentionally NOT here — it's matched separator-bounded via `MULTI_RE` (see `parse`)
+    // because its `mul` code is a wildcard in `score`.
 ];
 
 /// Score a release against prefs. `None` = excluded by a hard rule (resolution ceiling,
@@ -265,7 +294,18 @@ pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
         }
     }
     if let AudioReq::Lang(want) = &prefs.audio {
-        if !r.languages.is_empty() && !r.languages.iter().any(|l| l == want || l == "mul") {
+        // Normalise both sides to ISO 639-2 (3-letter) before comparing — exactly as `probe::verify`
+        // does via `lang_eq`. `AudioReq::parse` only lowercases the configured value, so a 2-letter
+        // `AUDIO_LANGUAGE` (e.g. `en`) must map to `eng` to match a release tagged "English" (parsed
+        // to `eng`); a raw `l == want` would otherwise penalise the CORRECT-language release here even
+        // though the probe accepts it — an inconsistency between acquisition ranking and verification.
+        let want = crate::probe::to_iso639_2(want);
+        if !r.languages.is_empty()
+            && !r
+                .languages
+                .iter()
+                .any(|l| crate::probe::to_iso639_2(l) == want || l == "mul")
+        {
             s -= 50_000;
         }
     }
@@ -466,6 +506,61 @@ mod tests {
     }
 
     #[test]
+    fn multi_is_separator_bounded_not_a_substring() {
+        // `MULTI` as a standalone token tags multi-language (`mul`, the audio wildcard); but
+        // `MultiSubs`/`multichannel` (no separator after `multi`) must NOT — otherwise a wrong-audio
+        // release escapes the language penalty for a non-default AUDIO_LANGUAGE user.
+        let tagged = parse(&raw(
+            "t",
+            "Film.2020.MULTI.1080p.x265",
+            "h",
+            Some("Film.mkv"),
+        ));
+        assert!(
+            tagged.languages.iter().any(|l| l == "mul"),
+            "a standalone MULTI token must tag multi-language"
+        );
+        // `MultiSubs` (multi-SUBTITLES) must NOT tag multi-AUDIO.
+        let subs = parse(&raw(
+            "t",
+            "Film.2020.German.MultiSubs.1080p",
+            "h",
+            Some("Film.mkv"),
+        ));
+        assert!(
+            !subs.languages.iter().any(|l| l == "mul"),
+            "MultiSubs must not be mis-tagged as multi-language"
+        );
+        // The German-audio + MultiSubs release is still penalised for an English-audio user.
+        let mut p = prefs();
+        p.audio = AudioReq::Lang("eng".to_string());
+        let untagged = parse(&raw("t", "Film.1080p.x265", "h2", Some("Film.mkv")));
+        assert!(
+            score(&subs, &p).unwrap() < score(&untagged, &p).unwrap(),
+            "German+MultiSubs must NOT escape the wrong-audio penalty via a spurious `mul` tag"
+        );
+    }
+
+    #[test]
+    fn score_audio_language_is_iso_normalized() {
+        // A 2-letter AUDIO_LANGUAGE (`en`) must match a release tagged "English" (parsed to `eng`),
+        // consistent with probe::verify (which normalises via to_iso639_2). A raw `l == want` would
+        // wrongly penalise the correct-language release.
+        let mut p = prefs();
+        p.audio = AudioReq::Lang("en".to_string()); // ISO 639-1
+        let english = parse(&raw("t", "Film.1080p.x265 English", "h1", Some("Film.mkv"))); // languages=["eng"]
+        let untagged = parse(&raw("t", "Film.1080p.x265", "h2", Some("Film.mkv")));
+        assert_eq!(
+            score(&english, &p).unwrap(),
+            score(&untagged, &p).unwrap(),
+            "a correct-language release (en→eng) must NOT be penalised vs an untagged one"
+        );
+        // And a genuinely wrong language is still penalised under the 2-letter setting.
+        let german = parse(&raw("t", "Film.1080p.x265 German", "h3", Some("Film.mkv"))); // languages=["ger"]
+        assert!(score(&german, &p).unwrap() < score(&untagged, &p).unwrap());
+    }
+
+    #[test]
     fn score_penalises_tiny_and_absurd_sizes_and_prefers_bitrate() {
         let normal = parse(&raw(
             "t",
@@ -541,6 +636,85 @@ mod tests {
     }
 
     #[test]
+    fn ts_container_extension_is_not_treated_as_telesync() {
+        // A trailing `.ts`/`.m2ts` is a transport-stream CONTAINER (a served video format), not a
+        // telesync — it must NOT be cam-rejected. Regression guard for the `\bts\b` false positive.
+        for name in [
+            "Show.S01E01.1080p.HDTV.ts",
+            "Movie.2025.2160p.WEB-DL.x265.m2ts",
+        ] {
+            let c = raw("Torrentio\n1080p", &format!("{name}\nRD+"), "h", Some(name));
+            assert!(
+                score(&parse(&c), &prefs()).is_some(),
+                "{name} is a transport-stream container, not a telesync — must be accepted"
+            );
+        }
+        // But a mid-name `.TS.` telesync TAG is still rejected (separator on both sides).
+        let tagged = raw(
+            "Torrentio\n1080p",
+            "Movie.2025.1080p.TS.x264\nRD+",
+            "h",
+            Some("Movie.mkv"),
+        );
+        assert_eq!(
+            score(&parse(&tagged), &prefs()),
+            None,
+            "a mid-name .TS. telesync tag must still be rejected by the quality floor"
+        );
+    }
+
+    #[test]
+    fn quality_summary_of_captures_score_and_fallbacks() {
+        // (a) A normal in-ceiling cached release: real score (not the sentinel), resolution + tier set.
+        let normal = QualitySummary::of(
+            &parse(&raw(
+                "Torrentio\n1080p",
+                "Movie.2025.1080p.BluRay.x265\nRD+",
+                "h",
+                Some("Movie.mkv"),
+            )),
+            &prefs(),
+        );
+        assert!(normal.cached, "RD+ marks it cached");
+        assert_eq!(normal.resolution, 1080);
+        assert!(normal.source_tier > 0, "BluRay is a known tier");
+        assert_ne!(
+            normal.score,
+            i64::MIN,
+            "an acceptable release has a real score"
+        );
+
+        // (b) An EXCLUDED release (above the P1080 ceiling) → `score` is None → `of` records the
+        // i64::MIN sentinel, which `is_meaningful_upgrade`'s strict `>` comparison relies on.
+        let excluded = QualitySummary::of(
+            &parse(&raw(
+                "Torrentio\n2160p",
+                "Movie.2025.2160p.BluRay.x265\nRD+",
+                "h",
+                Some("Movie.mkv"),
+            )),
+            &prefs(),
+        );
+        assert_eq!(
+            excluded.score,
+            i64::MIN,
+            "an above-ceiling release scores the sentinel, never an upgrade target"
+        );
+
+        // (c) An untagged-resolution release → the `unwrap_or(0)` fallback yields resolution 0.
+        let untagged = QualitySummary::of(
+            &parse(&raw(
+                "Torrentio",
+                "Movie.BluRay.x265\nRD+",
+                "h",
+                Some("Movie.mkv"),
+            )),
+            &prefs(),
+        );
+        assert_eq!(untagged.resolution, 0, "no resolution token → 0");
+    }
+
+    #[test]
     fn score_excludes_uncached_zero_seeder_keeps_cached() {
         // 👤0 and uncached → undownloadable → excluded outright (not scored).
         let dead = parse(&raw(
@@ -570,6 +744,60 @@ mod tests {
         ));
         assert_eq!(seeded.seeders, Some(10));
         assert!(score(&seeded, &prefs()).is_some());
+    }
+
+    #[test]
+    fn bare_web_source_tag_is_web_not_other() {
+        // The canonical scene `WEB` tag (no `-DL`/`Rip`) must classify as Source::Web, not Other —
+        // otherwise it scores BELOW HDTV at the same resolution and blocks a legitimate HDTV→WEB
+        // upgrade (`is_meaningful_upgrade` needs the candidate's tier > the owned tier).
+        for name in [
+            "Show.S01E01.1080p.WEB.H264-GROUP",
+            "Show S01E01 1080p WEB x264",
+            "Show.S01E01.1080p.WEB", // bare WEB at the end (before the \n description)
+        ] {
+            let r = parse(&raw(
+                "Torrentio\n1080p",
+                &format!("{name}\nRD+"),
+                "h",
+                Some("Show.mkv"),
+            ));
+            assert_eq!(
+                r.source,
+                Source::Web,
+                "{name} should classify as Source::Web"
+            );
+        }
+        // A bare-WEB release outranks a same-resolution HDTV (tier 3000 > 1000).
+        let web = parse(&raw(
+            "Torrentio\n1080p",
+            "Show.S01E01.1080p.WEB.x264\nRD+",
+            "h",
+            Some("Show.mkv"),
+        ));
+        let hdtv = parse(&raw(
+            "Torrentio\n1080p",
+            "Show.S01E01.1080p.HDTV.x264\nRD+",
+            "h",
+            Some("Show.mkv"),
+        ));
+        assert!(
+            score(&web, &prefs()) > score(&hdtv, &prefs()),
+            "bare WEB must outrank HDTV at the same resolution"
+        );
+        // A title that merely CONTAINS "web" as a word but has a real higher-tier source is still
+        // classified by that source (the bluray/remux checks run first).
+        assert_eq!(
+            parse(&raw(
+                "t",
+                "Charlottes Web 2006 1080p BluRay x264\nRD+",
+                "h",
+                Some("x.mkv"),
+            ))
+            .source,
+            Source::BluRay,
+            "a real BluRay source wins even when the title contains 'web'"
+        );
     }
 
     #[test]

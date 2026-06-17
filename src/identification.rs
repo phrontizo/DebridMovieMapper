@@ -8,8 +8,23 @@ use tracing::{debug, info, warn};
 
 static CAMEL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([a-z])([A-Z])").unwrap());
 
-static PREFIX_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^(\[.*?\]|\(.*?\)|[\w.-]+\.[a-z]{2,6}\s+-\s+)\s*").unwrap());
+// Leading release-group / site garbage to strip: a bracket tag `[...]`, a parenthesised tag that
+// contains at least one LETTER or is a parenthesised release-year (so a leading "(2020) Title" still
+// strips, but a NON-year numeric title-paren like `(500)` — as in "(500) Days of Summer" — is kept
+// as title content), or a `site.tld - ` prefix.
+static PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^(\[.*?\]|\((?:[^)]*[a-z][^)]*|(?:19|20)\d{2})\)|[\w.-]+\.[a-z]{2,6}\s+-\s+)\s*",
+    )
+    .unwrap()
+});
+
+/// A leading `[Title] (YYYY)` — bracket(s) that are PART of the title (e.g. `[REC] (2007)`),
+/// confirmed by an immediately-following parenthesised year — is NOT a release-group tag, so
+/// `PREFIX_RE` must not strip it (which would leave a yearfragment like `2007)` as the "title"). A
+/// genuine leading tag is `[group] Title …`, never `[group] (year)`.
+static TITLE_BRACKET_YEAR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\[[^\]]*\]\s*\((?:19|20)\d{2}\)").unwrap());
 
 static YEAR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(19|20)\d{2}\b").unwrap());
 
@@ -138,8 +153,11 @@ fn pick_highest_scored<'a>(
     normalized_query: &str,
     year: &Option<String>,
 ) -> Option<&'a TmdbSearchResult> {
+    // Compute "now" once per search rather than once per candidate (it was a syscall inside the
+    // per-result scorer's recency bonus).
+    let current_year = chrono::Utc::now().year();
     candidates
-        .map(|r| (score_result(r, normalized_query, year), r))
+        .map(|r| (score_result(r, normalized_query, year, current_year), r))
         .max_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(_, r)| r)
 }
@@ -227,7 +245,12 @@ fn select_best_match(
 
 /// Score a search result based on how well it matches the query
 /// Higher score = better match
-fn score_result(result: &TmdbSearchResult, normalized_query: &str, year: &Option<String>) -> f64 {
+fn score_result(
+    result: &TmdbSearchResult,
+    normalized_query: &str,
+    year: &Option<String>,
+    current_year: i32,
+) -> f64 {
     let mut score = 0.0;
 
     // Title match (most important)
@@ -285,7 +308,6 @@ fn score_result(result: &TmdbSearchResult, normalized_query: &str, year: &Option
         if let Some(release_date) = &result.release_date {
             if let Some(year_str) = release_date.get(0..4) {
                 if let Ok(release_year) = year_str.parse::<i32>() {
-                    let current_year = chrono::Utc::now().year();
                     let age = (current_year - release_year).max(0) as f64;
                     score += (80.0 - age * 8.0).max(0.0);
                 }
@@ -481,12 +503,15 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     }
 
     // 1. Remove common site prefixes and garbage at the start
-    // Patterns like "[ site ] ", "( site )", "site.com - ", "d3us-", "m-", "Bond.50."
-    if let Some(m) = PREFIX_RE.find(&title) {
-        // Only strip if it's followed by a separator (dot, space, dash) or it's a known prefix
-        title = title[m.end()..]
-            .trim_start_matches(|c: char| !c.is_alphanumeric())
-            .to_string();
+    // Patterns like "[ site ] ", "( site )", "site.com - ", "d3us-", "m-", "Bond.50".
+    // EXCEPT a leading "[Title] (YYYY)" whose brackets are part of the title (e.g. "[REC] (2007)").
+    if !TITLE_BRACKET_YEAR_RE.is_match(&title) {
+        if let Some(m) = PREFIX_RE.find(&title) {
+            // Only strip if it's followed by a separator (dot, space, dash) or it's a known prefix
+            title = title[m.end()..]
+                .trim_start_matches(|c: char| !c.is_alphanumeric())
+                .to_string();
+        }
     }
 
     // 2. Initial cleanup: replace dots and underscores with spaces
@@ -560,12 +585,24 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
 }
 
 pub fn is_show_guess(files: &[rd_client::TorrentFile]) -> bool {
-    files.iter().any(|f| {
+    // An episode marker (SxxExx, NxM, "Season N", …) in any filename → definitely a show.
+    if files.iter().any(|f| {
         let filename = f.path.split('/').next_back().unwrap_or(&f.path);
         SHOW_RE.is_match(filename)
-    }) || files
+    }) {
+        return true;
+    }
+    // Fallback: more than one SUBSTANTIAL selected video file → a show (or multi-episode pack).
+    // The size floor is essential because TorBox marks EVERY file `selected` (torbox_client maps
+    // `selected: 1` for all files), so a movie that ships a small sample/featurette as a second
+    // video file would otherwise be miscounted as a show. 100 MB excludes samples/extras while
+    // keeping real episodes (even short-form ones).
+    const MIN_SUBSTANTIAL_VIDEO_BYTES: u64 = 100_000_000;
+    files
         .iter()
-        .filter(|f| f.selected != 0 && is_video_file(&f.path))
+        .filter(|f| {
+            f.selected != 0 && is_video_file(&f.path) && f.bytes >= MIN_SUBSTANTIAL_VIDEO_BYTES
+        })
         .count()
         > 1
 }
@@ -619,6 +656,23 @@ fn is_generic_title(s: &str) -> bool {
 mod tests {
     use super::*;
     use crate::rd_client::{TorrentFile, TorrentInfo};
+
+    #[test]
+    fn normalize_title_folds_accents_and_unifies_and_with_ampersand() {
+        // Accent folding + non-alphanumeric stripping (spaces/punctuation removed).
+        assert_eq!(normalize_title("Pokémon"), "pokemon");
+        assert_eq!(normalize_title("Amélie"), "amelie");
+        assert_eq!(normalize_title("WALL·E (2008)"), "walle2008");
+        assert_eq!(normalize_title("Coraline & Co."), "coralineco");
+        // " and " is rewritten to " & " BEFORE alphanumeric filtering drops the connector, so the
+        // "and" and "&" spellings normalise to the SAME string (the point of the rule — without it,
+        // the "and" letters would survive and the two forms wouldn't match).
+        assert_eq!(
+            normalize_title("Tom and Jerry"),
+            normalize_title("Tom & Jerry")
+        );
+        assert_eq!(normalize_title("Tom and Jerry"), "tomjerry");
+    }
 
     #[tokio::test]
     #[ignore]
@@ -814,6 +868,27 @@ mod tests {
         assert_eq!(clean_name("Custom").0, "Custom");
         // Normal trailing-metadata stripping is unaffected.
         assert_eq!(clean_name("The Matrix 1080p").0, "The Matrix");
+    }
+
+    #[test]
+    fn clean_name_keeps_title_brackets_and_parens() {
+        // A leading "[Title] (YYYY)" is the title, not a release tag — must not strip to "2007)".
+        let (rec, rec_year) = clean_name("[REC] (2007) 1080p BluRay.mkv");
+        assert_eq!(rec, "[REC]");
+        assert_eq!(rec_year.as_deref(), Some("2007"));
+        // A non-year numeric title-paren is kept (the film "(500) Days of Summer").
+        assert_eq!(
+            clean_name("(500) Days of Summer 2009 1080p").0,
+            "(500) Days of Summer"
+        );
+        // Regression: a genuine leading bracket/site tag is STILL stripped.
+        assert_eq!(clean_name("[YTS.MX] The Matrix 1999 1080p").0, "The Matrix");
+        assert_eq!(
+            clean_name("(www.site.com) Inception 2010 1080p").0,
+            "Inception"
+        );
+        // Regression: a leading parenthesised YEAR prefix is STILL stripped.
+        assert_eq!(clean_name("(2020) Tenet 1080p BluRay").0, "Tenet");
     }
 
     #[tokio::test]
@@ -1567,6 +1642,30 @@ mod tests {
         ] {
             assert!(is_show_guess(&one_file(name)), "{name} should be a show");
         }
+    }
+
+    #[test]
+    fn is_show_guess_ignores_small_sample_second_video() {
+        // TorBox marks EVERY file `selected: 1`, so a movie + a small sample/featurette would be
+        // two "selected" videos. The size floor must keep this classified as a MOVIE.
+        let files = vec![
+            TorrentFile {
+                id: 1,
+                path: "/Movie.2023.1080p.mkv".to_string(),
+                bytes: 8_000_000_000,
+                selected: 1,
+            },
+            TorrentFile {
+                id: 2,
+                path: "/sample.mkv".to_string(),
+                bytes: 40_000_000, // 40 MB sample — below the substantial-video floor
+                selected: 1,
+            },
+        ];
+        assert!(
+            !is_show_guess(&files),
+            "a movie + small sample (both 'selected' on TorBox) must not be guessed as a show"
+        );
     }
 
     #[test]

@@ -94,10 +94,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // database: it moves the old file aside (<db_path>.corrupt) and recreates it.
     let store = debridmoviemapper::store::Store::open(&config.db_path)?;
 
+    // Surface a build failure as a startup error (consistent with the TMDB/provider/scraper clients)
+    // rather than panicking — reqwest's builder essentially never fails, but `?` keeps startup
+    // failures uniform and avoids an `expect` panic.
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .expect("Failed to build CDN HTTP client");
+        .map_err(|e| format!("Failed to build CDN HTTP client: {e}"))?;
 
     // The scraper gets its OWN client so an optional proxy applies to Torrentio/addon traffic only
     // — never the CDN media reads, TMDB, or provider APIs (which keep the direct `http_client`).
@@ -222,7 +225,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, _addr) = result?;
+                let (stream, _addr) = match result {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // A transient accept() error — fd exhaustion (EMFILE/ENFILE), a peer
+                        // that aborted before we accepted (ECONNABORTED), or EINTR — must NOT
+                        // tear down the whole listener (which would also skip graceful
+                        // shutdown below). Log, briefly back off so we don't hot-spin while
+                        // the process is out of descriptors, and keep accepting.
+                        tracing::warn!("accept() failed: {e} — continuing to accept");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {

@@ -33,7 +33,7 @@ RUN mkdir src && \
     echo 'fn main() {}' > src/main.rs && \
     echo '' > src/mapper.rs && \
     TARGET=$(cat /target_triple) && \
-    cargo build --release --target $TARGET && \
+    cargo build --release --locked --target $TARGET && \
     rm -rf src
 
 # Copy real source and build the application
@@ -42,7 +42,7 @@ COPY src ./src
 # (COPY preserves mtimes from the build context, which predate the dummy build above)
 RUN touch src/*.rs && \
     TARGET=$(cat /target_triple) && \
-    cargo build --release --target $TARGET && \
+    cargo build --release --locked --target $TARGET && \
     cp target/$TARGET/release/debridmoviemapper .
 
 # Create empty data directory owned by nobody for the scratch stage

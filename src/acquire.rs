@@ -86,9 +86,11 @@ impl TitleValidator for TmdbTitleValidator {
             return false;
         }
         if kind == MediaKind::Series {
+            // Accept the file if it declares the requested episode — including a multi-episode file
+            // (e.g. `S01E01E02`) requested for its second episode.
             matches!(
-                (season, episode, parse_se(file_name)),
-                (Some(s), Some(e), Some((fs, fe))) if fs == s && fe == e
+                (season, episode),
+                (Some(s), Some(e)) if parse_se_all(file_name).contains(&(s, e))
             )
         } else {
             true
@@ -96,15 +98,78 @@ impl TitleValidator for TmdbTitleValidator {
     }
 }
 
-fn parse_se(name: &str) -> Option<(u32, u32)> {
+/// Parse ALL `(season, episode)` pairs a filename declares. Handles a single `SxxEyy`, a contiguous
+/// MULTI-episode file (`S01E01E02`, `S01E01-E02`, `S01E01.E02`), and the dash-concatenated absolute
+/// code (`Show - 409 - Title` → `[(4, 9)]`). Returns an empty `Vec` when no episode code is found.
+///
+/// Multi-episode handling matters for `provides`: a double-episode file reporting only its FIRST
+/// episode leaves the second looking un-owned, so `monitor_episodes` re-acquires it as a duplicate
+/// singleton — the same failure the dash-code fallback prevents for packs, in a different form.
+///
+/// KNOWN LIMITATION — a RANGE form spanning >2 episodes (`S01E01-E03`) records only the explicit
+/// endpoints `[(1,1),(1,3)]`, dropping the middle `(1,2)` (so it may re-acquire the middle as a
+/// duplicate). The common 2-episode forms (`S01E01E02`, `S01E01-E02`) and explicit lists
+/// (`S01E01E02E03`) parse fully; range-named SINGLE files spanning 3+ episodes are uncommon (such
+/// content is usually a season pack of separate per-episode files), so this is an accepted edge.
+fn parse_se_all(name: &str) -> Vec<(u32, u32)> {
     use regex::Regex;
     use std::sync::LazyLock;
-    static SE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})e(\d{1,3})").unwrap());
-    let c = SE.captures(name)?;
-    Some((
-        c.get(1)?.as_str().parse().ok()?,
-        c.get(2)?.as_str().parse().ok()?,
-    ))
+    // Primary: SxxEyy, plus any contiguous `Eyy` continuations in the SAME season. The continuation
+    // REQUIRES an explicit `e` before each number so a resolution/codec token can't be mis-parsed as
+    // an episode (`S01E01.1080p` → the `.1080` has no `e`, so it is NOT a continuation).
+    static SE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})e(\d{1,3})((?:[-_. ]?e\d{1,3})*)").unwrap());
+    if let Some(c) = SE.captures(name) {
+        if let (Some(s), Some(e1)) = (
+            c.get(1).and_then(|m| m.as_str().parse::<u32>().ok()),
+            c.get(2).and_then(|m| m.as_str().parse::<u32>().ok()),
+        ) {
+            let mut eps = vec![(s, e1)];
+            if let Some(rest) = c.get(3).map(|m| m.as_str()) {
+                static EP: LazyLock<Regex> =
+                    LazyLock::new(|| Regex::new(r"(?i)e(\d{1,3})").unwrap());
+                for cap in EP.captures_iter(rest) {
+                    if let Some(e) = cap.get(1).and_then(|m| m.as_str().parse::<u32>().ok()) {
+                        let pair = (s, e);
+                        if !eps.contains(&pair) {
+                            eps.push(pair);
+                        }
+                    }
+                }
+            }
+            return eps;
+        }
+        // The `\d{1,2}`/`\d{1,3}` captures always parse to `u32`, so the `if let` above always
+        // returns when `SE` matches; reaching here would require that to change, in which case
+        // falling through to the dash-code fallback (which won't match an SxxExx name) is correct.
+    }
+    // Fallback: the dash-delimited CONCATENATED SxxEyy code some packs use instead of "S04E09",
+    // e.g. "Rick and Morty - 409 - Childrick of Mort.mkv" → S04E09 (last two digits = episode,
+    // leading digit = season). Without this, such packs derive an empty `provides`, so the
+    // reconciler thinks no episodes are owned and re-acquires the whole show as per-episode torrents
+    // (permanent duplicates). EXACTLY 3 digits (season 1–9): this deliberately excludes 4-digit
+    // tokens, which collide with years ("Show - 2024 - Title", date-named daily episodes
+    // "... - 2021 - 03 - 14") and would mis-decode to a phantom (20, NN) episode. A show with ≥10
+    // seasons using concatenated coding is rare and ambiguous with years anyway — rely on `SxxExx`
+    // for those. The " - NNN - " (space-dash-space) anchor avoids resolution false positives.
+    //
+    // KNOWN LIMITATION — absolute (anime) numbering: a 3-digit token here is decoded as concatenated
+    // SxxEyy, but absolute episode numbers are indistinguishable from it ("One Piece - 409 - …" is
+    // absolute ep 409, not S4E9). For such releases this records a phantom (4,9) as `provides`,
+    // which can suppress re-acquisition of the real S4E9 and write a wrong VFS selection slot. This
+    // is an accepted trade-off: the common concatenated-pack case (Western shows) is far more
+    // prevalent, and the prior behaviour (empty `provides` → whole-show re-acquire churn) was worse.
+    static DASH_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s-\s(\d{3})\s-\s").unwrap());
+    if let Some(c) = DASH_CODE.captures(name) {
+        if let Some(code) = c.get(1).and_then(|m| m.as_str().parse::<u32>().ok()) {
+            let (season, episode) = (code / 100, code % 100);
+            // Reject an implausible decode (episode 00) so a stray number can't masquerade.
+            if season >= 1 && episode >= 1 {
+                return vec![(season, episode)];
+            }
+        }
+    }
+    Vec::new()
 }
 
 fn now_secs() -> u64 {
@@ -225,9 +290,13 @@ pub(crate) fn episode_files(info: &TorrentInfo) -> Vec<(u32, u32, String)> {
     info.files
         .iter()
         .filter(|f| f.selected == 1 && crate::vfs::is_video_file(&f.path))
-        .filter_map(|f| {
+        .flat_map(|f| {
             let name = f.path.rsplit('/').next().unwrap_or(&f.path);
-            parse_se(name).map(|(s, e)| (s, e, f.path.clone()))
+            // A multi-episode file contributes ALL its episodes (so `provides` is complete and the
+            // reconciler doesn't re-acquire a contained episode as a duplicate singleton).
+            parse_se_all(name)
+                .into_iter()
+                .map(move |(s, e)| (s, e, f.path.clone()))
         })
         .collect()
 }
@@ -818,22 +887,28 @@ impl AcquisitionEngine {
                     continue; // within the back-off window — wait before re-probing
                 }
             }
-            // Downloaded → validate the title, then probe and finalise.
+            // Downloaded → validate the title (ONCE), then probe and finalise.
             let file_name = selected_path
                 .rsplit('/')
                 .next()
                 .unwrap_or(&selected_path)
                 .to_string();
-            if !self
-                .validator
-                .validate(
-                    &file_name,
-                    rec.request.tmdb_id,
-                    rec.request.kind,
-                    rec.request.season,
-                    rec.request.episode,
-                )
-                .await
+            // Validate ONLY on the first downloaded tick (`defer_state.is_none()`). The file name is
+            // invariant, so re-validating adds nothing — but `validate` makes an UNCACHED live TMDB
+            // call, and a transient TMDB failure makes it return `false`, which would `fail_and_reacquire`
+            // (blacklist + delete) an already-validated, correct, cached release. A probe only runs
+            // after validation passes, so a recorded `defer_state` already implies a prior pass.
+            if defer_state.is_none()
+                && !self
+                    .validator
+                    .validate(
+                        &file_name,
+                        rec.request.tmdb_id,
+                        rec.request.kind,
+                        rec.request.season,
+                        rec.request.episode,
+                    )
+                    .await
             {
                 self.fail_and_reacquire(hash, &t.id, &rec.request, "WrongTitle", &rec.provenance)
                     .await;
@@ -923,16 +998,23 @@ impl AcquisitionEngine {
             .store
             .blacklist_add(req.tmdb_id, hash.to_string(), reason, now_secs())
             .await;
-        let _ = self.store.remove_owned(hash.to_string()).await;
-        let _ = self.store.remove_authoritative(hash.to_string()).await;
-        // Drop any selection slots this hash represented so the VFS stops showing the dead release.
-        for (slot, entry) in self.store.all_selection().await {
-            if entry.hash.eq_ignore_ascii_case(hash) {
-                let _ = self.store.remove_selection(slot).await;
+        // Delete the provider torrent BEFORE dropping the store records (the `execute_remove`
+        // ordering). On a transient delete failure, KEEP the records so the next `observe` tick
+        // retries the delete rather than leaving a present-but-untracked torrent that
+        // `record_mirror_owned` would re-adopt as a duplicate. An empty `torrent_id` = genuinely
+        // absent (nothing to delete). The blacklist above is also a hash-scoped backstop against
+        // re-adoption.
+        let removed =
+            torrent_id.is_empty() || self.provider.delete_torrent(torrent_id).await.is_ok();
+        if removed {
+            let _ = self.store.remove_owned(hash.to_string()).await;
+            let _ = self.store.remove_authoritative(hash.to_string()).await;
+            // Drop any selection slots this hash represented so the VFS stops showing the dead release.
+            for (slot, entry) in self.store.all_selection().await {
+                if entry.hash.eq_ignore_ascii_case(hash) {
+                    let _ = self.store.remove_selection(slot).await;
+                }
             }
-        }
-        if !torrent_id.is_empty() {
-            let _ = self.provider.delete_torrent(torrent_id).await;
         }
         self.progress.lock().await.remove(torrent_id);
         self.verify_attempts.lock().await.remove(hash);
@@ -952,6 +1034,154 @@ mod tests {
     use crate::store::Provenance;
     use crate::vfs::{MediaMetadata, MediaType};
     use redb::backends::InMemoryBackend;
+
+    #[test]
+    fn parse_se_handles_sxxexx_and_dash_concatenated_codes() {
+        // Standard SxxExx → a single-element vec.
+        assert_eq!(parse_se_all("Show.S04E09.1080p.mkv"), vec![(4, 9)]);
+        assert_eq!(parse_se_all("Show S1E5.mkv"), vec![(1, 5)]);
+        // Dash-concatenated 3-digit form ("409" = S04E09).
+        assert_eq!(
+            parse_se_all("Rick and Morty - 409 - Childrick of Mort.mkv"),
+            vec![(4, 9)]
+        );
+        // Must NOT misread a resolution or year as an episode code.
+        assert!(parse_se_all("Movie.2009.1080p.BluRay.mkv").is_empty());
+        assert!(parse_se_all("Movie (1999).mkv").is_empty());
+        // A 4-digit dash-delimited YEAR must NOT decode (would have been a phantom S20E24).
+        assert!(parse_se_all("Show - 2024 - Title.mkv").is_empty());
+        // A date-named daily-show file must NOT decode (no 3-digit dash token).
+        assert!(parse_se_all("The Daily Show - 2021 - 03 - 14.mkv").is_empty());
+        // Implausible decode rejected (episode 00).
+        assert!(parse_se_all("Show - 400 - Title.mkv").is_empty());
+        // No episode marker at all.
+        assert!(parse_se_all("Just A Movie.mkv").is_empty());
+    }
+
+    #[test]
+    fn parse_se_all_handles_multi_episode_files() {
+        // Contiguous multi-episode files contribute ALL their episodes (so `provides` is complete and
+        // the reconciler doesn't re-acquire a contained episode as a duplicate singleton).
+        assert_eq!(
+            parse_se_all("Show.S01E01E02.1080p.mkv"),
+            vec![(1, 1), (1, 2)]
+        );
+        assert_eq!(parse_se_all("Show.S01E01-E02.mkv"), vec![(1, 1), (1, 2)]);
+        assert_eq!(
+            parse_se_all("Show S02E03E04E05.mkv"),
+            vec![(2, 3), (2, 4), (2, 5)]
+        );
+        // A resolution/codec token after the episode must NOT be parsed as a further episode (the
+        // continuation requires an explicit `e` before each number).
+        assert_eq!(parse_se_all("Show.S01E01.1080p.x265.mkv"), vec![(1, 1)]);
+        assert_eq!(parse_se_all("Show.S01E07.720p.WEB.mkv"), vec![(1, 7)]);
+    }
+
+    #[test]
+    fn episode_files_extracts_dash_concatenated_pack() {
+        // A pre-existing absolute/concatenated-coded season pack must report its episodes (so the
+        // reconciler doesn't re-acquire them as per-episode duplicates).
+        let info = TI {
+            hash: "h".into(),
+            files: vec![
+                TorrentFile {
+                    id: 0,
+                    path: "Rick and Morty - 409 - Childrick of Mort.mkv".into(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                },
+                TorrentFile {
+                    id: 1,
+                    path: "Rick and Morty - 410 - Star Mort.mkv".into(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut eps: Vec<(u32, u32)> = episode_files(&info)
+            .into_iter()
+            .map(|(s, e, _)| (s, e))
+            .collect();
+        eps.sort_unstable();
+        assert_eq!(eps, vec![(4, 9), (4, 10)]);
+    }
+
+    #[test]
+    fn episode_files_reports_all_episodes_of_a_multi_episode_file() {
+        // A single file covering two episodes must report BOTH (and both point to that file), so the
+        // reconciler sees the second episode as owned instead of re-acquiring it as a duplicate.
+        let info = TI {
+            hash: "h".into(),
+            files: vec![TorrentFile {
+                id: 0,
+                path: "Show.S01E01E02.1080p.mkv".into(),
+                bytes: 2_000_000_000,
+                selected: 1,
+            }],
+            ..Default::default()
+        };
+        let eps = episode_files(&info);
+        assert_eq!(
+            eps,
+            vec![
+                (1, 1, "Show.S01E01E02.1080p.mkv".to_string()),
+                (1, 2, "Show.S01E01E02.1080p.mkv".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn locator_for_pairs_link_by_selected_position() {
+        // The per-file CDN link is paired by position among the SELECTED files only — an unselected
+        // file must NOT advance the link index, or playback resolves the wrong file's bytes.
+        let info = TI {
+            id: "tid".into(),
+            hash: "h".into(),
+            files: vec![
+                TorrentFile {
+                    id: 9,
+                    path: "Unselected.mkv".into(),
+                    bytes: 1,
+                    selected: 0,
+                },
+                TorrentFile {
+                    id: 5,
+                    path: "A.mkv".into(),
+                    bytes: 1,
+                    selected: 1,
+                },
+                TorrentFile {
+                    id: 6,
+                    path: "B.mkv".into(),
+                    bytes: 1,
+                    selected: 1,
+                },
+            ],
+            links: vec!["urlA".into(), "urlB".into()],
+            ..Default::default()
+        };
+        // A is selected-position 0 (the unselected file does not consume a link slot).
+        let a = locator_for(&info, "h", "A.mkv");
+        assert_eq!(a.file_id, 5);
+        assert_eq!(a.link.as_deref(), Some("urlA"));
+        // B is selected-position 1, NOT 2 — only selected files advance the index.
+        let b = locator_for(&info, "h", "B.mkv");
+        assert_eq!(b.file_id, 6);
+        assert_eq!(b.link.as_deref(), Some("urlB"));
+        // A path that matches nothing → a safe default (file_id 0, no link).
+        let missing = locator_for(&info, "h", "Nope.mkv");
+        assert_eq!(missing.file_id, 0);
+        assert_eq!(missing.link, None);
+        // A provider with no per-file links (TorBox) → link None, but the file_id is still correct.
+        let no_links = TI {
+            links: vec![],
+            ..info.clone()
+        };
+        let tb = locator_for(&no_links, "h", "B.mkv");
+        assert_eq!(tb.file_id, 6);
+        assert_eq!(tb.link, None);
+    }
 
     fn store() -> Store {
         Store::from_database(Arc::new(

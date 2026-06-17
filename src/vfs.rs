@@ -12,14 +12,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// i.e. exactly the pre-SP3 behaviour (external / un-managed torrents are unaffected).
 pub type SelectionMap = std::collections::HashMap<String, crate::store::SelectionEntry>;
 
-/// Parse a SxxExx episode code from a file name. Mirrors `acquire::parse_se`.
+/// Parse the FIRST SxxExx episode code from a file name (for folder/season placement and the SP3
+/// selection-slot key). Mirrors the primary `SxxExx` match + dash-concatenated "Show - 409 - Title"
+/// → S04E09 fallback of `acquire::parse_se_all`; the multi-episode continuation `acquire::parse_se_all`
+/// adds is deliberately NOT needed here — VFS builds one node per file (a double-episode file is one
+/// `.strm` placed under its first episode's season), so a single representative `(season, episode)`
+/// is exactly right.
 fn parse_se(name: &str) -> Option<(u32, u32)> {
     static SE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})e(\d{1,3})").unwrap());
-    let c = SE.captures(name)?;
-    Some((
-        c.get(1)?.as_str().parse().ok()?,
-        c.get(2)?.as_str().parse().ok()?,
-    ))
+    if let Some(c) = SE.captures(name) {
+        return Some((
+            c.get(1)?.as_str().parse().ok()?,
+            c.get(2)?.as_str().parse().ok()?,
+        ));
+    }
+    // Exactly 3 digits (season 1–9): excludes 4-digit year/date tokens that would mis-decode (see
+    // `acquire::parse_se_all`). Kept identical to that copy's fallback.
+    static DASH_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s-\s(\d{3})\s-\s").unwrap());
+    let code: u32 = DASH_CODE.captures(name)?.get(1)?.as_str().parse().ok()?;
+    let (season, episode) = (code / 100, code % 100);
+    (season >= 1 && episode >= 1).then_some((season, episode))
 }
 
 /// Extract the numeric tmdb id from a `MediaMetadata.external_id` like `"tmdb:1396"`.
@@ -328,36 +340,50 @@ impl DebridVfs {
             let mut folder_inserted = false;
             match metadata.media_type {
                 MediaType::Movie => {
-                    let mut children = BTreeMap::new();
-                    // SP3: if a managed selection names a hash present in this group, that torrent
-                    // represents the movie; else fall back to the largest (torrents are size-sorted).
-                    let chosen = tmdb_id_of(&metadata)
+                    // SP3: prefer the managed-selection torrent (if present in this group); else the
+                    // largest (torrents are size-sorted). Then fall back to the next candidate that
+                    // actually yields a streamable video file, so a movie whose top choice is
+                    // archive-only (RAR/ZIP) doesn't vanish when a smaller streamable copy exists.
+                    let selected_hash = tmdb_id_of(&metadata)
                         .and_then(|id| selection.get(&crate::store::movie_slot(id)))
-                        .and_then(|sel| {
-                            torrents
-                                .iter()
-                                .find(|t| t.hash.eq_ignore_ascii_case(&sel.hash))
-                        })
-                        .or_else(|| torrents.first());
-                    if let Some(torrent) = chosen {
-                        let torrent_ts = parse_rd_date(&torrent.added);
-                        Self::add_torrent_files(&mut children, torrent);
-                        if !children.is_empty() {
-                            let prefix = format!("Movies/{}", folder_name);
-                            for name in children.keys() {
-                                timestamps.insert(format!("{}/{}", prefix, name), torrent_ts);
-                            }
-                            let nfo_content = Self::generate_nfo(&metadata);
-                            children.insert(
-                                "movie.nfo".to_string(),
-                                VfsNode::VirtualFile {
-                                    content: nfo_content,
-                                },
-                            );
-                            timestamps.insert(format!("{}/movie.nfo", prefix), torrent_ts);
-                            nodes.insert(folder_name, VfsNode::Directory { children });
-                            folder_inserted = true;
+                        .map(|sel| sel.hash.clone());
+                    let mut ordered: Vec<&TorrentInfo> = Vec::with_capacity(torrents.len());
+                    if let Some(h) = &selected_hash {
+                        if let Some(t) = torrents.iter().find(|t| t.hash.eq_ignore_ascii_case(h)) {
+                            ordered.push(t);
                         }
+                    }
+                    for t in &torrents {
+                        if selected_hash
+                            .as_ref()
+                            .is_some_and(|h| t.hash.eq_ignore_ascii_case(h))
+                        {
+                            continue; // selection-matched torrent is already at the front
+                        }
+                        ordered.push(t);
+                    }
+                    for torrent in ordered {
+                        let mut children = BTreeMap::new();
+                        Self::add_torrent_files(&mut children, torrent);
+                        if children.is_empty() {
+                            continue; // no streamable video in this candidate — try the next
+                        }
+                        let torrent_ts = parse_rd_date(&torrent.added);
+                        let prefix = format!("Movies/{}", folder_name);
+                        for name in children.keys() {
+                            timestamps.insert(format!("{}/{}", prefix, name), torrent_ts);
+                        }
+                        let nfo_content = Self::generate_nfo(&metadata);
+                        children.insert(
+                            "movie.nfo".to_string(),
+                            VfsNode::VirtualFile {
+                                content: nfo_content,
+                            },
+                        );
+                        timestamps.insert(format!("{}/movie.nfo", prefix), torrent_ts);
+                        nodes.insert(folder_name.clone(), VfsNode::Directory { children });
+                        folder_inserted = true;
+                        break;
                     }
                 }
                 MediaType::Show => {
@@ -440,15 +466,25 @@ impl DebridVfs {
                                                 }
                                             }
                                         }
-                                        let season = SEASON_RE
-                                            .captures(filename)
-                                            .and_then(|cap| {
-                                                cap.get(1)
-                                                    .or_else(|| cap.get(2))
-                                                    .or_else(|| cap.get(3))
-                                                    .or_else(|| cap.get(4))
+                                        // Prefer `parse_se` for the folder season: it handles both
+                                        // SxxExx AND the dash-concatenated "Show - 409 - Title"
+                                        // absolute-code form, so such a pack's episodes land in the
+                                        // right Season folder. Fall back to SEASON_RE for the
+                                        // patterns parse_se doesn't cover ("1x09", "Season 4",
+                                        // "Part 2"), then default to season 1.
+                                        let season = parse_se(filename)
+                                            .map(|(s, _)| s)
+                                            .or_else(|| {
+                                                SEASON_RE
+                                                    .captures(filename)
+                                                    .and_then(|cap| {
+                                                        cap.get(1)
+                                                            .or_else(|| cap.get(2))
+                                                            .or_else(|| cap.get(3))
+                                                            .or_else(|| cap.get(4))
+                                                    })
+                                                    .and_then(|m| m.as_str().parse::<u32>().ok())
                                             })
-                                            .and_then(|m| m.as_str().parse::<u32>().ok())
                                             .unwrap_or(1);
 
                                         let season_name = format!("Season {:02}", season);
@@ -748,6 +784,20 @@ fn sanitize_filename(name: &str) -> String {
 static EXCLUDED_VIDEO_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(sample|trailer|extras?|bonus|featurette)\b").unwrap());
 
+/// A real title whose FIRST token is `trailer`/`extra(s)` followed by a separator and more content —
+/// the show "Extras", "Trailer Park Boys", the movie "Extras 2020" — must NOT be excluded. Only these
+/// two keywords are realistic leading title words; `sample`/`bonus`/`featurette` essentially never
+/// lead a real title (and `sample-<release>.mkv` is a real ancillary form), so they are NOT given the
+/// leading exception. Matched against the filename stem (extension stripped).
+static EXCLUDED_LEADING_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(trailer|extras?)[._\s-]").unwrap());
+
+/// An SxxExx episode code marks a real episode — a sample/trailer/extra never carries one — so a
+/// file with one is kept even if its title contains an excluded keyword mid-name (or it is a real
+/// episode mis-foldered under an extras/bonus directory).
+static EPISODE_CODE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)s\d{1,2}e\d{1,3}").unwrap());
+
 /// Regex matching release-site / release-group advertisement clips that ship
 /// alongside the real media (e.g. `RARBG.com.mp4`, `www.YTS.MX.mp4`). Matched
 /// against the filename *stem* (extension stripped) and anchored end-to-end, so
@@ -776,25 +826,48 @@ const EXCLUDED_DIRS: &[&str] = &[
 pub fn is_video_file(path: &str) -> bool {
     let lower = path.to_lowercase();
     let filename = lower.rsplit('/').next().unwrap_or(&lower);
-    if EXCLUDED_VIDEO_RE.is_match(filename) {
-        return false;
-    }
-    // Exclude release-site / release-group advertisement clips (e.g. "RARBG.com.mp4")
-    // by testing the filename with its video extension stripped.
+    // The filename stem (video extension stripped) — used by the leading-keyword/episode/promo checks.
     let stem = VIDEO_EXTENSIONS
         .iter()
         .find_map(|ext| filename.strip_suffix(ext))
         .unwrap_or(filename);
+    let episode = EPISODE_CODE_RE.find(stem);
+    // Decide whether an excluded keyword (sample/trailer/extras/…) marks this as an ANCILLARY clip
+    // rather than real content. A genuine ancillary file carries the keyword as a DESCRIPTOR; a real
+    // title carries it as the LEADING token (the show "Extras"/"Trailer Park Boys") or BEFORE the
+    // episode code (e.g. "Some.Trailer.Show.S02E03"). A keyword that appears AFTER the episode code is
+    // a descriptor on an ancillary clip ("Show.S01E01.sample"); so is one with no episode code that
+    // does not lead the title. An episode code alone does NOT rescue a trailing-descriptor sample.
+    let ancillary = match EXCLUDED_VIDEO_RE.find(stem) {
+        None => false,
+        Some(kw) => {
+            if EXCLUDED_LEADING_RE.is_match(stem) {
+                false
+            } else {
+                match &episode {
+                    Some(ep) => kw.start() >= ep.start(),
+                    None => true,
+                }
+            }
+        }
+    };
+    if ancillary {
+        return false;
+    }
+    // Exclude release-site / release-group advertisement clips (e.g. "RARBG.com.mp4").
     if EXCLUDED_PROMO_RE.is_match(stem) {
         return false;
     }
-    // Exclude files in directories that indicate extras/bonus content
-    for component in lower.split('/') {
-        if component == filename {
-            continue;
-        }
-        if EXCLUDED_DIRS.contains(&component) {
-            return false;
+    // Exclude files in directories that indicate extras/bonus content — unless the file is a real
+    // episode (a mis-foldered "Extras/Show.S01E01.mkv" episode must not be dropped).
+    if episode.is_none() {
+        for component in lower.split('/') {
+            if component == filename {
+                continue;
+            }
+            if EXCLUDED_DIRS.contains(&component) {
+                return false;
+            }
         }
     }
     VIDEO_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
@@ -1097,6 +1170,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn build_falls_back_to_streamable_movie_when_largest_is_archive_only() {
+        // Two torrents in the same movie group: the LARGER is archive-only (RAR — unstreamable),
+        // the smaller has a real video. The movie must still appear, sourced from the streamable
+        // copy, rather than vanishing because the largest candidate yields no video.
+        let archive = (
+            TorrentInfo {
+                id: "big".to_string(),
+                filename: "Movie.2020.2160p".to_string(),
+                hash: "harchive".to_string(),
+                bytes: 9_000_000_000,
+                status: "downloaded".to_string(),
+                added: "2020-01-01".to_string(),
+                files: vec![TorrentFile {
+                    id: 1,
+                    path: "Movie.2020.2160p.rar".to_string(),
+                    bytes: 9_000_000_000,
+                    selected: 1,
+                }],
+                ..Default::default()
+            },
+            MediaMetadata {
+                title: "Movie".to_string(),
+                year: Some("2020".to_string()),
+                media_type: MediaType::Movie,
+                external_id: Some("tmdb:500".to_string()),
+            },
+        );
+        let streamable = (
+            TorrentInfo {
+                id: "small".to_string(),
+                filename: "Movie.2020.1080p".to_string(),
+                hash: "hvideo".to_string(),
+                bytes: 2_000_000_000,
+                status: "downloaded".to_string(),
+                added: "2020-01-01".to_string(),
+                files: vec![TorrentFile {
+                    id: 1,
+                    path: "Movie.2020.1080p.mkv".to_string(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                }],
+                ..Default::default()
+            },
+            MediaMetadata {
+                title: "Movie".to_string(),
+                year: Some("2020".to_string()),
+                media_type: MediaType::Movie,
+                external_id: Some("tmdb:500".to_string()),
+            },
+        );
+        // Archive-only listed first (it is the larger of the two).
+        let vfs = DebridVfs::build(vec![archive, streamable], &crate::vfs::SelectionMap::new());
+        let VfsNode::Directory { children } = &vfs.root else {
+            panic!("root is a directory");
+        };
+        let VfsNode::Directory { children: movies } = children.get("Movies").expect("Movies dir")
+        else {
+            panic!("Movies is a directory");
+        };
+        let (_, folder) = movies
+            .iter()
+            .next()
+            .expect("the movie folder must exist (not vanish to the archive-only torrent)");
+        let VfsNode::Directory { children: files } = folder else {
+            panic!("movie folder is a directory");
+        };
+        assert!(
+            files.contains_key("Movie.2020.1080p.mkv"),
+            "the streamable copy must be surfaced, got: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1531,6 +1678,67 @@ mod tests {
     }
 
     #[test]
+    fn build_places_dash_coded_episode_in_correct_season_folder() {
+        // A dash-concatenated absolute-code file ("Show - 409 - Title") must land in Season 04, not
+        // Season 01 — the season folder is derived via parse_se (which decodes the dash code), with
+        // SEASON_RE (which cannot) as a fallback only.
+        let torrents = vec![(
+            TorrentInfo {
+                id: "s1".to_string(),
+                filename: "Rick and Morty - 409 - Childrick of Mort.mkv".to_string(),
+                original_filename: "Rick and Morty - 409 - Childrick of Mort.mkv".to_string(),
+                hash: "h1".to_string(),
+                bytes: 3000,
+                original_bytes: 3000,
+                host: "host".to_string(),
+                split: 1,
+                progress: 100.0,
+                status: "downloaded".to_string(),
+                added: "2024-01-01".to_string(),
+                files: vec![TorrentFile {
+                    id: 1,
+                    path: "/Rick and Morty - 409 - Childrick of Mort.mkv".to_string(),
+                    bytes: 3000,
+                    selected: 1,
+                }],
+                links: vec!["http://link1".to_string()],
+                ended: Some("2024-01-01".to_string()),
+            },
+            MediaMetadata {
+                title: "Rick and Morty".to_string(),
+                year: Some("2014".to_string()),
+                media_type: MediaType::Show,
+                external_id: Some("tmdb:60625".to_string()),
+            },
+        )];
+
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
+
+        if let VfsNode::Directory { children } = &vfs.root {
+            let shows = children.get("Shows").expect("Shows dir");
+            if let VfsNode::Directory {
+                children: show_children,
+            } = shows
+            {
+                let show_dir = show_children.values().next().expect("one show folder");
+                if let VfsNode::Directory { children: seasons } = show_dir {
+                    assert!(
+                        seasons.contains_key("Season 04"),
+                        "expected Season 04, got {:?}",
+                        seasons.keys().collect::<Vec<_>>()
+                    );
+                    assert!(
+                        !seasons.contains_key("Season 01"),
+                        "dash-coded episode must NOT fall back to Season 01"
+                    );
+                } else {
+                    panic!("show dir is not a directory");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_show_same_tmdb_id_different_title_case() {
         // When two torrents have the same TMDB external_id but different title
         // casing (e.g. TMDB returned "Ted" one time and "ted" another), they
@@ -1834,6 +2042,37 @@ mod tests {
     fn is_video_file_no_false_positive_on_trailer_substring() {
         // "Trailerman" contains "trailer" as a substring but should NOT be filtered
         assert!(is_video_file("Trailerman.2024.mkv"));
+    }
+
+    #[test]
+    fn is_video_file_keeps_title_whose_first_word_is_an_excluded_keyword() {
+        // The keyword leads the real title — a show ("Extras", "Trailer Park Boys") or a movie
+        // ("Extras 2020") — so the file must be KEPT, not dropped as an ancillary clip.
+        assert!(is_video_file("Extras.S01E01.720p.mkv"));
+        assert!(is_video_file("Trailer.Park.Boys.S05E01.1080p.mkv"));
+        assert!(is_video_file("Extras.2020.1080p.BluRay.mkv"));
+        // A real title with the keyword mid-name BEFORE the episode code is kept.
+        assert!(is_video_file("Some.Trailer.Show.S02E03.mkv"));
+        // A real episode mis-foldered under an extras/bonus directory is still kept.
+        assert!(is_video_file("Extras/Extras.S01E01.mkv"));
+        // But genuine ancillary clips are STILL excluded (no leading keyword, no episode code).
+        assert!(!is_video_file("Movie.2020.1080p.sample.mkv"));
+        assert!(!is_video_file("The.Movie.Name.Trailer.mkv"));
+        assert!(!is_video_file("Movie.2020/Extras/featurette.mkv"));
+        assert!(!is_video_file("sample.mkv"));
+    }
+
+    #[test]
+    fn is_video_file_excludes_episode_coded_ancillary_clips() {
+        // An episode code must NOT rescue a sample/trailer whose keyword is a TRAILING descriptor
+        // (after the episode marker) — scene/P2P sample files carry the full release name + code.
+        assert!(!is_video_file(
+            "The.Office.S01E01.1080p.BluRay.x264-GRP.sample.mkv"
+        ));
+        assert!(!is_video_file("show.s01e01.1080p-grp.sample.mkv"));
+        assert!(!is_video_file("Sample/show.s01e01.1080p-grp.sample.mkv"));
+        // `sample-<release>.mkv` is a real ancillary form — `sample` is NOT a leading-title keyword.
+        assert!(!is_video_file("sample-the.matrix.1999.1080p.mkv"));
     }
 
     #[test]

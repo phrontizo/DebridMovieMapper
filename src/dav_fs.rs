@@ -15,6 +15,18 @@ const BUFFER_SIZE: usize = 2 * 1024 * 1024;
 /// Maximum single CDN fetch to prevent unbounded memory growth (16 MB)
 const MAX_FETCH_SIZE: usize = 16 * 1024 * 1024;
 
+/// Parse the start byte from a `Content-Range: bytes <start>-<end>/<total>` header value.
+/// `None` for an absent/unparseable value (callers then tolerate it rather than reject).
+fn parse_content_range_start(v: &str) -> Option<u64> {
+    v.trim()
+        .strip_prefix("bytes ")?
+        .split('-')
+        .next()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
 #[derive(Clone)]
 pub struct DebridFileSystem {
     vfs: Arc<RwLock<DebridVfs>>,
@@ -82,6 +94,15 @@ impl DavFileSystem for DebridFileSystem {
         async move {
             let rel = path.as_rel_ospath();
             let vfs_path = rel.to_string_lossy().into_owned();
+            // Timestamp lookup key, normalised exactly like the `metadata`/`read_dir` paths so an
+            // opened file reports the SAME mtime it does when listed (see below — the open-file
+            // metadata used to hardcode UNIX_EPOCH, confusing media-server change detection).
+            let ts_key = rel
+                .to_str()
+                .unwrap_or("")
+                .trim_matches('/')
+                .trim_start_matches("./")
+                .to_string();
             let name = rel
                 .to_str()
                 .and_then(|s| s.rsplit('/').next())
@@ -94,6 +115,7 @@ impl DavFileSystem for DebridFileSystem {
                 Media {
                     file_size: u64,
                     locator: crate::provider::FileLocator,
+                    modified_time: SystemTime,
                 },
                 Virtual(Vec<u8>),
             }
@@ -103,13 +125,18 @@ impl DavFileSystem for DebridFileSystem {
                     VfsNode::MediaFile { file_size, locator } => Payload::Media {
                         file_size: *file_size,
                         locator: locator.clone(),
+                        modified_time: vfs.timestamps.get(&ts_key).copied().unwrap_or(UNIX_EPOCH),
                     },
                     VfsNode::VirtualFile { content } => Payload::Virtual(content.clone()),
                     VfsNode::Directory { .. } => return Err(FsError::Forbidden),
                 }
             };
             match payload {
-                Payload::Media { file_size, locator } => Ok(Box::new(ProxiedMediaFile {
+                Payload::Media {
+                    file_size,
+                    locator,
+                    modified_time,
+                } => Ok(Box::new(ProxiedMediaFile {
                     name,
                     locator,
                     file_size,
@@ -122,6 +149,8 @@ impl DavFileSystem for DebridFileSystem {
                     buffer_start: 0,
                     read_activity: self.read_activity.clone(),
                     vfs_path,
+                    modified_time,
+                    confirmed_read: false,
                 }) as Box<dyn DavFile>),
                 Payload::Virtual(content) => Ok(Box::new(VirtualFile {
                     content: Bytes::from(content),
@@ -241,7 +270,6 @@ impl DavDirEntry for DebridDirEntry {
 
 /// A media file that lazily unrestricts its RD link and proxies CDN bytes.
 /// The CDN URL is cached per open instance. Reads use a 2 MB read-ahead buffer.
-#[derive(Debug)]
 struct ProxiedMediaFile {
     name: String,
     locator: crate::provider::FileLocator,
@@ -255,6 +283,29 @@ struct ProxiedMediaFile {
     buffer_start: u64,
     read_activity: Arc<crate::read_activity::ReadActivity>,
     vfs_path: String,
+    /// Real per-torrent mtime (from the VFS `timestamps`), captured at open so the opened-file
+    /// metadata matches what `read_dir`/`metadata` report for the same path.
+    modified_time: SystemTime,
+    /// Set once the first CDN fetch succeeds, so the repair-budget reset (`note_read_success`) fires
+    /// at most once per opened file rather than per chunk.
+    confirmed_read: bool,
+}
+
+// `DavFile` requires `Debug` as a supertrait, but this struct holds two capability values in the
+// clear — `locator.link` (the RD restricted link) and `cdn_url` (the signed CDN download URL) — so
+// an auto-derived Debug would let a stray `{:?}` (e.g. a future dav-server trace, or our own
+// logging) leak them. Redact like `RealDebridClient`/`TorBoxClient`: print only the non-sensitive
+// identity (name + hash), never the link or the resolved CDN URL.
+impl std::fmt::Debug for ProxiedMediaFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxiedMediaFile")
+            .field("name", &self.name)
+            .field("hash", &self.locator.hash)
+            .field("file_size", &self.file_size)
+            .field("pos", &self.pos)
+            // locator.link, cdn_url, and buffer are deliberately omitted (sensitive / large).
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProxiedMediaFile {
@@ -308,6 +359,10 @@ impl ProxiedMediaFile {
                 self.buffer = Bytes::new();
                 self.buffer_start = 0;
                 self.cdn_url = None;
+                // The repaired torrent has a different id — let the next confirmed read reset ITS
+                // repair budget via `note_read_success` (the old `confirmed_read` referred to the
+                // superseded torrent).
+                self.confirmed_read = false;
                 self.rd_client.invalidate(&old_locator).await;
                 match self.rd_client.resolve_url(&self.locator).await {
                     Ok(url) => {
@@ -337,7 +392,9 @@ impl ProxiedMediaFile {
 
     /// Fetch bytes from CDN, using the read-ahead buffer.
     async fn fetch_bytes(&mut self, len: usize) -> Result<Bytes, FsError> {
-        if self.pos >= self.file_size {
+        // A zero-length read needs no bytes — return early before the buffer-miss path forces a
+        // BUFFER_SIZE (2 MB) ranged GET that would just be discarded (`to_read = min(0, …) = 0`).
+        if len == 0 || self.pos >= self.file_size {
             return Ok(Bytes::new());
         }
 
@@ -358,6 +415,17 @@ impl ProxiedMediaFile {
         let fetch_size = len.clamp(BUFFER_SIZE, MAX_FETCH_SIZE) as u64;
         let range_end = std::cmp::min(pos + fetch_size - 1, self.file_size - 1);
         let body = self.fetch_cdn_range(pos, range_end).await?;
+
+        // A successful CDN fetch confirms the file genuinely works — reset its repair budget once per
+        // open (so the 3-attempt cap bounds only consecutive failed repairs, not separate incidents
+        // over the deployment's lifetime). `note_read_success` fast-paths a clean torrent, so this is
+        // cheap; doing it once (guarded by `confirmed_read`) avoids per-chunk work.
+        if !self.confirmed_read {
+            self.confirmed_read = true;
+            self.repair_manager
+                .note_read_success(&self.locator.torrent_id)
+                .await;
+        }
 
         self.buffer = body;
         self.buffer_start = pos;
@@ -402,10 +470,13 @@ impl ProxiedMediaFile {
                     // invalidating simultaneously forces every caller through the
                     // rate-limited resolve_url path and serialises them through the
                     // adaptive rate-limiter (~90 callers × 700 ms ≈ 63 s hang).
+                    // `e.without_url()` strips the signed CDN URL from the error's Display —
+                    // `reqwest::Error` embeds the request URL otherwise, leaking the sensitive
+                    // capability link into the logs (matches the scrubbing probe.rs already does).
                     tracing::warn!(
                         "CDN fetch failed for {}: {} — retrying with same URL",
                         self.name,
-                        e
+                        e.without_url()
                     );
                     if attempt == 0 {
                         continue;
@@ -437,7 +508,19 @@ impl ProxiedMediaFile {
                     .is_some_and(|cl| cl > MAX_FETCH_SIZE as u64),
                 _ => false,
             };
-            if !acceptable || oversized {
+            // For a 206, defensively confirm the CDN returned the range we asked for: a non-compliant
+            // CDN that answers 206 with a DIFFERENT start would otherwise be buffered at
+            // `buffer_start = pos`, silently serving wrong bytes. An absent/unparseable Content-Range
+            // is tolerated (the byte cap + emptiness checks still apply); only a parseable start that
+            // disagrees with `pos` is rejected (treated like an expired URL).
+            let range_mismatch = status == reqwest::StatusCode::PARTIAL_CONTENT
+                && resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_content_range_start)
+                    .is_some_and(|start| start != pos);
+            if !acceptable || oversized || range_mismatch {
                 tracing::warn!(
                     "CDN returned {} for {} at offset {} — clearing cached CDN URL",
                     status,
@@ -488,7 +571,12 @@ impl ProxiedMediaFile {
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        tracing::warn!("CDN body read failed for {}: {}", self.name, e);
+                        // Strip the signed CDN URL from the error Display (see above).
+                        tracing::warn!(
+                            "CDN body read failed for {}: {}",
+                            self.name,
+                            e.without_url()
+                        );
                         return Err(FsError::GeneralFailure);
                     }
                 }
@@ -537,7 +625,7 @@ impl DavFile for ProxiedMediaFile {
             Ok(Box::new(DebridMetaData {
                 is_directory: false,
                 size: self.file_size,
-                modified_time: SystemTime::UNIX_EPOCH,
+                modified_time: self.modified_time,
             }) as Box<dyn DavMetaData>)
         }
         .boxed()
@@ -625,6 +713,8 @@ mod tests {
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
             vfs_path: String::new(),
+            modified_time: SystemTime::UNIX_EPOCH,
+            confirmed_read: false,
         };
     }
 
@@ -930,6 +1020,8 @@ mod provider_abstraction_tests {
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
             vfs_path: String::new(),
+            modified_time: SystemTime::UNIX_EPOCH,
+            confirmed_read: false,
         };
         assert_eq!(f.locator.file_id, 3);
     }
@@ -977,6 +1069,8 @@ mod provider_abstraction_tests {
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
             vfs_path: String::new(),
+            modified_time: SystemTime::UNIX_EPOCH,
+            confirmed_read: false,
         };
 
         // The 200 carries the file from offset 0, not from 500 — serving it would hand the
@@ -1032,6 +1126,8 @@ mod provider_abstraction_tests {
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
             vfs_path: String::new(),
+            modified_time: SystemTime::UNIX_EPOCH,
+            confirmed_read: false,
         }
     }
 
@@ -1164,6 +1260,8 @@ mod provider_abstraction_tests {
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
             vfs_path: String::new(),
+            modified_time: SystemTime::UNIX_EPOCH,
+            confirmed_read: false,
         };
         (f, counter)
     }
@@ -1209,6 +1307,101 @@ mod provider_abstraction_tests {
         assert_eq!(&data[..], b"FRESHBYT");
     }
 
+    #[test]
+    fn parse_content_range_start_extracts_start() {
+        assert_eq!(parse_content_range_start("bytes 100-199/100000"), Some(100));
+        assert_eq!(parse_content_range_start("bytes 0-9/*"), Some(0));
+        assert_eq!(parse_content_range_start("nonsense"), None);
+        assert_eq!(parse_content_range_start("bytes abc-9/100"), None);
+    }
+
+    /// Server that always answers `206` claiming it started at byte `start`, regardless of the
+    /// requested Range — used to exercise the Content-Range mismatch guard.
+    async fn spawn_206_claiming_start(start: u64, body: &'static [u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let end = start as usize + body.len() - 1;
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/100000\r\nContent-Length: {}\r\n\r\n",
+                    start, end, body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{}/", addr)
+    }
+
+    #[tokio::test]
+    async fn fetch_cdn_range_rejects_206_with_mismatched_content_range() {
+        // We request pos=100 but the CDN answers 206 claiming it started at byte 0. Buffering it at
+        // buffer_start=100 would silently serve the wrong bytes — the read must reject (invalidate).
+        let url = spawn_206_claiming_start(0, b"WRONGBYTES").await;
+        let (mut f, invalidate_calls) = proxied_with_counter(url, 100, 100_000);
+        let r = f.fetch_bytes(8).await;
+        assert!(
+            r.is_err(),
+            "a 206 whose Content-Range start disagrees with the request must not be served"
+        );
+        assert!(
+            invalidate_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "a mismatched 206 must invalidate the cached resolution"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_bytes_zero_len_returns_empty_without_network() {
+        // A zero-length read must short-circuit before any CDN fetch (the server here would error).
+        let url = spawn_connection_closing().await;
+        let (mut f, invalidate_calls) = proxied_with_counter(url, 0, 1000);
+        let out = f.fetch_bytes(0).await.expect("zero-length read is Ok");
+        assert!(out.is_empty());
+        assert_eq!(
+            invalidate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a zero-length read must not touch the network"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_reports_plumbed_mtime() {
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
+        let repair = Arc::new(RepairManager::new(provider.clone()));
+        let ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut f = ProxiedMediaFile {
+            name: "M.mkv".into(),
+            locator: crate::provider::FileLocator::default(),
+            file_size: 42,
+            repair_manager: repair,
+            rd_client: provider,
+            http_client: reqwest::Client::new(),
+            pos: 0,
+            cdn_url: None,
+            buffer: bytes::Bytes::new(),
+            buffer_start: 0,
+            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            vfs_path: String::new(),
+            modified_time: ts,
+            confirmed_read: false,
+        };
+        let md = f.metadata().await.unwrap();
+        assert_eq!(
+            md.modified().unwrap(),
+            ts,
+            "opened-file mtime is the plumbed value"
+        );
+        assert_eq!(md.len(), 42);
+    }
+
     #[tokio::test]
     async fn read_bytes_stamps_read_activity() {
         use crate::read_activity::ReadActivity;
@@ -1233,6 +1426,8 @@ mod provider_abstraction_tests {
             buffer_start: 0,
             read_activity: ra.clone(),
             vfs_path: "Movies/X/x.mkv".into(),
+            modified_time: SystemTime::UNIX_EPOCH,
+            confirmed_read: false,
         };
         // The CDN fetch will fail (unroutable URL), but the stamp happens before the fetch.
         let _ = f.read_bytes(4).await;
@@ -1296,6 +1491,8 @@ mod provider_abstraction_tests {
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
             vfs_path: String::new(),
+            modified_time: SystemTime::UNIX_EPOCH,
+            confirmed_read: false,
         };
 
         let url = f
@@ -1363,6 +1560,8 @@ mod provider_abstraction_tests {
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
             vfs_path: String::new(),
+            modified_time: SystemTime::UNIX_EPOCH,
+            confirmed_read: false,
         };
 
         // The read still fails (the repaired CDN also 500s), but repair must have been attempted —

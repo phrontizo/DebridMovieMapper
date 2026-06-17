@@ -13,16 +13,26 @@ use std::time::{Duration, Instant};
 /// files and returns `(new_torrent_id, post_add_info)`. On any failure after the add — including the
 /// file list never resolving within `max_wait` — the leaked torrent is deleted before returning
 /// `Err` (so nothing leaks). The caller decides cached-vs-not by re-fetching final info.
+///
+/// `protect_id`: a torrent id that must NEVER be deleted by the failure cleanup. This guards the
+/// same-hash re-add on providers (TorBox) whose `add_magnet` recovers the EXISTING torrent by
+/// infohash and returns its **same** id — there the "added" torrent IS the real torrent under
+/// repair, so deleting it on a transient failure (e.g. a re-activating torrent that briefly reports
+/// `files: null`) would be permanent data loss. Real-Debrid mints a fresh id, so its leaked-torrent
+/// cleanup is unaffected (`new_id != protect_id`). Pass `None` to always clean up.
 pub async fn materialise(
     provider: &dyn DebridProvider,
     hash: &str,
     settle: Duration,
     max_wait: Duration,
+    protect_id: Option<&str>,
     select: impl Fn(&TorrentInfo) -> Vec<u32>,
 ) -> Result<(String, TorrentInfo), AppError> {
     let magnet = format!("magnet:?xt=urn:btih:{}", hash);
     let added = provider.add_magnet(&magnet).await.map_err(AppError::Http)?;
     let new_id = added.id;
+    // Skip the leaked-torrent delete when the add recovered the protected (real) torrent.
+    let cleanup_ok = protect_id != Some(new_id.as_str());
 
     let deadline = Instant::now() + max_wait;
     let (info, ids) = loop {
@@ -32,7 +42,9 @@ pub async fn materialise(
         let info = match provider.get_torrent_info(&new_id).await {
             Ok(i) => i,
             Err(e) => {
-                let _ = provider.delete_torrent(&new_id).await;
+                if cleanup_ok {
+                    let _ = provider.delete_torrent(&new_id).await;
+                }
                 return Err(AppError::Http(e));
             }
         };
@@ -44,7 +56,9 @@ pub async fn materialise(
     };
 
     if ids.is_empty() {
-        let _ = provider.delete_torrent(&new_id).await;
+        if cleanup_ok {
+            let _ = provider.delete_torrent(&new_id).await;
+        }
         return Err(AppError::Repair(format!(
             "no matching files to select in torrent {}",
             new_id
@@ -56,7 +70,9 @@ pub async fn materialise(
         .collect::<Vec<_>>()
         .join(",");
     if let Err(e) = provider.select_files(&new_id, &ids_str).await {
-        let _ = provider.delete_torrent(&new_id).await;
+        if cleanup_ok {
+            let _ = provider.delete_torrent(&new_id).await;
+        }
         return Err(AppError::Http(e));
     }
     Ok((new_id, info))
@@ -99,6 +115,7 @@ mod tests {
             "H",
             Duration::from_millis(0),
             Duration::from_millis(0),
+            None,
             |info| {
                 info.files
                     .iter()
@@ -121,6 +138,7 @@ mod tests {
             "H",
             Duration::from_millis(0),
             Duration::from_millis(0),
+            None,
             |_| Vec::<u32>::new(),
         )
         .await;
@@ -204,6 +222,7 @@ mod tests {
             "H",
             Duration::from_millis(5),
             Duration::from_secs(2),
+            None,
             mkv_selector,
         )
         .await
@@ -223,9 +242,79 @@ mod tests {
             "H",
             Duration::from_millis(5),
             Duration::from_millis(40),
+            None,
             mkv_selector,
         )
         .await;
         assert!(r.is_err(), "must error after max_wait with no file list");
+    }
+
+    /// Provider that records delete_torrent calls — to prove `protect_id` suppresses the cleanup
+    /// delete when the (same-id) re-add returned the protected torrent.
+    #[derive(Debug, Default)]
+    struct DeleteRecordingProvider {
+        deleted: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl DebridProvider for DeleteRecordingProvider {
+        fn name(&self) -> &'static str {
+            "rec"
+        }
+        async fn get_torrents(&self) -> Result<Vec<crate::rd_client::Torrent>, reqwest::Error> {
+            Ok(vec![])
+        }
+        async fn get_torrent_info(&self, _id: &str) -> Result<TorrentInfo, reqwest::Error> {
+            // No files → selector matches nothing → materialise hits the cleanup-delete path.
+            Ok(TorrentInfo {
+                id: "tid".into(),
+                hash: "H".into(),
+                status: "downloading".into(),
+                ..Default::default()
+            })
+        }
+        async fn add_magnet(&self, _m: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+            Ok(AddMagnetResponse {
+                id: "tid".into(), // same id as protect_id — TorBox behaviour
+                uri: String::new(),
+            })
+        }
+        async fn select_files(&self, _t: &str, _f: &str) -> Result<(), reqwest::Error> {
+            Ok(())
+        }
+        async fn delete_torrent(&self, t: &str) -> Result<(), reqwest::Error> {
+            self.deleted.lock().unwrap().push(t.to_string());
+            Ok(())
+        }
+        async fn resolve_url(
+            &self,
+            _l: &crate::provider::FileLocator,
+        ) -> Result<String, crate::error::AppError> {
+            Err(crate::error::AppError::Unavailable)
+        }
+        async fn invalidate(&self, _l: &crate::provider::FileLocator) {}
+        async fn evict_expired_cache(&self) {}
+    }
+
+    #[tokio::test]
+    async fn materialise_protect_id_suppresses_cleanup_delete_on_failure() {
+        // Same-id re-add (new == protect_id) with no matching files: materialise must NOT delete the
+        // protected (real) torrent — that would be data loss on TorBox.
+        let provider = Arc::new(DeleteRecordingProvider::default());
+        let p: Arc<dyn DebridProvider> = provider.clone();
+        let r = materialise(
+            &*p,
+            "H",
+            Duration::from_millis(0),
+            Duration::from_millis(0),
+            Some("tid"),
+            |_| Vec::<u32>::new(),
+        )
+        .await;
+        assert!(r.is_err(), "no matching files → Err");
+        assert!(
+            provider.deleted.lock().unwrap().is_empty(),
+            "protect_id must suppress the cleanup delete of the real torrent, got: {:?}",
+            provider.deleted.lock().unwrap()
+        );
     }
 }

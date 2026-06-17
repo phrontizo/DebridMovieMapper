@@ -173,9 +173,27 @@ mod tests {
         assert_eq!(state.interval_ms, 200);
     }
 
-    #[test]
-    fn retry_after_cap_constant() {
-        assert_eq!(MAX_RETRY_AFTER_SECS, 300);
+    #[tokio::test]
+    async fn retry_after_is_capped_to_the_max() {
+        // BEHAVIOUR (not a literal pin): a Retry-After far beyond the cap must clamp the wait to
+        // MAX_RETRY_AFTER_SECS — a hostile/buggy header must never park the limiter for hours.
+        let limiter = AdaptiveRateLimiter::new();
+        let before = tokio::time::Instant::now();
+        limiter.record_throttle(Some(100_000)).await;
+        let wait = limiter
+            .state
+            .lock()
+            .await
+            .next_allowed
+            .duration_since(before);
+        assert!(
+            wait <= Duration::from_secs(MAX_RETRY_AFTER_SECS) + Duration::from_secs(1),
+            "a huge Retry-After must be clamped to the cap, was {wait:?}"
+        );
+        assert!(
+            wait >= Duration::from_secs(MAX_RETRY_AFTER_SECS) - Duration::from_secs(1),
+            "the cap should still be applied (wait near the cap), was {wait:?}"
+        );
     }
 
     fn now_unix_secs() -> f64 {

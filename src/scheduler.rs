@@ -6,6 +6,9 @@
 //! - **Trakt cycle task** = `sync_trakt` THEN `reconcile_wanted`, sequentially each tick (so the
 //!   reconciler sees the just-synced wanted set). Cadence: `TRAKT_SYNC_INTERVAL_SECS`.
 //! - **Episode monitor task** = `monitor_episodes`. Cadence: `TRAKT_EPISODE_CHECK_INTERVAL_SECS`.
+//! - **Upgrade task** (SP3) = `run_upgrade_once` (daily quality-upgrade + full-season consolidation).
+//!   Spawned ONLY when `config.upgrade.enabled()` (`UPGRADE_INTERVAL_SECS > 0`). Cadence:
+//!   `UPGRADE_INTERVAL_SECS`.
 //!
 //! The Trakt cycle + monitor tasks are spawned ONLY when `trakt_jobs_enabled(&app)` — i.e. both a
 //! Trakt client and `config.trakt` are present; otherwise the service runs exactly as before.
@@ -27,10 +30,40 @@ where
         if *shutdown.borrow() {
             return;
         }
-        job().await;
+        // Run the job, but cancel it promptly if shutdown fires MID-tick. A long tick (e.g. an
+        // upgrade budget staging many candidates, each polling the provider for seconds) must not
+        // delay graceful shutdown past the container's stop grace (→ SIGKILL) — the scan loop
+        // already bails mid-work, so the periodic jobs must too. Dropping the job future at an await
+        // point is safe: the jobs are idempotent and all persistence is via ACID redb writes, so the
+        // worst case is an added-but-unrecorded provider torrent, which the account-mirror/dedup pass
+        // reclaims on the next run.
+        // Run the job under `catch_unwind` so a panic in ONE tick is logged and the schedule
+        // continues, rather than unwinding `periodic` and silently disabling this subsystem for the
+        // process lifetime (a `JoinError` would otherwise surface only at shutdown). `catch_unwind`
+        // (not `tokio::spawn`) is used so the mid-tick cancellation below is preserved — spawning
+        // would detach the task on shutdown instead of dropping it. A caught panic leaves at worst an
+        // added-but-unrecorded provider torrent (same as the drop-on-shutdown case), reclaimed next run.
+        use futures_util::FutureExt;
+        tokio::select! {
+            res = std::panic::AssertUnwindSafe(job()).catch_unwind() => {
+                if res.is_err() {
+                    tracing::error!("periodic job panicked; tick aborted, schedule continues");
+                }
+            }
+            // shutdown signalled (Ok) or sender dropped (Err) — either way, stop.
+            _ = shutdown.changed() => return,
+        }
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
-            _ = shutdown.changed() => {}
+            // `changed()` resolving means either a shutdown signal OR the sender was dropped
+            // (Err). Both are terminal here: treat a dropped sender as shutdown so we exit rather
+            // than hot-spin re-running `job()` with no delay (a dropped sender resolves `changed()`
+            // immediately and forever while `borrow()` stays false).
+            res = shutdown.changed() => {
+                if res.is_err() {
+                    return;
+                }
+            }
         }
         if *shutdown.borrow() {
             return;
@@ -112,6 +145,7 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
                             &app.provider,
                             &app.tmdb_client,
                             &app.store,
+                            app.config.remove_finished_shows,
                         )
                         .await;
                     }
@@ -361,6 +395,45 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "job runs exactly once (the immediate run) before shutdown"
+        );
+    }
+
+    /// A shutdown signalled MID-tick cancels the in-flight job promptly, rather than waiting for a
+    /// long-running tick to finish (which would defeat graceful shutdown under a container stop grace).
+    #[tokio::test(start_paused = true)]
+    async fn periodic_cancels_in_flight_job_on_shutdown() {
+        use std::sync::atomic::AtomicBool;
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = watch::channel(false);
+
+        let s = started.clone();
+        let f = finished.clone();
+        let handle = tokio::spawn(periodic(Duration::from_secs(60), rx, move || {
+            let s = s.clone();
+            let f = f.clone();
+            async move {
+                s.store(true, Ordering::SeqCst);
+                // A long-running tick. If shutdown didn't cancel it, the task would block here.
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                f.store(true, Ordering::SeqCst);
+            }
+        }));
+
+        // Let the job start and park on its long sleep.
+        tokio::task::yield_now().await;
+        assert!(
+            started.load(Ordering::SeqCst),
+            "the job should have started"
+        );
+
+        // Signal shutdown mid-job; the task must return WITHOUT the 1h tick completing.
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "an in-flight job must be cancelled on shutdown, not run to completion"
         );
     }
 }

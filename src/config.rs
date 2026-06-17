@@ -79,7 +79,7 @@ pub struct QualityPrefs {
 ///
 /// Present only when both `TRAKT_CLIENT_ID` and `TRAKT_CLIENT_SECRET` are set;
 /// absent means Trakt sync is disabled and the service runs as before.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TraktConfig {
     pub client_id: String,
     pub client_secret: String,
@@ -92,6 +92,23 @@ pub struct TraktConfig {
     /// (the default) — every show you've ever watched with unwatched aired episodes qualifies.
     /// Parsed from `TRAKT_CATCHUP_LOOKBACK` (e.g. `90d`, `12w`, `6mo`; `0`/unset = all-time).
     pub catchup_lookback_secs: Option<u64>,
+}
+
+// Manual Debug redacts `client_secret` so a `debug!("{config:?}")` (or a panic message) can never
+// leak the Trakt app secret into the logs.
+impl std::fmt::Debug for TraktConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TraktConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("sync_interval_secs", &self.sync_interval_secs)
+            .field(
+                "episode_check_interval_secs",
+                &self.episode_check_interval_secs,
+            )
+            .field("catchup_lookback_secs", &self.catchup_lookback_secs)
+            .finish()
+    }
 }
 
 /// Parse a catch-up lookback like `90d`, `12w`, `6mo` (or a bare number = days) into seconds.
@@ -181,8 +198,8 @@ impl TraktConfig {
     }
 
     /// Read `TRAKT_CLIENT_ID`, `TRAKT_CLIENT_SECRET`, `TRAKT_SYNC_INTERVAL_SECS`,
-    /// and `TRAKT_EPISODE_CHECK_INTERVAL_SECS` from the process environment, then delegate
-    /// to `from_parts`.
+    /// `TRAKT_EPISODE_CHECK_INTERVAL_SECS`, and `TRAKT_CATCHUP_LOOKBACK` from the process
+    /// environment, then delegate to `from_parts`.
     pub fn from_env() -> Option<TraktConfig> {
         Self::from_parts(
             std::env::var("TRAKT_CLIENT_ID").ok(),
@@ -195,7 +212,7 @@ impl TraktConfig {
 }
 
 /// Acquisition-engine configuration (SP1). Held by `Config`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AcquisitionConfig {
     pub prefs: QualityPrefs,
     pub stall_timeout_secs: u64,
@@ -211,6 +228,28 @@ pub struct AcquisitionConfig {
     pub acquire_dead_timeout_secs: u64,
 }
 
+// Manual Debug redacts `scraper_addon_url` and `scraper_proxy_url` — both can embed credentials
+// (the Torrentio addon URL embeds the debrid token as `<provider>=<TOKEN>`; a proxy URL can embed
+// `user:password@`), so they must never reach the logs verbatim — only whether each is configured.
+impl std::fmt::Debug for AcquisitionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcquisitionConfig")
+            .field("prefs", &self.prefs)
+            .field("stall_timeout_secs", &self.stall_timeout_secs)
+            .field("max_acquire_attempts", &self.max_acquire_attempts)
+            .field(
+                "scraper_addon_url",
+                &self.scraper_addon_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "scraper_proxy_url",
+                &self.scraper_proxy_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("acquire_dead_timeout_secs", &self.acquire_dead_timeout_secs)
+            .finish()
+    }
+}
+
 impl Default for AcquisitionConfig {
     fn default() -> Self {
         Self::from_parts(None, None, None, None, None, None, None)
@@ -218,10 +257,13 @@ impl Default for AcquisitionConfig {
 }
 
 impl AcquisitionConfig {
-    fn parse_bool(s: Option<String>, default: bool) -> bool {
+    /// The single boolean-env parser for the whole crate (see `Config::from_env`'s `env_flag`,
+    /// which delegates here). Accepts `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off`
+    /// (case-insensitive); anything unrecognised (or absent) returns `default`.
+    pub(crate) fn parse_bool(s: Option<String>, default: bool) -> bool {
         match s.map(|s| s.trim().to_ascii_lowercase()) {
-            Some(v) if v == "true" || v == "1" || v == "yes" => true,
-            Some(v) if v == "false" || v == "0" || v == "no" => false,
+            Some(v) if v == "true" || v == "1" || v == "yes" || v == "on" => true,
+            Some(v) if v == "false" || v == "0" || v == "no" || v == "off" => false,
             _ => default,
         }
     }
@@ -302,11 +344,23 @@ impl AcquisitionConfig {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        a.acquire_dead_timeout_secs = std::env::var("ACQUIRE_DEAD_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(|n| n.max(120))
-            .unwrap_or(600);
+        // Warn (don't silently fall back) on an unparseable value, matching the other interval
+        // knobs — a typo like `ACQUIRE_DEAD_TIMEOUT_SECS=10m` should be visible, not indistinguishable
+        // from unset.
+        a.acquire_dead_timeout_secs = match std::env::var("ACQUIRE_DEAD_TIMEOUT_SECS").ok() {
+            Some(s) => s
+                .trim()
+                .parse::<u64>()
+                .unwrap_or_else(|_| {
+                    warn!(
+                        "Invalid ACQUIRE_DEAD_TIMEOUT_SECS value '{}', falling back to 600",
+                        s
+                    );
+                    600
+                })
+                .max(120),
+            None => 600,
+        };
         a
     }
 }
@@ -390,7 +444,7 @@ impl UpgradeConfig {
 /// settings, SP4) will supply runtime-tunable *preferences* alongside this; the
 /// startup values here (tokens, paths, port) are not runtime-overridable, so they
 /// are plain fields rather than accessors.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub provider_kind: ProviderKind,
     pub provider_token: String,
@@ -414,6 +468,27 @@ pub struct Config {
     pub remove_finished_shows: bool,
 }
 
+// Manual Debug redacts the provider token and TMDB API key so a `debug!("{config:?}")` (or a panic
+// message carrying the Config) can never leak credentials. `AcquisitionConfig`/`TraktConfig` have
+// their own redacting Debug impls (proxy URL / Trakt secret).
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("provider_kind", &self.provider_kind)
+            .field("provider_token", &"<redacted>")
+            .field("tmdb_api_key", &"<redacted>")
+            .field("scan_interval_secs", &self.scan_interval_secs)
+            .field("db_path", &self.db_path)
+            .field("port", &self.port)
+            .field("acquisition", &self.acquisition)
+            .field("trakt", &self.trakt)
+            .field("upgrade", &self.upgrade)
+            .field("dedup_remove_duplicates", &self.dedup_remove_duplicates)
+            .field("remove_finished_shows", &self.remove_finished_shows)
+            .finish()
+    }
+}
+
 impl Config {
     /// Build from the process environment (reads the same variables as before).
     pub fn from_env() -> Result<Self, AppError> {
@@ -428,15 +503,10 @@ impl Config {
         cfg.acquisition = AcquisitionConfig::from_env();
         cfg.trakt = TraktConfig::from_env();
         cfg.upgrade = UpgradeConfig::from_env();
+        // Delegate to the single crate-wide boolean parser so every flag accepts the same set
+        // (`1`/`true`/`yes`/`on`), defaulting to false when unset/unrecognised.
         fn env_flag(name: &str) -> bool {
-            std::env::var(name)
-                .map(|v| {
-                    matches!(
-                        v.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on"
-                    )
-                })
-                .unwrap_or(false)
+            AcquisitionConfig::parse_bool(std::env::var(name).ok(), false)
         }
         cfg.dedup_remove_duplicates = env_flag("DEDUP_REMOVE_DUPLICATES");
         cfg.remove_finished_shows = env_flag("REMOVE_FINISHED_SHOWS");
@@ -474,7 +544,13 @@ impl Config {
         }
         .max(10); // Enforce minimum 10s to avoid hammering the provider API.
 
-        let db_path = db_path.unwrap_or_else(|| "metadata.db".to_string());
+        // Trim + treat blank as unset (consistent with the other env knobs — a quoted/whitespace
+        // `DB_PATH` from compose YAML, or an empty `DB_PATH=`, falls back to the default rather than
+        // becoming a whitespace/empty path).
+        let db_path = db_path
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "metadata.db".to_string());
 
         let port = match port {
             Some(s) => s.trim().parse::<u16>().unwrap_or_else(|_| {
@@ -538,6 +614,55 @@ mod tests {
         let c = parts(None, Some("tb-tok"), Some("tmdb"), None, None, None).unwrap();
         assert_eq!(c.provider_kind, ProviderKind::TorBox);
         assert_eq!(c.provider_token, "tb-tok");
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        // Config Debug must never print the provider token or TMDB key (a stray `debug!("{config:?}")`
+        // would otherwise leak credentials).
+        let mut c = parts(
+            Some("rd-SECRET-tok"),
+            None,
+            Some("tmdb-SECRET-key"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        c.trakt = TraktConfig::from_parts(
+            Some("trakt-client-id".into()),
+            Some("trakt-SECRET-secret".into()),
+            None,
+            None,
+            None,
+        );
+        c.acquisition.scraper_proxy_url = Some("http://user:SECRETpw@proxy:8080".into());
+        // A custom Torrentio addon URL embeds the debrid token (`realdebrid=<TOKEN>`), so it too
+        // must never be printed verbatim.
+        c.acquisition.scraper_addon_url =
+            Some("https://torrentio.strem.fun/realdebrid=rd-SECRET-addontok/manifest.json".into());
+        let dbg = format!("{c:?}");
+        assert!(
+            !dbg.contains("rd-SECRET-tok"),
+            "provider token leaked: {dbg}"
+        );
+        assert!(!dbg.contains("tmdb-SECRET-key"), "tmdb key leaked: {dbg}");
+        assert!(
+            !dbg.contains("trakt-SECRET-secret"),
+            "trakt secret leaked: {dbg}"
+        );
+        assert!(!dbg.contains("SECRETpw"), "proxy creds leaked: {dbg}");
+        assert!(
+            !dbg.contains("rd-SECRET-addontok"),
+            "scraper addon-url token leaked: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "expected redaction markers: {dbg}"
+        );
+        // Non-secret fields are still printed.
+        assert!(dbg.contains("RealDebrid"));
+        assert!(dbg.contains("trakt-client-id"));
     }
 
     #[test]
@@ -694,6 +819,47 @@ mod tests {
             SubReq::parse(Some("eng".into())),
             SubReq::Lang("eng".into())
         );
+    }
+
+    #[test]
+    fn audio_req_parse_keyword_empty_and_lang() {
+        // Symmetric with subtitle_none_keyword_means_skip: the "original" keyword (any case), an
+        // empty/whitespace value, and absence all mean Original; a code is lowercased.
+        assert_eq!(AudioReq::parse(None), AudioReq::Original);
+        assert_eq!(AudioReq::parse(Some("original".into())), AudioReq::Original);
+        assert_eq!(AudioReq::parse(Some("ORIGINAL".into())), AudioReq::Original);
+        assert_eq!(AudioReq::parse(Some("   ".into())), AudioReq::Original);
+        assert_eq!(
+            AudioReq::parse(Some("ENG".into())),
+            AudioReq::Lang("eng".into()),
+            "a language code is normalised to lowercase"
+        );
+    }
+
+    #[test]
+    fn parse_bool_accepts_all_synonyms_and_falls_back() {
+        // The single crate-wide bool parser backs DEDUP_REMOVE_DUPLICATES / REMOVE_FINISHED_SHOWS,
+        // documented to accept true/1/yes/on (and false/0/no/off), case-insensitively.
+        for t in ["true", "1", "yes", "on", "ON", "Yes"] {
+            assert!(
+                AcquisitionConfig::parse_bool(Some(t.into()), false),
+                "{t} should parse true"
+            );
+        }
+        for f in ["false", "0", "no", "off", "OFF"] {
+            assert!(
+                !AcquisitionConfig::parse_bool(Some(f.into()), true),
+                "{f} should parse false"
+            );
+        }
+        // An unrecognised value (or absence) returns the supplied default, both polarities.
+        assert!(AcquisitionConfig::parse_bool(Some("garbage".into()), true));
+        assert!(!AcquisitionConfig::parse_bool(
+            Some("garbage".into()),
+            false
+        ));
+        assert!(AcquisitionConfig::parse_bool(None, true));
+        assert!(!AcquisitionConfig::parse_bool(None, false));
     }
 
     // ── TraktConfig tests ────────────────────────────────────────────────────

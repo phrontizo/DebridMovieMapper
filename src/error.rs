@@ -14,6 +14,9 @@ pub enum AppError {
     #[error("Invalid configuration: {0}")]
     Config(String),
 
+    #[error("Background task failed: {0}")]
+    Task(String),
+
     #[error("Debrid resource temporarily unavailable")]
     Unavailable,
 }

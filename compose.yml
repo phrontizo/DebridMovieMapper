@@ -35,9 +35,11 @@ services:
       - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:-}
       - JELLYFIN_RCLONE_MOUNT_PATH=/media
 
-      # ── Acquisition engine (SP1) ──────────────────────────────────────────────
+      # ── Acquisition engine ────────────────────────────────────────────────────
       # Tunes how releases are scraped, scored and verified for content the service
       # acquires (driven by Trakt sync below). An empty value = the documented default.
+      # (Note: ACQUIRE_DEAD_TIMEOUT_SECS / DEDUP_REMOVE_DUPLICATES / REMOVE_FINISHED_SHOWS
+      # below are SP3/Trakt-lifecycle knobs, grouped here for convenience.)
       # Override the scraper addon; default auto-templates Torrentio from the provider token.
       - SCRAPER_ADDON_URL=${SCRAPER_ADDON_URL:-}
       # Route the SCRAPER's traffic (Torrentio/addon) through an HTTP(S) proxy, e.g.
@@ -45,9 +47,9 @@ services:
       - SCRAPER_PROXY_URL=${SCRAPER_PROXY_URL:-}
       # Hard resolution ceiling: 720 | 1080 | 2160/4k (default 1080).
       - MAX_RESOLUTION=${MAX_RESOLUTION:-}
-      # Required audio language: ISO code, or "original" = the title's original language (default original).
+      # Required audio language: 2- or 3-letter ISO code, or "original" = the title's original language (default original).
       - AUDIO_LANGUAGE=${AUDIO_LANGUAGE:-}
-      # Required subtitle language: ISO code, or "none" = skip the subtitle check (default none).
+      # Required subtitle language: 2- or 3-letter ISO code, or "none" = skip the subtitle check (default none).
       - SUBTITLE_LANGUAGE=${SUBTITLE_LANGUAGE:-}
       # Prefer HEVC/x265 (default true) / HDR (default false).
       - PREFER_HEVC=${PREFER_HEVC:-}

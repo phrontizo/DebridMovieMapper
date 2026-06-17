@@ -6,12 +6,11 @@ I created this project as:
 * I was using the various arrs, and found it cumbersome, plus I ran out of storage space, meaning I needed to use a Debrid service of some kind
 * Zurg didn't work for me as I needed the folder structure for Jellyfin
 
-I use Debrid Media Manager for keeping Real Debrid populated at the moment, but am thinking of incorporating that into this service as well.
+I previously used Debrid Media Manager to keep Real-Debrid populated; that acquisition role is now built into this service (see the [Trakt Integration](#trakt-integration) section below).
 
 Note that this is still a work in progress and is provided as-is for educational purposes only.
 
 Future work:
-* Test with Kodi 
 * Add a web-ui to track progress and correct mismatches
 
 Trakt-driven acquisition (populate your debrid account from Trakt watchlists/in-progress and newly aired episodes of tracked shows, plus automatic lifecycle removal) is now built in — see the [Trakt Integration](#trakt-integration) section below.
@@ -24,7 +23,7 @@ This was 100% vibe coded using a mix of Claude and Junie as further AI experimen
 - **Season Grouping**: Automatically groups TV show episodes into `Season XX` folders.
 - **Real-Debrid *and* TorBox**: One codebase, either provider. Set `RD_API_TOKEN` for Real-Debrid or `TORBOX_API_KEY` for TorBox (exactly one) — everything else works the same.
 - **WebDAV Endpoint**: Exposes a WebDAV server (port 8080) serving proxied media files with real file sizes and extensions. Media bytes are fetched on demand from the provider's CDN. Mount via rclone for use with Jellyfin/Plex.
-- **On-Demand Repair**: Detects unavailable files at playback time (a 503 from Real-Debrid, or an uncached/expired file on TorBox) and attempts instant synchronous repair by re-adding the torrent. For cached content, playback continues after a ~1-2s delay; otherwise a fresh download is started automatically.
+- **On-Demand Repair**: Detects unavailable files at playback time (a 503 from Real-Debrid, an uncached/expired file on TorBox, or a persistent CDN 5xx on the byte fetch) and attempts instant synchronous repair by re-adding the torrent. For cached content, playback continues after a ~1-2s delay; otherwise a fresh download is started automatically.
 - **Trakt Integration (optional)**: Drive the library from your Trakt account(s) — watchlisted and in-progress movies/shows are auto-acquired, new episodes of tracked shows are picked up as they air, and content is automatically removed once everyone who wanted it has finished (or abandoned) it. Link one or more accounts via a local-network enrolment page. Disabled by default; when not configured the service runs exactly as before.
 - **Persistent Cache**: Uses an embedded database (`redb`) to cache media identifications, reducing API calls and speeding up restarts.
 - **Configurable Scan Interval**: Customizable scan interval via environment variable.
@@ -103,8 +102,8 @@ A debrid provider token is required: set **exactly one** of `RD_API_TOKEN` or `T
 | `SCRAPER_ADDON_URL`          | No       | *(auto)*       | Override the Torrentio scraper base URL. Defaults to a URL auto-built from your provider token (`https://torrentio.strem.fun/<provider>=<token>`). |
 | `SCRAPER_PROXY_URL`          | No       | -              | Route the **scraper's** requests (Torrentio / custom addon) through an HTTP(S) proxy — e.g. `http://[user:pass@]host:port`. Applies **only** to scraper traffic; the debrid CDN media reads, TMDB, and provider APIs stay direct. A set-but-invalid value (non-http(s) scheme; socks is not supported) is a startup error rather than a silent direct fallback. |
 | `MAX_RESOLUTION`             | No       | `1080`         | Hard resolution ceiling for acquisition: `720`, `1080`, `2160` / `4k`. Candidates above this height are excluded. |
-| `AUDIO_LANGUAGE`             | No       | `original`     | Required audio language for acquisition: an ISO code (e.g. `eng`) or `original` (uses the title's original language from TMDB). |
-| `SUBTITLE_LANGUAGE`          | No       | *(none)*       | Required subtitle language for acquisition: an ISO code, or omit / set to `none` to skip the check. |
+| `AUDIO_LANGUAGE`             | No       | `original`     | Required audio language for acquisition: a 2- or 3-letter ISO code (e.g. `eng` or `en`) or `original` (uses the title's original language from TMDB). |
+| `SUBTITLE_LANGUAGE`          | No       | *(none)*       | Required subtitle language for acquisition: a 2- or 3-letter ISO code, or omit / set to `none` to skip the check. |
 | `PREFER_HEVC`                | No       | `true`         | Prefer HEVC/H.265 encodes when scoring acquisition candidates. |
 | `PREFER_HDR`                 | No       | `false`        | Prefer HDR/Dolby Vision encodes when scoring acquisition candidates. |
 | `STALL_TIMEOUT_SECS`         | No       | `1800` (min 60) | Seconds without download progress before a Pending torrent is considered stalled and re-acquired. |
@@ -144,6 +143,7 @@ docker pull phrontizo/debridmoviemapper:latest
 **Available tags:**
 - `:latest` — latest stable release (updated on version tags like `v1.0.7`)
 - `:edge` — latest build from `main` branch (may be unstable)
+- `:v2edge` — latest build from the `v2` development branch (may be unstable; CI publishes a per-branch rolling tag)
 - `:1.0.7`, `:1.0`, `:1` — pinned to a specific release version
 
 ### 2. Run the container
@@ -168,7 +168,7 @@ Build locally for your current architecture:
 docker build -t debridmoviemapper .
 ```
 
-Multi-platform images are built and pushed automatically by GitHub Actions. Release tags (e.g. `git tag v1.0.7 && git push origin v1.0.7`) update `:latest` and semver tags; pushes to `main` update `:edge`.
+Multi-platform images are built and pushed automatically by GitHub Actions. Release tags (e.g. `git tag v1.0.7 && git push origin v1.0.7`) update `:latest` and semver tags; pushes to `main` update `:edge`, and pushes to the `v2` development branch update `:v2edge`.
 
 *Note: The named volume ensures your media identification cache is preserved across container recreations.*
 
@@ -224,7 +224,7 @@ Once running, the WebDAV server will be available at `http://localhost:8080`. Mo
 
 - **Jellyfin** (via rclone mount - see Docker Compose example above)
 - **Plex** (via rclone mount)
-- **Kodi**
+- **Kodi** (expected to work via the rclone mount; untested)
 - **Infuse** (iOS/tvOS/macOS)
 
 ## Acquisition
@@ -253,7 +253,7 @@ When configured, DebridMovieMapper keeps your library in sync with one or more T
 
 - **Watchlist + in-progress** movies and shows are automatically acquired into your debrid account.
 - **New episodes** of tracked shows are picked up as they air (using TMDB air dates).
-- **Automatic removal**: engine-acquired content is removed once *every* user who wanted it has finished it (a watched movie; a fully-watched ended show), or once a watchlisted title is un-watchlisted and nobody else wants it. Manually-added content is never auto-removed.
+- **Automatic removal** (the Trakt lifecycle): engine-acquired content is removed once *every* user who wanted it has finished it (a watched movie; a fully-watched ended show), or once a watchlisted title is un-watchlisted and nobody else wants it. Un-watchlisting (Trigger B) never deletes content you added directly to your debrid account — that removal is scoped to the engine-acquired copies, so a pre-existing season pack survives even if a watchlist acquired later episodes of the same show. Such pre-existing content is, however, treated as owned: the daily upgrade engine may replace a copy with a better cached release (pruning the superseded one); the duplicate-dedup pass may remove redundant duplicate copies when `DEDUP_REMOVE_DUPLICATES=true`; and a fully-watched **Ended** show is finish-removed **including ones already in your library** when `REMOVE_FINISHED_SHOWS=true` (see that option).
 
 It is a single shared household library: acquisition is the union across all linked accounts, and removal is per-user-aware (a title is only removed when no linked account still wants it).
 
@@ -363,9 +363,10 @@ There is no background repair loop. Instead, repair is triggered synchronously a
 
 - When a media file is read, `dav_fs` resolves it through the provider for a fresh CDN URL (a per-file resolution cache makes this free when the content is healthy)
 - If resolution reports the file is unavailable (a 503 from Real-Debrid, or an uncached/expired file on TorBox → `AppError::Unavailable`), `try_instant_repair` runs synchronously: re-adds the torrent by hash, matches the same file by path, and checks whether the replacement is already cached
+- A persistent CDN **5xx on the byte fetch** (the file resolved but is broken on the provider) also escalates to the same instant repair, once per read after a cheap fresh-URL retry still 5xxs — so a broken file is no longer an endless player retry-storm
 - **Cached content** (most common): repair completes in ~1-2 seconds and the replacement file is resolved inline — playback continues after a brief delay
-- **Non-cached content**: the file returns an error, the old torrent is deleted, and the new torrent is left to download (the scan loop picks it up automatically)
-- Non-cached/repairing torrents are hidden from WebDAV until healthy again
+- **Non-cached content** (Real-Debrid, where the re-add mints a new id): the file returns an error, the old torrent is deleted, and the new torrent is left to download (the scan loop picks it up automatically). On TorBox the re-add by hash returns the **same** torrent (re-downloading), so it is left in place and stays visible — the scan loop surfaces it once it finishes downloading
+- Torrents in the `Broken`/`Repairing` state — the Real-Debrid new-id replacement path (the superseded old id) and any torrent mid-repair — are hidden from WebDAV until healthy again. The TorBox same-id re-download is kept `Healthy` and therefore stays visible, as noted above
 
 ### Jellyfin Notifications
 
@@ -384,9 +385,9 @@ To fix this, delete the torrent from your debrid account and find an alternative
 ### Error Handling
 
 - **Unavailable file** (a 503 from Real-Debrid, or an uncached file on TorBox): Triggers synchronous instant repair — succeeds inline for cached content, fails for non-cached
-- **429 Rate Limit**: Adaptive token bucket rate limiter shared across the provider's API calls — on 429, the global request interval doubles (max 30s between requests) and Retry-After headers are respected; on success, the interval gradually recovers toward the baseline of 10 req/s
+- **429 Rate Limit**: Adaptive token bucket rate limiter shared across the provider's API calls — on 429, the global request interval doubles (max 30s between requests) and Retry-After headers are respected; on success, the interval **halves** back toward the baseline of 10 req/s (multiplicative recovery, so a throttle burst doesn't leave later requests crawling)
 - **404 Not Found**: Treated as success for delete operations (idempotent)
-- **Playback Errors**: WebDAV read failures on an unavailable file trigger instant repair (rate-limited to 30s cooldown, max 3 attempts per torrent)
+- **Playback Errors**: WebDAV read failures on an unavailable file (or a persistent CDN 5xx) trigger instant repair (rate-limited to 30s cooldown, max 3 attempts per torrent)
 
 ### Caching
 

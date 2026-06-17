@@ -133,24 +133,32 @@ impl EnrolmentService {
     /// Refresh one account's tokens. On success, rebuild + persist with the re-enrolment flag
     /// cleared; on failure, set the flag so the accounts page surfaces it.
     pub(crate) async fn refresh_account(&self, slug: &str) -> Result<(), AppError> {
-        let Some(mut tokens) = self.store.get_trakt_tokens(slug.to_string()).await else {
+        let Some(tokens) = self.store.get_trakt_tokens(slug.to_string()).await else {
             return Ok(()); // nothing stored under this slug — no-op
         };
-        match self.trakt.refresh(&tokens.refresh).await {
+        let outcome = self.trakt.refresh(&tokens.refresh).await;
+        // Re-read AFTER the network refresh: if the account was removed during the refresh window (a
+        // concurrent `/remove` on another connection, or the background sync), do NOT resurrect it by
+        // writing back. Rebuild from the re-read record so we also don't clobber a token a concurrent
+        // refresh/sync just wrote.
+        let Some(mut current) = self.store.get_trakt_tokens(slug.to_string()).await else {
+            return Ok(()); // account removed mid-refresh — don't resurrect it
+        };
+        match outcome {
             Ok(fresh) => {
-                tokens.access = fresh.access_token;
+                current.access = fresh.access_token;
                 if !fresh.refresh_token.is_empty() {
-                    tokens.refresh = fresh.refresh_token;
+                    current.refresh = fresh.refresh_token;
                 }
-                tokens.expires_at = fresh.created_at.saturating_add(fresh.expires_in);
-                tokens.needs_reenrolment = false;
+                current.expires_at = fresh.created_at.saturating_add(fresh.expires_in);
+                current.needs_reenrolment = false;
             }
             Err(e) => {
                 warn!("Trakt refresh failed for '{}': {}", slug, e);
-                tokens.needs_reenrolment = true;
+                current.needs_reenrolment = true;
             }
         }
-        self.store.put_trakt_tokens(slug.to_string(), tokens).await
+        self.store.put_trakt_tokens(slug.to_string(), current).await
     }
 
     /// Remove (unlink) one account's stored tokens.
@@ -502,6 +510,71 @@ mod tests {
             "a refresh failure must flag the account"
         );
         assert_eq!(tok.refresh, "RT", "the refresh token must be preserved");
+    }
+
+    #[tokio::test]
+    async fn refresh_account_does_not_resurrect_concurrently_removed_account() {
+        use crate::trakt_client::{
+            DeviceCode, DeviceTokenPoll, ShowProgress, TraktItem, WatchedData,
+        };
+        // A TraktClient whose `refresh` removes the account mid-call — deterministically simulating a
+        // concurrent `/remove` (another connection, or the background sync) during the refresh
+        // network window. refresh_account must NOT resurrect the removed account.
+        struct RemovingTrakt {
+            store: Store,
+        }
+        #[async_trait::async_trait]
+        impl TraktClient for RemovingTrakt {
+            async fn refresh(&self, _rt: &str) -> Result<TraktTokenResponse, AppError> {
+                self.store
+                    .remove_trakt_tokens("alice".into())
+                    .await
+                    .unwrap();
+                Ok(TraktTokenResponse {
+                    access_token: "FRESH".into(),
+                    refresh_token: "NEWREF".into(),
+                    expires_in: 100,
+                    created_at: 2_000,
+                })
+            }
+            async fn device_code(&self) -> Result<DeviceCode, AppError> {
+                unreachable!()
+            }
+            async fn poll_token(&self, _d: &str) -> Result<DeviceTokenPoll, AppError> {
+                unreachable!()
+            }
+            async fn me(&self, _a: &str) -> Result<TraktUser, AppError> {
+                unreachable!()
+            }
+            async fn watchlist(&self, _a: &str) -> Result<Vec<TraktItem>, AppError> {
+                unreachable!()
+            }
+            async fn in_progress(&self, _a: &str) -> Result<Vec<TraktItem>, AppError> {
+                unreachable!()
+            }
+            async fn watched(&self, _a: &str) -> Result<WatchedData, AppError> {
+                unreachable!()
+            }
+            async fn show_progress(&self, _a: &str, _t: u64) -> Result<ShowProgress, AppError> {
+                unreachable!()
+            }
+        }
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".into(), tokens_fixture("OLD", "Alice"))
+            .await
+            .unwrap();
+        let trakt: Arc<dyn TraktClient> = Arc::new(RemovingTrakt {
+            store: store.clone(),
+        });
+        let svc = EnrolmentService::new(trakt, store.clone());
+
+        svc.refresh_account("alice").await.unwrap();
+
+        assert!(
+            store.get_trakt_tokens("alice".into()).await.is_none(),
+            "an account removed during the refresh window must NOT be resurrected"
+        );
     }
 
     #[test]

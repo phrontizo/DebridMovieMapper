@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 
 const MAX_CACHE_SIZE: usize = 10_000;
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
@@ -124,11 +124,20 @@ struct CachedUnrestrictResponse {
     cached_at: std::time::Instant,
 }
 
-#[derive(Debug)]
 pub struct RealDebridClient {
     client: reqwest::Client,
     unrestrict_cache: Arc<RwLock<HashMap<String, CachedUnrestrictResponse>>>,
     rate_limiter: Arc<AdaptiveRateLimiter>,
+}
+
+// `DebridProvider` requires `Debug`, but `unrestrict_cache` holds restricted RD `link`s and signed
+// CDN `download` URLs (capability URLs) — an auto-derived Debug would let a stray `{:?}` leak them.
+// So redact like `TorBoxClient` (which protects its `api_key` the same way): print the type name
+// only, no fields.
+impl std::fmt::Debug for RealDebridClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealDebridClient").finish()
+    }
 }
 
 impl RealDebridClient {
@@ -168,6 +177,13 @@ impl RealDebridClient {
         attempt: u32,
         max_attempts: u32,
     ) {
+        // On the FINAL attempt there is no point sleeping — the caller gives up immediately after.
+        // (Without this guard a Retry-After 5xx on the last attempt would sleep up to
+        // MAX_RETRY_AFTER_SECS only to then return an error.)
+        if attempt >= max_attempts {
+            return;
+        }
+
         let retry_after = headers
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|h| h.to_str().ok())
@@ -180,7 +196,7 @@ impl RealDebridClient {
                 status, attempt, max_attempts, capped, seconds
             );
             tokio::time::sleep(Duration::from_secs(capped)).await;
-        } else if attempt < max_attempts {
+        } else {
             // Extended exponential backoff for 503/502/504, capped at 30s
             let backoff_secs = 2u64.saturating_pow(attempt);
             let delay = Duration::from_secs(std::cmp::min(backoff_secs, 30));
@@ -211,19 +227,25 @@ impl RealDebridClient {
     }
 
     pub async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
-        const MAX_PAGES: u32 = 200; // Safety limit to prevent infinite loops
+        // Runaway guard. At 50/page this allows ~100k torrents — far beyond any realistic account —
+        // so legitimate large libraries paginate to completion. Hitting it means a pathological /
+        // runaway listing: we must FAIL (below), never return a truncated `Ok`, because downstream
+        // treats an owned title absent from the listing as lapsed and re-acquires it (the same reason
+        // the per-page `Err` branch fails the whole listing). A truncated listing is worse than none.
+        const MAX_PAGES: u32 = 2000;
         let mut all_torrents = Vec::new();
         let mut page = 1u32;
         loop {
             if page > MAX_PAGES {
                 warn!(
-                    "Reached maximum page limit ({}), stopping pagination with {} torrents",
+                    "Reached maximum page limit ({}) with {} torrents; failing the whole listing \
+                     rather than returning a truncated list (which would churn the dropped pages)",
                     MAX_PAGES,
                     all_torrents.len()
                 );
-                break;
+                return Err(synthetic_bad_gateway(b"get_torrents exceeded MAX_PAGES"));
             }
-            info!("Fetching torrents page {}...", page);
+            debug!("Fetching torrents page {}...", page);
             let url = format!(
                 "https://api.real-debrid.com/rest/1.0/torrents?page={}&limit=50",
                 page
@@ -258,7 +280,7 @@ impl RealDebridClient {
                 }
             }
         }
-        info!("Fetched {} torrents in total.", all_torrents.len());
+        debug!("Fetched {} torrents in total.", all_torrents.len());
         Ok(all_torrents)
     }
 
@@ -280,7 +302,9 @@ impl RealDebridClient {
             let cache = self.unrestrict_cache.read().await;
             if let Some(cached) = cache.get(link) {
                 if cached.cached_at.elapsed() < CACHE_TTL {
-                    info!("Using cached unrestrict response for link: {}", link);
+                    // `debug`, not `info`: the restricted link is a sensitive capability URL — it
+                    // must not be emitted on the normal (info) playback path on every cache hit.
+                    debug!("Using cached unrestrict response (link redacted)");
                     return Ok(cached.response.clone());
                 }
             }
@@ -410,11 +434,19 @@ impl RealDebridClient {
                             "RD API returned 429 (attempt {}/{}). Adaptive limiter adjusted.",
                             attempt, max_attempts
                         );
+                        // Preserve the real 429 so that, if EVERY attempt is throttled, the surfaced
+                        // error reflects throttling rather than the synthetic "deserialization
+                        // failures" fallback below (which would otherwise misattribute the cause).
+                        last_error = resp.error_for_status().err();
                         continue;
                     }
 
                     if Self::should_retry_status(status) {
                         Self::wait_for_retry(status, resp.headers(), attempt, max_attempts).await;
+                        // Record the real status error so that, if this was the FINAL attempt, the
+                        // loop surfaces the actual persistent 5xx (e.g. 503) instead of a synthetic
+                        // 502 — preserving the diagnostic status and matching torbox_client.
+                        last_error = resp.error_for_status().err();
                         continue;
                     }
 
@@ -429,10 +461,19 @@ impl RealDebridClient {
                                     self.rate_limiter.record_success().await;
                                     return Ok(val);
                                 }
+                                // An empty body that can't be decoded into T (i.e. T is not
+                                // Vec/Value) is a contract violation that won't fix itself on
+                                // retry — count it toward the deserialization cap so a
+                                // permanently-empty endpoint doesn't burn all 10 attempts.
+                                deserialization_failures += 1;
                                 warn!(
-                                    "RD API empty body or 204 (attempt {}/{}). Status: {}",
+                                    "RD API empty body or 204 not decodable into the expected type (attempt {}/{}). Status: {}",
                                     attempt, max_attempts, status
                                 );
+                                if deserialization_failures >= 2 {
+                                    error!("Aborting after {} empty/undecodable RD responses — likely a contract change", deserialization_failures);
+                                    break;
+                                }
                                 continue;
                             }
                             match serde_json::from_str::<T>(&text) {
@@ -442,8 +483,17 @@ impl RealDebridClient {
                                 }
                                 Err(e) => {
                                     deserialization_failures += 1;
-                                    error!("Failed to decode RD response: {}. Status: {}, Body: {:.200}",
-                                        e, status, text);
+                                    // Do NOT log the raw body: this shared helper serves
+                                    // `unrestrict_link`, whose `UnrestrictResponse` carries the
+                                    // restricted `link` + signed `download` CDN URL as required
+                                    // fields — a partial/changed 200 body could otherwise emit a
+                                    // capability URL, breaking the "never log the link" invariant. The
+                                    // serde error names the failing field/offset; the length is enough
+                                    // to spot a schema change.
+                                    error!(
+                                        "Failed to decode RD response: {}. Status: {}, body {} bytes (redacted)",
+                                        e, status, text.len()
+                                    );
                                     // A schema change won't fix itself on retry — bail after 2 failures
                                     // to avoid wasting API calls on a permanently changed response format.
                                     if deserialization_failures >= 2 {
@@ -662,6 +712,60 @@ mod tests {
         (format!("http://{}/", addr), count)
     }
 
+    /// Like `spawn_counting` but adds `Retry-After: 0` so a retryable status's backoff is instant
+    /// (keeps a full-retry-loop test fast instead of sleeping out the exponential backoff).
+    async fn spawn_counting_retry_after_0(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = count.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "{}\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status_line,
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{}/", addr), count)
+    }
+
+    #[tokio::test]
+    async fn fetch_with_retry_surfaces_real_5xx_status_after_exhaustion() {
+        // Every attempt returns a retryable 503 (with Retry-After:0 so backoff is instant). After all
+        // attempts are exhausted, the surfaced error must carry the real 503 — not the synthetic 502
+        // "deserialization failures" fallback that would misattribute a server outage to a schema bug.
+        let (url, count) =
+            spawn_counting_retry_after_0("HTTP/1.1 503 Service Unavailable", r#"{"error":"down"}"#)
+                .await;
+        let client = RealDebridClient::new("fake".to_string()).unwrap();
+        let r: Result<serde_json::Value, _> = client
+            .fetch_with_retry(|| client.client.get(&url), &[])
+            .await;
+        let err = r.expect_err("a persistent 503 must surface as an error");
+        assert_eq!(
+            err.status(),
+            Some(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            "the persistent 503 must be surfaced, not a synthetic 502"
+        );
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            10,
+            "a retryable 5xx is retried the full attempt budget"
+        );
+    }
+
     #[tokio::test]
     async fn fetch_with_retry_does_not_retry_401() {
         // A persistent 401 (bad/expired token) is permanent — it must be returned on the FIRST
@@ -677,6 +781,31 @@ mod tests {
             count.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "a permanent 401 must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_retry_does_not_sleep_on_final_attempt() {
+        // On the final attempt there is nothing to wait for — the caller gives up immediately.
+        // A Retry-After header must NOT cause a (capped, up-to-5-minute) sleep here.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("300"),
+        );
+        let r = tokio::time::timeout(
+            Duration::from_millis(200),
+            RealDebridClient::wait_for_retry(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                &headers,
+                10,
+                10,
+            ),
+        )
+        .await;
+        assert!(
+            r.is_ok(),
+            "wait_for_retry must return immediately on the final attempt, not sleep Retry-After"
         );
     }
 
@@ -764,10 +893,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cache_constants_are_reasonable() {
-        assert_eq!(MAX_CACHE_SIZE, 10_000);
-        assert_eq!(CACHE_TTL, Duration::from_secs(3600));
+    #[tokio::test]
+    async fn unrestrict_cache_enforces_size_cap() {
+        // BEHAVIOUR (replaces a constant-literal pin): when the cache exceeds MAX_CACHE_SIZE,
+        // eviction trims it back to the cap. Exercises the size-cap branch of `evict_expired_cache`
+        // that the TTL-expiry test (`unrestrict_cache_evicts_expired_entries`) never reaches.
+        let client = RealDebridClient::new("fake-token".to_string()).unwrap();
+        {
+            let mut cache = client.unrestrict_cache.write().await;
+            for i in 0..(MAX_CACHE_SIZE + 5) {
+                cache.insert(
+                    format!("link-{i}"),
+                    CachedUnrestrictResponse {
+                        response: UnrestrictResponse::default(),
+                        cached_at: std::time::Instant::now(), // all fresh → only the size cap trims
+                    },
+                );
+            }
+        }
+        client.evict_expired_cache().await;
+        assert_eq!(
+            client.unrestrict_cache.read().await.len(),
+            MAX_CACHE_SIZE,
+            "eviction must trim an over-cap cache back to MAX_CACHE_SIZE"
+        );
     }
 
     #[tokio::test]

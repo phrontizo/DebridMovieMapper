@@ -97,11 +97,10 @@ impl TmdbClient {
         imdb_id: &str,
     ) -> Result<Option<(u64, crate::vfs::MediaType)>, reqwest::Error> {
         let url = format!("https://api.themoviedb.org/3/find/{}", imdb_id);
-        let api_key = self.api_key.clone();
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
                 self.client.get(&url).query(&[
-                    ("api_key", api_key.as_str()),
+                    ("api_key", self.api_key.as_str()),
                     ("external_source", "imdb_id"),
                 ])
             })
@@ -120,12 +119,11 @@ impl TmdbClient {
             crate::vfs::MediaType::Show => "tv",
         };
         let url = format!("https://api.themoviedb.org/3/{}/{}", path, tmdb_id);
-        let api_key = self.api_key.clone();
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
                 self.client
                     .get(&url)
-                    .query(&[("api_key", api_key.as_str())])
+                    .query(&[("api_key", self.api_key.as_str())])
             })
             .await?;
         Ok(parse_details(&v, kind))
@@ -145,12 +143,11 @@ impl TmdbClient {
             "https://api.themoviedb.org/3/{}/{}/external_ids",
             path, tmdb_id
         );
-        let api_key = self.api_key.clone();
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
                 self.client
                     .get(&url)
-                    .query(&[("api_key", api_key.as_str())])
+                    .query(&[("api_key", self.api_key.as_str())])
             })
             .await?;
         Ok(parse_external_ids(&v))
@@ -160,12 +157,11 @@ impl TmdbClient {
     /// Network/HTTP failure → Err; an unrecognised or missing status → Ok(ShowStatus::Other).
     pub async fn show_status(&self, tmdb_id: u64) -> Result<ShowStatus, reqwest::Error> {
         let url = format!("https://api.themoviedb.org/3/tv/{}", tmdb_id);
-        let api_key = self.api_key.clone();
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
                 self.client
                     .get(&url)
-                    .query(&[("api_key", api_key.as_str())])
+                    .query(&[("api_key", self.api_key.as_str())])
             })
             .await?;
         Ok(parse_show_status(&v))
@@ -181,12 +177,11 @@ impl TmdbClient {
             "https://api.themoviedb.org/3/tv/{}/season/{}",
             tmdb_id, season
         );
-        let api_key = self.api_key.clone();
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
                 self.client
                     .get(&url)
-                    .query(&[("api_key", api_key.as_str())])
+                    .query(&[("api_key", self.api_key.as_str())])
             })
             .await?;
         Ok(parse_season_air_dates(&v, season))
@@ -195,12 +190,11 @@ impl TmdbClient {
     /// Enumerate a series' (non-Specials) season numbers from TMDB `/tv/{id}` details.
     pub async fn show_season_numbers(&self, tmdb_id: u64) -> Result<Vec<u32>, reqwest::Error> {
         let url = format!("https://api.themoviedb.org/3/tv/{}", tmdb_id);
-        let api_key = self.api_key.clone();
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
                 self.client
                     .get(&url)
-                    .query(&[("api_key", api_key.as_str())])
+                    .query(&[("api_key", self.api_key.as_str())])
             })
             .await?;
         Ok(parse_season_numbers(&v))
@@ -249,7 +243,12 @@ impl TmdbClient {
                             "TMDB API returned {} (attempt {}/{}). Waiting {}s",
                             status, attempt, max_attempts, capped
                         );
-                        tokio::time::sleep(Duration::from_secs(capped)).await;
+                        // On the FINAL attempt there's nothing to wait for — the loop exits right
+                        // after. Skip the (up to MAX_RETRY_AFTER_SECS) sleep so a TMDB throttle can't
+                        // block the scan hot path for nothing (matches `rd_client::wait_for_retry`).
+                        if attempt < max_attempts {
+                            tokio::time::sleep(Duration::from_secs(capped)).await;
+                        }
                         continue; // Without this, the same error response falls through to error_for_status
                     }
 
@@ -259,6 +258,18 @@ impl TmdbClient {
                         Ok(resp) => return resp.json::<T>().await.map_err(|e| e.without_url()),
                         Err(e) => {
                             let e = e.without_url();
+                            // A 4xx client error (401 auth, 403, 404, 400) will NOT fix itself on
+                            // retry — return immediately rather than burning all `max_attempts`
+                            // rate-limited attempts (plus exponential backoff) on it. 429 is handled
+                            // above; a 5xx falls through to retry. (Matches rd_client's terminal-4xx
+                            // behaviour; also stops a bad-key test from taking minutes.)
+                            if status.is_client_error() {
+                                warn!(
+                                    "TMDB API client error (attempt {}/{}): {} — not retrying",
+                                    attempt, max_attempts, e
+                                );
+                                return Err(e);
+                            }
                             warn!(
                                 "TMDB API error (attempt {}/{}): {}",
                                 attempt, max_attempts, e
@@ -474,6 +485,47 @@ mod tests {
             "tmdb_client.rs fetch_with_retry must not use .expect() on last_error — \
              use a synthetic error response instead to avoid panicking when all \
              attempts are exhausted by retryable status codes"
+        );
+    }
+
+    /// Loopback server that replies to every request with `status` and counts the requests it saw.
+    async fn spawn_counting_status(
+        status: u16,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = counter.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..12 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = format!("HTTP/1.1 {} STATUS\r\nContent-Length: 0\r\n\r\n", status);
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{}/", addr), counter)
+    }
+
+    #[tokio::test]
+    async fn fetch_with_retry_does_not_retry_4xx_client_errors() {
+        // A permanent 4xx (e.g. 401 bad key) must return after exactly ONE request, not burn all
+        // 10 rate-limited attempts with backoff (which previously made bad-key tests take minutes).
+        let (url, counter) = spawn_counting_status(401).await;
+        let client = TmdbClient::new("k".into()).unwrap();
+        let r: Result<serde_json::Value, _> =
+            client.fetch_with_retry(|| client.client.get(&url)).await;
+        assert!(r.is_err(), "a 401 must surface as an error");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a 4xx client error must not be retried"
         );
     }
 
