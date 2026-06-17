@@ -392,10 +392,10 @@ impl Store {
         }
         // INVARIANT: migrations commit in their own transaction(s) BEFORE the version stamp below,
         // so a crash between the two re-runs `run_migrations` on the next boot. Every migration step
-        // MUST therefore be idempotent (both current steps — the `3..5` `wanted` clear and the `<6`
-        // `upgrade_checks` clear, each `t.retain(|_,_| false)` — are). A future non-idempotent
-        // migration must instead fold its work into the same write txn that stamps `SCHEMA_VERSION`
-        // (below) so the two commit atomically.
+        // MUST therefore be idempotent (all three current steps — the `3..5` `wanted` clear, the `<6`
+        // `upgrade_checks` clear, and the `<7` `blacklist` clear, each `t.retain(|_,_| false)` — are).
+        // A future non-idempotent migration must instead fold its work into the same write txn that
+        // stamps `SCHEMA_VERSION` (below) so the two commit atomically.
         let write_txn = db.begin_write()?;
         {
             write_txn.open_table(MATCHES_TABLE)?; // create if absent
