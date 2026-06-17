@@ -854,6 +854,56 @@ impl Store {
         .unwrap_or_default()
     }
 
+    /// Remove blacklist entries stamped (`at`) strictly before `cutoff_at` (Unix seconds). The
+    /// blacklist is otherwise append-only, so without a TTL prune it grows for the deployment's
+    /// lifetime (library churn leaves dead rows behind) and the O(total) read paths
+    /// (`all_blacklisted_hashes` / `blacklisted_hashes_for`) get progressively slower. Pruning also
+    /// makes a long-rejected hash eligible to retry again, in case a better/fixed release later
+    /// appears under it. Returns the number of rows removed. A malformed/`at`-less row is treated as
+    /// age 0 (pruned) — it predates the `at` field and is regenerable anyway.
+    pub async fn prune_blacklist_before(&self, cutoff_at: u64) -> usize {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> usize {
+            let txn = match db.begin_write() {
+                Ok(t) => t,
+                Err(_) => return 0,
+            };
+            let mut removed = 0usize;
+            {
+                let mut table = match txn.open_table(BLACKLIST_TABLE) {
+                    Ok(t) => t,
+                    Err(_) => return 0,
+                };
+                // Collect stale keys first (can't remove during the borrowing iteration).
+                let stale: Vec<String> = match table.iter() {
+                    Ok(iter) => iter
+                        .flatten()
+                        .filter_map(|(k, v)| {
+                            let at = serde_json::from_slice::<serde_json::Value>(v.value())
+                                .ok()
+                                .and_then(|j| j.get("at").and_then(|a| a.as_u64()))
+                                .unwrap_or(0);
+                            (at < cutoff_at).then(|| k.value().to_string())
+                        })
+                        .collect(),
+                    Err(_) => return 0,
+                };
+                for k in &stale {
+                    if table.remove(k.as_str()).is_ok() {
+                        removed += 1;
+                    }
+                }
+            }
+            // A failed commit rolls back the removals — report 0 (nothing persisted).
+            if txn.commit().is_err() {
+                return 0;
+            }
+            removed
+        })
+        .await
+        .unwrap_or(0)
+    }
+
     /// Every blacklisted infohash (lowercased) for a SINGLE `tmdb_id` — the per-title rejected set
     /// the acquisition engine filters candidates against. One read instead of one `is_blacklisted`
     /// per scraped candidate. The trailing `|` in the prefix prevents a tmdb_id-prefix collision
@@ -1615,6 +1665,27 @@ mod tests {
         assert!(store.is_blacklisted(27205, upper.clone()).await);
         // `all_blacklisted_hashes` returns the lowercased form.
         assert!(store.all_blacklisted_hashes().await.contains(&lower));
+    }
+
+    #[tokio::test]
+    async fn prune_blacklist_before_removes_only_stale_rows() {
+        let store = mem_store();
+        store
+            .blacklist_add(1, "old".into(), "WrongTitle", 100)
+            .await
+            .unwrap();
+        store
+            .blacklist_add(1, "recent".into(), "Corrupt", 5_000)
+            .await
+            .unwrap();
+        // Prune everything stamped before 1_000: only "old" (at=100) qualifies.
+        let removed = store.prune_blacklist_before(1_000).await;
+        assert_eq!(removed, 1);
+        assert!(!store.is_blacklisted(1, "old".into()).await);
+        assert!(
+            store.is_blacklisted(1, "recent".into()).await,
+            "a row newer than the cutoff must survive"
+        );
     }
 
     #[tokio::test]

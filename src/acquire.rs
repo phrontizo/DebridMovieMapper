@@ -677,10 +677,24 @@ impl AcquisitionEngine {
     pub async fn observe(&self, torrents: &[crate::rd_client::Torrent]) {
         let owned = self.store.all_owned().await;
         // Key by lowercased provider hash so it matches the lowercased candidate hashes we store.
-        let by_hash: HashMap<String, &crate::rd_client::Torrent> = torrents
-            .iter()
-            .map(|t| (t.hash.to_ascii_lowercase(), t))
-            .collect();
+        // When the listing contains DUPLICATE entries for a hash (a repair leak or an external
+        // re-add — exactly what the scan loop's dedup deletes), resolve each hash to its BEST entry:
+        // prefer a `downloaded` torrent, and among equals keep the newest (the provider lists
+        // newest-first, so the first-seen). A naive `.collect()` is last-write-wins and would resolve
+        // to the OLDEST duplicate — which may be a stale `error`/`dead` entry the scan loop is about to
+        // delete, wrongly driving `fail_and_reacquire` (blacklist + re-scrape) on a title that in fact
+        // has a healthy downloaded copy.
+        let mut by_hash: HashMap<String, &crate::rd_client::Torrent> = HashMap::new();
+        for t in torrents {
+            let key = t.hash.to_ascii_lowercase();
+            match by_hash.get(&key) {
+                Some(existing) if existing.status == "downloaded" => {} // best already kept
+                Some(_) if t.status != "downloaded" => {} // both non-downloaded: keep the newer
+                _ => {
+                    by_hash.insert(key, t);
+                }
+            }
+        }
 
         for (hash, rec) in &owned {
             let Some(t) = by_hash.get(hash.as_str()).copied() else {
@@ -1613,6 +1627,49 @@ mod tests {
             .await;
         assert!(st.is_blacklisted(27205, "h1".into()).await);
         assert!(st.get_owned("h1".into()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn observe_prefers_downloaded_duplicate_over_stale_error_entry() {
+        // A hash with a healthy newest `downloaded` entry PLUS an older `error` duplicate (a repair
+        // leak / external re-add). observe must resolve the hash to the downloaded copy and keep the
+        // Verified record — NOT fail_and_reacquire off the stale error duplicate. (A naive
+        // last-write-wins by_hash resolved to the oldest/errored entry and wrongly reaped it.)
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::watchlist("a"),
+                added_at: now_secs(),
+                status: OwnedStatus::Verified,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        // Provider lists newest-first: newest downloaded, then an older errored duplicate.
+        eng.observe(&[
+            torrent("tid_new", "h1", "downloaded", 100.0),
+            torrent("tid_old", "h1", "error", 0.0),
+        ])
+        .await;
+        assert!(
+            st.get_owned("h1".into()).await.is_some(),
+            "the Verified record must survive (resolved to the downloaded duplicate)"
+        );
+        assert!(
+            !st.is_blacklisted(27205, "h1".into()).await,
+            "a title with a healthy downloaded copy must not be blacklisted"
+        );
     }
 
     #[tokio::test]

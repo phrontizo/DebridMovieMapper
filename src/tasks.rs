@@ -39,6 +39,11 @@ pub struct ScanConfig {
     pub app: AppState,
 }
 
+/// Blacklist entries older than this are pruned (the table is otherwise append-only). A rejected
+/// hash becomes eligible to retry again after the TTL — long enough that a wrong-title/corrupt hash
+/// isn't re-tried constantly, short enough to bound the table and let a later better release through.
+const BLACKLIST_TTL_SECS: u64 = 30 * 86_400;
+
 pub async fn run_scan_loop(
     scan_config: ScanConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -86,11 +91,34 @@ pub async fn run_scan_loop(
 
     info!("Scan task: running initial scan immediately");
 
+    // Prune the append-only blacklist on startup and then roughly daily, so it can't grow unbounded
+    // over the deployment's lifetime (which would also slow the O(total) blacklist read paths).
+    let prune_every_ticks = (86_400 / interval_secs.max(1)).max(1);
+    let mut tick: u64 = 0;
+
     loop {
         if *shutdown.borrow() {
             info!("Scan task: shutdown requested, exiting");
             return;
         }
+        if tick.is_multiple_of(prune_every_ticks) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let pruned = store
+                .prune_blacklist_before(now.saturating_sub(BLACKLIST_TTL_SECS))
+                .await;
+            if pruned > 0 {
+                info!(
+                    "Pruned {} stale blacklist entr{} (older than {}d)",
+                    pruned,
+                    if pruned == 1 { "y" } else { "ies" },
+                    BLACKLIST_TTL_SECS / 86_400
+                );
+            }
+        }
+        tick = tick.saturating_add(1);
         // Consume repair replacements (new_id → old_id) before processing torrents
         let repair_replacements = repair_manager.take_repair_replacements().await;
         if !repair_replacements.is_empty() {

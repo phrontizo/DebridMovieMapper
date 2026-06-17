@@ -221,11 +221,9 @@ async fn try_upgrade_movie(
 
     // 4. Stage the cached candidate: add + validate + record Verified (non-destructive — any failure
     //    leaves the current release untouched). Returns (hash, torrent_id, selected_file_path).
-    //    A staging failure is candidate-specific (not cached / failed validation) → NoChange (the
-    //    title was evaluated; re-scrape on the next cursor wrap).
-    let staged = stage_and_verify(app, tmdb_id, &owned_rec.request, &cand)
-        .await
-        .map_err(UpgradeSkip::NoChange)?;
+    //    stage_and_verify classifies its own outcome: a transient provider/probe glitch → Deferred
+    //    (retry next tick), a candidate-specific failure (not cached / wrong title / pack) → NoChange.
+    let staged = stage_and_verify(app, tmdb_id, &owned_rec.request, &cand).await?;
 
     // Fetch the provider listing for the prune ONCE, and BEFORE the idle re-check below, so there is
     // NO network round-trip between the idle confirmation and the destructive prune — a read
@@ -326,19 +324,21 @@ async fn stage_and_verify(
     tmdb_id: u64,
     base_req: &crate::store::AcquireRequest,
     cand: &release::ReleaseInfo,
-) -> Result<(String, String, String), String> {
+) -> Result<(String, String, String), UpgradeSkip> {
     let hash = cand.info_hash.clone();
     let magnet = format!("magnet:?xt=urn:btih:{}", hash);
+    // A provider add/info failure is transient → Deferred (retry next tick, keep the cursor) rather
+    // than NoChange (which would skip this title — with its real upgrade candidate — for a full wrap).
     let added = app
         .provider
         .add_magnet(&magnet)
         .await
-        .map_err(|e| format!("add failed: {e}"))?;
+        .map_err(|e| UpgradeSkip::Deferred(format!("add failed: {e}")))?;
     let info = match app.provider.get_torrent_info(&added.id).await {
         Ok(i) => i,
         Err(e) => {
             let _ = app.provider.delete_torrent(&added.id).await;
-            return Err(format!("info failed: {e}"));
+            return Err(UpgradeSkip::Deferred(format!("info failed: {e}")));
         }
     };
     // Select the single feature file FIRST: RD only reports a (cached) torrent as `downloaded`
@@ -351,7 +351,7 @@ async fn stage_and_verify(
         .max_by_key(|f| f.bytes)
     else {
         let _ = app.provider.delete_torrent(&added.id).await;
-        return Err("no video file".into());
+        return Err(UpgradeSkip::NoChange("no video file".into()));
     };
     let csv = file.id.to_string();
     let selected_path = file.path.clone();
@@ -363,7 +363,7 @@ async fn stage_and_verify(
         .unwrap_or(info);
     if fresh.status != "downloaded" {
         let _ = app.provider.delete_torrent(&added.id).await;
-        return Err("candidate not cached".into());
+        return Err(UpgradeSkip::NoChange("candidate not cached".into()));
     }
     let file_name = selected_path
         .rsplit('/')
@@ -379,7 +379,7 @@ async fn stage_and_verify(
             .store
             .blacklist_add(tmdb_id, hash.clone(), "MoviePack", now_secs())
             .await;
-        return Err("multi-feature pack".into());
+        return Err(UpgradeSkip::NoChange("multi-feature pack".into()));
     }
     // Title validation (the engine exposes `validate_title` — see below).
     if !app
@@ -392,7 +392,7 @@ async fn stage_and_verify(
             .store
             .blacklist_add(tmdb_id, hash.clone(), "WrongTitle", now_secs())
             .await;
-        return Err("title mismatch".into());
+        return Err(UpgradeSkip::NoChange("title mismatch".into()));
     }
     // Probe gate (I-1): run the SAME audio/subtitle probe as acquisition before adopting. A
     // wrong-language/corrupt release is blacklisted + dropped; a transient probe failure is
@@ -409,11 +409,11 @@ async fn stage_and_verify(
                 .store
                 .blacklist_add(tmdb_id, hash.clone(), reason, now_secs())
                 .await;
-            return Err(format!("probe rejected: {reason}"));
+            return Err(UpgradeSkip::NoChange(format!("probe rejected: {reason}")));
         }
         crate::acquire::VerifyResult::Defer => {
             let _ = app.provider.delete_torrent(&added.id).await;
-            return Err("probe deferred".into());
+            return Err(UpgradeSkip::Deferred("probe deferred".into()));
         }
     }
     // Record Verified with sticky provenance from the owned record we are upgrading.
