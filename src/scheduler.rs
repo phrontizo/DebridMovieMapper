@@ -182,6 +182,8 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
                                 &app.provider,
                                 &app.tmdb_client,
                                 &app.store,
+                                &app.read_activity,
+                                Duration::from_secs(app.config.upgrade.idle_secs),
                             )
                             .await;
                         }
@@ -202,6 +204,8 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
                             &app.provider,
                             &app.tmdb_client,
                             &app.store,
+                            &app.read_activity,
+                            Duration::from_secs(app.config.upgrade.idle_secs),
                             app.config.remove_finished_shows,
                         )
                         .await;

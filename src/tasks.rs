@@ -1666,6 +1666,8 @@ async fn execute_remove(
     provider: &Arc<dyn DebridProvider>,
     torrents: &[Torrent],
     store: &Store,
+    read_activity: &Arc<crate::read_activity::ReadActivity>,
+    idle_window: Duration,
     tmdb_id: u64,
     hashes: &[String],
 ) {
@@ -1673,6 +1675,18 @@ async fn execute_remove(
     // title that protects every pre-existing copy). Skip early so we don't read the whole selection
     // table just to iterate an empty list.
     if hashes.is_empty() {
+        return;
+    }
+    // Idle-gate the destructive removal so a Trakt Trigger-A/B removal never interrupts an active
+    // stream (consistent with dedup/upgrade) — important in a multi-user household where one member
+    // finishing/abandoning a title must not yank it out from under another who is watching it.
+    // Library-wide: if anything is being read, defer. The owned record is left intact, so the next
+    // reconcile tick re-derives and retries the removal once idle.
+    if !read_activity.all_idle(idle_window).await {
+        debug!(
+            "reconcile: library not idle — deferring removal of tmdb {} to a later tick",
+            tmdb_id
+        );
         return;
     }
     // NOTE: on a delete failure we skip remove_owned so the next reconcile tick retries — leaving
@@ -1739,11 +1753,14 @@ async fn execute_acquire(
 /// Reconcile the combined wanted-set against owned-and-available content: acquire missing/lapsed
 /// titles (recording per-user provenance) and remove engine-owned titles per the removal
 /// lifecycle. Idempotent — re-derives every decision from the store + provider listing each call.
+#[allow(clippy::too_many_arguments)]
 pub async fn reconcile_wanted(
     engine: &AcquisitionEngine,
     provider: &Arc<dyn DebridProvider>,
     tmdb: &TmdbClient,
     store: &Store,
+    read_activity: &Arc<crate::read_activity::ReadActivity>,
+    idle_window: Duration,
 ) {
     let torrents = match provider.get_torrents().await {
         Ok(t) => t,
@@ -1769,7 +1786,16 @@ pub async fn reconcile_wanted(
     for op in ops {
         match op {
             ReconcileOp::Remove { tmdb_id, hashes } => {
-                execute_remove(provider, &torrents, store, tmdb_id, &hashes).await
+                execute_remove(
+                    provider,
+                    &torrents,
+                    store,
+                    read_activity,
+                    idle_window,
+                    tmdb_id,
+                    &hashes,
+                )
+                .await
             }
             ReconcileOp::Acquire {
                 tmdb_id,
@@ -1911,11 +1937,14 @@ pub(crate) fn season_aired(aired: &[(u32, u32)], season: u32) -> Vec<u32> {
 /// hashes is present in the provider listing. A specific episode is therefore treated as available
 /// whenever any of the show's hashes is present — acceptable for PROACTIVE acquisition (per-episode
 /// unavailability is still caught at playback/repair).
+#[allow(clippy::too_many_arguments)]
 pub async fn monitor_episodes(
     engine: &AcquisitionEngine,
     provider: &Arc<dyn DebridProvider>,
     tmdb: &TmdbClient,
     store: &Store,
+    read_activity: &Arc<crate::read_activity::ReadActivity>,
+    idle_window: Duration,
     remove_finished_shows: bool,
 ) {
     use crate::wanted::{reconcile_title, Action, Owned, TitleView};
@@ -2039,7 +2068,16 @@ pub async fn monitor_episodes(
                     if let Some(g) = owned_group {
                         let hashes = removal_hashes(g, reason, remove_finished_shows);
                         if !hashes.is_empty() {
-                            execute_remove(provider, &torrents, store, tmdb_id, &hashes).await;
+                            execute_remove(
+                                provider,
+                                &torrents,
+                                store,
+                                read_activity,
+                                idle_window,
+                                tmdb_id,
+                                &hashes,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -4099,11 +4137,76 @@ mod reconcile_wanted_tests {
             ..Default::default()
         });
         let torrents = provider.get_torrents().await.unwrap();
-        execute_remove(&provider, &torrents, &store, 27205, &["h1".to_string()]).await;
+        let idle = Arc::new(crate::read_activity::ReadActivity::new());
+        execute_remove(
+            &provider,
+            &torrents,
+            &store,
+            &idle,
+            Duration::from_secs(300),
+            27205,
+            &["h1".to_string()],
+        )
+        .await;
         assert!(store.get_owned("h1".into()).await.is_none());
         assert!(
             store.get_selection(movie_slot(27205)).await.is_none(),
             "removal must clear the selection slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_remove_defers_when_library_active() {
+        // A removal must NOT fire while something is being streamed (multi-user stream protection):
+        // the owned record + selection are left intact for a later (idle) tick.
+        use crate::store::{movie_slot, SelectionEntry};
+        let store = mem_store();
+        store
+            .put_owned(
+                "h1".into(),
+                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "h1".into(),
+                    file_path: "m.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent {
+                id: "tid".into(),
+                hash: "h1".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let torrents = provider.get_torrents().await.unwrap();
+        let activity = Arc::new(crate::read_activity::ReadActivity::new());
+        activity.touch("Movies/M/m.mkv").await; // an active read
+        execute_remove(
+            &provider,
+            &torrents,
+            &store,
+            &activity,
+            Duration::from_secs(300),
+            27205,
+            &["h1".to_string()],
+        )
+        .await;
+        assert!(
+            store.get_owned("h1".into()).await.is_some(),
+            "an active library must defer the removal (owned record kept for retry)"
+        );
+        assert!(
+            store.get_selection(movie_slot(27205)).await.is_some(),
+            "the selection slot must be kept while deferred"
         );
     }
 
@@ -4123,7 +4226,17 @@ mod reconcile_wanted_tests {
             ..Default::default()
         });
         let torrents = vec![torrent("t1", "H1")]; // hash case differs from stored "h1"
-        execute_remove(&provider, &torrents, &store, 27205, &["h1".to_string()]).await;
+        let idle = Arc::new(crate::read_activity::ReadActivity::new());
+        execute_remove(
+            &provider,
+            &torrents,
+            &store,
+            &idle,
+            Duration::from_secs(300),
+            27205,
+            &["h1".to_string()],
+        )
+        .await;
         assert_eq!(
             *deleted.lock().unwrap(),
             vec!["t1".to_string()],
@@ -4187,7 +4300,16 @@ mod reconcile_wanted_tests {
         );
         let tmdb = crate::tmdb_client::TmdbClient::new("k".into()).unwrap();
 
-        reconcile_wanted(&engine, &provider, &tmdb, &store).await;
+        let idle = Arc::new(crate::read_activity::ReadActivity::new());
+        reconcile_wanted(
+            &engine,
+            &provider,
+            &tmdb,
+            &store,
+            &idle,
+            Duration::from_secs(300),
+        )
+        .await;
 
         assert!(
             deleted.lock().unwrap().is_empty(),
