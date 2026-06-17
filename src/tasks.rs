@@ -4248,6 +4248,56 @@ mod reconcile_wanted_tests {
         );
     }
 
+    #[tokio::test]
+    async fn execute_remove_keeps_owned_record_when_delete_fails() {
+        // On a delete_torrent failure, execute_remove must KEEP the owned record (and its selection)
+        // so the next reconcile tick re-derives and retries the removal, rather than orphaning the
+        // torrent on the provider.
+        use crate::store::{movie_slot, SelectionEntry};
+        let store = mem_store();
+        store
+            .put_owned(
+                "h1".into(),
+                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "h1".into(),
+                    file_path: "m.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            fail_delete: true,
+            ..Default::default()
+        });
+        let torrents = vec![torrent("t1", "h1")];
+        let idle = Arc::new(crate::read_activity::ReadActivity::new());
+        execute_remove(
+            &provider,
+            &torrents,
+            &store,
+            &idle,
+            Duration::from_secs(300),
+            27205,
+            &["h1".to_string()],
+        )
+        .await;
+        assert!(
+            store.get_owned("h1".to_string()).await.is_some(),
+            "a failed delete must leave the owned record for the next tick to retry"
+        );
+        assert!(
+            store.get_selection(movie_slot(27205)).await.is_some(),
+            "a failed delete must leave the selection slot intact"
+        );
+    }
+
     /// When `get_torrents` fails, `reconcile_wanted` must early-return without executing any ops:
     /// no `delete_torrent` call and no owned records removed. Without the guard, a failed fetch
     /// defaults to an empty listing and Trigger-B fires, incorrectly removing owned content.

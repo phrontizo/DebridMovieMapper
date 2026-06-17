@@ -112,6 +112,9 @@ pub struct MockProvider {
     /// When `true`, `get_torrents` returns a `reqwest::Error` so tests can exercise the
     /// early-return guard in `reconcile_wanted` / `monitor_episodes`.
     pub fail_get_torrents: bool,
+    /// When `true`, `delete_torrent` returns a `reqwest::Error` (still recording the attempted id)
+    /// so tests can exercise the keep-the-owned-record-for-retry path in `execute_remove`.
+    pub fail_delete: bool,
 }
 
 #[cfg(test)]
@@ -138,6 +141,10 @@ impl DebridProvider for MockProvider {
     }
     async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error> {
         self.deleted.lock().unwrap().push(torrent_id.to_string());
+        if self.fail_delete {
+            // Drive an immediate URL-parse failure to produce a reqwest::Error without any I/O.
+            return reqwest::Client::new().get("").send().await.map(|_| ());
+        }
         Ok(())
     }
     async fn resolve_url(&self, loc: &FileLocator) -> Result<String, crate::error::AppError> {
