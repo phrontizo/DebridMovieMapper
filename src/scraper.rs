@@ -4,7 +4,7 @@ use crate::release::RawCandidate;
 use async_trait::async_trait;
 use regex::Regex;
 use std::sync::LazyLock;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Movie vs series — the two Stremio stream endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -28,7 +28,13 @@ pub enum MediaKind {
 pub fn build_http_client(proxy_url: Option<&str>) -> Result<reqwest::Client, AppError> {
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
     if let Some(url) = proxy_url {
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
+        // Case-insensitive scheme check (URL schemes are case-insensitive per RFC 3986, and the url
+        // crate lowercases the scheme, so `HTTP://…` is valid). Only the scheme is inspected — never
+        // lowercase the whole URL, which would corrupt a `user:pass@` credential.
+        let scheme_ok = url.split_once("://").is_some_and(|(scheme, _)| {
+            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+        });
+        if !scheme_ok {
             // Deliberately omit the value (it may carry `user:pass@` credentials).
             return Err(AppError::Config(
                 "SCRAPER_PROXY_URL must be an http(s) proxy URL like \
@@ -149,7 +155,13 @@ pub fn parse_streams(v: &serde_json::Value) -> Vec<RawCandidate> {
         return out;
     };
     for s in streams {
-        let (info_hash, url_idx) = match s.get("infoHash").and_then(|h| h.as_str()) {
+        let (info_hash, url_idx) = match s
+            .get("infoHash")
+            .and_then(|h| h.as_str())
+            .filter(|h| !h.is_empty())
+        {
+            // A present-but-EMPTY infoHash is degenerate (would build `magnet:?xt=urn:btih:`), so
+            // treat it like a missing one — fall through to the debrid-url hash recovery (else skip).
             Some(h) => (h.to_ascii_lowercase(), None),
             None => match s
                 .get("url")
@@ -217,6 +229,17 @@ impl Scraper for TorrentioScraper {
                 imdb_id, kind, season, episode
             );
             return Ok(Vec::new());
+        }
+        // A non-404 4xx (400/401/403) is a PERMANENT addon error — a misconfigured SCRAPER_ADDON_URL
+        // or a revoked provider token — not the transient 429/5xx the retry-next-tick is meant for.
+        // It still surfaces as an error (so the engine doesn't silently see zero candidates), but warn
+        // distinctly so the operator can tell a config problem apart from a transient upstream blip.
+        if resp.status().is_client_error() {
+            warn!(
+                "scrape: addon returned {} for {} — misconfigured SCRAPER_ADDON_URL or revoked provider token?",
+                resp.status(),
+                imdb_id
+            );
         }
         let resp = resp
             .error_for_status()
@@ -444,6 +467,34 @@ mod tests {
             {"name": "x", "title": "y", "url": "https://example.com/no/hash/here.mkv"}
         ]});
         assert!(parse_streams(&json).is_empty());
+    }
+
+    #[test]
+    fn skips_stream_with_empty_infohash() {
+        // A present-but-empty infoHash must not produce a degenerate `magnet:?xt=urn:btih:` candidate
+        // — with no recoverable url it's skipped, exactly like a missing infoHash.
+        let json = serde_json::json!({"streams": [
+            {"name": "x", "title": "y", "infoHash": ""}
+        ]});
+        assert!(parse_streams(&json).is_empty());
+        // And an empty infoHash with a resolvable debrid url still recovers the hash from the url.
+        let json2 = serde_json::json!({"streams": [
+            {"name": "x", "title": "y", "infoHash": "",
+             "url": "https://x/resolve/realdebrid/TOKEN/abcdef0123456789abcdef0123456789abcdef01/null/0/f.mkv"}
+        ]});
+        let cands = parse_streams(&json2);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(
+            cands[0].info_hash,
+            "abcdef0123456789abcdef0123456789abcdef01"
+        );
+    }
+
+    #[test]
+    fn build_http_client_accepts_uppercase_proxy_scheme() {
+        // URL schemes are case-insensitive; a valid `HTTP://`/`HTTPS://` proxy must not be rejected.
+        assert!(build_http_client(Some("HTTP://proxy.example:8080")).is_ok());
+        assert!(build_http_client(Some("HTTPS://proxy.example:8443")).is_ok());
     }
 
     #[tokio::test]
