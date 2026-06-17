@@ -126,6 +126,18 @@ fn to_torrent_file(f: &TbFile) -> TorrentFile {
     }
 }
 
+/// Map a decoded `mylist` into canonical torrents, DROPPING any entry with an unusable identity
+/// (id 0 or empty hash). `null_to_default` defaults a null/missing/type-mismatched id→0 and hash→""
+/// rather than failing the whole list decode; such an entry can't be acted on (a delete against id
+/// "0", or a hash-keyed lookup on ""), so skip it instead of surfacing a phantom torrent. A real
+/// TorBox torrent always has both.
+fn map_listed_torrents(raw: &[TbTorrent]) -> Vec<Torrent> {
+    raw.iter()
+        .filter(|t| t.id != 0 && !t.hash.is_empty())
+        .map(to_torrent)
+        .collect()
+}
+
 /// Map a TorBox torrent to the lightweight canonical `Torrent` (no files).
 fn to_torrent(t: &TbTorrent) -> Torrent {
     Torrent {
@@ -484,7 +496,7 @@ impl TorBoxClient {
     pub async fn list_torrents_raw(&self) -> Result<Vec<Torrent>, reqwest::Error> {
         let url = format!("{}/torrents/mylist?bypass_cache=true", TORBOX_BASE);
         let raw: Vec<TbTorrent> = self.send_data(|| self.client.get(&url)).await?;
-        Ok(raw.iter().map(to_torrent).collect())
+        Ok(map_listed_torrents(&raw))
     }
 
     pub async fn torrent_info_raw(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
@@ -943,6 +955,27 @@ mod tests {
         let arr: Vec<TbTorrent> = serde_json::from_str(&format!("[{},{}]", MYLIST_ITEM, bad))
             .expect("one type-mismatched entry must not fail the whole list");
         assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn list_drops_entries_with_unusable_identity() {
+        // A type-mismatched/absent id or hash defaults to 0/"" (null_to_default) — unusable, so it
+        // must be dropped from the mapped list rather than surfaced as a phantom id-0 torrent.
+        let bad = r#"{
+            "id": "notanumber", "hash": 123, "name": "X",
+            "download_finished": true, "download_state": "cached", "files": []
+        }"#;
+        let raw: Vec<TbTorrent> =
+            serde_json::from_str(&format!("[{},{}]", MYLIST_ITEM, bad)).unwrap();
+        assert_eq!(raw.len(), 2, "both entries decode (lenient)");
+        let mapped = map_listed_torrents(&raw);
+        assert_eq!(
+            mapped.len(),
+            1,
+            "the unusable (id 0 / empty hash) entry is dropped"
+        );
+        assert_ne!(mapped[0].id, "0");
+        assert!(!mapped[0].hash.is_empty());
     }
 
     #[test]
