@@ -589,10 +589,17 @@ impl Config {
             .unwrap_or_else(|| "metadata.db".to_string());
 
         let port = match port.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-            Some(s) => s.parse::<u16>().unwrap_or_else(|_| {
-                warn!("Invalid PORT value '{}', falling back to 8080", s);
-                8080
-            }),
+            // Reject 0 alongside unparseable values: port 0 binds a random ephemeral port (nothing
+            // is configured for it) and makes `--healthcheck` connect to 127.0.0.1:0 → fail →
+            // container restart loop. Fall back to 8080 with the same warn.
+            Some(s) => s
+                .parse::<u16>()
+                .ok()
+                .filter(|&p| p != 0)
+                .unwrap_or_else(|| {
+                    warn!("Invalid PORT value '{}', falling back to 8080", s);
+                    8080
+                }),
             None => 8080,
         };
 
@@ -771,6 +778,14 @@ mod tests {
         );
         assert_eq!(
             parts(Some("rd"), None, Some("t"), None, None, Some("nope"))
+                .unwrap()
+                .port,
+            8080
+        );
+        // PORT=0 is a footgun (binds a random ephemeral port; the healthcheck then connects to
+        // 127.0.0.1:0 and fails → restart loop). Treat it like the unparseable case → default 8080.
+        assert_eq!(
+            parts(Some("rd"), None, Some("t"), None, None, Some("0"))
                 .unwrap()
                 .port,
             8080

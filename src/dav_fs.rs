@@ -510,20 +510,17 @@ impl ProxiedMediaFile {
             // corrupting the read.
             let acceptable = status == reqwest::StatusCode::PARTIAL_CONTENT
                 || (status == reqwest::StatusCode::OK && pos == 0);
-            // Reject by advertised Content-Length as a cheap early-out: a 200 ignored the Range and
-            // is returning the whole object (refuse unless it fits the window; an absent length is
-            // treated as oversized), and a 206 whose Content-Length exceeds the cap is a
-            // non-compliant CDN echoing a huge body as "partial". The bounded read below is the
-            // hard guarantee — Content-Length is attacker-controlled and may lie or be absent.
-            let oversized = match status {
-                reqwest::StatusCode::OK => resp
+            // Reject by advertised Content-Length as a cheap early-out for a 206 whose Content-Length
+            // exceeds the cap (a non-compliant CDN echoing a huge body as "partial"). A 200 is only
+            // `acceptable` at pos==0 — a Range-ignoring CDN (e.g. TorBox) streaming the WHOLE object
+            // from byte 0, so a full-file Content-Length far above the window is EXPECTED, not
+            // oversized; the window-bounded read below stops at `want` bytes and drops the connection
+            // (mirroring `probe::read_body`). The bounded read is the hard guarantee regardless —
+            // Content-Length is attacker-controlled and may lie or be absent.
+            let oversized = status == reqwest::StatusCode::PARTIAL_CONTENT
+                && resp
                     .content_length()
-                    .is_none_or(|cl| cl > MAX_FETCH_SIZE as u64),
-                reqwest::StatusCode::PARTIAL_CONTENT => resp
-                    .content_length()
-                    .is_some_and(|cl| cl > MAX_FETCH_SIZE as u64),
-                _ => false,
-            };
+                    .is_some_and(|cl| cl > MAX_FETCH_SIZE as u64);
             // For a 206, defensively confirm the CDN returned the range we asked for: a non-compliant
             // CDN that answers 206 with a DIFFERENT start would otherwise be buffered at
             // `buffer_start = pos`, silently serving wrong bytes. An absent/unparseable Content-Range
@@ -585,11 +582,21 @@ impl ProxiedMediaFile {
             // accumulation doesn't repeatedly reallocate-and-copy as chunks arrive. The bounded
             // loop below still enforces MAX_FETCH_SIZE regardless of what the CDN actually sends.
             let want = range_end.saturating_sub(pos).saturating_add(1);
-            let mut body = bytes::BytesMut::with_capacity(want.min(MAX_FETCH_SIZE as u64) as usize);
+            let want_usize = want.min(MAX_FETCH_SIZE as u64) as usize;
+            let mut body = bytes::BytesMut::with_capacity(want_usize);
             loop {
                 match resp.chunk().await {
                     Ok(Some(chunk)) => {
                         body.extend_from_slice(&chunk);
+                        // Stop once the requested window is satisfied and drop the rest of the
+                        // connection: a Range-ignoring 200 (TorBox) streams the WHOLE multi-GB object
+                        // from byte 0, so we must read only `want` bytes rather than the entire file
+                        // (mirrors `probe::read_body`). `want` <= MAX_FETCH_SIZE, so this also bounds
+                        // the allocation; the check below is a hard backstop.
+                        if body.len() >= want_usize {
+                            body.truncate(want_usize);
+                            break;
+                        }
                         if body.len() > MAX_FETCH_SIZE {
                             tracing::warn!(
                                 "CDN body for {} exceeded {} bytes — clearing cached CDN URL",
@@ -1361,6 +1368,56 @@ mod provider_abstraction_tests {
             invalidate_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "a transient 5xx must NOT invalidate the cached resolution (avoids the resolve stampede)"
+        );
+    }
+
+    /// Server that replies `200 OK` (ignoring the Range header) advertising a HUGE Content-Length
+    /// — far above MAX_FETCH_SIZE — but only writes `body` bytes. This is exactly TorBox's CDN
+    /// behaviour on a large file: it ignores `bytes=0-N` and streams the WHOLE object from byte 0,
+    /// so the advertised length is the multi-GB file size while the client only needs the first
+    /// window. A correct client reads its window and drops the connection.
+    async fn spawn_range_ignoring_200_huge_cl(body: &'static [u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                // Advertise a 5 GB body (>> MAX_FETCH_SIZE) but only send the window's worth.
+                let head = "HTTP/1.1 200 OK\r\nContent-Length: 5000000000\r\n\r\n".to_string();
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+                // Keep the connection open briefly so the client can read its window and drop it.
+                let _ = sock.read(&mut buf).await;
+            }
+        });
+        format!("http://{}/", addr)
+    }
+
+    #[tokio::test]
+    async fn fetch_cdn_range_accepts_range_ignoring_200_with_oversized_content_length_at_offset_0()
+    {
+        // TorBox's CDN ignores the Range header and replies `200 OK` streaming the WHOLE (multi-GB)
+        // object from byte 0, advertising the full file size as Content-Length. At pos==0 that is a
+        // VALID response — the client must read its window and drop the connection, NOT reject it as
+        // "oversized" (which broke first-byte playback of every TorBox file > MAX_FETCH_SIZE).
+        let body: &[u8] = b"TORBOX200BYTES16"; // 16 bytes
+        let url = spawn_range_ignoring_200_huge_cl(body).await;
+        let (mut f, invalidate_calls) = proxied_with_counter(url, 0, body.len() as u64);
+        let data = f
+            .fetch_bytes(8)
+            .await
+            .expect("a Range-ignoring 200 at offset 0 must serve its window, not be rejected");
+        assert_eq!(&data[..], b"TORBOX20");
+        assert_eq!(
+            invalidate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a valid Range-ignoring 200 must not invalidate the cached resolution"
         );
     }
 

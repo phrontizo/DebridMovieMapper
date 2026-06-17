@@ -1033,6 +1033,13 @@ impl AcquisitionEngine {
             .lock()
             .await
             .retain(|h, _| owned_hashes.contains(h.as_str()));
+        // Bound `validate_fails` to owned hashes too — a stale per-hash count from a prior lifecycle
+        // would otherwise let a single transient validate blip on a re-acquired hash trip the
+        // two-strikes reap on its first tick (see `observe_prunes_stale_validate_fails_for_unowned_hash`).
+        self.validate_fails
+            .lock()
+            .await
+            .retain(|h, _| owned_hashes.contains(h.as_str()));
     }
 
     async fn is_stalled(&self, torrent_id: &str, progress: f64) -> bool {
@@ -1809,6 +1816,33 @@ mod tests {
             st.get_owned("h1".into()).await.unwrap().status,
             OwnedStatus::Verified,
             "once validation recovers, the record verifies (not blacklisted)"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_prunes_stale_validate_fails_for_unowned_hash() {
+        // The per-hash `validate_fails` counter (the transient-TMDB two-strikes tolerance) must be
+        // bounded to currently-owned hashes each tick, exactly like `verify_attempts`/`progress`.
+        // Otherwise a stale `=1` entry from a prior lifecycle of a hash survives after the title is
+        // removed (Trigger-B / dedup / lapse) and, on a later re-acquire of the SAME release, a
+        // single transient validate blip bumps it straight to 2 → wrongly blacklists + reaps a
+        // correct cached release on its FIRST tick, defeating the documented one-blip tolerance.
+        let st = store();
+        let eng = engine(
+            provider_returning("downloaded", "other"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        // A lingering counter for a hash that is no longer owned (its record was removed).
+        eng.validate_fails.lock().await.insert("ghost".into(), 1);
+        // A non-empty listing that doesn't include "ghost"; the store has no owned records.
+        eng.observe(&[torrent("tid_other", "other", "downloaded", 100.0)])
+            .await;
+        assert!(
+            !eng.validate_fails.lock().await.contains_key("ghost"),
+            "a validate_fails entry for an unowned hash must be pruned each observe tick"
         );
     }
 

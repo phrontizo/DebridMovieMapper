@@ -104,9 +104,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Healthcheck mode: exercise the request/handler path, then exit.
     if std::env::args().any(|a| a == "--healthcheck") {
+        // Resolve PORT identically to the server (Config also rejects 0 → 8080), so the probe never
+        // targets a different port than the one the server actually bound.
         let port: u16 = std::env::var("PORT")
             .ok()
-            .and_then(|s| s.trim().parse().ok())
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .filter(|&p| p != 0)
             .unwrap_or(8080);
         std::process::exit(if healthcheck(port) { 0 } else { 1 });
     }
