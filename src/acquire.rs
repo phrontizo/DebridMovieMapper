@@ -1759,6 +1759,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observe_dead_status_with_no_imdb_is_left_in_place() {
+        // Content-loss guard (A19): a dead/error-status torrent whose record has NO imdb id (a mirror
+        // torrent that can't be re-scraped) must be LEFT IN PLACE — deleting it would lose
+        // un-rescrapable user content. Leave it for on-read repair instead.
+        let st = store();
+        let mut r = req();
+        r.imdb_id = String::new(); // mirror torrent, no imdb id
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: r,
+                provenance: Provenance::manual(),
+                added_at: now_secs(),
+                status: OwnedStatus::Verified,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![torrent("tid_h1", "h1", "dead", 0.0)],
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "dead", 0.0)]).await;
+        assert!(
+            st.get_owned("h1".into()).await.is_some(),
+            "a dead torrent with no imdb id must be left in place (content-loss guard)"
+        );
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "must not delete an un-rescrapable record"
+        );
+        assert!(
+            !st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_dead_status_with_imdb_reaps_and_blacklists() {
+        // Counterpart to the content-loss guard: a dead torrent WITH an imdb id (re-scrapable) is
+        // reaped — deleted + blacklisted + re-acquired (no replacement here → just removed).
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(), // imdb_id = "tt1"
+                provenance: Provenance::manual(),
+                added_at: now_secs(),
+                status: OwnedStatus::Verified,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![torrent("tid_h1", "h1", "dead", 0.0)],
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper { candidates: vec![] }), // no replacement
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "dead", 0.0)]).await;
+        assert!(
+            st.get_owned("h1".into()).await.is_none(),
+            "a dead torrent WITH an imdb id is reaped"
+        );
+        assert!(
+            st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await
+        );
+        assert_eq!(*deleted.lock().unwrap(), vec!["tid_h1".to_string()]);
+    }
+
+    #[tokio::test]
     async fn observe_prefers_downloaded_duplicate_over_stale_error_entry() {
         // A hash with a healthy newest `downloaded` entry PLUS an older `error` duplicate (a repair
         // leak / external re-add). observe must resolve the hash to the downloaded copy and keep the
