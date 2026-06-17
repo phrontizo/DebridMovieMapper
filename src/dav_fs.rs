@@ -522,27 +522,39 @@ impl ProxiedMediaFile {
                     .is_some_and(|start| start != pos);
             if !acceptable || oversized || range_mismatch {
                 tracing::warn!(
-                    "CDN returned {} for {} at offset {} — clearing cached CDN URL",
+                    "CDN returned {} for {} at offset {}",
                     status,
                     self.name,
                     pos
                 );
-                // Expired URL (403/410) or a Range-ignoring 200 on a seek: drop the cached URL and
-                // resolution so the next attempt fetches a fresh one.
-                self.cdn_url = None;
-                self.rd_client.invalidate(&self.locator).await;
-                // A persistent server error (5xx) is NOT a stale URL — the file is broken on the
-                // provider. Once a fresh-URL retry (attempt > 0) still 5xxs, escalate to instant
-                // repair (re-add by hash) ONCE, exactly like resolve-time `Unavailable`: a cached
-                // replacement fixes playback inline; otherwise the read fails (instead of the player
-                // retry-storming a 500 forever). The repair cooldown bounds re-add attempts.
-                if status.is_server_error() && attempt > 0 && !repaired {
-                    repaired = true;
-                    if self.attempt_instant_repair().await.is_ok() {
-                        continue; // fetch again against the repaired torrent's fresh url
+                // A persistent server error (5xx) is NOT a stale URL — the file is (transiently)
+                // broken on the provider, not the signed URL. Do NOT clear `cdn_url` / invalidate the
+                // resolution for a 5xx: with many concurrent readers (one ProxiedMediaFile per rclone
+                // read-ahead) all invalidating at once, the next reads would serialise through the
+                // rate-limited resolve path (~63s hang) — the exact stampede the connection-error arm
+                // above avoids. Retry the SAME url; once a retry (attempt > 0) still 5xxs, escalate to
+                // instant repair (re-add by hash) ONCE — a cached replacement fixes playback inline,
+                // else the read fails (instead of the player retry-storming a 500 forever). The repair
+                // cooldown bounds re-add attempts. (`oversized`/`range_mismatch` require a 2xx, so they
+                // never reach this `is_server_error` arm.)
+                if status.is_server_error() {
+                    if attempt > 0 && !repaired {
+                        repaired = true;
+                        if self.attempt_instant_repair().await.is_ok() {
+                            continue; // fetch again against the repaired torrent's fresh url
+                        }
+                        return Err(FsError::GeneralFailure);
+                    }
+                    if attempt == 0 {
+                        continue; // retry the SAME url (no invalidate) — a transient origin blip
                     }
                     return Err(FsError::GeneralFailure);
                 }
+                // Genuinely stale/non-compliant (expired 403/410, a Range-ignoring 200 on a seek, an
+                // oversized body, or a range mismatch): drop the cached URL + resolution so the next
+                // attempt re-resolves a fresh one.
+                self.cdn_url = None;
+                self.rd_client.invalidate(&self.locator).await;
                 if attempt == 0 {
                     continue;
                 }
@@ -1309,6 +1321,27 @@ mod provider_abstraction_tests {
             .await
             .expect("a 403 then 206 must recover and serve bytes");
         assert_eq!(&data[..], b"FRESHBYT");
+    }
+
+    #[tokio::test]
+    async fn fetch_cdn_range_transient_5xx_retries_same_url_without_invalidating() {
+        // A transient origin 5xx is NOT a stale URL: the byte-fetch must retry the SAME url rather
+        // than clear the cached resolution, so many concurrent readers (one per rclone read-ahead)
+        // don't all stampede the rate-limited resolve path. First request 500, retry 206 → recovers,
+        // and invalidate is never called (contrast `fetch_cdn_range_invalidates_on_http_error`'s 403).
+        let body: &[u8] = b"FRESHBYTES123456"; // 16 bytes
+        let url = spawn_first_status_then_206("500 Internal Server Error", body).await;
+        let (mut f, invalidate_calls) = proxied_with_counter(url, 0, body.len() as u64);
+        let data = f
+            .fetch_bytes(8)
+            .await
+            .expect("a transient 500 then 206 must recover and serve bytes");
+        assert_eq!(&data[..], b"FRESHBYT");
+        assert_eq!(
+            invalidate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a transient 5xx must NOT invalidate the cached resolution (avoids the resolve stampede)"
+        );
     }
 
     #[test]
