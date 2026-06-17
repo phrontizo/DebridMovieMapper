@@ -359,7 +359,14 @@ async fn stage_and_verify(
     };
     let csv = file.id.to_string();
     let selected_path = file.path.clone();
-    let _ = app.provider.select_files(&added.id, &csv).await;
+    // A select_files error is caught downstream by the `status != "downloaded"` gate, but log it so a
+    // real provider failure isn't invisible on the movie path (parity with the consolidation path).
+    if let Err(e) = app.provider.select_files(&added.id, &csv).await {
+        warn!(
+            "upgrade: select_files for staged candidate {} failed: {}",
+            hash, e
+        );
+    }
     // Re-fetch and wait for the cached verdict; only a `downloaded` torrent may be staged (we never
     // speculatively download upgrades). All later gates run against this post-selection `fresh`.
     let fresh = await_downloaded(app.provider.as_ref(), &added.id)

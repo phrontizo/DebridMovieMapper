@@ -255,6 +255,10 @@ impl TmdbClient {
                         if attempt < max_attempts {
                             tokio::time::sleep(Duration::from_secs(capped)).await;
                         }
+                        // Record the real status error so that, on exhaustion, the surfaced error is
+                        // the actual persistent 503/429/etc rather than the synthetic 502 fallback
+                        // below (which would misattribute a sustained TMDB outage). Mirrors rd_client.
+                        last_error = resp.error_for_status_ref().err().map(|e| e.without_url());
                         continue; // Without this, the same error response falls through to error_for_status
                     }
 

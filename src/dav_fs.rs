@@ -380,11 +380,19 @@ impl ProxiedMediaFile {
                 }
             }
             Err(reason) => {
-                tracing::error!(
-                    "Instant repair failed for {}: {} — file unavailable",
-                    self.name,
-                    reason
-                );
+                // "not cached" is the NORMAL lapsed-cache outcome: the torrent is being re-downloaded
+                // and the scan loop will surface it once ready — logging that at error! on every
+                // cooldown-spaced read of a lapsed file is wrong-level noise. Reserve warn! for an
+                // actual repair failure (rate-limited / max-attempts / info-fetch error).
+                if reason.contains("not cached") {
+                    tracing::info!(
+                        "Instant repair for {}: {} — leaving to download",
+                        self.name,
+                        reason
+                    );
+                } else {
+                    tracing::warn!("Instant repair failed for {}: {}", self.name, reason);
+                }
                 Err(FsError::GeneralFailure)
             }
         }

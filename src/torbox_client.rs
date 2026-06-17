@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const TORBOX_BASE: &str = "https://api.torbox.app/v1/api";
 
@@ -570,12 +570,32 @@ impl TorBoxClient {
                 self.cache_put(loc, cdn.clone()).await;
                 Ok(cdn)
             }
-            Err(_) => {
-                info!(
-                    "TorBox requestdl unavailable for torrent {} file {}",
-                    loc.torrent_id, loc.file_id
-                );
-                Err(AppError::Unavailable)
+            Err(e) => {
+                // A 5xx / connection error / malformed response means the bytes aren't currently
+                // available → signal repair (Unavailable). A clearly-permanent auth/permission
+                // failure (401/403) won't be fixed by a re-add-by-hash, so surface it as Http to
+                // avoid a pointless repair cycle on every read. (A 404 stays Unavailable: it can be a
+                // stale torrent_id that re-add-by-hash recovers.) Log at debug — read-path, not an
+                // error, and during a repair storm info! would spam.
+                match e.status() {
+                    Some(s)
+                        if s == reqwest::StatusCode::UNAUTHORIZED
+                            || s == reqwest::StatusCode::FORBIDDEN =>
+                    {
+                        debug!(
+                            "TorBox requestdl auth/permission error ({}) for torrent {} file {}",
+                            s, loc.torrent_id, loc.file_id
+                        );
+                        Err(AppError::Http(e))
+                    }
+                    _ => {
+                        debug!(
+                            "TorBox requestdl unavailable for torrent {} file {}",
+                            loc.torrent_id, loc.file_id
+                        );
+                        Err(AppError::Unavailable)
+                    }
+                }
             }
         }
     }

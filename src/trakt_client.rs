@@ -168,7 +168,21 @@ impl TraktClientImpl {
         loop {
             attempt += 1;
             self.limiter.wait_for_token().await;
-            let resp = make_request().send().await.map_err(AppError::Http)?;
+            let resp = match make_request().send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Retry a transient transport error (connection reset / DNS blip / timeout) with
+                    // the same backoff as the 5xx branch — so a flaky network doesn't drop a whole
+                    // Trakt sync tick that RD/TorBox (which both retry transport errors) would ride
+                    // out. The URL is scrubbed (it can't carry the OAuth token, but stay consistent).
+                    if attempt < MAX_ATTEMPTS {
+                        let backoff_ms = 200u64.saturating_mul(1u64 << (attempt - 1).min(5));
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+                    return Err(AppError::Http(e.without_url()));
+                }
+            };
             let status = resp.status();
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 let retry_after = resp

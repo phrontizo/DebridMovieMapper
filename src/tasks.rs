@@ -188,7 +188,9 @@ pub async fn run_scan_loop(
                                         current_data.push((new_info, metadata));
                                     }
                                     Err(e) => {
-                                        error!("Failed to get info for repair replacement {}: {}, falling back to re-identification", torrent.id, e);
+                                        // Fully recovered this same tick (queued for re-identification
+                                        // below), so this is a warning, not an error.
+                                        warn!("Failed to get info for repair replacement {}: {}, falling back to re-identification", torrent.id, e);
                                         to_identify.push((*torrent).clone());
                                     }
                                 }
@@ -1538,7 +1540,17 @@ pub(crate) async fn dedup_owned(app: &AppState, torrents: &[crate::rd_client::To
                     continue;
                 }
             }
-            let _ = app.store.remove_owned(h.clone()).await;
+            // The torrent is already gone from the provider; if dropping the owned record fails, the
+            // stale record would never be reclaimed (plan_dedup only considers PRESENT hashes), so
+            // log it and DON'T count the hash as removed — mirrors `execute_remove`'s discipline.
+            if let Err(e) = app.store.remove_owned(h.clone()).await {
+                warn!(
+                    "dedup: remove_owned {} failed after delete: {} — record left stale",
+                    short(h),
+                    e
+                );
+                continue;
+            }
             // Clear any selection slot that pointed at the removed hash (the VFS re-derives it from
             // the kept covering hash on the next scan).
             for (slot, entry) in &selection {
