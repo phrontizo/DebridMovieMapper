@@ -145,10 +145,14 @@ pub fn parse_rd_date(s: &str) -> SystemTime {
 static SEASON_RE: LazyLock<Regex> = LazyLock::new(|| {
     // The `Sxx` arm is word-anchored (`\bs`) and bounded to 1-2 digits followed by `e` or a word
     // boundary, so a codec token (`DTS5`/`DDP5` — `s` mid-token) or a 4-digit `S2024` can't be read
-    // as a season while `S05E01`/`S5` still are. The `NxNN` arm is likewise bounded to a 1-2 digit
+    // as a season while `S05E01`/`S5` still are. The `season`/`part` arms accept any scene separator
+    // (`[\s._-]*`), not just whitespace, so `Season.2`/`Part_2`/`Season-2` (the common dotted scene
+    // form) resolve rather than mis-foldering to season 1. The `NxNN` arm is bounded to a 1-2 digit
     // season so a "WIDTHxHEIGHT" pixel resolution (e.g. 1920x1080) is not mistaken for one.
-    Regex::new(r"(?i)\bs(\d{1,2})(?:e|\b)|season\s*(\d+)|\b(\d{1,2})x\d{1,3}\b|part\s*(\d+)")
-        .unwrap()
+    Regex::new(
+        r"(?i)\bs(\d{1,2})(?:e|\b)|season[\s._-]*(\d+)|\b(\d{1,2})x\d{1,3}\b|part[\s._-]*(\d+)",
+    )
+    .unwrap()
 });
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3321,6 +3325,32 @@ mod tests {
         assert_eq!(extract("Show.S5.E01.mkv"), Some(5));
         assert_eq!(extract("Show.Part2.E01.mkv"), Some(2));
         assert_eq!(extract("Show.1x05.mkv"), Some(1));
+    }
+
+    #[test]
+    fn season_re_accepts_dotted_and_underscore_separators_for_spelled_out_forms() {
+        let extract = |name: &str| -> Option<u32> {
+            SEASON_RE
+                .captures(name)
+                .and_then(|cap| {
+                    cap.get(1)
+                        .or_else(|| cap.get(2))
+                        .or_else(|| cap.get(3))
+                        .or_else(|| cap.get(4))
+                })
+                .and_then(|m| m.as_str().parse::<u32>().ok())
+        };
+        // Scene names separate the spelled-out "Season"/"Part" from the number with a dot/underscore/
+        // dash, not just a space — these must resolve, not mis-fold to season 1.
+        assert_eq!(extract("Show.Season.2.E05.mkv"), Some(2));
+        assert_eq!(extract("Show.Season_2.E05.mkv"), Some(2));
+        assert_eq!(extract("Show.Season-2.E05.mkv"), Some(2));
+        assert_eq!(extract("Show.Part.3.E01.mkv"), Some(3));
+        // The space/no-separator forms still work.
+        assert_eq!(extract("Show.Season 4.E01.mkv"), Some(4));
+        assert_eq!(extract("Show.Season5.E01.mkv"), Some(5));
+        // A keyword with no following digit ("Seasonal", "Departure") must NOT match.
+        assert_eq!(extract("Seasonal.Documentary.mkv"), None);
     }
 
     /// Test that archive-only torrents produce an empty movie folder (no media files).

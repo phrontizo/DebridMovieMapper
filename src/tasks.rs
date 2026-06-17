@@ -1128,17 +1128,15 @@ pub(crate) async fn record_mirror_owned(
             // above the resolution ceiling (the upgrade path then skips it conservatively).
             quality: mirror_quality(info, prefs),
         };
-        // Re-check immediately before writing: the per-title TMDB lookup above is an await point, so
-        // a concurrent `engine.acquire` (separate scheduler task) could have written a
-        // provenance-bearing record for this hash since the snapshot was taken. `put_owned` is a
-        // blind overwrite, so without this the mirror could clobber real provenance with an empty one
-        // (silently making an engine-acquired title an un-removable mirror copy). Only hashes that
-        // passed the snapshot reach here (≈0 in steady state), so this adds ≈0 reads per tick.
-        if store.get_owned(hash.clone()).await.is_some() {
-            continue;
-        }
-        match store.put_owned(hash.clone(), rec).await {
-            Ok(()) => recorded += 1,
+        // Write ONLY if no record exists, ATOMICALLY: the per-title TMDB lookup above is an await
+        // point, so a concurrent `engine.acquire` (separate scheduler task) could have written a
+        // provenance-bearing record for this hash since the snapshot was taken. A check-then-blind-
+        // `put_owned` leaves a race window between the two transactions; `put_owned_if_absent` does the
+        // check-and-insert in one transaction, so the mirror can never clobber real provenance with an
+        // empty one (which would silently make an engine-acquired title an un-removable mirror copy).
+        match store.put_owned_if_absent(hash.clone(), rec).await {
+            Ok(true) => recorded += 1,
+            Ok(false) => {} // a record already exists for this hash — leave it intact
             Err(e) => warn!("mirror: failed to record owned {}: {}", hash, e),
         }
     }

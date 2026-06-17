@@ -652,6 +652,52 @@ impl Store {
         Self::flatten_join(result)
     }
 
+    /// Insert an owned record ONLY if none exists for `hash`, atomically in one write transaction.
+    /// Returns `true` if it wrote, `false` if a record was already present (left intact). The account
+    /// mirror uses this so a concurrent `engine.acquire` (a separate scheduler task) that wrote a
+    /// provenance-bearing record for the same hash can't be clobbered by the mirror's empty-provenance
+    /// write — the check-and-insert is a single transaction, closing the `get_owned`→`put_owned` race.
+    pub async fn put_owned_if_absent(
+        &self,
+        hash: String,
+        rec: OwnedRecord,
+    ) -> Result<bool, AppError> {
+        let bytes = match serde_json::to_vec(&rec) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Failed to serialise OwnedRecord for {}: {}", hash, e);
+                return Ok(false);
+            }
+        };
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, redb::Error> {
+            let txn = db.begin_write()?;
+            let wrote = {
+                let mut table = txn.open_table(OWNED_TABLE)?;
+                // `.is_some()` drops the read guard before the `&mut` insert below.
+                if table.get(hash.as_str())?.is_some() {
+                    false
+                } else {
+                    table.insert(hash.as_str(), bytes.as_slice())?;
+                    true
+                }
+            };
+            txn.commit()?;
+            Ok(wrote)
+        })
+        .await;
+        match result {
+            Ok(Ok(wrote)) => Ok(wrote),
+            Ok(Err(e)) => Err(AppError::Db(e)),
+            Err(e) => {
+                error!("redb blocking write task did not complete: {:?}", e);
+                Err(AppError::Task(format!(
+                    "redb blocking task did not complete: {e}"
+                )))
+            }
+        }
+    }
+
     pub async fn get_owned(&self, hash: String) -> Option<OwnedRecord> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
@@ -1685,6 +1731,38 @@ mod tests {
         assert_eq!(store.all_owned().await.len(), 1);
         store.remove_owned("h1".to_string()).await.unwrap();
         assert!(store.get_owned("h1".to_string()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn put_owned_if_absent_writes_only_when_absent_and_never_clobbers() {
+        let store = mem_store();
+        let engine_rec = OwnedRecord {
+            request: req("tt1", 27205),
+            provenance: Provenance::watchlist("alice"), // provenance-bearing (engine) record
+            added_at: 1,
+            status: OwnedStatus::Pending,
+            provides: vec![],
+            quality: None,
+        };
+        // Absent → writes, returns true.
+        assert!(store
+            .put_owned_if_absent("h1".into(), engine_rec.clone())
+            .await
+            .unwrap());
+        // Present → does NOT write, returns false, and the existing engine record is preserved.
+        let mirror_rec = OwnedRecord {
+            provenance: Provenance { entries: vec![] }, // empty-provenance mirror
+            ..engine_rec.clone()
+        };
+        assert!(!store
+            .put_owned_if_absent("h1".into(), mirror_rec)
+            .await
+            .unwrap());
+        let kept = store.get_owned("h1".into()).await.unwrap();
+        assert!(
+            !kept.provenance.entries.is_empty(),
+            "the existing engine record's provenance must NOT be clobbered by the mirror write"
+        );
     }
 
     #[tokio::test]

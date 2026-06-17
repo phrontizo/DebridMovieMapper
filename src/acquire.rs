@@ -684,18 +684,26 @@ impl AcquisitionEngine {
         let owned = self.store.all_owned().await;
         // Key by lowercased provider hash so it matches the lowercased candidate hashes we store.
         // When the listing contains DUPLICATE entries for a hash (a repair leak or an external
-        // re-add — exactly what the scan loop's dedup deletes), resolve each hash to its BEST entry:
-        // prefer a `downloaded` torrent, and among equals keep the newest (the provider lists
-        // newest-first, so the first-seen). A naive `.collect()` is last-write-wins and would resolve
-        // to the OLDEST duplicate — which may be a stale `error`/`dead` entry the scan loop is about to
-        // delete, wrongly driving `fail_and_reacquire` (blacklist + re-scrape) on a title that in fact
-        // has a healthy downloaded copy.
+        // re-add — exactly what the scan loop's dedup deletes), resolve each hash to its BEST entry
+        // by HEALTH: a `downloaded` torrent beats a still-downloading/queued one, which beats a
+        // dead/error one — and among equal health keep the newest (the provider lists newest-first, so
+        // the first-seen). Ranking by health (not just "downloaded vs not") is essential: otherwise a
+        // newest `error`/`dead` duplicate masks an older but LIVE `downloading` one, and `observe`
+        // then reaps+blacklists the hash (`fail_and_reacquire`), abandoning the in-flight download.
+        fn dup_rank(status: &str) -> u8 {
+            match status {
+                "downloaded" => 2,
+                "magnet_error" | "dead" | "error" | "virus" => 0,
+                _ => 1, // downloading / queued / waiting_files_selection / …
+            }
+        }
         let mut by_hash: HashMap<String, &crate::rd_client::Torrent> = HashMap::new();
         for t in torrents {
             let key = t.hash.to_ascii_lowercase();
             match by_hash.get(&key) {
-                Some(existing) if existing.status == "downloaded" => {} // best already kept
-                Some(_) if t.status != "downloaded" => {} // both non-downloaded: keep the newer
+                // Keep the existing entry only when it ranks at least as healthy (first-seen = newest
+                // wins ties); a strictly-healthier incoming entry replaces it.
+                Some(existing) if dup_rank(&existing.status) >= dup_rank(&t.status) => {}
                 _ => {
                     by_hash.insert(key, t);
                 }
@@ -2023,6 +2031,51 @@ mod tests {
             !st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
                 .await,
             "a title with a healthy downloaded copy must not be blacklisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_keeps_live_downloading_duplicate_over_newest_error_entry() {
+        // A hash listed twice: a NEWEST error/dead entry plus an OLDER still-downloading one (a repair
+        // leak / external re-add). observe must resolve to the LIVE download (rank by HEALTH, not just
+        // downloaded-vs-not) and keep it Pending — NOT reap+blacklist off the dead duplicate, which
+        // would abandon the in-flight download.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::watchlist("a"),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let eng = engine(
+            provider_returning("downloading", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        // Provider lists newest-first: a newest errored duplicate, then the older live download.
+        eng.observe(&[
+            torrent("tid_err", "h1", "error", 0.0),
+            torrent("tid_dl", "h1", "downloading", 42.0),
+        ])
+        .await;
+        assert_eq!(
+            st.get_owned("h1".into()).await.unwrap().status,
+            OwnedStatus::Pending,
+            "the live download must survive (resolved to the downloading duplicate)"
+        );
+        assert!(
+            !st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await,
+            "a live in-flight download must not be reaped/blacklisted off a dead duplicate"
         );
     }
 

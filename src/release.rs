@@ -93,8 +93,11 @@ static SEED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{1f464}\s*(\d+
 // transport-stream CONTAINER extension (both are served video formats), wrongly cam-rejecting a
 // legitimate `.ts` release. `hd-?ts` stays here (unambiguous — never a container extension).
 static CAM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // Bare `tc` (telecine) is included alongside `hd-?tc`/`tele-?cine`: unlike `ts`, there is no `.tc`
+    // CONTAINER extension, so the word-bounded `\btc\b` is unambiguous (it matches a standalone `TC`
+    // tag, not a substring like "catch").
     Regex::new(
-        r"\b(cam|cam-?rip|hd-?cam|hq-?cam|hd-?ts|tele-?sync|hd-?tc|tele-?cine|scr|screener|dvd-?scr|bd-?scr|work-?print|r5|pre-?dvd|predvd)\b",
+        r"\b(cam|cam-?rip|hd-?cam|hq-?cam|hd-?ts|tele-?sync|hd-?tc|tele-?cine|tc|scr|screener|dvd-?scr|bd-?scr|work-?print|r5|pre-?dvd|predvd)\b",
     )
     .unwrap()
 });
@@ -692,6 +695,8 @@ mod tests {
             "CAM",
             "HDCAM",
             "TELESYNC",
+            "TELECINE",
+            "TC", // bare telecine tag — must be rejected like HDTC/TELECINE
             "DVDScr",
             "R5",
             "TS",
