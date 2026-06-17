@@ -1437,6 +1437,183 @@ mod tests {
         );
     }
 
+    /// Provider that touches read-activity inside `get_torrent_info` — simulating a playback read that
+    /// begins DURING staging (after the outer idle gate passed). Used to trip the 4b idle re-check.
+    #[derive(Debug)]
+    struct TouchDuringStageProvider {
+        ra: Arc<crate::read_activity::ReadActivity>,
+        deleted: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl DebridProvider for TouchDuringStageProvider {
+        fn name(&self) -> &'static str {
+            "touchstage"
+        }
+        async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
+            Ok(vec![
+                Torrent {
+                    id: "told".into(),
+                    hash: "hold".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tnew".into(),
+                    hash: "hnew".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ])
+        }
+        async fn get_torrent_info(&self, _id: &str) -> Result<TorrentInfo, reqwest::Error> {
+            // A read begins mid-stage → the 4b idle re-check must trip and force a full rollback.
+            self.ra.touch("Movies/something.mkv").await;
+            Ok(TorrentInfo {
+                id: "tnew".into(),
+                hash: "hnew".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "M.2020.1080p.REMUX.mkv".into(),
+                    bytes: 30_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            })
+        }
+        async fn add_magnet(&self, _m: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+            Ok(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            })
+        }
+        async fn select_files(&self, _t: &str, _f: &str) -> Result<(), reqwest::Error> {
+            Ok(())
+        }
+        async fn delete_torrent(&self, t: &str) -> Result<(), reqwest::Error> {
+            self.deleted.lock().unwrap().push(t.to_string());
+            Ok(())
+        }
+        async fn resolve_url(
+            &self,
+            _l: &crate::provider::FileLocator,
+        ) -> Result<String, crate::error::AppError> {
+            Ok("https://cdn/new".into())
+        }
+        async fn invalidate(&self, _l: &crate::provider::FileLocator) {}
+        async fn evict_expired_cache(&self) {}
+    }
+
+    #[tokio::test]
+    async fn movie_upgrade_rolls_back_when_library_goes_active_during_staging() {
+        // The 4b idle re-check: the outer/inner idle gates pass, the candidate is fully staged, then a
+        // read begins mid-stage. The engine must ROLL BACK the staged candidate (delete + drop
+        // records) and DEFER — never prune the old torrent out from under the new read. (Distinct from
+        // the outer-gate `active_movie_is_not_pruned` test, where nothing is ever staged.)
+        let store = mem_store();
+        store
+            .put_owned(
+                "hold".into(),
+                OwnedRecord {
+                    request: movie_req(),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(QualitySummary {
+                        cached: true,
+                        source_tier: 3_000,
+                        resolution: 1080,
+                        score: 10,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "hold".into(),
+                    file_path: "old.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let scraper: Arc<dyn Scraper> = Arc::new(MockScraper {
+            candidates: vec![remux_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ra = Arc::new(crate::read_activity::ReadActivity::new());
+        let provider: Arc<dyn DebridProvider> = Arc::new(TouchDuringStageProvider {
+            ra: ra.clone(),
+            deleted: deleted.clone(),
+        });
+        // Build the AppState manually so the provider and the engine SHARE `ra` — the mid-stage touch
+        // must be visible to run_upgrade_once's idle gates.
+        let mut config =
+            Config::from_parts(None, Some("tb".into()), Some("k".into()), None, None, None)
+                .unwrap();
+        config.acquisition = AcquisitionConfig::default();
+        let validator: Arc<dyn crate::acquire::TitleValidator> = Arc::new(PassValidator);
+        let prober: Arc<dyn crate::acquire::Prober> =
+            Arc::new(CannedProber(Err(ProbeError::Unsupported)));
+        let engine = Arc::new(crate::acquire::AcquisitionEngine::new(
+            provider.clone(),
+            scraper.clone(),
+            validator,
+            prober,
+            store.clone(),
+            config.acquisition.prefs.clone(),
+            5,
+            Duration::from_secs(1800),
+            Duration::from_secs(600),
+        ));
+        let app = AppState {
+            provider: provider.clone(),
+            tmdb_client: Arc::new(TmdbClient::new("k".into()).unwrap()),
+            vfs: Arc::new(RwLock::new(DebridVfs::new())),
+            store: store.clone(),
+            repair_manager: Arc::new(RepairManager::new(provider)),
+            config: Arc::new(config),
+            jellyfin_client: None,
+            http_client: reqwest::Client::new(),
+            scraper,
+            engine,
+            trakt_client: None,
+            read_activity: ra.clone(),
+        };
+        run_upgrade_once(&app).await;
+
+        assert!(
+            deleted.lock().unwrap().contains(&"tnew".to_string()),
+            "the staged candidate must be deleted on the 4b rollback"
+        );
+        assert!(
+            store.get_owned("hnew".into()).await.is_none(),
+            "the staged record must be dropped on rollback"
+        );
+        assert!(
+            store.get_owned("hold".into()).await.is_some(),
+            "the current release must be untouched"
+        );
+        assert!(
+            !deleted.lock().unwrap().contains(&"told".to_string()),
+            "the old torrent must NOT be pruned (the read must not be interrupted)"
+        );
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hold",
+            "the selection must NOT be swapped"
+        );
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Movie, 27205).await,
+            0,
+            "a title deferred mid-stage keeps its cursor unstamped"
+        );
+    }
+
     /// Simulates Real-Debrid's add→select→downloaded lifecycle: a freshly-added (even cached)
     /// torrent reports `waiting_files_selection` with its file list already populated, and flips to
     /// `downloaded` only AFTER `select_files` is called. The pre-fix ordering (gate on status

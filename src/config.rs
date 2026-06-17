@@ -536,14 +536,20 @@ impl Config {
         cfg.acquisition = AcquisitionConfig::from_env();
         cfg.trakt = TraktConfig::from_env();
         cfg.upgrade = UpgradeConfig::from_env();
-        // Delegate to the single crate-wide boolean parser so every flag accepts the same set
-        // (`1`/`true`/`yes`/`on`), defaulting to false when unset/unrecognised.
-        fn env_flag(name: &str) -> bool {
-            AcquisitionConfig::parse_bool(std::env::var(name).ok(), false)
-        }
-        cfg.dedup_remove_duplicates = env_flag("DEDUP_REMOVE_DUPLICATES");
-        cfg.remove_finished_shows = env_flag("REMOVE_FINISHED_SHOWS");
+        cfg.apply_household_flags(|name| std::env::var(name).ok());
         Ok(cfg)
+    }
+
+    /// Apply the two household-policy flags from a name→value `lookup`. Factored out of `from_env` so
+    /// the env-NAME → field wiring is unit-testable WITHOUT mutating the process environment (a
+    /// name swap would silently enable destructive duplicate deletion when the operator meant
+    /// finished-show removal). Each flag delegates to the crate-wide boolean parser, so it accepts the
+    /// same synonyms (`1`/`true`/`yes`/`on`) and defaults to false when unset/unrecognised.
+    fn apply_household_flags(&mut self, lookup: impl Fn(&str) -> Option<String>) {
+        self.dedup_remove_duplicates =
+            AcquisitionConfig::parse_bool(lookup("DEDUP_REMOVE_DUPLICATES"), false);
+        self.remove_finished_shows =
+            AcquisitionConfig::parse_bool(lookup("REMOVE_FINISHED_SHOWS"), false);
     }
 
     /// Pure construction from raw optional values — unit-testable without touching
@@ -1112,6 +1118,34 @@ mod tests {
     fn config_from_parts_has_trakt_none() {
         let c = parts(Some("rd"), None, Some("tmdb"), None, None, None).unwrap();
         assert_eq!(c.trakt, None);
+    }
+
+    #[test]
+    fn household_flags_map_each_env_name_to_its_own_field() {
+        // Guards against a NAME SWAP that would silently enable destructive duplicate deletion when
+        // the operator meant finished-show removal (or vice-versa). Pure lookup → no env mutation.
+        let mut c = parts(Some("rd"), None, Some("tmdb"), None, None, None).unwrap();
+        assert!(!c.dedup_remove_duplicates && !c.remove_finished_shows);
+        // Only DEDUP set → only dedup flips.
+        c.apply_household_flags(|n| (n == "DEDUP_REMOVE_DUPLICATES").then(|| "yes".to_string()));
+        assert!(c.dedup_remove_duplicates, "DEDUP_REMOVE_DUPLICATES → dedup");
+        assert!(
+            !c.remove_finished_shows,
+            "DEDUP must NOT set remove_finished_shows"
+        );
+        // Only REMOVE_FINISHED set → only finished flips (and dedup resets to false).
+        c.apply_household_flags(|n| (n == "REMOVE_FINISHED_SHOWS").then(|| "1".to_string()));
+        assert!(
+            !c.dedup_remove_duplicates,
+            "REMOVE_FINISHED must NOT set dedup"
+        );
+        assert!(
+            c.remove_finished_shows,
+            "REMOVE_FINISHED_SHOWS → remove_finished_shows"
+        );
+        // Unset → both default false.
+        c.apply_household_flags(|_| None);
+        assert!(!c.dedup_remove_duplicates && !c.remove_finished_shows);
     }
 
     #[test]

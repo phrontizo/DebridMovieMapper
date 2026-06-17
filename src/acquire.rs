@@ -1392,6 +1392,62 @@ mod tests {
         }
     }
 
+    /// Hash-aware provider for end-to-end re-acquire tests: `add_magnet` derives the torrent id from
+    /// the magnet's infohash and `get_torrent_info` returns a downloaded single-file movie for that
+    /// hash — so a blacklist→re-scrape→add-next-candidate round-trip resolves a DIFFERENT hash than
+    /// the original (unlike `provider_returning`, which is pinned to one hash).
+    #[derive(Debug, Default)]
+    struct HashAwareProvider {
+        deleted: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl DebridProvider for HashAwareProvider {
+        fn name(&self) -> &'static str {
+            "hashaware"
+        }
+        async fn get_torrents(&self) -> Result<Vec<crate::rd_client::Torrent>, reqwest::Error> {
+            Ok(vec![])
+        }
+        async fn get_torrent_info(&self, id: &str) -> Result<TI, reqwest::Error> {
+            let hash = id.strip_prefix("tid_").unwrap_or(id).to_string();
+            Ok(TI {
+                id: id.to_string(),
+                hash,
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "Movie.2023.1080p.x265.mkv".into(),
+                    bytes: 10,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/file".into()],
+                ..Default::default()
+            })
+        }
+        async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+            let hash = magnet.rsplit("btih:").next().unwrap_or("").to_string();
+            Ok(AddMagnetResponse {
+                id: format!("tid_{hash}"),
+                uri: String::new(),
+            })
+        }
+        async fn select_files(&self, _t: &str, _f: &str) -> Result<(), reqwest::Error> {
+            Ok(())
+        }
+        async fn delete_torrent(&self, t: &str) -> Result<(), reqwest::Error> {
+            self.deleted.lock().unwrap().push(t.to_string());
+            Ok(())
+        }
+        async fn resolve_url(
+            &self,
+            _l: &crate::provider::FileLocator,
+        ) -> Result<String, crate::error::AppError> {
+            Ok("https://cdn/file".into())
+        }
+        async fn invalidate(&self, _l: &crate::provider::FileLocator) {}
+        async fn evict_expired_cache(&self) {}
+    }
+
     fn engine(
         provider: Arc<dyn DebridProvider>,
         scraper: Arc<dyn Scraper>,
@@ -2323,6 +2379,62 @@ mod tests {
             eng.acquire(req(), Provenance::manual()).await,
             AcquireOutcome::NoAcceptableRelease,
             "all candidates blacklisted → nothing acquirable"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_wrong_title_reacquires_the_next_candidate_end_to_end() {
+        // The self-healing round-trip: h1 fails title-validation (two strikes) → blacklist + delete +
+        // re-scrape → the NEXT candidate (h2) is added as Pending. Proves the recovery promotes a
+        // DIFFERENT hash (not a re-add of the just-blacklisted one) end to end.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let provider: Arc<dyn DebridProvider> = Arc::new(HashAwareProvider::default());
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper {
+                candidates: vec![cand("h1", true), cand("h2", true)],
+            }),
+            Arc::new(OkValidator(false)), // h1 fails title-validation
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        // Tick 1: one validation failure — not yet reaped (transient-TMDB tolerance).
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await;
+        assert_eq!(
+            st.get_owned("h1".into()).await.unwrap().status,
+            OwnedStatus::Pending
+        );
+        // Tick 2: second consecutive failure → reap h1 + re-acquire the next candidate.
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await;
+        assert!(st.get_owned("h1".into()).await.is_none(), "h1 reaped");
+        assert!(
+            st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await,
+            "h1 blacklisted"
+        );
+        let h2 = st
+            .get_owned("h2".into())
+            .await
+            .expect("the next candidate (h2) must be acquired");
+        assert_eq!(
+            h2.status,
+            OwnedStatus::Pending,
+            "h2 is recorded Pending (its verdict is deferred to a later observe)"
         );
     }
 
