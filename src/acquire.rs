@@ -538,8 +538,15 @@ impl AcquisitionEngine {
                 .await;
             // Best-effort: if the file list is already present (cached), select now so it is
             // immediately resolvable; otherwise observe selects once metadata resolves.
+            //
+            // Select WITHOUT the addon hint (None, None) so the chosen file matches what `observe`
+            // later records/probes (`select_target(.., None, None)` = the largest video). A valid
+            // single-feature movie's feature IS the largest (the pack-guard rejects multi-feature),
+            // so this is correct; and it avoids the B10 mismatch where a misleading hint points at a
+            // non-largest file (e.g. a sample) — acquire would select that while observe probes the
+            // largest, leaving the largest unselected → a broken locator → a stuck Pending.
             if let Ok(info) = self.provider.get_torrent_info(&added.id).await {
-                let ids = select_ids_for(req.kind, &info, cand.file_name.as_deref(), cand.file_idx);
+                let ids = select_ids_for(req.kind, &info, None, None);
                 if !ids.is_empty() {
                     let csv = ids
                         .iter()
@@ -1134,6 +1141,40 @@ mod tests {
         // continuation requires an explicit `e` before each number).
         assert_eq!(parse_se_all("Show.S01E01.1080p.x265.mkv"), vec![(1, 1)]);
         assert_eq!(parse_se_all("Show.S01E07.720p.WEB.mkv"), vec![(1, 7)]);
+    }
+
+    #[test]
+    fn select_target_no_hint_picks_largest_so_acquire_and_observe_agree() {
+        // B10: `acquire` and `observe` must select the SAME movie file. Both now call
+        // `select_target(.., None, None)` → the largest video (the feature). A misleading addon hint
+        // pointing at a smaller sample WOULD have picked it (the old acquire behaviour), leaving the
+        // largest — which observe records/probes — unselected → a broken locator → a stuck Pending.
+        let info = TI {
+            files: vec![
+                TorrentFile {
+                    id: 1,
+                    path: "Movie.2020.SAMPLE.mkv".into(),
+                    bytes: 50_000_000,
+                    selected: 1,
+                },
+                TorrentFile {
+                    id: 2,
+                    path: "Movie.2020.1080p.x265.mkv".into(),
+                    bytes: 8_000_000_000,
+                    selected: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        // No hint (what BOTH acquire and observe now use) → the feature (largest video).
+        assert_eq!(select_target(&info, None, None).unwrap().id, 2);
+        // A hint at the sample would have picked it — the divergence the fix removes.
+        assert_eq!(
+            select_target(&info, Some("Movie.2020.SAMPLE.mkv"), None)
+                .unwrap()
+                .id,
+            1
+        );
     }
 
     #[test]

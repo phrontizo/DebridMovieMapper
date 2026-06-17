@@ -344,6 +344,15 @@ impl DebridVfs {
                     // largest (torrents are size-sorted). Then fall back to the next candidate that
                     // actually yields a streamable video file, so a movie whose top choice is
                     // archive-only (RAR/ZIP) doesn't vanish when a smaller streamable copy exists.
+                    //
+                    // ASYMMETRY (B11): unlike the episode path, this matches the selection by HASH only
+                    // and then emits the torrent's largest streamable video — it does NOT enforce the
+                    // stored `SelectionEntry.file_path`. That is safe because a movie torrent holds a
+                    // single feature (the acquisition + upgrade pack-guards reject multi-feature packs),
+                    // so the hash uniquely identifies the file; the stored `file_path` is forward-compat
+                    // only. Enforcing it here (without the episode path's largest-bytes self-heal on a
+                    // path mismatch) would risk HIDING a movie after a re-acquire shifted the path, so
+                    // the hash-only match is deliberate.
                     let selected_hash = tmdb_id_of(&metadata)
                         .and_then(|id| selection.get(&crate::store::movie_slot(id)))
                         .map(|sel| sel.hash.clone());
