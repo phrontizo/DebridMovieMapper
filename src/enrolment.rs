@@ -256,13 +256,24 @@ fn is_cross_origin<B>(req: &hyper::Request<B>) -> bool {
         }
     }
     if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
-        // Strip the scheme to compare host[:port] against the Host header.
-        let origin_host = origin.split_once("://").map(|(_, rest)| rest).unwrap_or("");
+        // A PRESENT Origin must parse to a host[:port] that matches the Host header. An
+        // unparseable/`null` Origin (sandboxed iframe, some redirect/privacy contexts — no
+        // `scheme://host`) is NOT same-origin, so treat it as cross-origin rather than letting it
+        // fall through as allowed. (A request with NO Origin header at all — curl/tests/old browsers
+        // — is still treated as same-origin under the documented trusted-LAN model.)
         let host = headers
             .get("host")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if !origin_host.is_empty() && !host.is_empty() && !origin_host.eq_ignore_ascii_case(host) {
+        let same_origin = origin
+            .split_once("://")
+            .map(|(_, h)| h)
+            .is_some_and(|origin_host| {
+                !origin_host.is_empty()
+                    && !host.is_empty()
+                    && origin_host.eq_ignore_ascii_case(host)
+            });
+        if !same_origin {
             return true;
         }
     }
@@ -769,6 +780,10 @@ mod tests {
         assert!(is_cross_origin(&req));
         // Mismatched Origin host → cross-origin.
         let req = post_req(&[("host", "host.local"), ("origin", "https://evil.example")]);
+        assert!(is_cross_origin(&req));
+        // A present-but-unparseable `Origin: null` (sandboxed iframe / privacy context) is NOT
+        // same-origin → must be treated as cross-origin, not allowed to fall through.
+        let req = post_req(&[("host", "host.local"), ("origin", "null")]);
         assert!(is_cross_origin(&req));
     }
 

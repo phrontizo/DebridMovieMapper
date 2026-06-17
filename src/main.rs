@@ -21,6 +21,14 @@ use tracing::info;
 
 const MAX_CONNECTIONS: usize = 256;
 
+/// Maximum time to wait for a client to send a complete set of request headers. hyper applies this
+/// to EACH request, including the next-request wait on an idle HTTP/1.1 keep-alive connection — so a
+/// peer that dies uncleanly (rclone container restart, killed player, network partition) without
+/// sending FIN/RST no longer pins its connection permit (one of `MAX_CONNECTIONS`) indefinitely. It
+/// only bounds the HEADER phase, never response-body streaming, so long media streams are unaffected;
+/// a client whose idle keep-alive is closed simply reconnects on its next request.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The log-filter directive: `RUST_LOG` when set to something non-empty, else `info` (the prior
 /// default, so logging is unchanged when the var is unset). Parsing/validation of the directive is
 /// left to `EnvFilter` at the call site (a malformed value falls back to `info`).
@@ -31,6 +39,48 @@ fn log_directive(rust_log: Option<String>) -> String {
         .unwrap_or_else(|| "info".to_string())
 }
 
+/// Debug-string classification of a `serve_connection` error that is a benign/expected client-side
+/// disconnect (`IncompleteMessage` — a player/WebDAV client dropping mid-request) or our own
+/// `header_read_timeout` closing an idle keep-alive connection (`HeaderTimeout` / "timed out"). hyper
+/// 1.x doesn't expose typed accessors for these, so we match its Debug output — pinned by a unit test
+/// so a hyper upgrade that renames a variant fails CI rather than silently demoting (or, for the
+/// timeout, spamming at ERROR) the wrong errors. (io-level kinds are handled separately, by downcast.)
+fn dbg_is_ignorable_disconnect(dbg: &str) -> bool {
+    dbg.contains("IncompleteMessage") || dbg.contains("HeaderTimeout") || dbg.contains("timed out")
+}
+
+/// Docker liveness probe. Actually exercises the request/handler path (a minimal HTTP request),
+/// NOT just `accept()`: the accept loop completes the TCP handshake BEFORE the connection-permit
+/// check, so a bare `connect()` succeeds even when the pool is exhausted and the handler immediately
+/// drops the stream — which would report a wedged, request-rejecting container as healthy and never
+/// get it restarted. Requiring an HTTP status line back catches that. HTTP/1.0 so the server closes
+/// the connection after responding (no keep-alive idle to wait on).
+fn healthcheck(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let Ok(addr) = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    let timeout = std::time::Duration::from_secs(5);
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    // OPTIONS is cheap and WebDAV servers always answer it; any HTTP status line proves the handler
+    // path is alive (even a 404/405 starts with "HTTP/").
+    if stream
+        .write_all(b"OPTIONS / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = [0u8; 64];
+    match stream.read(&mut buf) {
+        Ok(n) => buf[..n].starts_with(b"HTTP/"),
+        Err(_) => false,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env FIRST so the healthcheck resolves PORT identically to the server (which loads
@@ -39,21 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // server listened elsewhere, reporting a healthy container as unhealthy.
     dotenvy::dotenv().ok();
 
-    // Healthcheck mode: verify the WebDAV server is listening, then exit.
+    // Healthcheck mode: exercise the request/handler path, then exit.
     if std::env::args().any(|a| a == "--healthcheck") {
         let port: u16 = std::env::var("PORT")
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(8080);
-        let ok = format!("127.0.0.1:{}", port)
-            .parse::<std::net::SocketAddr>()
-            .ok()
-            .map(|addr| {
-                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))
-                    .is_ok()
-            })
-            .unwrap_or(false);
-        std::process::exit(if ok { 0 } else { 1 });
+        std::process::exit(if healthcheck(port) { 0 } else { 1 });
     }
 
     // Honour RUST_LOG (e.g. `RUST_LOG=debridmoviemapper=debug`); default to INFO when unset so
@@ -264,6 +306,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::task::spawn(async move {
                     let _permit = permit; // Hold permit until connection closes
                     if let Err(err) = http1::Builder::new()
+                        .header_read_timeout(HEADER_READ_TIMEOUT)
                         .serve_connection(
                             io,
                             service_fn(move |req: Request<hyper::body::Incoming>| {
@@ -295,20 +338,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await
                     {
                         use std::error::Error;
-                        if let Some(io_err) =
-                            err.source().and_then(|s| s.downcast_ref::<std::io::Error>())
-                        {
-                            if matches!(
-                                io_err.kind(),
-                                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
-                            ) {
-                                return;
-                            }
-                        }
-                        // hyper 1.x does not expose is_incomplete_message() — use string check
-                        // This handles clients that disconnect mid-request (common with WebDAV)
+                        // Benign client-side disconnects + our own idle keep-alive header timeout:
+                        // typed io-kind inspection first, then a documented Debug-string fallback for
+                        // hyper variants without typed accessors.
+                        let io_benign = err
+                            .source()
+                            .and_then(|s| s.downcast_ref::<std::io::Error>())
+                            .is_some_and(|io_err| {
+                                matches!(
+                                    io_err.kind(),
+                                    std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::BrokenPipe
+                                        | std::io::ErrorKind::TimedOut
+                                        | std::io::ErrorKind::UnexpectedEof
+                                )
+                            });
                         let dbg = format!("{:?}", err);
-                        if dbg.contains("IncompleteMessage") {
+                        if io_benign || dbg_is_ignorable_disconnect(&dbg) {
                             return;
                         }
                         // A `User(Body)` error is our response-body stream failing (e.g. a CDN fetch
@@ -342,7 +388,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::log_directive;
+    use super::{dbg_is_ignorable_disconnect, healthcheck, log_directive};
+
+    #[test]
+    fn healthcheck_requires_an_http_response() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // A server that replies with an HTTP status line → healthy.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 128];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        assert!(healthcheck(port), "an HTTP response must report healthy");
+        let _ = h.join();
+
+        // A server that accepts but replies with non-HTTP bytes (e.g. an exhausted pool dropping the
+        // stream after a bare accept) → unhealthy. A bare TCP connect would have falsely passed.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 128];
+                let _ = s.read(&mut buf);
+                // Drop without writing an HTTP response (closes the connection).
+            }
+        });
+        assert!(
+            !healthcheck(port),
+            "a dropped/non-HTTP connection must report unhealthy"
+        );
+        let _ = h.join();
+
+        // Nothing listening → unhealthy.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(
+            !healthcheck(dead_port),
+            "a closed port must report unhealthy"
+        );
+    }
+
+    #[test]
+    fn ignorable_disconnect_matches_expected_hyper_debug_strings() {
+        // Pin the hyper Debug substrings we classify as benign. If a hyper upgrade renames a variant,
+        // these assertions fail in CI instead of the connection-error log silently regressing.
+        assert!(dbg_is_ignorable_disconnect(
+            "hyper::Error(IncompleteMessage)"
+        ));
+        assert!(dbg_is_ignorable_disconnect("Error { kind: HeaderTimeout }"));
+        assert!(dbg_is_ignorable_disconnect(
+            "error reading header: operation timed out"
+        ));
+        // A genuine server-side body error must NOT be classified as an ignorable disconnect.
+        assert!(!dbg_is_ignorable_disconnect("Error { kind: User(Body) }"));
+        assert!(!dbg_is_ignorable_disconnect("some unexpected error"));
+    }
 
     #[test]
     fn log_directive_defaults_to_info_and_honours_rust_log() {
