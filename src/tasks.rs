@@ -4289,6 +4289,7 @@ mod reconcile_wanted_tests {
             )
             .await
             .unwrap();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
             torrents: vec![Torrent {
                 id: "tid".into(),
@@ -4296,6 +4297,7 @@ mod reconcile_wanted_tests {
                 status: "downloaded".into(),
                 ..Default::default()
             }],
+            deleted: deleted.clone(),
             ..Default::default()
         });
         let torrents = provider.get_torrents().await.unwrap();
@@ -4311,6 +4313,10 @@ mod reconcile_wanted_tests {
             &["h1".to_string()],
         )
         .await;
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "an active library must NOT issue any provider delete"
+        );
         assert!(
             store.get_owned("h1".into()).await.is_some(),
             "an active library must defer the removal (owned record kept for retry)"

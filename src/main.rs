@@ -288,6 +288,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     tokio::pin!(shutdown_signal);
 
+    // A minimal 503 sent to a connection rejected for pool saturation. Sending a real HTTP response
+    // (rather than a bare TCP drop) means a transiently-saturated-but-alive server still answers the
+    // `--healthcheck` probe's `OPTIONS /` with an `HTTP/` status line — so it reports HEALTHY (busy,
+    // not wedged) instead of being restarted by Docker, which would kill every in-flight stream.
+    const REJECT_503: &[u8] =
+        b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    // Throttle the saturation WARN so a reconnect storm can't spam the log (the accept()-error path
+    // backs off; this path must not block legitimate accepts, so it rate-limits the log instead).
+    let mut last_reject_log: Option<std::time::Instant> = None;
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -307,8 +317,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
-                        tracing::warn!("Max connections ({}) reached, rejecting", MAX_CONNECTIONS);
-                        drop(stream);
+                        let now = std::time::Instant::now();
+                        if last_reject_log
+                            .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(1))
+                        {
+                            tracing::warn!(
+                                "Max connections ({}) reached — rejecting with 503",
+                                MAX_CONNECTIONS
+                            );
+                            last_reject_log = Some(now);
+                        }
+                        // Fire-and-forget a 503 (bounded by a short write timeout so a slow/dead peer
+                        // can't stall the accept loop); no permit is held — it's a tiny one-shot write.
+                        tokio::task::spawn(async move {
+                            use tokio::io::AsyncWriteExt;
+                            let mut stream = stream;
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                async {
+                                    let _ = stream.write_all(REJECT_503).await;
+                                    let _ = stream.shutdown().await;
+                                },
+                            )
+                            .await;
+                        });
                         continue;
                     }
                 };
