@@ -539,6 +539,29 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn fetch_with_retry_surfaces_real_5xx_status_after_exhaustion() {
+        // B8 lock-in: a persistent retryable 5xx must, on exhaustion, surface the REAL status
+        // (503) rather than the synthetic 502 fallback — otherwise a sustained TMDB outage would
+        // be misattributed as a bad gateway. `start_paused` auto-advances the backoff sleeps so the
+        // 10 attempts complete instantly. Mirrors rd_client's analogous regression test.
+        let (url, counter) = spawn_counting_status(503).await;
+        let client = TmdbClient::new("k".into()).unwrap();
+        let r: Result<serde_json::Value, _> =
+            client.fetch_with_retry(|| client.client.get(&url)).await;
+        let err = r.expect_err("a persistent 503 must surface as an error");
+        assert_eq!(
+            err.status(),
+            Some(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            "the surfaced error must carry the real 503, not the synthetic 502 fallback"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            10,
+            "a retryable 5xx must be retried for the full attempt budget"
+        );
+    }
+
     #[test]
     fn tmdb_response_deserializes_without_results_field() {
         // TMDB might return a response without a results key (e.g., error responses

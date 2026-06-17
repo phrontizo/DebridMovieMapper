@@ -1098,6 +1098,65 @@ mod tests {
         assert_eq!(client.watched("ignored").await.unwrap().movies, vec![3]);
     }
 
+    /// Loopback server that DROPS the first `drop_n` connections (accept then close immediately —
+    /// a transport error / connection reset for the client) and then replies `200 OK` with `body`
+    /// to the next request. Counts every accepted connection.
+    async fn spawn_drop_then_json(
+        drop_n: usize,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = counter.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut seen = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if seen < drop_n {
+                    seen += 1;
+                    // Drop the connection without responding → transport error on the client.
+                    drop(sock);
+                    continue;
+                }
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+                break;
+            }
+        });
+        (format!("http://{}/", addr), counter)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_with_retry_recovers_from_a_transient_transport_error() {
+        // B12 lock-in: a transient transport error (connection reset before the response) must be
+        // retried with backoff rather than dropping the whole read — so a flaky network doesn't
+        // abort a Trakt sync tick that RD/TorBox would ride out. The server drops the first
+        // connection, then serves a valid `/users/me` body; `me()` must still succeed.
+        let (url, counter) =
+            spawn_drop_then_json(1, r#"{"username":"Bob","ids":{"slug":"bob"}}"#).await;
+        let client = TraktClientImpl::new("cid".into(), "secret".into(), reqwest::Client::new())
+            .with_base_url(url);
+        let user = client
+            .me("at")
+            .await
+            .expect("a single transient transport error must be retried, not fatal");
+        assert_eq!(user.slug, "bob");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the first (dropped) connection plus the successful retry = 2 attempts"
+        );
+    }
+
     #[tokio::test]
     async fn mock_trakt_fail_reads_errors_reads_and_fail_refresh_errors_refresh() {
         let mock = MockTrakt {

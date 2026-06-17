@@ -808,6 +808,56 @@ mod tests {
         format!("http://{}/", addr)
     }
 
+    /// Spawn a local HTTP server that replies to every request with `status` (empty body) and
+    /// counts the requests it saw. Serves up to 8 connections — enough for a full retry budget.
+    async fn spawn_status_repeating(
+        status: u16,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = counter.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 {} STATUS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    status
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{}/", addr), counter)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_data_final_attempt_429_surfaces_real_status_not_synthetic_502() {
+        // A persistent 429 must, after the retry budget is exhausted, surface the REAL 429 status
+        // (so a sustained throttle is not misattributed to a synthetic Bad Gateway contract
+        // failure). `start_paused` auto-advances the rate-limiter back-off so the test is instant.
+        let (url, counter) = spawn_status_repeating(429).await;
+        let client = TorBoxClient::new("fake".to_string()).unwrap();
+        let r: Result<serde_json::Value, _> = client.send_data(|| client.client.get(&url)).await;
+        let err = r.expect_err("a persistent 429 must surface as an error");
+        assert_eq!(
+            err.status(),
+            Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            "the surfaced error must carry the real 429, not a synthetic 502"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            6,
+            "a 429 must be retried for the full attempt budget before surfacing"
+        );
+    }
+
     #[tokio::test]
     async fn send_ok_rejects_200_with_success_false() {
         // TorBox returns HTTP 200 with `{"success":false}` for soft failures (e.g. controltorrent
