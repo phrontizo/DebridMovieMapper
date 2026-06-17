@@ -143,9 +143,12 @@ pub fn parse_rd_date(s: &str) -> SystemTime {
 }
 
 static SEASON_RE: LazyLock<Regex> = LazyLock::new(|| {
-    // The `NxNN` arm is bounded to a 1-2 digit season so a "WIDTHxHEIGHT" pixel
-    // resolution (e.g. 1920x1080) is not mistaken for a season number.
-    Regex::new(r"(?i)s(\d+)|season\s*(\d+)|\b(\d{1,2})x\d{1,3}\b|part\s*(\d+)").unwrap()
+    // The `Sxx` arm is word-anchored (`\bs`) and bounded to 1-2 digits followed by `e` or a word
+    // boundary, so a codec token (`DTS5`/`DDP5` — `s` mid-token) or a 4-digit `S2024` can't be read
+    // as a season while `S05E01`/`S5` still are. The `NxNN` arm is likewise bounded to a 1-2 digit
+    // season so a "WIDTHxHEIGHT" pixel resolution (e.g. 1920x1080) is not mistaken for one.
+    Regex::new(r"(?i)\bs(\d{1,2})(?:e|\b)|season\s*(\d+)|\b(\d{1,2})x\d{1,3}\b|part\s*(\d+)")
+        .unwrap()
 });
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3292,6 +3295,32 @@ mod tests {
         assert_eq!(extract("Show.12x05.mkv"), Some(12));
         // An explicit SxxExx marker still wins even when a resolution is present.
         assert_eq!(extract("Show.S03E05.1920x1080.mkv"), Some(3));
+    }
+
+    #[test]
+    fn season_re_ignores_mid_token_s_and_oversized_season_number() {
+        let extract = |name: &str| -> Option<u32> {
+            SEASON_RE
+                .captures(name)
+                .and_then(|cap| {
+                    cap.get(1)
+                        .or_else(|| cap.get(2))
+                        .or_else(|| cap.get(3))
+                        .or_else(|| cap.get(4))
+                })
+                .and_then(|m| m.as_str().parse::<u32>().ok())
+        };
+        // A codec token like DTS5 / DDP5 must NOT be read as "season 5" — the `s`/digit is mid-token,
+        // not a season marker. (Previously `s(\d+)` matched the `s5` inside `DTS5` → bogus Season 05.)
+        assert_eq!(extract("Show.E05.DTS5.1.1080p.mkv"), None);
+        assert_eq!(extract("Show.E05.DDP5.1.mkv"), None);
+        // A 4-digit S-number (a stray S2024) must NOT be read as "season 2024" — seasons are 1-2 digit.
+        assert_eq!(extract("Show.S2024E01.mkv"), None);
+        // Genuine markers still resolve.
+        assert_eq!(extract("Show.S05E01.mkv"), Some(5));
+        assert_eq!(extract("Show.S5.E01.mkv"), Some(5));
+        assert_eq!(extract("Show.Part2.E01.mkv"), Some(2));
+        assert_eq!(extract("Show.1x05.mkv"), Some(1));
     }
 
     /// Test that archive-only torrents produce an empty movie folder (no media files).

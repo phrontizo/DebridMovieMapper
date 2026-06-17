@@ -154,6 +154,19 @@ impl EnrolmentService {
                 current.needs_reenrolment = false;
             }
             Err(e) => {
+                // Only flag re-enrolment if we failed against the CURRENT refresh token. If a
+                // concurrent refresh (a second /refresh POST, or the background sync) already rotated
+                // it — `current.refresh` differs from the token we tried — Trakt invalidated our token
+                // on that other success, so THIS failure is a false alarm. Leaving the good record
+                // alone (no flag, no clobber) prevents a spurious `needs_reenrolment` that would make
+                // background jobs skip a healthy account.
+                if current.refresh != tokens.refresh {
+                    info!(
+                        "Trakt refresh for '{}' failed on a since-rotated token (concurrent refresh) — not flagging",
+                        slug
+                    );
+                    return Ok(());
+                }
                 warn!("Trakt refresh failed for '{}': {}", slug, e);
                 current.needs_reenrolment = true;
             }
@@ -798,5 +811,105 @@ mod tests {
         // No CSRF-relevant headers (curl/tests) → allowed under the trusted-LAN model.
         let req = post_req(&[("host", "host.local")]);
         assert!(!is_cross_origin(&req));
+    }
+
+    /// A TraktClient whose `refresh` simulates a CONCURRENT refresh: it rotates the stored token's
+    /// refresh string (as if another /refresh just succeeded and Trakt invalidated ours), then fails.
+    struct RotatingThenFailingRefresh {
+        store: Store,
+    }
+    #[async_trait::async_trait]
+    impl TraktClient for RotatingThenFailingRefresh {
+        async fn device_code(&self) -> Result<DeviceCode, AppError> {
+            Err(AppError::Unavailable)
+        }
+        async fn poll_token(&self, _dc: &str) -> Result<DeviceTokenPoll, AppError> {
+            Err(AppError::Unavailable)
+        }
+        async fn refresh(&self, _refresh_token: &str) -> Result<TraktTokenResponse, AppError> {
+            // Concurrent refresh rotated the stored token during our network window.
+            if let Some(mut t) = self.store.get_trakt_tokens("alice".into()).await {
+                t.refresh = "ROTATED".into();
+                let _ = self.store.put_trakt_tokens("alice".into(), t).await;
+            }
+            Err(AppError::Unavailable) // our refresh against the now-stale token fails
+        }
+        async fn me(&self, _at: &str) -> Result<TraktUser, AppError> {
+            Err(AppError::Unavailable)
+        }
+        async fn watchlist(
+            &self,
+            _at: &str,
+        ) -> Result<Vec<crate::trakt_client::TraktItem>, AppError> {
+            Err(AppError::Unavailable)
+        }
+        async fn in_progress(
+            &self,
+            _at: &str,
+        ) -> Result<Vec<crate::trakt_client::TraktItem>, AppError> {
+            Err(AppError::Unavailable)
+        }
+        async fn watched(&self, _at: &str) -> Result<crate::trakt_client::WatchedData, AppError> {
+            Err(AppError::Unavailable)
+        }
+        async fn show_progress(
+            &self,
+            _at: &str,
+            _trakt_id: u64,
+        ) -> Result<crate::trakt_client::ShowProgress, AppError> {
+            Err(AppError::Unavailable)
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_on_a_concurrently_rotated_token_does_not_flag_reenrolment() {
+        // A second concurrent /refresh rotates the stored token; our refresh then fails against the
+        // now-stale token. That false-alarm failure must NOT set needs_reenrolment over the freshly
+        // good record (which would make background jobs skip a healthy account).
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
+            .await
+            .unwrap(); // refresh = "RT"
+        let svc = EnrolmentService::new(
+            Arc::new(RotatingThenFailingRefresh {
+                store: store.clone(),
+            }),
+            store.clone(),
+        );
+        svc.refresh_account("alice").await.unwrap();
+        let tok = store.get_trakt_tokens("alice".into()).await.unwrap();
+        assert_eq!(
+            tok.refresh, "ROTATED",
+            "the concurrently-rotated token must survive"
+        );
+        assert!(
+            !tok.needs_reenrolment,
+            "a stale-token refresh failure must NOT flag re-enrolment on a healthy account"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_on_the_current_token_does_flag_reenrolment() {
+        // The genuine-failure counterpart: refresh fails against the CURRENT token (no concurrent
+        // rotation) → the account IS flagged for re-enrolment.
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
+            .await
+            .unwrap();
+        let svc = EnrolmentService::new(
+            Arc::new(MockTrakt {
+                fail_refresh: true,
+                ..Default::default()
+            }),
+            store.clone(),
+        );
+        svc.refresh_account("alice").await.unwrap();
+        let tok = store.get_trakt_tokens("alice".into()).await.unwrap();
+        assert!(
+            tok.needs_reenrolment,
+            "a genuine refresh failure must flag re-enrolment"
+        );
     }
 }

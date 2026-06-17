@@ -1401,9 +1401,17 @@ pub(crate) fn plan_dedup(
             continue; // no possible duplicate
         }
         // Sort by keep-priority DESC; deterministic tie-break on hash ASC.
+        // `protected` (empty-provenance mirror or manual add) ranks FIRST so dedup never drops the
+        // user's own library copy in favour of an engine-acquired duplicate — otherwise a later
+        // Trigger-B abandonment of the surviving engine copy would net-remove content that
+        // `removal_hashes`' mirror/manual protection is meant to keep. (When provenance is uniform —
+        // e.g. all engine, or all mirror — this axis is constant and the prior selected>quality>
+        // episodes order is unchanged.)
         hashes.sort_by(|(ha, ra), (hb, rb)| {
             let key = |h: &str, r: &OwnedRecord| {
+                let protected = r.provenance.entries.is_empty() || r.provenance.has_manual_entry();
                 (
+                    protected,
                     selected.contains(h),
                     r.quality.as_ref().map(|q| q.score).unwrap_or(i64::MIN),
                     r.provides.len(),
@@ -2713,6 +2721,29 @@ mod tests {
             plans.is_empty(),
             "complementary packs + an unknown-coverage hash yield no removals"
         );
+    }
+
+    #[test]
+    fn plan_dedup_movie_keeps_mirror_over_higher_quality_engine_copy() {
+        use crate::scraper::MediaKind;
+        // A movie owned as BOTH a mirror copy (empty provenance) and a higher-quality engine copy
+        // (watchlist provenance) must KEEP the mirror — otherwise a later Trigger-B abandonment of the
+        // engine copy net-removes the user's own library content that mirror-protection guards.
+        let mirror = dedup_rec(MediaKind::Movie, 1, vec![], Some(10)); // empty provenance, lower score
+        let mut engine = dedup_rec(MediaKind::Movie, 1, vec![], Some(99)); // higher score
+        engine.provenance = Provenance::watchlist("alice");
+        let owned = vec![
+            ("mirror".to_string(), mirror),
+            ("engine".to_string(), engine),
+        ];
+        let plans = plan_dedup(&owned, &hset(&["mirror", "engine"]), &hset(&[]));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].keep,
+            vec!["mirror"],
+            "the protected (empty-provenance) mirror copy must be kept"
+        );
+        assert_eq!(plans[0].remove, vec!["engine"]);
     }
 
     #[test]

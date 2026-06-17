@@ -367,29 +367,43 @@ fn overrun_error(declared_end: usize, buf_len: usize) -> ProbeError {
 // --- MKV (EBML) parser ---
 
 /// Read an EBML element id (1..=4 bytes, marker bits retained). Advances `pos`.
-fn read_ebml_id(buf: &[u8], pos: &mut usize) -> Option<u32> {
-    let first = *buf.get(*pos)?;
+///
+/// Distinguishes a STRUCTURAL fault (an id wider than 4 bytes) → `Corrupt`, from an under-fetched
+/// read where the id is split across the fetched-buffer boundary → `Transient` (defer + retry). The
+/// previous `Option` return folded both into `None`, so a truncated header was wrongly blacklisted as
+/// Corrupt — the same incomplete buffer was classified `Transient` (correct) or `Corrupt` (wrong)
+/// depending only on whether the cut landed in a payload or a header. (See `overrun_error`.)
+fn read_ebml_id(buf: &[u8], pos: &mut usize) -> Result<u32, ProbeError> {
+    let first = *buf.get(*pos).ok_or(ProbeError::Transient)?;
     let len = first.leading_zeros() as usize + 1;
-    if len > 4 || *pos + len > buf.len() {
-        return None;
+    if len > 4 {
+        return Err(ProbeError::Corrupt); // an id wider than 4 bytes is structurally invalid
+    }
+    if *pos + len > buf.len() {
+        return Err(ProbeError::Transient); // the id is split by the under-fetched boundary
     }
     let mut id: u32 = 0;
     for i in 0..len {
         id = (id << 8) | buf[*pos + i] as u32;
     }
     *pos += len;
-    Some(id)
+    Ok(id)
 }
 
-/// Read an EBML data size vint (marker stripped). All-ones → `u64::MAX` (unknown size).
-fn read_ebml_size(buf: &[u8], pos: &mut usize) -> Option<u64> {
-    let first = *buf.get(*pos)?;
+/// Read an EBML data size vint (marker stripped). All-ones → `u64::MAX` (unknown size). Like
+/// `read_ebml_id`, a leading-zero byte or a >8-byte length is structural (`Corrupt`), while a vint
+/// split across the fetched boundary is an under-fetch (`Transient`).
+fn read_ebml_size(buf: &[u8], pos: &mut usize) -> Result<u64, ProbeError> {
+    let first = *buf.get(*pos).ok_or(ProbeError::Transient)?;
     if first == 0 {
-        return None;
+        return Err(ProbeError::Corrupt); // a leading 0 byte = invalid vint length octet
     }
     let len = first.leading_zeros() as usize + 1;
-    if len > 8 || *pos + len > buf.len() {
-        return None;
+    if len > 8 {
+        return Err(ProbeError::Corrupt);
+    }
+    if *pos + len > buf.len() {
+        return Err(ProbeError::Transient); // the size vint is split by the under-fetched boundary
     }
     let mut val: u64 = (first as u64) & (0xFF >> len);
     let mut all_ones = val == (0xFFu64 >> len);
@@ -400,9 +414,9 @@ fn read_ebml_size(buf: &[u8], pos: &mut usize) -> Option<u64> {
     }
     *pos += len;
     if all_ones {
-        Some(u64::MAX)
+        Ok(u64::MAX)
     } else {
-        Some(val)
+        Ok(val)
     }
 }
 
@@ -433,8 +447,8 @@ pub fn parse_mkv_tracks(buf: &[u8]) -> Result<Vec<Track>, ProbeError> {
     let mut out = Vec::new();
     let mut pos = t_start;
     while pos < t_end {
-        let id = read_ebml_id(buf, &mut pos).ok_or(ProbeError::Corrupt)?;
-        let size = read_ebml_size(buf, &mut pos).ok_or(ProbeError::Corrupt)?;
+        let id = read_ebml_id(buf, &mut pos)?;
+        let size = read_ebml_size(buf, &mut pos)?;
         let end = if size == u64::MAX {
             t_end
         } else {
@@ -460,8 +474,8 @@ fn find_ebml_child(
 ) -> Result<Option<(usize, usize)>, ProbeError> {
     let mut pos = start;
     while pos < end {
-        let id = read_ebml_id(buf, &mut pos).ok_or(ProbeError::Corrupt)?;
-        let size = read_ebml_size(buf, &mut pos).ok_or(ProbeError::Corrupt)?;
+        let id = read_ebml_id(buf, &mut pos)?;
+        let size = read_ebml_size(buf, &mut pos)?;
         let payload_start = pos;
         let payload_end = if size == u64::MAX {
             end // unknown/streaming size → spans to the end of the search region
@@ -494,8 +508,8 @@ fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, 
     let mut saw_language = false;
     let mut pos = start;
     while pos < end {
-        let id = read_ebml_id(buf, &mut pos).ok_or(ProbeError::Corrupt)?;
-        let size = read_ebml_size(buf, &mut pos).ok_or(ProbeError::Corrupt)?;
+        let id = read_ebml_id(buf, &mut pos)?;
+        let size = read_ebml_size(buf, &mut pos)?;
         if size == u64::MAX {
             return Err(ProbeError::Corrupt);
         }
@@ -1025,6 +1039,48 @@ mod tests {
             parse_mkv_tracks(&bytes),
             Err(ProbeError::Transient)
         ));
+    }
+
+    #[test]
+    fn ebml_header_read_split_by_buffer_boundary_is_transient_not_corrupt() {
+        // An element id/size vint split across the under-fetched buffer boundary must classify
+        // `Transient` (defer + retry), NOT `Corrupt` (blacklist a good release for 30 days). A
+        // genuinely structural fault (id >4 bytes, size leading-0 / >8 bytes) stays `Corrupt`.
+        // id: 0x10 → leading_zeros=3 → len=4, but only 1 byte present → split → Transient.
+        let mut pos = 0;
+        assert!(matches!(
+            read_ebml_id(&[0x10], &mut pos),
+            Err(ProbeError::Transient)
+        ));
+        // size: 0x10 → len=4, only 2 bytes present → split → Transient.
+        let mut pos = 0;
+        assert!(matches!(
+            read_ebml_size(&[0x10, 0x00], &mut pos),
+            Err(ProbeError::Transient)
+        ));
+        // pos at/past the end → nothing to read → under-fetch → Transient.
+        let mut pos = 0;
+        assert!(matches!(
+            read_ebml_id(&[], &mut pos),
+            Err(ProbeError::Transient)
+        ));
+        // STRUCTURAL faults remain Corrupt (precedence over the truncation check):
+        // id wider than 4 bytes (leading 0 byte → len=9).
+        let mut pos = 0;
+        assert!(matches!(
+            read_ebml_id(&[0x00, 1, 2, 3, 4, 5, 6, 7, 8, 9], &mut pos),
+            Err(ProbeError::Corrupt)
+        ));
+        // size with a leading 0 length octet.
+        let mut pos = 0;
+        assert!(matches!(
+            read_ebml_size(&[0x00], &mut pos),
+            Err(ProbeError::Corrupt)
+        ));
+        // A complete, valid id still parses unchanged.
+        let mut pos = 0;
+        assert_eq!(read_ebml_id(&[0x83], &mut pos).unwrap(), 0x83);
+        assert_eq!(pos, 1);
     }
     #[test]
     fn mp4_truncated_moov_is_transient() {

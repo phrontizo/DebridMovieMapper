@@ -130,8 +130,14 @@ fn best_scored_result<'a>(
     }
     if is_short_title {
         let candidates = results.iter().filter(|r| {
-            let normalized_title = normalize_title(&r.title);
-            let title_matches = normalized_title == normalized_query;
+            // Match against BOTH the (possibly localized) `title` and the `original_title`, mirroring
+            // `score_result`/`is_exact` — a short foreign title whose TMDB `title` is translated but
+            // whose `original_title` is the native short form would otherwise be wrongly dropped.
+            let title_matches = normalize_title(&r.title) == normalized_query
+                || r.original_title
+                    .as_deref()
+                    .map(|ot| normalize_title(ot) == normalized_query)
+                    .unwrap_or(false);
             let year_matches = year
                 .as_ref()
                 .map(|y| {
@@ -319,8 +325,11 @@ fn score_result(
         }
     }
 
-    // Popularity (minor tiebreaker)
-    score += result.popularity;
+    // Popularity (minor tiebreaker). CAP it: raw TMDB popularity reaches the hundreds–thousands for
+    // trending titles, which — unbounded — could outweigh the exact-vs-partial title gap (900) and let
+    // a trending substring match beat an obscure exact match on a year-less filename. A small cap
+    // keeps it a genuine tiebreaker among otherwise-comparable candidates.
+    score += result.popularity.min(50.0);
 
     score
 }
@@ -547,8 +556,14 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
         }
     }
 
-    // 4. Find year (19xx or 20xx)
-    let year = YEAR_RE.find(&title).map(|m| m.as_str().to_string());
+    // 4. Find year (19xx or 20xx). Use the LAST year token: scene names put the title first and the
+    //    release year last, so for a title that itself contains a year ("Blade Runner 2049", "1917",
+    //    "2012") the FIRST token is the title's number, not the release year — using it picks the
+    //    wrong disambiguator and the wrong TMDB id.
+    let year = YEAR_RE
+        .find_iter(&title)
+        .last()
+        .map(|m| m.as_str().to_string());
 
     // 5. Handle stop words (technical metadata, quality, codecs, season info)
     let title_before_stopwords = title.clone();
@@ -575,8 +590,10 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
         title = title_before_stopwords;
     }
 
-    // 6. Truncate at year if it appears in title (and is not at the very start)
-    if let Some(m) = YEAR_RE.find(&title) {
+    // 6. Truncate at year if it appears in title (and is not at the very start). Use the LAST year
+    //    token (the release year) so a title-embedded year ("Blade Runner 2049") is kept and only the
+    //    trailing release year is dropped, rather than truncating at the title's own number.
+    if let Some(m) = YEAR_RE.find_iter(&title).last() {
         if m.start() > 0 {
             // Check if this year is part of a range (e.g. 1985-1999 or 1985 1999)
             if !YEAR_RANGE_RE.is_match(&title) {
@@ -898,6 +915,23 @@ mod tests {
         let (rec, rec_year) = clean_name("[REC] (2007) 1080p BluRay.mkv");
         assert_eq!(rec, "[REC]");
         assert_eq!(rec_year.as_deref(), Some("2007"));
+        // A title that itself CONTAINS a year must use the LAST year token as the release year, not
+        // the first — else "Blade Runner 2049" (2017) is identified by year 2049 (and truncated to
+        // "Blade Runner"), matching the wrong film. The title-embedded "2049" is preserved.
+        let (br, br_year) = clean_name("Blade.Runner.2049.2017.1080p.BluRay.mkv");
+        assert_eq!(
+            br_year.as_deref(),
+            Some("2017"),
+            "release year is the LAST token"
+        );
+        assert!(
+            br.contains("2049"),
+            "the title-embedded year must be preserved, got {br:?}"
+        );
+        // 1917 (the 2019 war film): release year 2019, title "1917" kept.
+        let (war, war_year) = clean_name("1917.2019.1080p.BluRay.x264.mkv");
+        assert_eq!(war_year.as_deref(), Some("2019"));
+        assert!(war.contains("1917"), "got {war:?}");
         // A non-year numeric title-paren is kept (the film "(500) Days of Summer").
         assert_eq!(
             clean_name("(500) Days of Summer 2009 1080p").0,
@@ -1385,6 +1419,55 @@ mod tests {
             "short title with no year should still match exact title"
         );
         assert_eq!(got.unwrap().id, 1);
+    }
+
+    #[test]
+    fn best_scored_result_short_title_matches_via_original_title() {
+        // A short title whose TMDB `title` is localized but whose `original_title` is the native short
+        // form must still match (mirrors score_result/is_exact) — not be dropped as a non-match.
+        let mut r = make_result(
+            1,
+            "The ABC Movie",
+            Some("2020-01-01"),
+            50.0,
+            Some(7.0),
+            Some(500),
+        );
+        r.original_title = Some("ABC".to_string());
+        let nq = normalize_title("ABC");
+        let got = best_scored_result(std::slice::from_ref(&r), &nq, &None, true);
+        assert!(
+            got.is_some(),
+            "a short title matching original_title must not be dropped"
+        );
+        assert_eq!(got.unwrap().id, 1);
+    }
+
+    #[test]
+    fn popularity_term_is_capped_so_a_trending_partial_cannot_beat_an_exact_match() {
+        // Raw TMDB popularity can reach the thousands; uncapped it would swamp the exact-vs-partial
+        // title gap and let a trending substring match beat an obscure exact match on a year-less
+        // filename. The cap keeps popularity a tiebreaker, not a dominator.
+        let results = vec![
+            // Trending partial (contains "flow") with enormous popularity.
+            make_result(
+                1,
+                "Flowing River",
+                Some("2024-01-01"),
+                5000.0,
+                Some(8.0),
+                Some(99999),
+            ),
+            // Obscure exact match.
+            make_result(2, "Flow", Some("2024-01-01"), 1.0, Some(6.0), Some(10)),
+        ];
+        let nq = normalize_title("Flow");
+        let got = best_scored_result(&results, &nq, &None, false);
+        assert_eq!(
+            got.unwrap().id,
+            2,
+            "an exact match must beat a trending partial despite huge popularity"
+        );
     }
 
     #[test]

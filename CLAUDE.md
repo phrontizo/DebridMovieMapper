@@ -134,7 +134,7 @@ The Trakt cycle + episode monitor are gated on `scheduler::trakt_jobs_enabled` (
 | `scheduler.rs` | `periodic` primitive + `run` that spawns the cooperating periodic jobs over `AppState`; the Trakt cycle + episode monitor are gated on `trakt_jobs_enabled` |
 | `enrolment.rs` | Local-network Trakt device-flow enrolment page (`/trakt/accounts`; enrol/refresh/remove) served on the WebDAV listener; `poll_to_completion` stores tokens keyed by Trakt user slug |
 | `upgrade.rs` | Daily quality-upgrade + full-season consolidation engine (SP3). `run_upgrade_once` processes owned titles in a round-robin budget (`UPGRADE_BUDGET_PER_TICK`): for movies — scrapes, finds a meaningfully-better CACHED release (`is_meaningful_upgrade`: uncached→cached, OR a strict `score` gain on a concrete category jump — higher resolution, or a higher source tier at the same resolution — never trading resolution for tier, so it stays consistent with acquisition and can't flip-flop), stages it, and idle-gated swaps the `selection` + prunes the superseded torrent; for shows — finds a CACHED full-season pack covering all aired episodes at same-or-better quality (`consolidation_target`), stages it, and on idle-gated success repoints all episode `selection` slots and prunes scattered episode torrents. |
-| `mapper.rs` | Library root — module declarations |
+| `mapper.rs` | Library root — module declarations + the crate-canonical `now_unix_secs()` epoch-seconds helper (re-used by `acquire`/`upgrade`/`tasks`) |
 
 **Data flow for playback:**
 1. Jellyfin/player opens a media file via WebDAV
