@@ -139,10 +139,23 @@ fn to_torrent_file(f: &TbFile) -> TorrentFile {
 /// "0", or a hash-keyed lookup on ""), so skip it instead of surfacing a phantom torrent. A real
 /// TorBox torrent always has both.
 fn map_listed_torrents(raw: &[TbTorrent]) -> Vec<Torrent> {
-    raw.iter()
+    let mapped: Vec<Torrent> = raw
+        .iter()
         .filter(|t| t.id != 0 && !t.hash.is_empty())
         .map(to_torrent)
-        .collect()
+        .collect();
+    // Surface a count when entries are dropped: normally zero, but if TorBox ever changed the wire
+    // shape of `id`/`hash` (e.g. stringized id) `null_to_default` would zero them and the WHOLE
+    // library would silently vanish here — a `debug!` makes that diagnosable rather than mysterious.
+    let dropped = raw.len() - mapped.len();
+    if dropped > 0 {
+        debug!(
+            "mylist: dropped {} of {} entries with an unusable identity (id 0 or empty hash)",
+            dropped,
+            raw.len()
+        );
+    }
+    mapped
 }
 
 /// Map a TorBox torrent to the lightweight canonical `Torrent` (no files).
@@ -178,8 +191,8 @@ const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(3 * 3600); // TorBox lin
 const RESOLVE_CACHE_MAX: usize = 10_000; // Bound the cache like the RD client does
 
 /// Enforce the resolve-cache bound: drop expired entries, then, if still over `max`,
-/// evict the oldest entries. Keeps the cache from growing without limit between the
-/// periodic `evict_expired_cache` sweeps.
+/// evict the oldest entries. Called from `cache_put` when the cache exceeds the bound, so the cache
+/// is self-limiting (and expired entries are TTL-checked on read in `cache_get`) — no external sweep.
 fn bound_cache(cache: &mut HashMap<(String, u32), CachedUrl>, max: usize) {
     cache.retain(|_, c| c.at.elapsed() < RESOLVE_CACHE_TTL);
     if cache.len() > max {
@@ -261,6 +274,9 @@ impl TorBoxClient {
             .default_headers(headers)
             .user_agent(format!("DebridMovieMapper/{}", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(60))
+            // Bound the connect phase separately (see rd_client) so a black-holing endpoint fails
+            // fast rather than waiting out the full request timeout. Healthy connects are sub-second.
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| AppError::Config(format!("Failed to build TorBox HTTP client: {}", e)))?;
         Ok(Self {
@@ -303,12 +319,6 @@ impl TorBoxClient {
     async fn invalidate_locator(&self, loc: &FileLocator) {
         let key = (loc.torrent_id.clone(), loc.file_id);
         self.resolve_cache.write().await.remove(&key);
-    }
-
-    // Wired into the `DebridProvider::evict_expired_cache` impl.
-    async fn evict_expired(&self) {
-        let mut cache = self.resolve_cache.write().await;
-        bound_cache(&mut cache, RESOLVE_CACHE_MAX);
     }
 
     /// Feed TorBox's advertised rate-limit window into the limiter so it paces proactively
@@ -659,9 +669,6 @@ impl crate::provider::DebridProvider for TorBoxClient {
     }
     async fn invalidate(&self, loc: &FileLocator) {
         self.invalidate_locator(loc).await
-    }
-    async fn evict_expired_cache(&self) {
-        self.evict_expired().await
     }
 }
 

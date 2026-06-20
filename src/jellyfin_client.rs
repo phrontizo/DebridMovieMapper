@@ -181,9 +181,15 @@ impl JellyfinClient {
     /// Try to create a JellyfinClient from environment variables.
     /// Returns None if any of the required env vars are missing or invalid.
     pub fn from_env() -> Option<Self> {
-        let url = std::env::var("JELLYFIN_URL").ok()?;
-        let api_key = std::env::var("JELLYFIN_API_KEY").ok()?;
-        let mount_path = std::env::var("JELLYFIN_RCLONE_MOUNT_PATH").ok()?;
+        // Trim and treat blank-as-unset for every value, matching `Config`'s env handling — a
+        // whitespace-only value (e.g. from quoted compose YAML) must not build a client that POSTs
+        // to a malformed URL at runtime.
+        let url = std::env::var("JELLYFIN_URL").ok()?.trim().to_string();
+        let api_key = std::env::var("JELLYFIN_API_KEY").ok()?.trim().to_string();
+        let mount_path = std::env::var("JELLYFIN_RCLONE_MOUNT_PATH")
+            .ok()?
+            .trim()
+            .to_string();
 
         if url.is_empty() || api_key.is_empty() || mount_path.is_empty() {
             return None;
@@ -345,5 +351,38 @@ mod tests {
             "/mnt/debrid".to_string(),
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn from_env_trims_values_and_treats_blank_as_unset() {
+        // Use uniquely-scoped restore so this test doesn't disturb a real environment if one is set.
+        let restore = |k: &str, v: Option<String>| match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        };
+        let prev = (
+            std::env::var("JELLYFIN_URL").ok(),
+            std::env::var("JELLYFIN_API_KEY").ok(),
+            std::env::var("JELLYFIN_RCLONE_MOUNT_PATH").ok(),
+        );
+
+        // Whitespace-padded values must be trimmed (and not build a malformed-URL client).
+        std::env::set_var("JELLYFIN_URL", "  http://jellyfin:8096  ");
+        std::env::set_var("JELLYFIN_API_KEY", "  abc123  ");
+        std::env::set_var("JELLYFIN_RCLONE_MOUNT_PATH", "  /media  ");
+        let client = JellyfinClient::from_env().expect("trimmed config builds a client");
+        assert_eq!(client.url, "http://jellyfin:8096");
+        assert_eq!(client.mount_path, "/media");
+
+        // A whitespace-only value is treated as unset → None.
+        std::env::set_var("JELLYFIN_URL", "   ");
+        assert!(
+            JellyfinClient::from_env().is_none(),
+            "a whitespace-only JELLYFIN_URL must be treated as unset"
+        );
+
+        restore("JELLYFIN_URL", prev.0);
+        restore("JELLYFIN_API_KEY", prev.1);
+        restore("JELLYFIN_RCLONE_MOUNT_PATH", prev.2);
     }
 }

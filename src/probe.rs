@@ -934,6 +934,16 @@ mod tests {
         out.extend_from_slice(payload);
         out
     }
+    fn ebml_elem_unknown_size(id: u32, payload: &[u8]) -> Vec<u8> {
+        // Like `ebml_elem` but stamps the EBML "unknown size" data-size vint — the all-ones pattern,
+        // which as a length-1 vint is the single byte 0xFF (`read_ebml_size` decodes it to u64::MAX).
+        // Models a live/streaming Segment that declares no length; the parser treats its payload as
+        // spanning to the end of the search region.
+        let mut out = id_bytes(id);
+        out.push(0xFF); // length-1 unknown-size vint (all-ones) → u64::MAX
+        out.extend_from_slice(payload);
+        out
+    }
     fn mkv_with(audio_lang: &str, sub_lang: Option<&str>) -> Vec<u8> {
         let mut audio = Vec::new();
         audio.extend(ebml_elem(0x83, &[2]));
@@ -961,6 +971,17 @@ mod tests {
     }
     fn mdhd(lang_packed: u16) -> Vec<u8> {
         let mut p = vec![0u8; 4 + 16];
+        p.extend_from_slice(&lang_packed.to_be_bytes());
+        p.extend_from_slice(&[0, 0]);
+        mp4_box(b"mdhd", &p)
+    }
+    fn mdhd_v1(lang_packed: u16) -> Vec<u8> {
+        // version-1 (64-bit) mdhd: the version byte is 1 and creation/modification/duration are
+        // 64-bit (timescale stays 32-bit), so the layout before the 2-byte packed language is
+        // version(1)+flags(3) + creation(8)+modification(8)+timescale(4)+duration(8) = 32 bytes —
+        // the packed language sits at payload offset 32 (vs 20 for version 0).
+        let mut p = vec![0u8; 4 + 8 + 8 + 4 + 8];
+        p[0] = 1; // version 1 → 64-bit time fields → language at payload offset 32
         p.extend_from_slice(&lang_packed.to_be_bytes());
         p.extend_from_slice(&[0, 0]);
         mp4_box(b"mdhd", &p)
@@ -1027,6 +1048,31 @@ mod tests {
                 .iter()
                 .any(|t| t.kind == TrackKind::Audio && t.language.as_deref() == Some("eng")),
             "expected the in-window audio track to be parsed from the oversized-Segment MKV"
+        );
+    }
+    #[test]
+    fn mkv_unknown_size_segment_spans_to_buffer_end() {
+        // A Segment declared with the EBML "unknown size" vint (all-ones → u64::MAX) carries no
+        // length — common for live/streaming muxes. `find_ebml_child` must treat its payload as
+        // spanning to the end of the search region (capped to the buffer) and still locate Tracks
+        // within it, rather than mis-parsing the size or deferring. All other fixtures use known
+        // sizes, so this is the only exercise of the `size == u64::MAX` child branch.
+        let mut audio = Vec::new();
+        audio.extend(ebml_elem(0x83, &[2]));
+        audio.extend(ebml_elem(0x22B59C, b"eng"));
+        let tracks = ebml_elem(0xAE, &audio);
+        let tracks_elem = ebml_elem(0x1654AE6B, &tracks);
+        let segment = ebml_elem_unknown_size(0x18538067, &tracks_elem);
+        let mut bytes = ebml_elem(0x1A45DFA3, &[]);
+        bytes.extend(segment);
+
+        let parsed =
+            parse_mkv_tracks(&bytes).expect("unknown-size Segment MKV must parse, not defer");
+        assert!(
+            parsed
+                .iter()
+                .any(|t| t.kind == TrackKind::Audio && t.language.as_deref() == Some("eng")),
+            "expected the audio track to be parsed from the unknown-size Segment MKV"
         );
     }
     #[test]
@@ -1132,6 +1178,27 @@ mod tests {
         assert!(tracks
             .iter()
             .any(|t| t.kind == TrackKind::Subtitle && t.language.as_deref() == Some("ger")));
+    }
+    #[test]
+    fn mp4_mdhd_version1_uses_64bit_language_offset() {
+        // A version-1 (64-bit) mdhd puts the packed language at payload offset 32 (vs 20 for
+        // version 0), because creation/modification/duration are 64-bit. The default `mdhd` helper
+        // only builds version-0 boxes, so this exercises the `version == 1` branch of
+        // `parse_mdhd_language` — the language must still be decoded correctly.
+        let mut mdia = hdlr(b"soun");
+        mdia.extend(mdhd_v1(packed("fre")));
+        let mdia_box = mp4_box(b"mdia", &mdia);
+        let trak = mp4_box(b"trak", &mdia_box);
+        let moov = mp4_box(b"moov", &trak);
+        let mut bytes = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+        bytes.extend(moov);
+        let tracks = parse_mp4_tracks(&bytes).expect("parse");
+        assert!(
+            tracks
+                .iter()
+                .any(|t| t.kind == TrackKind::Audio && t.language.as_deref() == Some("fre")),
+            "version-1 mdhd language must be read at the 64-bit offset (start + 32)"
+        );
     }
     #[test]
     fn mp4_no_moov_is_tracks_not_found() {

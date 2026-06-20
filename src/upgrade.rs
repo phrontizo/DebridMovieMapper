@@ -43,7 +43,15 @@ pub async fn run_upgrade_once(app: &AppState) {
             );
             continue;
         }
-        // Representative owned record (the movie path uses it; a settled record gates both kinds).
+        // Eligibility is gated on ONE representative record's status — the lexicographically-first
+        // hash in the group (`g.hashes` is sorted) — NOT on every record in the group. This is a
+        // coarse, order-dependent heuristic: for a show whose episodes are a mix of Pending and
+        // Verified, whether the title is considered THIS tick depends on which hash happens to sort
+        // first. That's acceptable because it self-corrects across ticks — the per-handler logic
+        // re-reads each record's own state (the movie path baselines on every owned copy via
+        // `best_owned_quality`; the consolidation path re-reads each episode record), and a season
+        // whose representative isn't settled yet simply gets reconsidered on a later tick once it
+        // lands Verified. The representative record also seeds the movie path's request metadata.
         let Some(hash) = g.hashes.first().cloned() else {
             continue;
         };
@@ -51,7 +59,7 @@ pub async fn run_upgrade_once(app: &AppState) {
             continue;
         };
         if rec.status != OwnedStatus::Verified {
-            continue; // only upgrade settled titles
+            continue; // representative record not settled yet → reconsider next tick
         }
         candidates.push((*tmdb_id, g.media_type.clone(), g.hashes.clone(), rec));
     }
@@ -648,6 +656,26 @@ async fn try_consolidate_show(
     let aired = crate::tasks::aired_episodes(&app.tmdb_client, tmdb_id, today)
         .await
         .pairs;
+    consolidate_show_seasons(app, tmdb_id, group_hashes, &owned, &aired, idle_window).await
+}
+
+/// The post-aired-lookup body of [`try_consolidate_show`]: given the already-resolved owned records
+/// and the show's aired-episode set, consolidate each scattered season into a full-season cached
+/// pack. Split out from `try_consolidate_show` so the destructive staging → record → repoint → prune
+/// orchestration is unit-testable WITHOUT the live TMDB aired-episode lookup (which the wrapper does,
+/// and which is exercised by the live smoke). Behaviour is identical to the previously-inlined body.
+async fn consolidate_show_seasons(
+    app: &AppState,
+    tmdb_id: u64,
+    group_hashes: &[String],
+    owned: &[(String, OwnedRecord)],
+    aired: &[(u32, u32)],
+    idle_window: Duration,
+) -> Result<(), UpgradeSkip> {
+    // A representative request (for imdb id + metadata) — any owned record works.
+    let Some((_, sample)) = owned.first().cloned() else {
+        return Err(UpgradeSkip::NoChange("no owned records".into()));
+    };
 
     // Seasons currently held as SCATTERED single-episode torrents (provides.len()==1).
     let mut seasons: Vec<u32> = owned
@@ -671,7 +699,7 @@ async fn try_consolidate_show(
     // Fix B: hoist provenance scan outside the per-season loop (one DB scan per title, not per season).
     let prov = base_req_provenance(app, MediaType::Show, tmdb_id).await;
     for season in seasons {
-        let season_aired = crate::tasks::season_aired(&aired, season);
+        let season_aired = crate::tasks::season_aired(aired, season);
         if season_aired.is_empty() {
             continue;
         }
@@ -696,14 +724,14 @@ async fn try_consolidate_show(
         // A→B→A every daily tick (add + 4 MB probe + delete + selection churn → spurious Jellyfin
         // re-notify). Require genuine scatter to merge. (Once episodes accumulate into ≥2 records the
         // season is consolidated; a single record is left for the acquisition path to fill.)
-        if !season_has_scatter(&owned, season) {
+        if !season_has_scatter(owned, season) {
             continue;
         }
 
         // Per-episode owned quality across ALL records that supply an episode of this season (the
         // prune below supersedes any of them). Unknown quality on any contributor → skip the season
         // (can't prove the candidate pack isn't a regression).
-        let Some(season_owned_q) = season_owned_quality(&owned, season) else {
+        let Some(season_owned_q) = season_owned_quality(owned, season) else {
             debug!(
                 "consolidate: tmdb {} s{} skipped (an owned record has unknown quality)",
                 tmdb_id, season
@@ -966,7 +994,7 @@ async fn try_consolidate_show(
                 .filter(|(s, _, _)| *s == season)
                 .map(|(_, e, _)| *e)
                 .collect();
-            for (h, rec) in &owned {
+            for (h, rec) in owned {
                 if h.eq_ignore_ascii_case(&r.info_hash) {
                     continue; // never prune the pack we just adopted
                 }
@@ -1502,7 +1530,6 @@ mod tests {
             Ok("https://cdn/new".into())
         }
         async fn invalidate(&self, _l: &crate::provider::FileLocator) {}
-        async fn evict_expired_cache(&self) {}
     }
 
     #[tokio::test]
@@ -1675,7 +1702,6 @@ mod tests {
             Ok("https://cdn/new".into())
         }
         async fn invalidate(&self, _l: &crate::provider::FileLocator) {}
-        async fn evict_expired_cache(&self) {}
     }
 
     #[tokio::test]
@@ -2048,6 +2074,109 @@ mod tests {
             store.get_owned("hold".into()).await.unwrap().status,
             OwnedStatus::Verified,
             "the existing owned record must be untouched (no swap)"
+        );
+    }
+
+    #[tokio::test]
+    async fn round_robin_budget_processes_only_the_stalest_title() {
+        // run_upgrade_once sorts owned titles by least-recently-checked (`get_upgrade_checked`) then
+        // truncates to `budget_per_tick`. Every other upgrade test seeds exactly ONE title, so the
+        // sort + truncate are no-ops. Here: THREE owned movies with DISTINCT seeded cursors and a
+        // budget of 1 ⇒ only the STALEST (smallest cursor) is evaluated this tick; the other two keep
+        // their pre-seeded cursors untouched. Each title's scrape returns a same-quality release
+        // (genuine no-upgrade), so the evaluated title advances its cursor (→ now_secs(), far above the
+        // seeded epochs) without staging anything — isolating the round-robin selection.
+        let store = mem_store();
+        let ids = [101u64, 202, 303];
+        for &id in &ids {
+            let mut req = movie_req();
+            req.tmdb_id = id;
+            req.metadata.external_id = Some(format!("tmdb:{id}"));
+            store
+                .put_owned(
+                    format!("h{id}"),
+                    OwnedRecord {
+                        request: req,
+                        provenance: Provenance::watchlist("a"),
+                        added_at: 1,
+                        status: OwnedStatus::Verified,
+                        provides: vec![],
+                        quality: Some(QualitySummary {
+                            cached: true,
+                            source_tier: 3_000,
+                            resolution: 1080,
+                            score: 10,
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        // Distinct seeded cursors: 303 is the STALEST (smallest), 101 the freshest.
+        store
+            .set_upgrade_checked(&MediaType::Movie, 101, 3_000)
+            .await
+            .unwrap();
+        store
+            .set_upgrade_checked(&MediaType::Movie, 202, 2_000)
+            .await
+            .unwrap();
+        store
+            .set_upgrade_checked(&MediaType::Movie, 303, 1_000)
+            .await
+            .unwrap();
+
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![web_1080_candidate()], // same tier+resolution → no meaningful upgrade
+        });
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "t101".into(),
+                    hash: "h101".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "t202".into(),
+                    hash: "h202".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "t303".into(),
+                    hash: "h303".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let mut app = app_with(scraper, provider, store.clone());
+        // Budget of 1: only one (the stalest) title may be processed this tick. `app.config` is the
+        // sole strong Arc reference at this point, so `get_mut` succeeds.
+        Arc::get_mut(&mut app.config)
+            .unwrap()
+            .upgrade
+            .budget_per_tick = 1;
+
+        run_upgrade_once(&app).await;
+
+        // Only the stalest (303) was evaluated → its cursor advanced past ALL seeded epochs.
+        assert!(
+            store.get_upgrade_checked(&MediaType::Movie, 303).await > 3_000,
+            "the stalest title must be processed (cursor advanced to now_secs)"
+        );
+        // The other two were over budget this tick → cursors untouched.
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Movie, 202).await,
+            2_000,
+            "the second-stalest title must be left for a later tick (over budget)"
+        );
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Movie, 101).await,
+            3_000,
+            "the freshest title must be left for a later tick (over budget)"
         );
     }
 
@@ -2517,6 +2646,553 @@ mod tests {
         assert!(
             !season_has_scatter(&other, 1),
             "a different season's record must not count toward this season's scatter"
+        );
+    }
+
+    // ── show-consolidation orchestration tests (Task 10) ───────────────────────
+    //
+    // These exercise `try_consolidate_show`'s destructive multi-step body (stage cached full-season
+    // pack → record owned with full-season `provides` → repoint episode `selection` slots → prune the
+    // superseded scattered episode torrents) and its recovery branches. They call the extracted
+    // `consolidate_show_seasons` directly with an injected aired-episode set, so they stay fully
+    // deterministic and offline: the only thing `consolidate_show_seasons` does NOT cover is the thin
+    // TMDB aired-episode lookup that the `try_consolidate_show` wrapper performs (covered by the live
+    // smoke, not unit tests — `aired_episodes` is documented as such).
+
+    const SHOW_TMDB: u64 = 1399;
+
+    fn show_meta() -> MediaMetadata {
+        MediaMetadata {
+            title: "S".into(),
+            year: Some("2019".into()),
+            media_type: MediaType::Show,
+            external_id: Some("tmdb:1399".into()),
+        }
+    }
+    /// An owned per-episode record (a single `(season, episode)` in `provides`), Series kind.
+    fn ep_record(season: u32, episode: u32, q: QualitySummary) -> OwnedRecord {
+        OwnedRecord {
+            request: AcquireRequest {
+                imdb_id: "tt9".into(),
+                tmdb_id: SHOW_TMDB,
+                kind: MediaKind::Series,
+                season: Some(season),
+                episode: Some(episode),
+                original_language: Some("eng".into()),
+                metadata: show_meta(),
+            },
+            provenance: Provenance::watchlist("a"),
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides: vec![(season, episode)],
+            quality: Some(q),
+        }
+    }
+    /// A cached BluRay 1080p full-season pack candidate — no regression over the WEB 1080p singletons.
+    fn season_pack_candidate() -> RawCandidate {
+        RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "S.2019.S01.1080p.BluRay.x265\nRD+".into(),
+            info_hash: "hpack".into(),
+            file_idx: None,
+            file_name: None,
+        }
+    }
+    /// The provider's view of the staged pack: two SELECTED season-1 episode videos.
+    fn pack_info() -> TorrentInfo {
+        TorrentInfo {
+            id: "tpack".into(),
+            hash: "hpack".into(),
+            status: "downloaded".into(),
+            files: vec![
+                TorrentFile {
+                    id: 0,
+                    path: "S.S01E01.1080p.BluRay.mkv".into(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                },
+                TorrentFile {
+                    id: 1,
+                    path: "S.S01E02.1080p.BluRay.mkv".into(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                },
+            ],
+            links: vec!["https://cdn/p1".into(), "https://cdn/p2".into()],
+            ..Default::default()
+        }
+    }
+    /// The torrents the provider lists during the prune: two scattered episodes + the staged pack.
+    fn show_listing() -> Vec<Torrent> {
+        vec![
+            Torrent {
+                id: "te1".into(),
+                hash: "e1".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            },
+            Torrent {
+                id: "te2".into(),
+                hash: "e2".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            },
+            Torrent {
+                id: "tpack".into(),
+                hash: "hpack".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            },
+        ]
+    }
+    /// Seed two scattered WEB 1080p singletons (S01E01=e1, S01E02=e2) + their selection slots.
+    async fn seed_two_scattered_episodes(store: &Store) {
+        store
+            .put_owned("e1".into(), ep_record(1, 1, q1080_web()))
+            .await
+            .unwrap();
+        store
+            .put_owned("e2".into(), ep_record(1, 2, q1080_web()))
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 1),
+                SelectionEntry {
+                    hash: "e1".into(),
+                    file_path: "e1.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 2),
+                SelectionEntry {
+                    hash: "e2".into(),
+                    file_path: "e2.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    fn owned_two() -> Vec<(String, OwnedRecord)> {
+        vec![
+            ("e1".to_string(), ep_record(1, 1, q1080_web())),
+            ("e2".to_string(), ep_record(1, 2, q1080_web())),
+        ]
+    }
+    fn group_two() -> Vec<String> {
+        vec!["e1".to_string(), "e2".to_string()]
+    }
+
+    #[tokio::test]
+    async fn idle_show_with_cached_full_season_pack_consolidates_repoints_and_prunes() {
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![season_pack_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(pack_info()),
+            resolved_url: Some("https://cdn/p1".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        // S01 aired E01-E02 (deterministic, injected — no TMDB call). Library never read ⇒ idle.
+        let res = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(res.is_ok(), "a clean consolidation returns Ok");
+
+        // The pack is recorded owned+verified with the FULL-season provides.
+        let pack = store
+            .get_owned("hpack".into())
+            .await
+            .expect("pack recorded owned+verified");
+        assert_eq!(pack.status, OwnedStatus::Verified);
+        assert_eq!(
+            pack.provides,
+            vec![(1, 1), (1, 2)],
+            "pack provides the full season"
+        );
+        // Both episode selection slots are repointed to the pack.
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            "hpack",
+            "E01 slot repointed to the pack"
+        );
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 2))
+                .await
+                .unwrap()
+                .hash,
+            "hpack",
+            "E02 slot repointed to the pack"
+        );
+        // The superseded scattered episode torrents are pruned (provider + owned records).
+        assert!(
+            store.get_owned("e1".into()).await.is_none(),
+            "e1 pruned from owned"
+        );
+        assert!(
+            store.get_owned("e2".into()).await.is_none(),
+            "e2 pruned from owned"
+        );
+        let d = deleted.lock().unwrap();
+        assert!(
+            d.contains(&"te1".to_string()) && d.contains(&"te2".to_string()),
+            "both scattered episode torrents deleted from the provider"
+        );
+        assert!(
+            !d.contains(&"tpack".to_string()),
+            "the adopted pack is NOT deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_season_complete_series_pack_is_rejected() {
+        // A "complete series" pack (covers >1 season) must be rejected as a consolidation target — it
+        // would leave its other seasons recorded-owned but un-repointed/un-pruned. The staged pack is
+        // dropped and the scattered episodes keep their selection untouched.
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![season_pack_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // The staged pack ALSO contains a season-2 file → multi-season, not a single-season pack.
+        let mut info = pack_info();
+        info.files.push(TorrentFile {
+            id: 2,
+            path: "S.S02E01.1080p.BluRay.mkv".into(),
+            bytes: 2_000_000_000,
+            selected: 1,
+        });
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(info),
+            resolved_url: Some("https://cdn/p1".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        let res = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "the season loop completes (nothing consolidated)"
+        );
+
+        assert!(
+            store.get_owned("hpack".into()).await.is_none(),
+            "a multi-season pack must NOT be adopted"
+        );
+        assert!(
+            store.get_owned("e1".into()).await.is_some()
+                && store.get_owned("e2".into()).await.is_some(),
+            "scattered episodes untouched"
+        );
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            "e1",
+            "selection unchanged"
+        );
+        let d = deleted.lock().unwrap();
+        assert!(
+            d.contains(&"tpack".to_string()),
+            "the rejected multi-season pack is dropped (deleted)"
+        );
+        assert!(
+            !d.contains(&"te1".to_string()) && !d.contains(&"te2".to_string()),
+            "no episode torrent is pruned when the pack is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_consolidation_drops_staged_pack_when_listing_unavailable() {
+        // The pack stages, but the provider listing (fetched for the prune) is UNAVAILABLE → the
+        // staged pack is dropped and the operation deferred, leaving the per-episode content intact.
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![season_pack_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            // get_torrents (the prune listing) is fetched only AFTER staging → fail it there.
+            fail_get_torrents: true,
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(pack_info()),
+            resolved_url: Some("https://cdn/p1".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        let res = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(UpgradeSkip::Deferred(_))),
+            "a listing-fetch failure defers (cursor unstamped)"
+        );
+
+        assert!(
+            store.get_owned("hpack".into()).await.is_none(),
+            "the staged pack must not be recorded when the listing is unavailable"
+        );
+        assert!(
+            deleted.lock().unwrap().contains(&"tpack".to_string()),
+            "the staged pack must be dropped (deleted) on rollback"
+        );
+        assert!(
+            store.get_owned("e1".into()).await.is_some()
+                && store.get_owned("e2".into()).await.is_some(),
+            "the existing per-episode content is intact"
+        );
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            "e1",
+            "selection unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_consolidation_drops_staged_pack_when_library_active() {
+        // The pack stages, but a read begins in the library before the idle gate → the staged pack is
+        // dropped (no dangling stage) and the operation deferred; per-episode content stays intact.
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![season_pack_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(pack_info()),
+            resolved_url: Some("https://cdn/p1".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+        // A recent read anywhere in the library → the consolidation idle gate trips.
+        app.read_activity.touch("Shows/S/whatever.mkv").await;
+
+        let res = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(UpgradeSkip::Deferred(_))),
+            "an active library defers consolidation"
+        );
+
+        assert!(
+            store.get_owned("hpack".into()).await.is_none(),
+            "no pack recorded while the library is active"
+        );
+        assert!(
+            deleted.lock().unwrap().contains(&"tpack".to_string()),
+            "the staged pack is dropped (deleted)"
+        );
+        assert!(
+            store.get_owned("e1".into()).await.is_some()
+                && store.get_owned("e2".into()).await.is_some(),
+            "per-episode content intact"
+        );
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            "e1",
+            "selection unchanged"
+        );
+        assert!(
+            !deleted.lock().unwrap().contains(&"te1".to_string()),
+            "no episode torrent is pruned"
+        );
+    }
+
+    /// A redb backend wrapping `InMemoryBackend` that fails every `write`/`set_len` once ARMED, so a
+    /// test can make a later store commit (here: the selection repoint) return `Err` deterministically.
+    /// Seed the store BEFORE arming. redb is copy-on-write — a failed page write aborts the commit
+    /// without flipping the committed root — so prior committed state stays readable (reads never call
+    /// `write`).
+    #[derive(Debug)]
+    struct ArmableFailBackend {
+        inner: redb::backends::InMemoryBackend,
+        fail_writes: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl redb::StorageBackend for ArmableFailBackend {
+        fn len(&self) -> Result<u64, std::io::Error> {
+            self.inner.len()
+        }
+        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+            self.inner.read(offset, out)
+        }
+        fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+            if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("set_len blocked (armed)"));
+            }
+            self.inner.set_len(len)
+        }
+        fn sync_data(&self) -> Result<(), std::io::Error> {
+            self.inner.sync_data()
+        }
+        fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+            if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("write blocked (armed)"));
+            }
+            self.inner.write(offset, data)
+        }
+    }
+    fn fail_after_arm_store() -> (Store, Arc<std::sync::atomic::AtomicBool>) {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backend = ArmableFailBackend {
+            inner: redb::backends::InMemoryBackend::new(),
+            fail_writes: fail.clone(),
+        };
+        let db = redb::Database::builder()
+            .create_with_backend(backend)
+            .unwrap();
+        (Store::from_database(Arc::new(db)).unwrap(), fail)
+    }
+
+    #[tokio::test]
+    async fn show_consolidation_repoint_failure_defers_prune() {
+        // If a `put_selection` repoint fails partway, the prune MUST be deferred — a scattered episode
+        // whose slot still points at the about-to-be-deleted hash must never be orphaned. Nothing may
+        // be deleted on the provider. (We arm the store to fail ALL writes, so the pack record also
+        // doesn't persist; the asserted contract — defer + delete nothing — is what matters here.)
+        let (store, fail) = fail_after_arm_store();
+        seed_two_scattered_episodes(&store).await;
+
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![season_pack_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(pack_info()),
+            resolved_url: Some("https://cdn/p1".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        // Arm AFTER seeding so the selection repoint (a redb commit) fails.
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let res = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(UpgradeSkip::Deferred(_))),
+            "a failed repoint defers the prune"
+        );
+
+        // The prune was DEFERRED: no torrent may be deleted (neither the scattered episodes — the
+        // whole point — nor the staged pack, which the repoint-fail branch intentionally leaves for
+        // the duplicate-dedup pass to reclaim later).
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "nothing may be deleted when the selection repoint failed"
+        );
+
+        // Disarm so verification reads are pristine, then confirm the per-episode content survives.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            store.get_owned("e1".into()).await.is_some()
+                && store.get_owned("e2".into()).await.is_some(),
+            "scattered episodes are NOT pruned"
+        );
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            "e1",
+            "E01 slot still points at its scattered episode"
+        );
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 2))
+                .await
+                .unwrap()
+                .hash,
+            "e2",
+            "E02 slot still points at its scattered episode"
         );
     }
 

@@ -199,7 +199,6 @@ mod tests {
             Err(crate::error::AppError::Unavailable)
         }
         async fn invalidate(&self, _l: &crate::provider::FileLocator) {}
-        async fn evict_expired_cache(&self) {}
     }
 
     fn mkv_selector(info: &TorrentInfo) -> Vec<u32> {
@@ -292,7 +291,6 @@ mod tests {
             Err(crate::error::AppError::Unavailable)
         }
         async fn invalidate(&self, _l: &crate::provider::FileLocator) {}
-        async fn evict_expired_cache(&self) {}
     }
 
     #[tokio::test]

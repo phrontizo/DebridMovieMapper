@@ -41,12 +41,25 @@ fn log_directive(rust_log: Option<String>) -> String {
 
 /// Debug-string classification of a `serve_connection` error that is a benign/expected client-side
 /// disconnect (`IncompleteMessage` — a player/WebDAV client dropping mid-request) or our own
-/// `header_read_timeout` closing an idle keep-alive connection (`HeaderTimeout` / "timed out"). hyper
-/// 1.x doesn't expose typed accessors for these, so we match its Debug output — pinned by a unit test
-/// so a hyper upgrade that renames a variant fails CI rather than silently demoting (or, for the
-/// timeout, spamming at ERROR) the wrong errors. (io-level kinds are handled separately, by downcast.)
+/// `header_read_timeout` closing an idle keep-alive connection (`HeaderTimeout`, or the textual
+/// "error reading header: operation timed out"). hyper 1.x doesn't expose typed accessors for these,
+/// so we match its Debug output — pinned by a unit test so a hyper upgrade that renames a variant
+/// fails CI rather than silently demoting the wrong errors. (io-level kinds are handled separately,
+/// by downcast.) The timeout match is scoped to the "reading header" phrase rather than a bare
+/// "timed out" so a genuine upstream/CDN body timeout (whose Debug also contains "timed out") is NOT
+/// misclassified as an ignorable disconnect.
 fn dbg_is_ignorable_disconnect(dbg: &str) -> bool {
-    dbg.contains("IncompleteMessage") || dbg.contains("HeaderTimeout") || dbg.contains("timed out")
+    dbg.contains("IncompleteMessage")
+        || dbg.contains("HeaderTimeout")
+        || dbg.contains("reading header")
+}
+
+/// Whether a request path is routed to the Trakt enrolment service rather than WebDAV. Matches the
+/// exact `/trakt` collection plus anything under `/trakt/` — but NOT an unrelated sibling such as
+/// `/traktor` (a bare `starts_with("/trakt")` would misroute it). Extracted so it is unit-testable
+/// (the routing closure that uses it lives inline in `serve_connection`).
+fn is_trakt_path(p: &str) -> bool {
+    p == "/trakt" || p.starts_with("/trakt/")
 }
 
 /// The shared HTTP/1 server-connection builder. Extracted so a test can drive a real
@@ -270,6 +283,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("WebDAV server listening on http://{}", addr);
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    // Bounds the number of concurrent fire-and-forget 503-rejecter tasks (below) so a reconnect
+    // storm against an already-saturated pool can't spawn unbounded short-lived tasks — the very
+    // amplification the connection cap exists to prevent. When this is also exhausted, the excess
+    // connection is simply dropped (closed) without a 503. The bound is set to MAX_CONNECTIONS so the
+    // 503-rejecter pool is at least as large as the connection pool: that preserves the
+    // healthcheck-503 guarantee (a transiently-saturated server still answers the `--healthcheck`
+    // probe with 503 rather than a bare drop → Docker keeps it alive) for any realistic load, while
+    // still capping the absolute worst case — each rejecter is a tiny ≤1s task, so this ceiling is
+    // cheap and is only approached under a pathological multi-hundred-connection burst.
+    const MAX_REJECTERS: usize = MAX_CONNECTIONS;
+    let reject_semaphore = Arc::new(Semaphore::new(MAX_REJECTERS));
 
     // Unified shutdown future: triggers on SIGINT (ctrl+c) or SIGTERM (Docker stop)
     let shutdown_signal = async {
@@ -343,19 +367,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             last_reject_log = Some(now);
                         }
                         // Fire-and-forget a 503 (bounded by a short write timeout so a slow/dead peer
-                        // can't stall the accept loop); no permit is held — it's a tiny one-shot write.
-                        tokio::task::spawn(async move {
-                            use tokio::io::AsyncWriteExt;
-                            let mut stream = stream;
-                            let _ = tokio::time::timeout(
-                                std::time::Duration::from_secs(1),
-                                async {
-                                    let _ = stream.write_all(REJECT_503).await;
-                                    let _ = stream.shutdown().await;
-                                },
-                            )
-                            .await;
-                        });
+                        // can't stall the accept loop), but only if a rejecter slot is free — so the
+                        // rejecter tasks themselves stay bounded under a storm. No connection permit is
+                        // held; this is a tiny one-shot write. If no rejecter slot is free, drop the
+                        // connection (close on `stream` going out of scope).
+                        if let Ok(reject_permit) = reject_semaphore.clone().try_acquire_owned() {
+                            tokio::task::spawn(async move {
+                                let _reject_permit = reject_permit; // released when the write finishes
+                                use tokio::io::AsyncWriteExt;
+                                let mut stream = stream;
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(1),
+                                    async {
+                                        let _ = stream.write_all(REJECT_503).await;
+                                        let _ = stream.shutdown().await;
+                                    },
+                                )
+                                .await;
+                            });
+                        }
                         continue;
                     }
                 };
@@ -375,8 +405,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     // Route the local-network Trakt enrolment paths to the
                                     // enrolment service; everything else is WebDAV. Both arms
                                     // produce a `Response<dav_server::body::Body>`.
-                                    let p = req.uri().path();
-                                    if p == "/trakt" || p.starts_with("/trakt/") {
+                                    if is_trakt_path(req.uri().path()) {
                                         match &enrolment {
                                             Some(enr) => Ok::<_, hyper::Error>(enr.handle(req).await),
                                             None => Ok::<_, hyper::Error>(
@@ -434,7 +463,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Signal the background tasks to stop and wait for them to finish
+    // Signal the background tasks to stop and wait for them to finish.
+    //
+    // NOTE: in-flight WebDAV connection tasks are detached (`tokio::task::spawn` above, each holding
+    // a connection permit) and are NOT drained here — when `main` returns the runtime drops and those
+    // tasks are aborted, so any active stream is cut mid-transfer. This is the intended behaviour for a
+    // media proxy under `docker stop`: a player simply re-requests the byte range on restart, and a
+    // bounded-grace drain would only delay shutdown for connections that are about to be re-opened
+    // anyway. We DO drain the background scheduler (account sync / acquisition / Trakt / upgrade), whose
+    // mid-flight provider mutations are worth finishing cleanly.
     let _ = shutdown_tx.send(true);
     info!("Waiting for background tasks to finish...");
     if let Err(e) = scheduler_handle.await {
@@ -447,7 +484,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dbg_is_ignorable_disconnect, healthcheck, http1_builder, log_directive};
+    use super::{
+        dbg_is_ignorable_disconnect, healthcheck, http1_builder, is_trakt_path, log_directive,
+    };
+
+    #[test]
+    fn is_trakt_path_matches_enrolment_routes_only() {
+        assert!(is_trakt_path("/trakt"));
+        assert!(is_trakt_path("/trakt/"));
+        assert!(is_trakt_path("/trakt/accounts"));
+        assert!(is_trakt_path("/trakt/enrol"));
+        // Must NOT misroute WebDAV paths, including a sibling that merely shares the prefix.
+        assert!(!is_trakt_path("/"));
+        assert!(!is_trakt_path("/Movies/x.mkv"));
+        assert!(!is_trakt_path("/traktor"));
+        assert!(!is_trakt_path("/trakt-backup"));
+    }
 
     #[tokio::test]
     async fn http1_builder_serves_a_connection() {
@@ -549,8 +601,12 @@ mod tests {
         assert!(dbg_is_ignorable_disconnect(
             "error reading header: operation timed out"
         ));
-        // A genuine server-side body error must NOT be classified as an ignorable disconnect.
+        // A genuine server-side body error must NOT be classified as an ignorable disconnect —
+        // including a CDN body timeout, whose Debug also contains "timed out" but not "reading header".
         assert!(!dbg_is_ignorable_disconnect("Error { kind: User(Body) }"));
+        assert!(!dbg_is_ignorable_disconnect(
+            "Error { kind: User(Body), source: \"operation timed out\" }"
+        ));
         assert!(!dbg_is_ignorable_disconnect("some unexpected error"));
     }
 

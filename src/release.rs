@@ -8,6 +8,9 @@ pub struct RawCandidate {
     pub name: String,
     pub description: String,
     pub info_hash: String,
+    /// The addon-provided `fileIdx` (faithful parse output, asserted in `scraper` tests). NOT used
+    /// for file selection: `acquire`/`observe` select the largest video so they always agree (B10),
+    /// so a misleading addon index can't diverge them — see `acquire::select_target`.
     pub file_idx: Option<usize>,
     pub file_name: Option<String>,
 }
@@ -70,7 +73,6 @@ impl Source {
 #[derive(Debug, Clone)]
 pub struct ReleaseInfo {
     pub info_hash: String,
-    pub file_idx: Option<usize>,
     pub file_name: Option<String>,
     pub resolution: Option<u16>,
     pub codec: Codec,
@@ -225,7 +227,6 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
 
     ReleaseInfo {
         info_hash: c.info_hash.clone(),
-        file_idx: c.file_idx,
         file_name: c.file_name.clone(),
         resolution,
         codec,
@@ -265,6 +266,10 @@ static LANG_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(r"\b({alt})\b")).unwrap()
 });
 
+/// The dominant score term: a release already present/cached on the provider outranks any uncached
+/// one. Named so `QualitySummary::mark_cached` can keep a stored score consistent with `score()`.
+pub const CACHED_BONUS: i64 = 1_000_000;
+
 /// Score a release against prefs. `None` = excluded by a hard rule (resolution ceiling,
 /// cam/telesync source, or an uncached zero-seeder release). Higher is better.
 ///
@@ -293,7 +298,7 @@ pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
     }
     let mut s: i64 = 0;
     if r.cached {
-        s += 1_000_000;
+        s += CACHED_BONUS;
     }
     s += r.source.tier_score();
     s += r.resolution.unwrap_or(0) as i64 * 100;
@@ -308,9 +313,13 @@ pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
     }
     s += (r.seeders.unwrap_or(0).min(1000) as i64) * 2;
     if let Some(sz) = r.size_bytes {
-        // Reject fake/sample (<300 MB) and absurd (>80 GB) files. The upper bound is generous so
-        // a legitimate REMUX (often 25–40 GB at 1080p — now our top source tier) isn't penalised.
-        if !(300_000_000..=80_000_000_000).contains(&sz) {
+        // Penalise fake/sample (<50 MB) and absurd (>80 GB) files. The lower bound targets ACTUAL
+        // samples — a few-second clip is tens of MB — rather than "short" content: a 300 MB floor
+        // wrongly penalised legitimate short TV episodes (e.g. a ~22-min 720p episode) and short
+        // films, which `monitor_episodes` acquires per-episode, deprioritising a perfectly valid
+        // small release below a larger one. The upper bound is generous so a legitimate REMUX
+        // (often 25–40 GB at 1080p — our top source tier) isn't penalised.
+        if !(50_000_000..=80_000_000_000).contains(&sz) {
             s -= 4_000;
         } else {
             // Prefer higher bitrate (larger file) at a given resolution/source — a tiebreaker
@@ -365,6 +374,20 @@ impl QualitySummary {
             source_tier: r.source.tier_score(),
             resolution: r.resolution.unwrap_or(0),
             score: score(r, prefs).unwrap_or(i64::MIN),
+        }
+    }
+
+    /// Mark this owned release as now present/cached on the provider — used when an UNCACHED torrent
+    /// finishes downloading (so its acquire-time snapshot recorded `cached: false`). Flips `cached`
+    /// AND adds [`CACHED_BONUS`] to `score` so the stored summary matches what `score()` would yield
+    /// for a cached release. Both are required: `is_meaningful_upgrade` short-circuits to "any cached
+    /// candidate is an upgrade" while `!current.cached`, and its fallback compares `score` — so a
+    /// stale `cached:false` (or a score missing the bonus) would let the upgrade engine replace this
+    /// working copy with a LOWER-quality cached release and delete it. Idempotent.
+    pub fn mark_cached(&mut self) {
+        if !self.cached {
+            self.cached = true;
+            self.score = self.score.saturating_add(CACHED_BONUS);
         }
     }
 }
@@ -655,9 +678,11 @@ mod tests {
             "h1",
             Some("A.mkv"),
         ));
+        // A genuine sample (a few-second clip) is tens of MB — below the 50 MB floor. A 150 MB
+        // file is a legitimate short episode/film and must NOT be sample-penalised (see below).
         let tiny = parse(&raw(
             "t",
-            "A.1080p.x265\n\u{1f4be} 150 MB",
+            "A.1080p.x265\n\u{1f4be} 20 MB",
             "h2",
             Some("A.mkv"),
         ));
@@ -679,8 +704,20 @@ mod tests {
             "h5",
             Some("A.mkv"),
         ));
+        // A legitimate short episode/film (150 MB) is NOT sample-penalised: it sits in the valid
+        // band, so it scores ~4000 higher than a true 20 MB sample (both have ~0 bitrate bonus).
+        let short_ep = parse(&raw(
+            "t",
+            "A.1080p.x265\n\u{1f4be} 150 MB",
+            "h6",
+            Some("A.mkv"),
+        ));
         assert!(score(&normal, &prefs()).unwrap() > score(&tiny, &prefs()).unwrap());
         assert!(score(&normal, &prefs()).unwrap() > score(&absurd, &prefs()).unwrap());
+        assert!(
+            score(&short_ep, &prefs()).unwrap() - score(&tiny, &prefs()).unwrap() >= 4_000,
+            "a 150 MB short episode must avoid the sample penalty that a 20 MB clip incurs"
+        );
         // Higher bitrate (larger) preferred at the same resolution/source…
         assert!(score(&bigger, &prefs()).unwrap() > score(&normal, &prefs()).unwrap());
         // …and a 35 GB REMUX-sized file is no longer penalised (it's capped, not rejected).
@@ -1136,6 +1173,81 @@ mod tests {
         assert!(
             !is_meaningful_upgrade(&cur_res, &cand_higher_res),
             "equal score + resolution jump must NOT be an upgrade"
+        );
+    }
+
+    #[test]
+    fn mark_cached_flips_flag_adds_bonus_and_is_idempotent() {
+        // An uncached snapshot scored without the cached bonus…
+        let uncached = parse(&raw(
+            "t",
+            "A.1080p.WEB.x265\n\u{1f4be} 8 GB",
+            "h",
+            Some("A.mkv"),
+        ));
+        let mut q = QualitySummary::of(&uncached, &prefs());
+        assert!(!q.cached);
+        let base_score = q.score;
+        // …must, once the torrent is present/cached, equal what `of()` yields for the cached release.
+        q.mark_cached();
+        let cached = parse(&raw(
+            "t",
+            "A.1080p.WEB.x265\n\u{1f4be} 8 GB",
+            "h",
+            Some("A.mkv"),
+        ));
+        let cached_q = QualitySummary::of(
+            &ReleaseInfo {
+                cached: true,
+                ..cached
+            },
+            &prefs(),
+        );
+        assert!(q.cached);
+        assert_eq!(q.score, base_score + CACHED_BONUS);
+        assert_eq!(
+            q.score, cached_q.score,
+            "mark_cached must match a freshly-scored cached release"
+        );
+        // Idempotent: a second call must not double-add the bonus.
+        let after = q.score;
+        q.mark_cached();
+        assert_eq!(q.score, after);
+    }
+
+    #[test]
+    fn upgrade_does_not_downgrade_resolution_after_uncached_copy_is_marked_cached() {
+        // Regression for the stale-`cached` bug: a movie acquired while UNCACHED (1080p WEB) records
+        // `cached:false`; once it downloads, `record_verified` calls `mark_cached`. After that, a
+        // LOWER-resolution but higher-tier CACHED candidate (720p BluRay) must NOT be a "meaningful
+        // upgrade" — resolution dominates, so swapping+pruning to it would be a downgrade + data loss.
+        let owned_uncached = parse(&raw(
+            "t",
+            "Movie.1080p.WEB.x265\n\u{1f4be} 8 GB",
+            "h1",
+            Some("Movie.mkv"),
+        ));
+        let mut current = QualitySummary::of(&owned_uncached, &prefs());
+        // Before the fix `current.cached` stayed false → the `!current.cached` short-circuit made the
+        // 720p candidate a (wrong) upgrade. After `mark_cached`, the score comparison runs correctly.
+        current.mark_cached();
+        let cand_720_bluray = parse(&raw(
+            "t",
+            "Movie.720p.BluRay.x265\n\u{1f4be} 6 GB",
+            "h2",
+            Some("Movie.mkv"),
+        ));
+        let candidate = QualitySummary::of(
+            &ReleaseInfo {
+                cached: true,
+                ..cand_720_bluray
+            },
+            &prefs(),
+        );
+        assert!(candidate.cached && current.cached);
+        assert!(
+            !is_meaningful_upgrade(&current, &candidate),
+            "a lower-resolution cached release must not upgrade a now-cached higher-resolution owned copy"
         );
     }
 }

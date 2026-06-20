@@ -7,18 +7,19 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 /// Current on-disk schema version. Bump when a migration is added in `run_migrations`.
-//
-// v6: the `upgrade_checks` cursor key gained a media-type discriminator (`upgrade_check_key`),
-//     orphaning old bare-`tmdb_id` rows; the v5→v6 migration clears the (regenerable) cursor.
-// v7: the `blacklist` key gained a media-type discriminator (`blacklist_key`) so a movie and a show
-//     sharing a numeric TMDB id no longer cross-contaminate rejections; the v6→v7 migration clears
-//     the (regenerable) blacklist.
-/// v1→v2: additive (owned_hashes, authoritative_ids, blacklist tables).
-/// v2→v3: additive (trakt_tokens, wanted tables).
-/// v3→v4: additive (selection, upgrade_checks tables; OwnedRecord.provides/quality fields).
-/// v4→v5: the `wanted` row key gained a media-type discriminator (movie/show with the same numeric
-///        TMDB id no longer collide). Old `{user}|{tmdb_id}` rows are cleared — regenerated from
-///        Trakt within one sync interval (lossless).
+///
+/// Migration history (ascending):
+/// - v1→v2: additive (owned_hashes, authoritative_ids, blacklist tables).
+/// - v2→v3: additive (trakt_tokens, wanted tables).
+/// - v3→v4: additive (selection, upgrade_checks tables; OwnedRecord.provides/quality fields).
+/// - v4→v5: the `wanted` row key gained a media-type discriminator (movie/show with the same numeric
+///   TMDB id no longer collide). Old `{user}|{tmdb_id}` rows are cleared — regenerated from Trakt
+///   within one sync interval (lossless).
+/// - v5→v6: the `upgrade_checks` cursor key gained a media-type discriminator (`upgrade_check_key`),
+///   orphaning old bare-`tmdb_id` rows; the migration clears the (regenerable) cursor.
+/// - v6→v7: the `blacklist` key gained a media-type discriminator (`blacklist_key`) so a movie and a
+///   show sharing a numeric TMDB id no longer cross-contaminate rejections; the migration clears the
+///   (regenerable) blacklist.
 pub const SCHEMA_VERSION: u64 = 7;
 
 /// TMDB identification cache: torrent id -> serde_json((TorrentInfo, MediaMetadata)).
@@ -41,6 +42,10 @@ const BLACKLIST_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blac
 /// Build a `blacklist` key from (media_type, tmdb_id, hash). The hash is lowercased so the table is
 /// case-insensitive (consistent with `all_blacklisted_hashes`). `MediaKind` is used (not `MediaType`)
 /// because every caller — the acquisition/upgrade engines — works in `MediaKind`.
+///
+/// Invariant: the `|` joiner is delimiter-safe because no key input contains `|` — the discriminator
+/// is a single char, `tmdb_id` is decimal, and a torrent infohash is hex. `all_blacklisted_hashes`'
+/// `rsplit_once('|')` relies on this; a future non-hex key source would break it.
 fn blacklist_key(kind: crate::scraper::MediaKind, tmdb_id: u64, hash: &str) -> String {
     let disc = match kind {
         crate::scraper::MediaKind::Movie => 'm',
@@ -55,7 +60,9 @@ const TRAKT_TOKENS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("t
 /// id can be both a movie and a show, and without it the two would collide on one key.
 const WANTED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wanted");
 
-/// Build a `wanted` row key from (user, media_type, tmdb_id). See [`WANTED_TABLE`].
+/// Build a `wanted` row key from (user, media_type, tmdb_id). See [`WANTED_TABLE`]. The `|` joiner is
+/// delimiter-safe: a Trakt user slug contains no `|`, the discriminator is one char, and `tmdb_id` is
+/// decimal (so `all_wanted`'s key parsing is unambiguous).
 fn wanted_key(user: &str, media_type: &crate::vfs::MediaType, tmdb_id: u64) -> String {
     let disc = match media_type {
         crate::vfs::MediaType::Movie => 'm',
@@ -75,7 +82,9 @@ fn upgrade_check_key(media_type: &crate::vfs::MediaType, tmdb_id: u64) -> String
 }
 /// SP3 live-selection: slot ("m|tmdb" / "e|tmdb|s|e") -> serde_json(SelectionEntry).
 const SELECTION_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("selection");
-/// SP3 upgrade round-robin cursor: tmdb_id (as string) -> last-checked unix secs.
+/// SP3 upgrade round-robin cursor: `upgrade_check_key` ("<m|s>|tmdb_id") -> last-checked unix secs.
+/// (Since v6 the key carries a media-type discriminator — not the bare tmdb_id — which is why the
+/// v5→v6 migration clears the table.)
 const UPGRADE_CHECKS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("upgrade_checks");
 
 /// The persisted "what to acquire" spec (also used by `acquire.rs`). Stored in `owned_hashes`
@@ -196,7 +205,7 @@ pub struct OwnedRecord {
 /// `needs_reenrolment` is set by the `sync_trakt` job when a token refresh or read fails (the
 /// account likely needs re-authorising); it is cleared on the next successful sync. Old records
 /// written before this field existed decode it as `false`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TraktTokens {
     pub access: String,
     pub refresh: String,
@@ -204,6 +213,20 @@ pub struct TraktTokens {
     pub username: String,
     #[serde(default)]
     pub needs_reenrolment: bool,
+}
+
+// Manual `Debug` redacting the access/refresh tokens — a stray `{tokens:?}` must never leak them,
+// matching the redaction convention used by `TraktConfig`/`FileLocator`/the provider clients.
+impl std::fmt::Debug for TraktTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TraktTokens")
+            .field("access", &"<redacted>")
+            .field("refresh", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("username", &self.username)
+            .field("needs_reenrolment", &self.needs_reenrolment)
+            .finish()
+    }
 }
 
 /// Which Trakt sources put a title in a user's wanted-set.
@@ -407,7 +430,14 @@ impl Store {
             write_txn.open_table(SELECTION_TABLE)?; // create if absent
             write_txn.open_table(UPGRADE_CHECKS_TABLE)?; // create if absent
             let mut meta = write_txn.open_table(META_TABLE)?; // create if absent
-            meta.insert(SCHEMA_VERSION_KEY, &SCHEMA_VERSION)?;
+
+            // Only (re)stamp when the version actually advanced (fresh DB reads version 0, or a
+            // migration just ran). On an already-current DB this skips the one redundant meta insert
+            // (the enclosing write txn is still opened/committed for the create-if-absent opens above,
+            // which are themselves no-ops for an existing DB).
+            if version < SCHEMA_VERSION {
+                meta.insert(SCHEMA_VERSION_KEY, &SCHEMA_VERSION)?;
+            }
         }
         write_txn.commit()?;
         Ok(())
@@ -606,16 +636,18 @@ impl Store {
         Self::flatten_join(result)
     }
 
-    /// Collapse a `spawn_blocking` result for a WRITE accessor: a redb error propagates, and a join
-    /// failure (the blocking task panicked or was cancelled) is logged AND returned as an error.
-    /// Returning `Err` here — rather than the old log-and-swallow `Ok(())` — is important for writes:
-    /// swallowing a join failure would report a persistence success that never happened (silent write
-    /// loss). Callers that genuinely want best-effort semantics opt in explicitly with `.ok()`.
-    fn flatten_join(
-        result: Result<Result<(), redb::Error>, tokio::task::JoinError>,
-    ) -> Result<(), AppError> {
+    /// Flatten a `spawn_blocking` join result, preserving the success value `T`: a redb error maps to
+    /// `Db`, and a join failure (the blocking task panicked or was cancelled) is logged AND mapped to
+    /// `Task` rather than being swallowed as a false success. Returning `Err` here — rather than a
+    /// log-and-swallow `Ok` — is important for writes: swallowing a join failure would report a
+    /// persistence success that never happened (silent write loss). Callers that genuinely want
+    /// best-effort semantics opt in explicitly with `.ok()`. Generic over `T` so both unit-returning
+    /// writes and value-returning ones (e.g. `put_owned_if_absent`'s `bool`) share one implementation.
+    fn flatten_join<T>(
+        result: Result<Result<T, redb::Error>, tokio::task::JoinError>,
+    ) -> Result<T, AppError> {
         match result {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(AppError::Db(e)),
             Err(e) => {
                 error!("redb blocking write task did not complete: {:?}", e);
@@ -686,16 +718,7 @@ impl Store {
             Ok(wrote)
         })
         .await;
-        match result {
-            Ok(Ok(wrote)) => Ok(wrote),
-            Ok(Err(e)) => Err(AppError::Db(e)),
-            Err(e) => {
-                error!("redb blocking write task did not complete: {:?}", e);
-                Err(AppError::Task(format!(
-                    "redb blocking task did not complete: {e}"
-                )))
-            }
-        }
+        Self::flatten_join(result)
     }
 
     pub async fn get_owned(&self, hash: String) -> Option<OwnedRecord> {
@@ -1153,6 +1176,8 @@ impl Store {
         Self::flatten_join(result)
     }
 
+    /// Single-key `wanted` lookup. Test-only: production reads the whole set via `all_wanted`.
+    #[cfg(test)]
     pub async fn get_wanted(
         &self,
         user: String,
@@ -1254,6 +1279,8 @@ impl Store {
         Self::flatten_join(result)
     }
 
+    /// Single-slot `selection` lookup. Test-only: production reads the whole map via `all_selection`.
+    #[cfg(test)]
     pub async fn get_selection(&self, slot: String) -> Option<SelectionEntry> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
@@ -2190,6 +2217,36 @@ mod tests {
         assert!(!decoded.needs_reenrolment);
     }
 
+    /// The manual `Debug` impl for `TraktTokens` must redact the OAuth `access`/`refresh` tokens —
+    /// a stray `debug!("{tokens:?}")` must never leak credentials. Guards against a future edit
+    /// (e.g. re-adding `#[derive(Debug)]`) silently re-exposing them. Mirrors config.rs's
+    /// `debug_redacts_secrets`.
+    #[test]
+    fn trakt_tokens_debug_redacts_secrets() {
+        let tok = TraktTokens {
+            access: "SECRET_ACCESS_XYZ".to_string(),
+            refresh: "SECRET_REFRESH_XYZ".to_string(),
+            expires_at: 1_234_567_890,
+            username: "alice".to_string(),
+            needs_reenrolment: false,
+        };
+        let dbg = format!("{tok:?}");
+        assert!(
+            !dbg.contains("SECRET_ACCESS_XYZ"),
+            "access token leaked: {dbg}"
+        );
+        assert!(
+            !dbg.contains("SECRET_REFRESH_XYZ"),
+            "refresh token leaked: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "expected redaction marker: {dbg}"
+        );
+        // Non-secret fields stay visible.
+        assert!(dbg.contains("alice"), "username should be visible: {dbg}");
+    }
+
     #[tokio::test]
     async fn wanted_round_trip() {
         let store = mem_store();
@@ -2622,6 +2679,43 @@ mod tests {
             bt.iter().unwrap().count(),
             0,
             "the legacy bare-key blacklist row must be cleared by the v6→v7 migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrates_v5_db_preserves_new_format_wanted_rows() {
+        // Guards the `wanted` clear range (`(3..5)`): a NEW-format wanted row (the v5+ key, with a
+        // media-type discriminator) in a v5 DB must SURVIVE migration to current — wanted holds the
+        // user's desired-state and is NOT regenerable within the same tick. If someone accidentally
+        // broadened the clear to `(3..6)`/`(3..7)`, this row would be wiped and the test would fail.
+        let tmp = TempDb::new("migrate_v5_keeps_wanted");
+        {
+            let db = Database::create(&tmp.path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                // New-format key (user|m|tmdb), exactly as `put_wanted` would write.
+                let wdef: TableDefinition<&str, &[u8]> = TableDefinition::new("wanted");
+                let mut wt = txn.open_table(wdef).unwrap();
+                let rec = movie_wanted("alice", 777);
+                let key = wanted_key("alice", &MediaType::Movie, 777);
+                wt.insert(key.as_str(), serde_json::to_vec(&rec).unwrap().as_slice())
+                    .unwrap();
+
+                let vdef: TableDefinition<&str, u64> = TableDefinition::new("meta");
+                let mut v = txn.open_table(vdef).unwrap();
+                v.insert("schema_version", &5u64).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = Store::open(&tmp.path).unwrap();
+        let all = store.all_wanted().await;
+        assert!(
+            all.iter().any(|r| r.user == "alice" && r.tmdb_id == 777),
+            "a new-format wanted row in a v5 DB must survive migration to current, got {all:?}"
+        );
+        assert!(
+            !std::path::Path::new(&tmp.corrupt_path()).exists(),
+            "valid v5 DB must not be moved aside"
         );
     }
 

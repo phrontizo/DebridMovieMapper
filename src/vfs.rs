@@ -323,6 +323,23 @@ impl DebridVfs {
             // able to introduce one into the directory path. Idempotent for normal ids.
             let folder_name = sanitize_filename(&folder_name);
 
+            // Final uniqueness guard within this section (Movies/ or Shows/). The identified-title
+            // path (`Title [tmdbid-N]`) bypasses the `used_names` counter, so without this an
+            // identified folder could collide with — and SILENTLY OVERWRITE (data loss) — an
+            // unidentified group whose cleaned title happens to match that exact form (or two names
+            // could fold together under `sanitize_filename`). Suffix ` (N)` until unique so neither
+            // entry is lost. Each `metadata` group is processed exactly once, so a pre-existing key
+            // here is always a genuine cross-group collision, never a legitimate re-entry.
+            let folder_name = {
+                let mut candidate = folder_name.clone();
+                let mut n = 1u32;
+                while nodes.contains_key(&candidate) {
+                    candidate = format!("{} ({})", folder_name, n);
+                    n += 1;
+                }
+                candidate
+            };
+
             // Warn about archive-only torrents that can't be streamed
             for torrent in &torrents {
                 let has_video = torrent
@@ -773,6 +790,13 @@ impl DebridVfs {
 /// Replace characters that are invalid in filenames or interpreted as path separators.
 /// Covers POSIX path separators and Windows-reserved characters (important for
 /// WebDAV clients accessing via rclone on Windows/SMB).
+///
+/// NOTE on a deliberate asymmetry: this is applied to library-CONSTRUCTED names — Movie/Show folder
+/// names, season folders, and NFO file names — but NOT to media-file LEAF names, which keep the exact
+/// torrent basename (`file.path.split('/').next_back()`). That is intentional: Jellyfin/Plex parse
+/// episode/quality metadata out of the original scene filename, so mangling it would degrade
+/// identification. It is not a path-traversal risk — `/` is already stripped by taking the basename,
+/// the WebDAV layer XML-encodes names, and `dav_fs::walk_components` rejects any `..` component.
 fn sanitize_filename(name: &str) -> String {
     let mut replaced = String::with_capacity(name.len());
     for c in name.chars() {
@@ -1516,6 +1540,69 @@ mod tests {
                 );
                 assert_eq!(key, "Movie [tmdbid-12-34]");
             }
+        }
+    }
+
+    #[test]
+    fn build_does_not_lose_a_group_when_an_unidentified_title_mimics_an_identified_folder() {
+        // Regression: the identified path builds `Title [tmdbid-N]` without a uniqueness guard, so an
+        // unidentified group whose cleaned title is EXACTLY that string must not silently overwrite
+        // (data-loss) the identified group's folder. Both must survive (one ` (N)`-suffixed).
+        let mk = |id: &str, hash: &str, title: &str, ext: Option<&str>| {
+            (
+                TorrentInfo {
+                    id: id.to_string(),
+                    filename: "Movie.mkv".to_string(),
+                    original_filename: "Movie.mkv".to_string(),
+                    hash: hash.to_string(),
+                    bytes: 1000,
+                    original_bytes: 1000,
+                    host: "h".to_string(),
+                    split: 1,
+                    progress: 100.0,
+                    status: "downloaded".to_string(),
+                    added: "2023-01-01".to_string(),
+                    files: vec![TorrentFile {
+                        id: 1,
+                        path: "/Movie.mkv".to_string(),
+                        bytes: 1000,
+                        selected: 1,
+                    }],
+                    links: vec!["http://link".to_string()],
+                    ended: Some("2023-01-01".to_string()),
+                },
+                MediaMetadata {
+                    title: title.to_string(),
+                    year: None,
+                    media_type: MediaType::Movie,
+                    external_id: ext.map(String::from),
+                },
+            )
+        };
+        // Identified "Movie" (tmdb:5) → folder "Movie [tmdbid-5]"; unidentified title that mimics it.
+        let torrents = vec![
+            mk("1", "h1", "Movie", Some("tmdb:5")),
+            mk("2", "h2", "Movie [tmdbid-5]", None),
+        ];
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
+        if let VfsNode::Directory { children } = &vfs.root {
+            if let Some(VfsNode::Directory {
+                children: movie_children,
+            }) = children.get("Movies")
+            {
+                assert_eq!(
+                    movie_children.len(),
+                    2,
+                    "both groups must survive the folder-name collision, got keys: {:?}",
+                    movie_children.keys().collect::<Vec<_>>()
+                );
+                assert!(movie_children.contains_key("Movie [tmdbid-5]"));
+                assert!(movie_children.contains_key("Movie [tmdbid-5] (1)"));
+            } else {
+                panic!("Movies directory missing");
+            }
+        } else {
+            panic!("root is not a directory");
         }
     }
 
@@ -3691,6 +3778,85 @@ mod selection_tests {
         assert!(
             found,
             "a selection with a present hash but mismatched file_path must not hide the episode"
+        );
+    }
+
+    #[test]
+    fn movie_colliding_basenames_in_subpaths_both_kept() {
+        // A movie torrent with TWO selected videos sharing a basename in different sub-paths
+        // (`/A/Movie.mkv` and `/B/Movie.mkv`). The VFS keys leaf nodes by basename, so without the
+        // `add_path_to_tree` " (N)" rename branch the second insert would SILENTLY OVERWRITE the
+        // first (one file lost). Both must survive — one renamed `Movie (1).mkv` — and each must
+        // keep its own distinct locator/link (this branch is live for movies; the show path
+        // pre-filters collisions, so only movies exercise it).
+        let torrent = TorrentInfo {
+            id: "t".into(),
+            hash: "h".into(),
+            bytes: 6_000_000_000,
+            status: "downloaded".into(),
+            files: vec![
+                TorrentFile {
+                    id: 0,
+                    path: "/A/Movie.mkv".into(),
+                    bytes: 3_000_000_000,
+                    selected: 1,
+                },
+                TorrentFile {
+                    id: 1,
+                    path: "/B/Movie.mkv".into(),
+                    bytes: 3_000_000_000,
+                    selected: 1,
+                },
+            ],
+            links: vec!["https://cdn/a".into(), "https://cdn/b".into()],
+            ..Default::default()
+        };
+        let vfs = DebridVfs::build(vec![(torrent, movie_meta(27205))], &SelectionMap::new());
+
+        // Collect the media-file leaf names + their links under Movies/.
+        let mut names: Vec<String> = Vec::new();
+        let mut links: Vec<String> = Vec::new();
+        if let VfsNode::Directory { children } = &vfs.root {
+            if let Some(VfsNode::Directory { children: movies }) = children.get("Movies") {
+                for folder in movies.values() {
+                    if let VfsNode::Directory { children: files } = folder {
+                        for (name, node) in files {
+                            if let VfsNode::MediaFile { locator, .. } = node {
+                                names.push(name.clone());
+                                links.push(locator.link.clone().unwrap_or_default());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        names.sort();
+
+        assert_eq!(
+            names.len(),
+            2,
+            "both colliding-basename videos must be kept, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Movie.mkv".to_string()),
+            "the first file keeps its basename, got {:?}",
+            names
+        );
+        assert!(
+            names.iter().any(|n| n == "Movie (1).mkv"),
+            "the colliding file must be renamed (not lost), got {:?}",
+            names
+        );
+        // Each kept file must retain its own distinct locator/link — proof neither overwrote the
+        // other (an overwrite would leave a single locator behind both names).
+        links.sort();
+        links.dedup();
+        assert_eq!(
+            links.len(),
+            2,
+            "each kept file must retain its distinct link, got {:?}",
+            links
         );
     }
 }

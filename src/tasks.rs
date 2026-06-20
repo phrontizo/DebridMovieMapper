@@ -1227,10 +1227,15 @@ async fn build_acquire_request(
     imdb_hint: Option<String>,
 ) -> Result<Option<AcquireRequest>, AppError> {
     let media_type = media_type_of(kind);
-    // Only hit TMDB's external_ids when Trakt didn't already give us an IMDB id.
-    let tmdb_external = match &imdb_hint {
-        Some(_) => None,
-        None => tmdb.external_imdb_id(tmdb_id, media_type.clone()).await?,
+    // Only hit TMDB's external_ids when Trakt didn't already give us a USABLE IMDB id. Gate on
+    // non-emptiness (not mere `Some`-ness) so a `Some("")`/whitespace hint doesn't suppress the
+    // TMDB fallback and then get filtered to `None` by `choose_imdb` — which would silently skip a
+    // title TMDB could have resolved. This matches `choose_imdb`'s own non-empty filter.
+    let has_usable_hint = imdb_hint.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let tmdb_external = if has_usable_hint {
+        None
+    } else {
+        tmdb.external_imdb_id(tmdb_id, media_type.clone()).await?
     };
     let Some(imdb_id) = choose_imdb(imdb_hint, tmdb_external) else {
         return Ok(None);
@@ -2813,6 +2818,43 @@ mod tests {
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].keep, vec!["served"], "the served pack is kept");
         assert_eq!(plans[0].remove, vec!["better"]);
+    }
+
+    #[test]
+    fn plan_dedup_show_episode_count_tiebreak_keeps_larger_pack() {
+        use crate::scraper::MediaKind;
+        // `provides.len()` (episode count) is the keep-priority axis BELOW protected/selected/score and
+        // ABOVE the lexicographic hash tie-break. Two packs equal on protected (both mirror),
+        // unselected, and score, differing ONLY in episode count: the LARGER pack must be kept first so
+        // the smaller (fully-covered subset) is redundant → removed.
+        //
+        // The larger pack is named lexicographically LATER ("zbig" > "asmall") so the hash tie-break
+        // alone would pick the WRONG (smaller) one — this isolates the episode-count axis. If
+        // `provides.len()` were NOT consulted, the keys would be equal, "asmall" would sort first and be
+        // kept, "zbig" would then add an uncovered episode (1,2) and ALSO be kept ⇒ NOTHING removed
+        // (plans empty). So a passing assertion proves the episode-count tie-break is what fires.
+        let owned = vec![
+            (
+                "asmall".to_string(),
+                dedup_rec(MediaKind::Series, 7, vec![(1, 1)], Some(10)),
+            ),
+            (
+                "zbig".to_string(),
+                dedup_rec(MediaKind::Series, 7, vec![(1, 1), (1, 2)], Some(10)),
+            ),
+        ];
+        let plans = plan_dedup(&owned, &hset(&["asmall", "zbig"]), &hset(&[]));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].keep,
+            vec!["zbig"],
+            "the larger-episode-count pack is kept (provides.len tie-break beats the hash order)"
+        );
+        assert_eq!(
+            plans[0].remove,
+            vec!["asmall"],
+            "the smaller pack, fully covered by the larger, is redundant → removed"
+        );
     }
 
     #[test]

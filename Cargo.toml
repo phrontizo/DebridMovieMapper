@@ -6,7 +6,10 @@ license = "MIT"
 
 [dependencies]
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+# `io-util` (AsyncWriteExt) is a PRODUCTION dependency: the accept-loop 503 rejecter in main.rs writes
+# the response via it. It was previously only enabled transitively by `signal`; declared explicitly so
+# a future tokio feature reshuffle can't break the build.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -18,7 +21,8 @@ tracing = "0.1"
 # without it `fmt::init()` is pinned to INFO. Pulls in `matchers` (tiny); `regex` is already a dependency.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Only the server + HTTP/1 stack is used (see src/main.rs); `body`/`service`/`Request`/`Response`
-# are core and need no feature. hyper-util is used solely for `rt::TokioIo` (the `tokio` feature).
+# are core and need no feature. hyper-util is used for `rt::TokioIo` + `rt::TokioTimer` (the `tokio`
+# feature) — the timer is required for hyper's `header_read_timeout` to take effect.
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 bytes = "1"
@@ -30,10 +34,10 @@ chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 urlencoding = "2"
-# test-util enables tokio's paused-clock harness; io-util (AsyncReadExt/AsyncWriteExt) is used only
-# by the loopback-server test helpers. Both are dev-only: with the edition-2021 feature resolver
-# they do not reach release builds.
-tokio = { version = "1", features = ["test-util", "io-util"] }
+# test-util enables tokio's paused-clock harness — genuinely dev-only (the edition-2021 feature
+# resolver keeps it out of release builds). io-util is NOT listed here: it's a production dependency
+# declared on the main `tokio` entry above, which the loopback-server test helpers reuse.
+tokio = { version = "1", features = ["test-util"] }
 
 [lib]
 name = "debridmoviemapper"

@@ -64,6 +64,11 @@ impl AdaptiveRateLimiter {
     }
 
     /// Record a 429 throttle — double the interval and optionally respect Retry-After.
+    ///
+    /// Under concurrency, N requests that each independently receive a 429 each double the interval,
+    /// so a burst can jump it by up to ~2^N in one tick (saturating to `MAX_INTERVAL_MS`); recovery
+    /// is then one halving per success. This is bounded and self-correcting (the interval is capped
+    /// and `record_success` walks it back), so it's accepted rather than de-duplicated per window.
     pub async fn record_throttle(&self, retry_after: Option<u64>) {
         let mut state = self.state.lock().await;
         state.interval_ms = state.interval_ms.saturating_mul(2).min(MAX_INTERVAL_MS);
@@ -90,6 +95,9 @@ impl AdaptiveRateLimiter {
         if !reset_epoch_secs.is_finite() {
             return;
         }
+        // Park only once the window is down to its last `LOW_REMAINING` slots. This deliberately
+        // strands those final slots (we wait for the reset rather than spend them) as headroom
+        // against a miscounted window tripping a 429 — a small, intentional throughput cost.
         if remaining > LOW_REMAINING {
             return;
         }

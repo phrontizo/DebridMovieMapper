@@ -174,7 +174,6 @@ fn parse_se_all(name: &str) -> Vec<(u32, u32)> {
 
 use crate::now_unix_secs as now_secs;
 
-/// Extract the numeric tmdb id from `MediaMetadata.external_id` (`"tmdb:1396"`).
 /// One-line summary of a ranked candidate for debug logs (short hash + the ranking-relevant
 /// signals). Contains no token/URL — safe to log.
 fn release_summary(r: &ReleaseInfo) -> String {
@@ -222,54 +221,28 @@ pub struct AcquisitionEngine {
 /// video. Used both to choose what to select and to identify the served file afterwards — the
 /// latter matters because some providers (TorBox) auto-select *every* file, so "first selected"
 /// is not the video (it could be a `.srt`/`.nfo`).
-fn select_target<'a>(
-    info: &'a TorrentInfo,
-    file_hint: Option<&str>,
-    file_idx: Option<usize>,
-) -> Option<&'a crate::rd_client::TorrentFile> {
-    if let Some(hint) = file_hint {
-        let hint_base = hint.rsplit('/').next().unwrap_or(hint);
-        if let Some(f) = info
-            .files
-            .iter()
-            .find(|f| f.path.rsplit('/').next().unwrap_or(&f.path) == hint_base)
-        {
-            return Some(f);
-        }
-    }
-    if let Some(idx) = file_idx {
-        if let Some(f) = info.files.get(idx) {
-            return Some(f);
-        }
-    }
+/// The representative video for a movie request: the largest video file (the feature). `acquire`
+/// and `observe` must agree on this (B10) — a misleading addon file hint/index would have diverged
+/// them (one selecting a sample, the other the feature → a broken locator / stuck Pending) — so
+/// neither passes a hint and the largest video is always taken.
+fn select_target(info: &TorrentInfo) -> Option<&crate::rd_client::TorrentFile> {
     info.files
         .iter()
         .filter(|f| crate::vfs::is_video_file(&f.path))
         .max_by_key(|f| f.bytes)
 }
 
-/// Choose file ids to select for a candidate (see `select_target`).
-fn select_file_ids(
-    info: &TorrentInfo,
-    file_hint: Option<&str>,
-    file_idx: Option<usize>,
-) -> Vec<u32> {
-    select_target(info, file_hint, file_idx)
-        .map(|f| vec![f.id])
-        .unwrap_or_default()
+/// Choose file ids to select for a movie candidate (see `select_target`).
+fn select_file_ids(info: &TorrentInfo) -> Vec<u32> {
+    select_target(info).map(|f| vec![f.id]).unwrap_or_default()
 }
 
 /// Select file ids appropriate to the request kind: a single target video for a movie (so the
 /// movie-pack guard can reject multi-feature packs), or ALL video files for a series (so a season
 /// pack downloads fully on providers that don't auto-select, and `provides` covers every episode).
-fn select_ids_for(
-    kind: MediaKind,
-    info: &TorrentInfo,
-    hint: Option<&str>,
-    idx: Option<usize>,
-) -> Vec<u32> {
+fn select_ids_for(kind: MediaKind, info: &TorrentInfo) -> Vec<u32> {
     match kind {
-        MediaKind::Movie => select_file_ids(info, hint, idx),
+        MediaKind::Movie => select_file_ids(info),
         MediaKind::Series => info
             .files
             .iter()
@@ -528,13 +501,13 @@ impl AcquisitionEngine {
             // immediately resolvable; otherwise observe selects once metadata resolves.
             //
             // Select WITHOUT the addon hint (None, None) so the chosen file matches what `observe`
-            // later records/probes (`select_target(.., None, None)` = the largest video). A valid
+            // later records/probes (`select_target` = the largest video). A valid
             // single-feature movie's feature IS the largest (the pack-guard rejects multi-feature),
             // so this is correct; and it avoids the B10 mismatch where a misleading hint points at a
             // non-largest file (e.g. a sample) — acquire would select that while observe probes the
             // largest, leaving the largest unselected → a broken locator → a stuck Pending.
             if let Ok(info) = self.provider.get_torrent_info(&added.id).await {
-                let ids = select_ids_for(req.kind, &info, None, None);
+                let ids = select_ids_for(req.kind, &info);
                 if !ids.is_empty() {
                     let csv = ids
                         .iter()
@@ -628,7 +601,9 @@ impl AcquisitionEngine {
         info: &TorrentInfo,
         selected_path: &str,
     ) {
-        match req.kind {
+        // Per-kind: write the selection slot(s) and, for a series, compute the SE-mapped episode set
+        // to persist as `provides` (the season-pack churn fix).
+        let provides_update: Option<Vec<(u32, u32)>> = match req.kind {
             MediaKind::Movie => {
                 if let Some(id) = crate::vfs::tmdb_id_of(&req.metadata) {
                     let _ = self
@@ -642,6 +617,7 @@ impl AcquisitionEngine {
                         )
                         .await;
                 }
+                None
             }
             MediaKind::Series => {
                 let eps = episode_files(info);
@@ -659,21 +635,32 @@ impl AcquisitionEngine {
                             .await;
                     }
                 }
-                // Persist provides = the SE-mapped episode set (the churn fix).
-                // Write provides + Verified in one put_owned so there is no intermediate
-                // Pending+provides failure window.
-                if let Some(mut rec) = self.store.get_owned(hash.to_string()).await {
-                    rec.provides = eps.iter().map(|(s, e, _)| (*s, *e)).collect();
-                    rec.status = OwnedStatus::Verified;
-                    let _ = self.store.put_owned(hash.to_string(), rec).await;
-                }
-                return;
+                Some(eps.iter().map(|(s, e, _)| (*s, *e)).collect())
             }
+        };
+
+        // Single read-modify-write so status (+ series `provides`) and the cached-quality refresh
+        // commit together with no intermediate window. CRITICAL: a torrent reaching this point is
+        // `downloaded` (present on the provider), so it IS cached — refresh the acquire-time
+        // `quality` snapshot (an UNCACHED candidate recorded `cached: false`) via `mark_cached`, else
+        // the upgrade engine's "`!current.cached` → any cached candidate is an upgrade" rule would
+        // later replace this working copy with a LOWER-quality cached release and delete it.
+        if let Some(mut rec) = self.store.get_owned(hash.to_string()).await {
+            rec.status = OwnedStatus::Verified;
+            if let Some(eps) = provides_update {
+                rec.provides = eps;
+            }
+            if let Some(q) = rec.quality.as_mut() {
+                q.mark_cached();
+            }
+            let _ = self.store.put_owned(hash.to_string(), rec).await;
+        } else {
+            // Record vanished (e.g. concurrently removed) — best-effort status set.
+            let _ = self
+                .store
+                .set_owned_status(hash.to_string(), OwnedStatus::Verified)
+                .await;
         }
-        let _ = self
-            .store
-            .set_owned_status(hash.to_string(), OwnedStatus::Verified)
-            .await;
     }
 
     /// Called each scan tick with the current torrent list. Resolves optimistically-added Pending
@@ -805,7 +792,7 @@ impl AcquisitionEngine {
             let none_selected = info.files.iter().all(|f| f.selected != 1);
             if none_selected {
                 // No candidate hint preserved in OwnedRecord; use the kind-appropriate fallback (largest video for movies, all videos for series).
-                let ids = select_ids_for(rec.request.kind, &info, None, None);
+                let ids = select_ids_for(rec.request.kind, &info);
                 debug!(
                     "observe: hash {} nothing selected yet — selecting {} file(s)",
                     hash,
@@ -846,7 +833,7 @@ impl AcquisitionEngine {
             // Series: the file matching the REQUESTED episode (validating a pack's largest file
             // against the requested (s,e) would misfire — a pack holds many episodes).
             let selected_path = match rec.request.kind {
-                MediaKind::Movie => select_target(&info, None, None).map(|f| f.path.clone()),
+                MediaKind::Movie => select_target(&info).map(|f| f.path.clone()),
                 MediaKind::Series => episode_files(&info)
                     .into_iter()
                     .find(|(s, e, _)| {
@@ -1147,10 +1134,10 @@ mod tests {
     }
 
     #[test]
-    fn select_target_no_hint_picks_largest_so_acquire_and_observe_agree() {
-        // B10: `acquire` and `observe` must select the SAME movie file. Both now call
-        // `select_target(.., None, None)` → the largest video (the feature). A misleading addon hint
-        // pointing at a smaller sample WOULD have picked it (the old acquire behaviour), leaving the
+    fn select_target_picks_largest_so_acquire_and_observe_agree() {
+        // B10: `acquire` and `observe` must select the SAME movie file. `select_target` takes no hint
+        // and picks the largest video (the feature), so both paths agree by construction. A
+        // hint/index-driven selector (the old behaviour) could pick a smaller SAMPLE, leaving the
         // largest — which observe records/probes — unselected → a broken locator → a stuck Pending.
         let info = TI {
             files: vec![
@@ -1169,15 +1156,60 @@ mod tests {
             ],
             ..Default::default()
         };
-        // No hint (what BOTH acquire and observe now use) → the feature (largest video).
-        assert_eq!(select_target(&info, None, None).unwrap().id, 2);
-        // A hint at the sample would have picked it — the divergence the fix removes.
-        assert_eq!(
-            select_target(&info, Some("Movie.2020.SAMPLE.mkv"), None)
-                .unwrap()
-                .id,
-            1
-        );
+        // The feature (largest video) is always chosen — never the smaller sample.
+        assert_eq!(select_target(&info).unwrap().id, 2);
+    }
+
+    #[test]
+    fn count_feature_videos_excludes_sub_floor_sample() {
+        // The ~700MB `FEATURE_MIN_BYTES` floor distinguishes a real feature from a bundled sample.
+        // The sub-floor file here is a VALID video (a neutral name, so `is_video_file` accepts it —
+        // a name like "sample.mkv" would be rejected by `is_video_file` regardless of size, which
+        // would NOT exercise the floor): it is excluded purely because it falls below the byte floor,
+        // so a feature + a small clip reads as ONE feature (not a multi-movie pack).
+        let info = TI {
+            files: vec![
+                TorrentFile {
+                    id: 1,
+                    path: "Movie.2020.1080p.BluRay.mkv".into(),
+                    bytes: 8_000_000_000, // > 700MB → a feature
+                    selected: 1,
+                },
+                TorrentFile {
+                    id: 2,
+                    path: "Movie.2020.720p.WEBRip.mkv".into(),
+                    bytes: 50_000_000, // < 700MB → below the floor, excluded
+                    selected: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(count_feature_videos(&info), 1);
+    }
+
+    #[test]
+    fn count_feature_videos_counts_two_features_as_a_pack() {
+        // Two >=floor videos = a multi-movie pack → the guard must see count == 2 so a movie request
+        // never silently acquires a bundle of features (the reject gated on this floor in both
+        // `acquire` and `upgrade`).
+        let info = TI {
+            files: vec![
+                TorrentFile {
+                    id: 1,
+                    path: "Movie.A.2020.1080p.mkv".into(),
+                    bytes: 4_000_000_000, // > 700MB → a feature
+                    selected: 1,
+                },
+                TorrentFile {
+                    id: 2,
+                    path: "Movie.B.2021.1080p.mkv".into(),
+                    bytes: 5_000_000_000, // > 700MB → a second feature
+                    selected: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(count_feature_videos(&info), 2);
     }
 
     #[test]
@@ -1453,7 +1485,6 @@ mod tests {
             Ok("https://cdn/file".into())
         }
         async fn invalidate(&self, _l: &crate::provider::FileLocator) {}
-        async fn evict_expired_cache(&self) {}
     }
 
     fn engine(
@@ -1777,6 +1808,58 @@ mod tests {
                 .unwrap()
                 .hash,
             "h1"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_marks_uncached_acquired_quality_as_cached_on_verify() {
+        // Regression: a movie acquired while UNCACHED records `quality.cached = false`. Once it
+        // downloads and `observe` verifies it, the record is present/cached on the provider, so the
+        // snapshot MUST be refreshed — otherwise the upgrade engine's `!current.cached → any cached
+        // candidate is an upgrade` rule would later prune this working copy for a lower-quality one.
+        let st = store();
+        let uncached_quality = crate::release::QualitySummary {
+            cached: false,
+            source_tier: 3_000,
+            resolution: 1080,
+            score: 111_000, // an uncached score (no CACHED_BONUS)
+        };
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: Some(uncached_quality),
+            },
+        )
+        .await
+        .unwrap();
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![Track {
+                kind: crate::probe::TrackKind::Audio,
+                language: Some("eng".into()),
+            }]))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await;
+        let rec = st.get_owned("h1".into()).await.unwrap();
+        assert_eq!(rec.status, OwnedStatus::Verified);
+        let q = rec.quality.expect("quality preserved");
+        assert!(
+            q.cached,
+            "verified (downloaded) record must be marked cached"
+        );
+        assert_eq!(
+            q.score,
+            111_000 + crate::release::CACHED_BONUS,
+            "score must gain the cached bonus so the upgrade comparison stays consistent"
         );
     }
 
@@ -2288,6 +2371,44 @@ mod tests {
             st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
                 .await,
             "a stalled hash must be blacklisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_stalled_resets_when_progress_advances() {
+        // The stall timer must RESET whenever download progress ADVANCES across ticks — a moving
+        // download is never "stalled", even under the strictest possible timeout. CLAUDE.md flags the
+        // "resets only on a progress change" contract: the past TorBox bug was a constant 0.0% that
+        // never advanced and so was falsely reaped; here we prove the reset arm fires on real movement.
+        // stall_timeout=ZERO is the strictest case — a NON-advancing tick is always "stalled"
+        // (elapsed >= 0), so the ONLY thing that can return `false` is the progress-advanced reset.
+        let eng = AcquisitionEngine::new(
+            provider_returning("downloading", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            store(),
+            prefs(),
+            5,
+            Duration::ZERO,
+            Duration::from_secs(600),
+        );
+        // First sighting at 10% primes the map; with the zero timeout a no-movement tick reads stalled.
+        assert!(
+            eng.is_stalled("tid", 10.0).await,
+            "a no-progress tick is stalled at timeout 0"
+        );
+        // Progress ADVANCED 10% → 20%: the reset arm fires, so it is NOT stalled even though the zero
+        // timeout would otherwise trip. This is the bug-class guard — an actively-moving download survives.
+        assert!(
+            !eng.is_stalled("tid", 20.0).await,
+            "an advancing download must NOT be stalled (reset fires)"
+        );
+        // Progress now HOLDS at 20%: no advance → stalled again, confirming the reset protects only an
+        // actively-moving download (not a one-shot exemption that sticks after movement stops).
+        assert!(
+            eng.is_stalled("tid", 20.0).await,
+            "held progress is stalled again once movement stops"
         );
     }
 

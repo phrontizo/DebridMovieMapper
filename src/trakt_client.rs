@@ -19,7 +19,7 @@ pub struct TraktItem {
 }
 
 /// Device-flow code response (`POST /oauth/device/code`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct DeviceCode {
     pub device_code: String,
     pub user_code: String,
@@ -28,14 +28,42 @@ pub struct DeviceCode {
     pub expires_in: u64, // seconds until the code expires
 }
 
+// Manual `Debug` redacting `device_code` (the secret used to poll for the token) — a stray
+// `debug!("{dc:?}")` must not leak it, matching `TraktConfig`/`FileLocator`. The `user_code` and
+// verification URL are non-secret (shown to the operator), so they stay visible.
+impl std::fmt::Debug for DeviceCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCode")
+            .field("device_code", &"<redacted>")
+            .field("user_code", &self.user_code)
+            .field("verification_url", &self.verification_url)
+            .field("interval", &self.interval)
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
 /// OAuth token response (device token / refresh). Caller maps to `store::TraktTokens` via
 /// `expires_at = created_at + expires_in`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct TraktTokenResponse {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_in: u64, // seconds
     pub created_at: u64, // unix epoch seconds
+}
+
+// Manual `Debug` redacting the access/refresh tokens (also covers `DeviceTokenPoll::Authorized`,
+// whose derived `Debug` defers to this).
+impl std::fmt::Debug for TraktTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TraktTokenResponse")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 /// The authenticated user's identity (`GET /users/me`). `slug` is the stable Trakt URL slug
@@ -134,7 +162,8 @@ impl TraktClientImpl {
         }
     }
 
-    /// Builder override for the API base URL (e.g. a future live test pointing elsewhere).
+    /// Builder override for the API base URL (test-only: point the client at a loopback/mock server).
+    #[cfg(test)]
     pub fn with_base_url(mut self, base_url: String) -> Self {
         self.base_url = base_url.trim_end_matches('/').to_string();
         self
@@ -768,6 +797,82 @@ mod tests {
                 expires_in: 7776000,
                 created_at: 1700000000,
             }
+        );
+    }
+
+    /// The manual `Debug` impl for `TraktTokenResponse` must redact the OAuth tokens — a stray
+    /// `debug!("{resp:?}")` must never leak them. Also covers `DeviceTokenPoll::Authorized`, whose
+    /// derived `Debug` defers to this manual impl (the embedding case). Guards against a future edit
+    /// re-deriving `Debug` and silently re-exposing credentials.
+    #[test]
+    fn token_response_debug_redacts_secrets() {
+        let resp = TraktTokenResponse {
+            access_token: "SECRET_ACCESS_XYZ".into(),
+            refresh_token: "SECRET_REFRESH_XYZ".into(),
+            expires_in: 7776000,
+            created_at: 1700000000,
+        };
+        let dbg = format!("{resp:?}");
+        assert!(
+            !dbg.contains("SECRET_ACCESS_XYZ"),
+            "access token leaked: {dbg}"
+        );
+        assert!(
+            !dbg.contains("SECRET_REFRESH_XYZ"),
+            "refresh token leaked: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "expected redaction marker: {dbg}"
+        );
+
+        // Embedding case: the derived Debug for DeviceTokenPoll must defer to the manual redacting
+        // impl, so a wrapped token response does not leak either.
+        let poll = DeviceTokenPoll::Authorized(resp);
+        let poll_dbg = format!("{poll:?}");
+        assert!(
+            !poll_dbg.contains("SECRET_ACCESS_XYZ"),
+            "access token leaked through DeviceTokenPoll::Authorized: {poll_dbg}"
+        );
+        assert!(
+            !poll_dbg.contains("SECRET_REFRESH_XYZ"),
+            "refresh token leaked through DeviceTokenPoll::Authorized: {poll_dbg}"
+        );
+        assert!(
+            poll_dbg.contains("<redacted>"),
+            "expected redaction marker in wrapped poll: {poll_dbg}"
+        );
+    }
+
+    /// The manual `Debug` impl for `DeviceCode` must redact the secret `device_code` (used to poll
+    /// for the token) while keeping the non-secret `user_code`/`verification_url` visible (they're
+    /// shown to the operator). Guards against a future re-derive leaking the polling secret.
+    #[test]
+    fn device_code_debug_redacts_device_code_only() {
+        let dc = DeviceCode {
+            device_code: "SECRET_DEVICE_XYZ".into(),
+            user_code: "USERCODE123".into(),
+            verification_url: "https://trakt.tv/activate".into(),
+            interval: 5,
+            expires_in: 600,
+        };
+        let dbg = format!("{dc:?}");
+        assert!(
+            !dbg.contains("SECRET_DEVICE_XYZ"),
+            "device_code leaked: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "expected redaction marker: {dbg}"
+        );
+        // Non-secret fields must remain visible.
+        assert!(
+            dbg.contains("USERCODE123"),
+            "user_code should be visible: {dbg}"
+        );
+        assert!(
+            dbg.contains("https://trakt.tv/activate"),
+            "verification_url should be visible: {dbg}"
         );
     }
 

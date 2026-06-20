@@ -693,6 +693,64 @@ mod tests {
         RepairManager::new(rd_client)
     }
 
+    /// `locator_for_file` advances `link_idx` ONLY for `selected == 1` files, pairing RD's
+    /// per-file restricted links positionally among the SELECTED files. With a SELECTED file
+    /// AND an UNSELECTED file both preceding the target, the target is the 2nd selected file
+    /// (`link_idx == 1`) and must pair `links[1]`; the unselected file must NOT consume an index.
+    /// The single-selected-file repair tests never reach `link_idx > 0`, so this guards it.
+    #[test]
+    fn locator_for_file_pairs_link_by_position_among_selected_files() {
+        use crate::rd_client::{TorrentFile, TorrentInfo};
+
+        let info = TorrentInfo {
+            id: "tid".to_string(),
+            hash: "H".to_string(),
+            status: "downloaded".to_string(),
+            files: vec![
+                // Selected, but not the target → pushes link_idx to 1.
+                TorrentFile {
+                    id: 10,
+                    path: "/SelectedFirst.mkv".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                },
+                // Unselected → must be skipped WITHOUT consuming a link index.
+                TorrentFile {
+                    id: 20,
+                    path: "/Unselected.mkv".to_string(),
+                    bytes: 500,
+                    selected: 0,
+                },
+                // The target: the 2nd selected file → must pair links[1].
+                TorrentFile {
+                    id: 30,
+                    path: "/Target.mkv".to_string(),
+                    bytes: 2000,
+                    selected: 1,
+                },
+            ],
+            // RD emits one link per SELECTED file, in selected order: [SelectedFirst, Target].
+            links: vec![
+                "https://rd/selected-first".to_string(),
+                "https://rd/target".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let loc = RepairManager::locator_for_file(&info, "H", "/Target.mkv")
+            .expect("target file should resolve to a locator");
+
+        assert_eq!(loc.file_id, 30);
+        assert_eq!(loc.file_path, "/Target.mkv");
+        assert_eq!(loc.hash, "H");
+        assert_eq!(loc.torrent_id, "tid");
+        assert_eq!(
+            loc.link.as_deref(),
+            Some("https://rd/target"),
+            "the 2nd selected file must pair links[1]; the unselected file must not consume an index"
+        );
+    }
+
     #[tokio::test]
     async fn try_instant_repair_cached_returns_new_locator() {
         use crate::provider::FileLocator;

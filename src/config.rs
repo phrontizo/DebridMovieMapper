@@ -27,7 +27,9 @@ impl MaxResolution {
             _ => None,
         }
     }
-    /// Parse "720"/"1080"/"2160"/"4k"; anything else → default 1080p.
+    /// Parse "720"/"1080"/"2160"/"4k"; anything else → default 1080p. Test-only convenience;
+    /// production uses `try_parse` directly (it logs a warning on an unrecognised value).
+    #[cfg(test)]
     pub fn parse(s: &str) -> Self {
         Self::try_parse(s).unwrap_or(MaxResolution::P1080)
     }

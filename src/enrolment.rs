@@ -21,18 +21,24 @@ use tracing::{info, warn};
 pub struct EnrolmentService {
     trakt: Arc<dyn TraktClient>,
     store: Store,
-    /// Caps concurrent device-flow enrolment polls to one. The `/trakt/enrol` route carries no
-    /// auth, so without this a single client could spawn unbounded long-lived (~600s) background
-    /// poll tasks — exhausting host resources and hammering Trakt's API under our `client_id`.
+    /// Caps concurrent device-flow enrolment polls. The `/trakt/enrol` route carries no auth, so
+    /// without this a single client could spawn unbounded long-lived (~600s) background poll tasks —
+    /// exhausting host resources and hammering Trakt's API under our `client_id`. A small bound (not
+    /// one) lets a household link several accounts back-to-back without the next `/trakt/enrol`
+    /// 429-ing while an earlier code is still pending approval, while still keeping the exposure
+    /// tightly bounded.
     inflight: Arc<tokio::sync::Semaphore>,
 }
+
+/// Max simultaneous pending device-flow enrolments (each holds a slot for the ~600s poll window).
+const MAX_CONCURRENT_ENROLMENTS: usize = 3;
 
 impl EnrolmentService {
     pub fn new(trakt: Arc<dyn TraktClient>, store: Store) -> Self {
         Self {
             trakt,
             store,
-            inflight: Arc::new(tokio::sync::Semaphore::new(1)),
+            inflight: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ENROLMENTS)),
         }
     }
 
@@ -81,14 +87,15 @@ impl EnrolmentService {
     /// Begin device-flow enrolment: fetch a device code, spawn the background poll that
     /// completes the link, and return HTML showing the user_code + verification URL.
     pub(crate) async fn start_enrolment(&self) -> Response<Body> {
-        // Admit only one in-flight enrolment at a time (the route is unauthenticated). The owned
-        // permit is moved into the background poll below and released when it finishes/expires.
+        // Admit only a small bounded number of in-flight enrolments (the route is unauthenticated).
+        // The owned permit is moved into the background poll below and released when it
+        // finishes/expires.
         let Ok(permit) = self.inflight.clone().try_acquire_owned() else {
             return html(
                 StatusCode::TOO_MANY_REQUESTS,
                 "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Enrolment in progress</title></head>\
-                 <body><h1>An enrolment is already in progress</h1>\
-                 <p>Finish approving the current device code on trakt.tv, or wait for it to expire, then try again.</p>\
+                 <body><h1>Too many enrolments already in progress</h1>\
+                 <p>Finish approving a pending device code on trakt.tv, or wait for one to expire, then try again.</p>\
                  <p><a href=\"/trakt/accounts\">Back to accounts</a></p></body></html>"
                     .to_string(),
             );
@@ -507,28 +514,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_enrolment_caps_concurrent_polls_to_one() {
+    async fn start_enrolment_caps_concurrent_polls_to_the_bound() {
         let store = mem_store();
         let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), store);
-        // Hold the single permit to simulate one enrolment already in flight.
-        let held = svc
-            .inflight
-            .clone()
-            .try_acquire_owned()
-            .expect("first permit available");
+        // Exhaust the pool: hold all MAX_CONCURRENT_ENROLMENTS permits to simulate that many
+        // enrolments already in flight.
+        let held: Vec<_> = (0..MAX_CONCURRENT_ENROLMENTS)
+            .map(|_| {
+                svc.inflight
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("permit available up to the bound")
+            })
+            .collect();
         let refused = svc.start_enrolment().await;
         assert_eq!(
             refused.status(),
             StatusCode::TOO_MANY_REQUESTS,
-            "a second concurrent enrolment must be refused, not spawn another poll task"
+            "an enrolment beyond the bound must be refused, not spawn another poll task"
         );
-        // Once the in-flight enrolment ends, the slot frees and a new enrolment is admitted again.
+        // Once an in-flight enrolment ends, a slot frees and a new enrolment is admitted again.
         drop(held);
         let admitted = svc.start_enrolment().await;
         assert_ne!(
             admitted.status(),
             StatusCode::TOO_MANY_REQUESTS,
-            "the slot must free after the in-flight enrolment ends"
+            "a slot must free after an in-flight enrolment ends"
         );
     }
 

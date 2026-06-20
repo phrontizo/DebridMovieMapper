@@ -34,8 +34,8 @@ impl std::fmt::Debug for FileLocator {
 /// active per deployment (chosen at startup by `choose_provider`).
 ///
 /// Beyond the basic torrent operations it exposes the provider-neutral file-resolution surface
-/// (`resolve_url`/`invalidate`/`evict_expired_cache`) the VFS and repair paths depend on, so no
-/// component needs to know which concrete client is behind the `Arc<dyn DebridProvider>`.
+/// (`resolve_url`/`invalidate`) the VFS and repair paths depend on, so no component needs to know
+/// which concrete client is behind the `Arc<dyn DebridProvider>`.
 ///
 /// `Debug` is a supertrait so an `Arc<dyn DebridProvider>` can live inside `Debug`-deriving
 /// structs like `RepairManager`.
@@ -57,9 +57,6 @@ pub trait DebridProvider: Send + Sync + std::fmt::Debug {
 
     /// Drop any cached resolution for `loc` (RD: the unrestrict-cache entry for its link).
     async fn invalidate(&self, loc: &FileLocator);
-
-    /// Evict expired cached resolutions.
-    async fn evict_expired_cache(&self);
 }
 
 /// Which provider the service should run against this deployment.
@@ -160,7 +157,6 @@ impl DebridProvider for MockProvider {
         self.invalidate_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-    async fn evict_expired_cache(&self) {}
 }
 
 #[cfg(test)]
@@ -195,7 +191,6 @@ mod tests {
         // Methods with no canned value return defaults / no-ops.
         assert_eq!(provider.get_torrent_info("x").await.unwrap().id, "");
         provider.invalidate(&FileLocator::default()).await;
-        provider.evict_expired_cache().await; // no-op, must not panic
         assert_eq!(
             invalidate_calls.load(std::sync::atomic::Ordering::SeqCst),
             1,

@@ -525,7 +525,8 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     // EXCEPT a leading "[Title] (YYYY)" whose brackets are part of the title (e.g. "[REC] (2007)").
     if !TITLE_BRACKET_YEAR_RE.is_match(&title) {
         if let Some(m) = PREFIX_RE.find(&title) {
-            // Only strip if it's followed by a separator (dot, space, dash) or it's a known prefix
+            // PREFIX_RE itself encodes the separator/known-prefix constraints; once it matches,
+            // strip the prefix and any leading non-alphanumeric run that follows it.
             title = title[m.end()..]
                 .trim_start_matches(|c: char| !c.is_alphanumeric())
                 .to_string();
@@ -535,11 +536,9 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     // 2. Initial cleanup: replace dots and underscores with spaces
     title = title.replace(['.', '_'], " ");
 
-    // 3. Handle "aka" - usually title aka alternative title
-    // Search case-insensitively by finding " aka " on the original title using
-    // a regex-free approach that respects UTF-8 boundaries. We scan for the
-    // pattern in the lowercased version but use char_indices on the original
-    // to find a byte-boundary-safe offset.
+    // 3. Handle "aka" - usually "title aka alternative title"; keep the part after " aka ".
+    // `find_case_insensitive` scans bytes with ASCII case-folding and returns a byte offset
+    // that is always on a UTF-8 boundary (the needle is pure ASCII), so the slice below is safe.
     if let Some(aka_pos) = find_case_insensitive(&title, " aka ") {
         let after_aka = &title[aka_pos + 5..];
         if !after_aka.trim().is_empty() {
@@ -595,8 +594,15 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     //    trailing release year is dropped, rather than truncating at the title's own number.
     if let Some(m) = YEAR_RE.find_iter(&title).last() {
         if m.start() > 0 {
-            // Check if this year is part of a range (e.g. 1985-1999 or 1985 1999)
-            if !YEAR_RANGE_RE.is_match(&title) {
+            // Only skip truncation when THIS matched (trailing) year is itself part of a
+            // range, e.g. "1985-1999" / "1985 1999" — keeping a date-range title intact. A
+            // range elsewhere in the title (e.g. "WWII in Color 1939-1945 2009") must NOT
+            // disable dropping the separate trailing release year, so we check the matched
+            // year's span against the range matches rather than testing the whole title.
+            let in_range = YEAR_RANGE_RE
+                .find_iter(&title)
+                .any(|r| r.start() <= m.start() && m.end() <= r.end());
+            if !in_range {
                 title.truncate(m.start());
             }
         }
@@ -945,6 +951,79 @@ mod tests {
         );
         // Regression: a leading parenthesised YEAR prefix is STILL stripped.
         assert_eq!(clean_name("(2020) Tenet 1080p BluRay").0, "Tenet");
+    }
+
+    #[test]
+    fn clean_name_drops_release_year_even_when_title_contains_a_year_range() {
+        // A date-range in the title (e.g. a war/history doc) must NOT disable dropping the
+        // separate trailing release year. The range is checked against the matched year's span,
+        // not the whole title.
+        let (title, year) = clean_name("WWII.in.Color.1939-1945.2009.1080p.mkv");
+        assert_eq!(
+            year.as_deref(),
+            Some("2009"),
+            "release year is the LAST token"
+        );
+        assert_eq!(
+            title, "WWII in Color 1939-1945",
+            "the title-embedded date range is preserved and only the trailing release year dropped"
+        );
+        // A title that is JUST a date range (no separate release year) keeps the whole range.
+        let (only_range, _) = clean_name("The Great War 1914-1918 1080p BluRay.mkv");
+        assert_eq!(only_range, "The Great War 1914-1918");
+    }
+
+    // --- Direct tests for the score_result tuning constants ---
+
+    #[test]
+    fn score_result_exact_year_beats_off_by_one_and_wrong_year() {
+        let q = "themovie";
+        // Three identical titles differing only by release year vs the queried 2010.
+        let exact = make_result(1, "The Movie", Some("2010-01-01"), 0.0, None, None);
+        let off_by_one = make_result(2, "The Movie", Some("2011-01-01"), 0.0, None, None);
+        let wrong = make_result(3, "The Movie", Some("2020-01-01"), 0.0, None, None);
+        let year = Some("2010".to_string());
+        let s_exact = score_result(&exact, q, &year, 2024);
+        let s_off = score_result(&off_by_one, q, &year, 2024);
+        let s_wrong = score_result(&wrong, q, &year, 2024);
+        // Exact (+200) > ±1 (+150) > wrong (+0) for the year component, on top of the shared
+        // exact-title +1000.
+        assert!(s_exact > s_off, "{s_exact} vs {s_off}");
+        assert!(s_off > s_wrong, "{s_off} vs {s_wrong}");
+        assert_eq!(s_exact - s_off, 50.0);
+        assert_eq!(s_off - s_wrong, 150.0);
+    }
+
+    #[test]
+    fn score_result_exact_title_dominates_partial_even_with_wrong_year() {
+        // An exact-title-but-wrong-year result must still beat a partial-title-but-exact-year one:
+        // the exact/partial gap (1000 - 100 = 900) dwarfs the year gap (200).
+        let exact_wrong_year = make_result(1, "Heat", Some("1999-01-01"), 0.0, None, None);
+        let partial_right_year = make_result(2, "Heat Wave", Some("1995-01-01"), 0.0, None, None);
+        let year = Some("1995".to_string());
+        let s_exact = score_result(&exact_wrong_year, "heat", &year, 2024);
+        let s_partial = score_result(&partial_right_year, "heat", &year, 2024);
+        assert!(
+            s_exact > s_partial,
+            "exact-title must win: {s_exact} vs {s_partial}"
+        );
+    }
+
+    #[test]
+    fn score_result_recency_only_applies_without_a_year() {
+        // With no filename year, a newer release scores higher via the recency ramp.
+        let new = make_result(1, "Sherwood", Some("2022-01-01"), 0.0, None, None);
+        let old = make_result(2, "Sherwood", Some("2010-01-01"), 0.0, None, None);
+        let s_new = score_result(&new, "sherwood", &None, 2024);
+        let s_old = score_result(&old, "sherwood", &None, 2024);
+        assert!(s_new > s_old, "recency tiebreaker: {s_new} vs {s_old}");
+        // The ramp floors at 0 (no negative penalty for very old content beyond ~10 years).
+        let ancient = make_result(3, "Sherwood", Some("1980-01-01"), 0.0, None, None);
+        let s_ancient = score_result(&ancient, "sherwood", &None, 2024);
+        assert_eq!(
+            s_ancient, 1000.0,
+            "old content gets exact-title only, no recency"
+        );
     }
 
     #[tokio::test]

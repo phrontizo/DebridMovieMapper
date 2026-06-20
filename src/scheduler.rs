@@ -1,9 +1,9 @@
 //! Background-job scheduler (SP2 Task 10). Splits the single `run_scan_loop` spawn into
 //! cooperating periodic tasks over a shared [`AppState`]:
 //!
-//! - **Scan task** = `run_scan_loop` (UNCHANGED): the account sync (VFS mirror) + acquisition
-//!   verification (`engine.observe`) — both inlined in `run_scan_loop`, sharing one `get_torrents`
-//!   per tick. Cadence: `SCAN_INTERVAL_SECS`.
+//! - **Scan task** = `run_scan_loop`: per tick, sharing one `get_torrents`, the account sync (VFS
+//!   mirror) + acquisition verification (`engine.observe`), plus (SP3) `record_mirror_owned` and
+//!   `dedup_owned`. Cadence: `SCAN_INTERVAL_SECS`.
 //! - **Trakt cycle task** = `sync_trakt` THEN `reconcile_wanted`, sequentially each tick (so the
 //!   reconciler sees the just-synced wanted set). Cadence: `TRAKT_SYNC_INTERVAL_SECS`.
 //! - **Episode monitor task** = `monitor_episodes`. Cadence: `TRAKT_EPISODE_CHECK_INTERVAL_SECS`.
@@ -427,6 +427,58 @@ mod tests {
             (4..=5).contains(&n),
             "expected ~4 runs (initial + 3 ticks), got {}",
             n
+        );
+    }
+
+    /// A panicking tick must NOT kill the schedule: `periodic` runs each tick under
+    /// `catch_unwind` (unlike a plain `job().await`, which would unwind `periodic` and silently
+    /// disable the subsystem for the process lifetime). The job PANICS on its first invocation,
+    /// then increments `after_panic` on every later tick — so `after_panic` advancing past the
+    /// panicking first tick is direct proof the schedule continued.
+    #[tokio::test(start_paused = true)]
+    async fn periodic_continues_after_a_panicking_tick() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let after_panic = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = watch::channel(false);
+
+        let calls_c = calls.clone();
+        let after_c = after_panic.clone();
+        let handle = tokio::spawn(periodic(Duration::from_secs(60), rx, move || {
+            let calls_c = calls_c.clone();
+            let after_c = after_c.clone();
+            async move {
+                let n = calls_c.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    panic!("simulated panic on the first tick");
+                }
+                after_c.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        // Immediate run → panics (caught by `catch_unwind`); the schedule must survive it.
+        tokio::task::yield_now().await;
+
+        // Advance through three intervals, one at a time, yielding so the task re-arms each sleep.
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Signal shutdown and advance once more so the task observes it and exits.
+        tx.send(true).unwrap();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        let _ = handle.await;
+
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "the job must be invoked again after the panicking first tick (got {})",
+            calls.load(Ordering::SeqCst)
+        );
+        assert!(
+            after_panic.load(Ordering::SeqCst) >= 1,
+            "ticks after the panic must run — the counter must advance past the panic (got {})",
+            after_panic.load(Ordering::SeqCst)
         );
     }
 
