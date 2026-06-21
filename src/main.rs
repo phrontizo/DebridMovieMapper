@@ -256,7 +256,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app_state.repair_manager.clone(),
         app_state.http_client.clone(),
         app_state.read_activity.clone(),
-    );
+    )
+    .with_first_read_bytes(app_state.config.cdn_first_read_bytes);
     let dav_handler = DavHandler::builder()
         .filesystem(Box::new(dav_fs))
         .locksystem(dav_server::fakels::FakeLs::new())

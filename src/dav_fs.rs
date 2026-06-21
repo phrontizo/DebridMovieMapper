@@ -37,6 +37,9 @@ pub struct DebridFileSystem {
     repair_manager: Arc<RepairManager>,
     http_client: reqwest::Client,
     read_activity: Arc<crate::read_activity::ReadActivity>,
+    /// Size of the FIRST read-ahead fetch on each opened media file (later reads use `BUFFER_SIZE`).
+    /// Defaults to `BUFFER_SIZE` (no enlargement); `with_first_read_bytes` sets it from config.
+    first_read_bytes: u64,
 }
 
 impl DebridFileSystem {
@@ -53,7 +56,16 @@ impl DebridFileSystem {
             repair_manager,
             http_client,
             read_activity,
+            first_read_bytes: BUFFER_SIZE as u64,
         }
+    }
+
+    /// Set the first-read-ahead window (from `Config::cdn_first_read_bytes`). Clamped to
+    /// [`BUFFER_SIZE`, `MAX_FETCH_SIZE`] so it can never undercut the normal window or exceed the
+    /// per-fetch cap, regardless of the configured value.
+    pub fn with_first_read_bytes(mut self, bytes: u64) -> Self {
+        self.first_read_bytes = bytes.clamp(BUFFER_SIZE as u64, MAX_FETCH_SIZE as u64);
+        self
     }
 
     /// Resolve a path to a VfsNode reference without cloning.
@@ -162,6 +174,7 @@ impl DavFileSystem for DebridFileSystem {
                     vfs_path,
                     modified_time,
                     confirmed_read: false,
+                    first_read_bytes: self.first_read_bytes,
                 }) as Box<dyn DavFile>),
                 Payload::Virtual(content) => Ok(Box::new(VirtualFile {
                     content: Bytes::from(content),
@@ -302,6 +315,10 @@ struct ProxiedMediaFile {
     /// Set once the first CDN fetch succeeds, so the repair-budget reset (`note_read_success`) fires
     /// at most once per opened file rather than per chunk.
     confirmed_read: bool,
+    /// Size of the FIRST read-ahead fetch (while the buffer is still empty) — front-loads the
+    /// container header/early index so the open/ffprobe burst needs fewer cold CDN round-trips.
+    /// Later (warm-buffer) fetches use `BUFFER_SIZE`.
+    first_read_bytes: u64,
 }
 
 // `DavFile` requires `Debug` as a supertrait, but this struct holds two capability values in the
@@ -432,8 +449,18 @@ impl ProxiedMediaFile {
             return Ok(data);
         }
 
-        // Buffer miss — fetch from CDN (with retry on expired URL).
-        let fetch_size = len.clamp(BUFFER_SIZE, MAX_FETCH_SIZE) as u64;
+        // Buffer miss — fetch from CDN (with retry on expired URL). The FIRST fetch of an opened file
+        // (buffer still empty) uses the larger `first_read_bytes` window so a player's open/ffprobe
+        // burst (header + early index) is satisfied from one cold fetch instead of several; later
+        // (warm-buffer) fetches use the normal `BUFFER_SIZE` read-ahead. `first_read_bytes` is already
+        // clamped to [BUFFER_SIZE, MAX_FETCH_SIZE]; clamp again defensively.
+        let min_window = if self.buffer.is_empty() {
+            self.first_read_bytes
+                .clamp(BUFFER_SIZE as u64, MAX_FETCH_SIZE as u64)
+        } else {
+            BUFFER_SIZE as u64
+        };
+        let fetch_size = (len as u64).max(min_window).min(MAX_FETCH_SIZE as u64);
         let range_end = std::cmp::min(pos + fetch_size - 1, self.file_size - 1);
         let body = self.fetch_cdn_range(pos, range_end).await?;
 
@@ -507,6 +534,8 @@ impl ProxiedMediaFile {
             };
 
             let status = resp.status();
+            // Read once: reused for the oversized check below AND the keep-alive drain decision.
+            let content_length = resp.content_length();
             // A ranged request should yield 206 Partial Content. A plain 200 means the CDN
             // ignored the Range header and is returning the whole object starting at byte 0.
             // That is only safe to buffer when we asked for offset 0 — for any seek (pos > 0)
@@ -523,9 +552,7 @@ impl ProxiedMediaFile {
             // (mirroring `probe::read_body`). The bounded read is the hard guarantee regardless —
             // Content-Length is attacker-controlled and may lie or be absent.
             let oversized = status == reqwest::StatusCode::PARTIAL_CONTENT
-                && resp
-                    .content_length()
-                    .is_some_and(|cl| cl > MAX_FETCH_SIZE as u64);
+                && content_length.is_some_and(|cl| cl > MAX_FETCH_SIZE as u64);
             // For a 206, defensively confirm the CDN returned the range we asked for: a non-compliant
             // CDN that answers 206 with a DIFFERENT start would otherwise be buffered at
             // `buffer_start = pos`, silently serving wrong bytes. An absent/unparseable Content-Range
@@ -588,17 +615,28 @@ impl ProxiedMediaFile {
             // loop below still enforces MAX_FETCH_SIZE regardless of what the CDN actually sends.
             let want = range_end.saturating_sub(pos).saturating_add(1);
             let want_usize = want.min(MAX_FETCH_SIZE as u64) as usize;
+            // Keep-alive reuse: a bounded 206 (Content-Length present and <= the window we asked for)
+            // has a body of exactly that length, so reading it to its natural end (`Ok(None)`) lets
+            // reqwest return the connection to the pool — the NEXT window's GET then reuses the same
+            // TCP+TLS connection instead of re-handshaking per 2 MB read. We must NOT do this for a
+            // Range-ignoring 200 (TorBox streaming the WHOLE multi-GB object from byte 0): there we
+            // still read only `want` bytes then drop the connection (we can't drain gigabytes). A 206
+            // whose Content-Length is absent or exceeds the window is treated as the latter (drop).
+            let drainable = status == reqwest::StatusCode::PARTIAL_CONTENT
+                && content_length.is_some_and(|cl| cl <= want_usize as u64);
             let mut body = bytes::BytesMut::with_capacity(want_usize);
             loop {
                 match resp.chunk().await {
                     Ok(Some(chunk)) => {
                         body.extend_from_slice(&chunk);
-                        // Stop once the requested window is satisfied and drop the rest of the
-                        // connection: a Range-ignoring 200 (TorBox) streams the WHOLE multi-GB object
-                        // from byte 0, so we must read only `want` bytes rather than the entire file
-                        // (mirrors `probe::read_body`). `want` <= MAX_FETCH_SIZE, so this also bounds
-                        // the allocation; the check below is a hard backstop.
-                        if body.len() >= want_usize {
+                        // For a non-drainable response (Range-ignoring 200, or a 206 lacking a bounded
+                        // Content-Length), stop once the requested window is satisfied and drop the
+                        // rest of the connection — a 200 streams the WHOLE multi-GB object from byte 0,
+                        // so we must read only `want` bytes (mirrors `probe::read_body`). A drainable
+                        // 206 instead falls through to `Ok(None)` (its body == Content-Length <= want),
+                        // so the socket is released to the keep-alive pool. `want` <= MAX_FETCH_SIZE, so
+                        // this also bounds the allocation; the check below is a hard backstop.
+                        if !drainable && body.len() >= want_usize {
                             body.truncate(want_usize);
                             break;
                         }
@@ -759,6 +797,7 @@ mod tests {
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
+            first_read_bytes: BUFFER_SIZE as u64,
         };
     }
 
@@ -1072,6 +1111,7 @@ mod provider_abstraction_tests {
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
+            first_read_bytes: BUFFER_SIZE as u64,
         };
         assert_eq!(f.locator.file_id, 3);
     }
@@ -1121,6 +1161,7 @@ mod provider_abstraction_tests {
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
+            first_read_bytes: BUFFER_SIZE as u64,
         };
 
         // The 200 carries the file from offset 0, not from 500 — serving it would hand the
@@ -1178,6 +1219,7 @@ mod provider_abstraction_tests {
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
+            first_read_bytes: BUFFER_SIZE as u64,
         }
     }
 
@@ -1312,6 +1354,7 @@ mod provider_abstraction_tests {
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
+            first_read_bytes: BUFFER_SIZE as u64,
         };
         (f, counter)
     }
@@ -1513,6 +1556,7 @@ mod provider_abstraction_tests {
             vfs_path: String::new(),
             modified_time: ts,
             confirmed_read: false,
+            first_read_bytes: BUFFER_SIZE as u64,
         };
         let md = f.metadata().await.unwrap();
         assert_eq!(
@@ -1549,6 +1593,7 @@ mod provider_abstraction_tests {
             vfs_path: "Movies/X/x.mkv".into(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
+            first_read_bytes: BUFFER_SIZE as u64,
         };
         // The CDN fetch will fail (unroutable URL), but the stamp happens before the fetch.
         let _ = f.read_bytes(4).await;
@@ -1614,6 +1659,7 @@ mod provider_abstraction_tests {
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
+            first_read_bytes: BUFFER_SIZE as u64,
         };
 
         let url = f
@@ -1683,6 +1729,7 @@ mod provider_abstraction_tests {
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
+            first_read_bytes: BUFFER_SIZE as u64,
         };
 
         // The read still fails (the repaired CDN also 500s), but repair must have been attempted —
@@ -1721,6 +1768,7 @@ mod provider_abstraction_tests {
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
+            first_read_bytes: BUFFER_SIZE as u64,
         };
         let data = f
             .fetch_bytes(4)
@@ -1771,6 +1819,7 @@ mod provider_abstraction_tests {
             vfs_path: "Movies/X/x.mkv".to_string(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
+            first_read_bytes: BUFFER_SIZE as u64,
         };
         assert!(
             f.read_bytes(4).await.is_err(),
@@ -1822,5 +1871,145 @@ mod provider_abstraction_tests {
             f.seek(SeekFrom::End(-100_000)).await.is_err(),
             "an End seek before byte 0 must error, not underflow"
         );
+    }
+
+    // --- Option A: keep-alive connection reuse + larger first read-ahead window ---
+
+    /// A keep-alive HTTP/1.1 server that answers each ranged GET with a compliant `206` (correct
+    /// `Content-Range`/`Content-Length` and exactly the requested bytes), serving MULTIPLE requests
+    /// on the SAME connection. Records every accepted TCP connection (to prove reuse) and every
+    /// requested `(start, end)` range (to prove window sizing).
+    #[allow(clippy::type_complexity)]
+    async fn spawn_keepalive_206(
+        total: u64,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let ranges: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let (c2, r2) = (conns.clone(), ranges.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                c2.fetch_add(1, Ordering::SeqCst);
+                let r3 = r2.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let (start, end) = req
+                            .lines()
+                            .find_map(|l| {
+                                let v = l.trim();
+                                let v = v
+                                    .strip_prefix("Range:")
+                                    .or_else(|| v.strip_prefix("range:"))?
+                                    .trim()
+                                    .strip_prefix("bytes=")?;
+                                let mut it = v.split('-');
+                                let s: u64 = it.next()?.trim().parse().ok()?;
+                                let e: u64 = it.next()?.trim().parse().ok()?;
+                                Some((s, e))
+                            })
+                            .unwrap_or((0, 0));
+                        r3.lock().unwrap().push((start, end));
+                        let len = end - start + 1;
+                        let head = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                            start, end, total, len
+                        );
+                        if sock.write_all(head.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        if sock.write_all(&vec![b'A'; len as usize]).await.is_err() {
+                            break;
+                        }
+                        let _ = sock.flush().await;
+                    }
+                });
+            }
+        });
+        (format!("http://{}/", addr), conns, ranges)
+    }
+
+    #[tokio::test]
+    async fn bounded_206_reuses_pooled_connection_across_windows() {
+        use std::sync::atomic::Ordering;
+        // A 100 MB virtual file; two sequential 2 MB window fetches at different offsets.
+        let total = 100 * 1024 * 1024u64;
+        let (url, conns, _ranges) = spawn_keepalive_206(total).await;
+        let mut f = proxied_for(url, 0, total);
+
+        let a = f
+            .fetch_cdn_range(0, BUFFER_SIZE as u64 - 1)
+            .await
+            .expect("first window");
+        assert_eq!(a.len(), BUFFER_SIZE);
+        let b = f
+            .fetch_cdn_range(BUFFER_SIZE as u64, 2 * BUFFER_SIZE as u64 - 1)
+            .await
+            .expect("second window");
+        assert_eq!(b.len(), BUFFER_SIZE);
+
+        // The bounded-206 drain reads each body to its natural end, so reqwest returns the socket to
+        // the keep-alive pool and the second window reuses it. WITHOUT the drain fix the first fetch
+        // would break mid-body, close the connection, and force a second TCP+TLS handshake → 2 conns.
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            1,
+            "second window must reuse the pooled connection, not re-handshake"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_read_uses_larger_window_then_buffer_size() {
+        let total = 100 * 1024 * 1024u64;
+        let (url, _conns, ranges) = spawn_keepalive_206(total).await;
+        let mut f = proxied_for(url, 0, total);
+        f.first_read_bytes = 8 * 1024 * 1024; // simulate CDN_FIRST_READ_MB=8
+
+        // Cold first read (buffer empty) → one 8 MB window.
+        let _ = f.fetch_bytes(8).await.expect("cold read");
+        // Advance past the 8 MB buffer to force a warm-miss fetch.
+        f.pos = 8 * 1024 * 1024;
+        let _ = f.fetch_bytes(8).await.expect("warm-miss read");
+
+        let r = ranges.lock().unwrap().clone();
+        assert_eq!(r.len(), 2, "exactly two CDN fetches, got {r:?}");
+        assert_eq!(
+            r[0],
+            (0, 8 * 1024 * 1024 - 1),
+            "cold first read must use the larger first_read_bytes (8 MB) window"
+        );
+        assert_eq!(
+            r[1].1 - r[1].0 + 1,
+            BUFFER_SIZE as u64,
+            "subsequent reads must fall back to the BUFFER_SIZE window"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_first_read_is_buffer_size() {
+        // With the default field value (no enlargement), the cold first read uses BUFFER_SIZE — so a
+        // deployment that doesn't set CDN_FIRST_READ_MB behaves exactly as before.
+        let total = 100 * 1024 * 1024u64;
+        let (url, _conns, ranges) = spawn_keepalive_206(total).await;
+        let mut f = proxied_for(url, 0, total); // proxied_for defaults first_read_bytes = BUFFER_SIZE
+        let _ = f.fetch_bytes(8).await.expect("cold read");
+        let r = ranges.lock().unwrap().clone();
+        assert_eq!(r[0], (0, BUFFER_SIZE as u64 - 1));
     }
 }

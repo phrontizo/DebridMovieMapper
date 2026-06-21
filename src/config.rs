@@ -501,6 +501,46 @@ pub struct Config {
     /// finish-removal candidates (a preview) without removing. Set `REMOVE_FINISHED_SHOWS=true` to
     /// enable removal once the logged candidates have been reviewed.
     pub remove_finished_shows: bool,
+    /// Size (bytes) of the FIRST read-ahead fetch when a media file is opened — front-loads the
+    /// container header + early index so a player's open/ffprobe burst needs fewer cold CDN
+    /// round-trips before playback. Subsequent reads use the normal `BUFFER_SIZE` (2 MB) window.
+    /// From `CDN_FIRST_READ_MB` (default 8, clamped 2–16 MB; 2 = no enlargement).
+    pub cdn_first_read_bytes: u64,
+}
+
+/// Default first-read window in MB (used when `CDN_FIRST_READ_MB` is unset/invalid).
+const CDN_FIRST_READ_MB_DEFAULT: u64 = 8;
+/// Lower bound = the normal read-ahead window (2 MB); upper bound = the per-fetch cap (16 MB), which
+/// mirror `dav_fs::BUFFER_SIZE` / `MAX_FETCH_SIZE`.
+const CDN_FIRST_READ_MB_MIN: u64 = 2;
+const CDN_FIRST_READ_MB_MAX: u64 = 16;
+
+// Compile-time invariants: the knob's lower bound must equal the normal read-ahead window so a
+// configured value can never undercut it, the default must sit within [min, max], and the upper
+// bound must not exceed the per-fetch cap. A future change to `dav_fs::BUFFER_SIZE` that broke the
+// first of these would fail the build here rather than silently mis-sizing the first read.
+const _: () = assert!(CDN_FIRST_READ_MB_MIN * 1024 * 1024 == crate::dav_fs::BUFFER_SIZE as u64);
+const _: () = assert!(CDN_FIRST_READ_MB_MAX == 16);
+const _: () = assert!(
+    CDN_FIRST_READ_MB_DEFAULT >= CDN_FIRST_READ_MB_MIN
+        && CDN_FIRST_READ_MB_DEFAULT <= CDN_FIRST_READ_MB_MAX
+);
+
+/// Parse `CDN_FIRST_READ_MB` (whole MB) into a byte count, clamped to [2, 16] MB. Unset/blank/invalid
+/// → the 8 MB default. Standalone + pure so the parse/clamp is unit-testable without the environment.
+fn parse_cdn_first_read_bytes(raw: Option<String>) -> u64 {
+    let mb = match raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
+            warn!(
+                "Invalid CDN_FIRST_READ_MB value '{}', falling back to {}",
+                s, CDN_FIRST_READ_MB_DEFAULT
+            );
+            CDN_FIRST_READ_MB_DEFAULT
+        }),
+        None => CDN_FIRST_READ_MB_DEFAULT,
+    }
+    .clamp(CDN_FIRST_READ_MB_MIN, CDN_FIRST_READ_MB_MAX);
+    mb * 1024 * 1024
 }
 
 // Manual Debug redacts the provider token and TMDB API key so a `debug!("{config:?}")` (or a panic
@@ -520,6 +560,7 @@ impl std::fmt::Debug for Config {
             .field("upgrade", &self.upgrade)
             .field("dedup_remove_duplicates", &self.dedup_remove_duplicates)
             .field("remove_finished_shows", &self.remove_finished_shows)
+            .field("cdn_first_read_bytes", &self.cdn_first_read_bytes)
             .finish()
     }
 }
@@ -538,6 +579,8 @@ impl Config {
         cfg.acquisition = AcquisitionConfig::from_env();
         cfg.trakt = TraktConfig::from_env();
         cfg.upgrade = UpgradeConfig::from_env();
+        cfg.cdn_first_read_bytes =
+            parse_cdn_first_read_bytes(std::env::var("CDN_FIRST_READ_MB").ok());
         cfg.apply_household_flags(|name| std::env::var(name).ok());
         Ok(cfg)
     }
@@ -624,6 +667,9 @@ impl Config {
             upgrade: UpgradeConfig::default(),
             dedup_remove_duplicates: false,
             remove_finished_shows: false,
+            // Default window; `from_env` overrides from `CDN_FIRST_READ_MB`. (Not a `from_parts`
+            // parameter — it's a perf knob, not part of the core provider/port/db wiring.)
+            cdn_first_read_bytes: CDN_FIRST_READ_MB_DEFAULT * 1024 * 1024,
         })
     }
 }
@@ -1195,5 +1241,44 @@ mod tests {
     fn config_from_parts_has_upgrade_default() {
         let c = parts(Some("rd"), None, Some("tmdb"), None, None, None).unwrap();
         assert_eq!(c.upgrade.interval_secs, 86_400);
+    }
+
+    #[test]
+    fn config_from_parts_has_cdn_first_read_default() {
+        let c = parts(Some("rd"), None, Some("tmdb"), None, None, None).unwrap();
+        assert_eq!(c.cdn_first_read_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn cdn_first_read_parses_clamps_and_defaults() {
+        let mb = |n: u64| n * 1024 * 1024;
+        // Unset / blank / non-numeric → 8 MB default.
+        assert_eq!(parse_cdn_first_read_bytes(None), mb(8));
+        assert_eq!(parse_cdn_first_read_bytes(Some("   ".into())), mb(8));
+        assert_eq!(parse_cdn_first_read_bytes(Some("garbage".into())), mb(8));
+        // Valid value, with surrounding whitespace, in bytes.
+        assert_eq!(parse_cdn_first_read_bytes(Some(" 12 ".into())), mb(12));
+        // Clamped to [2, 16] MB.
+        assert_eq!(parse_cdn_first_read_bytes(Some("0".into())), mb(2));
+        assert_eq!(parse_cdn_first_read_bytes(Some("1".into())), mb(2));
+        assert_eq!(parse_cdn_first_read_bytes(Some("999".into())), mb(16));
+    }
+
+    #[test]
+    fn config_debug_redacts_secrets_still() {
+        // Adding the cdn field must not regress secret redaction.
+        let c = parts(
+            Some("rd-secret-xyz"),
+            None,
+            Some("tmdb-secret-xyz"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let s = format!("{c:?}");
+        assert!(!s.contains("rd-secret-xyz"));
+        assert!(!s.contains("tmdb-secret-xyz"));
+        assert!(s.contains("cdn_first_read_bytes"));
     }
 }
