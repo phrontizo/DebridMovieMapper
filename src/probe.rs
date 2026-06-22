@@ -569,7 +569,12 @@ fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, 
 /// Read a box header at `pos`: returns (box_type, payload_start, box_end).
 fn read_box_header(buf: &[u8], pos: usize) -> Result<([u8; 4], usize, usize), ProbeError> {
     if pos + 8 > buf.len() {
-        return Err(ProbeError::TracksNotFound);
+        // The 8-byte box header straddles the fetched-buffer boundary: an under-fetch (truncated
+        // ranged read), not a broken structure or "no tracks" → defer + retry (Transient), matching
+        // the 64-bit-largesize guard below and this file's truncation→Transient convention. All
+        // current callers gate their loops on `pos + 8 <= len`, so this is defensive; if a future
+        // caller drops that guard, a truncated read must NOT be mis-accepted as TracksNotFound.
+        return Err(ProbeError::Transient);
     }
     let size32 = u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
     let typ = [buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]];
@@ -1167,6 +1172,17 @@ mod tests {
         buf[0..4].copy_from_slice(&1u32.to_be_bytes());
         buf[4..8].copy_from_slice(b"moov");
         assert_eq!(read_box_header(&buf, 0), Err(ProbeError::Transient));
+    }
+    #[test]
+    fn read_box_header_truncated_8byte_header_is_transient() {
+        // Fewer than the 8 bytes of a basic box header were fetched: an under-fetch, which must
+        // defer (Transient), NOT accept-as-TracksNotFound (which would wrongly pass a truncated
+        // read instead of retrying). Mirrors the largesize-truncation classification above.
+        let buf = vec![0u8; 4];
+        assert_eq!(read_box_header(&buf, 0), Err(ProbeError::Transient));
+        // A header that starts mid-buffer and straddles the end is likewise an under-fetch.
+        let buf = vec![0u8; 10];
+        assert_eq!(read_box_header(&buf, 6), Err(ProbeError::Transient));
     }
     #[test]
     fn mp4_tracks_front_moov() {

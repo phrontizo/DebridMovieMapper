@@ -100,11 +100,20 @@ fn healthcheck(port: u16) -> bool {
     {
         return false;
     }
+    // Read until we have at least the 5-byte "HTTP/" status-line prefix. A single read() can
+    // deliver fewer bytes than were sent, so requiring the prefix in the FIRST chunk could mark a
+    // healthy server unhealthy on a short read (→ a spurious container restart). The read timeout
+    // set above bounds the loop; an error/timeout or EOF-before-5-bytes reports unhealthy.
     let mut buf = [0u8; 64];
-    match stream.read(&mut buf) {
-        Ok(n) => buf[..n].starts_with(b"HTTP/"),
-        Err(_) => false,
+    let mut filled = 0;
+    while filled < 5 {
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => break, // EOF before the status line → not a live HTTP responder
+            Ok(n) => filled += n,
+            Err(_) => return false, // timeout / connection error
+        }
     }
+    buf[..filled].starts_with(b"HTTP/")
 }
 
 #[tokio::main]

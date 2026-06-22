@@ -430,19 +430,36 @@ impl DebridVfs {
                     // directory, skip it to avoid creating (1)/(2) duplicates from repair replacements.
                     // SP3: per-episode selection overrides for this show (slot -> entry).
                     let show_tmdb = tmdb_id_of(&metadata);
-                    // The (hash, file_path) pairs actually emittable in this show's group. A
-                    // selection naming a pair that isn't present — an absent hash, OR a present
-                    // hash whose file was re-listed under a different path — is stale and must NOT
-                    // hide the episode (self-healing → falls back to the legacy first/largest dedup
-                    // so the episode still appears). Computed BEFORE the loop below moves `torrents`.
+                    // The (hash, file_path) pairs actually EMITTABLE in this show's group. A
+                    // selection naming a pair that isn't emittable — an absent hash, a present hash
+                    // whose file was re-listed under a different path, OR a selected file with no
+                    // positional link (RD's `selected != links` anomaly, see the warn below) — is
+                    // stale/unservable and must NOT hide the episode (self-healing → falls back to
+                    // the legacy first/largest dedup so the episode still appears). The link check
+                    // MUST mirror the emit loop's `link_idx` accounting below exactly: `link_idx`
+                    // advances once per SELECTED file (video or not), and a video file is emittable
+                    // only when `links` is empty (TorBox) or has a link at its position — otherwise
+                    // present_files would mark a file "present" that the emit loop then refuses to
+                    // emit, suppressing every other torrent's copy and vanishing the episode.
+                    // Computed BEFORE the loop below moves `torrents`.
                     let present_files: std::collections::HashSet<(String, String)> = torrents
                         .iter()
                         .flat_map(|t| {
                             let h = t.hash.to_ascii_lowercase();
-                            t.files
-                                .iter()
-                                .filter(|f| f.selected == 1 && is_video_file(&f.path))
-                                .map(move |f| (h.clone(), f.path.clone()))
+                            let links_empty = t.links.is_empty();
+                            let mut link_idx = 0usize;
+                            let mut out: Vec<(String, String)> = Vec::new();
+                            for f in &t.files {
+                                if f.selected == 1 {
+                                    if is_video_file(&f.path)
+                                        && (links_empty || t.links.get(link_idx).is_some())
+                                    {
+                                        out.push((h.clone(), f.path.clone()));
+                                    }
+                                    link_idx += 1;
+                                }
+                            }
+                            out
                         })
                         .collect();
                     for torrent in torrents {
@@ -3778,6 +3795,83 @@ mod selection_tests {
         assert!(
             found,
             "a selection with a present hash but mismatched file_path must not hide the episode"
+        );
+    }
+
+    #[test]
+    fn episode_selection_pointing_at_a_linkless_file_degrades_to_legacy_dedup() {
+        // RD's `selected != links` anomaly: torrent A has TWO selected videos but only ONE link, so
+        // its S01E02 (link_idx 1) has NO positional link and is NOT emittable. A managed selection
+        // points S01E02 at that non-emittable copy; torrent B holds an emittable S01E02. The episode
+        // must NOT vanish — because A's S01E02 isn't emittable it must not count as "present", so the
+        // gate degrades to legacy dedup and B's copy is emitted. (Before the fix, present_files
+        // included the link-less file, the gate suppressed B's copy, and S01E02 disappeared.)
+        let a = TorrentInfo {
+            id: "ta".into(),
+            hash: "h_sel".into(),
+            bytes: 2_000_000_000,
+            status: "downloaded".into(),
+            files: vec![
+                TorrentFile {
+                    id: 0,
+                    path: "Show.S01E01.1080p.mkv".into(),
+                    bytes: 1_000_000_000,
+                    selected: 1,
+                },
+                TorrentFile {
+                    id: 1,
+                    path: "Show.S01E02.1080p.mkv".into(),
+                    bytes: 1_000_000_000,
+                    selected: 1,
+                },
+            ],
+            links: vec!["https://cdn/e1".into()], // ONE link for TWO selected files (the anomaly)
+            ..Default::default()
+        };
+        let b = TorrentInfo {
+            id: "tb".into(),
+            hash: "h_alt".into(),
+            bytes: 1_000_000_000,
+            status: "downloaded".into(),
+            files: vec![TorrentFile {
+                id: 0,
+                path: "Show.S01E02.1080p.mkv".into(),
+                bytes: 1_000_000_000,
+                selected: 1,
+            }],
+            links: vec!["https://cdn/e2_alt".into()],
+            ..Default::default()
+        };
+        let mut sel = SelectionMap::new();
+        sel.insert(
+            episode_slot(1396, 1, 2),
+            SelectionEntry {
+                hash: "h_sel".into(),
+                file_path: "Show.S01E02.1080p.mkv".into(),
+            },
+        );
+        let vfs = DebridVfs::build(vec![(a, show_meta(1396)), (b, show_meta(1396))], &sel);
+        // Season 01 must hold BOTH episodes: S01E01 (from A, emittable) and S01E02 (self-healed to
+        // B, since A's copy is link-less). Before the fix only S01E01 survived.
+        let mut media_count = 0;
+        if let VfsNode::Directory { children } = &vfs.root {
+            if let Some(VfsNode::Directory { children: shows }) = children.get("Shows") {
+                for show in shows.values() {
+                    if let VfsNode::Directory { children: seasons } = show {
+                        if let Some(VfsNode::Directory { children: eps }) = seasons.get("Season 01")
+                        {
+                            media_count = eps
+                                .values()
+                                .filter(|n| matches!(n, VfsNode::MediaFile { .. }))
+                                .count();
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            media_count, 2,
+            "S01E02 must be self-healed to the emittable copy, not vanished (got {media_count})"
         );
     }
 

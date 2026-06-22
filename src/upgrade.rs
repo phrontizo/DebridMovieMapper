@@ -138,6 +138,32 @@ async fn best_owned_quality(app: &AppState, owned_hashes: &[String]) -> Option<Q
     best
 }
 
+/// The IMDB id to scrape a group with: prefer ANY owned copy that actually carries a non-empty
+/// IMDB id (Torrentio is IMDB-keyed) over only the lexicographically-first representative — in a
+/// mixed group the representative can be an empty-imdb account-mirror record, which would otherwise
+/// permanently exclude an otherwise-upgradeable title. `None` only when NO owned copy has an id.
+async fn group_imdb_id(app: &AppState, owned_hashes: &[String]) -> Option<String> {
+    for h in owned_hashes {
+        if let Some(rec) = app.store.get_owned(h.clone()).await {
+            if !rec.request.imdb_id.is_empty() {
+                return Some(rec.request.imdb_id);
+            }
+        }
+    }
+    None
+}
+
+/// The owned record to use for a show group's scrape/stage metadata: prefer one with a non-empty
+/// IMDB id (same reasoning as [`group_imdb_id`] — a mixed group's first record may be an empty-imdb
+/// mirror), falling back to the first record so the no-imdb skip below still triggers cleanly.
+fn scrape_sample(owned: &[(String, OwnedRecord)]) -> Option<OwnedRecord> {
+    owned
+        .iter()
+        .find(|(_, r)| !r.request.imdb_id.is_empty())
+        .or_else(|| owned.first())
+        .map(|(_, r)| r.clone())
+}
+
 /// Stage + (idle-gated) swap a single movie title. Returns Err(reason) on a non-fatal skip.
 async fn try_upgrade_movie(
     app: &AppState,
@@ -162,19 +188,27 @@ async fn try_upgrade_movie(
             "current quality unknown/mixed; not upgrading (avoids regression)".into(),
         ));
     };
-    // Torrentio is IMDB-keyed: a mirror record whose IMDB id never resolved (stored empty) can't be
+    // Torrentio is IMDB-keyed: a record whose IMDB id never resolved (stored empty) can't be
     // scraped, so skip before the network call rather than issuing a fruitless empty-key request
-    // every budgeted tick (mirrors `build_acquire_request`'s skip on the acquisition path).
-    if owned_rec.request.imdb_id.is_empty() {
+    // every budgeted tick (mirrors `build_acquire_request`'s skip on the acquisition path). Resolve
+    // the id from ANY owned copy in the group, not just the representative — a mixed group whose
+    // representative is an empty-imdb mirror must still be upgradeable via an engine copy's id.
+    let Some(imdb_id) = group_imdb_id(app, owned_hashes).await else {
         return Err(UpgradeSkip::NoChange(
-            "no imdb id; cannot scrape for upgrade".into(),
+            "no imdb id in any owned copy; cannot scrape for upgrade".into(),
         ));
-    }
+    };
+    // Scrape/stage with the representative's metadata but the group-resolved IMDB id, so the staged
+    // record carries a usable id even when the representative didn't.
+    let req = crate::store::AcquireRequest {
+        imdb_id: imdb_id.clone(),
+        ..owned_rec.request.clone()
+    };
     // 2. Scrape fresh candidates for this title, then pick the best cached meaningful upgrade not
     //    already owned/blacklisted. A scrape failure is transient → Deferred (retry next tick).
     let raws = app
         .scraper
-        .find(&owned_rec.request.imdb_id, MediaKind::Movie, None, None)
+        .find(&req.imdb_id, MediaKind::Movie, None, None)
         .await
         .map_err(|e| UpgradeSkip::Deferred(format!("scrape failed: {e}")))?;
     let mut best: Option<(release::ReleaseInfo, QualitySummary)> = None;
@@ -229,7 +263,7 @@ async fn try_upgrade_movie(
     //    leaves the current release untouched). Returns (hash, torrent_id, selected_file_path).
     //    stage_and_verify classifies its own outcome: a transient provider/probe glitch → Deferred
     //    (retry next tick), a candidate-specific failure (not cached / wrong title / pack) → NoChange.
-    let staged = stage_and_verify(app, tmdb_id, &owned_rec.request, &cand).await?;
+    let staged = stage_and_verify(app, tmdb_id, &req, &cand).await?;
 
     // Fetch the provider listing for the prune ONCE, and BEFORE the idle re-check below, so there is
     // NO network round-trip between the idle confirmation and the destructive prune — a read
@@ -637,13 +671,14 @@ async fn try_consolidate_show(
             owned.push((h.clone(), r));
         }
     }
-    // A representative request (for imdb id + metadata) — any owned record works.
-    let Some((_, sample)) = owned.first().cloned() else {
+    // A representative request (for imdb id + metadata): prefer an owned record that actually has a
+    // non-empty IMDB id (a mixed group's first record may be an empty-imdb mirror — see scrape_sample).
+    let Some(sample) = scrape_sample(&owned) else {
         return Err(UpgradeSkip::NoChange("no owned records".into()));
     };
-    // Torrentio is IMDB-keyed: a mirror show whose IMDB id never resolved can't be scraped for a
-    // consolidation pack, so skip before the TMDB aired-episode lookup + per-season scrapes rather
-    // than issuing fruitless empty-key requests each tick.
+    // Torrentio is IMDB-keyed: a show whose IMDB id never resolved in ANY owned copy can't be
+    // scraped for a consolidation pack, so skip before the TMDB aired-episode lookup + per-season
+    // scrapes rather than issuing fruitless empty-key requests each tick.
     if sample.request.imdb_id.is_empty() {
         return Err(UpgradeSkip::NoChange(
             "no imdb id; cannot scrape for consolidation".into(),
@@ -672,8 +707,9 @@ async fn consolidate_show_seasons(
     aired: &[(u32, u32)],
     idle_window: Duration,
 ) -> Result<(), UpgradeSkip> {
-    // A representative request (for imdb id + metadata) — any owned record works.
-    let Some((_, sample)) = owned.first().cloned() else {
+    // A representative request (for imdb id + metadata): prefer an owned record that actually has a
+    // non-empty IMDB id (a mixed group's first record may be an empty-imdb mirror — see scrape_sample).
+    let Some(sample) = scrape_sample(owned) else {
         return Err(UpgradeSkip::NoChange("no owned records".into()));
     };
 
@@ -1278,6 +1314,163 @@ mod tests {
             deleted.lock().unwrap().contains(&"told".to_string()),
             "old torrent deleted from provider"
         );
+    }
+
+    #[tokio::test]
+    async fn movie_upgrade_uses_imdb_from_any_group_record_not_just_representative() {
+        // Mixed group: the lexicographically-FIRST hash ("amirror") is an account-mirror record
+        // with an EMPTY imdb id (its id never resolved); a later hash ("zengine") carries the real
+        // id. The representative used to gate upgrade eligibility is the first hash, so the old code
+        // skipped the whole title ("no imdb id") and it was PERMANENTLY un-upgradeable. The fix
+        // resolves the scrape id from ANY owned copy, so the upgrade proceeds.
+        let store = mem_store();
+        let web_q = || {
+            Some(QualitySummary {
+                cached: true,
+                source_tier: 3_000,
+                resolution: 1080,
+                score: 10,
+            })
+        };
+        store
+            .put_owned(
+                "amirror".into(),
+                OwnedRecord {
+                    request: AcquireRequest {
+                        imdb_id: "".into(), // mirror record: id never resolved
+                        ..movie_req()
+                    },
+                    provenance: Provenance { entries: vec![] }, // empty provenance = account mirror
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: web_q(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "zengine".into(),
+                OwnedRecord {
+                    request: movie_req(), // imdb_id "tt1"
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: web_q(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "amirror".into(),
+                    file_path: "old.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![remux_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "tmir".into(),
+                    hash: "amirror".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "teng".into(),
+                    hash: "zengine".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tnew".into(),
+                    hash: "hnew".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tnew".into(),
+                hash: "hnew".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "M.2020.1080p.REMUX.mkv".into(),
+                    bytes: 30_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/new".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        run_upgrade_once(&app).await;
+
+        let sel = store.get_selection(movie_slot(27205)).await.unwrap();
+        assert_eq!(
+            sel.hash, "hnew",
+            "upgrade proceeds using the imdb id from a non-representative owned copy"
+        );
+        assert!(
+            store.get_owned("hnew".into()).await.is_some(),
+            "staged release is recorded owned"
+        );
+        assert_eq!(
+            store
+                .get_owned("hnew".into())
+                .await
+                .unwrap()
+                .request
+                .imdb_id,
+            "tt1",
+            "staged record carries the group-resolved imdb id"
+        );
+    }
+
+    #[test]
+    fn scrape_sample_prefers_a_record_with_an_imdb_id() {
+        let with_id = |hash: &str, imdb: &str| {
+            (
+                hash.to_string(),
+                OwnedRecord {
+                    request: AcquireRequest {
+                        imdb_id: imdb.into(),
+                        ..movie_req()
+                    },
+                    provenance: Provenance { entries: vec![] },
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                },
+            )
+        };
+        // First record has no id; a later one does → that later one is chosen.
+        let owned = vec![with_id("a", ""), with_id("z", "tt7")];
+        assert_eq!(scrape_sample(&owned).unwrap().request.imdb_id, "tt7");
+        // None have an id → falls back to the first (so the no-imdb skip still fires cleanly).
+        let owned = vec![with_id("a", ""), with_id("z", "")];
+        assert_eq!(scrape_sample(&owned).unwrap().request.imdb_id, "");
+        // Empty group → None.
+        assert!(scrape_sample(&[]).is_none());
     }
 
     #[tokio::test]

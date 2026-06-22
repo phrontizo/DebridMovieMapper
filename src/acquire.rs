@@ -601,32 +601,93 @@ impl AcquisitionEngine {
         info: &TorrentInfo,
         selected_path: &str,
     ) {
-        // Per-kind: write the selection slot(s) and, for a series, compute the SE-mapped episode set
-        // to persist as `provides` (the season-pack churn fix).
-        let provides_update: Option<Vec<(u32, u32)>> = match req.kind {
-            MediaKind::Movie => {
-                if let Some(id) = crate::vfs::tmdb_id_of(&req.metadata) {
-                    let _ = self
-                        .store
-                        .put_selection(
-                            crate::store::movie_slot(id),
-                            crate::store::SelectionEntry {
-                                hash: hash.to_string(),
-                                file_path: selected_path.to_string(),
-                            },
-                        )
-                        .await;
+        // Compute the SE-mapped episode set for a series (this hash's `provides` — the season-pack
+        // churn fix); a movie supplies none.
+        let eps: Vec<(u32, u32, String)> = match req.kind {
+            MediaKind::Movie => Vec::new(),
+            MediaKind::Series => episode_files(info),
+        };
+
+        // Single read-modify-write FIRST so status (+ series `provides`) and the cached-quality
+        // refresh commit together with no intermediate window — AND so the slot-overwrite gate below
+        // sees this hash's REFRESHED quality. CRITICAL: a torrent reaching this point is `downloaded`
+        // (present on the provider), so it IS cached — refresh the acquire-time `quality` snapshot
+        // (an UNCACHED candidate recorded `cached: false`) via `mark_cached`, else the upgrade
+        // engine's "`!current.cached` → any cached candidate is an upgrade" rule would later replace
+        // this working copy with a LOWER-quality cached release and delete it.
+        let new_quality: Option<crate::release::QualitySummary> =
+            if let Some(mut rec) = self.store.get_owned(hash.to_string()).await {
+                rec.status = OwnedStatus::Verified;
+                if req.kind == MediaKind::Series {
+                    rec.provides = eps.iter().map(|(s, e, _)| (*s, *e)).collect();
                 }
+                if let Some(q) = rec.quality.as_mut() {
+                    q.mark_cached();
+                }
+                let q = rec.quality.clone();
+                let _ = self.store.put_owned(hash.to_string(), rec).await;
+                q
+            } else {
+                // Record vanished (e.g. concurrently removed) — best-effort status set; treat its
+                // quality as unknown so the gate below won't clobber an established slot.
+                let _ = self
+                    .store
+                    .set_owned_status(hash.to_string(), OwnedStatus::Verified)
+                    .await;
                 None
+            };
+
+        // Write the selection slot(s). For a MOVIE the acquire path is authoritative for the single
+        // title slot (re-acquire repoints to the fresh copy), so write unconditionally. For a SERIES
+        // pack, DON'T let a (possibly lower-quality) pack STEAL a sibling-episode slot that already
+        // points at a different, BETTER single release — that would serve a worse file and let the
+        // dedup set-cover delete the better copy. `provides` (set above) already covers the whole
+        // pack regardless of which slots we (re)point, so re-acquire churn is unaffected.
+        let Some(id) = crate::vfs::tmdb_id_of(&req.metadata) else {
+            return;
+        };
+        match req.kind {
+            MediaKind::Movie => {
+                let _ = self
+                    .store
+                    .put_selection(
+                        crate::store::movie_slot(id),
+                        crate::store::SelectionEntry {
+                            hash: hash.to_string(),
+                            file_path: selected_path.to_string(),
+                        },
+                    )
+                    .await;
             }
             MediaKind::Series => {
-                let eps = episode_files(info);
-                if let Some(id) = crate::vfs::tmdb_id_of(&req.metadata) {
-                    for (s, e, path) in &eps {
+                for (s, e, path) in &eps {
+                    let slot = crate::store::episode_slot(id, *s, *e);
+                    let overwrite = match self.store.get_selection(slot.clone()).await {
+                        // Empty slot → take it.
+                        None => true,
+                        // Already ours → idempotent re-point (e.g. file_path refresh).
+                        Some(existing) if existing.hash.eq_ignore_ascii_case(hash) => true,
+                        Some(existing) => match self.store.get_owned(existing.hash.clone()).await {
+                            // The slot points at a release we no longer own (stale) → repoint to
+                            // this present pack, which supplies the episode.
+                            None => true,
+                            // A different, still-owned release holds this episode: overwrite only
+                            // when this pack is NOT a downgrade. Unknown quality on either side is a
+                            // conservative keep (can't prove it isn't a regression).
+                            Some(old) => match (
+                                new_quality.as_ref().map(|q| q.score),
+                                old.quality.as_ref().map(|q| q.score),
+                            ) {
+                                (Some(n), Some(x)) => n >= x,
+                                _ => false,
+                            },
+                        },
+                    };
+                    if overwrite {
                         let _ = self
                             .store
                             .put_selection(
-                                crate::store::episode_slot(id, *s, *e),
+                                slot,
                                 crate::store::SelectionEntry {
                                     hash: hash.to_string(),
                                     file_path: path.clone(),
@@ -635,31 +696,7 @@ impl AcquisitionEngine {
                             .await;
                     }
                 }
-                Some(eps.iter().map(|(s, e, _)| (*s, *e)).collect())
             }
-        };
-
-        // Single read-modify-write so status (+ series `provides`) and the cached-quality refresh
-        // commit together with no intermediate window. CRITICAL: a torrent reaching this point is
-        // `downloaded` (present on the provider), so it IS cached — refresh the acquire-time
-        // `quality` snapshot (an UNCACHED candidate recorded `cached: false`) via `mark_cached`, else
-        // the upgrade engine's "`!current.cached` → any cached candidate is an upgrade" rule would
-        // later replace this working copy with a LOWER-quality cached release and delete it.
-        if let Some(mut rec) = self.store.get_owned(hash.to_string()).await {
-            rec.status = OwnedStatus::Verified;
-            if let Some(eps) = provides_update {
-                rec.provides = eps;
-            }
-            if let Some(q) = rec.quality.as_mut() {
-                q.mark_cached();
-            }
-            let _ = self.store.put_owned(hash.to_string(), rec).await;
-        } else {
-            // Record vanished (e.g. concurrently removed) — best-effort status set.
-            let _ = self
-                .store
-                .set_owned_status(hash.to_string(), OwnedStatus::Verified)
-                .await;
         }
     }
 
@@ -791,6 +828,24 @@ impl AcquisitionEngine {
             // Ensure something is selected so it downloads (RD: nothing downloads until selected).
             let none_selected = info.files.iter().all(|f| f.selected != 1);
             if none_selected {
+                // If selection never takes effect across the whole dead-timeout window, the hash is
+                // genuinely stuck (the provider lists files but won't honour select_files for it) —
+                // reap + re-acquire rather than retrying selection forever, consistent with the
+                // !has_files / missing-selected-path branches. Checked FIRST so the give-up tick
+                // doesn't waste a select_files round-trip on a hash we're about to reap. A provider
+                // OUTAGE instead fails the get_torrent_info above and skips this branch, so this only
+                // fires on a stuck hash.
+                if now_secs().saturating_sub(rec.added_at) > self.dead_timeout.as_secs() {
+                    self.fail_and_reacquire(
+                        hash,
+                        &t.id,
+                        &rec.request,
+                        "SelectStuck",
+                        &rec.provenance,
+                    )
+                    .await;
+                    continue;
+                }
                 // No candidate hint preserved in OwnedRecord; use the kind-appropriate fallback (largest video for movies, all videos for series).
                 let ids = select_ids_for(rec.request.kind, &info);
                 debug!(
@@ -805,21 +860,6 @@ impl AcquisitionEngine {
                         .collect::<Vec<_>>()
                         .join(",");
                     let _ = self.provider.select_files(&t.id, &csv).await;
-                }
-                // If selection never takes effect across the whole dead-timeout window, the hash is
-                // genuinely stuck (the provider lists files but won't honour select_files for it) —
-                // reap + re-acquire rather than retrying selection forever, consistent with the
-                // !has_files / missing-selected-path branches. A provider OUTAGE instead fails the
-                // get_torrent_info above and skips this branch, so this only fires on a stuck hash.
-                if now_secs().saturating_sub(rec.added_at) > self.dead_timeout.as_secs() {
-                    self.fail_and_reacquire(
-                        hash,
-                        &t.id,
-                        &rec.request,
-                        "SelectStuck",
-                        &rec.provenance,
-                    )
-                    .await;
                 }
                 continue; // re-inspect next tick after selection settles
             }
@@ -2852,6 +2892,159 @@ mod tests {
                 .hash,
             "hp",
             "selection slot for S01E02 must point to hp"
+        );
+    }
+
+    // Shared setup for the pack-selection-gate tests: an E01 single ("hsingle") at `single_score`
+    // and a pending pack ("hpack", E01+E02) at `pack_score`. Runs observe and returns the store.
+    async fn run_pack_gate(single_score: i64, pack_score: i64) -> Store {
+        let st = store();
+        let base = AcquireRequest {
+            imdb_id: "tt1".into(),
+            tmdb_id: 27205,
+            kind: MediaKind::Series,
+            season: Some(1),
+            episode: Some(2),
+            original_language: Some("eng".into()),
+            metadata: MediaMetadata {
+                title: "Show".into(),
+                year: Some("2023".into()),
+                media_type: MediaType::Show,
+                external_id: Some("tmdb:27205".into()),
+            },
+        };
+        let q = |score: i64| {
+            Some(crate::release::QualitySummary {
+                cached: true,
+                source_tier: 8_000,
+                resolution: 1080,
+                score,
+            })
+        };
+        st.put_owned(
+            "hsingle".into(),
+            OwnedRecord {
+                request: AcquireRequest {
+                    episode: Some(1),
+                    ..base.clone()
+                },
+                provenance: Provenance::manual(),
+                added_at: now_secs(),
+                status: OwnedStatus::Verified,
+                provides: vec![(1, 1)],
+                quality: q(single_score),
+            },
+        )
+        .await
+        .unwrap();
+        st.put_owned(
+            "hpack".into(),
+            OwnedRecord {
+                request: base.clone(),
+                provenance: Provenance::manual(),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![(1, 2)],
+                quality: q(pack_score),
+            },
+        )
+        .await
+        .unwrap();
+        st.put_selection(
+            crate::store::episode_slot(27205, 1, 1),
+            crate::store::SelectionEntry {
+                hash: "hsingle".into(),
+                file_path: "E01.single.mkv".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_hpack".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TI {
+                id: "tid_hpack".into(),
+                hash: "hpack".into(),
+                status: "downloaded".into(),
+                files: vec![
+                    TorrentFile {
+                        id: 0,
+                        path: "Show.S01E01.mkv".into(),
+                        bytes: 1_000_000_000,
+                        selected: 1,
+                    },
+                    TorrentFile {
+                        id: 1,
+                        path: "Show.S01E02.mkv".into(),
+                        bytes: 1_000_000_000,
+                        selected: 1,
+                    },
+                ],
+                links: vec!["https://cdn/e01".into(), "https://cdn/e02".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/e01".into()),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        eng.observe(&[
+            torrent("tid_hpack", "hpack", "downloaded", 100.0),
+            torrent("tid_hsingle", "hsingle", "downloaded", 100.0),
+        ])
+        .await;
+        st
+    }
+
+    #[tokio::test]
+    async fn observe_pack_does_not_clobber_a_better_existing_episode_selection() {
+        // A LOWER-quality season pack must claim the empty E02 slot but NOT steal E01 from a better
+        // single — that would serve a worse file and let dedup delete the better copy.
+        let st = run_pack_gate(1_000_000, 100).await;
+        assert_eq!(
+            st.get_selection(crate::store::episode_slot(27205, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            "hsingle",
+            "the better E01 single must NOT be clobbered by the lower-quality pack"
+        );
+        assert_eq!(
+            st.get_selection(crate::store::episode_slot(27205, 1, 2))
+                .await
+                .unwrap()
+                .hash,
+            "hpack",
+            "the pack still claims the empty E02 slot"
+        );
+        let mut provides = st.get_owned("hpack".into()).await.unwrap().provides;
+        provides.sort();
+        assert_eq!(
+            provides,
+            vec![(1u32, 1u32), (1u32, 2u32)],
+            "provides still covers both episodes (no re-acquire churn)"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_pack_overwrites_a_worse_existing_episode_selection() {
+        // The symmetric direction: a pack that is NOT a downgrade (>= the single) DOES repoint E01,
+        // so a genuine consolidation/quality improvement still takes effect.
+        let st = run_pack_gate(100, 1_000_000).await;
+        assert_eq!(
+            st.get_selection(crate::store::episode_slot(27205, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            "hpack",
+            "a better-or-equal pack repoints E01"
         );
     }
 }

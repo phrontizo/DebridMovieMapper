@@ -353,10 +353,21 @@ pub async fn run_scan_loop(
 fn dedup_torrents_by_hash(
     torrents: &[crate::rd_client::Torrent],
 ) -> (Vec<&crate::rd_client::Torrent>, Vec<String>) {
+    let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut seen_hashes: HashMap<&str, usize> = HashMap::new();
     let mut deduped: Vec<&crate::rd_client::Torrent> = Vec::new();
     let mut duplicate_ids: Vec<String> = Vec::new();
     for torrent in torrents {
+        // The SAME physical torrent can appear twice in ONE listing — a page-boundary repeat when a
+        // paginated, newest-first listing races a concurrent add (the add shifts every entry up one,
+        // so the boundary item reappears at the next offset). A provider id is unique per torrent, so
+        // a repeated (non-empty) id is always such an artefact, never two distinct torrents. Skip the
+        // repeat entirely: it must be neither kept twice NOR marked for deletion — deleting it would
+        // remove the live torrent we already kept (data loss), and double-marking a genuine duplicate
+        // would spawn a redundant (error-logging on TorBox) second delete.
+        if !torrent.id.is_empty() && !seen_ids.insert(torrent.id.as_str()) {
+            continue;
+        }
         if torrent.status != "downloaded" || torrent.hash.is_empty() {
             deduped.push(torrent);
             continue;
@@ -639,6 +650,18 @@ pub async fn sync_trakt(
     catchup_lookback_secs: Option<u64>,
     remove_finished_shows: bool,
 ) {
+    // The owned SHOW library is one shared household library, identical for every enrolled user, so
+    // read it ONCE per sync cycle rather than re-scanning `all_owned()` inside each `sync_trakt_user`
+    // (the catch-up finish-cleanup gate only needs the set of owned show tmdb ids). A view that is at
+    // most one cycle stale is fine — finish-cleanup self-corrects next sync.
+    let owned_show_ids: std::collections::HashSet<u64> = store
+        .all_owned()
+        .await
+        .into_iter()
+        .filter(|(_, r)| matches!(r.request.kind, MediaKind::Series))
+        .map(|(_, r)| r.request.tmdb_id)
+        .collect();
+
     for (slug, tokens) in store.all_trakt_tokens().await {
         if let Err(e) = sync_trakt_user(
             trakt,
@@ -648,6 +671,7 @@ pub async fn sync_trakt(
             tokens.clone(),
             catchup_lookback_secs,
             remove_finished_shows,
+            &owned_show_ids,
         )
         .await
         {
@@ -682,6 +706,7 @@ pub async fn sync_trakt(
 /// NOTE: store-write errors (`put_wanted`/`remove_wanted`/`put_trakt_tokens`) also propagate as
 /// `Err` and therefore trigger `needs_reenrolment`; this is intentional and self-healing — the
 /// flag is cleared on the next successful sync.
+#[allow(clippy::too_many_arguments)] // shared handles + per-user state + per-cycle inputs; one caller
 async fn sync_trakt_user(
     trakt: &std::sync::Arc<dyn crate::trakt_client::TraktClient>,
     tmdb: &crate::tmdb_client::TmdbClient,
@@ -690,6 +715,7 @@ async fn sync_trakt_user(
     mut tokens: crate::store::TraktTokens,
     catchup_lookback_secs: Option<u64>,
     remove_finished_shows: bool,
+    owned_show_ids: &std::collections::HashSet<u64>,
 ) -> Result<(), crate::error::AppError> {
     use crate::store::TraktTokens;
     use crate::vfs::MediaType;
@@ -697,7 +723,28 @@ async fn sync_trakt_user(
     // Refresh if at/near expiry, persisting the fresh tokens before using them.
     let now = crate::now_unix_secs();
     if tokens.expires_at <= now + REFRESH_BUFFER_SECS {
-        let r = trakt.refresh(&tokens.refresh).await?;
+        let r = match trakt.refresh(&tokens.refresh).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Mirror `enrolment::refresh_account`: if a concurrent refresh (another `/refresh`
+                // POST, or an overlapping sync) already rotated the single-use refresh token since
+                // we snapshotted it, Trakt invalidated OUR token on that other success — so this
+                // failure is a false alarm, not a de-auth. Skip this cycle (the rotated token is used
+                // next time) rather than propagating, which would wrongly flag the healthy account
+                // for re-enrolment. A genuine refresh failure (token unchanged) still propagates, and
+                // a later READ failure still flags — the guard is scoped to the refresh cause only.
+                if let Some(stored) = store.get_trakt_tokens(slug.to_string()).await {
+                    if stored.refresh != tokens.refresh {
+                        info!(
+                            "trakt: refresh for '{}' failed on a since-rotated token (concurrent refresh) — skipping this cycle",
+                            slug
+                        );
+                        return Ok(());
+                    }
+                }
+                return Err(e);
+            }
+        };
         // Match `enrolment::refresh_account`: keep the existing refresh token if Trakt returns an
         // empty one (don't blank a still-valid token and force re-enrolment), and use
         // `saturating_add` for the expiry so a pathological `created_at + expires_in` can't overflow.
@@ -744,15 +791,9 @@ async fn sync_trakt_user(
     // no longer bloats the set or drives a fruitless reconcile each cycle. On a missing Trakt id or a
     // progress error we conservatively include the show (degrade to the old lookback-only behaviour
     // rather than silently dropping a possibly-behind title; it self-corrects next sync).
-    // The owned show library (after the account mirror, this is the user's whole library) — used to
-    // identify finished-ended shows that are owned and so candidates for finish-cleanup.
-    let owned_show_ids: std::collections::HashSet<u64> = store
-        .all_owned()
-        .await
-        .into_iter()
-        .filter(|(_, r)| matches!(r.request.kind, MediaKind::Series))
-        .map(|(_, r)| r.request.tmdb_id)
-        .collect();
+    // `owned_show_ids` (the shared household show library, used to spot finished-ended owned shows
+    // that are finish-cleanup candidates) is computed ONCE per sync cycle by the caller and passed
+    // in, rather than re-scanning `all_owned()` for every enrolled user.
 
     let catchup_cutoff: Option<i64> = catchup_lookback_secs.map(|s| now.saturating_sub(s) as i64);
     let mut behind: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -900,17 +941,26 @@ async fn sync_trakt_user(
         store.put_wanted(rec).await?;
     }
 
-    // Clear a stale re-enrolment flag now that this sync has succeeded.
+    // Clear a stale re-enrolment flag now that this sync has succeeded. RE-READ the current record
+    // and flip ONLY the flag (read-modify-write) rather than writing back the snapshot `tokens`:
+    // this branch runs only when NO refresh occurred this cycle (so `tokens` is the pre-sync
+    // snapshot), and a concurrent `/refresh`/enrolment may have rotated access/refresh during this
+    // user's read window — writing the stale snapshot back would clobber the fresh token. Also skip
+    // if the account was concurrently removed (don't resurrect it). Mirrors `enrolment::refresh_account`.
     if tokens.needs_reenrolment {
-        store
-            .put_trakt_tokens(
-                slug.to_string(),
-                TraktTokens {
-                    needs_reenrolment: false,
-                    ..tokens
-                },
-            )
-            .await?;
+        if let Some(current) = store.get_trakt_tokens(slug.to_string()).await {
+            if current.needs_reenrolment {
+                store
+                    .put_trakt_tokens(
+                        slug.to_string(),
+                        TraktTokens {
+                            needs_reenrolment: false,
+                            ..current
+                        },
+                    )
+                    .await?;
+            }
+        }
     }
 
     Ok(())
@@ -1375,10 +1425,11 @@ pub(crate) struct DedupPlan {
 ///   A show hash with **empty `provides`** (unknown coverage) is **always kept** — never removed on
 ///   a guess.
 ///
-/// Keep-priority (highest kept first): currently-served (`selected`) > higher `quality.score` (an
-/// absent summary ranks lowest) > more episodes provided > lexicographically-smallest hash
-/// (deterministic). Only groups with at least one removal are returned. Absent (not-`present`)
-/// hashes are ignored entirely — they're already gone, never a removal target or coverage source.
+/// Keep-priority (highest kept first): protected (empty-provenance mirror OR manual add) >
+/// currently-served (`selected`) > higher `quality.score` (an absent summary ranks lowest) > more
+/// episodes provided > lexicographically-smallest hash (deterministic). Only groups with at least
+/// one removal are returned. Absent (not-`present`) hashes are ignored entirely — they're already
+/// gone, never a removal target or coverage source.
 pub(crate) fn plan_dedup(
     owned: &[(String, OwnedRecord)],
     present: &std::collections::HashSet<String>,
@@ -2182,6 +2233,44 @@ mod tests {
         let kept_ids: Vec<&str> = kept.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(kept_ids, vec!["a", "c"]);
         assert_eq!(dups, vec!["b".to_string(), "d".to_string()]);
+    }
+
+    #[test]
+    fn dedup_does_not_self_delete_a_same_id_duplicate() {
+        // A paginated listing racing a concurrent add can return the SAME physical torrent twice
+        // (same id AND hash) at a page boundary. That artefact must NOT be marked for deletion —
+        // deleting it would delete the very torrent we kept (data loss). Only a DISTINCT id is a
+        // genuine duplicate (repair leak / external re-add).
+        let torrents = vec![
+            torrent("a", "H1", "downloaded"),
+            torrent("a", "H1", "downloaded"), // same id+hash → listing artefact, NOT a real dup
+            torrent("b", "H1", "downloaded"), // distinct id → genuine duplicate of a
+        ];
+        let (kept, dups) = dedup_torrents_by_hash(&torrents);
+        let kept_ids: Vec<&str> = kept.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(kept_ids, vec!["a"]);
+        assert_eq!(
+            dups,
+            vec!["b".to_string()],
+            "only the distinct-id duplicate is removed; the same-id artefact must never be"
+        );
+
+        // A genuine (distinct-id) duplicate that ALSO appears twice as a page-boundary artefact must
+        // be marked for deletion exactly ONCE — not twice (which would spawn a redundant, error-
+        // logging second delete on TorBox).
+        let torrents = vec![
+            torrent("a", "H1", "downloaded"),
+            torrent("b", "H1", "downloaded"), // genuine duplicate of a
+            torrent("b", "H1", "downloaded"), // same id again → listing artefact of the duplicate
+        ];
+        let (kept, dups) = dedup_torrents_by_hash(&torrents);
+        let kept_ids: Vec<&str> = kept.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(kept_ids, vec!["a"]);
+        assert_eq!(
+            dups,
+            vec!["b".to_string()],
+            "the duplicate is removed exactly once"
+        );
     }
 
     #[test]
@@ -3717,6 +3806,96 @@ mod trakt_sync_tests {
                 .await
                 .is_none(),
             "no wanted rows must have been written"
+        );
+    }
+
+    /// A TraktClient whose `refresh` simulates a CONCURRENT refresh: it rotates the stored token's
+    /// refresh string (as if another `/refresh`/overlapping sync just succeeded, invalidating ours)
+    /// then fails. Mirrors `enrolment::RotatingThenFailingRefresh`.
+    struct RotatingThenFailingRefresh {
+        store: Store,
+    }
+    #[async_trait::async_trait]
+    impl TraktClient for RotatingThenFailingRefresh {
+        async fn device_code(
+            &self,
+        ) -> Result<crate::trakt_client::DeviceCode, crate::error::AppError> {
+            Err(crate::error::AppError::Unavailable)
+        }
+        async fn poll_token(
+            &self,
+            _dc: &str,
+        ) -> Result<crate::trakt_client::DeviceTokenPoll, crate::error::AppError> {
+            Err(crate::error::AppError::Unavailable)
+        }
+        async fn refresh(
+            &self,
+            _refresh_token: &str,
+        ) -> Result<TraktTokenResponse, crate::error::AppError> {
+            if let Some(mut t) = self.store.get_trakt_tokens("alice".into()).await {
+                t.refresh = "ROTATED".into();
+                let _ = self.store.put_trakt_tokens("alice".into(), t).await;
+            }
+            Err(crate::error::AppError::Unavailable)
+        }
+        async fn me(
+            &self,
+            _at: &str,
+        ) -> Result<crate::trakt_client::TraktUser, crate::error::AppError> {
+            Err(crate::error::AppError::Unavailable)
+        }
+        async fn watchlist(&self, _at: &str) -> Result<Vec<TraktItem>, crate::error::AppError> {
+            Err(crate::error::AppError::Unavailable)
+        }
+        async fn in_progress(&self, _at: &str) -> Result<Vec<TraktItem>, crate::error::AppError> {
+            Err(crate::error::AppError::Unavailable)
+        }
+        async fn watched(&self, _at: &str) -> Result<WatchedData, crate::error::AppError> {
+            Err(crate::error::AppError::Unavailable)
+        }
+        async fn show_progress(
+            &self,
+            _at: &str,
+            _trakt_id: u64,
+        ) -> Result<crate::trakt_client::ShowProgress, crate::error::AppError> {
+            Err(crate::error::AppError::Unavailable)
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_trakt_refresh_failure_on_a_concurrently_rotated_token_does_not_flag() {
+        // The sync-side mirror of the enrolment rotation-guard test: a near-expiry token triggers a
+        // refresh; a concurrent refresh rotates the stored token and ours then fails against the
+        // now-stale token. That false alarm must NOT flag the (healthy) account for re-enrolment.
+        let store = mem_store();
+        store
+            .put_trakt_tokens(
+                "alice".to_string(),
+                TraktTokens {
+                    access: "acc".to_string(),
+                    refresh: "original-ref".to_string(),
+                    expires_at: 0, // already expired → refresh path runs
+                    username: "alice".to_string(),
+                    needs_reenrolment: false,
+                },
+            )
+            .await
+            .unwrap();
+        let trakt: Arc<dyn TraktClient> = Arc::new(RotatingThenFailingRefresh {
+            store: store.clone(),
+        });
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+
+        sync_trakt(&trakt, &tmdb, &store, None, false).await;
+
+        let tok = store.get_trakt_tokens("alice".to_string()).await.unwrap();
+        assert_eq!(
+            tok.refresh, "ROTATED",
+            "the concurrently-rotated token survives"
+        );
+        assert!(
+            !tok.needs_reenrolment,
+            "a stale-token refresh failure must NOT flag a healthy account"
         );
     }
 }

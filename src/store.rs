@@ -1279,8 +1279,9 @@ impl Store {
         Self::flatten_join(result)
     }
 
-    /// Single-slot `selection` lookup. Test-only: production reads the whole map via `all_selection`.
-    #[cfg(test)]
+    /// Single-slot `selection` point lookup. Used by `acquire::record_verified` to gate a
+    /// season-pack's episode-slot overwrite on quality (don't clobber a better single), and by the
+    /// tests. The VFS build path reads the whole map at once via `all_selection`.
     pub async fn get_selection(&self, slot: String) -> Option<SelectionEntry> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {

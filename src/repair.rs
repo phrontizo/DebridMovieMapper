@@ -432,6 +432,12 @@ impl RepairManager {
                     // re-add does NOT itself reset attempts (only a confirmed good read via
                     // `note_read_success` does), so three cooldown-spaced reads would still hit the
                     // attempt cap and trap the real torrent. The cooldown still rate-limits retries.
+                    // Accepted downside for a genuinely-NEW-id provider (RD): a PERSISTENT
+                    // path-mismatch (rare — this is normally a settle blip) never accumulates toward
+                    // the give-up cap, so it re-adds+deletes once per cooldown indefinitely rather
+                    // than giving up. The alternative (a new-id-only give-up counter) would trade that
+                    // rare churn for the unrecoverable Failed/hidden trap above on the COMMON transient
+                    // case, which is strictly worse — so the reset is kept.
                     // For a genuinely-new id (RD) also delete the
                     // leaked replacement (TorBox's same-id re-add IS the real torrent — never delete).
                     if !same_torrent {

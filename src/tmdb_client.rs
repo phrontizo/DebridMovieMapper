@@ -205,13 +205,19 @@ impl TmdbClient {
     ) -> Result<T, reqwest::Error> {
         let mut last_error: Option<reqwest::Error> = None;
         let max_attempts = 10;
+        // Set when a retryable-status iteration already slept its explicit `Retry-After`/capped wait
+        // below; suppresses the next iteration's exponential backoff so a 429/503/502/504 retry waits
+        // ONCE (the Retry-After), not `Retry-After + backoff`. Transport-error/other-5xx retries leave
+        // it false, so they still get the exponential backoff.
+        let mut waited_explicitly = false;
 
         for attempt in 1..=max_attempts {
-            if attempt > 1 {
+            if attempt > 1 && !waited_explicitly {
                 let backoff = (2u64.saturating_pow(attempt as u32 - 2) * 1000).min(30_000);
                 let jitter = rand::rng().random_range(0..500);
                 tokio::time::sleep(Duration::from_millis(backoff + jitter)).await;
             }
+            waited_explicitly = false;
 
             // Proactive rate limiting: pace requests MIN_REQUEST_INTERVAL apart. RESERVE the next
             // slot under the lock and release it BEFORE sleeping, so concurrent callers (e.g. the
@@ -253,6 +259,7 @@ impl TmdbClient {
                         // block the scan hot path for nothing (matches `rd_client::wait_for_retry`).
                         if attempt < max_attempts {
                             tokio::time::sleep(Duration::from_secs(capped)).await;
+                            waited_explicitly = true; // skip the next iteration's backoff (no double wait)
                         }
                         // Record the real status error so that, on exhaustion, the surfaced error is
                         // the actual persistent 503/429/etc rather than the synthetic 502 fallback

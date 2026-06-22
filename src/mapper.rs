@@ -33,3 +33,18 @@ pub mod trakt_client;
 pub mod upgrade;
 pub mod vfs;
 pub mod wanted;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn now_unix_secs_is_recent_and_non_decreasing() {
+        let a = now_unix_secs();
+        // Sanity floor: well after 2023-11 (1_700_000_000). Catches a zeroed/garbage clock and the
+        // saturating-to-0 path firing in normal operation. Also proves it does not panic.
+        assert!(a > 1_700_000_000, "epoch seconds look wrong: {a}");
+        let b = now_unix_secs();
+        assert!(b >= a, "monotonic within a call sequence: {a} then {b}");
+    }
+}

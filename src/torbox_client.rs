@@ -158,6 +158,40 @@ fn map_listed_torrents(raw: &[TbTorrent]) -> Vec<Torrent> {
     mapped
 }
 
+/// Drive offset/limit pagination: call `fetch_page(offset)` for `offset = 0, limit, 2*limit, …`,
+/// accumulating pages until a SHORT page (fewer than `limit` items) signals the natural end, or
+/// `max_pages` is reached (a defensive backstop, e.g. against an API that ignores `offset` and would
+/// otherwise loop forever). Any page error propagates.
+///
+/// Returns `(items, hit_cap)`. `hit_cap` is `true` when the loop stopped because it reached
+/// `max_pages` while the FINAL page was still full — i.e. more pages likely remain and `items` is
+/// almost certainly TRUNCATED. The caller MUST treat that as a failure rather than an `Ok`, because
+/// downstream treats an owned title absent from the listing as lapsed → re-acquire, so a truncated
+/// listing would cause a re-acquisition storm + duplicate adds (this mirrors the RD client's
+/// `get_torrents`, which fails rather than returns a partial listing at its own cap).
+async fn paginate<T, E, F, Fut>(
+    limit: usize,
+    max_pages: usize,
+    mut fetch_page: F,
+) -> Result<(Vec<T>, bool), E>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<T>, E>>,
+{
+    let mut all: Vec<T> = Vec::new();
+    let mut hit_cap = true; // cleared only if we reach a natural (short) end
+    for page in 0..max_pages {
+        let items = fetch_page(page * limit).await?;
+        let short = items.len() < limit;
+        all.extend(items);
+        if short {
+            hit_cap = false; // last (short/empty) page — the listing is complete
+            break;
+        }
+    }
+    Ok((all, hit_cap))
+}
+
 /// Map a TorBox torrent to the lightweight canonical `Torrent` (no files).
 fn to_torrent(t: &TbTorrent) -> Torrent {
     Torrent {
@@ -521,8 +555,38 @@ impl TorBoxClient {
     }
 
     pub async fn list_torrents_raw(&self) -> Result<Vec<Torrent>, reqwest::Error> {
-        let url = format!("{}/torrents/mylist?bypass_cache=true", TORBOX_BASE);
-        let raw: Vec<TbTorrent> = self.send_data(|| self.client.get(&url)).await?;
+        // TorBox `/torrents/mylist` returns at most `limit` torrents (standard page = 1000; up to
+        // 10000 supported) and accepts `offset`. A single unbounded fetch would SILENTLY TRUNCATE
+        // the library for accounts with >1000 torrents — and downstream treats an owned title absent
+        // from the listing as lapsed → re-acquire, so truncation would cause a re-acquisition storm +
+        // duplicate adds. Paginate until a short page, mirroring the RD client's `get_torrents`.
+        const PAGE: usize = 1000;
+        const MAX_PAGES: usize = 50; // 50k-torrent backstop against an offset-ignoring API
+        let (raw, hit_cap) = paginate(PAGE, MAX_PAGES, |offset| {
+            let url = format!(
+                "{}/torrents/mylist?bypass_cache=true&limit={}&offset={}",
+                TORBOX_BASE, PAGE, offset
+            );
+            async move {
+                self.send_data::<Vec<TbTorrent>, _>(|| self.client.get(&url))
+                    .await
+            }
+        })
+        .await?;
+        if hit_cap {
+            // We exhausted MAX_PAGES with a full final page → the listing is almost certainly
+            // truncated. FAIL rather than return a partial Ok (which downstream would read as a
+            // shrunken library → mass re-acquire + duplicate adds), exactly as RD's `get_torrents`
+            // does at its cap. An offset-ignoring API also lands here (every page full) instead of
+            // silently returning duplicated/partial data.
+            warn!(
+                "TorBox mylist pagination hit the {}-page cap (~{} torrents) with a full final page — \
+                 refusing a possibly-truncated listing",
+                MAX_PAGES,
+                raw.len()
+            );
+            return Err(synthetic_bad_gateway());
+        }
         Ok(map_listed_torrents(&raw))
     }
 
@@ -554,20 +618,35 @@ impl TorBoxClient {
                 uri: magnet,
             }),
             Err(e) => {
-                // TorBox 400s ("Download already queued") when the torrent is already in the
-                // account. Recover idempotently by locating the existing torrent by infohash
-                // rather than failing the acquisition.
-                if let Some(hash) = magnet_infohash(&magnet) {
-                    if let Ok(list) = self.list_torrents_raw().await {
-                        if let Some(t) = list.iter().find(|t| t.hash.eq_ignore_ascii_case(&hash)) {
-                            info!(
-                                "TorBox createtorrent rejected but torrent already present; reusing id {}",
-                                t.id
-                            );
-                            return Ok(crate::rd_client::AddMagnetResponse {
-                                id: t.id.clone(),
-                                uri: magnet,
-                            });
+                // TorBox rejects an add for a torrent already in the account ("Download already
+                // queued"), commonly as an HTTP 400. Recover idempotently by locating the existing
+                // torrent by infohash rather than failing the acquisition. We must NOT regress the
+                // old "recover on any error" behaviour for the dup case, but we CAN skip the recovery
+                // list-fetch for an error that definitively is NOT a dup: a non-400 CLIENT error
+                // (401/403 auth, 404) — the add plainly failed and the list-fetch would fail the same
+                // way. Everything else still attempts recovery: a 400 (the dup signal); a 5xx —
+                // because a soft enveloped `success:false` is surfaced by `send_data` as a *synthetic
+                // 502*, indistinguishable from a real outage, so we don't risk blocking a soft-failure
+                // dup signal; and a statusless transport error (cheap best-effort, falls through to
+                // the original error if no match).
+                let skip_recovery = e
+                    .status()
+                    .is_some_and(|s| s.is_client_error() && s != reqwest::StatusCode::BAD_REQUEST);
+                if !skip_recovery {
+                    if let Some(hash) = magnet_infohash(&magnet) {
+                        if let Ok(list) = self.list_torrents_raw().await {
+                            if let Some(t) =
+                                list.iter().find(|t| t.hash.eq_ignore_ascii_case(&hash))
+                            {
+                                info!(
+                                    "TorBox createtorrent rejected but torrent already present; reusing id {}",
+                                    t.id
+                                );
+                                return Ok(crate::rd_client::AddMagnetResponse {
+                                    id: t.id.clone(),
+                                    uri: magnet,
+                                });
+                            }
                         }
                     }
                 }
@@ -810,6 +889,74 @@ mod tests {
         bound_cache(&mut cache, RESOLVE_CACHE_MAX);
         assert!(cache.contains_key(&("fresh".to_string(), 1)));
         assert!(!cache.contains_key(&("stale".to_string(), 2)));
+    }
+
+    #[tokio::test]
+    async fn paginate_fetches_until_a_short_page() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        // Two FULL pages (limit=3) then a short page → 7 items total, exactly 3 fetches.
+        let r: Result<(Vec<u32>, bool), &str> = paginate(3, 50, |offset| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok(match offset {
+                    0 => vec![1, 2, 3],
+                    3 => vec![4, 5, 6],
+                    6 => vec![7], // short → stop
+                    _ => vec![],
+                })
+            }
+        })
+        .await;
+        let (items, hit_cap) = r.unwrap();
+        assert_eq!(items, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert!(!hit_cap, "a natural short-page end is NOT a truncation");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "stops on the first short page"
+        );
+    }
+
+    #[tokio::test]
+    async fn paginate_stops_on_first_empty_page_and_propagates_errors() {
+        // An immediate empty page (len 0 < limit) ends pagination after one call (not truncated).
+        let r: Result<(Vec<u32>, bool), &str> =
+            paginate(3, 50, |_| async move { Ok(Vec::<u32>::new()) }).await;
+        let (items, hit_cap) = r.unwrap();
+        assert_eq!(items, Vec::<u32>::new());
+        assert!(!hit_cap);
+        // A page error propagates rather than returning a partial Ok (no truncated-library re-acquire).
+        let r: Result<(Vec<u32>, bool), &str> = paginate(3, 50, |offset| async move {
+            if offset == 0 {
+                Ok(vec![1, 2, 3])
+            } else {
+                Err("boom")
+            }
+        })
+        .await;
+        assert_eq!(r, Err("boom"));
+    }
+
+    #[tokio::test]
+    async fn paginate_max_pages_backstops_and_flags_truncation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        // Every page is FULL (an API ignoring `offset`, or a >cap library) → bounded by max_pages,
+        // never infinite, AND `hit_cap` is set so the caller refuses the truncated listing rather
+        // than returning a partial Ok (which would look like a shrunken library → re-acquire storm).
+        let r: Result<(Vec<u32>, bool), &str> = paginate(2, 4, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(vec![0u32, 1]) }
+        })
+        .await;
+        let (items, hit_cap) = r.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "capped at max_pages");
+        assert_eq!(items.len(), 8);
+        assert!(
+            hit_cap,
+            "a full final page at the cap must flag truncation (caller fails, not partial Ok)"
+        );
     }
 
     #[test]

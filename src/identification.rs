@@ -318,8 +318,13 @@ fn score_result(
         if let Some(release_date) = &result.release_date {
             if let Some(year_str) = release_date.get(0..4) {
                 if let Ok(release_year) = year_str.parse::<i32>() {
-                    let age = (current_year - release_year).max(0) as f64;
-                    score += (80.0 - age * 8.0).max(0.0);
+                    // Skip the bonus for a future-dated (unaired) release rather than clamping its
+                    // age to 0 and awarding the full +80 — an unaired title must not out-rank an
+                    // already-released one during disambiguation.
+                    if release_year <= current_year {
+                        let age = (current_year - release_year) as f64;
+                        score += (80.0 - age * 8.0).max(0.0);
+                    }
                 }
             }
         }
@@ -459,8 +464,13 @@ pub async fn identify_name(
     );
 
     if let Some((title, release_date, id, source, mtype)) = selected {
-        let year_val =
-            release_date.map(|d| d.chars().filter(|c| c.is_ascii_digit()).take(4).collect());
+        let year_val = release_date.and_then(|d| {
+            let digits: String = d.chars().filter(|c| c.is_ascii_digit()).take(4).collect();
+            // Mirror `parse_details`: only a full 4-digit year is meaningful. An empty
+            // `release_date` (common for shows with no first_air_date) or a malformed short one
+            // must map to None, not Some("")/Some("201") leaking into the VFS.
+            (digits.len() == 4).then_some(digits)
+        });
         info!(
             "Identified {} ({:?}) as {:?} via TMDB (ID: {})",
             title, year_val, mtype, id
@@ -599,9 +609,22 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
             // range elsewhere in the title (e.g. "WWII in Color 1939-1945 2009") must NOT
             // disable dropping the separate trailing release year, so we check the matched
             // year's span against the range matches rather than testing the whole title.
-            let in_range = YEAR_RANGE_RE
-                .find_iter(&title)
-                .any(|r| r.start() <= m.start() && m.end() <= r.end());
+            let in_range = YEAR_RANGE_RE.find_iter(&title).any(|r| {
+                // The matched (trailing) year must fall inside this range match...
+                if !(r.start() <= m.start() && m.end() <= r.end()) {
+                    return false;
+                }
+                // ...AND the pair must be genuinely ASCENDING to be a real date range. Two
+                // adjacent standalone years where the title's own year precedes a SMALLER release
+                // year (e.g. "Blade Runner 2049 2017") is NOT a range — the trailing release year
+                // must still be dropped, else it pollutes the TMDB query and loses the exact-title
+                // score boost.
+                let years: Vec<i32> = YEAR_RE
+                    .find_iter(r.as_str())
+                    .filter_map(|y| y.as_str().parse().ok())
+                    .collect();
+                matches!(years.as_slice(), [a, b] if a < b)
+            });
             if !in_range {
                 title.truncate(m.start());
             }
@@ -930,9 +953,10 @@ mod tests {
             Some("2017"),
             "release year is the LAST token"
         );
-        assert!(
-            br.contains("2049"),
-            "the title-embedded year must be preserved, got {br:?}"
+        assert_eq!(
+            br, "Blade Runner 2049",
+            "the title-embedded year is preserved AND the trailing release year is dropped — \
+             two adjacent standalone years (2049 then a SMALLER 2017) are not a date range"
         );
         // 1917 (the 2019 war film): release year 2019, title "1917" kept.
         let (war, war_year) = clean_name("1917.2019.1080p.BluRay.x264.mkv");
@@ -1023,6 +1047,18 @@ mod tests {
         assert_eq!(
             s_ancient, 1000.0,
             "old content gets exact-title only, no recency"
+        );
+        // A future-dated (unaired) release must NOT out-rank an already-released one. Previously its
+        // age was clamped to 0 and it got the full +80, beating the current-year title; now it gets
+        // no recency bonus at all.
+        let unaired = make_result(4, "Sherwood", Some("2030-01-01"), 0.0, None, None);
+        let current = make_result(5, "Sherwood", Some("2024-01-01"), 0.0, None, None);
+        let s_unaired = score_result(&unaired, "sherwood", &None, 2024);
+        let s_current = score_result(&current, "sherwood", &None, 2024);
+        assert_eq!(s_unaired, 1000.0, "no recency bonus for an unaired release");
+        assert!(
+            s_current > s_unaired,
+            "a just-released title must beat a future-dated one: {s_current} vs {s_unaired}"
         );
     }
 

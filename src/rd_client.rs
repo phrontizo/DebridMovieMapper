@@ -453,10 +453,22 @@ impl RealDebridClient {
                     let status = resp.status();
 
                     if terminal_statuses.contains(&status) {
-                        warn!(
-                            "RD API returned terminal status {} — not retrying (attempt {}/{})",
-                            status, attempt, max_attempts
-                        );
+                        // A 404 terminal is an expected, benign outcome (e.g. deleting an
+                        // already-absent torrent, which `delete_torrent` maps to Ok) — log it at
+                        // debug so routine idempotent prune/dedup/repair deletes don't spam warnings
+                        // (which would also drown genuine terminal-5xx warnings). Other terminal
+                        // statuses (5xx, etc.) stay at warn.
+                        if status == reqwest::StatusCode::NOT_FOUND {
+                            debug!(
+                                "RD API returned terminal status {} — not retrying (attempt {}/{})",
+                                status, attempt, max_attempts
+                            );
+                        } else {
+                            warn!(
+                                "RD API returned terminal status {} — not retrying (attempt {}/{})",
+                                status, attempt, max_attempts
+                            );
+                        }
                         return Err(match resp.error_for_status() {
                             Err(e) => e,
                             // Defensive: a non-error status was configured terminal (no current
