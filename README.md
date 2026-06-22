@@ -375,13 +375,16 @@ When `JELLYFIN_URL`, `JELLYFIN_API_KEY`, and `JELLYFIN_RCLONE_MOUNT_PATH` are al
 
 ### Archive-Only Torrents
 
-Some torrents contain RAR/ZIP archives instead of video files. Debrid services do not extract these archives, so they cannot be streamed. When such a torrent is detected, a warning is logged:
+Some torrents deliver their video inside RAR/ZIP archives rather than as plain `.mkv`/`.mp4` files. Debrid services do not extract these archives, so the contents cannot be streamed. The service detects archive-only torrents (covering `.rar`, `.zip`, `.7z`, `.tar`, `.gz`/`.bz2`, and split-volume `.r00…`/`.s00…` parts) and handles them differently depending on where the torrent came from:
 
-```
-WARN Torrent 'Movie.Name.1080p.BluRay' contains only archive files (RAR/ZIP) and cannot be streamed — replace it with a non-archive version on your debrid service
-```
+- **Engine-acquired content (Trakt-driven): handled automatically — no manual action needed.** An archive-only release never resolves a streamable video file, so the acquisition resolver (`observe`) treats it like any other dead torrent: once it has stayed unresolved for `ACQUIRE_DEAD_TIMEOUT_SECS` (default 600 s) it is reaped, its hash is **blacklisted** (so the same release isn't tried again), and the next-best candidate is acquired in its place. (Archive-ness isn't detected at scrape time — a Stremio stream object carries no such signal — so the engine can still *pick* an archive release, but it is caught and replaced here rather than lingering.)
+- **Content you added yourself, or that pre-existed in your debrid account (the account mirror): manual resolution required.** Such content is recorded as owned and is **not** auto-removed (it is never blacklisted), so a warning is logged on each scan instead:
 
-To fix this, delete the torrent from your debrid account and find an alternative release that contains video files directly (`.mkv`, `.mp4`, etc.).
+  ```
+  WARN Torrent 'Movie.Name.1080p.BluRay' contains only archive files (RAR/ZIP) and cannot be streamed — replace it with a non-archive version on your debrid service
+  ```
+
+  To fix it, delete the torrent from your debrid account and add an alternative release whose video files are stored directly (`.mkv`, `.mp4`, etc.).
 
 ### Error Handling
 
