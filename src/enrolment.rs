@@ -309,6 +309,24 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Percent-encode a single URL path segment so a slug can never break out of the
+/// `/trakt/accounts/<slug>/…` route. Real Trakt slugs are `[a-z0-9_-]`, so this is a no-op for them;
+/// it is defence-in-depth against a path-significant character (`/`, `?`, `#`, space, …) arriving in
+/// a malformed slug. Encodes everything outside the RFC 3986 unreserved set (`esc` is still applied
+/// separately for the HTML-attribute layer).
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// The enrolment instructions page (shows the device user_code + verification URL).
 fn enrol_html(dc: &DeviceCode) -> String {
     // Defensive: only render a clickable link for an http(s) URL. The value is from Trakt's
@@ -350,12 +368,13 @@ fn accounts_html(accounts: &[(String, TraktTokens)]) -> String {
             };
             rows.push_str(&format!(
                 "<li><strong>{user}</strong> (slug: {slug}){marker} \
-                 <form method=\"post\" action=\"/trakt/accounts/{slug}/refresh\" style=\"display:inline\">\
+                 <form method=\"post\" action=\"/trakt/accounts/{slug_path}/refresh\" style=\"display:inline\">\
                  <button type=\"submit\">Refresh</button></form> \
-                 <form method=\"post\" action=\"/trakt/accounts/{slug}/remove\" style=\"display:inline\">\
+                 <form method=\"post\" action=\"/trakt/accounts/{slug_path}/remove\" style=\"display:inline\">\
                  <button type=\"submit\">Remove</button></form></li>",
                 user = esc(&tok.username),
                 slug = esc(slug),
+                slug_path = encode_path_segment(slug),
                 marker = marker,
             ));
         }
@@ -751,6 +770,16 @@ mod tests {
             esc(r#"<script>alert("1")&'</script>"#),
             "&lt;script&gt;alert(&quot;1&quot;)&amp;'&lt;/script&gt;"
         );
+    }
+
+    #[test]
+    fn encode_path_segment_passes_real_slugs_and_encodes_path_specials() {
+        // Real Trakt slugs are unreserved characters → unchanged (the route still matches).
+        assert_eq!(encode_path_segment("kiril-p"), "kiril-p");
+        assert_eq!(encode_path_segment("user_123.x~y"), "user_123.x~y");
+        // A path-significant character can't break out of the /trakt/accounts/<slug>/… route.
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+        assert_eq!(encode_path_segment("a b?c#d"), "a%20b%3Fc%23d");
     }
 
     #[test]
