@@ -42,13 +42,30 @@ pub enum AudioReq {
     Original,
 }
 
+/// A plausible ISO-639 language code: 2 (ISO 639-1) or 3 (ISO 639-2) ASCII letters. Anything else —
+/// a full name ("english"), a locale ("pt-BR"), a typo — never matches the codes `probe` extracts, so
+/// accepting it would silently penalise every candidate and quietly stall acquisition. Such values
+/// are rejected back to the knob's default (with a warning) rather than taken verbatim.
+fn is_iso_lang_code(v: &str) -> bool {
+    matches!(v.len(), 2 | 3) && v.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
 impl AudioReq {
-    /// `None`/empty/"original" → Original; otherwise the given language code.
+    /// `None`/empty/"original" → Original; a valid 2-/3-letter ISO code → that language; any other
+    /// non-empty value is invalid (warned) and falls back to Original.
     pub fn parse(s: Option<String>) -> Self {
         match s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
             None => AudioReq::Original,
             Some(v) if v.eq_ignore_ascii_case("original") => AudioReq::Original,
-            Some(v) => AudioReq::Lang(v.to_ascii_lowercase()),
+            Some(v) if is_iso_lang_code(&v) => AudioReq::Lang(v.to_ascii_lowercase()),
+            Some(v) => {
+                warn!(
+                    "Invalid AUDIO_LANGUAGE '{}' (expected a 2-/3-letter ISO code or 'original'); \
+                     falling back to 'original'",
+                    v
+                );
+                AudioReq::Original
+            }
         }
     }
 }
@@ -61,12 +78,21 @@ pub enum SubReq {
 }
 
 impl SubReq {
-    /// `None`/empty/"none" → None (skip); otherwise the given language code.
+    /// `None`/empty/"none" → None (skip); a valid 2-/3-letter ISO code → that language; any other
+    /// non-empty value is invalid (warned) and falls back to None (skip the check).
     pub fn parse(s: Option<String>) -> Self {
         match s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
             None => SubReq::None,
             Some(v) if v.eq_ignore_ascii_case("none") => SubReq::None,
-            Some(v) => SubReq::Lang(v.to_ascii_lowercase()),
+            Some(v) if is_iso_lang_code(&v) => SubReq::Lang(v.to_ascii_lowercase()),
+            Some(v) => {
+                warn!(
+                    "Invalid SUBTITLE_LANGUAGE '{}' (expected a 2-/3-letter ISO code or 'none'); \
+                     skipping the subtitle check",
+                    v
+                );
+                SubReq::None
+            }
         }
     }
 }
@@ -1002,6 +1028,31 @@ mod tests {
             AudioReq::Lang("eng".into()),
             "a language code is normalised to lowercase"
         );
+        // A 2-letter ISO 639-1 code is also accepted.
+        assert_eq!(AudioReq::parse(Some("en".into())), AudioReq::Lang("en".into()));
+    }
+
+    #[test]
+    fn language_reqs_reject_non_iso_values_to_the_default() {
+        // A full language name / locale / typo is not a 2-/3-letter ISO code, so it never matches
+        // the codes `probe` extracts. Accepting it verbatim would silently penalise every candidate
+        // and quietly stop acquisition — instead we fall back to the default (Original / skip).
+        assert_eq!(
+            AudioReq::parse(Some("english".into())),
+            AudioReq::Original,
+            "a full language name falls back to Original, not Lang(\"english\")"
+        );
+        assert_eq!(AudioReq::parse(Some("en-US".into())), AudioReq::Original);
+        assert_eq!(AudioReq::parse(Some("e".into())), AudioReq::Original);
+        assert_eq!(
+            SubReq::parse(Some("english".into())),
+            SubReq::None,
+            "a full language name falls back to skip, not Lang(\"english\")"
+        );
+        assert_eq!(SubReq::parse(Some("pt-br".into())), SubReq::None);
+        // Valid codes still pass through unchanged.
+        assert_eq!(AudioReq::parse(Some("fra".into())), AudioReq::Lang("fra".into()));
+        assert_eq!(SubReq::parse(Some("de".into())), SubReq::Lang("de".into()));
     }
 
     #[test]
