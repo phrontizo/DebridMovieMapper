@@ -507,21 +507,30 @@ impl RealDebridClient {
                     match resp.error_for_status() {
                         Ok(resp) => {
                             let text = resp.text().await?;
-                            // 204 No Content or empty body: try deserializing from "[]".
-                            // This succeeds for Vec<T> and serde_json::Value, allowing
-                            // callers like select_files (which gets 204) to work transparently.
-                            if text.trim().is_empty() || status.as_u16() == 204 {
+                            // 204 No Content: try deserializing from "[]". This succeeds for Vec<T>
+                            // and serde_json::Value, allowing callers like select_files/delete_torrent
+                            // (which get a 204) to work transparently.
+                            //
+                            // NOTE: this is gated on the 204 status, NOT on an empty body — an empty
+                            // body under a *200* must NOT decode to `[]`. `get_torrents` reads an
+                            // empty `Vec<Torrent>` as end-of-list, so an anomalous empty-body 200
+                            // mid-pagination (e.g. a proxy/CDN quirk) would silently truncate the
+                            // listing, and downstream treats an owned title absent from the listing
+                            // as lapsed → re-acquire. Letting an empty-body 200 fall through to the
+                            // decode below (which fails → deserialization cap → surfaced error) makes
+                            // `get_torrents` fail the whole listing instead — the safe outcome.
+                            if status == reqwest::StatusCode::NO_CONTENT {
                                 if let Ok(val) = serde_json::from_str::<T>("[]") {
                                     self.rate_limiter.record_success().await;
                                     return Ok(val);
                                 }
-                                // An empty body that can't be decoded into T (i.e. T is not
+                                // A 204 whose body can't be decoded into T (i.e. T is not
                                 // Vec/Value) is a contract violation that won't fix itself on
                                 // retry — count it toward the deserialization cap so a
                                 // permanently-empty endpoint doesn't burn all 10 attempts.
                                 deserialization_failures += 1;
                                 warn!(
-                                    "RD API empty body or 204 not decodable into the expected type (attempt {}/{}). Status: {}",
+                                    "RD API 204 not decodable into the expected type (attempt {}/{}). Status: {}",
                                     attempt, max_attempts, status
                                 );
                                 if deserialization_failures >= 2 {
@@ -935,6 +944,45 @@ mod tests {
         assert!(
             r.is_err(),
             "a later-page error must fail the whole listing, never return a truncated Ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_torrents_fails_on_an_empty_body_200_page_rather_than_truncating() {
+        // A mid-pagination 200 with an EMPTY body (a reverse-proxy/CDN quirk) must NOT be read as an
+        // empty page (end-of-list): that would silently drop every later page, and downstream treats
+        // an owned title absent from the listing as lapsed → re-acquire. Fail the whole listing.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (status_line, body): (&str, &str) = if req.contains("page=1&") {
+                    ("HTTP/1.1 200 OK", r#"[{"id":"a"}]"#)
+                } else {
+                    // page 2+: a 200 with an empty body (NOT "[]").
+                    ("HTTP/1.1 200 OK", "")
+                };
+                let head = format!(
+                    "{}\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status_line,
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let client = RealDebridClient::new("fake".to_string())
+            .unwrap()
+            .with_base_url(format!("http://{}", addr));
+        let r = client.get_torrents().await;
+        assert!(
+            r.is_err(),
+            "an empty-body 200 page must fail the whole listing, not be treated as end-of-list"
         );
     }
 
