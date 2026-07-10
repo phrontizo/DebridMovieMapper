@@ -114,6 +114,13 @@ pub async fn run_scan_loop(
                     BLACKLIST_TTL_SECS / 86_400
                 );
             }
+            // Bound the otherwise append-only upgrade_checks cursor table: drop rows for titles that
+            // have left the library (removal / dedup / downgrade prune) so it can't grow unbounded
+            // over the deployment's lifetime — same rationale as the blacklist prune above.
+            let cursors = store.prune_upgrade_checks_not_owned().await;
+            if cursors > 0 {
+                info!("Pruned {cursors} upgrade-cursor row(s) for titles no longer owned");
+            }
         }
         tick = tick.saturating_add(1);
         // Consume repair replacements (new_id → old_id) before processing torrents

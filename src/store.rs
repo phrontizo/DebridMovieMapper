@@ -1397,6 +1397,64 @@ impl Store {
         .await;
         Self::flatten_join(result)
     }
+
+    /// Prune `upgrade_checks` cursor rows whose `(media_type, tmdb_id)` is no longer owned. The table
+    /// is otherwise append-only — `set_upgrade_checked` only ever upserts, and nothing removes a row
+    /// when a title leaves the library (Trigger-A/B removal, dedup deletion, downgrade prune) — so
+    /// like the append-only `blacklist` it needs a bound over a deployment's lifetime. Called ~daily
+    /// from the scan loop. The keep-set is derived from the current owned set exactly as the upgrade
+    /// job stamps the cursor (`upgrade_check_key(media_type, tmdb_id)`). Returns rows removed.
+    pub async fn prune_upgrade_checks_not_owned(&self) -> usize {
+        let keep: std::collections::HashSet<String> = self
+            .all_owned()
+            .await
+            .into_iter()
+            .map(|(_, rec)| {
+                let media_type = match rec.request.kind {
+                    crate::scraper::MediaKind::Movie => crate::vfs::MediaType::Movie,
+                    crate::scraper::MediaKind::Series => crate::vfs::MediaType::Show,
+                };
+                upgrade_check_key(&media_type, rec.request.tmdb_id)
+            })
+            .collect();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> usize {
+            let txn = match db.begin_write() {
+                Ok(t) => t,
+                Err(_) => return 0,
+            };
+            let mut removed = 0usize;
+            {
+                let mut table = match txn.open_table(UPGRADE_CHECKS_TABLE) {
+                    Ok(t) => t,
+                    Err(_) => return 0,
+                };
+                // Collect keys not in the owned keep-set first (can't remove during iteration).
+                let stale: Vec<String> = match table.iter() {
+                    Ok(iter) => iter
+                        .flatten()
+                        .filter_map(|(k, _)| {
+                            let key = k.value().to_string();
+                            (!keep.contains(&key)).then_some(key)
+                        })
+                        .collect(),
+                    Err(_) => return 0,
+                };
+                for k in &stale {
+                    if table.remove(k.as_str()).is_ok() {
+                        removed += 1;
+                    }
+                }
+            }
+            // A failed commit rolls back the removals — report 0 (nothing persisted).
+            if txn.commit().is_err() {
+                return 0;
+            }
+            removed
+        })
+        .await
+        .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -2911,6 +2969,89 @@ mod tests {
     fn slot_keys_distinguish_movie_and_episode() {
         assert_eq!(crate::store::movie_slot(27205), "m|27205");
         assert_eq!(crate::store::episode_slot(1396, 1, 2), "e|1396|1|2");
+    }
+
+    #[tokio::test]
+    async fn prune_upgrade_checks_drops_rows_for_titles_no_longer_owned() {
+        use crate::vfs::MediaType;
+        let store = mem_store();
+        // Cursor rows for a still-owned movie (101), a still-owned show (303), and a title that has
+        // since left the library (movie 202). A show with the SAME numeric id as an owned MOVIE (101)
+        // is NOT owned → its cursor must be pruned (the media-type discriminator keeps them distinct).
+        store
+            .set_upgrade_checked(&MediaType::Movie, 101, 1_000)
+            .await
+            .unwrap();
+        store
+            .set_upgrade_checked(&MediaType::Movie, 202, 2_000)
+            .await
+            .unwrap();
+        store
+            .set_upgrade_checked(&MediaType::Show, 303, 3_000)
+            .await
+            .unwrap();
+        store
+            .set_upgrade_checked(&MediaType::Show, 101, 4_000)
+            .await
+            .unwrap();
+
+        // Own only movie 101 and show 303.
+        store
+            .put_owned(
+                "h101".into(),
+                OwnedRecord {
+                    request: req("tt101", 101),
+                    provenance: Provenance::manual(),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut show_req = req("tt303", 303);
+        show_req.kind = MediaKind::Series;
+        store
+            .put_owned(
+                "h303".into(),
+                OwnedRecord {
+                    request: show_req,
+                    provenance: Provenance::manual(),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![(1, 1)],
+                    quality: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let removed = store.prune_upgrade_checks_not_owned().await;
+        assert_eq!(removed, 2, "movie 202 and show 101 cursors are pruned");
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Movie, 101).await,
+            1_000,
+            "owned movie 101 cursor kept"
+        );
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Show, 303).await,
+            3_000,
+            "owned show 303 cursor kept"
+        );
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Movie, 202).await,
+            0,
+            "un-owned movie 202 cursor pruned"
+        );
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Show, 101).await,
+            0,
+            "un-owned show 101 cursor pruned (distinct from owned movie 101)"
+        );
+
+        // Idempotent: a second prune with the same owned set removes nothing.
+        assert_eq!(store.prune_upgrade_checks_not_owned().await, 0);
     }
 
     /// `Provenance::merge` unions entries and deduplicates; `has_manual_entry` reports correctly.
