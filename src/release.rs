@@ -430,7 +430,17 @@ pub fn is_target_improvement(
         return Improvement::None;
     }
     if candidate.resolution < current.resolution {
-        Improvement::Downgrade
+        // A lower-resolution candidate is only ever a CORRECTIVE downgrade — and only when `current`
+        // actually sits ABOVE the ceiling. Within the ceiling we never trade resolution for a
+        // higher tier/bonus (a within-ceiling copy can be out-scored at a lower resolution when it
+        // carries e.g. a wrong-audio penalty; that must NOT prune the higher-res copy). Guarding on
+        // the ceiling keeps `rank_changes`'s direction-homogeneous assumption true: an over-ceiling
+        // `current` yields only `Downgrade`s, a within-ceiling `current` only `Upgrade`s.
+        if current.resolution > prefs.max_resolution.height() {
+            Improvement::Downgrade
+        } else {
+            Improvement::None
+        }
     } else {
         Improvement::Upgrade
     }
@@ -1360,6 +1370,40 @@ mod tests {
             assert_eq!(
                 is_target_improvement(&cur, &cand, &prefs(MaxResolution::P1080)),
                 Improvement::Downgrade
+            );
+        }
+
+        #[test]
+        fn within_ceiling_current_is_not_downgraded_for_higher_tier_lower_res() {
+            // Regression: a WITHIN-ceiling current copy must never be traded DOWN in resolution for a
+            // higher-tier/bonus lower-res candidate. Here the current 1080p (exactly at the 1080
+            // ceiling) carries a wrong-audio penalty, so a 720p REMUX+HEVC candidate out-scores it —
+            // but 720p is a resolution regression and the current copy is NOT over the ceiling, so
+            // this must be `None`, not `Downgrade`. As `Downgrade` it would, under
+            // ALLOW_RESOLUTION_DOWNGRADE, prune the 1080p copy — a silent resolution loss the flag
+            // never authorised (the flag only corrects copies sitting ABOVE the ceiling).
+            let cur = QualitySummary {
+                cached: true,
+                source_tier: 3_000, // WEB
+                resolution: 1080,   // exactly at the ceiling -> within
+                // 1_000_000 + 3_000 + 108_000 - 50_000 (wrong-audio penalty) = 1_061_000
+                score: 1_061_000,
+            };
+            let cand = QualitySummary {
+                cached: true,
+                source_tier: 8_000, // REMUX
+                resolution: 720,
+                // 1_000_000 + 8_000 + 72_000 + 5_000 (hevc) = 1_085_000 (> cur)
+                score: 1_085_000,
+            };
+            assert!(
+                cand.score > cur.score,
+                "test setup: candidate must out-score current"
+            );
+            assert_eq!(
+                is_target_improvement(&cur, &cand, &prefs(MaxResolution::P1080)),
+                Improvement::None,
+                "within-ceiling current must not be downgraded to a lower resolution"
             );
         }
 
