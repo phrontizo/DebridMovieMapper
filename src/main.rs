@@ -43,9 +43,12 @@ fn log_directive(rust_log: Option<String>) -> String {
 /// disconnect (`IncompleteMessage` — a player/WebDAV client dropping mid-request) or our own
 /// `header_read_timeout` closing an idle keep-alive connection (`HeaderTimeout`, or the textual
 /// "error reading header: operation timed out"). hyper 1.x doesn't expose typed accessors for these,
-/// so we match its Debug output — pinned by a unit test so a hyper upgrade that renames a variant
-/// fails CI rather than silently demoting the wrong errors. (io-level kinds are handled separately,
-/// by downcast.) The timeout match is scoped to the "reading header" phrase rather than a bare
+/// so we match its Debug output. `real_header_read_timeout_is_classified_ignorable` drives a LIVE
+/// timeout through `serve_connection` and asserts production's classification still treats it as
+/// benign, so a hyper upgrade that changes the timeout error's shape fails CI rather than silently
+/// demoting the wrong errors; `ignorable_disconnect_matches_expected_hyper_debug_strings` separately
+/// pins this function's accepted/rejected substrings. (io-level kinds are handled separately, by
+/// downcast.) The timeout match is scoped to the "reading header" phrase rather than a bare
 /// "timed out" so a genuine upstream/CDN body timeout (whose Debug also contains "timed out") is NOT
 /// misclassified as an ignorable disconnect.
 fn dbg_is_ignorable_disconnect(dbg: &str) -> bool {
@@ -600,10 +603,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn real_header_read_timeout_is_classified_ignorable() {
+        // Drive a REAL header-read timeout through serve_connection (client connects but never sends
+        // request headers) and assert production's classification treats the resulting hyper error as
+        // a benign disconnect. Unlike the hardcoded-string test below, this constructs an actual hyper
+        // error, so a hyper upgrade that changes the timeout error's shape (Debug string AND io-kind
+        // source) fails CI here rather than silently regressing the connection-error log.
+        use hyper::service::service_fn;
+        use hyper::{Request, Response};
+        use hyper_util::rt::{TokioIo, TokioTimer};
+        use std::error::Error;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let mut b = hyper::server::conn::http1::Builder::new();
+            b.timer(TokioTimer::new())
+                .header_read_timeout(std::time::Duration::from_millis(50));
+            b.serve_connection(
+                io,
+                service_fn(|_req: Request<hyper::body::Incoming>| async {
+                    Ok::<_, hyper::Error>(Response::new(dav_server::body::Body::from(
+                        "ok".to_string(),
+                    )))
+                }),
+            )
+            .await
+        });
+
+        // Connect but send NOTHING, holding the socket open so the header-read timeout fires.
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let err = server
+            .await
+            .unwrap()
+            .expect_err("a client that never sends headers must trigger the header-read timeout");
+        // Mirror production's exact classification (main.rs serve_connection error arm): an io-kind
+        // TimedOut/reset/EOF source OR the Debug-string classifier.
+        let dbg = format!("{err:?}");
+        let io_benign = err
+            .source()
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .is_some_and(|io_err| {
+                matches!(
+                    io_err.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+            });
+        assert!(
+            io_benign || dbg_is_ignorable_disconnect(&dbg),
+            "a real hyper header-read timeout must classify as a benign disconnect, got: {dbg:?}"
+        );
+    }
+
     #[test]
     fn ignorable_disconnect_matches_expected_hyper_debug_strings() {
-        // Pin the hyper Debug substrings we classify as benign. If a hyper upgrade renames a variant,
-        // these assertions fail in CI instead of the connection-error log silently regressing.
+        // Pin the classifier's accepted/rejected SUBSTRINGS (guarding an accidental edit to
+        // dbg_is_ignorable_disconnect). The real-error coverage — that a live hyper timeout still
+        // classifies as benign — is in `real_header_read_timeout_is_classified_ignorable` above.
         assert!(dbg_is_ignorable_disconnect(
             "hyper::Error(IncompleteMessage)"
         ));
