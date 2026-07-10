@@ -942,8 +942,15 @@ fn xml_escape(s: &str) -> String {
             '>' => result.push_str("&gt;"),
             '"' => result.push_str("&quot;"),
             '\'' => result.push_str("&apos;"),
-            // Strip XML 1.0 invalid control chars (keep tab, newline, carriage return)
-            '\u{0000}'..='\u{0008}' | '\u{000B}' | '\u{000C}' | '\u{000E}'..='\u{001F}' => {}
+            // Strip XML 1.0 invalid control chars (keep tab, newline, carriage return), plus the
+            // two non-character code points U+FFFE/U+FFFF, which are also invalid under the XML 1.0
+            // `Char` production and would make a strict media-server NFO parser reject the file.
+            '\u{0000}'..='\u{0008}'
+            | '\u{000B}'
+            | '\u{000C}'
+            | '\u{000E}'..='\u{001F}'
+            | '\u{FFFE}'
+            | '\u{FFFF}' => {}
             _ => result.push(c),
         }
     }
@@ -1985,6 +1992,10 @@ mod tests {
         );
         // Tab, newline, carriage return are valid XML and should be preserved
         assert_eq!(xml_escape("a\tb\nc\rd"), "a\tb\nc\rd");
+        // U+FFFE / U+FFFF are the only remaining `char`-expressible code points that are invalid
+        // under the XML 1.0 Char production — a strict media-server parser rejects an NFO
+        // containing one, so they must be stripped like the C0 controls.
+        assert_eq!(xml_escape("a\u{FFFE}b\u{FFFF}c"), "abc");
     }
 
     #[test]
