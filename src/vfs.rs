@@ -370,8 +370,9 @@ impl DebridVfs {
                     // archive-only (RAR/ZIP) doesn't vanish when a smaller streamable copy exists.
                     //
                     // ASYMMETRY (B11): unlike the episode path, this matches the selection by HASH only
-                    // and then emits the torrent's largest streamable video — it does NOT enforce the
-                    // stored `SelectionEntry.file_path`. That is safe because a movie torrent holds a
+                    // and then emits ALL selected streamable video files of that torrent (exactly one,
+                    // for a single-feature movie) — it does NOT enforce the stored
+                    // `SelectionEntry.file_path`. That is safe because a movie torrent holds a
                     // single feature (the acquisition + upgrade pack-guards reject multi-feature packs),
                     // so the hash uniquely identifies the file; the stored `file_path` is forward-compat
                     // only. Enforcing it here (without the episode path's largest-bytes self-heal on a

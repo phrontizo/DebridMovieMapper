@@ -457,8 +457,9 @@ pub async fn identify_name(
         movie_results.extend(movie_no_year);
     }
 
-    // Score all results and pick the best TV and movie matches
-    // For short titles (≤3 chars), require exact match + year match
+    // Score all results and pick the best TV and movie matches.
+    // For short titles (≤3 chars), require an exact title match — plus a year match only when the
+    // filename actually carries a year (a short title with no year still matches on exact title).
     let is_short_title = is_short_title(&cleaned_name);
 
     let best_tv = best_scored_result(&tv_results, &normalized_cleaned, &year, is_short_title);

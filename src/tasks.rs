@@ -1869,8 +1869,9 @@ async fn execute_remove(
 }
 
 /// Execute an `Acquire`: build the request from TMDB (preferring Trakt's `imdb_hint`), then drive
-/// the SP1 engine, recording the supplied provenance. A title with no IMDB id anywhere is skipped
-/// quietly (it can't be scraped). TMDB/engine-dependent — exercised by the live smoke.
+/// the acquisition engine (SP3 optimistic-add), recording the supplied provenance. A title with no
+/// IMDB id anywhere is skipped quietly (it can't be scraped). TMDB/engine-dependent — exercised by
+/// the live smoke.
 #[allow(clippy::too_many_arguments)]
 async fn execute_acquire(
     engine: &AcquisitionEngine,
