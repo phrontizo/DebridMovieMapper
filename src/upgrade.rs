@@ -274,8 +274,10 @@ async fn apply_upgrade(
 
 /// Pick the best CACHED candidate that is a target improvement over `baseline`, skipping owned and
 /// blacklisted hashes. Applies the same hard filters as acquisition via `score()` (returns None for
-/// above-ceiling / cam / dead-seeder), then ranks the qualifying candidates best-effective-score
-/// first. Returns the release + its Improvement direction. Shared by the movie and episode paths.
+/// above-ceiling / cam / dead-seeder), then ranks the qualifying candidates best-score first
+/// (effective score == raw score here, since every candidate has already passed `score()`'s ceiling
+/// filter, so it is within the ceiling and unpenalised). Returns the release + its Improvement
+/// direction. Shared by the movie and episode paths.
 async fn pick_best_change(
     app: &AppState,
     media: MediaKind,
@@ -321,11 +323,13 @@ async fn pick_best_change(
 }
 
 /// Gate a corrective downgrade on the opt-in flag. An `Upgrade` always proceeds. A `Downgrade` with
-/// the flag OFF is logged (preview) and rejected; with the flag ON it proceeds.
+/// the flag OFF is logged (preview, including the current/old hash being downgraded) and rejected;
+/// with the flag ON it proceeds.
 fn downgrade_allowed_or_log(
     app: &AppState,
     tmdb_id: u64,
     imp: release::Improvement,
+    old_hash: &str,
     current: &QualitySummary,
     cand: &release::ReleaseInfo,
 ) -> bool {
@@ -334,8 +338,9 @@ fn downgrade_allowed_or_log(
         release::Improvement::Downgrade if app.config.allow_resolution_downgrade => true,
         release::Improvement::Downgrade => {
             info!(
-                "upgrade: tmdb {} would downgrade {}p -> {} ({}p) [set ALLOW_RESOLUTION_DOWNGRADE=true to enable]",
+                "upgrade: tmdb {} would downgrade {}({}p) -> {}({}p) [set ALLOW_RESOLUTION_DOWNGRADE=true to enable]",
                 tmdb_id,
+                old_hash,
                 current.resolution,
                 cand.info_hash,
                 cand.resolution.unwrap_or(0)
@@ -407,8 +412,11 @@ async fn try_upgrade_movie(
     };
     // 2b. A corrective downgrade (owned copy is above the ceiling) only proceeds when the operator
     //     has opted in; otherwise it is preview-logged and skipped (NoChange — evaluated, not
-    //     deferred, so the round-robin cursor still rotates onward).
-    if !downgrade_allowed_or_log(app, tmdb_id, imp, &current, &cand) {
+    //     deferred, so the round-robin cursor still rotates onward). The preview log names the
+    //     title's representative owned hash (the movie baseline spans all copies; the swap prunes
+    //     them all, so the first is a stable, meaningful stand-in).
+    let old_hash = owned_hashes.first().map(String::as_str).unwrap_or("");
+    if !downgrade_allowed_or_log(app, tmdb_id, imp, old_hash, &current, &cand) {
         return Err(UpgradeSkip::NoChange("downgrade gated (dry-run)".into()));
     }
 
@@ -933,13 +941,17 @@ async fn stage_episode_candidate(
 /// the SAME episodes, repointing every covered episode slot and pruning the old pack. Gated as a
 /// downgrade (`ALLOW_RESOLUTION_DOWNGRADE`). Keeps the old pack when no conforming replacement
 /// exists — a sole over-ceiling copy is never deleted with nothing to replace it.
+///
+/// Returns `true` iff it bailed early because the library became active (a non-idle `all_idle`
+/// check) — so the caller can leave the round-robin cursor unstamped and reconsider next tick;
+/// `false` on normal completion (whether or not a correction was applied).
 async fn correct_over_ceiling_packs(
     app: &AppState,
     tmdb_id: u64,
     owned: &[(String, OwnedRecord)],
     imdb_id: &str,
     idle_window: Duration,
-) {
+) -> bool {
     let prefs = &app.config.acquisition.prefs;
     let ceiling = prefs.max_resolution.height();
     let owned_hashes: Vec<String> = owned.iter().map(|(h, _)| h.clone()).collect();
@@ -976,11 +988,11 @@ async fn correct_over_ceiling_packs(
             if imp == release::Improvement::None {
                 continue;
             }
-            if !downgrade_allowed_or_log(app, tmdb_id, imp, &pack_q, &cand) {
+            if !downgrade_allowed_or_log(app, tmdb_id, imp, pack_hash, &pack_q, &cand) {
                 break; // logged (dry-run); no candidate below would fare better — stop this pack
             }
             if !app.read_activity.all_idle(idle_window).await {
-                return; // library active; retry the whole correction pass next tick
+                return true; // library active; defer — leave the cursor unstamped, retry next tick
             }
 
             let (torrent_id, fresh) = match stage_and_await_cached(app, &cand.info_hash).await {
@@ -1101,21 +1113,27 @@ async fn correct_over_ceiling_packs(
             break; // one correction per pack per tick
         }
     }
+    false // completed the pass without a mid-tick library-active defer
 }
 
 /// The per-episode-upgrade (a) + over-ceiling-pack-correction (b) body of `try_upgrade_show`,
 /// WITHOUT the TMDB-driven consolidation tail (c) — split out so it is unit-testable fully offline,
 /// mirroring the `try_consolidate_show` / `consolidate_show_seasons` split just below (consolidation's
 /// live TMDB aired-episode lookup is exercised by the live smoke, not unit tests; see that split's
-/// doc comment). Fire-and-forget per item: one episode/pack's outcome (Deferred/NoChange/staged)
-/// never aborts the rest of the group — every branch already classifies + logs its own outcome, so
-/// there is nothing further to propagate to the caller.
+/// doc comment). Fire-and-forget per item: one episode/pack's per-candidate outcome
+/// (Deferred/NoChange/staged) never aborts the rest of the group — every branch already classifies +
+/// logs its own outcome.
+///
+/// Returns `true` iff it stopped early because the library became active mid-tick (a non-idle
+/// `all_idle` check, in the per-episode loop or in `correct_over_ceiling_packs`). The caller uses
+/// this to signal `Deferred` so the round-robin cursor is NOT stamped and the skipped work is
+/// reconsidered next tick (rather than waiting a full cursor wrap). `false` on normal completion.
 async fn upgrade_show_episodes_and_packs(
     app: &AppState,
     tmdb_id: u64,
     group_hashes: &[String],
     idle_window: Duration,
-) {
+) -> bool {
     let mut owned: Vec<(String, OwnedRecord)> = Vec::new();
     for h in group_hashes {
         if let Some(r) = app.store.get_owned(h.clone()).await {
@@ -1123,9 +1141,10 @@ async fn upgrade_show_episodes_and_packs(
         }
     }
     // Torrentio is IMDB-keyed: without an id anywhere in the group there is nothing to scrape.
-    // Consolidation performs the identical check independently, so it self-skips too.
+    // Consolidation performs the identical check independently, so it self-skips too. Not a
+    // deferral — there is no work to reconsider — so this returns `false`.
     let Some(imdb_id) = group_imdb_id(app, group_hashes).await else {
-        return;
+        return false;
     };
 
     // (a) Per-singleton-episode upgrade/downgrade.
@@ -1153,7 +1172,7 @@ async fn upgrade_show_episodes_and_packs(
         else {
             continue;
         };
-        if !downgrade_allowed_or_log(app, tmdb_id, imp, &q, &cand) {
+        if !downgrade_allowed_or_log(app, tmdb_id, imp, hash, &q, &cand) {
             continue;
         }
         if !app.read_activity.all_idle(idle_window).await {
@@ -1162,9 +1181,10 @@ async fn upgrade_show_episodes_and_packs(
                 tmdb_id
             );
             // Stop ALL further staging (remaining episodes + pack correction) this tick — mirrors
-            // the library-wide idle gate in `run_upgrade_once`. Consolidation's own idle re-check
-            // independently decides whether IT can still proceed.
-            return;
+            // the library-wide idle gate in `run_upgrade_once`. Signal deferral so the caller
+            // leaves the cursor unstamped; consolidation's own idle re-check independently decides
+            // whether IT can still proceed.
+            return true;
         }
         match stage_episode_candidate(app, tmdb_id, &req, &cand, season, episode).await {
             Ok((new_hash, tid, path)) => {
@@ -1200,22 +1220,37 @@ async fn upgrade_show_episodes_and_packs(
 
     // (b) Over-ceiling pack correction (flag-gated): replace a pack above the ceiling with a
     // within-ceiling cached full-season replacement that covers the SAME episodes; keeps the pack
-    // when no conforming replacement exists (sole-copy safety).
-    correct_over_ceiling_packs(app, tmdb_id, &owned, &imdb_id, idle_window).await;
+    // when no conforming replacement exists (sole-copy safety). The per-episode loop above returns
+    // early on a mid-tick defer, so reaching here means it completed; propagate the pack pass's own
+    // defer signal (equivalent to `episode_deferred || pack_deferred` with episode_deferred=false).
+    correct_over_ceiling_packs(app, tmdb_id, &owned, &imdb_id, idle_window).await
 }
 
 /// Show dispatch target for `run_upgrade_once`: per-episode upgrade/downgrade + over-ceiling pack
 /// correction (`upgrade_show_episodes_and_packs`), then full-season consolidation (unchanged —
 /// `try_consolidate_show` still runs every tick exactly as before this task, so its existing
 /// behaviour/tests are preserved).
+///
+/// If the per-episode/pack phase deferred mid-tick (library became active), return `Deferred`
+/// REGARDLESS of consolidation's own result, so `run_upgrade_once` leaves the round-robin cursor
+/// unstamped and the skipped episodes/pack-correction are reconsidered next tick rather than
+/// waiting a full cursor wrap (a `NoChange`/`Ok` from a scatter-free consolidation would otherwise
+/// stamp it). When the phase did NOT defer, propagate consolidation's own `Result`. Consolidation
+/// still runs in both cases (its swap/prune is independently idle-gated).
 async fn try_upgrade_show(
     app: &AppState,
     tmdb_id: u64,
     group_hashes: &[String],
     idle_window: Duration,
 ) -> Result<(), UpgradeSkip> {
-    upgrade_show_episodes_and_packs(app, tmdb_id, group_hashes, idle_window).await;
-    try_consolidate_show(app, tmdb_id, group_hashes, idle_window).await
+    let deferred = upgrade_show_episodes_and_packs(app, tmdb_id, group_hashes, idle_window).await;
+    let consolidated = try_consolidate_show(app, tmdb_id, group_hashes, idle_window).await;
+    if deferred {
+        return Err(UpgradeSkip::Deferred(
+            "show per-episode/pack upgrade deferred mid-tick (library active)".into(),
+        ));
+    }
+    consolidated
 }
 
 /// Consolidate a show's scattered per-episode torrents into a full-season CACHED pack, season by
@@ -4723,6 +4758,126 @@ mod tests {
             new_rec.provides.contains(&(1, 1)) && new_rec.provides.contains(&(1, 2)),
             "replacement provides the full owned episode set: {:?}",
             new_rec.provides
+        );
+    }
+
+    #[tokio::test]
+    async fn non_idle_library_defers_show_upgrade_leaving_state_unchanged() {
+        // FIX 1: a singleton episode WITH a valid better cached candidate, but the library is
+        // NON-idle. The per-episode idle guard must bail and SIGNAL deferral (`true`) so
+        // `try_upgrade_show` returns `Deferred` and `run_upgrade_once` leaves the round-robin cursor
+        // unstamped — nothing swapped/pruned. Asserted on the offline core
+        // `upgrade_show_episodes_and_packs` (returns `true` + zero store mutations) rather than
+        // `try_upgrade_show`: the latter's consolidation tail makes a live TMDB call — the one
+        // network dependency this file's show-test split exists to avoid — and the wrapper's
+        // `if deferred { Err(Deferred) }` is trivial straight-line logic over this bool.
+        let h = show_harness_singleton_720_ep().await;
+        // Mark the library active; a 60s window then reports it non-idle.
+        h.app.read_activity.touch("Shows/S/S01E01.mkv").await;
+
+        let deferred = upgrade_show_episodes_and_packs(
+            &h.app,
+            h.tmdb,
+            &h.group_hashes,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        assert!(
+            deferred,
+            "a non-idle library must defer the per-episode phase (cursor left unstamped upstream)"
+        );
+        assert_eq!(
+            h.app
+                .store
+                .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            h.old_720_hash,
+            "selection unchanged while deferred"
+        );
+        assert!(
+            h.app
+                .store
+                .get_owned(h.old_720_hash.clone())
+                .await
+                .is_some(),
+            "old owned record still present (nothing pruned)"
+        );
+        assert!(
+            h.app
+                .store
+                .get_owned(h.cand_1080_hash.clone())
+                .await
+                .is_none(),
+            "candidate not staged/recorded while deferred"
+        );
+    }
+
+    #[tokio::test]
+    async fn untagged_singleton_episode_is_not_upgraded() {
+        // FIX 4: symmetric to the movie path's `mirror_movie_with_unknown_quality_is_not_upgraded`.
+        // An owned singleton episode with `quality: None` (untagged/legacy mirror) has no baseline,
+        // so the per-episode upgrade must SKIP it (no scrape/stage) even when a "better" candidate
+        // exists — comparing against a default would treat any cached release as an upgrade and
+        // could delete a possibly-better untagged copy.
+        let store = mem_store();
+        let old_hash = "euntagged".to_string();
+        let mut rec = ep_record(1, 1, q720_web());
+        rec.quality = None; // untagged
+        store.put_owned(old_hash.clone(), rec).await.unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 1),
+                SelectionEntry {
+                    hash: old_hash.clone(),
+                    file_path: "old.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // A candidate that WOULD be a meaningful upgrade if the current quality were known.
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![ep_1080_web_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        let deferred = upgrade_show_episodes_and_packs(
+            &app,
+            SHOW_TMDB,
+            std::slice::from_ref(&old_hash),
+            Duration::from_secs(0),
+        )
+        .await;
+
+        assert!(!deferred, "an untagged skip is not a deferral");
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "no staging/delete attempted for an untagged episode"
+        );
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            old_hash,
+            "selection unchanged"
+        );
+        assert!(
+            store.get_owned(old_hash.clone()).await.is_some(),
+            "untagged owned record untouched"
+        );
+        assert!(
+            store.get_owned("hep1080".into()).await.is_none(),
+            "candidate not recorded owned"
         );
     }
 }
