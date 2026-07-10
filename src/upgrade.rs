@@ -233,7 +233,9 @@ async fn try_upgrade_movie(
             continue;
         }
         let q = QualitySummary::of(&r, &app.config.acquisition.prefs);
-        if !release::is_meaningful_upgrade(&current, &q) {
+        if release::is_target_improvement(&current, &q, &app.config.acquisition.prefs)
+            == release::Improvement::None
+        {
             continue;
         }
         if best

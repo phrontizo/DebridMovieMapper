@@ -380,7 +380,7 @@ impl QualitySummary {
     /// Mark this owned release as now present/cached on the provider — used when an UNCACHED torrent
     /// finishes downloading (so its acquire-time snapshot recorded `cached: false`). Flips `cached`
     /// AND adds [`CACHED_BONUS`] to `score` so the stored summary matches what `score()` would yield
-    /// for a cached release. Both are required: `is_meaningful_upgrade` short-circuits to "any cached
+    /// for a cached release. Both are required: `is_target_improvement` short-circuits to "any cached
     /// candidate is an upgrade" while `!current.cached`, and its fallback compares `score` — so a
     /// stale `cached:false` (or a score missing the bonus) would let the upgrade engine replace this
     /// working copy with a LOWER-quality cached release and delete it. Idempotent.
@@ -392,31 +392,48 @@ impl QualitySummary {
     }
 }
 
-/// A candidate is a meaningful upgrade over the current owned release iff it is CACHED and the
-/// engine's OWN ranking strictly prefers it (`score`), on a concrete category jump:
-/// - current uncached → any cached candidate upgrades it;
-/// - else the candidate must score strictly higher AND improve at least one quality axis (source
-///   tier OR resolution).
+/// The direction of a beneficial swap under the current prefs, or `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Improvement {
+    None,
+    Upgrade,
+    Downgrade,
+}
+
+/// Whether swapping `current` -> `candidate` moves the owned copy toward the ideal under `prefs`,
+/// and in which direction. Generalises the plain upgrade-only comparison to also fire a CORRECTIVE
+/// DOWNGRADE when `current` is above the ceiling (its `effective_score` is penalised, so a
+/// within-ceiling cached `candidate` now scores higher even at a lower raw resolution).
 ///
-/// The strict-`score` requirement (not a bare "higher tier OR higher resolution") is what prevents
-/// the infinite flip-flop: each swap strictly increases the owned score, which is bounded, so it
-/// converges and never oscillates (e.g. 2160p WEB ↔ 1080p REMUX — only the score-increasing
-/// direction qualifies, so it stabilizes on the higher-scored release). It also keeps the upgrade
-/// engine CONSISTENT with acquisition, which picks by `score`: because resolution dominates the
-/// source-tier band within the ceiling, the engine scores 1080p WEB above 720p BluRay, so that
-/// cross-axis upgrade is allowed (a no-regression-on-both-axes rule would wrongly strand the
-/// library on the 720p BluRay). The category-jump clause still rejects a marginal
-/// same-tier-same-resolution wobble (bitrate/HEVC/HDR/seeders), avoiding churn.
-pub fn is_meaningful_upgrade(current: &QualitySummary, candidate: &QualitySummary) -> bool {
+/// A `candidate` reaching this function has already passed `score()`'s hard filter, so it is always
+/// within the ceiling; its effective score equals its raw score. Convergence: within a fixed ceiling
+/// every accepted swap strictly increases the owned effective score (bounded) => no flip-flop.
+pub fn is_target_improvement(
+    current: &QualitySummary,
+    candidate: &QualitySummary,
+    prefs: &QualityPrefs,
+) -> Improvement {
     if !candidate.cached {
-        return false;
+        return Improvement::None;
     }
     if !current.cached {
-        return true;
+        return Improvement::Upgrade;
     }
-    candidate.score > current.score
-        && (candidate.source_tier > current.source_tier
-            || candidate.resolution > current.resolution)
+    let cur = effective_score(current, prefs);
+    let cand = effective_score(candidate, prefs);
+    if cand <= cur {
+        return Improvement::None;
+    }
+    // Require a category change (tier or resolution differs) so a marginal same-tier/same-res
+    // bitrate/HEVC/HDR/seeder wobble never triggers a swap.
+    if candidate.source_tier == current.source_tier && candidate.resolution == current.resolution {
+        return Improvement::None;
+    }
+    if candidate.resolution < current.resolution {
+        Improvement::Downgrade
+    } else {
+        Improvement::Upgrade
+    }
 }
 
 /// Ceiling-aware score for an OWNED copy. Within the ceiling it is `q.score` unchanged; ABOVE the
@@ -834,7 +851,7 @@ mod tests {
         );
 
         // (b) An EXCLUDED release (above the P1080 ceiling) → `score` is None → `of` records the
-        // i64::MIN sentinel, which `is_meaningful_upgrade`'s strict `>` comparison relies on.
+        // i64::MIN sentinel, which `is_target_improvement`'s strict `>` comparison relies on.
         let excluded = QualitySummary::of(
             &parse(&raw(
                 "Torrentio\n2160p",
@@ -899,7 +916,7 @@ mod tests {
     fn bare_web_source_tag_is_web_not_other() {
         // The canonical scene `WEB` tag (no `-DL`/`Rip`) must classify as Source::Web, not Other —
         // otherwise it scores BELOW HDTV at the same resolution and blocks a legitimate HDTV→WEB
-        // upgrade (`is_meaningful_upgrade` needs the candidate's tier > the owned tier).
+        // upgrade (`is_target_improvement` needs the candidate's tier > the owned tier).
         for name in [
             "Show.S01E01.1080p.WEB.H264-GROUP",
             "Show S01E01 1080p WEB x264",
@@ -973,7 +990,7 @@ mod tests {
 
     #[test]
     fn meaningful_upgrade_requires_cached_category_jump() {
-        use super::{is_meaningful_upgrade, QualitySummary};
+        use super::{is_target_improvement, Improvement, QualitySummary};
         let owned_web_1080_cached = QualitySummary {
             cached: true,
             source_tier: 3_000,
@@ -987,10 +1004,10 @@ mod tests {
             resolution: 2160,
             score: 9,
         };
-        assert!(!is_meaningful_upgrade(
-            &owned_web_1080_cached,
-            &cand_uncached
-        ));
+        assert_eq!(
+            is_target_improvement(&owned_web_1080_cached, &cand_uncached, &prefs()),
+            Improvement::None
+        );
         // cached, higher tier → upgrade
         let cand_remux = QualitySummary {
             cached: true,
@@ -998,7 +1015,10 @@ mod tests {
             resolution: 1080,
             score: 5,
         };
-        assert!(is_meaningful_upgrade(&owned_web_1080_cached, &cand_remux));
+        assert_eq!(
+            is_target_improvement(&owned_web_1080_cached, &cand_remux, &prefs()),
+            Improvement::Upgrade
+        );
         // cached, same tier + same resolution → NOT an upgrade (marginal)
         let cand_same = QualitySummary {
             cached: true,
@@ -1006,15 +1026,27 @@ mod tests {
             resolution: 1080,
             score: 999,
         };
-        assert!(!is_meaningful_upgrade(&owned_web_1080_cached, &cand_same));
-        // cached, higher resolution → upgrade
-        let cand_4k = QualitySummary {
+        assert_eq!(
+            is_target_improvement(&owned_web_1080_cached, &cand_same, &prefs()),
+            Improvement::None
+        );
+        // cached, higher resolution (within the P1080 ceiling — a fresh 720p owned copy) → upgrade
+        let owned_720 = QualitySummary {
             cached: true,
             source_tier: 3_000,
-            resolution: 2160,
+            resolution: 720,
+            score: 1,
+        };
+        let cand_1080 = QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 1080,
             score: 2,
         };
-        assert!(is_meaningful_upgrade(&owned_web_1080_cached, &cand_4k));
+        assert_eq!(
+            is_target_improvement(&owned_720, &cand_1080, &prefs()),
+            Improvement::Upgrade
+        );
         // owned uncached → any cached candidate upgrades it
         let owned_uncached = QualitySummary {
             cached: false,
@@ -1022,12 +1054,22 @@ mod tests {
             resolution: 1080,
             score: 0,
         };
-        assert!(is_meaningful_upgrade(&owned_uncached, &cand_same));
+        assert_eq!(
+            is_target_improvement(&owned_uncached, &cand_same, &prefs()),
+            Improvement::Upgrade
+        );
     }
 
     #[test]
     fn meaningful_upgrade_follows_score_no_flip_flop_no_cross_axis_strand() {
-        use super::{is_meaningful_upgrade, QualitySummary};
+        use super::{is_target_improvement, Improvement, QualitySummary};
+        // A P2160 ceiling keeps every candidate here (up to 2160p) within-ceiling, so
+        // `effective_score` reduces to the plain `score` — matching the ceiling-unaware upgrade
+        // comparison this test was originally written against.
+        let prefs = QualityPrefs {
+            max_resolution: MaxResolution::P2160,
+            ..prefs()
+        };
         // Realistic scores: cached(1_000_000) + tier + resolution*100 (resolution dominates).
         let bluray_720 = QualitySummary {
             cached: true,
@@ -1057,19 +1099,22 @@ mod tests {
         // Legitimate cross-axis upgrade: 720p BluRay → 1080p WEB scores higher (resolution wins),
         // so the engine prefers it — must be an upgrade (a no-regression-on-both-axes rule would
         // wrongly strand the library on the 720p BluRay).
-        assert!(
-            is_meaningful_upgrade(&bluray_720, &web_1080),
+        assert_eq!(
+            is_target_improvement(&bluray_720, &web_1080, &prefs),
+            Improvement::Upgrade,
             "higher-scored cross-axis (720p BluRay → 1080p WEB) must upgrade"
         );
 
         // No flip-flop on the 2160p WEB ↔ 1080p REMUX pair: only the score-increasing direction
         // qualifies, so it converges to 2160p WEB and never oscillates.
-        assert!(
-            is_meaningful_upgrade(&remux_1080, &web_2160),
+        assert_eq!(
+            is_target_improvement(&remux_1080, &web_2160, &prefs),
+            Improvement::Upgrade,
             "1080p REMUX → 2160p WEB is the higher-scored direction → upgrade (converge)"
         );
-        assert!(
-            !is_meaningful_upgrade(&web_2160, &remux_1080),
+        assert_eq!(
+            is_target_improvement(&web_2160, &remux_1080, &prefs),
+            Improvement::None,
             "2160p WEB → 1080p REMUX is a score downgrade → NOT an upgrade (no flip-flop)"
         );
 
@@ -1080,8 +1125,9 @@ mod tests {
             resolution: 1080,
             score: 1_111_500, // slightly higher than web_1080 but same tier+res
         };
-        assert!(
-            !is_meaningful_upgrade(&web_1080, &web_1080_marginal),
+        assert_eq!(
+            is_target_improvement(&web_1080, &web_1080_marginal, &prefs),
+            Improvement::None,
             "marginal same-tier-same-resolution score wobble is not an upgrade"
         );
     }
@@ -1160,11 +1206,17 @@ mod tests {
     }
 
     #[test]
-    fn is_meaningful_upgrade_requires_strictly_greater_score_at_equal_score() {
+    fn is_target_improvement_requires_strictly_greater_score_at_equal_score() {
         // The flip-flop-prevention guarantee rests on the score comparison being STRICT (`>`). Two
         // cached releases with an EQUAL score but a genuine tier/resolution category jump must NOT be
         // upgrades of each other — if this regressed to `>=`, the upgrade engine would swap+prune
         // forever each idle tick (churn + a torn-down stream).
+        // A P2160 ceiling keeps the resolution-jump candidate within-ceiling here too, so the
+        // equal-score comparison — not the over-ceiling penalty — is what's under test.
+        let prefs = QualityPrefs {
+            max_resolution: MaxResolution::P2160,
+            ..prefs()
+        };
         let cur_tier = QualitySummary {
             cached: true,
             source_tier: 3_000,
@@ -1177,8 +1229,9 @@ mod tests {
             resolution: 1080,
             score: 100, // …but identical score
         };
-        assert!(
-            !is_meaningful_upgrade(&cur_tier, &cand_higher_tier),
+        assert_eq!(
+            is_target_improvement(&cur_tier, &cand_higher_tier, &prefs),
+            Improvement::None,
             "equal score + tier jump must NOT be an upgrade (strict > guards against flip-flop)"
         );
         let cur_res = QualitySummary {
@@ -1193,8 +1246,9 @@ mod tests {
             resolution: 2160, // a real resolution jump…
             score: 200,       // …but identical score
         };
-        assert!(
-            !is_meaningful_upgrade(&cur_res, &cand_higher_res),
+        assert_eq!(
+            is_target_improvement(&cur_res, &cand_higher_res, &prefs),
+            Improvement::None,
             "equal score + resolution jump must NOT be an upgrade"
         );
     }
@@ -1268,10 +1322,89 @@ mod tests {
             &prefs(),
         );
         assert!(candidate.cached && current.cached);
-        assert!(
-            !is_meaningful_upgrade(&current, &candidate),
+        assert_eq!(
+            is_target_improvement(&current, &candidate, &prefs()),
+            Improvement::None,
             "a lower-resolution cached release must not upgrade a now-cached higher-resolution owned copy"
         );
+    }
+
+    #[cfg(test)]
+    mod target_improvement_tests {
+        use super::{is_target_improvement, Improvement, QualitySummary};
+        use crate::config::{AudioReq, MaxResolution, QualityPrefs, SubReq};
+
+        fn prefs(ceiling: MaxResolution) -> QualityPrefs {
+            QualityPrefs {
+                max_resolution: ceiling,
+                audio: AudioReq::Original,
+                subtitle: SubReq::None,
+                prefer_hevc: true,
+                prefer_hdr: false,
+            }
+        }
+        fn cached(res: u16, tier: i64) -> QualitySummary {
+            QualitySummary {
+                cached: true,
+                source_tier: tier,
+                resolution: res,
+                score: 1_000_000 + tier + res as i64 * 100,
+            }
+        }
+
+        #[test]
+        fn over_ceiling_current_and_within_candidate_is_downgrade() {
+            // Own 2160; ceiling dropped to 1080; a cached 1080 exists.
+            let cur = cached(2160, 8_000);
+            let cand = cached(1080, 6_000);
+            assert_eq!(
+                is_target_improvement(&cur, &cand, &prefs(MaxResolution::P1080)),
+                Improvement::Downgrade
+            );
+        }
+
+        #[test]
+        fn genuine_higher_resolution_is_upgrade() {
+            let cur = cached(1080, 3_000);
+            let cand = cached(2160, 3_000);
+            assert_eq!(
+                is_target_improvement(&cur, &cand, &prefs(MaxResolution::P2160)),
+                Improvement::Upgrade
+            );
+        }
+
+        #[test]
+        fn same_tier_same_res_wobble_is_none() {
+            let cur = cached(1080, 3_000);
+            let mut cand = cached(1080, 3_000);
+            cand.score += 500; // bitrate/HEVC wobble only, no category change
+            assert_eq!(
+                is_target_improvement(&cur, &cand, &prefs(MaxResolution::P1080)),
+                Improvement::None
+            );
+        }
+
+        #[test]
+        fn uncached_candidate_is_none() {
+            let cur = cached(1080, 3_000);
+            let mut cand = cached(2160, 8_000);
+            cand.cached = false;
+            assert_eq!(
+                is_target_improvement(&cur, &cand, &prefs(MaxResolution::P2160)),
+                Improvement::None
+            );
+        }
+
+        #[test]
+        fn uncached_current_any_cached_is_upgrade() {
+            let mut cur = cached(1080, 3_000);
+            cur.cached = false;
+            let cand = cached(720, 1_000);
+            assert_eq!(
+                is_target_improvement(&cur, &cand, &prefs(MaxResolution::P1080)),
+                Improvement::Upgrade
+            );
+        }
     }
 
     #[cfg(test)]

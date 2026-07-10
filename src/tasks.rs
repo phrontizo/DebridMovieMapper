@@ -1002,7 +1002,7 @@ fn meta_tmdb_id(metadata: &MediaMetadata) -> Option<u64> {
 ///
 /// The last case is the important one: a partially/un-tagged name (e.g. `The Matrix (1999).mkv`)
 /// parses to `resolution: 0` and/or `source_tier: 0` — UNKNOWN on an axis the upgrade comparison
-/// (`is_meaningful_upgrade`) uses. Recording such a record would let a scraped candidate "upgrade"
+/// (`is_target_improvement`) uses. Recording such a record would let a scraped candidate "upgrade"
 /// (potentially DOWNGRADE) it on the unknown axis, deleting a possibly-better original. We only
 /// record a quality we can compare safely on both axes.
 fn mirror_quality(
