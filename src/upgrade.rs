@@ -120,18 +120,28 @@ pub async fn run_upgrade_once(app: &AppState) {
     }
 }
 
-/// The best (highest-`score`) quality across ALL owned copies of a title, or `None` if ANY owned
-/// copy has unknown quality (a legacy/untagged mirror record). Used as the upgrade baseline so a
-/// swap that prunes every copy can only proceed against the BEST one it would delete — never
+/// The best (highest-`effective_score`) quality across ALL owned copies of a title, or `None` if ANY
+/// owned copy has unknown quality (a legacy/untagged mirror record). Used as the upgrade baseline so
+/// a swap that prunes every copy can only proceed against the BEST one it would delete — never
 /// downgrading by comparing against a worse duplicate. `None` (unknown copy present) is a
 /// conservative skip: we can't prove a candidate beats an unmeasured copy, so we don't risk
-/// deleting it.
+/// deleting it. Ranking by `effective_score` (rather than raw `score`) is ceiling-aware: an
+/// over-ceiling copy no longer masquerades as "best" and block its own corrective downgrade — e.g.
+/// owning only a 2160p copy under a 1080p ceiling must baseline off its (heavily penalised)
+/// effective score so a within-ceiling cached candidate can be recognised as an improvement.
 async fn best_owned_quality(app: &AppState, owned_hashes: &[String]) -> Option<QualitySummary> {
     let mut best: Option<QualitySummary> = None;
     for h in owned_hashes {
         let rec = app.store.get_owned(h.clone()).await?;
         let q = rec.quality?; // any unknown-quality owned copy → conservative skip (None)
-        if best.as_ref().map(|b| q.score > b.score).unwrap_or(true) {
+        let better = best
+            .as_ref()
+            .map(|b| {
+                release::effective_score(&q, &app.config.acquisition.prefs)
+                    > release::effective_score(b, &app.config.acquisition.prefs)
+            })
+            .unwrap_or(true);
+        if better {
             best = Some(q);
         }
     }
@@ -162,6 +172,178 @@ fn scrape_sample(owned: &[(String, OwnedRecord)]) -> Option<OwnedRecord> {
         .find(|(_, r)| !r.request.imdb_id.is_empty())
         .or_else(|| owned.first())
         .map(|(_, r)| r.clone())
+}
+
+/// A staged, verified replacement ready to be swapped in. `slot_files` maps each selection slot to
+/// the file_path within the staged torrent that should represent it (one entry for a movie, one per
+/// episode for a pack).
+struct StagedUpgrade {
+    hash: String,
+    torrent_id: String,
+    slot_files: Vec<(String, String)>,
+}
+
+/// Shared swap/prune tail used by the movie, per-episode, and pack-correction callers. Idle-gates,
+/// fetches the provider listing ONCE (before the final idle re-check, so there is no network
+/// round-trip between confirming idle and the destructive prune), repoints every slot to the staged
+/// release, then prunes the superseded hashes. Non-destructive rollback on defer: a mid-stage active
+/// read fully deletes the staged torrent + drops its records and leaves the current release intact.
+async fn apply_upgrade(
+    app: &AppState,
+    staged: StagedUpgrade,
+    supersede_hashes: &[String],
+    idle_window: Duration,
+) -> Result<(), UpgradeSkip> {
+    // Fetch the provider listing for the prune ONCE, and BEFORE the idle re-check below, so there is
+    // NO network round-trip between the idle confirmation and the destructive prune — a read
+    // starting in that window could otherwise have the old torrent deleted out from under it.
+    // Distinguish a FETCH FAILURE from a genuinely-empty account: `unwrap_or_default()` would make a
+    // failed `get_torrents` look empty, so `prune_owned_hash_in` (which treats "hash absent from the
+    // listing" as "already gone → drop the record") would drop the old hashes' records while leaving
+    // the still-present torrents orphaned → re-adopted as duplicates. On an `Err`, roll back the
+    // staged candidate and defer.
+    let listing = match app.provider.get_torrents().await {
+        Ok(l) => l,
+        Err(_) => {
+            if app
+                .provider
+                .delete_torrent(&staged.torrent_id)
+                .await
+                .is_ok()
+            {
+                let _ = app.store.remove_owned(staged.hash.clone()).await;
+                let _ = app.store.remove_authoritative(staged.hash.clone()).await;
+            }
+            return Err(UpgradeSkip::Deferred(
+                "provider listing unavailable; deferring".into(),
+            ));
+        }
+    };
+    // Re-check idle IMMEDIATELY before the destructive swap+prune. Staging above can take many
+    // seconds (add + select + cached-poll + 4 MB probe), during which a playback read may have begun
+    // anywhere in the library. If it is no longer idle, fully roll back the freshly-staged candidate
+    // (delete it + drop its records — non-destructive: the current release is untouched) and retry
+    // later, so the prune below never interrupts an in-flight stream.
+    if !app.read_activity.all_idle(idle_window).await {
+        // Roll back by the KNOWN torrent id, not the listing snapshot: the just-staged torrent may
+        // not have propagated into `listing` yet. Only drop the store records when the delete
+        // SUCCEEDED — on a transient delete failure, KEEP them so a later tick retries rather than
+        // leaving a present-but-untracked torrent that `record_mirror_owned` would re-adopt as a
+        // DUPLICATE (the `execute_remove`/`prune_owned_hash_in` keep-on-failure discipline).
+        if app
+            .provider
+            .delete_torrent(&staged.torrent_id)
+            .await
+            .is_ok()
+        {
+            let _ = app.store.remove_owned(staged.hash.clone()).await;
+            let _ = app.store.remove_authoritative(staged.hash.clone()).await;
+        }
+        return Err(UpgradeSkip::Deferred(
+            "library became active during staging; deferring".into(),
+        ));
+    }
+    // Repoint every slot. If ANY selection write fails, do NOT prune (pruning behind a stale
+    // selection would leave a slot resolving to a hash we're about to delete) — defer the prune; the
+    // staged copy stays owned and is reclaimed by the duplicate-dedup pass.
+    for (slot, file_path) in &staged.slot_files {
+        if let Err(e) = app
+            .store
+            .put_selection(
+                slot.clone(),
+                crate::store::SelectionEntry {
+                    hash: staged.hash.clone(),
+                    file_path: file_path.clone(),
+                },
+            )
+            .await
+        {
+            return Err(UpgradeSkip::Deferred(format!(
+                "selection write failed; deferring prune: {e}"
+            )));
+        }
+    }
+    for old in supersede_hashes {
+        if old.eq_ignore_ascii_case(&staged.hash) {
+            continue;
+        }
+        prune_owned_hash_in(app, old, &listing).await;
+    }
+    Ok(())
+}
+
+/// Pick the best CACHED candidate that is a target improvement over `baseline`, skipping owned and
+/// blacklisted hashes. Applies the same hard filters as acquisition via `score()` (returns None for
+/// above-ceiling / cam / dead-seeder), then ranks the qualifying candidates best-effective-score
+/// first. Returns the release + its Improvement direction. Shared by the movie and episode paths.
+async fn pick_best_change(
+    app: &AppState,
+    media: MediaKind,
+    tmdb_id: u64,
+    raws: &[release::RawCandidate],
+    baseline: &QualitySummary,
+    owned_hashes: &[String],
+) -> Option<(release::ReleaseInfo, release::Improvement)> {
+    let prefs = &app.config.acquisition.prefs;
+    let mut best: Option<(release::ReleaseInfo, QualitySummary, release::Improvement)> = None;
+    for raw in raws {
+        let r = release::parse(raw);
+        if owned_hashes
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(&r.info_hash))
+        {
+            continue;
+        }
+        if app
+            .store
+            .is_blacklisted(media, tmdb_id, r.info_hash.clone())
+            .await
+        {
+            continue;
+        }
+        if release::score(&r, prefs).is_none() {
+            continue; // hard filters (ceiling/cam/dead-seeder) — never upgrade past the ceiling
+        }
+        let q = QualitySummary::of(&r, prefs);
+        let imp = release::is_target_improvement(baseline, &q, prefs);
+        if imp == release::Improvement::None {
+            continue;
+        }
+        let better = best
+            .as_ref()
+            .map(|(_, bq, _)| q.score > bq.score)
+            .unwrap_or(true);
+        if better {
+            best = Some((r, q, imp));
+        }
+    }
+    best.map(|(r, _, imp)| (r, imp))
+}
+
+/// Gate a corrective downgrade on the opt-in flag. An `Upgrade` always proceeds. A `Downgrade` with
+/// the flag OFF is logged (preview) and rejected; with the flag ON it proceeds.
+fn downgrade_allowed_or_log(
+    app: &AppState,
+    tmdb_id: u64,
+    imp: release::Improvement,
+    current: &QualitySummary,
+    cand: &release::ReleaseInfo,
+) -> bool {
+    match imp {
+        release::Improvement::Upgrade => true,
+        release::Improvement::Downgrade if app.config.allow_resolution_downgrade => true,
+        release::Improvement::Downgrade => {
+            info!(
+                "upgrade: tmdb {} would downgrade {}p -> {} ({}p) [set ALLOW_RESOLUTION_DOWNGRADE=true to enable]",
+                tmdb_id,
+                current.resolution,
+                cand.info_hash,
+                cand.resolution.unwrap_or(0)
+            );
+            false
+        }
+        release::Improvement::None => false,
+    }
 }
 
 /// Stage + (idle-gated) swap a single movie title. Returns Err(reason) on a non-fatal skip.
@@ -204,51 +386,31 @@ async fn try_upgrade_movie(
         imdb_id: imdb_id.clone(),
         ..owned_rec.request.clone()
     };
-    // 2. Scrape fresh candidates for this title, then pick the best cached meaningful upgrade not
+    // 2. Scrape fresh candidates for this title, then pick the best cached target-improvement not
     //    already owned/blacklisted. A scrape failure is transient → Deferred (retry next tick).
     let raws = app
         .scraper
         .find(&req.imdb_id, MediaKind::Movie, None, None)
         .await
         .map_err(|e| UpgradeSkip::Deferred(format!("scrape failed: {e}")))?;
-    let mut best: Option<(release::ReleaseInfo, QualitySummary)> = None;
-    for raw in &raws {
-        let r = release::parse(raw);
-        if owned_hashes
-            .iter()
-            .any(|h| h.eq_ignore_ascii_case(&r.info_hash))
-        {
-            continue;
-        }
-        if app
-            .store
-            .is_blacklisted(MediaKind::Movie, tmdb_id, r.info_hash.clone())
-            .await
-        {
-            continue;
-        }
-        // Apply the same hard filters as acquisition (resolution ceiling, cam/telesync, dead seeders):
-        // score() returns None for any release that fails them. Never "upgrade" past the ceiling.
-        if release::score(&r, &app.config.acquisition.prefs).is_none() {
-            continue;
-        }
-        let q = QualitySummary::of(&r, &app.config.acquisition.prefs);
-        if release::is_target_improvement(&current, &q, &app.config.acquisition.prefs)
-            == release::Improvement::None
-        {
-            continue;
-        }
-        if best
-            .as_ref()
-            .map(|(_, bq)| q.score > bq.score)
-            .unwrap_or(true)
-        {
-            best = Some((r, q));
-        }
-    }
-    let Some((cand, _q)) = best else {
+    let Some((cand, imp)) = pick_best_change(
+        app,
+        MediaKind::Movie,
+        tmdb_id,
+        &raws,
+        &current,
+        owned_hashes,
+    )
+    .await
+    else {
         return Err(UpgradeSkip::NoChange("no meaningful upgrade".into()));
     };
+    // 2b. A corrective downgrade (owned copy is above the ceiling) only proceeds when the operator
+    //     has opted in; otherwise it is preview-logged and skipped (NoChange — evaluated, not
+    //     deferred, so the round-robin cursor still rotates onward).
+    if !downgrade_allowed_or_log(app, tmdb_id, imp, &current, &cand) {
+        return Err(UpgradeSkip::NoChange("downgrade gated (dry-run)".into()));
+    }
 
     // 3. Idle gate FIRST. Upgrade targets are cached-only (instant to add), so there is no benefit
     //    to pre-staging a download — we only commit when the library is idle, and skip otherwise.
@@ -267,75 +429,19 @@ async fn try_upgrade_movie(
     //    (retry next tick), a candidate-specific failure (not cached / wrong title / pack) → NoChange.
     let staged = stage_and_verify(app, tmdb_id, &req, &cand).await?;
 
-    // Fetch the provider listing for the prune ONCE, and BEFORE the idle re-check below, so there is
-    // NO network round-trip between the idle confirmation and the destructive prune — a read
-    // starting in that window could otherwise have the old torrent deleted out from under it (the
-    // same ordering the consolidation path uses). Also avoids a per-hash re-fetch.
-    // Distinguish a FETCH FAILURE from a genuinely-empty account: `unwrap_or_default()` would make a
-    // failed `get_torrents` look empty, so `prune_owned_hash_in` (which treats "hash absent from the
-    // listing" as "already gone → drop the record") would drop the old hashes' records while leaving
-    // the still-present torrents orphaned → re-adopted as duplicates. On an `Err`, roll back the
-    // staged candidate and defer (mirrors the idle-defer rollback below).
-    let listing = match app.provider.get_torrents().await {
-        Ok(l) => l,
-        Err(_) => {
-            if app.provider.delete_torrent(&staged.1).await.is_ok() {
-                let _ = app.store.remove_owned(staged.0.clone()).await;
-                let _ = app.store.remove_authoritative(staged.0.clone()).await;
-            }
-            return Err(UpgradeSkip::Deferred(
-                "provider listing unavailable; deferring upgrade".into(),
-            ));
-        }
-    };
-
-    // 4b. Re-check idle IMMEDIATELY before the destructive swap+prune. Staging above can take many
-    //     seconds (add + select + cached-poll + 4 MB probe), during which a playback read may have
-    //     begun anywhere in the library. If it is no longer idle, fully roll back the freshly-staged
-    //     candidate (delete it + drop its records — non-destructive: the current release is
-    //     untouched) and retry later, so the prune below never interrupts an in-flight stream.
-    if !app.read_activity.all_idle(idle_window).await {
-        // Roll back by the KNOWN torrent id, not the listing snapshot: the just-staged torrent may
-        // not have propagated into `listing` yet. Only drop the store records when the delete
-        // SUCCEEDED — on a transient delete failure, KEEP them so a later tick retries rather than
-        // leaving a present-but-untracked torrent that `record_mirror_owned` would re-adopt as a
-        // DUPLICATE (the `execute_remove`/`prune_owned_hash_in` keep-on-failure discipline).
-        if app.provider.delete_torrent(&staged.1).await.is_ok() {
-            let _ = app.store.remove_owned(staged.0.clone()).await;
-            let _ = app.store.remove_authoritative(staged.0.clone()).await;
-        }
-        return Err(UpgradeSkip::Deferred(
-            "library became active during staging; deferring upgrade".into(),
-        ));
-    }
-
-    // 5. Swap selection → new hash, then prune every old owned hash. If the selection repoint did
-    //    NOT persist, do NOT prune — pruning the old torrents while the selection still points at one
-    //    of them would leave the slot resolving to a hash we're about to delete (a stale DB row at
-    //    best). Defer the prune; the staged copy stays owned and is reclaimed by the duplicate-dedup
-    //    pass (a put_selection failure is a rare redb-write/disk error that triggers DB self-heal
-    //    anyway). Strictly safer than pruning behind a stale selection.
-    if let Err(e) = app
-        .store
-        .put_selection(
-            movie_slot(tmdb_id),
-            crate::store::SelectionEntry {
-                hash: staged.0.clone(),
-                file_path: staged.2.clone(),
-            },
-        )
-        .await
-    {
-        return Err(UpgradeSkip::Deferred(format!(
-            "selection write failed; deferring prune: {e}"
-        )));
-    }
-    for old in owned_hashes {
-        if old.eq_ignore_ascii_case(&staged.0) {
-            continue;
-        }
-        prune_owned_hash_in(app, old, &listing).await;
-    }
+    // 5. Swap selection → new hash, then prune every old owned hash (shared tail; see `apply_upgrade`
+    //    for the idle re-check + rollback discipline preserved exactly from the original inline tail).
+    apply_upgrade(
+        app,
+        StagedUpgrade {
+            hash: staged.0.clone(),
+            torrent_id: staged.1,
+            slot_files: vec![(movie_slot(tmdb_id), staged.2)],
+        },
+        owned_hashes,
+        idle_window,
+    )
+    .await?;
     info!("upgrade: tmdb {} swapped to {}", tmdb_id, staged.0);
     Ok(())
 }
@@ -2554,6 +2660,189 @@ mod tests {
             store.get_selection(movie_slot(27205)).await.unwrap().hash,
             "hold",
             "selection unchanged"
+        );
+    }
+
+    // ── corrective-downgrade tests (Task 4) ───────────────────────────────────
+
+    /// Harness for the movie corrective-downgrade tests: a single owned copy ABOVE the P1080
+    /// ceiling (2160p REMUX — as if acquired before the ceiling was lowered, or mirrored from a
+    /// pre-existing library file), with the movie selection pointing at it, plus a cached
+    /// within-ceiling 1080p REMUX candidate available from the scraper/provider.
+    struct DowngradeHarness {
+        app: AppState,
+        tmdb: u64,
+        owned_hashes: Vec<String>,
+        rec: OwnedRecord,
+        owned_2160_hash: String,
+        cand_1080_hash: String,
+    }
+
+    impl DowngradeHarness {
+        /// Flip `allow_resolution_downgrade` on the harness's `Config` (rebuilds the `Arc` since
+        /// `Config` doesn't expose interior mutability).
+        fn set_allow_downgrade(&mut self, v: bool) {
+            let mut cfg = (*self.app.config).clone();
+            cfg.allow_resolution_downgrade = v;
+            self.app.config = Arc::new(cfg);
+        }
+    }
+
+    async fn harness_with_owned_movie_2160_and_1080_candidate() -> DowngradeHarness {
+        let store = mem_store();
+        let owned_2160_hash = "h2160".to_string();
+        store
+            .put_owned(
+                owned_2160_hash.clone(),
+                OwnedRecord {
+                    request: movie_req(),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(QualitySummary {
+                        cached: true,
+                        source_tier: 8_000,
+                        resolution: 2160,
+                        score: 1_008_000,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: owned_2160_hash.clone(),
+                    file_path: "old2160.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // A cached, within-ceiling 1080p REMUX candidate — `remux_candidate()` is already used
+        // (and proven) elsewhere as a meaningful cached upgrade; reused here as the corrective
+        // within-ceiling replacement.
+        let cand = remux_candidate();
+        let cand_1080_hash = cand.info_hash.clone();
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![cand],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "told".into(),
+                    hash: owned_2160_hash.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tnew".into(),
+                    hash: cand_1080_hash.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tnew".into(),
+                hash: cand_1080_hash.clone(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "M.2020.1080p.REMUX.mkv".into(),
+                    bytes: 20_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/new".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+        let rec = store.get_owned(owned_2160_hash.clone()).await.unwrap();
+
+        DowngradeHarness {
+            app,
+            tmdb: 27205,
+            owned_hashes: vec![owned_2160_hash.clone()],
+            rec,
+            owned_2160_hash,
+            cand_1080_hash,
+        }
+    }
+
+    #[tokio::test]
+    async fn movie_over_ceiling_downgrade_is_dry_run_by_default() {
+        // Own a cached 2160p movie; ceiling = 1080; a cached 1080p candidate is scrape-available.
+        // Flag OFF (default): no swap, no prune — the 2160p copy stays owned and its selection
+        // unchanged.
+        let h = harness_with_owned_movie_2160_and_1080_candidate().await;
+        assert!(!h.app.config.allow_resolution_downgrade);
+        let r = try_upgrade_movie(
+            &h.app,
+            h.tmdb,
+            &h.owned_hashes,
+            &h.rec,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(matches!(r, Ok(()) | Err(UpgradeSkip::NoChange(_))));
+        assert!(
+            h.app
+                .store
+                .get_owned(h.owned_2160_hash.clone())
+                .await
+                .is_some(),
+            "dry-run must not prune the over-ceiling copy"
+        );
+        assert_eq!(
+            h.app
+                .store
+                .get_selection(movie_slot(h.tmdb))
+                .await
+                .unwrap()
+                .hash,
+            h.owned_2160_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn movie_over_ceiling_downgrade_swaps_when_flag_set() {
+        let mut h = harness_with_owned_movie_2160_and_1080_candidate().await;
+        h.set_allow_downgrade(true);
+        let r = try_upgrade_movie(
+            &h.app,
+            h.tmdb,
+            &h.owned_hashes,
+            &h.rec,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert!(
+            h.app
+                .store
+                .get_owned(h.owned_2160_hash.clone())
+                .await
+                .is_none(),
+            "flag on: the over-ceiling copy is pruned"
+        );
+        assert_eq!(
+            h.app
+                .store
+                .get_selection(movie_slot(h.tmdb))
+                .await
+                .unwrap()
+                .hash,
+            h.cand_1080_hash
         );
     }
 
