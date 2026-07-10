@@ -268,13 +268,16 @@ pub struct WantedRecord {
 
 /// Why opening the on-disk database failed, split by recovery strategy.
 enum OpenFailure {
-    /// The file is genuinely damaged or format-incompatible (corrupt / needs-repair /
-    /// old-or-newer format) — safe to move aside and recreate. The regenerable `matches` cache
-    /// makes this lossless in practice; non-corrupt upgrades migrate authoritative tables instead.
+    /// The file is genuinely damaged/unreadable (bad magic, truncated, redb repair aborted), or was
+    /// written by a NEWER build of this app (our schema version is ahead of the binary) — safe to
+    /// move aside and recreate. The regenerable `matches` cache makes this lossless in practice;
+    /// forward migrations bring an older OUR-schema DB up to date instead of discarding it.
     Corrupt(String),
     /// A transient/operational failure: another instance holds the lock, the path is not writable,
-    /// disk is full, etc. The file is intact — discarding it would lose authoritative data, so the
-    /// caller fails startup and lets the operator fix the underlying condition.
+    /// disk is full, etc. — OR an INTACT database in an older redb on-disk format
+    /// (`UpgradeRequired`, e.g. after a redb dependency bump). The file is intact, so discarding it
+    /// would lose authoritative data; the caller fails startup and lets the operator fix the
+    /// underlying condition (back up / migrate) instead.
     Transient(String),
 }
 
@@ -295,9 +298,16 @@ fn io_kind_is_corruption(kind: std::io::ErrorKind) -> bool {
 fn db_open_failure(e: redb::DatabaseError) -> OpenFailure {
     use redb::{DatabaseError, StorageError};
     let corrupt = match &e {
-        DatabaseError::RepairAborted | DatabaseError::UpgradeRequired(_) => true,
+        // redb tried to auto-repair the file and gave up → genuinely damaged, safe to recreate.
+        DatabaseError::RepairAborted => true,
         DatabaseError::Storage(StorageError::Corrupted(_)) => true,
         DatabaseError::Storage(StorageError::Io(io)) => io_kind_is_corruption(io.kind()),
+        // Everything else is transient (fail startup, keep the file). In particular
+        // `UpgradeRequired` is an INTACT database in an OLDER on-disk format (e.g. after a redb
+        // dependency bump across a format boundary): moving it aside would silently drop the
+        // non-regenerable authoritative tables (owned/wanted/trakt_tokens/selection), violating the
+        // "never silently dropped" contract — so we fail loudly and let the operator back up /
+        // migrate rather than lose data.
         _ => false,
     };
     let msg = format!("open failed: {e}");
@@ -1680,6 +1690,13 @@ mod tests {
             ))),
             OpenFailure::Transient(_)
         ));
+        // An INTACT database in an older redb on-disk format (`UpgradeRequired`) must NOT be moved
+        // aside — its authoritative tables (owned/wanted/trakt_tokens/selection) are not regenerable,
+        // so we fail startup and let the operator back up / migrate rather than silently wipe them.
+        assert!(matches!(
+            db_open_failure(redb::DatabaseError::UpgradeRequired(1)),
+            OpenFailure::Transient(_)
+        ));
     }
 
     #[test]
@@ -1696,8 +1713,9 @@ mod tests {
 
     #[test]
     fn db_open_failure_recovers_only_on_genuine_corruption() {
-        // A non-redb / damaged file (redb returns Corrupted "Invalid magic number"), an old format,
-        // or an aborted repair are the only signals that justify moving the file aside.
+        // A non-redb / damaged file (redb returns Corrupted "Invalid magic number") or an aborted
+        // repair are the only signals that justify moving the file aside. NB `UpgradeRequired` is
+        // NOT here — it is an intact old-format DB (see the transient test above).
         assert!(matches!(
             db_open_failure(redb::DatabaseError::Storage(redb::StorageError::Corrupted(
                 "Invalid magic number".into()
@@ -1709,10 +1727,6 @@ mod tests {
             db_open_failure(redb::DatabaseError::Storage(redb::StorageError::Io(
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "bad header")
             ))),
-            OpenFailure::Corrupt(_)
-        ));
-        assert!(matches!(
-            db_open_failure(redb::DatabaseError::UpgradeRequired(1)),
             OpenFailure::Corrupt(_)
         ));
         assert!(matches!(
