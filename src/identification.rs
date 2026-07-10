@@ -543,14 +543,24 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     // 1. Remove common site prefixes and garbage at the start
     // Patterns like "[ site ] ", "( site )", "site.com - ", "d3us-", "m-", "Bond.50".
     // EXCEPT a leading "[Title] (YYYY)" whose brackets are part of the title (e.g. "[REC] (2007)").
-    if !TITLE_BRACKET_YEAR_RE.is_match(&title) {
-        if let Some(m) = PREFIX_RE.find(&title) {
-            // PREFIX_RE itself encodes the separator/known-prefix constraints; once it matches,
-            // strip the prefix and any leading non-alphanumeric run that follows it.
-            title = title[m.end()..]
-                .trim_start_matches(|c: char| !c.is_alphanumeric())
-                .to_string();
-        }
+    // Loop so a RUN of consecutive leading tags ("[Group][BD] Title") is fully stripped — a single
+    // pass removes only the first group and would leave the next tag's label glued on
+    // ("[Judas][BD] …" -> "BD] …"). Stripping the PREFIX_RE match (incl. its trailing \s*) each
+    // iteration keeps the next tag's opening bracket intact so it is recognised again.
+    let mut stripped_any_prefix = false;
+    while !TITLE_BRACKET_YEAR_RE.is_match(&title) {
+        let Some(m) = PREFIX_RE.find(&title) else {
+            break;
+        };
+        title = title[m.end()..].to_string();
+        stripped_any_prefix = true;
+    }
+    // Remove any leftover leading non-alphanumeric run, but only if we stripped a prefix AND we did
+    // not stop on a "[Title] (YYYY)" (whose leading '[' is title content, not junk).
+    if stripped_any_prefix && !TITLE_BRACKET_YEAR_RE.is_match(&title) {
+        title = title
+            .trim_start_matches(|c: char| !c.is_alphanumeric())
+            .to_string();
     }
 
     // 2. Initial cleanup: replace dots and underscores with spaces
@@ -957,6 +967,25 @@ mod tests {
         );
         // Regression: a leading parenthesised YEAR is STILL stripped.
         assert_eq!(clean_name("(2020) Tenet 1080p BluRay").0, "Tenet");
+    }
+
+    #[test]
+    fn clean_name_strips_a_run_of_leading_bracket_tags() {
+        // Consecutive leading tags ("[Group][BD] Title", common on anime releases) must ALL be
+        // stripped. A single-pass strip removed only the first group and left the second's label
+        // glued on ("[Judas][BD] …" -> "BD] …") unless the second happened to be a stopword.
+        assert_eq!(
+            clean_name("[Judas][BD] Cowboy Bebop 1999 1080p.mkv").0,
+            "Cowboy Bebop"
+        );
+        // Three consecutive bracket tags.
+        assert_eq!(
+            clean_name("[Erai-raws][1080p][HEVC] Attack on Titan 2013 1080p.mkv").0,
+            "Attack on Titan"
+        );
+        // Regression guard: a leading "[Title] (YYYY)" whose bracket is title content is still kept,
+        // even after a preceding release-group tag is stripped.
+        assert_eq!(clean_name("[Nyaa] [REC] (2007) 1080p.mkv").0, "[REC]");
     }
 
     #[test]
