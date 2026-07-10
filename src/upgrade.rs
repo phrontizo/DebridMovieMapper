@@ -843,12 +843,17 @@ async fn stage_episode_candidate(
     let hash = cand.info_hash.clone();
     let (torrent_id, fresh) = stage_and_await_cached(app, &hash).await?;
     let eps = crate::acquire::episode_files(&fresh);
-    // Adopt a per-episode release: the target (s,e) must be present, and the pack must not span
-    // other seasons (a multi-season pack is left to consolidation, not the per-episode path).
-    if eps.iter().any(|(s, _, _)| *s != season) {
+    // Adopt a per-episode release ONLY when it is a TRUE singleton for the target (season, episode):
+    // every parsed episode file must be exactly that episode. A multi-episode (or multi-season) pack
+    // is left to the consolidation / pack-correction paths — adopting it here would record it with
+    // provides=[(season, episode)] (truncated), hiding the pack's other episodes so `monitor_episodes`
+    // re-acquires them as duplicate singletons and consolidation treats the pack as a singleton. That
+    // is exactly the season-pack churn the `provides` mechanism exists to prevent. The per-episode
+    // caller falls through to the next-best candidate on this NoChange (in-tick fall-through).
+    if eps.iter().any(|(s, e, _)| *s != season || *e != episode) {
         let _ = app.provider.delete_torrent(&torrent_id).await;
         return Err(UpgradeSkip::NoChange(
-            "multi-season pack; not a per-episode candidate".into(),
+            "multi-episode/season pack; not a per-episode candidate".into(),
         ));
     }
     let Some((_, _, path)) = eps.iter().find(|(s, e, _)| *s == season && *e == episode) else {
@@ -5436,6 +5441,119 @@ mod tests {
         assert!(
             app.store.get_owned("eold720".into()).await.is_none(),
             "old singleton pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_episode_upgrade_rejects_multi_episode_pack() {
+        // A per-episode upgrade must NOT adopt a single-season MULTI-episode pack that merely
+        // CONTAINS the target episode: it would be recorded with provides=[(season, episode)] —
+        // truncating the pack's real episode set, hiding its other episodes (re-acquired as
+        // duplicate singletons) and reintroducing the season-pack churn `provides` prevents. The
+        // pack is left to the consolidation path; the per-episode slot must stay unchanged.
+        let store = mem_store();
+        let old = "eold720".to_string();
+        store
+            .put_owned(old.clone(), ep_record(1, 5, q720_web()))
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 5),
+                SelectionEntry {
+                    hash: old.clone(),
+                    file_path: "old.S01E05.720p.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The ONLY candidate is a single-season 1080p pack that contains E05 AND E06 (higher score
+        // than the owned 720p). Before the fix it was adopted with a truncated provides=[(1,5)].
+        let pack = RawCandidate {
+            name: "Show.S01.1080p.WEB".into(),
+            description: "WEB\nRD+".into(),
+            info_hash: "hpack".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![pack.clone()],
+        });
+
+        let mut by_id = std::collections::HashMap::new();
+        by_id.insert(
+            "hpack".to_string(),
+            TorrentInfo {
+                id: "hpack".into(),
+                hash: "hpack".into(),
+                status: "downloaded".into(),
+                files: vec![
+                    TorrentFile {
+                        id: 0,
+                        path: "Show.S01E05.1080p.mkv".into(),
+                        bytes: 2_000_000_000,
+                        selected: 1,
+                    },
+                    TorrentFile {
+                        id: 1,
+                        path: "Show.S01E06.1080p.mkv".into(),
+                        bytes: 2_000_000_000,
+                        selected: 1,
+                    },
+                ],
+                links: vec!["https://cdn/p0".into(), "https://cdn/p1".into()],
+                ..Default::default()
+            },
+        );
+
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "eold720".into(),
+                    hash: old.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "hpack".into(),
+                    hash: "hpack".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            torrent_info_by_id: by_id,
+            resolved_url: Some("https://cdn/p0".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        let deferred = upgrade_show_episodes_and_packs(
+            &app,
+            SHOW_TMDB,
+            std::slice::from_ref(&old),
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(!deferred, "rejecting a pack is not a deferral");
+        assert_eq!(
+            app.store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 5))
+                .await
+                .unwrap()
+                .hash,
+            old,
+            "E05 slot must stay on the singleton; a multi-episode pack is not a per-episode candidate"
+        );
+        assert!(
+            app.store.get_owned("hpack".into()).await.is_none(),
+            "multi-episode pack must not be adopted (would truncate provides to [(1,5)])"
+        );
+        assert!(
+            app.store.get_owned("eold720".into()).await.is_some(),
+            "old singleton kept — nothing better was adopted"
         );
     }
 }
