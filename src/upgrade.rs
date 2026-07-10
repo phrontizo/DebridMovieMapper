@@ -273,56 +273,6 @@ async fn apply_upgrade(
     Ok(())
 }
 
-/// Pick the best CACHED candidate that is a target improvement over `baseline`, skipping owned and
-/// blacklisted hashes. Applies the same hard filters as acquisition via `score()` (returns None for
-/// above-ceiling / cam / dead-seeder), then ranks the qualifying candidates best-score first
-/// (effective score == raw score here, since every candidate has already passed `score()`'s ceiling
-/// filter, so it is within the ceiling and unpenalised). Returns the release + its Improvement
-/// direction. Shared by the movie and episode paths.
-async fn pick_best_change(
-    app: &AppState,
-    media: MediaKind,
-    tmdb_id: u64,
-    raws: &[release::RawCandidate],
-    baseline: &QualitySummary,
-    owned_hashes: &[String],
-) -> Option<(release::ReleaseInfo, release::Improvement)> {
-    let prefs = &app.config.acquisition.prefs;
-    let mut best: Option<(release::ReleaseInfo, QualitySummary, release::Improvement)> = None;
-    for raw in raws {
-        let r = release::parse(raw);
-        if owned_hashes
-            .iter()
-            .any(|h| h.eq_ignore_ascii_case(&r.info_hash))
-        {
-            continue;
-        }
-        if app
-            .store
-            .is_blacklisted(media, tmdb_id, r.info_hash.clone())
-            .await
-        {
-            continue;
-        }
-        if release::score(&r, prefs).is_none() {
-            continue; // hard filters (ceiling/cam/dead-seeder) — never upgrade past the ceiling
-        }
-        let q = QualitySummary::of(&r, prefs);
-        let imp = release::is_target_improvement(baseline, &q, prefs);
-        if imp == release::Improvement::None {
-            continue;
-        }
-        let better = best
-            .as_ref()
-            .map(|(_, bq, _)| q.score > bq.score)
-            .unwrap_or(true);
-        if better {
-            best = Some((r, q, imp));
-        }
-    }
-    best.map(|(r, _, imp)| (r, imp))
-}
-
 /// Rank all CACHED target-improvement candidates best-score-first, skipping owned and blacklisted
 /// hashes and anything failing `score()`'s hard filters (ceiling / cam / dead-seeder). The caller
 /// stages them in order until one is adopted (in-tick fall-through), so a top candidate that fails a
@@ -1214,54 +1164,60 @@ async fn upgrade_show_episodes_and_packs(
             Ok(r) => r,
             Err(_) => continue, // transient; other episodes/packs/consolidation still run this tick
         };
-        let Some((cand, imp)) =
-            pick_best_change(app, MediaKind::Series, tmdb_id, &raws, &q, group_hashes).await
-        else {
-            continue;
-        };
-        if !downgrade_allowed_or_log(app, tmdb_id, imp, hash, &q, &cand) {
-            continue;
-        }
-        if !app.read_activity.all_idle(idle_window).await {
-            debug!(
-                "upgrade: tmdb {} library active; deferring remaining show upgrade work",
-                tmdb_id
-            );
-            // Stop ALL further staging (remaining episodes + pack correction) this tick — mirrors
-            // the library-wide idle gate in `run_upgrade_once`. Signal deferral so the caller
-            // leaves the cursor unstamped; consolidation's own idle re-check independently decides
-            // whether IT can still proceed.
-            return true;
-        }
-        match stage_episode_candidate(app, tmdb_id, &req, &cand, season, episode).await {
-            Ok((new_hash, tid, path)) => {
-                let _ = apply_upgrade(
-                    app,
-                    StagedUpgrade {
-                        hash: new_hash.clone(),
-                        torrent_id: tid,
-                        slot_files: vec![(
-                            crate::store::episode_slot(tmdb_id, season, episode),
-                            path,
-                        )],
-                    },
-                    std::slice::from_ref(hash),
-                    idle_window,
-                )
-                .await;
-                info!(
-                    "upgrade: tmdb {} s{}e{} swapped to {}",
-                    tmdb_id, season, episode, new_hash
-                );
+        let ranked = rank_changes(app, MediaKind::Series, tmdb_id, &raws, &q, group_hashes).await;
+        for (cand, imp) in ranked {
+            if !downgrade_allowed_or_log(app, tmdb_id, imp, hash, &q, &cand) {
+                break; // direction-homogeneous list → all remaining are gated downgrades
             }
-            Err(UpgradeSkip::Deferred(reason)) => debug!(
-                "upgrade: tmdb {} s{}e{} deferred: {}",
-                tmdb_id, season, episode, reason
-            ),
-            Err(UpgradeSkip::NoChange(reason)) => debug!(
-                "upgrade: tmdb {} s{}e{} no change: {}",
-                tmdb_id, season, episode, reason
-            ),
+            if !app.read_activity.all_idle(idle_window).await {
+                debug!(
+                    "upgrade: tmdb {} library active; deferring remaining show upgrade work",
+                    tmdb_id
+                );
+                // Stop ALL further staging (remaining episodes + pack correction) this tick and
+                // signal deferral so the caller leaves the cursor unstamped (unchanged behaviour).
+                return true;
+            }
+            match stage_episode_candidate(app, tmdb_id, &req, &cand, season, episode).await {
+                Ok((new_hash, tid, path)) => {
+                    let _ = apply_upgrade(
+                        app,
+                        StagedUpgrade {
+                            hash: new_hash.clone(),
+                            torrent_id: tid,
+                            slot_files: vec![(
+                                crate::store::episode_slot(tmdb_id, season, episode),
+                                path,
+                            )],
+                        },
+                        std::slice::from_ref(hash),
+                        idle_window,
+                    )
+                    .await;
+                    info!(
+                        "upgrade: tmdb {} s{}e{} swapped to {}",
+                        tmdb_id, season, episode, new_hash
+                    );
+                    break; // episode upgraded → move to the next episode
+                }
+                // Candidate-specific reject → try the next-best candidate for THIS episode.
+                Err(UpgradeSkip::NoChange(reason)) => {
+                    debug!(
+                        "upgrade: tmdb {} s{}e{} no change: {}",
+                        tmdb_id, season, episode, reason
+                    );
+                    continue;
+                }
+                // Transient glitch on this episode → give up this episode this tick (move to the
+                // next episode), matching the prior per-episode fire-and-forget behaviour.
+                Err(UpgradeSkip::Deferred(reason)) => {
+                    debug!(
+                        "upgrade: tmdb {} s{}e{} deferred: {}",
+                        tmdb_id, season, episode, reason
+                    );
+                    break;
+                }
+            }
         }
     }
 
@@ -5360,6 +5316,126 @@ mod tests {
         assert!(
             store.get_owned("hep1080".into()).await.is_none(),
             "candidate not recorded owned"
+        );
+    }
+
+    /// Owns S1E1 as a cached 720p singleton; the scrape's top-scored candidate resolves to a pack
+    /// whose files are S01E02 only (lacks the target episode E1 → `NoChange`), and the next-best is
+    /// a clean S01E01 1080p release. The per-episode loop must fall through the wrong candidate and
+    /// adopt the good one within the same tick.
+    #[tokio::test]
+    async fn episode_upgrade_falls_through_missing_episode_to_next_candidate() {
+        let store = mem_store();
+        let old = "eold720".to_string();
+        store
+            .put_owned(old.clone(), ep_record(1, 1, q720_web()))
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 1),
+                SelectionEntry {
+                    hash: old.clone(),
+                    file_path: "old.S01E01.720p.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let wrong = RawCandidate {
+            name: "Show.S01E02.1080p.REMUX".into(),
+            description: "REMUX\nRD+".into(),
+            info_hash: "hwrong".into(),
+            file_idx: None,
+            file_name: None,
+        }; // higher score, wrong episode
+        let good = RawCandidate {
+            name: "Show.S01E01.1080p.WEB".into(),
+            description: "WEB\nRD+".into(),
+            info_hash: "hgood".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![wrong.clone(), good.clone()],
+        });
+
+        let mut by_id = std::collections::HashMap::new();
+        by_id.insert(
+            "hwrong".to_string(),
+            TorrentInfo {
+                id: "hwrong".into(),
+                hash: "hwrong".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "Show.S01E02.1080p.mkv".into(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/w0".into()],
+                ..Default::default()
+            },
+        );
+        by_id.insert(
+            "hgood".to_string(),
+            TorrentInfo {
+                id: "hgood".into(),
+                hash: "hgood".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "Show.S01E01.1080p.mkv".into(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/g0".into()],
+                ..Default::default()
+            },
+        );
+
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "eold720".into(),
+                    hash: old.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "hgood".into(),
+                    hash: "hgood".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            torrent_info_by_id: by_id,
+            resolved_url: Some("https://cdn/g0".into()),
+            deleted: Arc::new(std::sync::Mutex::new(Vec::new())),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        let deferred = upgrade_show_episodes_and_packs(
+            &app,
+            SHOW_TMDB,
+            std::slice::from_ref(&old),
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(!deferred, "adopting a candidate is not a deferral");
+        assert_eq!(
+            app.store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            "hgood",
+            "episode slot repointed to the correct-episode candidate"
+        );
+        assert!(
+            app.store.get_owned("eold720".into()).await.is_none(),
+            "old singleton pruned"
         );
     }
 }
