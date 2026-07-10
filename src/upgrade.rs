@@ -691,6 +691,21 @@ async fn base_req_provenance(
         .unwrap_or_else(crate::store::Provenance::manual)
 }
 
+/// The merged sticky provenance across a group's owned records — the same value
+/// `base_req_provenance` recovers, but computed from records the caller ALREADY holds instead of
+/// re-scanning the entire `owned` table. `owned` is always the full group here (the show paths build
+/// it from `group_hashes`), so the merge is identical; a group is never empty on these paths (we are
+/// upgrading owned content), so no `manual()` fallback is needed.
+fn merged_provenance(owned: &[(String, OwnedRecord)]) -> crate::store::Provenance {
+    let mut prov = crate::store::Provenance {
+        entries: Vec::new(),
+    };
+    for (_, r) in owned {
+        prov.merge(&r.provenance);
+    }
+    prov
+}
+
 /// Inputs to the pure consolidation decision for ONE season.
 #[derive(Debug, Clone)]
 pub struct ConsolidationInput {
@@ -871,6 +886,7 @@ async fn stage_episode_candidate(
     cand: &release::ReleaseInfo,
     season: u32,
     episode: u32,
+    group_prov: &crate::store::Provenance,
 ) -> Result<(String, String, String), UpgradeSkip> {
     let hash = cand.info_hash.clone();
     let (torrent_id, fresh) = stage_and_await_cached(app, &hash).await?;
@@ -948,7 +964,7 @@ async fn stage_episode_candidate(
             return Err(UpgradeSkip::Deferred("probe deferred".into()));
         }
     }
-    let prov = base_req_provenance(app, MediaType::Show, tmdb_id).await;
+    let prov = group_prov.clone();
     let _ = app
         .store
         .put_owned(
@@ -989,6 +1005,8 @@ async fn correct_over_ceiling_packs(
     let prefs = &app.config.acquisition.prefs;
     let ceiling = prefs.max_resolution.height();
     let owned_hashes: Vec<String> = owned.iter().map(|(h, _)| h.clone()).collect();
+    // Merge the group's provenance once from the records in hand (no per-pack owned-table re-scan).
+    let group_prov = merged_provenance(owned);
     for (pack_hash, rec) in owned.iter().filter(|(_, r)| r.provides.len() > 1) {
         let Some(pack_q) = rec.quality.clone() else {
             continue; // untagged → no baseline, skip
@@ -1096,7 +1114,7 @@ async fn correct_over_ceiling_packs(
                     continue;
                 }
             }
-            let prov = base_req_provenance(app, MediaType::Show, tmdb_id).await;
+            let prov = group_prov.clone();
             let base_req = crate::store::AcquireRequest {
                 imdb_id: imdb_id.to_string(),
                 ..rec.request.clone()
@@ -1189,6 +1207,9 @@ async fn upgrade_show_episodes_and_packs(
     let Some(imdb_id) = group_imdb_id(app, group_hashes).await else {
         return false;
     };
+    // Merge the group's sticky provenance ONCE from the records already fetched above, instead of
+    // re-scanning the whole owned table per staged episode (see `merged_provenance`).
+    let group_prov = merged_provenance(&owned);
 
     // (a) Per-singleton-episode upgrade/downgrade.
     for (hash, rec) in owned.iter().filter(|(_, r)| r.provides.len() == 1) {
@@ -1224,7 +1245,9 @@ async fn upgrade_show_episodes_and_packs(
                 // signal deferral so the caller leaves the cursor unstamped (unchanged behaviour).
                 return true;
             }
-            match stage_episode_candidate(app, tmdb_id, &req, &cand, season, episode).await {
+            match stage_episode_candidate(app, tmdb_id, &req, &cand, season, episode, &group_prov)
+                .await
+            {
                 Ok((new_hash, tid, path)) => {
                     match apply_upgrade(
                         app,
@@ -1389,8 +1412,9 @@ async fn consolidate_show_seasons(
         ));
     }
 
-    // Fix B: hoist provenance scan outside the per-season loop (one DB scan per title, not per season).
-    let prov = base_req_provenance(app, MediaType::Show, tmdb_id).await;
+    // Fix B: hoist provenance merge outside the per-season loop. Merged from the `owned` records
+    // already in hand (no `owned`-table re-scan) — see `merged_provenance`.
+    let prov = merged_provenance(owned);
     for season in seasons {
         let season_aired = crate::tasks::season_aired(aired, season);
         if season_aired.is_empty() {
