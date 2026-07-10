@@ -217,14 +217,12 @@ pub struct AcquisitionEngine {
     validate_fails: Arc<Mutex<HashMap<String, u32>>>,
 }
 
-/// The single target media file for a candidate: the addon's named/index file, else the largest
-/// video. Used both to choose what to select and to identify the served file afterwards — the
-/// latter matters because some providers (TorBox) auto-select *every* file, so "first selected"
-/// is not the video (it could be a `.srt`/`.nfo`).
-/// The representative video for a movie request: the largest video file (the feature). `acquire`
-/// and `observe` must agree on this (B10) — a misleading addon file hint/index would have diverged
-/// them (one selecting a sample, the other the feature → a broken locator / stuck Pending) — so
-/// neither passes a hint and the largest video is always taken.
+/// The representative video for a movie request: the largest video file (the feature). Used both to
+/// choose what to select and to identify the served file afterwards — the latter matters because
+/// some providers (TorBox) auto-select *every* file, so "first selected" is not the video (it could
+/// be a `.srt`/`.nfo`). `acquire` and `observe` must agree on this (B10) — a misleading addon file
+/// hint/index would have diverged them (one selecting a sample, the other the feature → a broken
+/// locator / stuck Pending) — so neither passes a hint and the largest video is always taken.
 fn select_target(info: &TorrentInfo) -> Option<&crate::rd_client::TorrentFile> {
     info.files
         .iter()
