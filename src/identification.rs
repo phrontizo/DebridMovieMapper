@@ -42,7 +42,10 @@ static STOP_RE: LazyLock<Regex> = LazyLock::new(|| {
     // Country" → "The"). When such a token is a genuine release tag it is followed by a real metadata
     // token (resolution/codec/source) that truncates instead; when it is a title word the query keeps
     // it, which TMDB's fuzzy scoring tolerates — exactly as for the ISO codes above.
-    Regex::new(r"(?i)\b(1080p|720p|2160p|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d+x\d+|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web-dl|h264|h265|x264|x265|remux|vff|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack)\b").unwrap()
+    // The resolution alternatives accept an optional 2-3 digit framerate suffix
+    // (`1080p60`/`2160p50`) so a framerate-glued quality tag still truncates the title rather than
+    // leaking into the TMDB query — mirroring the same fix on `release::RES_RE`.
+    Regex::new(r"(?i)\b(1080p(?:\d{2,3})?|720p(?:\d{2,3})?|2160p(?:\d{2,3})?|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d+x\d+|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web-dl|h264|h265|x264|x265|remux|vff|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack)\b").unwrap()
 });
 
 static YEAR_RANGE_RE: LazyLock<Regex> =
@@ -935,6 +938,16 @@ mod tests {
         // A hyphenated title without the episode-number pattern is unaffected.
         assert_eq!(
             clean_name("Spider-Man - Far From Home 1080p").0,
+            "Spider-Man - Far From Home"
+        );
+    }
+
+    #[test]
+    fn clean_name_truncates_at_framerate_suffixed_resolution() {
+        // A framerate-glued quality tag ("2160p60"/"1080p50") is still metadata and must
+        // truncate the title, not leak into the TMDB query (mirrors the RES_RE framerate fix).
+        assert_eq!(
+            clean_name("Spider-Man - Far From Home 2160p60 WEB-DL").0,
             "Spider-Man - Far From Home"
         );
     }

@@ -85,8 +85,13 @@ pub struct ReleaseInfo {
     pub source: Source,
 }
 
+// An optional 2-3 digit framerate suffix (`(?:\d{2,3})?`) is tolerated after the `p` so a
+// framerate-glued token like "2160p60"/"1080p50" is still recognised as its base resolution.
+// Without it those tokens matched nothing → `resolution: None`, and `score` lets a None-resolution
+// release THROUGH the ceiling check, silently bypassing the `MAX_RESOLUTION` hard-filter. The
+// trailing `\b` still rejects "1080part" (the empty framerate match leaves `p`→`a`, no boundary).
 static RES_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(\d{3,4})p\b|\b(4k|uhd)\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\b(\d{3,4})p(?:\d{2,3})?\b|\b(4k|uhd)\b").unwrap());
 static SIZE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)([\d.]+)\s*(gb|mb)").unwrap());
 static SEED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{1f464}\s*(\d+)").unwrap());
 
@@ -510,6 +515,24 @@ mod tests {
         assert_eq!(r.seeders, Some(42));
         assert!(r.cached);
         assert_eq!(r.container, Container::Mkv);
+    }
+
+    #[test]
+    fn framerate_suffixed_resolution_is_still_parsed_and_ceiling_filtered() {
+        // A framerate-glued resolution token ("2160p60") must still be read as 2160 so the
+        // MAX_RESOLUTION hard-filter can exclude it — otherwise `resolution: None` lets an
+        // over-ceiling 4K release through the ceiling check (see `score`). The clean Torrentio
+        // `name` line is deliberately omitted here so only the description-side token is available.
+        let c = raw(
+            "Torrentio",
+            "Movie.2023.2160p60.WEB-DL.x265-GRP\n\u{1f4be} 30 GB \u{1f464} 9\nRD+",
+            "fps",
+            Some("Movie.2023.2160p60.WEB-DL.x265-GRP.mkv"),
+        );
+        let r = parse(&c);
+        assert_eq!(r.resolution, Some(2160), "2160p60 must parse as 2160");
+        // Excluded at a 1080 ceiling.
+        assert_eq!(score(&r, &prefs()), None);
     }
 
     #[test]
