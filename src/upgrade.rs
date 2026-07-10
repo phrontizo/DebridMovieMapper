@@ -1097,7 +1097,7 @@ async fn correct_over_ceiling_packs(
                 .filter(|(s, _, _)| *s == season)
                 .map(|(s, e, p)| (crate::store::episode_slot(tmdb_id, *s, *e), p.clone()))
                 .collect();
-            let _ = apply_upgrade(
+            match apply_upgrade(
                 app,
                 StagedUpgrade {
                     hash: cand.info_hash.clone(),
@@ -1107,12 +1107,21 @@ async fn correct_over_ceiling_packs(
                 std::slice::from_ref(pack_hash),
                 idle_window,
             )
-            .await;
-            info!(
-                "upgrade: tmdb {} s{} pack corrected to within-ceiling {}",
-                tmdb_id, season, cand.info_hash
-            );
-            break; // one correction per pack per tick
+            .await
+            {
+                Ok(()) => {
+                    info!(
+                        "upgrade: tmdb {} s{} pack corrected to within-ceiling {}",
+                        tmdb_id, season, cand.info_hash
+                    );
+                    break; // one correction per pack per tick
+                }
+                // apply_upgrade already rolled back the staged pack. A post-stage defer (library
+                // became active, or the prune listing/selection write failed) must propagate so the
+                // caller leaves the round-robin cursor unstamped and this pack is reconsidered next
+                // tick — NOT swallowed as a false "pack corrected".
+                Err(_) => return true,
+            }
         }
     }
     false // completed the pass without a mid-tick library-active defer
@@ -1185,7 +1194,7 @@ async fn upgrade_show_episodes_and_packs(
             }
             match stage_episode_candidate(app, tmdb_id, &req, &cand, season, episode).await {
                 Ok((new_hash, tid, path)) => {
-                    let _ = apply_upgrade(
+                    match apply_upgrade(
                         app,
                         StagedUpgrade {
                             hash: new_hash.clone(),
@@ -1198,12 +1207,21 @@ async fn upgrade_show_episodes_and_packs(
                         std::slice::from_ref(hash),
                         idle_window,
                     )
-                    .await;
-                    info!(
-                        "upgrade: tmdb {} s{}e{} swapped to {}",
-                        tmdb_id, season, episode, new_hash
-                    );
-                    break; // episode upgraded → move to the next episode
+                    .await
+                    {
+                        Ok(()) => {
+                            info!(
+                                "upgrade: tmdb {} s{}e{} swapped to {}",
+                                tmdb_id, season, episode, new_hash
+                            );
+                            break; // episode upgraded → move to the next episode
+                        }
+                        // apply_upgrade already rolled back the staged copy. A post-stage defer
+                        // (library became active, or the prune listing/selection write failed) must
+                        // propagate so the caller leaves the round-robin cursor unstamped and this
+                        // work is reconsidered next tick — NOT swallowed as a false "swapped".
+                        Err(_) => return true,
+                    }
                 }
                 // Candidate-specific reject → try the next-best candidate for THIS episode.
                 Err(UpgradeSkip::NoChange(reason)) => {
@@ -5554,6 +5572,222 @@ mod tests {
         assert!(
             app.store.get_owned("eold720".into()).await.is_some(),
             "old singleton kept — nothing better was adopted"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_episode_upgrade_propagates_apply_upgrade_defer() {
+        // F7: the per-episode loop discarded apply_upgrade's result. If the prune listing is
+        // unavailable (or the library became active) AFTER staging, apply_upgrade rolls back and
+        // returns Deferred — the loop must PROPAGATE that (return true → round-robin cursor left
+        // unstamped, reconsidered next tick), not swallow it and log a false "swapped". Force the
+        // deferral deterministically via a listing-fetch failure (fetched only after staging).
+        let store = mem_store();
+        let old = "e1old720".to_string();
+        store
+            .put_owned(old.clone(), ep_record(1, 1, q720_web()))
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 1),
+                SelectionEntry {
+                    hash: old.clone(),
+                    file_path: "old.S01E01.720p.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let cand = RawCandidate {
+            name: "Show.S01E01.1080p.WEB".into(),
+            description: "WEB\nRD+".into(),
+            info_hash: "hnew1080".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![cand],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            fail_get_torrents: true, // the prune listing (fetched only AFTER staging) → apply_upgrade defers
+            add_magnet: Some(AddMagnetResponse {
+                id: "tnew1080".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tnew1080".into(),
+                hash: "hnew1080".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "Show.S01E01.1080p.mkv".into(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/n0".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/n0".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        let deferred = upgrade_show_episodes_and_packs(
+            &app,
+            SHOW_TMDB,
+            std::slice::from_ref(&old),
+            Duration::from_secs(0),
+        )
+        .await;
+
+        assert!(
+            deferred,
+            "apply_upgrade Deferred on the per-episode path must propagate (cursor left unstamped)"
+        );
+        assert_eq!(
+            app.store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            old,
+            "selection unchanged after apply_upgrade rollback"
+        );
+        assert!(
+            app.store.get_owned("e1old720".into()).await.is_some(),
+            "old singleton kept"
+        );
+        assert!(
+            app.store.get_owned("hnew1080".into()).await.is_none(),
+            "staged candidate not recorded (rolled back)"
+        );
+        assert!(
+            deleted.lock().unwrap().contains(&"tnew1080".to_string()),
+            "staged torrent dropped on rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_ceiling_pack_correction_propagates_apply_upgrade_defer() {
+        // F7: correct_over_ceiling_packs discarded apply_upgrade's result the same way. On a
+        // post-staging Deferred it must return true (propagate the defer, leave the cursor unstamped
+        // and the over-ceiling pack intact for a retry) rather than log a false "pack corrected".
+        let store = mem_store();
+        let pack_hash = "pack2160".to_string();
+        let rec = OwnedRecord {
+            request: AcquireRequest {
+                imdb_id: "tt9".into(),
+                tmdb_id: SHOW_TMDB,
+                kind: MediaKind::Series,
+                season: Some(1),
+                episode: Some(1),
+                original_language: Some("eng".into()),
+                metadata: show_meta(),
+            },
+            provenance: Provenance::watchlist("a"),
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides: vec![(1, 1), (1, 2)],
+            quality: Some(q2160_remux()),
+        };
+        store.put_owned(pack_hash.clone(), rec).await.unwrap();
+        for (s, e, path) in [
+            (1u32, 1u32, "S.S01E01.2160p.mkv"),
+            (1, 2, "S.S01E02.2160p.mkv"),
+        ] {
+            store
+                .put_selection(
+                    crate::store::episode_slot(SHOW_TMDB, s, e),
+                    SelectionEntry {
+                        hash: pack_hash.clone(),
+                        file_path: path.into(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let cand = RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "S.2019.S01.1080p.BluRay.x265\nRD+".into(),
+            info_hash: "hpack1080".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![cand],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            fail_get_torrents: true, // the prune listing (fetched only AFTER staging) → apply_upgrade defers
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack1080".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tpack1080".into(),
+                hash: "hpack1080".into(),
+                status: "downloaded".into(),
+                files: vec![
+                    TorrentFile {
+                        id: 0,
+                        path: "S.S01E01.1080p.BluRay.mkv".into(),
+                        bytes: 2_000_000_000,
+                        selected: 1,
+                    },
+                    TorrentFile {
+                        id: 1,
+                        path: "S.S01E02.1080p.BluRay.mkv".into(),
+                        bytes: 2_000_000_000,
+                        selected: 1,
+                    },
+                ],
+                links: vec!["https://cdn/np1".into(), "https://cdn/np2".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/np1".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = {
+            let mut a = app_with(scraper, provider, store.clone());
+            let mut cfg = (*a.config).clone();
+            cfg.allow_resolution_downgrade = true; // permit the corrective downgrade
+            a.config = Arc::new(cfg);
+            a
+        };
+
+        let deferred = upgrade_show_episodes_and_packs(
+            &app,
+            SHOW_TMDB,
+            std::slice::from_ref(&pack_hash),
+            Duration::from_secs(0),
+        )
+        .await;
+
+        assert!(
+            deferred,
+            "apply_upgrade Deferred during pack correction must propagate (cursor left unstamped)"
+        );
+        assert!(
+            app.store.get_owned(pack_hash.clone()).await.is_some(),
+            "over-ceiling pack kept intact for retry (rollback)"
+        );
+        assert!(
+            app.store.get_owned("hpack1080".into()).await.is_none(),
+            "staged replacement not recorded (rolled back)"
+        );
+        assert_eq!(
+            app.store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            pack_hash,
+            "E01 slot unchanged after rollback"
         );
     }
 }
