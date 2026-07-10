@@ -16,7 +16,7 @@ use tokio::sync::RwLock;
 pub const BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
 /// Maximum single CDN fetch to prevent unbounded memory growth (16 MB)
-const MAX_FETCH_SIZE: usize = 16 * 1024 * 1024;
+pub const MAX_FETCH_SIZE: usize = 16 * 1024 * 1024;
 
 /// Parse the start byte from a `Content-Range: bytes <start>-<end>/<total>` header value.
 /// `None` for an absent/unparseable value (callers then tolerate it rather than reject).

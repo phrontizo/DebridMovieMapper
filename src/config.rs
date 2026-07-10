@@ -525,7 +525,7 @@ const CDN_FIRST_READ_MB_MAX: u64 = 16;
 // bound must not exceed the per-fetch cap. A future change to `dav_fs::BUFFER_SIZE` that broke the
 // first of these would fail the build here rather than silently mis-sizing the first read.
 const _: () = assert!(CDN_FIRST_READ_MB_MIN * 1024 * 1024 == crate::dav_fs::BUFFER_SIZE as u64);
-const _: () = assert!(CDN_FIRST_READ_MB_MAX == 16);
+const _: () = assert!(CDN_FIRST_READ_MB_MAX * 1024 * 1024 <= crate::dav_fs::MAX_FETCH_SIZE as u64);
 const _: () = assert!(
     CDN_FIRST_READ_MB_DEFAULT >= CDN_FIRST_READ_MB_MIN
         && CDN_FIRST_READ_MB_DEFAULT <= CDN_FIRST_READ_MB_MAX
