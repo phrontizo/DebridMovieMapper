@@ -33,7 +33,14 @@ static STOP_RE: LazyLock<Regex> = LazyLock::new(|| {
     // NOT stop words — they collide with real standalone title words ("Spa Night", "Pol Pot") and
     // would truncate/mangle the TMDB query. Audio/subtitle language is verified by `probe`, not by
     // filename cleaning, so dropping them costs nothing in identification value.
-    Regex::new(r"(?i)\b(1080p|720p|2160p|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d+x\d+|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web-dl|h264|h265|x264|x265|remux|multi|vff|custom|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack|completa|complete)\b").unwrap()
+    //
+    // For the SAME reason, the pack/label words `complete`/`completa`/`custom`/`multi` are NOT stop
+    // words: they collide with real title words, so as a leftmost-match TRUNCATION point they wrongly
+    // discarded the rest of a legitimate title (e.g. "A Complete Unknown" → "A", "The Custom of the
+    // Country" → "The"). When such a token is a genuine release tag it is followed by a real metadata
+    // token (resolution/codec/source) that truncates instead; when it is a title word the query keeps
+    // it, which TMDB's fuzzy scoring tolerates — exactly as for the ISO codes above.
+    Regex::new(r"(?i)\b(1080p|720p|2160p|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d+x\d+|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web-dl|h264|h265|x264|x265|remux|vff|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack)\b").unwrap()
 });
 
 static YEAR_RANGE_RE: LazyLock<Regex> =
@@ -593,7 +600,7 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
         }
     }
     // If stripping consumed the whole title, the leading "stop word" was actually the title
-    // itself (e.g. a film literally named "Multi"/"Custom"/"Complete"). Restore it rather
+    // itself (e.g. a film literally named after a metadata token like "Remux"). Restore it rather
     // than emit an empty title that cannot be searched.
     if title.is_empty() {
         title = title_before_stopwords;
@@ -923,6 +930,26 @@ mod tests {
         assert_eq!(clean_name("Custom").0, "Custom");
         // Normal trailing-metadata stripping is unaffected.
         assert_eq!(clean_name("The Matrix 1080p").0, "The Matrix");
+    }
+
+    #[test]
+    fn clean_name_keeps_titles_containing_ambiguous_pack_words() {
+        // Pack/label words that COLLIDE with real title words (complete/completa/custom/multi) must
+        // not truncate a legitimate title mid-word — exactly the reason the 3-letter ISO codes are
+        // excluded from STOP_RE. Regression: STOP_RE's leftmost match on "Complete" truncated the
+        // 2024 film "A Complete Unknown" to "A" (a 1-char short title that then fails identification).
+        let (title, year) = clean_name("A.Complete.Unknown.2024.1080p.BluRay.x264.mkv");
+        assert_eq!(title, "A Complete Unknown");
+        assert_eq!(year.as_deref(), Some("2024"));
+        // "custom" mid-title (the film "The Custom of the Country") — same truncation path.
+        assert_eq!(
+            clean_name("The Custom of the Country 2019 1080p").0,
+            "The Custom of the Country"
+        );
+        // Spanish "completa" as a title word.
+        assert_eq!(clean_name("Vida Completa 2018 1080p").0, "Vida Completa");
+        // A trailing resolution/codec token still truncates (the ambiguous words no longer shadow it).
+        assert_eq!(clean_name("The Matrix 1080p MULTI").0, "The Matrix");
     }
 
     #[test]
