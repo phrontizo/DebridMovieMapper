@@ -49,12 +49,14 @@ static YEAR_RANGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(19|20)\d{2}[\s-]+(19|20)\d{2}\b").unwrap());
 
 // Word-anchored show markers. The looser alternatives are bounded so a movie filename does not
-// trip them: `\b\d{1,2}x\d{1,3}\b` (episode form like 1x01) excludes a resolution such as
-// 1920x1080, and `\be\d{1,3}\b` (episode marker E05) excludes embedded matches like the `e7` in
-// "Se7en". The SxxExx alternative is leading-`\b`-anchored but intentionally NOT trailing-anchored,
-// so contiguous multi-episode and version markers (S01E01E02, S01E13v2) still match.
+// trip them: `\b\d{1,2}x\d{2,3}\b` (episode form like 1x01) excludes a resolution such as
+// 1920x1080 (via the 1-2-digit first number) AND an aspect-ratio tag such as 16x9 / 4x3 / 21x9
+// (via requiring a ZERO-PADDED ≥2-digit episode number — a real NxM episode is 1x01, not 1x9),
+// and `\be\d{1,3}\b` (episode marker E05) excludes embedded matches like the `e7` in "Se7en". The
+// SxxExx alternative is leading-`\b`-anchored but intentionally NOT trailing-anchored, so
+// contiguous multi-episode and version markers (S01E01E02, S01E13v2) still match.
 static SHOW_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bs\d+\.?e\d+|\bs\d+\b|\b\d{1,2}x\d{1,3}\b|\bseasons?\s*\d+|\b\d+\s*seasons?|\btemporada\s*\d+|\bsaison\s*\d+|\be\d{1,3}\b").unwrap()
+    Regex::new(r"(?i)\bs\d+\.?e\d+|\bs\d+\b|\b\d{1,2}x\d{2,3}\b|\bseasons?\s*\d+|\b\d+\s*seasons?|\btemporada\s*\d+|\bsaison\s*\d+|\be\d{1,3}\b").unwrap()
 });
 
 static GENERIC_RE: LazyLock<Regex> =
@@ -1980,11 +1982,15 @@ mod tests {
     #[test]
     fn is_show_guess_does_not_misclassify_movies() {
         // A resolution (1920x1080) must not trip the NxM episode form, and an embedded `e7`
-        // (Se7en) must not trip the lone-episode form.
+        // (Se7en) must not trip the lone-episode form. Aspect-ratio tags (16x9 / 4x3 / 21x9)
+        // must likewise not trip it — their single-digit second number isn't a zero-padded episode.
         for name in [
             "Se7en.1995.1080p.BluRay.x264.mkv",
             "Movie.1920x1080.HDR.mkv",
             "Code8.2019.2160p.mkv",
+            "Some.Movie.2001.16x9.DVDRip.mkv",
+            "Old.Cartoon.4x3.mkv",
+            "Ultrawide.Film.21x9.mkv",
         ] {
             assert!(
                 !is_show_guess(&one_file(name)),
