@@ -501,6 +501,11 @@ pub struct Config {
     /// finish-removal candidates (a preview) without removing. Set `REMOVE_FINISHED_SHOWS=true` to
     /// enable removal once the logged candidates have been reviewed.
     pub remove_finished_shows: bool,
+    /// When `true`, the upgrade engine may perform a CORRECTIVE DOWNGRADE — replacing an owned copy
+    /// that is now above `MAX_RESOLUTION` with a ceiling-conforming cached release (deleting the
+    /// higher-res copy). Default `false` only *logs* the planned downgrades (a preview). Pure quality
+    /// upgrades are unaffected by this flag. Mirrors `DEDUP_REMOVE_DUPLICATES` / `REMOVE_FINISHED_SHOWS`.
+    pub allow_resolution_downgrade: bool,
     /// Size (bytes) of the FIRST read-ahead fetch when a media file is opened — front-loads the
     /// container header + early index so a player's open/ffprobe burst needs fewer cold CDN
     /// round-trips before playback. Subsequent reads use the normal `BUFFER_SIZE` (2 MB) window.
@@ -560,6 +565,10 @@ impl std::fmt::Debug for Config {
             .field("upgrade", &self.upgrade)
             .field("dedup_remove_duplicates", &self.dedup_remove_duplicates)
             .field("remove_finished_shows", &self.remove_finished_shows)
+            .field(
+                "allow_resolution_downgrade",
+                &self.allow_resolution_downgrade,
+            )
             .field("cdn_first_read_bytes", &self.cdn_first_read_bytes)
             .finish()
     }
@@ -585,7 +594,7 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Apply the two household-policy flags from a name→value `lookup`. Factored out of `from_env` so
+    /// Apply the three household-policy flags from a name→value `lookup`. Factored out of `from_env` so
     /// the env-NAME → field wiring is unit-testable WITHOUT mutating the process environment (a
     /// name swap would silently enable destructive duplicate deletion when the operator meant
     /// finished-show removal). Each flag delegates to the crate-wide boolean parser, so it accepts the
@@ -595,6 +604,8 @@ impl Config {
             AcquisitionConfig::parse_bool(lookup("DEDUP_REMOVE_DUPLICATES"), false);
         self.remove_finished_shows =
             AcquisitionConfig::parse_bool(lookup("REMOVE_FINISHED_SHOWS"), false);
+        self.allow_resolution_downgrade =
+            AcquisitionConfig::parse_bool(lookup("ALLOW_RESOLUTION_DOWNGRADE"), false);
     }
 
     /// Pure construction from raw optional values — unit-testable without touching
@@ -667,6 +678,7 @@ impl Config {
             upgrade: UpgradeConfig::default(),
             dedup_remove_duplicates: false,
             remove_finished_shows: false,
+            allow_resolution_downgrade: false,
             // Default window; `from_env` overrides from `CDN_FIRST_READ_MB`. (Not a `from_parts`
             // parameter — it's a perf knob, not part of the core provider/port/db wiring.)
             cdn_first_read_bytes: CDN_FIRST_READ_MB_DEFAULT * 1024 * 1024,
@@ -1191,9 +1203,23 @@ mod tests {
             c.remove_finished_shows,
             "REMOVE_FINISHED_SHOWS → remove_finished_shows"
         );
-        // Unset → both default false.
+        // ALLOW_RESOLUTION_DOWNGRADE wires to allow_resolution_downgrade (and nothing else).
+        c.apply_household_flags(|n| {
+            (n == "ALLOW_RESOLUTION_DOWNGRADE").then(|| "true".to_string())
+        });
+        assert!(
+            c.allow_resolution_downgrade,
+            "ALLOW_RESOLUTION_DOWNGRADE → allow_resolution_downgrade"
+        );
+        assert!(
+            !c.dedup_remove_duplicates && !c.remove_finished_shows,
+            "ALLOW_RESOLUTION_DOWNGRADE must not enable the other household flags"
+        );
+        // Unset → all default false.
         c.apply_household_flags(|_| None);
-        assert!(!c.dedup_remove_duplicates && !c.remove_finished_shows);
+        assert!(
+            !c.dedup_remove_duplicates && !c.remove_finished_shows && !c.allow_resolution_downgrade
+        );
     }
 
     #[test]
