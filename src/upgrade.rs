@@ -1465,6 +1465,16 @@ async fn consolidate_show_seasons(
                 continue;
             }
 
+            // Pre-stage idle gate (mirrors the movie / per-episode / pack-correction paths): don't
+            // add + select + probe (a 4 MB CDN fetch) a pack that the post-stage idle re-check would
+            // only roll back if the library went active. This also short-circuits the wasted staging
+            // when the per-episode phase already deferred this tick for the same reason.
+            if !app.read_activity.all_idle(idle_window).await {
+                return Err(UpgradeSkip::Deferred(
+                    "library active; skip consolidation staging".into(),
+                ));
+            }
+
             // Stage: add + resolve + SE-map files.
             let magnet = format!("magnet:?xt=urn:btih:{}", r.info_hash);
             let Ok(added) = app.provider.add_magnet(&magnet).await else {
@@ -4612,9 +4622,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn show_consolidation_drops_staged_pack_when_library_active() {
-        // The pack stages, but a read begins in the library before the idle gate → the staged pack is
-        // dropped (no dangling stage) and the operation deferred; per-episode content stays intact.
+    async fn show_consolidation_skips_staging_when_library_active() {
+        // The library is active BEFORE staging, so the pre-stage idle gate defers immediately: the
+        // pack is never added/selected/probed (no wasted provider work + CDN probe that a later idle
+        // gate would only roll back), and per-episode content stays intact. Mirrors the movie /
+        // per-episode / pack-correction paths, which all idle-check before staging.
         let store = mem_store();
         seed_two_scattered_episodes(&store).await;
         let scraper = Arc::new(MockScraper {
@@ -4655,8 +4667,8 @@ mod tests {
             "no pack recorded while the library is active"
         );
         assert!(
-            deleted.lock().unwrap().contains(&"tpack".to_string()),
-            "the staged pack is dropped (deleted)"
+            !deleted.lock().unwrap().contains(&"tpack".to_string()),
+            "the pack is never staged (so never deleted) when the library is active pre-stage"
         );
         assert!(
             store.get_owned("e1".into()).await.is_some()
