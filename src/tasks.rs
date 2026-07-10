@@ -351,8 +351,10 @@ pub async fn run_scan_loop(
                 // upgrade-cursor prunes above). Store-only cleanup: the torrent is already gone, so
                 // there is nothing to delete and no active stream to interrupt.
                 if is_prune_tick {
-                    let present: std::collections::HashSet<String> =
-                        torrents.iter().map(|t| t.hash.to_ascii_lowercase()).collect();
+                    let present: std::collections::HashSet<String> = torrents
+                        .iter()
+                        .map(|t| t.hash.to_ascii_lowercase())
+                        .collect();
                     let reaped =
                         reap_absent_mirror_owned(&store, &present, torrents.is_empty()).await;
                     if reaped > 0 {
@@ -2873,7 +2875,10 @@ mod tests {
         .unwrap();
         // An absent mirror record (empty provenance) with a selection entry → fully reaped.
         store
-            .put_owned("gone".into(), reaper_rec(10, Provenance { entries: vec![] }))
+            .put_owned(
+                "gone".into(),
+                reaper_rec(10, Provenance { entries: vec![] }),
+            )
             .await
             .unwrap();
         store
@@ -2888,7 +2893,10 @@ mod tests {
             .unwrap();
         // A present mirror record and an absent ENGINE record must both be kept.
         store
-            .put_owned("here".into(), reaper_rec(11, Provenance { entries: vec![] }))
+            .put_owned(
+                "here".into(),
+                reaper_rec(11, Provenance { entries: vec![] }),
+            )
             .await
             .unwrap();
         store

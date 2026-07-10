@@ -837,14 +837,18 @@ mod tests {
     fn requestdl_status_is_permanent_only_for_auth_failures() {
         use reqwest::StatusCode;
         // 401/403 are permanent → resolve_locator surfaces Http (no pointless repair).
-        assert!(requestdl_status_is_permanent(Some(StatusCode::UNAUTHORIZED)));
+        assert!(requestdl_status_is_permanent(Some(
+            StatusCode::UNAUTHORIZED
+        )));
         assert!(requestdl_status_is_permanent(Some(StatusCode::FORBIDDEN)));
         // A 5xx, a 404 (stale torrent_id, recoverable), and a statusless transport error are all
         // "available later" → Unavailable → the read path repairs.
         assert!(!requestdl_status_is_permanent(Some(
             StatusCode::INTERNAL_SERVER_ERROR
         )));
-        assert!(!requestdl_status_is_permanent(Some(StatusCode::BAD_GATEWAY)));
+        assert!(!requestdl_status_is_permanent(Some(
+            StatusCode::BAD_GATEWAY
+        )));
         assert!(!requestdl_status_is_permanent(Some(StatusCode::NOT_FOUND)));
         assert!(!requestdl_status_is_permanent(None));
     }

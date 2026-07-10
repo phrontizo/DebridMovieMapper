@@ -1029,7 +1029,10 @@ mod tests {
             "a language code is normalised to lowercase"
         );
         // A 2-letter ISO 639-1 code is also accepted.
-        assert_eq!(AudioReq::parse(Some("en".into())), AudioReq::Lang("en".into()));
+        assert_eq!(
+            AudioReq::parse(Some("en".into())),
+            AudioReq::Lang("en".into())
+        );
     }
 
     #[test]
@@ -1051,7 +1054,10 @@ mod tests {
         );
         assert_eq!(SubReq::parse(Some("pt-br".into())), SubReq::None);
         // Valid codes still pass through unchanged.
-        assert_eq!(AudioReq::parse(Some("fra".into())), AudioReq::Lang("fra".into()));
+        assert_eq!(
+            AudioReq::parse(Some("fra".into())),
+            AudioReq::Lang("fra".into())
+        );
         assert_eq!(SubReq::parse(Some("de".into())), SubReq::Lang("de".into()));
     }
 
