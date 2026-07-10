@@ -26,7 +26,8 @@ enum UpgradeSkip {
 
 /// Run one upgrade tick over `app`: re-score a budgeted batch of owned titles. For MOVIES, stage any
 /// cached meaningful upgrade and — if the library is idle — swap selection + prune the old torrent.
-/// For SHOWS, consolidate scattered per-episode torrents into a full-season cached pack (Task 10).
+/// For SHOWS, three layered passes: per-episode upgrade/downgrade, over-ceiling season-pack
+/// correction, then full-season consolidation of scattered per-episode torrents into a cached pack.
 /// Each title (movie or show) is one budget unit, ordered least-recently-checked first.
 pub async fn run_upgrade_once(app: &AppState) {
     let budget = app.config.upgrade.budget_per_tick as usize;
