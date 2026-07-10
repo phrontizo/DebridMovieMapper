@@ -888,11 +888,15 @@ async fn sync_trakt_user(
         }
     }
 
-    // Finish-cleanup candidates = caught-up + owned + ENDED. These aren't "behind" (so they're not
-    // caught up for acquisition), but folding them into the wanted-set lets the reconciler's
-    // Trigger-A finish removal fire (the acquire path acquires nothing — every episode is watched).
-    // Gated on `remove_finished_shows`: when OFF we only LOG the candidates (a preview) and do NOT
-    // fold them, so nothing is removed; when ON they fold and are removed.
+    // Finish-cleanup candidates = caught-up (per Trakt's OWN progress signal) + owned + ENDED. These
+    // aren't "behind" for acquisition, but folding them into the wanted-set lets the reconciler's
+    // Trigger-A finish removal fire. Trigger A / the Show acquire-guard are decided by `user_finished`
+    // over the TMDB aired set, so the fold removes the show AND the acquire path acquires nothing ONLY
+    // when TMDB and Trakt agree on the aired episodes. If TMDB lists an aired episode that Trakt's
+    // watched set lacks (specials/numbering drift), the TMDB-authoritative reconcile instead treats
+    // the show as not-fully-watched: it is NOT removed and catch-up acquires that genuinely-unwatched
+    // episode — internally consistent, not a phantom acquire. Gated on `remove_finished_shows`: when
+    // OFF we only LOG the candidates (a preview) and do NOT fold them, so nothing is removed.
     let finished_ended = finished_ended_candidates(&caught_up_owned, &statuses);
     if !finished_ended.is_empty() {
         info!(
