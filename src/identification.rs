@@ -189,7 +189,7 @@ fn select_best_match(
     normalized_query: &str,
     year: &Option<String>,
     is_show_guess: bool,
-) -> Option<(String, Option<String>, String, &'static str, MediaType)> {
+) -> Option<(String, Option<String>, String, MediaType)> {
     let is_exact = |r: &TmdbSearchResult| -> bool {
         normalize_title(&r.title) == normalized_query
             || r.original_title
@@ -242,7 +242,6 @@ fn select_best_match(
                 selected.title.clone(),
                 selected.release_date.clone(),
                 selected.id.to_string(),
-                "tmdb",
                 media_type,
             ))
         }
@@ -250,14 +249,12 @@ fn select_best_match(
             tv.title.clone(),
             tv.release_date.clone(),
             tv.id.to_string(),
-            "tmdb",
             MediaType::Show,
         )),
         (None, Some(movie)) => Some((
             movie.title.clone(),
             movie.release_date.clone(),
             movie.id.to_string(),
-            "tmdb",
             MediaType::Movie,
         )),
         (None, None) => None,
@@ -475,7 +472,7 @@ pub async fn identify_name(
         is_show_guess,
     );
 
-    if let Some((title, release_date, id, source, mtype)) = selected {
+    if let Some((title, release_date, id, mtype)) = selected {
         let year_val = release_date.and_then(|d| {
             let digits: String = d.chars().filter(|c| c.is_ascii_digit()).take(4).collect();
             // Mirror `parse_details`: only a full 4-digit year is meaningful. An empty
@@ -491,7 +488,7 @@ pub async fn identify_name(
             title,
             year: year_val,
             media_type: mtype,
-            external_id: Some(format!("{}:{}", source, id)),
+            external_id: Some(format!("tmdb:{}", id)),
         });
     }
 
@@ -1754,7 +1751,7 @@ mod tests {
             &None,
             true,
         );
-        let (title, _date, id, _source, media_type) = got.unwrap();
+        let (title, _date, id, media_type) = got.unwrap();
         assert_eq!(title, "Breaking Bad");
         assert_eq!(id, "100");
         assert_eq!(media_type, MediaType::Show);
@@ -1777,7 +1774,7 @@ mod tests {
             &None,
             false,
         );
-        let (title, _date, id, _source, media_type) = got.unwrap();
+        let (title, _date, id, media_type) = got.unwrap();
         assert_eq!(title, "Inception");
         assert_eq!(id, "200");
         assert_eq!(media_type, MediaType::Movie);
@@ -1791,7 +1788,7 @@ mod tests {
         let nq = normalize_title("Dune");
         let year = Some("2000".to_string());
         let got = select_best_match(Some(&tv), Some(&movie), &nq, &year, false);
-        let (_title, _date, id, _source, media_type) = got.unwrap();
+        let (_title, _date, id, media_type) = got.unwrap();
         assert_eq!(id, "10");
         assert_eq!(media_type, MediaType::Show);
     }
@@ -1804,7 +1801,7 @@ mod tests {
         let nq = normalize_title("Don");
         let year = Some("2022".to_string());
         let got = select_best_match(Some(&tv), Some(&movie), &nq, &year, true);
-        let (_title, _date, id, _source, media_type) = got.unwrap();
+        let (_title, _date, id, media_type) = got.unwrap();
         assert_eq!(id, "20");
         assert_eq!(media_type, MediaType::Movie);
     }
@@ -1830,7 +1827,7 @@ mod tests {
         );
         let nq = normalize_title("Sherwood");
         let got = select_best_match(Some(&tv), Some(&movie), &nq, &None, true);
-        let (_title, _date, id, _source, media_type) = got.unwrap();
+        let (_title, _date, id, media_type) = got.unwrap();
         assert_eq!(id, "10");
         assert_eq!(media_type, MediaType::Show);
     }
@@ -1856,7 +1853,7 @@ mod tests {
         );
         let nq = normalize_title("Sherwood");
         let got = select_best_match(Some(&tv), Some(&movie), &nq, &None, false);
-        let (_title, _date, id, _source, media_type) = got.unwrap();
+        let (_title, _date, id, media_type) = got.unwrap();
         assert_eq!(id, "20");
         assert_eq!(media_type, MediaType::Movie);
     }
