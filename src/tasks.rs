@@ -711,6 +711,21 @@ pub async fn sync_trakt(
         .map(|(_, r)| r.request.tmdb_id)
         .collect();
 
+    // Read the whole `wanted` table ONCE and bucket by user, rather than re-scanning it inside every
+    // `sync_trakt_user` (an O(users × total_wanted_rows) N+1 — mirrors the `owned_show_ids` hoist
+    // above). Only `sync_trakt` writes `wanted`, and it runs sequentially, so a per-user prune set
+    // read here is identical to reading it at the user's turn.
+    let mut existing_wanted_by_user: std::collections::HashMap<
+        String,
+        Vec<(crate::vfs::MediaType, u64)>,
+    > = std::collections::HashMap::new();
+    for r in store.all_wanted().await {
+        existing_wanted_by_user
+            .entry(r.user.clone())
+            .or_default()
+            .push((r.media_type.clone(), r.tmdb_id));
+    }
+
     for (slug, tokens) in store.all_trakt_tokens().await {
         if let Err(e) = sync_trakt_user(
             trakt,
@@ -721,6 +736,10 @@ pub async fn sync_trakt(
             catchup_lookback_secs,
             remove_finished_shows,
             &owned_show_ids,
+            existing_wanted_by_user
+                .get(&slug)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
         )
         .await
         {
@@ -765,6 +784,7 @@ async fn sync_trakt_user(
     catchup_lookback_secs: Option<u64>,
     remove_finished_shows: bool,
     owned_show_ids: &std::collections::HashSet<u64>,
+    existing_wanted: &[(crate::vfs::MediaType, u64)],
 ) -> Result<(), crate::error::AppError> {
     use crate::store::TraktTokens;
     use crate::vfs::MediaType;
@@ -973,21 +993,17 @@ async fn sync_trakt_user(
             .collect::<Vec<_>>()
     );
     // Prune rows no longer wanted, keyed by (media_type, tmdb_id) so a movie and a show that share
-    // a numeric id are tracked independently.
-    let existing: Vec<(MediaType, u64)> = store
-        .all_wanted()
-        .await
-        .into_iter()
-        .filter(|r| r.user == slug)
-        .map(|r| (r.media_type.clone(), r.tmdb_id))
-        .collect();
+    // a numeric id are tracked independently. `existing_wanted` is this user's slice of the
+    // once-per-cycle `all_wanted` snapshot taken by `sync_trakt` (no per-user re-scan).
     let new_keys: std::collections::HashSet<(MediaType, u64)> = new
         .iter()
         .map(|r| (r.media_type.clone(), r.tmdb_id))
         .collect();
-    for (mt, id) in existing {
-        if !new_keys.contains(&(mt.clone(), id)) {
-            store.remove_wanted(slug.to_string(), mt, id).await?;
+    for (mt, id) in existing_wanted {
+        if !new_keys.contains(&(mt.clone(), *id)) {
+            store
+                .remove_wanted(slug.to_string(), mt.clone(), *id)
+                .await?;
         }
     }
     for rec in new {
