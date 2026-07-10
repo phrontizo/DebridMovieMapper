@@ -1079,8 +1079,8 @@ mod tests {
         // give up after a single decode failure — otherwise a transient hiccup discards the whole
         // mylist tick. First response is un-decodable; the second is valid → the call recovers.
         let (url, counter) = spawn_json_200_sequence(
-            "{ this is not valid json",         // decode failure on attempt 1
-            r#"{"success":true,"data":"ok"}"#,  // valid on attempt 2
+            "{ this is not valid json",        // decode failure on attempt 1
+            r#"{"success":true,"data":"ok"}"#, // valid on attempt 2
         )
         .await;
         let client = TorBoxClient::new("fake".to_string()).unwrap();
