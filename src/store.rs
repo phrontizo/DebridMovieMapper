@@ -1068,11 +1068,20 @@ impl Store {
             let mut out = std::collections::HashSet::new();
             if let Ok(txn) = db.begin_read() {
                 if let Ok(table) = txn.open_table(BLACKLIST_TABLE) {
-                    if let Ok(iter) = table.iter() {
+                    // The key is "<m|s>|tmdb_id|hash", so this title's rows are a contiguous,
+                    // lexicographically-ordered key range. A keyed range scan reads only those rows
+                    // (O(log n + matches)) instead of the whole table (which grows to 30 days of
+                    // churn under the TTL). Any key that sorts at/after `prefix` but does NOT start
+                    // with it sorts strictly AFTER the entire matching block, so the first
+                    // non-matching key ends the scan.
+                    if let Ok(iter) = table.range(prefix.as_str()..) {
                         for entry in iter.flatten() {
                             let (k, _) = entry;
-                            if let Some(hash) = k.value().strip_prefix(&prefix) {
-                                out.insert(hash.to_ascii_lowercase());
+                            match k.value().strip_prefix(&prefix) {
+                                Some(hash) => {
+                                    out.insert(hash.to_ascii_lowercase());
+                                }
+                                None => break,
                             }
                         }
                     }
@@ -2204,11 +2213,18 @@ mod tests {
             .blacklist_add(m, 123, "ccc".into(), "WrongTitle", 3)
             .await
             .unwrap();
+        // tmdb 13 sorts AFTER the "m|12|" block, so it exercises the range scan's break-on-first-
+        // non-matching-key path (its rows must not leak in, and must not truncate 12's rows).
+        store
+            .blacklist_add(m, 13, "ddd".into(), "WrongTitle", 4)
+            .await
+            .unwrap();
         let set = store.blacklisted_hashes_for(m, 12).await;
         assert_eq!(set.len(), 2);
         assert!(set.contains("aaa")); // lowercased
         assert!(set.contains("bbb"));
         assert!(!set.contains("ccc")); // belongs to tmdb 123, not 12
+        assert!(!set.contains("ddd")); // belongs to tmdb 13, not 12
         assert!(store.blacklisted_hashes_for(m, 999).await.is_empty());
     }
 
