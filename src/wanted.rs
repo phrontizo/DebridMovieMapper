@@ -173,6 +173,12 @@ fn episode_covered(title: &TitleView, e: &(u32, u32)) -> bool {
 
 /// Decide the actions for ONE title. Removal takes precedence over acquisition.
 pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
+    // Trigger A (finished) is invariant within this call and consulted in three places (the removal
+    // reason below and both acquire branches' flip-flop guards), so compute it once here. `wanted`
+    // and `aired_episodes` don't change during a reconcile, so this is behaviour-identical to the
+    // former repeated evaluations. (`should_remove` still evaluates it internally.)
+    let finished = trigger_a_finished(&title.wanted, &title.aired_episodes);
+
     // Removal first: if a title qualifies for removal we never also acquire it.
     // `owned` is bound only to read `owned.hash`; `should_remove` already returns false when owned is None.
     if let Some(owned) = &title.owned {
@@ -180,7 +186,7 @@ pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
             // Distinguish the trigger so the executor removes the right hash set: Trigger A
             // (finished) is a full cleanup incl. mirror copies; Trigger B (abandoned) keeps mirror.
             // should_remove == A || B, so if A didn't fire it must be B.
-            let reason = if trigger_a_finished(&title.wanted, &title.aired_episodes) {
+            let reason = if finished {
                 RemoveReason::Finished
             } else {
                 RemoveReason::Abandoned
@@ -198,22 +204,21 @@ pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
         return vec![];
     }
 
+    // Both acquire branches share the same `manual` derivation and `finished` flip-flop guard:
+    // manual content is removal-protected (`has_manual_entry`), so it is never reclaimed and never
+    // flip-flops — it must still re-acquire on lapse even when watched; otherwise a title every
+    // in-progress wanter has finished (watched, not watchlisted) is reclaimed by Trigger A, so the
+    // acquire path must NOT re-add it the next tick. The watchlist short-circuit inside
+    // `trigger_a_finished` keeps a watchlisted title acquiring.
+    let manual = title
+        .owned
+        .as_ref()
+        .map(|o| o.provenance.has_manual_entry())
+        .unwrap_or(false);
+
     match title.media_type {
         MediaType::Movie => {
-            // Symmetry with removal (mirrors the Show branch below): don't re-acquire a movie every
-            // in-progress wanter has finished (watched, not watchlisted). Trigger A reclaims such a
-            // movie; without this guard the acquire path re-adds it the very next tick, flip-flopping
-            // acquire↔remove on a paused re-watch (still in Trakt /sync/playback AND /sync/watched) —
-            // exactly the oscillation the watchlist guard prevents, but on the in-progress axis. The
-            // watchlist short-circuit in `trigger_a_finished` keeps a watchlisted movie acquiring.
-            // EXCEPTION: manual content is removal-protected (`has_manual_entry`), so it is never
-            // reclaimed and never flip-flops — it must still re-acquire on lapse even when watched.
-            let manual = title
-                .owned
-                .as_ref()
-                .map(|o| o.provenance.has_manual_entry())
-                .unwrap_or(false);
-            if !manual && trigger_a_finished(&title.wanted, &title.aired_episodes) {
+            if !manual && finished {
                 return vec![];
             }
             let needs_acquire = match &title.owned {
@@ -229,18 +234,13 @@ pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
             }
         }
         MediaType::Show => {
-            // Symmetry with removal (mirrors the Movie branch): don't acquire a show every watcher
-            // has finished (an ended show, fully watched). The Trigger-A watchlist guard means a
-            // watchlisted show is never "finished", so it still acquires — only in-progress-only
-            // finished shows are skipped. EXCEPTION: manual content is removal-protected and never
-            // flip-flops, so it is not suppressed here — it must stay available and restore its
-            // previously-owned episodes if the cache lapses (see the `owned_eps` filter below).
-            let manual = title
-                .owned
-                .as_ref()
-                .map(|o| o.provenance.has_manual_entry())
-                .unwrap_or(false);
-            if !manual && trigger_a_finished(&title.wanted, &title.aired_episodes) {
+            // Symmetry with the Movie branch: don't acquire a show every watcher has finished (an
+            // ended show, fully watched). The Trigger-A watchlist guard means a watchlisted show is
+            // never "finished", so it still acquires — only in-progress-only finished shows are
+            // skipped. Manual content is removal-protected and never flip-flops, so it is not
+            // suppressed here — it must stay available and restore its previously-owned episodes if
+            // the cache lapses (see the `owned_eps` filter below).
+            if !manual && finished {
                 return vec![];
             }
             // Acquire aired episodes we don't already own. For a CATCH-UP show (wanted because it's
