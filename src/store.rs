@@ -2731,6 +2731,13 @@ mod tests {
         // typed lookup couldn't distinguish "cleared" from "unreachable by the new key").
         drop(store);
         let db = Database::create(&tmp.path).unwrap();
+        // The migration must STAMP the current schema version. Without this a migration that moved
+        // data correctly but stamped the wrong version would silently re-migrate on every boot.
+        assert_eq!(
+            Store::read_version(&db).unwrap(),
+            SCHEMA_VERSION,
+            "migration must stamp the current schema version"
+        );
         let txn = db.begin_read().unwrap();
         let bdef: TableDefinition<&str, &[u8]> = TableDefinition::new("blacklist");
         let bt = txn.open_table(bdef).unwrap();
@@ -2817,6 +2824,15 @@ mod tests {
         assert!(
             !std::path::Path::new(&tmp.corrupt_path()).exists(),
             "valid v1 DB must not be moved aside"
+        );
+        // The full v1→current ladder must leave the schema stamped at the current version, so the
+        // service doesn't re-run the whole ladder on every subsequent boot.
+        drop(store);
+        let db = Database::create(&tmp.path).unwrap();
+        assert_eq!(
+            Store::read_version(&db).unwrap(),
+            SCHEMA_VERSION,
+            "the full migration ladder must stamp the current schema version"
         );
     }
 
