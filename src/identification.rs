@@ -623,11 +623,16 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
                 if !(r.start() <= m.start() && m.end() <= r.end()) {
                     return false;
                 }
-                // ...AND the pair must be genuinely ASCENDING to be a real date range. Two
-                // adjacent standalone years where the title's own year precedes a SMALLER release
-                // year (e.g. "Blade Runner 2049 2017") is NOT a range — the trailing release year
-                // must still be dropped, else it pollutes the TMDB query and loses the exact-title
-                // score boost.
+                // ...AND the pair must be DASH-joined to be a real date range ("1939-1945"). Two
+                // SPACE-separated standalone years are a title-year + release-year pair, NOT a
+                // range — even when ASCENDING: a film whose title IS an early year with a LATER
+                // release year ("1917 2019", "1941 1979") is ascending too, yet its trailing
+                // release year must still be dropped or it pollutes the TMDB query and loses the
+                // exact-title score boost. (A descending space pair like "Blade Runner 2049 2017"
+                // was already handled; requiring a dash also covers the ascending case.)
+                if !r.as_str().contains('-') {
+                    return false;
+                }
                 let years: Vec<i32> = YEAR_RE
                     .find_iter(r.as_str())
                     .filter_map(|y| y.as_str().parse().ok())
@@ -1006,10 +1011,16 @@ mod tests {
             "the title-embedded year is preserved AND the trailing release year is dropped — \
              two adjacent standalone years (2049 then a SMALLER 2017) are not a date range"
         );
-        // 1917 (the 2019 war film): release year 2019, title "1917" kept.
+        // 1917 (the 2019 war film): release year 2019, title "1917" kept — the trailing release
+        // year is dropped even though "1917 2019" is ASCENDING, because a real date range is
+        // dash-joined ("1939-1945"), not two space-separated standalone years.
         let (war, war_year) = clean_name("1917.2019.1080p.BluRay.x264.mkv");
         assert_eq!(war_year.as_deref(), Some("2019"));
-        assert!(war.contains("1917"), "got {war:?}");
+        assert_eq!(war, "1917", "got {war:?}");
+        // Same shape: a title-year that precedes its release year ("1941" dir. Spielberg, 1979).
+        let (forty_one, forty_one_year) = clean_name("1941.1979.1080p.BluRay.x264.mkv");
+        assert_eq!(forty_one_year.as_deref(), Some("1979"));
+        assert_eq!(forty_one, "1941", "got {forty_one:?}");
         // A non-year numeric title-paren is kept (the film "(500) Days of Summer").
         assert_eq!(
             clean_name("(500) Days of Summer 2009 1080p").0,
