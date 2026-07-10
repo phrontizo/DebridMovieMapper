@@ -4459,6 +4459,123 @@ mod tests {
         }
     }
 
+    /// Own ONE cached 2160p full-season pack (S01E01+E02, above the P1080 ceiling); the scraper
+    /// offers a cached WITHIN-ceiling 1080p full-season pack whose resolved files are S01E01+E02
+    /// (same episodes as the owned pack). Provider reports the staged pack as `downloaded` with the
+    /// two episode videos so staging succeeds. Models the destructive success path of pack
+    /// correction — mirrors `idle_show_with_cached_full_season_pack_consolidates_repoints_and_prunes`'s
+    /// provider mock. `cand_1080_hash` carries the new within-ceiling pack's hash.
+    async fn show_harness_pack_2160_with_1080_candidate() -> ShowUpgradeHarness {
+        let store = mem_store();
+        let pack_hash = "pack2160".to_string();
+        let rec = OwnedRecord {
+            request: AcquireRequest {
+                imdb_id: "tt9".into(),
+                tmdb_id: SHOW_TMDB,
+                kind: MediaKind::Series,
+                season: Some(1),
+                episode: Some(1),
+                original_language: Some("eng".into()),
+                metadata: show_meta(),
+            },
+            provenance: Provenance::watchlist("a"),
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides: vec![(1, 1), (1, 2)],
+            quality: Some(q2160_remux()),
+        };
+        store.put_owned(pack_hash.clone(), rec).await.unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 1),
+                SelectionEntry {
+                    hash: pack_hash.clone(),
+                    file_path: "S.S01E01.2160p.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 2),
+                SelectionEntry {
+                    hash: pack_hash.clone(),
+                    file_path: "S.S01E02.2160p.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // A cached, within-ceiling 1080p FULL-SEASON pack covering the same episodes as the owned pack.
+        let new_pack_hash = "hpack1080".to_string();
+        let cand = RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "S.2019.S01.1080p.BluRay.x265\nRD+".into(),
+            info_hash: new_pack_hash.clone(),
+            file_idx: None,
+            file_name: None,
+        };
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![cand],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "tpack2160".into(),
+                    hash: pack_hash.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tpack1080".into(),
+                    hash: new_pack_hash.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack1080".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tpack1080".into(),
+                hash: new_pack_hash.clone(),
+                status: "downloaded".into(),
+                files: vec![
+                    TorrentFile {
+                        id: 0,
+                        path: "S.S01E01.1080p.BluRay.mkv".into(),
+                        bytes: 2_000_000_000,
+                        selected: 1,
+                    },
+                    TorrentFile {
+                        id: 1,
+                        path: "S.S01E02.1080p.BluRay.mkv".into(),
+                        bytes: 2_000_000_000,
+                        selected: 1,
+                    },
+                ],
+                links: vec!["https://cdn/np1".into(), "https://cdn/np2".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/np1".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        ShowUpgradeHarness {
+            app,
+            tmdb: SHOW_TMDB,
+            group_hashes: vec![pack_hash.clone()],
+            old_720_hash: String::new(),
+            cand_1080_hash: new_pack_hash,
+            old_2160_hash: String::new(),
+            pack_hash,
+        }
+    }
+
     #[tokio::test]
     async fn singleton_episode_upgrades_to_better_cached_release() {
         // Own S1E1 as a cached 720p singleton; a cached 1080p S1E1 is scrape-available; ceiling 1080.
@@ -4555,6 +4672,57 @@ mod tests {
                 .hash,
             h.pack_hash,
             "selection unchanged — nothing to repoint to"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_ceiling_pack_corrected_to_within_ceiling_replacement() {
+        // Own a cached 2160p full-season pack (S01E01+E02); ceiling 1080; flag ON; the scraper
+        // offers a cached within-ceiling 1080p full-season pack covering the SAME episodes. The
+        // over-ceiling pack must be replaced: both episode slots repointed to the new pack, the old
+        // pack pruned. This is the destructive SUCCESS path — the most impactful new behaviour.
+        let mut h = show_harness_pack_2160_with_1080_candidate().await;
+        h.set_allow_downgrade(true);
+        upgrade_show_episodes_and_packs(&h.app, h.tmdb, &h.group_hashes, Duration::from_secs(0))
+            .await;
+
+        // Both episode slots repointed to the within-ceiling replacement.
+        assert_eq!(
+            h.app
+                .store
+                .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            h.cand_1080_hash,
+            "E01 slot repointed to the within-ceiling pack"
+        );
+        assert_eq!(
+            h.app
+                .store
+                .get_selection(crate::store::episode_slot(h.tmdb, 1, 2))
+                .await
+                .unwrap()
+                .hash,
+            h.cand_1080_hash,
+            "E02 slot repointed to the within-ceiling pack"
+        );
+        // Old over-ceiling pack pruned from owned.
+        assert!(
+            h.app.store.get_owned(h.pack_hash.clone()).await.is_none(),
+            "old over-ceiling pack pruned"
+        );
+        // New within-ceiling pack recorded owned, covering the full owned episode set.
+        let new_rec = h
+            .app
+            .store
+            .get_owned(h.cand_1080_hash.clone())
+            .await
+            .expect("within-ceiling replacement recorded owned");
+        assert!(
+            new_rec.provides.contains(&(1, 1)) && new_rec.provides.contains(&(1, 2)),
+            "replacement provides the full owned episode set: {:?}",
+            new_rec.provides
         );
     }
 }
