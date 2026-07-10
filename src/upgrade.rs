@@ -89,7 +89,7 @@ pub async fn run_upgrade_once(app: &AppState) {
         }
         let outcome = match media_type {
             MediaType::Movie => try_upgrade_movie(app, tmdb_id, &hashes, &rec, idle_window).await,
-            MediaType::Show => try_consolidate_show(app, tmdb_id, &hashes, idle_window).await,
+            MediaType::Show => try_upgrade_show(app, tmdb_id, &hashes, idle_window).await,
         };
         match outcome {
             // Evaluated to completion (success or a genuine no-upgrade): advance the cursor.
@@ -760,6 +760,462 @@ fn rank_cached_pack_candidates(
         .collect();
     scored.sort_by_key(|(_, s)| std::cmp::Reverse(*s)); // best score first
     scored.into_iter().map(|(r, _)| r).collect()
+}
+
+// ── per-episode upgrade/downgrade + over-ceiling pack correction (Task 5) ─────────────────────
+
+/// Add `hash`, select its video files, and poll for the cached verdict. Shared staging tail for
+/// `stage_episode_candidate` and `correct_over_ceiling_packs` (episode vs pack staging differ only
+/// in what they do with the resolved `TorrentInfo` afterwards — this covers exactly the add/select/
+/// poll/cached-gate steps common to both). On any failure the staged torrent is deleted so nothing
+/// leaks; returns the torrent id + the post-selection `TorrentInfo` on success.
+async fn stage_and_await_cached(
+    app: &AppState,
+    hash: &str,
+) -> Result<(String, crate::rd_client::TorrentInfo), UpgradeSkip> {
+    let magnet = format!("magnet:?xt=urn:btih:{}", hash);
+    let added = app
+        .provider
+        .add_magnet(&magnet)
+        .await
+        .map_err(|e| UpgradeSkip::Deferred(format!("add failed: {e}")))?;
+    let info = match app.provider.get_torrent_info(&added.id).await {
+        Ok(i) => i,
+        Err(e) => {
+            let _ = app.provider.delete_torrent(&added.id).await;
+            return Err(UpgradeSkip::Deferred(format!("info failed: {e}")));
+        }
+    };
+    let ids: Vec<u32> = info
+        .files
+        .iter()
+        .filter(|f| crate::vfs::is_video_file(&f.path))
+        .map(|f| f.id)
+        .collect();
+    if !ids.is_empty() {
+        if let Err(e) = app
+            .provider
+            .select_files(
+                &added.id,
+                &ids.iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+            .await
+        {
+            warn!(
+                "upgrade: select_files for staged candidate {} failed: {}",
+                hash, e
+            );
+        }
+    }
+    let fresh = await_downloaded(app.provider.as_ref(), &added.id)
+        .await
+        .unwrap_or(info);
+    if fresh.status != "downloaded" {
+        let _ = app.provider.delete_torrent(&added.id).await;
+        return Err(UpgradeSkip::NoChange("candidate not cached".into()));
+    }
+    Ok((added.id, fresh))
+}
+
+/// Stage ONE per-episode candidate: add + select + poll cached (via [`stage_and_await_cached`]),
+/// locate the target `(season, episode)` among the resolved files (rejecting a multi-season pack —
+/// that belongs to consolidation, not the per-episode path — and a candidate that turns out to lack
+/// the target episode), validate the title, and probe the same audio/subtitle gate as acquisition.
+/// On success records the episode `OwnedRecord` (Verified, sticky provenance) + authoritative id and
+/// returns `(hash, torrent_id, file_path)`. On any failure the staged torrent is cleaned up and the
+/// current release is left untouched (non-destructive).
+async fn stage_episode_candidate(
+    app: &AppState,
+    tmdb_id: u64,
+    base_req: &crate::store::AcquireRequest,
+    cand: &release::ReleaseInfo,
+    season: u32,
+    episode: u32,
+) -> Result<(String, String, String), UpgradeSkip> {
+    let hash = cand.info_hash.clone();
+    let (torrent_id, fresh) = stage_and_await_cached(app, &hash).await?;
+    let eps = crate::acquire::episode_files(&fresh);
+    // Adopt a per-episode release: the target (s,e) must be present, and the pack must not span
+    // other seasons (a multi-season pack is left to consolidation, not the per-episode path).
+    if eps.iter().any(|(s, _, _)| *s != season) {
+        let _ = app.provider.delete_torrent(&torrent_id).await;
+        return Err(UpgradeSkip::NoChange(
+            "multi-season pack; not a per-episode candidate".into(),
+        ));
+    }
+    let Some((_, _, path)) = eps.iter().find(|(s, e, _)| *s == season && *e == episode) else {
+        let _ = app.provider.delete_torrent(&torrent_id).await;
+        return Err(UpgradeSkip::NoChange(
+            "candidate lacks the target episode".into(),
+        ));
+    };
+    let file_path = path.clone();
+    let fname = file_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&file_path)
+        .to_string();
+    if !app
+        .engine
+        .validate_title(
+            &fname,
+            tmdb_id,
+            MediaKind::Series,
+            Some(season),
+            Some(episode),
+        )
+        .await
+    {
+        let _ = app.provider.delete_torrent(&torrent_id).await;
+        let _ = app
+            .store
+            .blacklist_add(
+                MediaKind::Series,
+                tmdb_id,
+                hash.clone(),
+                "WrongTitle",
+                now_secs(),
+            )
+            .await;
+        return Err(UpgradeSkip::NoChange("title mismatch".into()));
+    }
+    let probe_req = crate::store::AcquireRequest {
+        season: Some(season),
+        episode: Some(episode),
+        ..base_req.clone()
+    };
+    match app
+        .engine
+        .probe_file(&fresh, &hash, &file_path, &probe_req)
+        .await
+    {
+        crate::acquire::VerifyResult::Pass | crate::acquire::VerifyResult::Accept => {}
+        crate::acquire::VerifyResult::Reject(reason) => {
+            let _ = app.provider.delete_torrent(&torrent_id).await;
+            let _ = app
+                .store
+                .blacklist_add(MediaKind::Series, tmdb_id, hash.clone(), reason, now_secs())
+                .await;
+            return Err(UpgradeSkip::NoChange(format!("probe rejected: {reason}")));
+        }
+        crate::acquire::VerifyResult::Defer => {
+            let _ = app.provider.delete_torrent(&torrent_id).await;
+            return Err(UpgradeSkip::Deferred("probe deferred".into()));
+        }
+    }
+    let prov = base_req_provenance(app, MediaType::Show, tmdb_id).await;
+    let _ = app
+        .store
+        .put_owned(
+            hash.clone(),
+            OwnedRecord {
+                request: base_req.clone(),
+                provenance: prov,
+                added_at: now_secs(),
+                status: OwnedStatus::Verified,
+                provides: vec![(season, episode)],
+                quality: Some(QualitySummary::of(cand, &app.config.acquisition.prefs)),
+            },
+        )
+        .await;
+    let _ = app
+        .store
+        .put_authoritative(hash.clone(), base_req.metadata.clone())
+        .await;
+    Ok((hash, torrent_id, file_path))
+}
+
+/// Replace an owned season pack that is now ABOVE the ceiling (e.g. acquired before the ceiling was
+/// lowered, or mirrored from a pre-existing library) with a within-ceiling cached pack that covers
+/// the SAME episodes, repointing every covered episode slot and pruning the old pack. Gated as a
+/// downgrade (`ALLOW_RESOLUTION_DOWNGRADE`). Keeps the old pack when no conforming replacement
+/// exists — a sole over-ceiling copy is never deleted with nothing to replace it.
+async fn correct_over_ceiling_packs(
+    app: &AppState,
+    tmdb_id: u64,
+    owned: &[(String, OwnedRecord)],
+    imdb_id: &str,
+    idle_window: Duration,
+) {
+    let prefs = &app.config.acquisition.prefs;
+    let ceiling = prefs.max_resolution.height();
+    let owned_hashes: Vec<String> = owned.iter().map(|(h, _)| h.clone()).collect();
+    for (pack_hash, rec) in owned.iter().filter(|(_, r)| r.provides.len() > 1) {
+        let Some(pack_q) = rec.quality.clone() else {
+            continue; // untagged → no baseline, skip
+        };
+        if pack_q.resolution <= ceiling {
+            continue; // within ceiling → not a correction target
+        }
+        let season = rec.provides[0].0;
+        if rec.provides.iter().any(|(s, _)| *s != season) {
+            continue; // single-season packs only
+        }
+        let need: Vec<u32> = rec.provides.iter().map(|(_, e)| *e).collect();
+
+        let Ok(raws) = app
+            .scraper
+            .find(imdb_id, MediaKind::Series, Some(season), Some(1))
+            .await
+        else {
+            continue;
+        };
+        for cand in rank_cached_pack_candidates(&raws, prefs, &owned_hashes) {
+            if app
+                .store
+                .is_blacklisted(MediaKind::Series, tmdb_id, cand.info_hash.clone())
+                .await
+            {
+                continue;
+            }
+            let cand_q = QualitySummary::of(&cand, prefs);
+            let imp = release::is_target_improvement(&pack_q, &cand_q, prefs);
+            if imp == release::Improvement::None {
+                continue;
+            }
+            if !downgrade_allowed_or_log(app, tmdb_id, imp, &pack_q, &cand) {
+                break; // logged (dry-run); no candidate below would fare better — stop this pack
+            }
+            if !app.read_activity.all_idle(idle_window).await {
+                return; // library active; retry the whole correction pass next tick
+            }
+
+            let (torrent_id, fresh) = match stage_and_await_cached(app, &cand.info_hash).await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let eps = crate::acquire::episode_files(&fresh);
+            if eps.iter().any(|(s, _, _)| *s != season) {
+                let _ = app.provider.delete_torrent(&torrent_id).await;
+                continue; // multi-season pack; not a clean single-season replacement
+            }
+            if !need.iter().all(|e| eps.iter().any(|(_, pe, _)| pe == e)) {
+                let _ = app.provider.delete_torrent(&torrent_id).await;
+                continue; // must cover every episode the old pack provided
+            }
+            let Some((rs, re, rpath)) = eps.iter().find(|(s, _, _)| *s == season) else {
+                let _ = app.provider.delete_torrent(&torrent_id).await;
+                continue;
+            };
+            let fname = rpath.rsplit('/').next().unwrap_or(rpath).to_string();
+            if !app
+                .engine
+                .validate_title(&fname, tmdb_id, MediaKind::Series, Some(*rs), Some(*re))
+                .await
+            {
+                let _ = app.provider.delete_torrent(&torrent_id).await;
+                let _ = app
+                    .store
+                    .blacklist_add(
+                        MediaKind::Series,
+                        tmdb_id,
+                        cand.info_hash.clone(),
+                        "WrongTitle",
+                        now_secs(),
+                    )
+                    .await;
+                continue;
+            }
+            let probe_req = crate::store::AcquireRequest {
+                imdb_id: imdb_id.to_string(),
+                season: Some(*rs),
+                episode: Some(*re),
+                ..rec.request.clone()
+            };
+            match app
+                .engine
+                .probe_file(&fresh, &cand.info_hash, rpath, &probe_req)
+                .await
+            {
+                crate::acquire::VerifyResult::Pass | crate::acquire::VerifyResult::Accept => {}
+                crate::acquire::VerifyResult::Reject(reason) => {
+                    let _ = app.provider.delete_torrent(&torrent_id).await;
+                    let _ = app
+                        .store
+                        .blacklist_add(
+                            MediaKind::Series,
+                            tmdb_id,
+                            cand.info_hash.clone(),
+                            reason,
+                            now_secs(),
+                        )
+                        .await;
+                    continue;
+                }
+                crate::acquire::VerifyResult::Defer => {
+                    let _ = app.provider.delete_torrent(&torrent_id).await;
+                    continue;
+                }
+            }
+            let prov = base_req_provenance(app, MediaType::Show, tmdb_id).await;
+            let base_req = crate::store::AcquireRequest {
+                imdb_id: imdb_id.to_string(),
+                ..rec.request.clone()
+            };
+            let provides: Vec<(u32, u32)> = eps
+                .iter()
+                .filter(|(s, _, _)| *s == season)
+                .map(|(s, e, _)| (*s, *e))
+                .collect();
+            let _ = app
+                .store
+                .put_owned(
+                    cand.info_hash.clone(),
+                    OwnedRecord {
+                        request: base_req.clone(),
+                        provenance: prov,
+                        added_at: now_secs(),
+                        status: OwnedStatus::Verified,
+                        provides,
+                        quality: Some(cand_q.clone()),
+                    },
+                )
+                .await;
+            let _ = app
+                .store
+                .put_authoritative(cand.info_hash.clone(), base_req.metadata.clone())
+                .await;
+            let slot_files: Vec<(String, String)> = eps
+                .iter()
+                .filter(|(s, _, _)| *s == season)
+                .map(|(s, e, p)| (crate::store::episode_slot(tmdb_id, *s, *e), p.clone()))
+                .collect();
+            let _ = apply_upgrade(
+                app,
+                StagedUpgrade {
+                    hash: cand.info_hash.clone(),
+                    torrent_id,
+                    slot_files,
+                },
+                std::slice::from_ref(pack_hash),
+                idle_window,
+            )
+            .await;
+            info!(
+                "upgrade: tmdb {} s{} pack corrected to within-ceiling {}",
+                tmdb_id, season, cand.info_hash
+            );
+            break; // one correction per pack per tick
+        }
+    }
+}
+
+/// The per-episode-upgrade (a) + over-ceiling-pack-correction (b) body of `try_upgrade_show`,
+/// WITHOUT the TMDB-driven consolidation tail (c) — split out so it is unit-testable fully offline,
+/// mirroring the `try_consolidate_show` / `consolidate_show_seasons` split just below (consolidation's
+/// live TMDB aired-episode lookup is exercised by the live smoke, not unit tests; see that split's
+/// doc comment). Fire-and-forget per item: one episode/pack's outcome (Deferred/NoChange/staged)
+/// never aborts the rest of the group — every branch already classifies + logs its own outcome, so
+/// there is nothing further to propagate to the caller.
+async fn upgrade_show_episodes_and_packs(
+    app: &AppState,
+    tmdb_id: u64,
+    group_hashes: &[String],
+    idle_window: Duration,
+) {
+    let mut owned: Vec<(String, OwnedRecord)> = Vec::new();
+    for h in group_hashes {
+        if let Some(r) = app.store.get_owned(h.clone()).await {
+            owned.push((h.clone(), r));
+        }
+    }
+    // Torrentio is IMDB-keyed: without an id anywhere in the group there is nothing to scrape.
+    // Consolidation performs the identical check independently, so it self-skips too.
+    let Some(imdb_id) = group_imdb_id(app, group_hashes).await else {
+        return;
+    };
+
+    // (a) Per-singleton-episode upgrade/downgrade.
+    for (hash, rec) in owned.iter().filter(|(_, r)| r.provides.len() == 1) {
+        let Some(q) = rec.quality.clone() else {
+            continue; // untagged → no baseline, skip
+        };
+        let (season, episode) = rec.provides[0];
+        let req = crate::store::AcquireRequest {
+            imdb_id: imdb_id.clone(),
+            season: Some(season),
+            episode: Some(episode),
+            ..rec.request.clone()
+        };
+        let raws = match app
+            .scraper
+            .find(&imdb_id, MediaKind::Series, Some(season), Some(episode))
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => continue, // transient; other episodes/packs/consolidation still run this tick
+        };
+        let Some((cand, imp)) =
+            pick_best_change(app, MediaKind::Series, tmdb_id, &raws, &q, group_hashes).await
+        else {
+            continue;
+        };
+        if !downgrade_allowed_or_log(app, tmdb_id, imp, &q, &cand) {
+            continue;
+        }
+        if !app.read_activity.all_idle(idle_window).await {
+            debug!(
+                "upgrade: tmdb {} library active; deferring remaining show upgrade work",
+                tmdb_id
+            );
+            // Stop ALL further staging (remaining episodes + pack correction) this tick — mirrors
+            // the library-wide idle gate in `run_upgrade_once`. Consolidation's own idle re-check
+            // independently decides whether IT can still proceed.
+            return;
+        }
+        match stage_episode_candidate(app, tmdb_id, &req, &cand, season, episode).await {
+            Ok((new_hash, tid, path)) => {
+                let _ = apply_upgrade(
+                    app,
+                    StagedUpgrade {
+                        hash: new_hash.clone(),
+                        torrent_id: tid,
+                        slot_files: vec![(
+                            crate::store::episode_slot(tmdb_id, season, episode),
+                            path,
+                        )],
+                    },
+                    std::slice::from_ref(hash),
+                    idle_window,
+                )
+                .await;
+                info!(
+                    "upgrade: tmdb {} s{}e{} swapped to {}",
+                    tmdb_id, season, episode, new_hash
+                );
+            }
+            Err(UpgradeSkip::Deferred(reason)) => debug!(
+                "upgrade: tmdb {} s{}e{} deferred: {}",
+                tmdb_id, season, episode, reason
+            ),
+            Err(UpgradeSkip::NoChange(reason)) => debug!(
+                "upgrade: tmdb {} s{}e{} no change: {}",
+                tmdb_id, season, episode, reason
+            ),
+        }
+    }
+
+    // (b) Over-ceiling pack correction (flag-gated): replace a pack above the ceiling with a
+    // within-ceiling cached full-season replacement that covers the SAME episodes; keeps the pack
+    // when no conforming replacement exists (sole-copy safety).
+    correct_over_ceiling_packs(app, tmdb_id, &owned, &imdb_id, idle_window).await;
+}
+
+/// Show dispatch target for `run_upgrade_once`: per-episode upgrade/downgrade + over-ceiling pack
+/// correction (`upgrade_show_episodes_and_packs`), then full-season consolidation (unchanged —
+/// `try_consolidate_show` still runs every tick exactly as before this task, so its existing
+/// behaviour/tests are preserved).
+async fn try_upgrade_show(
+    app: &AppState,
+    tmdb_id: u64,
+    group_hashes: &[String],
+    idle_window: Duration,
+) -> Result<(), UpgradeSkip> {
+    upgrade_show_episodes_and_packs(app, tmdb_id, group_hashes, idle_window).await;
+    try_consolidate_show(app, tmdb_id, group_hashes, idle_window).await
 }
 
 /// Consolidate a show's scattered per-episode torrents into a full-season CACHED pack, season by
@@ -3703,5 +4159,402 @@ mod tests {
             resolution: 2160,
             score: 9,
         }
+    }
+    fn q720_web() -> crate::release::QualitySummary {
+        crate::release::QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 720,
+            score: 1,
+        }
+    }
+
+    // ── per-episode upgrade/downgrade + over-ceiling pack correction tests (Task 5) ──────────
+    //
+    // These call `upgrade_show_episodes_and_packs` directly rather than the public dispatch
+    // target `try_upgrade_show`. `try_upgrade_show` always additionally invokes the TMDB-driven
+    // `try_consolidate_show` (see its doc comment) — reaching a REAL `https://api.themoviedb.org`
+    // call whenever the show group still has a resolvable IMDB id after this phase runs (true in
+    // every scenario below, since a resolvable id is exactly what's needed to exercise real
+    // scrape/upgrade logic here). Every OTHER show test in this module deliberately avoids that by
+    // calling `consolidate_show_seasons` (the pure/offline half of that same split) instead of
+    // `try_consolidate_show` — this mirrors that precedent so these new tests stay fully
+    // deterministic and network-free too. `try_upgrade_show` itself is exercised structurally by
+    // the `run_upgrade_once` dispatch (Movie/Show branch) — its own behaviour beyond "call the two
+    // pieces in order" is covered by this file's existing (unchanged) consolidation tests plus the
+    // cases below.
+
+    /// A cached 1080p WEB-DL single-episode candidate for S01E01 — a meaningful upgrade over a
+    /// 720p WEB singleton (same source tier, higher resolution).
+    fn ep_1080_web_candidate() -> RawCandidate {
+        RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "S.S01E01.1080p.WEB-DL.x265\nRD+".into(),
+            info_hash: "hep1080".into(),
+            file_idx: Some(0),
+            file_name: Some("S.S01E01.1080p.WEB-DL.mkv".into()),
+        }
+    }
+    /// A cached 1080p REMUX single-episode candidate for S01E01 — the within-ceiling corrective
+    /// replacement for an over-ceiling 2160p singleton.
+    fn ep_1080_remux_candidate() -> RawCandidate {
+        RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "S.S01E01.1080p.BluRay.REMUX.x265\nRD+".into(),
+            info_hash: "hep1080d".into(),
+            file_idx: Some(0),
+            file_name: Some("S.S01E01.1080p.REMUX.mkv".into()),
+        }
+    }
+
+    /// Harness for the Task 5 show tests: an owned singleton episode or full-season pack, a
+    /// scraped candidate (or none), and `set_allow_downgrade` to flip the corrective-downgrade
+    /// flag — mirrors `DowngradeHarness` above but for the per-episode/pack-correction path.
+    /// Only the fields relevant to a given scenario are populated; the rest are left empty.
+    struct ShowUpgradeHarness {
+        app: AppState,
+        tmdb: u64,
+        group_hashes: Vec<String>,
+        old_720_hash: String,
+        cand_1080_hash: String,
+        old_2160_hash: String,
+        pack_hash: String,
+    }
+
+    impl ShowUpgradeHarness {
+        fn set_allow_downgrade(&mut self, v: bool) {
+            let mut cfg = (*self.app.config).clone();
+            cfg.allow_resolution_downgrade = v;
+            self.app.config = Arc::new(cfg);
+        }
+    }
+
+    /// Own S01E01 as a cached 720p WEB singleton; a cached 1080p WEB-DL S01E01 is scrape-available
+    /// (a meaningful upgrade — same tier, higher resolution).
+    async fn show_harness_singleton_720_ep() -> ShowUpgradeHarness {
+        let store = mem_store();
+        let old_hash = "e720".to_string();
+        store
+            .put_owned(old_hash.clone(), ep_record(1, 1, q720_web()))
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 1),
+                SelectionEntry {
+                    hash: old_hash.clone(),
+                    file_path: "old720.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let cand = ep_1080_web_candidate();
+        let cand_hash = cand.info_hash.clone();
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![cand],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "told720".into(),
+                    hash: old_hash.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tep1080".into(),
+                    hash: cand_hash.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tep1080".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tep1080".into(),
+                hash: cand_hash.clone(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "S.S01E01.1080p.WEB-DL.mkv".into(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/ep1080".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/ep1080".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        ShowUpgradeHarness {
+            app,
+            tmdb: SHOW_TMDB,
+            group_hashes: vec![old_hash.clone()],
+            old_720_hash: old_hash,
+            cand_1080_hash: cand_hash,
+            old_2160_hash: String::new(),
+            pack_hash: String::new(),
+        }
+    }
+
+    /// Own S01E01 as a cached 2160p REMUX singleton (above the P1080 default ceiling — as if
+    /// acquired before the ceiling was lowered, or mirrored pre-existing); a cached within-ceiling
+    /// 1080p REMUX S01E01 is scrape-available as the corrective replacement.
+    async fn show_harness_singleton_2160_ep() -> ShowUpgradeHarness {
+        let store = mem_store();
+        let old_hash = "e2160".to_string();
+        store
+            .put_owned(old_hash.clone(), ep_record(1, 1, q2160_remux()))
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 1),
+                SelectionEntry {
+                    hash: old_hash.clone(),
+                    file_path: "old2160.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let cand = ep_1080_remux_candidate();
+        let cand_hash = cand.info_hash.clone();
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![cand],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "told2160".into(),
+                    hash: old_hash.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tep1080d".into(),
+                    hash: cand_hash.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tep1080d".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tep1080d".into(),
+                hash: cand_hash.clone(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "S.S01E01.1080p.REMUX.mkv".into(),
+                    bytes: 20_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/ep1080d".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/ep1080d".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        ShowUpgradeHarness {
+            app,
+            tmdb: SHOW_TMDB,
+            group_hashes: vec![old_hash.clone()],
+            old_720_hash: String::new(),
+            cand_1080_hash: cand_hash,
+            old_2160_hash: old_hash,
+            pack_hash: String::new(),
+        }
+    }
+
+    /// Own a cached 2160p full-season pack (S01E01-E02, above the P1080 default ceiling); the
+    /// scraper offers only an OVER-ceiling 2160p pack candidate — no within-ceiling replacement
+    /// exists, so `release::score`'s hard ceiling filter excludes it entirely.
+    async fn show_harness_pack_2160_no_candidate() -> ShowUpgradeHarness {
+        let store = mem_store();
+        let pack_hash = "pack2160".to_string();
+        let rec = OwnedRecord {
+            request: AcquireRequest {
+                imdb_id: "tt9".into(),
+                tmdb_id: SHOW_TMDB,
+                kind: MediaKind::Series,
+                season: Some(1),
+                episode: Some(1),
+                original_language: Some("eng".into()),
+                metadata: show_meta(),
+            },
+            provenance: Provenance::watchlist("a"),
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides: vec![(1, 1), (1, 2)],
+            quality: Some(q2160_remux()),
+        };
+        store.put_owned(pack_hash.clone(), rec).await.unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 1),
+                SelectionEntry {
+                    hash: pack_hash.clone(),
+                    file_path: "S.S01E01.2160p.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 2),
+                SelectionEntry {
+                    hash: pack_hash.clone(),
+                    file_path: "S.S01E02.2160p.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Only an OVER-CEILING pack candidate is scrape-available — no within-ceiling replacement.
+        let cand_4k = RawCandidate {
+            name: "Torrentio\n2160p".into(),
+            description: "S.2019.S01.2160p.BluRay.REMUX.x265\nRD+".into(),
+            info_hash: "hpack4k".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![cand_4k],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent {
+                id: "tpack2160".into(),
+                hash: pack_hash.clone(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        ShowUpgradeHarness {
+            app,
+            tmdb: SHOW_TMDB,
+            group_hashes: vec![pack_hash.clone()],
+            old_720_hash: String::new(),
+            cand_1080_hash: String::new(),
+            old_2160_hash: String::new(),
+            pack_hash,
+        }
+    }
+
+    #[tokio::test]
+    async fn singleton_episode_upgrades_to_better_cached_release() {
+        // Own S1E1 as a cached 720p singleton; a cached 1080p S1E1 is scrape-available; ceiling 1080.
+        let h = show_harness_singleton_720_ep().await;
+        upgrade_show_episodes_and_packs(&h.app, h.tmdb, &h.group_hashes, Duration::from_secs(0))
+            .await;
+        let sel = h
+            .app
+            .store
+            .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            sel.hash, h.cand_1080_hash,
+            "episode slot repointed to the 1080p release"
+        );
+        assert!(
+            h.app
+                .store
+                .get_owned(h.old_720_hash.clone())
+                .await
+                .is_none(),
+            "old singleton pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn singleton_episode_downgrade_respects_flag() {
+        // Own S1E1 cached 2160p singleton; ceiling 1080 (default); cached 1080p available.
+        let mut h = show_harness_singleton_2160_ep().await;
+        // Flag OFF: kept.
+        assert!(!h.app.config.allow_resolution_downgrade);
+        upgrade_show_episodes_and_packs(&h.app, h.tmdb, &h.group_hashes, Duration::from_secs(0))
+            .await;
+        assert!(
+            h.app
+                .store
+                .get_owned(h.old_2160_hash.clone())
+                .await
+                .is_some(),
+            "dry-run keeps 2160p"
+        );
+        assert_eq!(
+            h.app
+                .store
+                .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            h.old_2160_hash,
+            "selection unchanged in dry-run"
+        );
+        // Flag ON: corrected.
+        h.set_allow_downgrade(true);
+        upgrade_show_episodes_and_packs(&h.app, h.tmdb, &h.group_hashes, Duration::from_secs(0))
+            .await;
+        assert!(
+            h.app
+                .store
+                .get_owned(h.old_2160_hash.clone())
+                .await
+                .is_none(),
+            "flag on prunes 2160p"
+        );
+        assert_eq!(
+            h.app
+                .store
+                .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            h.cand_1080_hash,
+            "episode slot repointed to the within-ceiling replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_ceiling_pack_with_no_conforming_candidate_is_kept() {
+        // Own a cached 2160p full-season pack; ceiling 1080; scraper returns NO within-ceiling pack.
+        let mut h = show_harness_pack_2160_no_candidate().await;
+        h.set_allow_downgrade(true);
+        upgrade_show_episodes_and_packs(&h.app, h.tmdb, &h.group_hashes, Duration::from_secs(0))
+            .await;
+        assert!(
+            h.app.store.get_owned(h.pack_hash.clone()).await.is_some(),
+            "sole over-ceiling pack kept when no conforming replacement exists"
+        );
+        assert_eq!(
+            h.app
+                .store
+                .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            h.pack_hash,
+            "selection unchanged — nothing to repoint to"
+        );
     }
 }
