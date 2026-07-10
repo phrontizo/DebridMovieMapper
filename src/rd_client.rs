@@ -609,8 +609,9 @@ impl RealDebridClient {
     }
 
     /// Evict expired entries from the unrestrict cache, and if still over
-    /// MAX_CACHE_SIZE, remove the oldest entries.
-    pub async fn evict_expired_cache(&self) {
+    /// MAX_CACHE_SIZE, remove the oldest entries. Internal-only: the provider-neutral surface is the
+    /// `DebridProvider` trait; the concrete cache is not part of the public API.
+    async fn evict_expired_cache(&self) {
         let mut cache = self.unrestrict_cache.write().await;
         cache.retain(|_, v| v.cached_at.elapsed() < CACHE_TTL);
         // If still over max size, remove oldest entries
@@ -629,8 +630,9 @@ impl RealDebridClient {
 
     /// Remove a specific link from the unrestrict cache.
     /// Called after instant repair replaces a broken torrent so that stale
-    /// cached responses for the old link do not trigger a second repair.
-    pub async fn invalidate_unrestrict_cache(&self, link: &str) {
+    /// cached responses for the old link do not trigger a second repair. Internal-only: reached via
+    /// the `DebridProvider::invalidate` impl, not as public inherent API.
+    async fn invalidate_unrestrict_cache(&self, link: &str) {
         let mut cache = self.unrestrict_cache.write().await;
         cache.remove(link);
     }
