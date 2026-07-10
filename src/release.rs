@@ -8,9 +8,12 @@ pub struct RawCandidate {
     pub name: String,
     pub description: String,
     pub info_hash: String,
-    /// The addon-provided `fileIdx` (faithful parse output, asserted in `scraper` tests). NOT used
-    /// for file selection: `acquire`/`observe` select the largest video so they always agree (B10),
-    /// so a misleading addon index can't diverge them — see `acquire::select_target`.
+    /// The addon-provided `fileIdx` (faithful parse output, asserted in `scraper` tests). It has NO
+    /// production consumer — `release::parse` drops it, and `acquire`/`observe` select the largest
+    /// video so they always agree (B10), so a misleading addon index can't diverge them (see
+    /// `acquire::select_target`). Retained deliberately as a parse-only capture that documents the
+    /// Torrentio resolve-URL structure (guarded by the `hash_idx_from_url` tests), NOT dead flow to
+    /// be wired into selection.
     pub file_idx: Option<usize>,
     pub file_name: Option<String>,
 }
