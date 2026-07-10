@@ -145,13 +145,33 @@ pub async fn run_scan_loop(
                 // Duplicates arise when repair's add_magnet leaks a torrent, or when
                 // external tools (e.g. DebridMediaManager) re-add the same hash.
                 let (deduped_torrents, duplicate_ids) = dedup_torrents_by_hash(&torrents);
-                for dup_id in duplicate_ids {
-                    let rd = provider.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = rd.delete_torrent(&dup_id).await {
-                            tracing::error!("Failed to delete duplicate torrent {}: {}", dup_id, e);
+                // Idle-gate the provider-side deletion, like every other destructive path
+                // (execute_remove / dedup_owned / the upgrade prune): a redundant same-hash duplicate
+                // is never urgent, so defer its removal while any stream is active rather than risk
+                // deleting a torrent id a playback read is still resolving against. The duplicate is
+                // re-detected and removed on a later idle tick; `deduped_torrents` already hides it
+                // from the VFS this tick regardless.
+                if !duplicate_ids.is_empty() {
+                    let idle_window = Duration::from_secs(config.upgrade.idle_secs);
+                    if app.read_activity.all_idle(idle_window).await {
+                        for dup_id in duplicate_ids {
+                            let rd = provider.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = rd.delete_torrent(&dup_id).await {
+                                    tracing::error!(
+                                        "Failed to delete duplicate torrent {}: {}",
+                                        dup_id,
+                                        e
+                                    );
+                                }
+                            });
                         }
-                    });
+                    } else {
+                        debug!(
+                            "scan: library active; deferring deletion of {} duplicate torrent(s)",
+                            duplicate_ids.len()
+                        );
+                    }
                 }
 
                 let mut current_data = Vec::new();
