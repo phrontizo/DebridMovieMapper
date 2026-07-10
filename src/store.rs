@@ -292,6 +292,23 @@ fn io_kind_is_corruption(kind: std::io::ErrorKind) -> bool {
     )
 }
 
+/// A `<path>.corrupt` backup name that doesn't already exist (falling back to `<path>.corrupt.<n>`),
+/// so moving an unusable DB aside never fails on — nor silently overwrites — a `.corrupt` from a
+/// prior recovery. Returns the plain name if the bounded search is exhausted.
+fn unique_backup_path(path: &str) -> String {
+    let base = format!("{path}.corrupt");
+    if !std::path::Path::new(&base).exists() {
+        return base;
+    }
+    for n in 1..1000 {
+        let candidate = format!("{path}.corrupt.{n}");
+        if !std::path::Path::new(&candidate).exists() {
+            return candidate;
+        }
+    }
+    base
+}
+
 /// Classify a `Database::create`/open error. Only a positive *corruption* signal moves the file
 /// aside; lock contention (another instance), permission/disk I/O errors, and unknown future
 /// variants are treated as transient so a healthy database is never silently discarded.
@@ -503,10 +520,13 @@ impl Store {
         Ok(())
     }
 
-    /// Move an unusable database aside to `<path>.corrupt` and create a fresh one.
-    /// Never deletes outright unless the rename itself fails.
+    /// Move an unusable database aside to `<path>.corrupt` (or `<path>.corrupt.<n>` if that already
+    /// exists) and create a fresh one. Never deletes outright unless the rename itself fails.
     fn move_aside_and_create(path: &str) -> Result<Database, AppError> {
-        let backup = format!("{}.corrupt", path);
+        // Pick a backup name that doesn't already exist so the rename can't fail on (nor overwrite)
+        // a `.corrupt` from a prior recovery — on Windows rename won't overwrite an existing target,
+        // which would otherwise force the destructive `remove_file` fallback below.
+        let backup = unique_backup_path(path);
         if std::path::Path::new(path).exists() {
             match std::fs::rename(path, &backup) {
                 Ok(()) => info!("Moved aside unusable database to {}", backup),
@@ -1697,6 +1717,26 @@ mod tests {
             db_open_failure(redb::DatabaseError::UpgradeRequired(1)),
             OpenFailure::Transient(_)
         ));
+    }
+
+    #[test]
+    fn unique_backup_path_avoids_an_existing_corrupt_file() {
+        let mut base = std::env::temp_dir();
+        base.push(format!("dmm_backup_path_test_{}", std::process::id()));
+        let path = base.to_str().unwrap().to_string();
+        let corrupt = format!("{path}.corrupt");
+        let corrupt1 = format!("{path}.corrupt.1");
+        let _ = std::fs::remove_file(&corrupt);
+        let _ = std::fs::remove_file(&corrupt1);
+        // No existing `.corrupt` → the plain name.
+        assert_eq!(unique_backup_path(&path), corrupt);
+        // An existing `.corrupt` → a numbered variant, so the rename never fails on / clobbers it.
+        std::fs::write(&corrupt, b"x").unwrap();
+        assert_eq!(unique_backup_path(&path), corrupt1);
+        std::fs::write(&corrupt1, b"y").unwrap();
+        assert_eq!(unique_backup_path(&path), format!("{path}.corrupt.2"));
+        let _ = std::fs::remove_file(&corrupt);
+        let _ = std::fs::remove_file(&corrupt1);
     }
 
     #[test]
