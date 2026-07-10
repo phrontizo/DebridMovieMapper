@@ -101,7 +101,8 @@ pub async fn run_scan_loop(
             info!("Scan task: shutdown requested, exiting");
             return;
         }
-        if tick.is_multiple_of(prune_every_ticks) {
+        let is_prune_tick = tick.is_multiple_of(prune_every_ticks);
+        if is_prune_tick {
             let now = crate::now_unix_secs();
             let pruned = store
                 .prune_blacklist_before(now.saturating_sub(BLACKLIST_TTL_SECS))
@@ -341,6 +342,25 @@ pub async fn run_scan_loop(
                 // remove redundant duplicate torrents. Dry-run (log only) unless
                 // DEDUP_REMOVE_DUPLICATES is set.
                 dedup_owned(&app, &torrents).await;
+
+                // Daily: reap dangling account-mirror owned records whose hash has left the provider
+                // listing entirely. Without this, a `Verified` empty-provenance mirror record for a
+                // deleted/lapsed torrent is never cleaned (dedup/observe/Trigger-A/B all ignore an
+                // absent mirror record), so the `owned` table grows unbounded over the deployment's
+                // lifetime — slowing every O(all_owned) hot path (same rationale as the blacklist /
+                // upgrade-cursor prunes above). Store-only cleanup: the torrent is already gone, so
+                // there is nothing to delete and no active stream to interrupt.
+                if is_prune_tick {
+                    let present: std::collections::HashSet<String> =
+                        torrents.iter().map(|t| t.hash.to_ascii_lowercase()).collect();
+                    let reaped =
+                        reap_absent_mirror_owned(&store, &present, torrents.is_empty()).await;
+                    if reaped > 0 {
+                        info!(
+                            "Reaped {reaped} account-mirror owned record(s) whose hash left the provider"
+                        );
+                    }
+                }
 
                 let current_ids: std::collections::HashSet<&str> =
                     deduped_torrents.iter().map(|t| t.id.as_str()).collect();
@@ -1090,6 +1110,61 @@ fn mirror_quality(
 /// its selected video files (a movie's is empty); `quality` is derived from the representative
 /// (largest) video file via [`mirror_quality`] (or `None` when there is no video / it is above the
 /// resolution ceiling, in which case the upgrade path skips it conservatively).
+/// Owned-record hashes safe to reap because their torrent has left the provider: a `Verified`,
+/// EMPTY-provenance (account-mirror) record whose lowercased hash is absent from `present` (the
+/// current provider listing). The torrent is already gone, so reaping only drops a dangling
+/// bookkeeping row — `record_mirror_owned` re-creates it if the hash reappears, and the reconciler
+/// re-acquires it fresh if a Trakt user still wants it (so a rare wrongful reap on a transient
+/// listing glitch self-heals with no lost state). Engine/provenance-bearing records are left to the
+/// acquire/reconcile lifecycle. Returns empty when `listing_empty` — a wholesale-empty listing is an
+/// untrustworthy reap signal (same guard as `observe`).
+fn absent_mirror_records_to_reap(
+    owned: &[(String, OwnedRecord)],
+    present: &std::collections::HashSet<String>,
+    listing_empty: bool,
+) -> Vec<String> {
+    if listing_empty {
+        return Vec::new();
+    }
+    owned
+        .iter()
+        .filter(|(hash, rec)| {
+            rec.status == OwnedStatus::Verified
+                && rec.provenance.entries.is_empty()
+                && !present.contains(&hash.to_ascii_lowercase())
+        })
+        .map(|(hash, _)| hash.clone())
+        .collect()
+}
+
+/// Reap the dangling account-mirror owned records identified by [`absent_mirror_records_to_reap`],
+/// cleaning up each owned record plus its authoritative-id and selection entries (mirrors the
+/// blacklisted-phantom reaper in `record_mirror_owned`). Store-only — the torrent is already absent
+/// from the provider, so there is nothing to delete and no stream to interrupt (no idle-gate needed).
+/// Returns the number of records reaped.
+async fn reap_absent_mirror_owned(
+    store: &Store,
+    present: &std::collections::HashSet<String>,
+    listing_empty: bool,
+) -> usize {
+    let owned = store.all_owned().await;
+    let to_reap = absent_mirror_records_to_reap(&owned, present, listing_empty);
+    if to_reap.is_empty() {
+        return 0;
+    }
+    let selection = store.all_selection().await;
+    for h in &to_reap {
+        let _ = store.remove_owned(h.clone()).await;
+        let _ = store.remove_authoritative(h.clone()).await;
+        for (slot, entry) in &selection {
+            if entry.hash.eq_ignore_ascii_case(h) {
+                let _ = store.remove_selection(slot.clone()).await;
+            }
+        }
+    }
+    to_reap.len()
+}
+
 pub(crate) async fn record_mirror_owned(
     store: &Store,
     tmdb: &TmdbClient,
@@ -2735,6 +2810,105 @@ mod tests {
             store.get_owned("engine".into()).await.is_some(),
             "a blacklisted ENGINE record must be left for fail_and_reacquire to manage"
         );
+    }
+
+    /// Minimal `Verified` movie `OwnedRecord` with the given provenance, for the reaper tests.
+    fn reaper_rec(tmdb: u64, prov: Provenance) -> OwnedRecord {
+        OwnedRecord {
+            request: AcquireRequest {
+                imdb_id: String::new(),
+                tmdb_id: tmdb,
+                kind: crate::scraper::MediaKind::Movie,
+                season: None,
+                episode: None,
+                original_language: None,
+                metadata: MediaMetadata {
+                    title: "Movie".into(),
+                    year: None,
+                    media_type: MediaType::Movie,
+                    external_id: Some(format!("tmdb:{tmdb}")),
+                },
+            },
+            provenance: prov,
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: None,
+        }
+    }
+
+    #[test]
+    fn absent_mirror_records_to_reap_only_reaps_verified_empty_provenance_absent() {
+        let mirror_absent = reaper_rec(1, Provenance { entries: vec![] });
+        let mirror_present = reaper_rec(2, Provenance { entries: vec![] });
+        let mut mirror_pending = reaper_rec(3, Provenance { entries: vec![] });
+        mirror_pending.status = OwnedStatus::Pending; // observe owns absent Pending records
+        let engine_absent = reaper_rec(4, Provenance::watchlist("alice")); // provenance → not a mirror
+        let owned = vec![
+            ("aaa".to_string(), mirror_absent),
+            ("BBB".to_string(), mirror_present),
+            ("ccc".to_string(), mirror_pending),
+            ("ddd".to_string(), engine_absent),
+        ];
+        let present: std::collections::HashSet<String> = ["bbb".to_string()].into_iter().collect();
+        let reap = absent_mirror_records_to_reap(&owned, &present, false);
+        assert_eq!(
+            reap,
+            vec!["aaa".to_string()],
+            "only a Verified empty-provenance record absent from the listing is reaped \
+             (present mirror, Pending mirror, and engine records are all kept)"
+        );
+        // A wholesale-empty listing is untrustworthy: reap nothing.
+        assert!(absent_mirror_records_to_reap(&owned, &Default::default(), true).is_empty());
+    }
+
+    #[tokio::test]
+    async fn reap_absent_mirror_owned_drops_dangling_records_and_cleans_selection() {
+        use crate::store::{SelectionEntry, Store};
+        let store = Store::from_database(std::sync::Arc::new(
+            redb::Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        ))
+        .unwrap();
+        // An absent mirror record (empty provenance) with a selection entry → fully reaped.
+        store
+            .put_owned("gone".into(), reaper_rec(10, Provenance { entries: vec![] }))
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                crate::store::movie_slot(10),
+                SelectionEntry {
+                    hash: "gone".into(),
+                    file_path: "Movie.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        // A present mirror record and an absent ENGINE record must both be kept.
+        store
+            .put_owned("here".into(), reaper_rec(11, Provenance { entries: vec![] }))
+            .await
+            .unwrap();
+        store
+            .put_owned("eng".into(), reaper_rec(12, Provenance::watchlist("bob")))
+            .await
+            .unwrap();
+
+        let present: std::collections::HashSet<String> = ["here".to_string()].into_iter().collect();
+        let reaped = reap_absent_mirror_owned(&store, &present, false).await;
+        assert_eq!(reaped, 1);
+        assert!(store.get_owned("gone".into()).await.is_none());
+        assert!(
+            store
+                .get_selection(crate::store::movie_slot(10))
+                .await
+                .is_none(),
+            "the reaped record's selection entry must be cleaned up too"
+        );
+        assert!(store.get_owned("here".into()).await.is_some());
+        assert!(store.get_owned("eng".into()).await.is_some());
     }
 
     // ── plan_dedup (pure) ─────────────────────────────────────────────────────
