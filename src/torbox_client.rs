@@ -254,6 +254,28 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
     )
 }
 
+/// Whether a `requestdl` failure is a clearly-PERMANENT auth/permission error (401/403) that a
+/// re-add-by-hash cannot fix, so `resolve_locator` surfaces it as `Http` (hard read failure) rather
+/// than `Unavailable` (trigger a pointless repair on every read). Everything else — a 5xx, a 404
+/// (a stale torrent_id that re-add can recover), or a statusless transport error — is treated as
+/// available-later (`Unavailable`) so the read path repairs.
+fn requestdl_status_is_permanent(status: Option<reqwest::StatusCode>) -> bool {
+    matches!(
+        status,
+        Some(s) if s == reqwest::StatusCode::UNAUTHORIZED || s == reqwest::StatusCode::FORBIDDEN
+    )
+}
+
+/// Whether an `add_magnet_raw` (createtorrent) failure definitively is NOT a "download already
+/// queued" duplicate, so the recovery list-fetch can be skipped: a non-400 CLIENT error (401/403
+/// auth, 404) plainly failed and a list-fetch would fail the same way. Everything else still attempts
+/// recovery — a 400 (the dup signal); any 5xx (a soft enveloped `success:false` surfaces as a
+/// synthetic 502, indistinguishable from a real outage, so we don't risk dropping a dup signal); and
+/// a statusless transport error (cheap best-effort).
+fn add_error_skips_recovery(status: Option<reqwest::StatusCode>) -> bool {
+    status.is_some_and(|s| s.is_client_error() && s != reqwest::StatusCode::BAD_REQUEST)
+}
+
 /// Parse TorBox's advertised rate-limit window from response headers. TorBox sends
 /// `x-ratelimit-remaining` + `x-ratelimit-reset` (a unix-epoch float) on every response,
 /// letting us pace proactively. Returns `None` if either header is missing or unparseable.
@@ -652,9 +674,7 @@ impl TorBoxClient {
                 // 502*, indistinguishable from a real outage, so we don't risk blocking a soft-failure
                 // dup signal; and a statusless transport error (cheap best-effort, falls through to
                 // the original error if no match).
-                let skip_recovery = e
-                    .status()
-                    .is_some_and(|s| s.is_client_error() && s != reqwest::StatusCode::BAD_REQUEST);
+                let skip_recovery = add_error_skips_recovery(e.status());
                 if !skip_recovery {
                     if let Some(hash) = magnet_infohash(&magnet) {
                         if let Ok(list) = self.list_torrents_raw().await {
@@ -718,24 +738,20 @@ impl TorBoxClient {
                 // avoid a pointless repair cycle on every read. (A 404 stays Unavailable: it can be a
                 // stale torrent_id that re-add-by-hash recovers.) Log at debug — read-path, not an
                 // error, and during a repair storm info! would spam.
-                match e.status() {
-                    Some(s)
-                        if s == reqwest::StatusCode::UNAUTHORIZED
-                            || s == reqwest::StatusCode::FORBIDDEN =>
-                    {
-                        debug!(
-                            "TorBox requestdl auth/permission error ({}) for torrent {} file {}",
-                            s, loc.torrent_id, loc.file_id
-                        );
-                        Err(AppError::Http(e))
-                    }
-                    _ => {
-                        debug!(
-                            "TorBox requestdl unavailable for torrent {} file {}",
-                            loc.torrent_id, loc.file_id
-                        );
-                        Err(AppError::Unavailable)
-                    }
+                if requestdl_status_is_permanent(e.status()) {
+                    debug!(
+                        "TorBox requestdl auth/permission error ({:?}) for torrent {} file {}",
+                        e.status(),
+                        loc.torrent_id,
+                        loc.file_id
+                    );
+                    Err(AppError::Http(e))
+                } else {
+                    debug!(
+                        "TorBox requestdl unavailable for torrent {} file {}",
+                        loc.torrent_id, loc.file_id
+                    );
+                    Err(AppError::Unavailable)
                 }
             }
         }
@@ -815,6 +831,40 @@ mod tests {
         assert!(!is_transient_status(reqwest::StatusCode::OK));
         assert!(!is_transient_status(reqwest::StatusCode::NOT_FOUND));
         assert!(!is_transient_status(reqwest::StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn requestdl_status_is_permanent_only_for_auth_failures() {
+        use reqwest::StatusCode;
+        // 401/403 are permanent → resolve_locator surfaces Http (no pointless repair).
+        assert!(requestdl_status_is_permanent(Some(StatusCode::UNAUTHORIZED)));
+        assert!(requestdl_status_is_permanent(Some(StatusCode::FORBIDDEN)));
+        // A 5xx, a 404 (stale torrent_id, recoverable), and a statusless transport error are all
+        // "available later" → Unavailable → the read path repairs.
+        assert!(!requestdl_status_is_permanent(Some(
+            StatusCode::INTERNAL_SERVER_ERROR
+        )));
+        assert!(!requestdl_status_is_permanent(Some(StatusCode::BAD_GATEWAY)));
+        assert!(!requestdl_status_is_permanent(Some(StatusCode::NOT_FOUND)));
+        assert!(!requestdl_status_is_permanent(None));
+    }
+
+    #[test]
+    fn add_error_skips_recovery_only_for_non_400_client_errors() {
+        use reqwest::StatusCode;
+        // Non-400 client errors (401/403 auth, 404) plainly failed and are NOT a dup → skip recovery.
+        assert!(add_error_skips_recovery(Some(StatusCode::UNAUTHORIZED)));
+        assert!(add_error_skips_recovery(Some(StatusCode::FORBIDDEN)));
+        assert!(add_error_skips_recovery(Some(StatusCode::NOT_FOUND)));
+        // A 400 is the "download already queued" dup signal → MUST attempt recovery.
+        assert!(!add_error_skips_recovery(Some(StatusCode::BAD_REQUEST)));
+        // A 5xx (possibly a synthetic 502 masking a soft success:false dup) and a statusless
+        // transport error still attempt recovery — never risk dropping a dup signal.
+        assert!(!add_error_skips_recovery(Some(
+            StatusCode::INTERNAL_SERVER_ERROR
+        )));
+        assert!(!add_error_skips_recovery(Some(StatusCode::BAD_GATEWAY)));
+        assert!(!add_error_skips_recovery(None));
     }
 
     #[test]
