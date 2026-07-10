@@ -14,6 +14,29 @@ use tokio::sync::RwLock;
 /// upgrade/repair. Without it the map grows for every distinct path *ever* streamed.
 const MAX_TRACKED: usize = 4096;
 
+/// Evict the oldest entries from `map` until it is no larger than `watermark`, but ALWAYS keep at
+/// least the single newest entry (so `all_idle`/`most_recent`, which key off the newest read, are
+/// never disturbed). Split out from `touch` so the pivot-index bounds are unit-testable independently
+/// of the shipped `MAX_TRACKED`: `select_nth_unstable_by_key(k, …)` panics if `k >= len`, and a
+/// `watermark` of 0 (which `MAX_TRACKED <= 1` would produce) would otherwise make `excess == len`.
+fn evict_to_watermark(map: &mut HashMap<String, Instant>, watermark: usize) {
+    if map.len() <= watermark {
+        return;
+    }
+    // Cap the number removed at len-1 so the newest entry survives and the pivot index stays
+    // in-bounds even when `watermark == 0`.
+    let excess = (map.len() - watermark).min(map.len() - 1);
+    if excess == 0 {
+        return;
+    }
+    let mut entries: Vec<(String, Instant)> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    // Partition the `excess` oldest entries to the front in O(n) (no full sort needed).
+    entries.select_nth_unstable_by_key(excess, |(_, t)| *t);
+    for (k, _) in entries.into_iter().take(excess) {
+        map.remove(&k);
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ReadActivity {
     last_read: Arc<RwLock<HashMap<String, Instant>>>,
@@ -41,14 +64,7 @@ impl ReadActivity {
         }
         map.insert(path.to_string(), Instant::now());
         if map.len() > MAX_TRACKED {
-            let excess = map.len() - WATERMARK;
-            let mut entries: Vec<(String, Instant)> =
-                map.iter().map(|(k, v)| (k.clone(), *v)).collect();
-            // Partition the `excess` oldest entries to the front in O(n) (no full sort needed).
-            entries.select_nth_unstable_by_key(excess, |(_, t)| *t);
-            for (k, _) in entries.into_iter().take(excess) {
-                map.remove(&k);
-            }
+            evict_to_watermark(&mut map, WATERMARK);
         }
     }
 
@@ -115,6 +131,36 @@ mod tests {
         assert!(ra.most_recent().await.is_some());
         // …and a zero-length window makes any elapsed time count as idle again.
         assert!(ra.all_idle(Duration::from_secs(0)).await);
+    }
+
+    #[test]
+    fn eviction_does_not_panic_for_tiny_watermark() {
+        // Latent-trap guard: if MAX_TRACKED is ever lowered so WATERMARK computes to 0, the pivot
+        // index passed to select_nth_unstable_by_key must still stay < len. A watermark of 0 must
+        // not panic and must keep at least one (the newest) entry rather than emptying the map.
+        let mut two: HashMap<String, Instant> = HashMap::new();
+        two.insert("a".into(), Instant::now());
+        two.insert("b".into(), Instant::now());
+        evict_to_watermark(&mut two, 0);
+        assert_eq!(
+            two.len(),
+            1,
+            "keeps exactly one entry (the newest); never panics or empties"
+        );
+
+        // A single-entry map with watermark 0 has nothing safe to evict → unchanged, no panic.
+        let mut one: HashMap<String, Instant> = HashMap::new();
+        one.insert("solo".into(), Instant::now());
+        evict_to_watermark(&mut one, 0);
+        assert_eq!(one.len(), 1);
+
+        // Normal case still evicts down to the watermark exactly.
+        let mut many: HashMap<String, Instant> = HashMap::new();
+        for i in 0..10 {
+            many.insert(format!("k{i}"), Instant::now());
+        }
+        evict_to_watermark(&mut many, 4);
+        assert_eq!(many.len(), 4, "evicts down to the watermark");
     }
 
     #[tokio::test]
