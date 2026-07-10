@@ -527,16 +527,17 @@ impl DebridVfs {
                                         // "Part 2"), then default to season 1.
                                         let season = se
                                             .map(|(s, _)| s)
+                                            .or_else(|| season_from(filename))
+                                            // Only when the basename yields nothing: season packs
+                                            // often encode the season in the PARENT DIRECTORY
+                                            // ("Show/Season 04/09 - Title.mkv") rather than the
+                                            // filename. Filename precedence is preserved (this runs
+                                            // last), so a contradictory "1x05" in a "/Season 03/"
+                                            // path still prefers the filename.
                                             .or_else(|| {
-                                                SEASON_RE
-                                                    .captures(filename)
-                                                    .and_then(|cap| {
-                                                        cap.get(1)
-                                                            .or_else(|| cap.get(2))
-                                                            .or_else(|| cap.get(3))
-                                                            .or_else(|| cap.get(4))
-                                                    })
-                                                    .and_then(|m| m.as_str().parse::<u32>().ok())
+                                                let dir =
+                                                    &file.path[..file.path.len() - filename.len()];
+                                                season_from(dir)
                                             })
                                             .unwrap_or(1);
 
@@ -931,6 +932,21 @@ pub fn is_video_file(path: &str) -> bool {
         }
     }
     VIDEO_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// Extract a season number from an arbitrary string (filename or directory portion) via SEASON_RE,
+/// returning the first populated capture group (`Sxx` / `Season N` / `NxNN` / `Part N`). Shared by
+/// the filename check and the parent-directory fallback in the show-emit loop.
+fn season_from(s: &str) -> Option<u32> {
+    SEASON_RE
+        .captures(s)
+        .and_then(|cap| {
+            cap.get(1)
+                .or_else(|| cap.get(2))
+                .or_else(|| cap.get(3))
+                .or_else(|| cap.get(4))
+        })
+        .and_then(|m| m.as_str().parse::<u32>().ok())
 }
 
 fn xml_escape(s: &str) -> String {
@@ -1860,6 +1876,67 @@ mod tests {
                     assert!(
                         !seasons.contains_key("Season 01"),
                         "dash-coded episode must NOT fall back to Season 01"
+                    );
+                } else {
+                    panic!("show dir is not a directory");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_uses_parent_directory_season_when_filename_lacks_one() {
+        // A season pack that encodes the season in the DIRECTORY, not the basename
+        // ("Breaking Bad Season 2/02 - Cats in the Bag.mkv"), must land in Season 02 rather than
+        // silently defaulting to Season 01 — the basename alone yields no season/episode code.
+        let torrents = vec![(
+            TorrentInfo {
+                id: "s1".to_string(),
+                filename: "02 - Cats in the Bag.mkv".to_string(),
+                original_filename: "02 - Cats in the Bag.mkv".to_string(),
+                hash: "h1".to_string(),
+                bytes: 3000,
+                original_bytes: 3000,
+                host: "host".to_string(),
+                split: 1,
+                progress: 100.0,
+                status: "downloaded".to_string(),
+                added: "2024-01-01".to_string(),
+                files: vec![TorrentFile {
+                    id: 1,
+                    path: "/Breaking Bad Season 2/02 - Cats in the Bag.mkv".to_string(),
+                    bytes: 3000,
+                    selected: 1,
+                }],
+                links: vec!["http://link1".to_string()],
+                ended: Some("2024-01-01".to_string()),
+            },
+            MediaMetadata {
+                title: "Breaking Bad".to_string(),
+                year: Some("2008".to_string()),
+                media_type: MediaType::Show,
+                external_id: Some("tmdb:1396".to_string()),
+            },
+        )];
+
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
+
+        if let VfsNode::Directory { children } = &vfs.root {
+            let shows = children.get("Shows").expect("Shows dir");
+            if let VfsNode::Directory {
+                children: show_children,
+            } = shows
+            {
+                let show_dir = show_children.values().next().expect("one show folder");
+                if let VfsNode::Directory { children: seasons } = show_dir {
+                    assert!(
+                        seasons.contains_key("Season 02"),
+                        "expected Season 02 from the directory, got {:?}",
+                        seasons.keys().collect::<Vec<_>>()
+                    );
+                    assert!(
+                        !seasons.contains_key("Season 01"),
+                        "directory-coded season must NOT fall back to Season 01"
                     );
                 } else {
                     panic!("show dir is not a directory");
