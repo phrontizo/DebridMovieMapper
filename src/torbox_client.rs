@@ -398,12 +398,24 @@ impl TorBoxClient {
 
     /// Send a request, rate-limited with 429/transient retry, returning the envelope's `data`.
     /// Synthesises a Bad Gateway reqwest error when `success` is false or `data` is missing.
+    /// Uses the default 6-attempt budget for background/bulk callers (mylist/createtorrent/…).
     async fn send_data<T, F>(&self, make: F) -> Result<T, reqwest::Error>
     where
         T: serde::de::DeserializeOwned,
         F: Fn() -> reqwest::RequestBuilder,
     {
-        let max_attempts = 6u32;
+        self.send_data_n(make, 6).await
+    }
+
+    /// `send_data` with an explicit attempt budget. The synchronous on-read playback resolve
+    /// (`resolve_locator`) passes a SMALL budget (3) so a black-holing endpoint (packets dropped →
+    /// repeated 10s connect timeouts) fails over to instant repair in ~30s rather than ~60s — the
+    /// same fast-fail rationale as the RD client's 3-attempt `unrestrict_link` read path.
+    async fn send_data_n<T, F>(&self, make: F, max_attempts: u32) -> Result<T, reqwest::Error>
+    where
+        T: serde::de::DeserializeOwned,
+        F: Fn() -> reqwest::RequestBuilder,
+    {
         for attempt in 1..=max_attempts {
             self.rate_limiter.wait_for_token().await;
             let resp = match make().send().await {
@@ -726,7 +738,13 @@ impl TorBoxClient {
             "{}/torrents/requestdl?token={}&torrent_id={}&file_id={}",
             TORBOX_BASE, self.api_key, loc.torrent_id, loc.file_id
         );
-        match self.send_data::<String, _>(|| self.client.get(&url)).await {
+        // Bounded budget (3): this is the synchronous on-read resolve, so a wedged/black-holing
+        // endpoint must fail over to instant repair fast rather than run the full 6-attempt loop
+        // (mirrors the RD client's fast-fail `unrestrict_link` read path).
+        match self
+            .send_data_n::<String, _>(|| self.client.get(&url), 3)
+            .await
+        {
             Ok(cdn) => {
                 self.cache_put(loc, cdn.clone()).await;
                 Ok(cdn)
@@ -1176,6 +1194,26 @@ mod tests {
             counter.load(std::sync::atomic::Ordering::SeqCst),
             6,
             "a 429 must be retried for the full attempt budget before surfacing"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_data_n_honours_a_smaller_budget() {
+        // The on-read resolve path (`resolve_locator`) passes a small budget (3) so a persistently
+        // failing/black-holing endpoint fails over to repair fast, rather than the 6-attempt default
+        // background callers use. A persistent 503 must be retried only `max_attempts` times.
+        let (url, counter) = spawn_status_repeating(503).await;
+        let client = TorBoxClient::new("fake".to_string()).unwrap();
+        let r: Result<serde_json::Value, _> =
+            client.send_data_n(|| client.client.get(&url), 3).await;
+        assert!(
+            r.is_err(),
+            "a persistent 503 surfaces an error after the budget"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the bounded budget (3) is honoured, not the default 6"
         );
     }
 
