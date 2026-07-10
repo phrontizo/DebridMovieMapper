@@ -465,6 +465,14 @@ impl TorBoxClient {
                         e,
                         text.len()
                     );
+                    // A truncated/partial 200 body is transient — retry rather than discard the whole
+                    // call on a one-off hiccup (symmetry with the RD client's decode-retry; without
+                    // this a mid-body glitch fails the entire mylist tick). A persistent schema
+                    // mismatch simply exhausts the budget and returns the synthetic 502 below.
+                    if attempt < max_attempts {
+                        tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                        continue;
+                    }
                 }
             }
             break;
@@ -547,6 +555,14 @@ impl TorBoxClient {
                         e,
                         text.len()
                     );
+                    // A truncated/partial 200 body is transient — retry rather than discard the whole
+                    // call on a one-off hiccup (symmetry with send_data and the RD client's
+                    // decode-retry). A persistent schema mismatch exhausts the budget and returns the
+                    // synthetic 502 below.
+                    if attempt < max_attempts {
+                        tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                        continue;
+                    }
                 }
             }
             break;
@@ -1022,6 +1038,63 @@ mod tests {
             }
         });
         (format!("http://{}/", addr), counter)
+    }
+
+    /// Spawn a local HTTP server that replies with `first` on the first connection then `second` on
+    /// every subsequent connection (both `200 OK` JSON), counting the requests it saw.
+    async fn spawn_json_200_sequence(
+        first: &'static str,
+        second: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = counter.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for i in 0..8 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let n = c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let body = if i == 0 { first } else { second };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = n; // silence unused in case of a single-connection run
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{}/", addr), counter)
+    }
+
+    #[tokio::test]
+    async fn send_data_retries_a_transient_decode_failure() {
+        // A one-off truncated/garbage 200 body must be RETRIED (symmetry with the RD client), not
+        // give up after a single decode failure — otherwise a transient hiccup discards the whole
+        // mylist tick. First response is un-decodable; the second is valid → the call recovers.
+        let (url, counter) = spawn_json_200_sequence(
+            "{ this is not valid json",         // decode failure on attempt 1
+            r#"{"success":true,"data":"ok"}"#,  // valid on attempt 2
+        )
+        .await;
+        let client = TorBoxClient::new("fake".to_string()).unwrap();
+        let r: Result<String, _> = client.send_data(|| client.client.get(&url)).await;
+        assert_eq!(
+            r.unwrap(),
+            "ok",
+            "a transient decode failure is retried and recovers"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly one retry after the transient decode failure"
+        );
     }
 
     #[tokio::test(start_paused = true)]
