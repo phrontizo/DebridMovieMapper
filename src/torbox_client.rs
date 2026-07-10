@@ -418,7 +418,7 @@ impl TorBoxClient {
                     .map(|e| e.without_url())
                     .unwrap_or_else(synthetic_bad_gateway));
             }
-            // Retry transient 5xx (502/503/504) with a short backoff before giving up.
+            // Retry transient 5xx (500/502/503/504) with a short backoff before giving up.
             if is_transient_status(resp.status()) && attempt < max_attempts {
                 warn!("TorBox {} (attempt {}), retrying", resp.status(), attempt);
                 tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
@@ -453,9 +453,13 @@ impl TorBoxClient {
                     );
                 }
                 Ok(env) => {
+                    // Redact `detail` before logging: `send_data::<String>` serves `requestdl` and a
+                    // TorBox error body can echo the token-bearing URL (`?token=<key>`), so the
+                    // API-controlled `detail` string is NOT assumed safe (matches the redaction the
+                    // `error_for_status_ref` branch above already applies).
                     warn!(
                         "TorBox response not success: {:?} (body {} bytes, redacted)",
-                        env.detail,
+                        env.detail.as_deref().map(|d| self.redact(d)),
                         text.len()
                     );
                 }
@@ -543,9 +547,12 @@ impl TorBoxClient {
                     return Ok(());
                 }
                 Ok(env) => {
+                    // Redact `detail` before logging: a TorBox error body can echo the token-bearing
+                    // URL, so the API-controlled `detail` string is scrubbed like the
+                    // `error_for_status_ref` branch above (never assumed secret-free).
                     warn!(
                         "TorBox response not success: {:?} (body {} bytes, redacted)",
-                        env.detail,
+                        env.detail.as_deref().map(|d| self.redact(d)),
                         text.len()
                     );
                 }
