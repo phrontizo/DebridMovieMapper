@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 /// provider/scraper was momentarily unavailable) and must be reconsidered next tick — its cursor is
 /// left UNSTAMPED. A `NoChange` title WAS evaluated to completion (no meaningful upgrade exists, or
 /// the chosen candidate didn't pan out) and its cursor is stamped so the budget rotates onward.
+#[derive(Debug)]
 enum UpgradeSkip {
     Deferred(String),
     NoChange(String),
@@ -322,6 +323,51 @@ async fn pick_best_change(
     best.map(|(r, _, imp)| (r, imp))
 }
 
+/// Rank all CACHED target-improvement candidates best-score-first, skipping owned and blacklisted
+/// hashes and anything failing `score()`'s hard filters (ceiling / cam / dead-seeder). The caller
+/// stages them in order until one is adopted (in-tick fall-through), so a top candidate that fails a
+/// candidate-specific gate no longer ends the tick. The list is direction-homogeneous (all `Upgrade`
+/// or all `Downgrade`) because `is_target_improvement` only rates a lower-resolution candidate as
+/// improving when the owned copy is over the ceiling.
+async fn rank_changes(
+    app: &AppState,
+    media: MediaKind,
+    tmdb_id: u64,
+    raws: &[release::RawCandidate],
+    baseline: &QualitySummary,
+    owned_hashes: &[String],
+) -> Vec<(release::ReleaseInfo, release::Improvement)> {
+    let prefs = &app.config.acquisition.prefs;
+    let mut scored: Vec<(i64, release::ReleaseInfo, release::Improvement)> = Vec::new();
+    for raw in raws {
+        let r = release::parse(raw);
+        if owned_hashes
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(&r.info_hash))
+        {
+            continue;
+        }
+        if app
+            .store
+            .is_blacklisted(media, tmdb_id, r.info_hash.clone())
+            .await
+        {
+            continue;
+        }
+        if release::score(&r, prefs).is_none() {
+            continue;
+        }
+        let q = QualitySummary::of(&r, prefs);
+        let imp = release::is_target_improvement(baseline, &q, prefs);
+        if imp == release::Improvement::None {
+            continue;
+        }
+        scored.push((q.score, r, imp));
+    }
+    scored.sort_by_key(|(score, ..)| std::cmp::Reverse(*score)); // best score first (stable for ties)
+    scored.into_iter().map(|(_, r, imp)| (r, imp)).collect()
+}
+
 /// Gate a corrective downgrade on the opt-in flag. An `Upgrade` always proceeds. A `Downgrade` with
 /// the flag OFF is logged (preview, including the current/old hash being downgraded) and rejected;
 /// with the flag ON it proceeds.
@@ -391,14 +437,15 @@ async fn try_upgrade_movie(
         imdb_id: imdb_id.clone(),
         ..owned_rec.request.clone()
     };
-    // 2. Scrape fresh candidates for this title, then pick the best cached target-improvement not
-    //    already owned/blacklisted. A scrape failure is transient → Deferred (retry next tick).
+    // 2. Scrape fresh candidates for this title, then rank the cached target-improvements not
+    //    already owned/blacklisted (best-score-first). A scrape failure is transient → Deferred
+    //    (retry next tick).
     let raws = app
         .scraper
         .find(&req.imdb_id, MediaKind::Movie, None, None)
         .await
         .map_err(|e| UpgradeSkip::Deferred(format!("scrape failed: {e}")))?;
-    let Some((cand, imp)) = pick_best_change(
+    let ranked = rank_changes(
         app,
         MediaKind::Movie,
         tmdb_id,
@@ -406,52 +453,52 @@ async fn try_upgrade_movie(
         &current,
         owned_hashes,
     )
-    .await
-    else {
+    .await;
+    if ranked.is_empty() {
         return Err(UpgradeSkip::NoChange("no meaningful upgrade".into()));
-    };
-    // 2b. A corrective downgrade (owned copy is above the ceiling) only proceeds when the operator
-    //     has opted in; otherwise it is preview-logged and skipped (NoChange — evaluated, not
-    //     deferred, so the round-robin cursor still rotates onward). The preview log names the
-    //     title's representative owned hash (the movie baseline spans all copies; the swap prunes
-    //     them all, so the first is a stable, meaningful stand-in).
+    }
+    // The movie baseline spans all owned copies (the swap prunes them all), so the first hash is a
+    // stable stand-in for the downgrade preview log.
     let old_hash = owned_hashes.first().map(String::as_str).unwrap_or("");
-    if !downgrade_allowed_or_log(app, tmdb_id, imp, old_hash, &current, &cand) {
-        return Err(UpgradeSkip::NoChange("downgrade gated (dry-run)".into()));
+    // Try ranked candidates best-first until one is adopted (in-tick fall-through), mirroring the
+    // pack-correction/consolidation loops.
+    for (cand, imp) in ranked {
+        // Gated-off downgrade: the list is direction-homogeneous, so every remaining candidate is a
+        // gated downgrade too — break (one preview log) rather than logging a preview per candidate.
+        if !downgrade_allowed_or_log(app, tmdb_id, imp, old_hash, &current, &cand) {
+            break;
+        }
+        // Idle re-check before staging each candidate (mirrors correct_over_ceiling_packs).
+        if !app.read_activity.all_idle(idle_window).await {
+            return Err(UpgradeSkip::Deferred(
+                "library active; deferring upgrade".into(),
+            ));
+        }
+        match stage_and_verify(app, tmdb_id, &req, &cand).await {
+            Ok(staged) => {
+                apply_upgrade(
+                    app,
+                    StagedUpgrade {
+                        hash: staged.0.clone(),
+                        torrent_id: staged.1,
+                        slot_files: vec![(movie_slot(tmdb_id), staged.2)],
+                    },
+                    owned_hashes,
+                    idle_window,
+                )
+                .await?;
+                info!("upgrade: tmdb {} swapped to {}", tmdb_id, staged.0);
+                return Ok(());
+            }
+            // Candidate-specific reject (already blacklisted where warranted) → try the next best.
+            Err(UpgradeSkip::NoChange(_)) => continue,
+            // Transient provider/probe glitch → stop; retry the whole title next tick.
+            Err(UpgradeSkip::Deferred(r)) => return Err(UpgradeSkip::Deferred(r)),
+        }
     }
-
-    // 3. Idle gate FIRST. Upgrade targets are cached-only (instant to add), so there is no benefit
-    //    to pre-staging a download — we only commit when the library is idle, and skip otherwise.
-    //    This guarantees we never hold two copies of a title (no dangling stage), which is why
-    //    `UPGRADE_STAGE_MAX_SECS` is config-only/reserved on this cached path (kept for forward-compat
-    //    with a future speculative-download upgrade mode; not consulted here).
-    if !app.read_activity.all_idle(idle_window).await {
-        return Err(UpgradeSkip::Deferred(
-            "library active; deferring upgrade".into(),
-        ));
-    }
-
-    // 4. Stage the cached candidate: add + validate + record Verified (non-destructive — any failure
-    //    leaves the current release untouched). Returns (hash, torrent_id, selected_file_path).
-    //    stage_and_verify classifies its own outcome: a transient provider/probe glitch → Deferred
-    //    (retry next tick), a candidate-specific failure (not cached / wrong title / pack) → NoChange.
-    let staged = stage_and_verify(app, tmdb_id, &req, &cand).await?;
-
-    // 5. Swap selection → new hash, then prune every old owned hash (shared tail; see `apply_upgrade`
-    //    for the idle re-check + rollback discipline preserved exactly from the original inline tail).
-    apply_upgrade(
-        app,
-        StagedUpgrade {
-            hash: staged.0.clone(),
-            torrent_id: staged.1,
-            slot_files: vec![(movie_slot(tmdb_id), staged.2)],
-        },
-        owned_hashes,
-        idle_window,
-    )
-    .await?;
-    info!("upgrade: tmdb {} swapped to {}", tmdb_id, staged.0);
-    Ok(())
+    Err(UpgradeSkip::NoChange(
+        "no acceptable upgrade candidate".into(),
+    ))
 }
 
 /// Real-Debrid reports a freshly-added torrent as `waiting_files_selection` (its file list is
@@ -1696,6 +1743,15 @@ mod tests {
             episode: None,
             original_language: Some("eng".into()),
             metadata: movie_meta(),
+        }
+    }
+    /// Like `movie_req`, but parameterised over tmdb/imdb id — used by the fall-through tests, which
+    /// exercise distinct titles (`movie_req()`'s fixed 27205/"tt1" is shared by many other tests).
+    fn movie_req_for(tmdb_id: u64, imdb_id: &str) -> AcquireRequest {
+        AcquireRequest {
+            imdb_id: imdb_id.into(),
+            tmdb_id,
+            ..movie_req()
         }
     }
     /// A cached REMUX 1080p candidate (a meaningful upgrade over a cached WEB 1080p).
@@ -3334,6 +3390,432 @@ mod tests {
                 .unwrap()
                 .hash,
             h.cand_1080_hash
+        );
+    }
+
+    // ── in-tick candidate fall-through tests (movie path) ─────────────────────
+
+    #[tokio::test]
+    async fn movie_upgrade_falls_through_pack_to_next_candidate() {
+        // Own a 720p movie. Scrape returns two IN-CEILING improvements: the top-scored one (1080p
+        // REMUX) resolves to a MULTI-FEATURE pack (rejected + blacklisted); the next (1080p WEB) is a
+        // clean single movie. The engine must fall through and adopt the WEB release THIS tick.
+        const TMDB: u64 = 550;
+        let store = mem_store();
+        let owned_hash = "own720".to_string();
+        store
+            .put_owned(
+                owned_hash.clone(),
+                OwnedRecord {
+                    request: movie_req_for(TMDB, "tt0137523"),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(q720_web()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(TMDB),
+                SelectionEntry {
+                    hash: owned_hash.clone(),
+                    file_path: "old.720p.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Two cached in-ceiling improvements over 720p; REMUX outscores WEB so it is tried first.
+        let pack = RawCandidate {
+            name: "Fight.Club.1999.1080p.BluRay.REMUX".into(),
+            description: "REMUX\nRD+".into(),
+            info_hash: "hpack".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let good = RawCandidate {
+            name: "Fight.Club.1999.1080p.WEB".into(),
+            description: "WEB\nRD+".into(),
+            info_hash: "hgood".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![pack.clone(), good.clone()],
+        });
+
+        let mut by_id = std::collections::HashMap::new();
+        // "hpack" → two feature-sized videos ⇒ count_feature_videos > 1 ⇒ MoviePack reject.
+        by_id.insert(
+            "hpack".to_string(),
+            TorrentInfo {
+                id: "hpack".into(),
+                hash: "hpack".into(),
+                status: "downloaded".into(),
+                files: vec![
+                    TorrentFile {
+                        id: 0,
+                        path: "Fight.Club.1080p.mkv".into(),
+                        bytes: 8_000_000_000,
+                        selected: 1,
+                    },
+                    TorrentFile {
+                        id: 1,
+                        path: "Other.Movie.1080p.mkv".into(),
+                        bytes: 8_000_000_000,
+                        selected: 1,
+                    },
+                ],
+                links: vec!["https://cdn/p0".into(), "https://cdn/p1".into()],
+                ..Default::default()
+            },
+        );
+        // "hgood" → single feature video ⇒ adopted.
+        by_id.insert(
+            "hgood".to_string(),
+            TorrentInfo {
+                id: "hgood".into(),
+                hash: "hgood".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "Fight.Club.1999.1080p.WEB.mkv".into(),
+                    bytes: 6_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/g0".into()],
+                ..Default::default()
+            },
+        );
+
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "own720".into(),
+                    hash: owned_hash.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "hgood".into(),
+                    hash: "hgood".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            torrent_info_by_id: by_id,
+            resolved_url: Some("https://cdn/g0".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+        // app_with wires an accepting prober (Unsupported → Accept), so staging the good candidate
+        // verifies.
+
+        let owned = vec![owned_hash.clone()];
+        let rec = app.store.get_owned(owned_hash.clone()).await.unwrap();
+        let r = try_upgrade_movie(&app, TMDB, &owned, &rec, Duration::from_secs(0)).await;
+        assert!(
+            r.is_ok(),
+            "fall-through should adopt the good candidate: {r:?}"
+        );
+        assert_eq!(
+            app.store
+                .get_selection(movie_slot(TMDB))
+                .await
+                .unwrap()
+                .hash,
+            "hgood",
+            "selection repointed to the second-best (usable) candidate"
+        );
+        assert!(
+            app.store
+                .is_blacklisted(MediaKind::Movie, TMDB, "hpack".into())
+                .await,
+            "the multi-feature pack was blacklisted"
+        );
+        assert!(
+            app.store.get_owned("own720".into()).await.is_none(),
+            "old 720p copy pruned"
+        );
+    }
+
+    /// Owns a 720p movie and wires a two-candidate scrape (top-scored `hpack` = 1080p REMUX, second
+    /// `hgood` = 1080p WEB) with per-candidate `torrent_info_by_id`. Callers pass the resolved files
+    /// for each and whether the top's info errors (transient).
+    async fn movie_two_candidate_app(
+        top_files: Vec<TorrentFile>,
+        second_files: Vec<TorrentFile>,
+        fail_top_info: bool,
+    ) -> (AppState, String) {
+        const TMDB: u64 = 550;
+        let store = mem_store();
+        let owned_hash = "own720".to_string();
+        store
+            .put_owned(
+                owned_hash.clone(),
+                OwnedRecord {
+                    request: movie_req_for(TMDB, "tt0137523"),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(q720_web()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(TMDB),
+                SelectionEntry {
+                    hash: owned_hash.clone(),
+                    file_path: "old.720p.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let pack = RawCandidate {
+            name: "Fight.Club.1999.1080p.BluRay.REMUX".into(),
+            description: "REMUX\nRD+".into(),
+            info_hash: "hpack".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let good = RawCandidate {
+            name: "Fight.Club.1999.1080p.WEB".into(),
+            description: "WEB\nRD+".into(),
+            info_hash: "hgood".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![pack, good],
+        });
+
+        let mut by_id = std::collections::HashMap::new();
+        by_id.insert(
+            "hpack".to_string(),
+            TorrentInfo {
+                id: "hpack".into(),
+                hash: "hpack".into(),
+                status: "downloaded".into(),
+                files: top_files,
+                links: vec!["https://cdn/p".into()],
+                ..Default::default()
+            },
+        );
+        by_id.insert(
+            "hgood".to_string(),
+            TorrentInfo {
+                id: "hgood".into(),
+                hash: "hgood".into(),
+                status: "downloaded".into(),
+                files: second_files,
+                links: vec!["https://cdn/g".into()],
+                ..Default::default()
+            },
+        );
+        let mut fail_info_ids = std::collections::HashSet::new();
+        if fail_top_info {
+            fail_info_ids.insert("hpack".to_string());
+        }
+
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "own720".into(),
+                    hash: owned_hash.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "hgood".into(),
+                    hash: "hgood".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            torrent_info_by_id: by_id,
+            fail_info_ids,
+            resolved_url: Some("https://cdn/g".into()),
+            deleted: Arc::new(std::sync::Mutex::new(Vec::new())),
+            ..Default::default()
+        });
+        (app_with(scraper, provider, store), owned_hash)
+    }
+
+    fn feature(name: &str) -> TorrentFile {
+        TorrentFile {
+            id: 0,
+            path: name.into(),
+            bytes: 8_000_000_000,
+            selected: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn movie_upgrade_exhausts_bad_candidates_and_keeps_current() {
+        // BOTH candidates resolve to multi-feature packs → both rejected+blacklisted, NoChange,
+        // nothing swapped.
+        let (app, owned) = movie_two_candidate_app(
+            vec![feature("A.1080p.mkv"), feature("B.1080p.mkv")],
+            vec![feature("C.1080p.mkv"), feature("D.1080p.mkv")],
+            false,
+        )
+        .await;
+        let rec = app.store.get_owned(owned.clone()).await.unwrap();
+        let r = try_upgrade_movie(
+            &app,
+            550,
+            std::slice::from_ref(&owned),
+            &rec,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(
+            matches!(r, Err(UpgradeSkip::NoChange(_))),
+            "all bad → NoChange: {r:?}"
+        );
+        assert_eq!(
+            app.store.get_selection(movie_slot(550)).await.unwrap().hash,
+            owned,
+            "selection unchanged"
+        );
+        assert!(
+            app.store.get_owned(owned.clone()).await.is_some(),
+            "old copy kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn movie_upgrade_transient_on_top_candidate_stops_without_trying_rest() {
+        // Top candidate's get_torrent_info errors (transient) → stage_and_verify returns Deferred →
+        // the loop STOPS (returns Deferred) and never stages the good second candidate.
+        let (app, owned) = movie_two_candidate_app(
+            vec![feature("Fight.Club.1080p.mkv")], // (unused: hpack info errors before file inspection)
+            vec![feature("Fight.Club.1999.1080p.WEB.mkv")],
+            true, // hpack info errors
+        )
+        .await;
+        let rec = app.store.get_owned(owned.clone()).await.unwrap();
+        let r = try_upgrade_movie(
+            &app,
+            550,
+            std::slice::from_ref(&owned),
+            &rec,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(
+            matches!(r, Err(UpgradeSkip::Deferred(_))),
+            "transient on top → Deferred: {r:?}"
+        );
+        assert_eq!(
+            app.store.get_selection(movie_slot(550)).await.unwrap().hash,
+            owned,
+            "nothing adopted — the good candidate was never staged"
+        );
+    }
+
+    #[tokio::test]
+    async fn movie_over_ceiling_downgrade_dry_run_breaks_and_makes_no_change() {
+        // Own a 2160p movie; ceiling 1080 (default prefs); ALLOW_RESOLUTION_DOWNGRADE off. Two
+        // in-ceiling 1080p candidates → rank_changes rates both as Downgrade; the loop breaks on the
+        // first (gated), logging one preview, and makes NO change / stages nothing.
+        const TMDB: u64 = 603;
+        let store = mem_store();
+        let owned = "own2160".to_string();
+        store
+            .put_owned(
+                owned.clone(),
+                OwnedRecord {
+                    request: movie_req_for(TMDB, "tt0133093"),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(q2160_remux()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(TMDB),
+                SelectionEntry {
+                    hash: owned.clone(),
+                    file_path: "old.2160p.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let c1 = RawCandidate {
+            name: "The.Matrix.1999.1080p.REMUX".into(),
+            description: "REMUX\nRD+".into(),
+            info_hash: "hc1".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let c2 = RawCandidate {
+            name: "The.Matrix.1999.1080p.WEB".into(),
+            description: "WEB\nRD+".into(),
+            info_hash: "hc2".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent {
+                id: "own2160".into(),
+                hash: owned.clone(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            deleted: deleted.clone(),
+            ..Default::default() // no torrent_info_by_id → staging never reached
+        });
+        let app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![c1, c2],
+            }),
+            provider,
+            store.clone(),
+        );
+        assert!(
+            !app.config.allow_resolution_downgrade,
+            "flag must be off for this test"
+        );
+        let rec = app.store.get_owned(owned.clone()).await.unwrap();
+        let r = try_upgrade_movie(
+            &app,
+            TMDB,
+            std::slice::from_ref(&owned),
+            &rec,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(
+            matches!(r, Err(UpgradeSkip::NoChange(_))),
+            "gated downgrade → NoChange: {r:?}"
+        );
+        assert_eq!(
+            app.store
+                .get_selection(movie_slot(TMDB))
+                .await
+                .unwrap()
+                .hash,
+            owned,
+            "unchanged"
+        );
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "nothing staged (broke before staging)"
         );
     }
 

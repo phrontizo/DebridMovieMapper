@@ -112,6 +112,14 @@ pub struct MockProvider {
     /// When `true`, `delete_torrent` returns a `reqwest::Error` (still recording the attempted id)
     /// so tests can exercise the keep-the-owned-record-for-retry path in `execute_remove`.
     pub fail_delete: bool,
+    /// Per-torrent-id `TorrentInfo` responses. When non-empty, `add_magnet` derives the returned id
+    /// from the magnet's infohash and `get_torrent_info` looks the id up here (falling back to the
+    /// single `torrent_info`). Lets a test stage several candidates that each resolve differently —
+    /// required to exercise the upgrade engine's in-tick candidate fall-through.
+    pub torrent_info_by_id: std::collections::HashMap<String, TorrentInfo>,
+    /// Torrent ids whose `get_torrent_info` returns a `reqwest::Error` (a transient failure), so a
+    /// test can drive `stage_and_verify`'s `Deferred` classification for one specific staged candidate.
+    pub fail_info_ids: std::collections::HashSet<String>,
 }
 
 #[cfg(test)]
@@ -127,10 +135,31 @@ impl DebridProvider for MockProvider {
         }
         Ok(self.torrents.clone())
     }
-    async fn get_torrent_info(&self, _id: &str) -> Result<TorrentInfo, reqwest::Error> {
+    async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
+        if self.fail_info_ids.contains(id) {
+            // Drive an immediate URL-parse failure to produce a reqwest::Error without any I/O
+            // (mirrors the fail_get_torrents path), so stage_and_verify classifies it as Deferred.
+            return reqwest::Client::new()
+                .get("")
+                .send()
+                .await
+                .map(|_| TorrentInfo::default());
+        }
+        if let Some(ti) = self.torrent_info_by_id.get(id) {
+            return Ok(ti.clone());
+        }
         Ok(self.torrent_info.clone().unwrap_or_default())
     }
-    async fn add_magnet(&self, _magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+    async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+        if !self.torrent_info_by_id.is_empty() {
+            // Per-candidate mode: id = the magnet's infohash, so each staged candidate resolves to
+            // its own `torrent_info_by_id` entry.
+            let hash = magnet.rsplit("urn:btih:").next().unwrap_or("").to_string();
+            return Ok(AddMagnetResponse {
+                id: hash,
+                uri: String::new(),
+            });
+        }
         Ok(self.add_magnet.clone().unwrap_or_default())
     }
     async fn select_files(&self, _torrent_id: &str, _file_ids: &str) -> Result<(), reqwest::Error> {
