@@ -399,9 +399,10 @@ fn read_ebml_size(buf: &[u8], pos: &mut usize) -> Result<u64, ProbeError> {
         return Err(ProbeError::Corrupt); // a leading 0 byte = invalid vint length octet
     }
     let len = first.leading_zeros() as usize + 1;
-    if len > 8 {
-        return Err(ProbeError::Corrupt);
-    }
+    // `first != 0` (rejected above), so `leading_zeros()` ∈ 0..=7 and `len` ∈ 1..=8. An 8-byte size
+    // vint is the EBML maximum, so — unlike `read_ebml_id`'s reachable 4-byte id cap — there is no
+    // over-length case to reject here; the invariant is asserted rather than checked at runtime.
+    debug_assert!(len <= 8, "a non-zero octet yields a 1..=8 byte EBML size vint");
     if *pos + len > buf.len() {
         return Err(ProbeError::Transient); // the size vint is split by the under-fetched boundary
     }
