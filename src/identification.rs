@@ -8,13 +8,15 @@ use tracing::{debug, info, warn};
 
 static CAMEL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([a-z])([A-Z])").unwrap());
 
-// Leading release-group / site garbage to strip: a bracket tag `[...]`, a parenthesised tag that
-// contains at least one LETTER or is a parenthesised release-year (so a leading "(2020) Title" still
-// strips, but a NON-year numeric title-paren like `(500)` — as in "(500) Days of Summer" — is kept
-// as title content), or a `site.tld - ` prefix.
+// Leading release-group / site garbage to strip: a bracket tag `[...]`, a parenthesised tag, a
+// parenthesised release-year (so a leading "(2020) Title" strips), or a `site.tld - ` prefix.
+// A parenthesised TAG must look like a site/URL tag — its content carries a letter AND a `.`/space
+// (e.g. `(www.site.com)`) — so a single parenthesised title WORD like `(Untitled)` (the 2009 film)
+// is kept as title content, and a NON-year numeric title-paren like `(500)` — "(500) Days of
+// Summer" — is likewise kept (no letter at all).
 static PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)^(\[.*?\]|\((?:[^)]*[a-z][^)]*|(?:19|20)\d{2})\)|[\w.-]+\.[a-z]{2,6}\s+-\s+)\s*",
+        r"(?i)^(\[.*?\]|\((?:[^)]*[a-z][^)]*[.\s][^)]*|[^)]*[.\s][^)]*[a-z][^)]*|(?:19|20)\d{2})\)|[\w.-]+\.[a-z]{2,6}\s+-\s+)\s*",
     )
     .unwrap()
 });
@@ -930,6 +932,25 @@ mod tests {
         assert_eq!(clean_name("Custom").0, "Custom");
         // Normal trailing-metadata stripping is unaffected.
         assert_eq!(clean_name("The Matrix 1080p").0, "The Matrix");
+    }
+
+    #[test]
+    fn clean_name_keeps_a_leading_parenthesised_title_word() {
+        // A leading "(word)" whose content is a single title word (no dot/whitespace) is NOT a
+        // site/URL release tag — it is part of the title (the 2009 film "(Untitled)"). PREFIX_RE
+        // must only strip a letter-paren that looks like a tag (its content carries a '.'/space, e.g.
+        // "(www.site.com)"). Regression: before, "(Untitled).2009" cleaned to the title "2009".
+        let (title, year) = clean_name("(Untitled).2009.1080p.mkv");
+        assert!(title.contains("Untitled"), "got {title:?}");
+        assert_ne!(title, "2009");
+        assert_eq!(year.as_deref(), Some("2009"));
+        // Regression: a genuine parenthesised URL/site tag (its content has dots) is STILL stripped.
+        assert_eq!(
+            clean_name("(www.site.com) Inception 2010 1080p").0,
+            "Inception"
+        );
+        // Regression: a leading parenthesised YEAR is STILL stripped.
+        assert_eq!(clean_name("(2020) Tenet 1080p BluRay").0, "Tenet");
     }
 
     #[test]
