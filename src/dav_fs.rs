@@ -1323,6 +1323,31 @@ mod provider_abstraction_tests {
         format!("http://{}/", addr)
     }
 
+    /// A single `206 Partial Content` carrying a `Content-Range` but NO `Content-Length` (a
+    /// chunked/streaming CDN). The body end is signalled by connection close, so the client's read
+    /// must be window-bounded rather than relying on Content-Length.
+    async fn spawn_206_no_content_length(body: &'static [u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",
+                    body.len() - 1,
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+                // No Content-Length: dropping the socket (Connection: close) signals the body end.
+            }
+        });
+        format!("http://{}/", addr)
+    }
+
     /// Build a ProxiedMediaFile plus a handle to the provider's invalidate-call counter.
     fn proxied_with_counter(
         url: String,
@@ -1398,6 +1423,21 @@ mod provider_abstraction_tests {
             .await
             .expect("a 403 then 206 must recover and serve bytes");
         assert_eq!(&data[..], b"FRESHBYT");
+    }
+
+    #[tokio::test]
+    async fn fetch_cdn_range_handles_206_without_content_length() {
+        // A 206 that omits Content-Length (chunked/streaming CDN) falls to the non-drainable,
+        // window-bounded read path (`drainable` needs a Content-Length <= the window). The requested
+        // window must still be served correctly, with the body end signalled by connection close.
+        let body: &[u8] = b"NOCLENGTH1234567"; // 16 bytes
+        let url = spawn_206_no_content_length(body).await;
+        let mut f = proxied_for(url, 0, body.len() as u64);
+        let data = f
+            .fetch_bytes(8)
+            .await
+            .expect("a 206 without Content-Length must still serve the window");
+        assert_eq!(&data[..], b"NOCLENGT");
     }
 
     #[tokio::test]
