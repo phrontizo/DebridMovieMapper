@@ -149,6 +149,34 @@ async fn best_owned_quality(app: &AppState, owned_hashes: &[String]) -> Option<Q
     best
 }
 
+/// The owned hashes to PRUNE when a movie upgrade is adopted. When corrective downgrade is NOT
+/// enabled (`ALLOW_RESOLUTION_DOWNGRADE` unset), an owned copy whose resolution sits ABOVE the
+/// `MAX_RESOLUTION` ceiling is EXCLUDED — removing an over-ceiling copy is a corrective downgrade,
+/// which the contract reserves for the gated downgrade path. Without this, the movie path (whose
+/// baseline is widened to the BEST copy — an over-ceiling copy being effective-score-penalised — and
+/// which prunes EVERY owned hash) would delete an over-ceiling engine copy (acquired under a
+/// previously-higher ceiling, so it still carries a known `quality`) as collateral of a
+/// within-ceiling upgrade, silently discarding content. With the flag on, every copy is prunable.
+async fn supersede_hashes(app: &AppState, owned_hashes: &[String]) -> Vec<String> {
+    if app.config.allow_resolution_downgrade {
+        return owned_hashes.to_vec();
+    }
+    let ceiling = app.config.acquisition.prefs.max_resolution.height();
+    let mut prunable = Vec::with_capacity(owned_hashes.len());
+    for h in owned_hashes {
+        let over_ceiling = app
+            .store
+            .get_owned(h.clone())
+            .await
+            .and_then(|r| r.quality)
+            .is_some_and(|q| q.resolution > ceiling);
+        if !over_ceiling {
+            prunable.push(h.clone());
+        }
+    }
+    prunable
+}
+
 /// The IMDB id to scrape a group with: prefer ANY owned copy that actually carries a non-empty
 /// IMDB id (Torrentio is IMDB-keyed) over only the lexicographically-first representative — in a
 /// mixed group the representative can be an empty-imdb account-mirror record, which would otherwise
@@ -426,6 +454,10 @@ async fn try_upgrade_movie(
         }
         match stage_and_verify(app, tmdb_id, &req, &cand).await {
             Ok(staged) => {
+                // Prune the superseded copies — but NOT an over-ceiling copy unless corrective
+                // downgrade is enabled (`supersede_hashes`), so a within-ceiling upgrade never
+                // deletes an over-ceiling copy as collateral.
+                let supersede = supersede_hashes(app, owned_hashes).await;
                 apply_upgrade(
                     app,
                     StagedUpgrade {
@@ -433,7 +465,7 @@ async fn try_upgrade_movie(
                         torrent_id: staged.1,
                         slot_files: vec![(movie_slot(tmdb_id), staged.2)],
                     },
-                    owned_hashes,
+                    &supersede,
                     idle_window,
                 )
                 .await?;
@@ -1947,6 +1979,142 @@ mod tests {
         assert!(
             deleted.lock().unwrap().contains(&"told".to_string()),
             "old torrent deleted from provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn movie_upgrade_keeps_an_over_ceiling_copy_when_downgrade_flag_off() {
+        // Mixed group at a 1080 ceiling: a within-ceiling WEB 1080p copy ("hold", the served copy)
+        // and an over-ceiling 2160p engine copy ("h2160", acquired under a previously-higher
+        // ceiling, so it carries a KNOWN quality). A cached REMUX 1080p upgrade is available.
+        // best_owned_quality picks the within-ceiling copy as the baseline (the 2160p is
+        // effective-score-penalised), so the REMUX is an Upgrade — and the prune-all would DELETE
+        // the 2160p copy as collateral, a corrective downgrade the contract reserves for
+        // ALLOW_RESOLUTION_DOWNGRADE. With the flag OFF, the 2160p copy must be KEPT.
+        let store = mem_store();
+        store
+            .put_owned(
+                "hold".into(),
+                OwnedRecord {
+                    request: movie_req(),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(QualitySummary {
+                        cached: true,
+                        source_tier: 3_000,
+                        resolution: 1080,
+                        score: 10,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "h2160".into(),
+                OwnedRecord {
+                    request: movie_req(),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(QualitySummary {
+                        cached: true,
+                        source_tier: 8_000,
+                        resolution: 2160,
+                        score: 1_008_000,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "hold".into(),
+                    file_path: "old.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![remux_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "told".into(),
+                    hash: "hold".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "t2160".into(),
+                    hash: "h2160".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tnew".into(),
+                    hash: "hnew".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tnew".into(),
+                hash: "hnew".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "M.2020.1080p.REMUX.mkv".into(),
+                    bytes: 30_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/new".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+        assert!(!app.config.allow_resolution_downgrade);
+
+        let rec = store.get_owned("hold".into()).await.unwrap();
+        let r = try_upgrade_movie(
+            &app,
+            27205,
+            &["h2160".to_string(), "hold".to_string()],
+            &rec,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(r.is_ok(), "the within-ceiling upgrade proceeds");
+        assert!(
+            store.get_owned("hnew".into()).await.is_some(),
+            "the REMUX upgrade is adopted"
+        );
+        assert!(
+            store.get_owned("hold".into()).await.is_none(),
+            "the superseded within-ceiling copy is pruned"
+        );
+        assert!(
+            store.get_owned("h2160".into()).await.is_some(),
+            "the over-ceiling copy must NOT be pruned without ALLOW_RESOLUTION_DOWNGRADE"
+        );
+        assert!(
+            !deleted.lock().unwrap().contains(&"t2160".to_string()),
+            "the over-ceiling torrent must not be deleted from the provider"
         );
     }
 
