@@ -1262,6 +1262,116 @@ mod tests {
         );
     }
 
+    /// Loopback that replies with `status` (empty body) on every connection, counting requests.
+    async fn spawn_status_repeating(
+        status: u16,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = counter.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 {} STATUS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    status
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{}/", addr), counter)
+    }
+
+    /// Loopback that replies `status` (empty body) on the first `fail_n` connections, then a 200
+    /// JSON `body`, counting requests.
+    async fn spawn_status_then_json(
+        status: u16,
+        fail_n: usize,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = counter.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut seen = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                if seen < fail_n {
+                    seen += 1;
+                    let head = format!(
+                        "HTTP/1.1 {} STATUS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        status
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.flush().await;
+                    continue;
+                }
+                // Serve the JSON success body, then stop.
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+                break;
+            }
+        });
+        (format!("http://{}/", addr), counter)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_with_retry_surfaces_a_persistent_5xx_after_exhausting_attempts() {
+        // A persistent 503 must be retried the full MAX_ATTEMPTS times (with backoff) and then
+        // surface as an error via the caller's error_for_status() — not hang or succeed. Guards the
+        // 5xx-retry branch. `start_paused` auto-advances the exponential backoff so it is instant.
+        let (url, counter) = spawn_status_repeating(503).await;
+        let client = TraktClientImpl::new("cid".into(), "secret".into(), reqwest::Client::new())
+            .with_base_url(url);
+        assert!(
+            client.me("at").await.is_err(),
+            "a persistent 5xx must surface as an error"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "a persistent 5xx is retried for the full MAX_ATTEMPTS budget"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_with_retry_recovers_from_a_429_then_success() {
+        // A single 429 (rate-limited) must record the throttle and RETRY, recovering on the next
+        // 200 — not surface as an error. Guards the 429 record_throttle+retry branch. `start_paused`
+        // auto-advances the limiter's post-throttle wait so the test is instant.
+        let (url, counter) =
+            spawn_status_then_json(429, 1, r#"{"username":"Bob","ids":{"slug":"bob"}}"#).await;
+        let client = TraktClientImpl::new("cid".into(), "secret".into(), reqwest::Client::new())
+            .with_base_url(url);
+        let user = client
+            .me("at")
+            .await
+            .expect("a single 429 must be retried and recover");
+        assert_eq!(user.slug, "bob");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the 429 attempt plus the successful retry = 2 requests"
+        );
+    }
+
     #[tokio::test]
     async fn mock_trakt_fail_reads_errors_reads_and_fail_refresh_errors_refresh() {
         let mock = MockTrakt {
