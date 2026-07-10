@@ -422,19 +422,24 @@ pub fn is_meaningful_upgrade(current: &QualitySummary, candidate: &QualitySummar
 /// Ceiling-aware score for an OWNED copy. Within the ceiling it is `q.score` unchanged; ABOVE the
 /// ceiling it is heavily penalised so a within-ceiling cached release always outscores it (enabling
 /// a corrective downgrade), and a more-over-ceiling copy scores below a less-over-ceiling one (so the
-/// worst offender is corrected first). Used ONLY by the upgrade comparison — `score()`'s hard
-/// above-ceiling filter (acquisition) is deliberately untouched.
+/// worst offender is corrected first). Both properties hold UNCONDITIONALLY, regardless of source
+/// tier or bonuses. Used ONLY by the upgrade comparison — `score()`'s hard above-ceiling filter
+/// (acquisition) is deliberately untouched.
 pub fn effective_score(q: &QualitySummary, prefs: &QualityPrefs) -> i64 {
     let ceiling = prefs.max_resolution.height();
     if q.resolution <= ceiling {
         return q.score;
     }
-    // score() added `resolution * 100`; subtract twice that to flip the resolution term negative
-    // (higher over-ceiling resolution => lower effective score), plus a floor that dominates the
-    // summed small additive bonuses (HEVC/HDR/container/bitrate/seeders <= ~16k) and the max source
-    // tier (8k), so the result is strictly below ANY within-ceiling cached release regardless of tier.
-    const OVER_CEILING_FLOOR: i64 = 100_000;
-    q.score - 2 * (q.resolution as i64) * 100 - OVER_CEILING_FLOOR
+    // Penalise by the amount over the ceiling at a per-unit rate that dominates the entire
+    // non-resolution score range (source tier <= 8k, additive bonuses <= ~15k, the up-to-50k
+    // language penalty). This makes both properties hold UNCONDITIONALLY, regardless of tier/bonus:
+    //   * every over-ceiling copy sits far below any within-ceiling cached release, and
+    //   * a more-over-ceiling copy always scores below a less-over-ceiling one (worst offender first).
+    // Saturating arithmetic mirrors `mark_cached` and avoids underflow on an i64::MIN sentinel score.
+    const OVER_CEILING_PENALTY_PER_UNIT: i64 = 100_000;
+    let over = (q.resolution as i64) - ceiling as i64;
+    q.score
+        .saturating_sub(over.saturating_mul(OVER_CEILING_PENALTY_PER_UNIT))
 }
 
 #[cfg(test)]
@@ -1319,11 +1324,22 @@ mod tests {
 
         #[test]
         fn more_over_ceiling_scores_below_less_over_ceiling() {
-            // ceiling 720: 2160 is "more over" than 1080.
             let p = prefs(MaxResolution::P720);
-            let two_k = cached(2160, 8_000);
-            let one_k = cached(1080, 8_000);
-            assert!(effective_score(&two_k, &p) < effective_score(&one_k, &p));
+            // Less-over-ceiling copy with the WEAKEST non-resolution score...
+            let less_over = QualitySummary {
+                cached: true,
+                source_tier: 0,
+                resolution: 1080,
+                score: 1_000_000 + 1080 * 100,
+            };
+            // ...must still beat a more-over-ceiling copy with the STRONGEST (max tier + bonuses).
+            let more_over = QualitySummary {
+                cached: true,
+                source_tier: 8_000,
+                resolution: 2160,
+                score: 1_000_000 + 8_000 + 2160 * 100 + 15_000,
+            };
+            assert!(effective_score(&more_over, &p) < effective_score(&less_over, &p));
         }
     }
 }
