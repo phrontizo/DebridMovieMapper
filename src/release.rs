@@ -419,6 +419,24 @@ pub fn is_meaningful_upgrade(current: &QualitySummary, candidate: &QualitySummar
             || candidate.resolution > current.resolution)
 }
 
+/// Ceiling-aware score for an OWNED copy. Within the ceiling it is `q.score` unchanged; ABOVE the
+/// ceiling it is heavily penalised so a within-ceiling cached release always outscores it (enabling
+/// a corrective downgrade), and a more-over-ceiling copy scores below a less-over-ceiling one (so the
+/// worst offender is corrected first). Used ONLY by the upgrade comparison — `score()`'s hard
+/// above-ceiling filter (acquisition) is deliberately untouched.
+pub fn effective_score(q: &QualitySummary, prefs: &QualityPrefs) -> i64 {
+    let ceiling = prefs.max_resolution.height();
+    if q.resolution <= ceiling {
+        return q.score;
+    }
+    // score() added `resolution * 100`; subtract twice that to flip the resolution term negative
+    // (higher over-ceiling resolution => lower effective score), plus a floor that dominates the
+    // summed small additive bonuses (HEVC/HDR/container/bitrate/seeders <= ~16k) and the max source
+    // tier (8k), so the result is strictly below ANY within-ceiling cached release regardless of tier.
+    const OVER_CEILING_FLOOR: i64 = 100_000;
+    q.score - 2 * (q.resolution as i64) * 100 - OVER_CEILING_FLOOR
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1249,5 +1267,63 @@ mod tests {
             !is_meaningful_upgrade(&current, &candidate),
             "a lower-resolution cached release must not upgrade a now-cached higher-resolution owned copy"
         );
+    }
+
+    #[cfg(test)]
+    mod effective_score_tests {
+        use super::{effective_score, QualitySummary};
+        use crate::config::{AudioReq, MaxResolution, QualityPrefs, SubReq};
+
+        fn prefs(ceiling: MaxResolution) -> QualityPrefs {
+            QualityPrefs {
+                max_resolution: ceiling,
+                audio: AudioReq::Original,
+                subtitle: SubReq::None,
+                prefer_hevc: true,
+                prefer_hdr: false,
+            }
+        }
+
+        // A cached release scored by score(): CACHED_BONUS + tier + resolution*100 (+ bonuses).
+        fn cached(res: u16, tier: i64) -> QualitySummary {
+            QualitySummary {
+                cached: true,
+                source_tier: tier,
+                resolution: res,
+                score: 1_000_000 + tier + res as i64 * 100,
+            }
+        }
+
+        #[test]
+        fn within_ceiling_is_unchanged() {
+            let q = cached(1080, 6_000);
+            assert_eq!(effective_score(&q, &prefs(MaxResolution::P1080)), q.score);
+            // At the ceiling exactly is still "within".
+            assert_eq!(effective_score(&q, &prefs(MaxResolution::P2160)), q.score);
+        }
+
+        #[test]
+        fn above_ceiling_scores_below_any_within_ceiling_cached() {
+            let over = cached(2160, 8_000); // 4K REMUX, ceiling 1080
+            let p = prefs(MaxResolution::P1080);
+            let over_eff = effective_score(&over, &p);
+            // Worst-case comparators that are WITHIN the 1080 ceiling and cached:
+            for within in [cached(1080, 8_000), cached(1080, 3_000), cached(480, 1_000)] {
+                assert!(
+                    over_eff < effective_score(&within, &p),
+                    "over-ceiling {over_eff} must be below within-ceiling {}",
+                    within.score
+                );
+            }
+        }
+
+        #[test]
+        fn more_over_ceiling_scores_below_less_over_ceiling() {
+            // ceiling 720: 2160 is "more over" than 1080.
+            let p = prefs(MaxResolution::P720);
+            let two_k = cached(2160, 8_000);
+            let one_k = cached(1080, 8_000);
+            assert!(effective_score(&two_k, &p) < effective_score(&one_k, &p));
+        }
     }
 }
