@@ -47,9 +47,12 @@ where
         // (not `tokio::spawn`) is used so the mid-tick cancellation below is preserved — spawning
         // would detach the task on shutdown instead of dropping it. A caught panic leaves at worst an
         // added-but-unrecorded provider torrent (same as the drop-on-shutdown case), reclaimed next run.
+        // The `job()` invocation itself is wrapped in the caught async block (not evaluated eagerly as
+        // `catch_unwind(job())` would), so a panic while *constructing* a tick's future is caught too,
+        // not just a panic while polling it.
         use futures_util::FutureExt;
         tokio::select! {
-            res = std::panic::AssertUnwindSafe(job()).catch_unwind() => {
+            res = std::panic::AssertUnwindSafe(async { job().await }).catch_unwind() => {
                 if res.is_err() {
                     tracing::error!("periodic job panicked; tick aborted, schedule continues");
                 }
