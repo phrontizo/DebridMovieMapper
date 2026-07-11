@@ -504,6 +504,56 @@ fn find_ebml_child(
     Ok(None)
 }
 
+/// If the MKV front-window parse deferred (`Transient`) because a Segment child declares an extent
+/// PAST the fetched buffer — a large `Attachments`/`Void`/cover-art block placed BEFORE `Tracks`, or
+/// a `Tracks` element itself larger than the window — return that first overrunning child's declared
+/// end (absolute offset). `probe_tracks` uses it to issue ONE larger targeted fetch instead of
+/// re-fetching the same 4 MB front forever (which would blacklist a valid release after the verify
+/// deadline). Mirrors `front_moov_extent` on the MP4 path. `None` when there is no Segment, an
+/// unknown-size child spans to the end, or the truncation is in an element HEADER (a genuine
+/// transient under-fetch the normal defer/retry handles).
+fn front_mkv_tracks_extent(buf: &[u8]) -> Option<u64> {
+    // Locate the Segment payload start without erroring (a header split at the boundary → None).
+    let mut pos = 0usize;
+    let seg_payload_start = loop {
+        if pos >= buf.len() {
+            return None;
+        }
+        let id = read_ebml_id(buf, &mut pos).ok()?;
+        let size = read_ebml_size(buf, &mut pos).ok()?;
+        let payload_start = pos;
+        if id == 0x18538067 {
+            break payload_start; // Segment: scan its children below
+        }
+        // A non-Segment top-level element (e.g. the EBML header). If it declares an unknown size or
+        // overruns the buffer we can't even reach the Segment → let the transient path handle it.
+        if size == u64::MAX {
+            return None;
+        }
+        let end = ebml_end(payload_start, size)?;
+        if end > buf.len() {
+            return None;
+        }
+        pos = end;
+    };
+    // Scan the Segment's children for the FIRST whose declared end runs past the fetched buffer.
+    let mut cpos = seg_payload_start;
+    while cpos < buf.len() {
+        let _id = read_ebml_id(buf, &mut cpos).ok()?;
+        let size = read_ebml_size(buf, &mut cpos).ok()?;
+        let payload_start = cpos;
+        if size == u64::MAX {
+            return None; // unknown/streaming size → no fixed extent to fetch
+        }
+        let end = ebml_end(payload_start, size)?;
+        if end > buf.len() {
+            return Some(end as u64);
+        }
+        cpos = end;
+    }
+    None
+}
+
 fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, ProbeError> {
     let mut kind = TrackKind::Other;
     let mut language: Option<String> = None;
@@ -750,7 +800,28 @@ pub async fn probe_tracks(http: &reqwest::Client, cdn_url: &str) -> Result<Vec<T
     const FRONT: u64 = 4 * 1024 * 1024;
     let front = fetch_range(http, cdn_url, 0, FRONT - 1).await?;
     match detect_container(&front) {
-        Some(ContainerKind::Mkv) => parse_mkv_tracks(&front),
+        Some(ContainerKind::Mkv) => match parse_mkv_tracks(&front) {
+            Err(ProbeError::Transient) => {
+                // A Segment child BEFORE `Tracks` (a large Attachments/Void/cover-art block) — or a
+                // `Tracks` element larger than the 4 MB window — declares an extent past the front
+                // read, returning `Transient`. Without this, re-probing fetches the same 4 MB and
+                // defers forever, blacklisting a valid file after the verify deadline. Issue ONE
+                // larger fetch (up to MAX_PROBE_FETCH) covering that element + the following Tracks
+                // and re-parse. If the overrun is past the cap, accept (can't verify → unknown)
+                // rather than churn; a header-split under-fetch (None) stays `Transient` (defer).
+                // Mirrors the MP4 large-`moov` recovery above.
+                match front_mkv_tracks_extent(&front) {
+                    Some(end) if end <= MAX_PROBE_FETCH as u64 => {
+                        let bigger =
+                            fetch_range(http, cdn_url, 0, MAX_PROBE_FETCH as u64 - 1).await?;
+                        parse_mkv_tracks(&bigger)
+                    }
+                    Some(_) => Err(ProbeError::TracksNotFound), // overrun > cap → accept, don't churn
+                    None => Err(ProbeError::Transient),
+                }
+            }
+            other => other,
+        },
         Some(ContainerKind::Mp4) => match parse_mp4_tracks(&front) {
             Err(ProbeError::TracksNotFound) => {
                 // moov is likely at the tail (non-faststart MP4). The suffix rarely starts on a
@@ -1084,6 +1155,54 @@ mod tests {
             "expected the audio track to be parsed from the unknown-size Segment MKV"
         );
     }
+    #[test]
+    fn front_mkv_tracks_extent_reports_a_pre_tracks_overrun() {
+        // A large Void (reserved space) placed BEFORE Tracks declares an extent past the front
+        // window, so parse_mkv_tracks defers (Transient). front_mkv_tracks_extent must report that
+        // element's declared end so probe_tracks can issue ONE larger fetch (mirroring the MP4
+        // large-moov recovery) instead of re-fetching the same 4 MB forever and blacklisting a valid
+        // file after the verify deadline.
+        let void = ebml_elem_sized(0xEC, 5_000_000, &[0u8; 4]); // Void declaring ~5 MB (≤ 8 MB cap)
+        let mut audio = Vec::new();
+        audio.extend(ebml_elem(0x83, &[2]));
+        audio.extend(ebml_elem(0x22B59C, b"eng"));
+        let tracks = ebml_elem(0xAE, &audio);
+        let mut seg_payload = void;
+        seg_payload.extend(ebml_elem(0x1654AE6B, &tracks));
+        let segment = ebml_elem_sized(0x18538067, 8_000_000_000, &seg_payload);
+        let mut bytes = ebml_elem(0x1A45DFA3, &[]);
+        bytes.extend(segment);
+
+        assert!(
+            matches!(parse_mkv_tracks(&bytes), Err(ProbeError::Transient)),
+            "an overrunning pre-Tracks element defers the front-window parse"
+        );
+        let extent =
+            front_mkv_tracks_extent(&bytes).expect("a pre-Tracks overrun must be reported");
+        assert!(
+            extent > bytes.len() as u64 && extent <= MAX_PROBE_FETCH as u64,
+            "extent {extent} must exceed the buffer {} and fit the fetch cap",
+            bytes.len()
+        );
+
+        // A fully-in-window layout has no overrun → no recovery extent.
+        let small_void = ebml_elem(0xEC, &[0u8; 4]);
+        let mut audio2 = Vec::new();
+        audio2.extend(ebml_elem(0x83, &[2]));
+        audio2.extend(ebml_elem(0x22B59C, b"eng"));
+        let mut seg2 = small_void;
+        seg2.extend(ebml_elem(0x1654AE6B, &ebml_elem(0xAE, &audio2)));
+        let segment2 = ebml_elem_sized(0x18538067, 8_000_000_000, &seg2);
+        let mut bytes2 = ebml_elem(0x1A45DFA3, &[]);
+        bytes2.extend(segment2);
+        assert!(parse_mkv_tracks(&bytes2).is_ok());
+        assert_eq!(
+            front_mkv_tracks_extent(&bytes2),
+            None,
+            "no overrun → no recovery extent"
+        );
+    }
+
     #[test]
     fn mkv_truncated_is_transient() {
         // A truncated ranged read (an element declared past the fetched bytes) is an under-fetch
