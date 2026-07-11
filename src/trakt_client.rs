@@ -310,8 +310,19 @@ impl TraktClient for TraktClientImpl {
             })
             .await?;
         let status = resp.status();
-        // Only a 200 carries a useful body; any other status maps purely off the code, so a
-        // missing/non-JSON body is fine (treated as Null).
+        if status == reqwest::StatusCode::OK {
+            // A 200 is the authorized response and MUST carry a token body. If the body fails to
+            // read (a transient mid-stream blip), bubble the error so `poll_to_completion` retries
+            // it as a transient poll error — NOT an Authorized with EMPTY tokens (`unwrap_or(Null)`
+            // → parse_token_response → ""), which would then fail `me("")` with a confusing 401 and
+            // abandon a grant that a retry would have completed.
+            let v = resp
+                .json::<serde_json::Value>()
+                .await
+                .map_err(AppError::Http)?;
+            return Ok(interpret_device_token(status, &v));
+        }
+        // Any other status maps purely off the code, so a missing/non-JSON body is fine (Null).
         let v = resp
             .json::<serde_json::Value>()
             .await

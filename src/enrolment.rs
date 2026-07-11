@@ -254,8 +254,10 @@ pub async fn poll_to_completion(
                 // The grant succeeded and Trakt has issued (and rotated to) this token pair. Do NOT
                 // throw it away if the immediately-following `me()` (slug lookup) blips — that would
                 // force the operator to redo the whole device-flow approval for a transient hiccup.
-                // Retry `me()` a few times on the poll cadence before giving up.
-                const MAX_ME_ATTEMPTS: u32 = 3;
+                // Retry `me()` several times on the poll cadence before giving up, so a brief Trakt
+                // hiccup right after approval (~20s at a 5s cadence) doesn't discard a valid grant
+                // and force the operator to redo the whole device-flow approval.
+                const MAX_ME_ATTEMPTS: u32 = 5;
                 let mut last_err: Option<AppError> = None;
                 for attempt in 1..=MAX_ME_ATTEMPTS {
                     match trakt.me(&tok.access_token).await {
