@@ -797,42 +797,61 @@ impl Store {
         status: OwnedStatus,
     ) -> Result<(), AppError> {
         let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-            let txn = db.begin_write()?;
+        let result = tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+            let txn = db.begin_write().map_err(|e| AppError::Db(e.into()))?;
             {
-                let mut table = txn.open_table(OWNED_TABLE)?;
+                let mut table = txn
+                    .open_table(OWNED_TABLE)
+                    .map_err(|e| AppError::Db(e.into()))?;
                 // Read the raw bytes into an owned Vec first so the read borrow ends
                 // before we call insert (which needs &mut table).
                 let existing: Option<Vec<u8>> = table
-                    .get(hash.as_str())?
+                    .get(hash.as_str())
+                    .map_err(|e| AppError::Db(e.into()))?
                     .map(|guard| guard.value().to_vec());
                 match existing {
-                    Some(raw) => match serde_json::from_slice::<OwnedRecord>(&raw) {
-                        Ok(mut rec) => {
-                            rec.status = status;
-                            match serde_json::to_vec(&rec) {
-                                Ok(bytes) => {
-                                    table.insert(hash.as_str(), bytes.as_slice())?;
-                                }
-                                // Effectively unreachable for this plain struct, but never drop a
-                                // write silently — surface it so a lost status change is diagnosable.
-                                Err(e) => error!(
-                                    "set_owned_status: re-serialise failed for {hash} ({e}); status change dropped"
-                                ),
-                            }
-                        }
-                        Err(e) => error!(
-                            "set_owned_status: corrupt owned record for {hash} ({e}); status change dropped"
-                        ),
-                    },
-                    None => warn!("set_owned_status: no owned record for {hash}; status change dropped"),
+                    Some(raw) => {
+                        // A record that won't deserialise / re-serialise is a real failure: surface
+                        // it (Err, NOT a phantom Ok) via an early `?` so the txn is dropped without
+                        // committing and the caller — e.g. `observe` marking a torrent `Verified` —
+                        // learns the status change did not land, instead of believing it did while
+                        // the record silently stays `Pending`. (Both are effectively unreachable for
+                        // this plain struct, but must never be swallowed.)
+                        let mut rec = serde_json::from_slice::<OwnedRecord>(&raw).map_err(|e| {
+                            AppError::Task(format!(
+                                "set_owned_status: corrupt owned record for {hash}: {e}"
+                            ))
+                        })?;
+                        rec.status = status;
+                        let bytes = serde_json::to_vec(&rec).map_err(|e| {
+                            AppError::Task(format!(
+                                "set_owned_status: re-serialise failed for {hash}: {e}"
+                            ))
+                        })?;
+                        table
+                            .insert(hash.as_str(), bytes.as_slice())
+                            .map_err(|e| AppError::Db(e.into()))?;
+                    }
+                    // A missing record is a legitimate no-op (e.g. a hash reaped between listing and
+                    // here), NOT a failure — commit nothing and return Ok.
+                    None => {
+                        warn!("set_owned_status: no owned record for {hash}; status change skipped")
+                    }
                 }
             }
-            txn.commit()?;
+            txn.commit().map_err(|e| AppError::Db(e.into()))?;
             Ok(())
         })
         .await;
-        Self::flatten_join(result)
+        match result {
+            Ok(inner) => inner,
+            Err(e) => {
+                error!("redb blocking write task did not complete: {:?}", e);
+                Err(AppError::Task(format!(
+                    "redb blocking task did not complete: {e}"
+                )))
+            }
+        }
     }
 
     pub async fn remove_owned(&self, hash: String) -> Result<(), AppError> {
@@ -2043,6 +2062,30 @@ mod tests {
         assert!(
             store.all_owned().await.is_empty(),
             "no phantom owned record may be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_owned_status_on_a_corrupt_record_returns_err_not_phantom_ok() {
+        // A status change against an existing-but-undeserialisable record must surface an Err (so the
+        // caller knows the change did not land), NOT commit-and-return-Ok while the record silently
+        // keeps its old status.
+        let store = mem_store();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(OWNED_TABLE).unwrap();
+                t.insert("bad", b"not a valid OwnedRecord".as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let res = store
+            .set_owned_status("bad".to_string(), OwnedStatus::Verified)
+            .await;
+        assert!(
+            matches!(res, Err(AppError::Task(_))),
+            "a corrupt owned record must yield Err, got: {res:?}"
         );
     }
 
