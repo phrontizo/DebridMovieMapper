@@ -5872,7 +5872,8 @@ mod tests {
 
         // Flag OFF (default): the guard keeps the slot on the over-ceiling pack.
         assert!(!app.config.allow_resolution_downgrade);
-        upgrade_show_episodes_and_packs(&app, SHOW_TMDB, &group_hashes, Duration::from_secs(0)).await;
+        upgrade_show_episodes_and_packs(&app, SHOW_TMDB, &group_hashes, Duration::from_secs(0))
+            .await;
         assert_eq!(
             store
                 .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
@@ -5889,7 +5890,8 @@ mod tests {
             cfg.allow_resolution_downgrade = true;
             app.config = Arc::new(cfg);
         }
-        upgrade_show_episodes_and_packs(&app, SHOW_TMDB, &group_hashes, Duration::from_secs(0)).await;
+        upgrade_show_episodes_and_packs(&app, SHOW_TMDB, &group_hashes, Duration::from_secs(0))
+            .await;
         assert_eq!(
             store
                 .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))

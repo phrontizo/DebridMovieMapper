@@ -477,8 +477,10 @@ impl TorBoxClient {
                         // Small backoff before retrying a statusless transport error (connection
                         // refused/reset) — mirrors the RD client; the rate limiter's baseline spacing
                         // alone would let a fast-failing endpoint spin the budget in a tight loop.
-                        tokio::time::sleep(Duration::from_millis((100 * attempt as u64).min(1_000)))
-                            .await;
+                        tokio::time::sleep(Duration::from_millis(
+                            (100 * attempt as u64).min(1_000),
+                        ))
+                        .await;
                         continue;
                     }
                     return Err(e);
@@ -1313,7 +1315,10 @@ mod tests {
                 200,
                 r#"{"success":true,"data":{"torrent_id":null}}"#.to_string(),
             ),
-            (200, format!(r#"{{"success":true,"data":[{{"id":42,"hash":"{hash}"}}]}}"#)),
+            (
+                200,
+                format!(r#"{{"success":true,"data":[{{"id":42,"hash":"{hash}"}}]}}"#),
+            ),
             (200, r#"{"success":true,"data":[]}"#.to_string()),
         ])
         .await;
@@ -1322,7 +1327,10 @@ mod tests {
             .add_magnet_raw(&magnet)
             .await
             .expect("a null torrent_id must recover the existing torrent, not fail");
-        assert_eq!(r.id, "42", "must reuse the existing torrent's id, not record 0");
+        assert_eq!(
+            r.id, "42",
+            "must reuse the existing torrent's id, not record 0"
+        );
     }
 
     #[tokio::test]
@@ -1336,7 +1344,10 @@ mod tests {
                 400,
                 r#"{"success":false,"detail":"Download already queued"}"#.to_string(),
             ),
-            (200, format!(r#"{{"success":true,"data":[{{"id":7,"hash":"{hash}"}}]}}"#)),
+            (
+                200,
+                format!(r#"{{"success":true,"data":[{{"id":7,"hash":"{hash}"}}]}}"#),
+            ),
             (200, r#"{"success":true,"data":[]}"#.to_string()),
         ])
         .await;

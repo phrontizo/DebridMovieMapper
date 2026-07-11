@@ -1051,13 +1051,9 @@ async fn sync_trakt_user(
     // `tokens.refresh` is safe.
     if tokens.needs_reenrolment {
         store
-            .update_trakt_tokens_if_refresh_matches(
-                slug.to_string(),
-                tokens.refresh.clone(),
-                |c| {
-                    c.needs_reenrolment = false;
-                },
-            )
+            .update_trakt_tokens_if_refresh_matches(slug.to_string(), tokens.refresh.clone(), |c| {
+                c.needs_reenrolment = false;
+            })
             .await?;
     }
 
