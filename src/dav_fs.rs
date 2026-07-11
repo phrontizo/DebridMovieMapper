@@ -140,7 +140,10 @@ impl DavFileSystem for DebridFileSystem {
                     locator: crate::provider::FileLocator,
                     modified_time: SystemTime,
                 },
-                Virtual(Vec<u8>),
+                Virtual {
+                    content: Vec<u8>,
+                    modified_time: SystemTime,
+                },
             }
             let payload = {
                 let vfs = self.vfs.read().await;
@@ -150,7 +153,12 @@ impl DavFileSystem for DebridFileSystem {
                         locator: locator.clone(),
                         modified_time: vfs.timestamps.get(&ts_key).copied().unwrap_or(UNIX_EPOCH),
                     },
-                    VfsNode::VirtualFile { content } => Payload::Virtual(content.clone()),
+                    VfsNode::VirtualFile { content } => Payload::Virtual {
+                        content: content.clone(),
+                        // Same ts_key/timestamps lookup as the MediaFile arm, so a listed and an
+                        // opened NFO report the same mtime (was hardcoded UNIX_EPOCH here).
+                        modified_time: vfs.timestamps.get(&ts_key).copied().unwrap_or(UNIX_EPOCH),
+                    },
                     VfsNode::Directory { .. } => return Err(FsError::Forbidden),
                 }
             };
@@ -176,9 +184,13 @@ impl DavFileSystem for DebridFileSystem {
                     confirmed_read: false,
                     first_read_bytes: self.first_read_bytes,
                 }) as Box<dyn DavFile>),
-                Payload::Virtual(content) => Ok(Box::new(VirtualFile {
+                Payload::Virtual {
+                    content,
+                    modified_time,
+                } => Ok(Box::new(VirtualFile {
                     content: Bytes::from(content),
                     pos: 0,
+                    modified_time,
                 }) as Box<dyn DavFile>),
             }
         }
@@ -940,6 +952,7 @@ mod tests {
         let mut file = VirtualFile {
             content: Bytes::from(&content[..]),
             pos: 0,
+            modified_time: SystemTime::UNIX_EPOCH,
         };
 
         // Read first 5 bytes
@@ -979,6 +992,7 @@ mod tests {
         let mut file = VirtualFile {
             content: Bytes::from(&b"Hello"[..]),
             pos: 2,
+            modified_time: SystemTime::UNIX_EPOCH,
         };
 
         // SeekFrom::Current(-10) from pos=2 should be negative => error
@@ -993,6 +1007,7 @@ mod tests {
         let mut file = VirtualFile {
             content: Bytes::from(&b"Hi"[..]),
             pos: 0,
+            modified_time: SystemTime::UNIX_EPOCH,
         };
 
         // SeekFrom::End(-10) on 2-byte file would be negative => error
@@ -1006,6 +1021,12 @@ mod tests {
 struct VirtualFile {
     content: Bytes,
     pos: u64,
+    /// The real per-torrent mtime for this NFO, plumbed through `open` from `vfs.timestamps` — the
+    /// SAME value the file reports when listed via `read_dir`/`metadata`. Hardcoding `UNIX_EPOCH`
+    /// here (as it once did) made an opened NFO report a 1970 mtime while its directory listing
+    /// reported the real one, confusing media-server change detection — the identical bug the
+    /// `MediaFile` open path was already fixed for.
+    modified_time: SystemTime,
 }
 
 impl DavFile for VirtualFile {
@@ -1013,7 +1034,7 @@ impl DavFile for VirtualFile {
         let meta = DebridMetaData {
             is_directory: false,
             size: self.content.len() as u64,
-            modified_time: SystemTime::UNIX_EPOCH,
+            modified_time: self.modified_time,
         };
         async move { Ok(Box::new(meta) as Box<dyn DavMetaData>) }.boxed()
     }
@@ -1093,6 +1114,75 @@ mod provider_abstraction_tests {
         let http = reqwest::Client::new();
         let ra = Arc::new(crate::read_activity::ReadActivity::new());
         let _fs = DebridFileSystem::new(provider, vfs, repair, http, ra);
+    }
+
+    #[tokio::test]
+    async fn opened_nfo_reports_the_real_mtime_not_unix_epoch() {
+        use dav_server::fs::{DavFile, DavFileSystem, OpenOptions};
+
+        let torrents = vec![(
+            crate::rd_client::TorrentInfo {
+                id: "t1".to_string(),
+                filename: "Test.mkv".to_string(),
+                original_filename: "Test.mkv".to_string(),
+                hash: "h".to_string(),
+                bytes: 1000,
+                original_bytes: 1000,
+                host: "h".to_string(),
+                split: 1,
+                progress: 100.0,
+                status: "downloaded".to_string(),
+                added: "2023-01-01".to_string(),
+                files: vec![crate::rd_client::TorrentFile {
+                    id: 1,
+                    path: "/Test.mkv".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                }],
+                links: vec!["http://link".to_string()],
+                ended: None,
+            },
+            crate::vfs::MediaMetadata {
+                title: "Test Movie".to_string(),
+                year: None,
+                media_type: crate::vfs::MediaType::Movie,
+                external_id: Some("tmdb:123".to_string()),
+            },
+        )];
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
+        let repair = Arc::new(RepairManager::new(provider.clone()));
+        let ra = Arc::new(crate::read_activity::ReadActivity::new());
+        let fs = DebridFileSystem::new(
+            provider,
+            Arc::new(RwLock::new(vfs)),
+            repair,
+            reqwest::Client::new(),
+            ra,
+        );
+
+        // Open the generated NFO and the media file; both must report the SAME real mtime
+        // (derived from `added: 2023-01-01`), NOT the old hardcoded UNIX_EPOCH for the NFO.
+        let nfo_path = DavPath::new("/Movies/Test Movie [tmdbid-123]/movie.nfo").unwrap();
+        let mut nfo = DavFileSystem::open(&fs, &nfo_path, OpenOptions::default())
+            .await
+            .unwrap();
+        let nfo_mtime = nfo.metadata().await.unwrap().modified().unwrap();
+        assert_ne!(
+            nfo_mtime,
+            SystemTime::UNIX_EPOCH,
+            "an opened NFO must report its real mtime, not UNIX_EPOCH"
+        );
+
+        let media_path = DavPath::new("/Movies/Test Movie [tmdbid-123]/Test.mkv").unwrap();
+        let mut media = DavFileSystem::open(&fs, &media_path, OpenOptions::default())
+            .await
+            .unwrap();
+        let media_mtime = media.metadata().await.unwrap().modified().unwrap();
+        assert_eq!(
+            nfo_mtime, media_mtime,
+            "the opened NFO and its media file must report the same mtime"
+        );
     }
 
     #[test]
