@@ -708,18 +708,25 @@ pub fn normalize_title(s: &str) -> String {
     let mut out = String::with_capacity(lowered.len());
     for c in lowered.chars() {
         match c {
-            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => out.push('a'),
-            'è' | 'é' | 'ê' | 'ë' => out.push('e'),
-            'ì' | 'í' | 'î' | 'ï' => out.push('i'),
-            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' => out.push('o'),
-            'ù' | 'ú' | 'û' | 'ü' => out.push('u'),
+            // Single-base folds. Each arm lists the common Latin diacritic variants (acute/grave/
+            // circumflex/umlaut/ring/macron/breve/ogonek/caron/dot/stroke) that fold to one ASCII
+            // letter, so a TMDB title and a filename that spell the same word with/without accents
+            // normalise identically. Multi-char folds (æ/œ/ß/þ) are handled below.
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => out.push('a'),
+            'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => out.push('e'),
+            'ì' | 'í' | 'î' | 'ï' | 'ī' | 'ĭ' | 'į' | 'ı' => out.push('i'),
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => out.push('o'),
+            'ù' | 'ú' | 'û' | 'ü' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => out.push('u'),
             'ý' | 'ÿ' => out.push('y'),
-            'ñ' => out.push('n'),
-            'ç' | 'č' => out.push('c'),
-            'š' => out.push('s'),
-            'ž' => out.push('z'),
-            'ł' => out.push('l'),
-            'ð' => out.push('d'),
+            'ñ' | 'ń' | 'ň' | 'ņ' => out.push('n'),
+            'ç' | 'č' | 'ć' | 'ĉ' | 'ċ' => out.push('c'),
+            'š' | 'ś' | 'ŝ' | 'ş' => out.push('s'),
+            'ž' | 'ź' | 'ż' => out.push('z'),
+            'ł' | 'ĺ' | 'ľ' | 'ļ' => out.push('l'),
+            'ð' | 'đ' | 'ď' => out.push('d'),
+            'ř' | 'ŕ' => out.push('r'),
+            'ť' | 'ţ' | 'ŧ' => out.push('t'),
+            'ğ' | 'ĝ' | 'ġ' | 'ģ' => out.push('g'),
             'þ' => out.push_str("th"),
             'æ' => out.push_str("ae"),
             'œ' => out.push_str("oe"),
@@ -791,6 +798,18 @@ mod tests {
         assert_eq!(normalize_title("Øystein"), "oystein");
         assert_eq!(normalize_title("Škoda"), "skoda");
         assert_eq!(normalize_title("Æon Flux"), normalize_title("Aeon Flux"));
+    }
+
+    #[test]
+    fn normalize_title_folds_extended_diacritics_consistently() {
+        // Macrons, dotted/stroked and Central-European diacritics must fold to their ASCII base too,
+        // so a TMDB title and a filename spelling the same word ASCII-only normalise identically.
+        assert_eq!(normalize_title("Tōkyō"), normalize_title("Tokyo")); // macrons ō→o
+        assert_eq!(normalize_title("Łódź"), normalize_title("Lodz")); // ł→l, ó→o, ź→z
+        assert_eq!(normalize_title("Dvořák"), normalize_title("Dvorak")); // ř→r, á→a
+        assert_eq!(normalize_title("Gdańsk"), normalize_title("Gdansk")); // ń→n
+        assert_eq!(normalize_title("Wałęsa"), normalize_title("Walesa")); // ł→l, ę→e
+        assert_eq!(normalize_title("Međimurje"), normalize_title("Medimurje")); // đ→d
     }
 
     #[tokio::test]
