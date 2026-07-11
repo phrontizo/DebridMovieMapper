@@ -729,6 +729,50 @@ mod tests {
     }
 
     #[test]
+    fn manual_returning_show_acquires_unwatched_aired_episodes_it_never_owned() {
+        // W2 regression (pins the W1 doc): a MANUAL, Trakt-wanted (in-progress), non-finished
+        // (Returning) show still acquires its UNWATCHED aired episodes via the normal catch-up path —
+        // including ones the manual copy never owned. The owned_eps clause only ADDS already-watched
+        // owned episodes; it does NOT restrict the base catch-up set.
+        let aired = vec![(1, 1), (1, 2)];
+        let t = show_title(
+            31,
+            vec![show_record(
+                "alice",
+                31,
+                /*watchlisted*/ false,
+                /*in_progress*/ true,
+                /*watched_eps*/ vec![(1, 1)],
+                ShowStatus::Returning,
+            )],
+            Some(owned(
+                "h",
+                Provenance::manual(),
+                /*available*/ true,
+                /*owned_episodes*/ vec![(1, 1)],
+            )),
+            aired,
+        );
+        let actions = reconcile_title(&t);
+        assert!(
+            actions.contains(&Action::AcquireEpisode {
+                tmdb_id: 31,
+                season: 1,
+                episode: 2
+            }),
+            "an unwatched aired episode the manual copy never owned is still acquired, got {actions:?}"
+        );
+        assert!(
+            !actions.contains(&Action::AcquireEpisode {
+                tmdb_id: 31,
+                season: 1,
+                episode: 1
+            }),
+            "a watched, owned+available episode is not re-acquired"
+        );
+    }
+
+    #[test]
     fn abandoned_watchlist_movie_removed_regardless_of_watch_percent_trigger_b() {
         // alice un-watchlisted (both sources false) — nobody wants it now. Trigger B fires
         // regardless of how much she had watched (incl. the record being gone entirely).

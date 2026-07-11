@@ -616,6 +616,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn healthcheck_accumulates_a_split_status_line() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        // MAIN1: the "HTTP/" prefix arrives split across multiple reads — "HT" then, after a delay,
+        // the rest. The accumulation loop must gather ≥5 bytes and report healthy, NOT mark a healthy
+        // server unhealthy because the first read() delivered fewer than 5 bytes.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 128];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HT");
+                let _ = s.flush();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let _ = s.write_all(b"TP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        assert!(
+            healthcheck(port),
+            "a status line split across reads must still report healthy"
+        );
+        let _ = h.join();
+    }
+
     #[tokio::test]
     async fn real_header_read_timeout_is_classified_ignorable() {
         // Drive a REAL header-read timeout through serve_connection (client connects but never sends
