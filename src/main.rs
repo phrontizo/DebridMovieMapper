@@ -129,13 +129,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Healthcheck mode: exercise the request/handler path, then exit.
     if std::env::args().any(|a| a == "--healthcheck") {
-        // Resolve PORT identically to the server (Config also rejects 0 → 8080), so the probe never
-        // targets a different port than the one the server actually bound.
-        let port: u16 = std::env::var("PORT")
-            .ok()
-            .and_then(|s| s.trim().parse::<u16>().ok())
-            .filter(|&p| p != 0)
-            .unwrap_or(8080);
+        // Resolve PORT identically to the server via the shared `config::resolve_port` (rejects 0 →
+        // 8080), so the probe never targets a different port than the one the server actually bound.
+        let port = debridmoviemapper::config::resolve_port(std::env::var("PORT").ok().as_deref()).0;
         std::process::exit(if healthcheck(port) { 0 } else { 1 });
     }
 
@@ -421,14 +417,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if is_trakt_path(req.uri().path()) {
                                         match &enrolment {
                                             Some(enr) => Ok::<_, hyper::Error>(enr.handle(req).await),
-                                            None => Ok::<_, hyper::Error>(
-                                                hyper::Response::builder()
-                                                    .status(hyper::StatusCode::NOT_FOUND)
-                                                    .body(dav_server::body::Body::from(
+                                            None => {
+                                                // Build infallibly (Response::new + status_mut) so the
+                                                // per-request path carries no panic site — the old
+                                                // `.expect("static 404 response")` was infallible but
+                                                // still an `expect` on the hot path.
+                                                let mut resp = hyper::Response::new(
+                                                    dav_server::body::Body::from(
                                                         "Trakt enrolment is not enabled".to_string(),
-                                                    ))
-                                                    .expect("static 404 response"),
-                                            ),
+                                                    ),
+                                                );
+                                                *resp.status_mut() =
+                                                    hyper::StatusCode::NOT_FOUND;
+                                                Ok::<_, hyper::Error>(resp)
+                                            }
                                         }
                                     } else {
                                         Ok::<_, hyper::Error>(dav_handler.handle(req).await)
@@ -487,8 +489,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // mid-flight provider mutations are worth finishing cleanly.
     let _ = shutdown_tx.send(true);
     info!("Waiting for background tasks to finish...");
-    if let Err(e) = scheduler_handle.await {
-        tracing::error!("Scheduler task ended abnormally: {:?}", e);
+    // Bound the drain: a job parked in a slow provider call (reqwest 30s timeout) or the shared
+    // rate limiter's backpressure could otherwise delay shutdown past `docker stop`'s ~10s grace →
+    // SIGKILL. The scheduler's operations are idempotent, so a task cut here is safely redone next
+    // start. Dropping the JoinHandle on timeout detaches the task; the runtime aborts it as `main`
+    // returns.
+    const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+    match tokio::time::timeout(SHUTDOWN_GRACE, scheduler_handle).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::error!("Scheduler task ended abnormally: {:?}", e),
+        Err(_) => tracing::warn!(
+            "Scheduler drain exceeded {}s; forcing shutdown",
+            SHUTDOWN_GRACE.as_secs()
+        ),
     }
 
     info!("Shutdown complete.");

@@ -2,6 +2,22 @@ use crate::error::AppError;
 use crate::provider::{choose_provider, ProviderKind};
 use tracing::warn;
 
+/// Resolve the WebDAV listen port from a raw `PORT` value, identically for the server
+/// (`Config::from_parts`) and the `--healthcheck` probe (`main`) so the probe can never target a
+/// different port than the one the server actually bound. Trims, treats blank as unset, and rejects
+/// `0` (binds a random ephemeral port → the healthcheck would connect to 127.0.0.1:0 → restart
+/// loop). Returns the resolved port plus whether a NON-EMPTY value was invalid/zero and fell back to
+/// 8080 (so the server can warn; the healthcheck ignores the flag).
+pub fn resolve_port(raw: Option<&str>) -> (u16, bool) {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => match s.parse::<u16>().ok().filter(|&p| p != 0) {
+            Some(p) => (p, false),
+            None => (8080, true),
+        },
+        None => (8080, false),
+    }
+}
+
 /// Hard resolution ceiling. Compare via `height()` (pixel height), not by variant order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaxResolution {
@@ -677,20 +693,15 @@ impl Config {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "metadata.db".to_string());
 
-        let port = match port.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-            // Reject 0 alongside unparseable values: port 0 binds a random ephemeral port (nothing
-            // is configured for it) and makes `--healthcheck` connect to 127.0.0.1:0 → fail →
-            // container restart loop. Fall back to 8080 with the same warn.
-            Some(s) => s
-                .parse::<u16>()
-                .ok()
-                .filter(|&p| p != 0)
-                .unwrap_or_else(|| {
-                    warn!("Invalid PORT value '{}', falling back to 8080", s);
-                    8080
-                }),
-            None => 8080,
-        };
+        // Shared with the `--healthcheck` probe (see `resolve_port`) so both target the same port.
+        let port_raw = port;
+        let (port, port_fell_back) = resolve_port(port_raw.as_deref());
+        if port_fell_back {
+            warn!(
+                "Invalid PORT value '{}', falling back to 8080",
+                port_raw.as_deref().unwrap_or("").trim()
+            );
+        }
 
         Ok(Self {
             provider_kind,
@@ -715,6 +726,21 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_port_matches_server_and_healthcheck() {
+        // Unset / blank → default, no fallback flag.
+        assert_eq!(resolve_port(None), (8080, false));
+        assert_eq!(resolve_port(Some("")), (8080, false));
+        assert_eq!(resolve_port(Some("   ")), (8080, false));
+        // Valid, incl. surrounding whitespace (quoted compose YAML).
+        assert_eq!(resolve_port(Some("9000")), (9000, false));
+        assert_eq!(resolve_port(Some("  9000 ")), (9000, false));
+        // Invalid / zero → fall back to 8080 AND flag it (so the server warns).
+        assert_eq!(resolve_port(Some("0")), (8080, true));
+        assert_eq!(resolve_port(Some("70000")), (8080, true));
+        assert_eq!(resolve_port(Some("nope")), (8080, true));
+    }
 
     fn parts(
         rd: Option<&str>,
