@@ -1867,6 +1867,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acquire_returns_temporarily_unavailable_on_scrape_error() {
+        // A scraper error (a retryable addon outage) must surface as TemporarilyUnavailable so the
+        // reconciler retries next tick, NOT NoAcceptableRelease. MockScraper always succeeds, so this
+        // uses a dedicated failing scraper.
+        struct FailScraper;
+        #[async_trait::async_trait]
+        impl Scraper for FailScraper {
+            async fn find(
+                &self,
+                _imdb_id: &str,
+                _kind: crate::scraper::MediaKind,
+                _season: Option<u32>,
+                _episode: Option<u32>,
+            ) -> Result<Vec<RawCandidate>, crate::error::AppError> {
+                Err(crate::error::AppError::Task("scrape boom".into()))
+            }
+        }
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(FailScraper),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            store(),
+        );
+        assert_eq!(
+            eng.acquire(req(), Provenance::manual()).await,
+            AcquireOutcome::TemporarilyUnavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_idempotent_when_listing_unavailable() {
+        // Owned record exists AND a ranked candidate matches it, but the provider listing FAILS
+        // (get_torrents errors → inner `None`). The engine must preserve the old idempotent behaviour
+        // (treat the owned record as present) and short-circuit as Acquired WITHOUT re-adding, rather
+        // than duplicating the torrent on a transient listing blip. Exercises the whole point of the
+        // `Option<Option<HashSet>>` "fetched? / succeeded?" shape.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: 7,
+                status: OwnedStatus::Verified,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        // Listing fails; add_magnet is left None so a wrongful re-add would NOT yield Acquired("h1").
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            fail_get_torrents: true,
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper {
+                candidates: vec![cand("h1", true)],
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        assert_eq!(
+            eng.acquire(req(), Provenance::manual()).await,
+            AcquireOutcome::Acquired("h1".into()),
+            "a listing blip must preserve idempotency (treat owned as present), not re-add"
+        );
+        let rec = st.get_owned("h1".into()).await.expect("record kept");
+        assert_eq!(rec.added_at, 7, "no spurious re-add on a listing blip");
+        assert!(
+            rec.provenance.has_manual_entry(),
+            "the manual provenance must be preserved"
+        );
+    }
+
+    #[tokio::test]
     async fn acquire_no_candidates_is_no_acceptable() {
         let eng = engine(
             provider_returning("downloaded", "h1"),
