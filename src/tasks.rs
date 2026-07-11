@@ -2394,9 +2394,12 @@ pub(crate) fn season_aired(aired: &[(u32, u32)], season: u32) -> Vec<u32> {
 /// episodes and removing finished/abandoned shows. This is the air-date-dependent half of show
 /// handling that Task 8 (`reconcile_wanted`) deferred.
 ///
-/// OVERLAP: this re-derives `reconcile_wanted`'s show Trigger-B removal, which is harmless (both
-/// idempotent); `monitor_episodes` ADDITIONALLY does episode acquisition + Trigger-A finish
-/// removal (both air-date dependent, hence here and not in Task 8).
+/// SCOPE: `monitor_episodes` does episode acquisition + Trigger-A finish removal (both air-date
+/// dependent, hence here and not in Task 8). It does NOT perform Trigger-B (abandoned-watchlist)
+/// removal: it iterates only titles still in the wanted set, and every persisted `WantedRecord`
+/// has `wants() == true`, so `trigger_b_abandoned` — which requires that NO user wants the title —
+/// is always false for anything reached here. Trigger B (for owned-but-*unwanted* titles whose
+/// wanted rows were pruned) is exclusively `reconcile_wanted`'s, which iterates wanted ∪ owned.
 ///
 /// AVAILABILITY is title-level: a show's owned copy counts as `available` if ANY of its owned
 /// hashes is present in the provider listing. A specific episode is therefore treated as available
