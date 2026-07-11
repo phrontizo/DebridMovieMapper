@@ -2112,6 +2112,46 @@ mod tests {
         let _ = std::fs::remove_file(&corrupt1);
     }
 
+    #[tokio::test]
+    async fn open_corrupt_db_errors_when_all_backup_names_taken() {
+        // Data-loss guard for `unique_backup_path`'s exhaustion return (→ `AppError::Config` in
+        // `move_aside_and_create`): when `.corrupt` AND `.corrupt.1 ..= .corrupt.999` (all 1000
+        // candidate backup names) already exist, there is nowhere left to move the corrupt DB.
+        // `move_aside_and_create`'s whole contract is that it NEVER deletes/overwrites the file, so
+        // this must surface as a hard startup Err with the original corrupt DB left intact on disk —
+        // never a silent wipe. Exercises that branch end-to-end (only the pieces were unit-tested).
+        let tmp = TempDb::new("backup_exhausted");
+        const CORRUPT_CONTENTS: &[u8] = b"genuinely-not-a-redb-file";
+        std::fs::write(&tmp.path, CORRUPT_CONTENTS).unwrap();
+
+        // Pre-create every candidate backup name: `.corrupt` and `.corrupt.1 ..= .corrupt.999`.
+        let backups: Vec<String> = std::iter::once(tmp.corrupt_path())
+            .chain((1..1000).map(|n| format!("{}.corrupt.{n}", tmp.path)))
+            .collect();
+        for b in &backups {
+            std::fs::write(b, b"existing backup").unwrap();
+        }
+
+        let result = Store::open(&tmp.path);
+
+        // Exhausted backup names → hard startup error, NOT a recovery.
+        assert!(
+            matches!(result, Err(AppError::Config(_))),
+            "exhausted backup names must fail startup, not silently recover"
+        );
+        // The whole point of move_aside_and_create: the corrupt DB is NEVER deleted or overwritten.
+        assert_eq!(
+            std::fs::read(&tmp.path).unwrap(),
+            CORRUPT_CONTENTS,
+            "the original corrupt DB must be left intact on disk, never deleted/overwritten"
+        );
+
+        // Clean up the numbered backups (the plain `.corrupt` + `path` are handled by TempDb::Drop).
+        for b in &backups {
+            let _ = std::fs::remove_file(b);
+        }
+    }
+
     #[test]
     fn db_open_failure_keeps_intact_db_on_transient_errors() {
         // Lock contention (another instance) and I/O / permission errors must NOT move the DB
