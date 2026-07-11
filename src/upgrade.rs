@@ -1109,6 +1109,12 @@ async fn correct_over_ceiling_packs(
     let owned_hashes: Vec<String> = owned.iter().map(|(h, _)| h.clone()).collect();
     // Merge the group's provenance once from the records in hand (no per-pack owned-table re-scan).
     let group_prov = merged_provenance(owned);
+    // Fetch the per-title blacklist ONCE and test membership in memory (mirrors `rank_changes`),
+    // rather than one awaited redb read per ranked candidate.
+    let blacklist = app
+        .store
+        .blacklisted_hashes_for(MediaKind::Series, tmdb_id)
+        .await;
     for (pack_hash, rec) in owned.iter().filter(|(_, r)| r.provides.len() > 1) {
         let Some(pack_q) = rec.quality.clone() else {
             continue; // untagged → no baseline, skip
@@ -1121,6 +1127,11 @@ async fn correct_over_ceiling_packs(
             continue; // single-season packs only
         }
         let need: Vec<u32> = rec.provides.iter().map(|(_, e)| *e).collect();
+        // The exact episode set the OLD over-ceiling pack supplied. The replacement must cover all of
+        // these, but we only repoint/claim THESE — never the extra episodes a bigger replacement pack
+        // happens to also contain (an extra episode may have a better within-ceiling singleton whose
+        // slot must not be dragged down to this pack; see the `provides`/`slot_files` filters below).
+        let need_set: std::collections::HashSet<u32> = need.iter().copied().collect();
 
         let Ok(raws) = app
             .scraper
@@ -1130,11 +1141,7 @@ async fn correct_over_ceiling_packs(
             continue;
         };
         for cand in rank_cached_pack_candidates(&raws, prefs, &owned_hashes) {
-            if app
-                .store
-                .is_blacklisted(MediaKind::Series, tmdb_id, cand.info_hash.clone())
-                .await
-            {
+            if blacklist.contains(&cand.info_hash.to_ascii_lowercase()) {
                 continue;
             }
             let cand_q = QualitySummary::of(&cand, prefs);
@@ -1221,9 +1228,12 @@ async fn correct_over_ceiling_packs(
                 imdb_id: imdb_id.to_string(),
                 ..rec.request.clone()
             };
+            // Claim/repoint ONLY the old pack's episodes (`need_set`), not every episode this
+            // replacement pack contains — so an extra episode with a better within-ceiling singleton
+            // keeps its own (better) selection and isn't silently downgraded onto this pack.
             let provides: Vec<(u32, u32)> = eps
                 .iter()
-                .filter(|(s, _, _)| *s == season)
+                .filter(|(s, e, _)| *s == season && need_set.contains(e))
                 .map(|(s, e, _)| (*s, *e))
                 .collect();
             let _ = app
@@ -1246,7 +1256,7 @@ async fn correct_over_ceiling_packs(
                 .await;
             let slot_files: Vec<(String, String)> = eps
                 .iter()
-                .filter(|(s, _, _)| *s == season)
+                .filter(|(s, e, _)| *s == season && need_set.contains(e))
                 .map(|(s, e, p)| (crate::store::episode_slot(tmdb_id, *s, *e), p.clone()))
                 .collect();
             match apply_upgrade(
@@ -1580,6 +1590,12 @@ async fn consolidate_show_seasons(
     // Fix B: hoist provenance merge outside the per-season loop. Merged from the `owned` records
     // already in hand (no `owned`-table re-scan) — see `merged_provenance`.
     let prov = merged_provenance(owned);
+    // Fetch the per-title blacklist ONCE and test membership in memory (mirrors `rank_changes`),
+    // rather than one awaited redb read per ranked candidate across every season.
+    let blacklist = app
+        .store
+        .blacklisted_hashes_for(MediaKind::Series, tmdb_id)
+        .await;
     for season in seasons {
         let season_aired = crate::tasks::season_aired(aired, season);
         if season_aired.is_empty() {
@@ -1646,11 +1662,7 @@ async fn consolidate_show_seasons(
         // resolution ceiling, cam/telesync, dead seeders — are applied by `score()` inside the helper:
         // a pack above the ceiling would pass the no-regression check yet violate it, so it's excluded).
         for r in rank_cached_pack_candidates(&raws, &app.config.acquisition.prefs, group_hashes) {
-            if app
-                .store
-                .is_blacklisted(MediaKind::Series, tmdb_id, r.info_hash.clone())
-                .await
-            {
+            if blacklist.contains(&r.info_hash.to_ascii_lowercase()) {
                 continue;
             }
 
@@ -4982,6 +4994,168 @@ mod tests {
         assert!(
             !d.contains(&"te1".to_string()) && !d.contains(&"te2".to_string()),
             "no episode torrent is pruned when the pack is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidation_falls_through_rejected_pack_to_the_next_candidate() {
+        // Two ranked pack candidates: the top-scored one (1080p REMUX) resolves to a MULTI-SEASON
+        // pack (rejected), the next (1080p BluRay) is a clean full-season pack. Consolidation must
+        // fall through IN-TICK and adopt the second — the same in-tick fall-through the movie and
+        // per-episode paths have; every other consolidate test seeds only ONE candidate.
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await; // e1=S01E01, e2=S01E02 (q1080_web)
+
+        // Both are 1080p HEVC cached (so the HEVC bonus can't flip the ranking); REMUX outscores
+        // BluRay on source tier, so `hbad` is tried first.
+        let bad = RawCandidate {
+            name: "S.2019.S01.1080p.BluRay.REMUX.x265".into(),
+            description: "REMUX\nRD+".into(),
+            info_hash: "hbad".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let good = RawCandidate {
+            name: "S.2019.S01.1080p.BluRay.x265".into(),
+            description: "BluRay\nRD+".into(),
+            info_hash: "hgood".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![bad, good],
+        });
+
+        let mut by_id = std::collections::HashMap::new();
+        // hbad → multi-season (S01E01, S01E02, S02E01) ⇒ rejected + deleted, fall through.
+        by_id.insert(
+            "hbad".to_string(),
+            TorrentInfo {
+                id: "hbad".into(),
+                hash: "hbad".into(),
+                status: "downloaded".into(),
+                files: vec![
+                    TorrentFile {
+                        id: 0,
+                        path: "S.S01E01.1080p.REMUX.mkv".into(),
+                        bytes: 3_000_000_000,
+                        selected: 1,
+                    },
+                    TorrentFile {
+                        id: 1,
+                        path: "S.S01E02.1080p.REMUX.mkv".into(),
+                        bytes: 3_000_000_000,
+                        selected: 1,
+                    },
+                    TorrentFile {
+                        id: 2,
+                        path: "S.S02E01.1080p.REMUX.mkv".into(),
+                        bytes: 3_000_000_000,
+                        selected: 1,
+                    },
+                ],
+                links: vec![
+                    "https://cdn/b0".into(),
+                    "https://cdn/b1".into(),
+                    "https://cdn/b2".into(),
+                ],
+                ..Default::default()
+            },
+        );
+        // hgood → clean single-season pack (S01E01, S01E02) ⇒ adopted.
+        by_id.insert(
+            "hgood".to_string(),
+            TorrentInfo {
+                id: "hgood".into(),
+                hash: "hgood".into(),
+                status: "downloaded".into(),
+                files: vec![
+                    TorrentFile {
+                        id: 0,
+                        path: "S.S01E01.1080p.BluRay.mkv".into(),
+                        bytes: 2_000_000_000,
+                        selected: 1,
+                    },
+                    TorrentFile {
+                        id: 1,
+                        path: "S.S01E02.1080p.BluRay.mkv".into(),
+                        bytes: 2_000_000_000,
+                        selected: 1,
+                    },
+                ],
+                links: vec!["https://cdn/g0".into(), "https://cdn/g1".into()],
+                ..Default::default()
+            },
+        );
+
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "te1".into(),
+                    hash: "e1".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "te2".into(),
+                    hash: "e2".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "hgood".into(),
+                    hash: "hgood".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            torrent_info_by_id: by_id,
+            resolved_url: Some("https://cdn/g0".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        let res = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(res.is_ok(), "consolidation completes after falling through");
+
+        // The SECOND candidate (hgood) is adopted with the full-season provides.
+        let pack = store
+            .get_owned("hgood".into())
+            .await
+            .expect("the second candidate must be adopted");
+        assert_eq!(pack.provides, vec![(1, 1), (1, 2)]);
+        assert!(
+            store.get_owned("hbad".into()).await.is_none(),
+            "the rejected multi-season pack must NOT be recorded owned"
+        );
+        // Both episode slots repoint to the adopted pack, and the scattered singletons are pruned.
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            "hgood"
+        );
+        assert!(store.get_owned("e1".into()).await.is_none());
+        let d = deleted.lock().unwrap();
+        assert!(
+            d.contains(&"hbad".to_string()),
+            "the rejected pack is deleted"
+        );
+        assert!(
+            d.contains(&"te1".to_string()) && d.contains(&"te2".to_string()),
+            "scattered episode torrents pruned after adopting the second candidate"
         );
     }
 
