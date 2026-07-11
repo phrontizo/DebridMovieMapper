@@ -423,6 +423,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_streams_falls_back_to_description_when_title_absent() {
+        // Some Stremio addons put the release metadata blob in `description` rather than `title`.
+        // `parse_streams` must fall back to it so ranking/identification still see the release
+        // details, and a stream carrying BOTH must prefer `title`.
+        let json = serde_json::json!({
+            "streams": [
+                { "name": "Addon",
+                  "description": "Movie.2023.1080p.x265-GRP",
+                  "infoHash": "aabbccddeeff00112233445566778899aabbccdd" },
+                { "name": "Addon",
+                  "title": "From.Title",
+                  "description": "From.Description",
+                  "infoHash": "1122334455667788990011223344556677889900" },
+            ]
+        });
+        let cands = parse_streams(&json);
+        assert_eq!(cands.len(), 2);
+        assert_eq!(cands[0].description, "Movie.2023.1080p.x265-GRP");
+        assert_eq!(cands[1].description, "From.Title");
+    }
+
+    #[test]
     fn parse_streams_rejects_a_malformed_explicit_infohash() {
         // A non-empty but structurally-invalid explicit infoHash (not 40-hex, not 32 base32) must
         // be treated like a missing one — it would otherwise build an invalid
