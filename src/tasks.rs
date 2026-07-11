@@ -1603,8 +1603,18 @@ pub(crate) fn plan_dedup(
         match media_type {
             MediaType::Movie => {
                 keep.push(hashes[0].0.clone());
-                for (h, _) in &hashes[1..] {
-                    remove.push(h.clone());
+                for (h, r) in &hashes[1..] {
+                    // A Manual-provenance copy is a protected never-auto-remove class (invariant
+                    // M-1): never dedup-remove it, even when a higher-keep-priority mirror/engine
+                    // duplicate won the keep slot. Both Manual and empty-provenance mirror rank as
+                    // `protected` on the sort axis, so without this a `selected`/higher-score mirror
+                    // could take hashes[0] and the Manual copy would be marked redundant — silently
+                    // dropping its never-auto-remove designation from the surviving group.
+                    if r.provenance.has_manual_entry() {
+                        keep.push(h.clone());
+                    } else {
+                        remove.push(h.clone());
+                    }
                 }
             }
             MediaType::Show => {
@@ -1614,7 +1624,11 @@ pub(crate) fn plan_dedup(
                         keep.push(h.clone()); // unknown coverage → never remove on a guess
                         continue;
                     }
-                    if r.provides.iter().any(|e| !covered.contains(e)) {
+                    // Never dedup-remove a Manual copy (invariant M-1, see the Movie branch).
+                    if r.provenance.has_manual_entry() {
+                        keep.push(h.clone());
+                        covered.extend(r.provides.iter().copied());
+                    } else if r.provides.iter().any(|e| !covered.contains(e)) {
                         keep.push(h.clone());
                         covered.extend(r.provides.iter().copied());
                     } else {
@@ -3024,6 +3038,40 @@ mod tests {
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].keep, vec!["served"]);
         assert_eq!(plans[0].remove, vec!["better"]);
+    }
+
+    #[test]
+    fn plan_dedup_never_removes_a_manual_copy() {
+        use crate::scraper::MediaKind;
+        // A Manual copy ("man") plus two mirror duplicates. The `selected`, higher-score mirror
+        // ("mir1") wins the keep slot — but the Manual copy must NOT be dedup-removed (M-1), even
+        // though it shares the `protected` axis; only the genuinely-redundant mirror is removed.
+        let mut man = dedup_rec(MediaKind::Movie, 1, vec![], Some(10));
+        man.provenance = Provenance::manual();
+        let owned = vec![
+            ("man".to_string(), man),
+            (
+                "mir1".to_string(),
+                dedup_rec(MediaKind::Movie, 1, vec![], Some(999)),
+            ),
+            (
+                "mir2".to_string(),
+                dedup_rec(MediaKind::Movie, 1, vec![], Some(1)),
+            ),
+        ];
+        let plans = plan_dedup(&owned, &hset(&["man", "mir1", "mir2"]), &hset(&["mir1"]));
+        assert_eq!(plans.len(), 1);
+        assert!(
+            !plans[0].remove.contains(&"man".to_string()),
+            "a Manual copy must never be dedup-removed"
+        );
+        assert_eq!(
+            plans[0].remove,
+            vec!["mir2"],
+            "only the redundant mirror is removed"
+        );
+        assert!(plans[0].keep.contains(&"man".to_string()));
+        assert!(plans[0].keep.contains(&"mir1".to_string()));
     }
 
     #[test]
