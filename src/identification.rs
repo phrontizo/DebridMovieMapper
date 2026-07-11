@@ -56,16 +56,42 @@ static STOP_RE: LazyLock<Regex> = LazyLock::new(|| {
 static YEAR_RANGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(19|20)\d{2}[\s-]+(19|20)\d{2}\b").unwrap());
 
-// Word-anchored show markers. The looser alternatives are bounded so a movie filename does not
-// trip them: `\b\d{1,2}x\d{2,3}\b` (episode form like 1x01) excludes a resolution such as
-// 1920x1080 (via the 1-2-digit first number) AND an aspect-ratio tag such as 16x9 / 4x3 / 21x9
-// (via requiring a ≥2-digit second number — a real NxM episode is 1x01, not 1x9),
-// and `\be\d{1,3}\b` (episode marker E05) excludes embedded matches like the `e7` in "Se7en". The
-// SxxExx alternative is leading-`\b`-anchored but intentionally NOT trailing-anchored, so
-// contiguous multi-episode and version markers (S01E01E02, S01E13v2) still match.
-static SHOW_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bs\d+\.?e\d+|\bs\d+\b|\b\d{1,2}x\d{2,3}\b|\bseasons?\s*\d+|\b\d+\s*seasons?|\btemporada\s*\d+|\bsaison\s*\d+|\be\d{1,3}\b").unwrap()
+// Word-anchored STRONG show markers — everything except the loose `NxM` form, which is handled
+// separately (see `NXM_RE`) so a movie *title* written `NxM` can be excluded. `\be\d{1,3}\b`
+// (episode marker E05) excludes embedded matches like the `e7` in "Se7en". The SxxExx alternative
+// is leading-`\b`-anchored but intentionally NOT trailing-anchored, so contiguous multi-episode
+// and version markers (S01E01E02, S01E13v2) still match.
+static STRONG_SHOW_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bs\d+\.?e\d+|\bs\d+\b|\bseasons?\s*\d+|\b\d+\s*seasons?|\btemporada\s*\d+|\bsaison\s*\d+|\be\d{1,3}\b").unwrap()
 });
+
+// The loose `NxM` episode form (e.g. 1x01, 3x14, 10x24). Bounded so a movie filename does not
+// trip it structurally: the 1-2-digit first number excludes a resolution such as 1920x1080, and
+// the ≥2-digit second number excludes an aspect-ratio tag such as 16x9 / 4x3 / 21x9 (a real NxM
+// episode is 1x01, not 1x9). It still matches a movie whose *title* is written `NxM` (10x10,
+// 24x36); `NXM_TITLE_ONLY_RE` filters those out — see `filename_has_show_marker`.
+static NXM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b\d{1,2}x\d{2,3}\b").unwrap());
+
+// A cleaned title that is ENTIRELY an `NxM` token (e.g. `10x10`, `24x36`) — a movie whose name
+// happens to be written that way, NOT an episode marker (which keeps the show name in the title).
+static NXM_TITLE_ONLY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\d{1,2}x\d{2,3}$").unwrap());
+
+/// Whether a single filename carries a genuine episode/show marker. Strong markers (SxxExx,
+/// Season N, Exx, …) are unambiguous. The loose `NxM` form also matches movie *titles* written
+/// that way (e.g. `10x10.2018`, `24x36.2019`): such a title is the whole cleaned name (only a
+/// year/quality metadata follows), whereas a real `NxM` marker is preceded by the show name — so
+/// after cleaning the former reduces to exactly the `NxM` token and is NOT treated as a marker.
+fn filename_has_show_marker(filename: &str) -> bool {
+    if STRONG_SHOW_RE.is_match(filename) {
+        return true;
+    }
+    if NXM_RE.is_match(filename) {
+        let (title, _year) = clean_name(filename);
+        return !NXM_TITLE_ONLY_RE.is_match(title.trim());
+    }
+    false
+}
 
 static GENERIC_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(episode|season|part|volume|vol)\s*(\d+|[a-z])?$").unwrap());
@@ -680,7 +706,7 @@ pub fn is_show_guess(files: &[rd_client::TorrentFile]) -> bool {
     // An episode marker (SxxExx, NxM, "Season N", …) in any filename → definitely a show.
     if files.iter().any(|f| {
         let filename = f.path.split('/').next_back().unwrap_or(&f.path);
-        SHOW_RE.is_match(filename)
+        filename_has_show_marker(filename)
     }) {
         return true;
     }
@@ -2107,6 +2133,12 @@ mod tests {
             "Some.Movie.2001.16x9.DVDRip.mkv",
             "Old.Cartoon.4x3.mkv",
             "Ultrawide.Film.21x9.mkv",
+            // A movie whose *title* is written NxM (10x10 [2018], 24x36 [2019]) must not be
+            // guessed as a show even though the NxM alternative matches — the title is the whole
+            // cleaned name (only a year/quality metadata follows), unlike a real episode marker.
+            "10x10.2018.1080p.BluRay.x264.mkv",
+            "24x36.2019.1080p.WEBRip.mkv",
+            "10x10.1080p.mkv",
         ] {
             assert!(
                 !is_show_guess(&one_file(name)),
