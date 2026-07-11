@@ -39,6 +39,66 @@ pub struct RepairManager {
     repair_replacements: Arc<RwLock<HashMap<String, String>>>,
 }
 
+/// RAII guard that makes the `Repairing` transition in `try_instant_repair` cancellation-safe.
+///
+/// `check_and_begin_repair` transitions a torrent to `Repairing`. `try_instant_repair` is awaited
+/// INSIDE the WebDAV read future, so if the player/HTTP connection drops mid-repair the future is
+/// dropped at an intermediate await before any outcome arm resets the state — leaving the torrent
+/// stranded `Repairing`, which `should_hide_torrent`/`hidden_torrent_ids` treat as hidden. A hidden
+/// torrent can never re-trigger repair (reads short-circuit on `should_hide_torrent`) and is not
+/// pruned while it is still listed, so it would be trapped until process restart. On drop while
+/// still armed, the guard resets a *still-`Repairing`* torrent back to `Healthy`; a normal
+/// completion calls [`RepairInProgressGuard::disarm`], so on completion the guard is a no-op (every
+/// exit path already sets a terminal state) and it only fires on cancellation.
+struct RepairInProgressGuard {
+    health_status: Arc<RwLock<HashMap<String, TorrentHealth>>>,
+    torrent_id: String,
+    armed: bool,
+}
+
+impl RepairInProgressGuard {
+    fn armed(
+        health_status: Arc<RwLock<HashMap<String, TorrentHealth>>>,
+        torrent_id: String,
+    ) -> Self {
+        Self {
+            health_status,
+            torrent_id,
+            armed: true,
+        }
+    }
+
+    /// Disarm the guard after a normal (non-cancelled) completion, whose own arms already set a
+    /// terminal state.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RepairInProgressGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let health_status = Arc::clone(&self.health_status);
+        let torrent_id = std::mem::take(&mut self.torrent_id);
+        // `Drop` cannot await, so hand the reset to a detached task. It resets ONLY a still
+        // `Repairing` entry, so a racing state change (another repair began, or a Broken/Failed
+        // transition) is never clobbered. If there is no current runtime (e.g. during shutdown) the
+        // in-memory health map no longer matters, so a failed spawn is harmless.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut map = health_status.write().await;
+                if let Some(h) = map.get_mut(&torrent_id) {
+                    if h.state == RepairState::Repairing {
+                        h.state = RepairState::Healthy;
+                    }
+                }
+            });
+        }
+    }
+}
+
 impl RepairManager {
     pub fn new(provider: Arc<dyn DebridProvider>) -> Self {
         Self {
@@ -170,16 +230,12 @@ impl RepairManager {
         // Write-side: set state to Repairing and increment attempt count
         let mut health_map = self.health_status.write().await;
         let attempt_num = if let Some(health) = health_map.get_mut(torrent_id) {
-            if health.repair_attempts >= MAX_REPAIR_ATTEMPTS {
-                error!(
-                    "Torrent {} has failed repair {} times, marking as permanently FAILED",
-                    torrent_id, MAX_REPAIR_ATTEMPTS
-                );
-                health.state = RepairState::Failed;
-                return Err("Maximum repair attempts exceeded".to_string());
-            }
-            // Double-check all guards: another task might have changed state or
-            // started a repair between the read and write lock acquisitions.
+            // Double-check all guards FIRST: another task might have changed state or started a
+            // repair between the read and write lock acquisitions. These re-checks must precede the
+            // attempts-cap promotion below — otherwise a concurrent racer that finds
+            // `repair_attempts == MAX` while another task's repair is legitimately in-flight
+            // (`Repairing`) would spuriously flip that in-flight torrent to `Failed`, which the
+            // state machine reserves for MAX *completed* failed attempts.
             if health.state == RepairState::Failed {
                 return Err("Torrent permanently failed".to_string());
             }
@@ -190,6 +246,14 @@ impl RepairManager {
                 if last_trigger.elapsed().as_secs() < REPAIR_COOLDOWN_SECS {
                     return Err("Repair rate limited".to_string());
                 }
+            }
+            if health.repair_attempts >= MAX_REPAIR_ATTEMPTS {
+                error!(
+                    "Torrent {} has failed repair {} times, marking as permanently FAILED",
+                    torrent_id, MAX_REPAIR_ATTEMPTS
+                );
+                health.state = RepairState::Failed;
+                return Err("Maximum repair attempts exceeded".to_string());
             }
             health.state = RepairState::Repairing;
             health.repair_attempts += 1;
@@ -370,6 +434,25 @@ impl RepairManager {
             attempt_num, torrent_id
         );
 
+        // Cancellation safety: `check_and_begin_repair` transitioned the torrent to `Repairing`.
+        // Because this future is awaited inside the WebDAV read path, a dropped connection would
+        // otherwise strand it `Repairing`/hidden with no way back. The guard resets a still
+        // `Repairing` torrent on drop; a normal completion disarms it (see `RepairInProgressGuard`).
+        let mut guard =
+            RepairInProgressGuard::armed(Arc::clone(&self.health_status), torrent_id.to_string());
+        let result = self.instant_repair_inner(locator, torrent_id).await;
+        guard.disarm();
+        result
+    }
+
+    /// The body of [`RepairManager::try_instant_repair`] after the `Repairing` transition, split out
+    /// so the outer method can wrap it in a cancellation-safety guard. Every exit path sets a
+    /// terminal health state, so the guard is a no-op unless this future is cancelled mid-await.
+    async fn instant_repair_inner(
+        &self,
+        locator: &crate::provider::FileLocator,
+        torrent_id: &str,
+    ) -> Result<crate::provider::FileLocator, String> {
         // Fetch old torrent info to know which files were selected (for re-selection).
         let old_info = match self.provider.get_torrent_info(torrent_id).await {
             Ok(info) => info,
@@ -805,6 +888,153 @@ mod tests {
         assert_eq!(new.file_path, "/Movie.mkv");
         assert_eq!(new.link.as_deref(), Some("https://rd/newlink"));
         assert_eq!(new.hash, "H");
+    }
+
+    /// R1 regression: `try_instant_repair` is awaited inside the WebDAV read future. If that future
+    /// is dropped mid-repair (the player/HTTP connection disconnects) after the torrent was moved to
+    /// `Repairing`, the cancellation-safety guard must reset it to `Healthy` — otherwise it stays
+    /// `Repairing`/hidden with nothing able to re-trigger repair, trapped until restart.
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_in_flight_repair_does_not_strand_torrent_hidden() {
+        use crate::provider::FileLocator;
+        use crate::rd_client::{AddMagnetResponse, TorrentFile, TorrentInfo};
+
+        // With the clock paused, `try_instant_repair`'s internal `sleep(500ms)` awaits never fire,
+        // so the future parks mid-repair with the torrent in `Repairing`.
+        let mock = crate::provider::MockProvider {
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid".to_string(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tid".to_string(),
+                hash: "H".to_string(),
+                status: "downloaded".to_string(),
+                files: vec![TorrentFile {
+                    id: 5,
+                    path: "/Movie.mkv".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                }],
+                links: vec![],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let manager = std::sync::Arc::new(RepairManager::new(std::sync::Arc::new(mock)));
+
+        let loc = FileLocator {
+            hash: "H".to_string(),
+            torrent_id: "tid".to_string(),
+            file_id: 5,
+            file_path: "/Movie.mkv".to_string(),
+            link: None,
+        };
+
+        let m = manager.clone();
+        let handle = tokio::spawn(async move { m.try_instant_repair(&loc).await });
+
+        // Let the task advance to its first internal await; by then it must have set `Repairing`.
+        let mut hidden = false;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            if manager.should_hide_torrent("tid").await {
+                hidden = true;
+                break;
+            }
+        }
+        assert!(
+            hidden,
+            "repair should have transitioned the torrent to Repairing (hidden)"
+        );
+
+        // Simulate the WebDAV reader disconnecting: drop the repair future mid-await.
+        handle.abort();
+
+        // The guard's detached reset must un-hide the torrent without a restart.
+        let mut recovered = false;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            if !manager.should_hide_torrent("tid").await {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "a cancelled repair must not leave the torrent stranded Repairing/hidden"
+        );
+    }
+
+    /// R2 regression: the write-side attempts-cap promotion must run AFTER the `Repairing` re-check,
+    /// so an at-cap torrent whose repair is legitimately in-flight is not spuriously flipped to
+    /// `Failed`.
+    #[tokio::test]
+    async fn at_cap_repairing_torrent_is_not_flipped_to_failed() {
+        let manager = make_test_manager();
+        {
+            let mut m = manager.health_status.write().await;
+            m.insert(
+                "tid".to_string(),
+                TorrentHealth {
+                    torrent_id: "tid".to_string(),
+                    state: RepairState::Repairing,
+                    repair_attempts: MAX_REPAIR_ATTEMPTS,
+                    last_repair_trigger: Some(std::time::Instant::now()),
+                },
+            );
+        }
+        let err = manager
+            .check_and_begin_repair("tid")
+            .await
+            .expect_err("a second repair must not begin while one is in-flight");
+        assert_eq!(err, "Repair already in progress");
+        let state = manager
+            .health_status
+            .read()
+            .await
+            .get("tid")
+            .unwrap()
+            .state
+            .clone();
+        assert_eq!(
+            state,
+            RepairState::Repairing,
+            "an in-flight Repairing torrent must not be promoted to Failed by the cap check"
+        );
+    }
+
+    /// The reordered write-side cap check still fires: an at-cap, non-in-flight, cooldown-expired
+    /// torrent is correctly promoted to `Failed`.
+    #[tokio::test]
+    async fn at_cap_healthy_torrent_is_marked_failed() {
+        let manager = make_test_manager();
+        {
+            let mut m = manager.health_status.write().await;
+            m.insert(
+                "tid".to_string(),
+                TorrentHealth {
+                    torrent_id: "tid".to_string(),
+                    state: RepairState::Healthy,
+                    repair_attempts: MAX_REPAIR_ATTEMPTS,
+                    last_repair_trigger: None,
+                },
+            );
+        }
+        let err = manager
+            .check_and_begin_repair("tid")
+            .await
+            .expect_err("an at-cap torrent must not begin another repair");
+        assert_eq!(err, "Maximum repair attempts exceeded");
+        let state = manager
+            .health_status
+            .read()
+            .await
+            .get("tid")
+            .unwrap()
+            .state
+            .clone();
+        assert_eq!(state, RepairState::Failed);
     }
 
     #[tokio::test]
