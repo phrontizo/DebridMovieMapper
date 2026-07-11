@@ -33,7 +33,7 @@ fn parse_content_range_start(v: &str) -> Option<u64> {
 #[derive(Clone)]
 pub struct DebridFileSystem {
     vfs: Arc<RwLock<DebridVfs>>,
-    rd_client: Arc<dyn DebridProvider>,
+    provider: Arc<dyn DebridProvider>,
     repair_manager: Arc<RepairManager>,
     http_client: reqwest::Client,
     read_activity: Arc<crate::read_activity::ReadActivity>,
@@ -44,7 +44,7 @@ pub struct DebridFileSystem {
 
 impl DebridFileSystem {
     pub fn new(
-        rd_client: Arc<dyn DebridProvider>,
+        provider: Arc<dyn DebridProvider>,
         vfs: Arc<RwLock<DebridVfs>>,
         repair_manager: Arc<RepairManager>,
         http_client: reqwest::Client,
@@ -52,7 +52,7 @@ impl DebridFileSystem {
     ) -> Self {
         Self {
             vfs,
-            rd_client,
+            provider,
             repair_manager,
             http_client,
             read_activity,
@@ -164,7 +164,7 @@ impl DavFileSystem for DebridFileSystem {
                     locator,
                     file_size,
                     repair_manager: self.repair_manager.clone(),
-                    rd_client: self.rd_client.clone(),
+                    provider: self.provider.clone(),
                     http_client: self.http_client.clone(),
                     pos: 0,
                     cdn_url: None,
@@ -301,7 +301,7 @@ struct ProxiedMediaFile {
     locator: crate::provider::FileLocator,
     file_size: u64,
     repair_manager: Arc<RepairManager>,
-    rd_client: Arc<dyn DebridProvider>,
+    provider: Arc<dyn DebridProvider>,
     http_client: reqwest::Client,
     pos: u64,
     cdn_url: Option<String>,
@@ -345,7 +345,7 @@ impl ProxiedMediaFile {
             return Ok(url.clone());
         }
 
-        match self.rd_client.resolve_url(&self.locator).await {
+        match self.provider.resolve_url(&self.locator).await {
             Ok(url) => {
                 // Never log the URL itself (it's an unrestricted, sensitive CDN link). `trace`, not
                 // `debug` — this fires on EVERY file open (the resolution itself is cached), so a
@@ -393,8 +393,8 @@ impl ProxiedMediaFile {
                 // repair budget via `note_read_success` (the old `confirmed_read` referred to the
                 // superseded torrent).
                 self.confirmed_read = false;
-                self.rd_client.invalidate(&old_locator).await;
-                match self.rd_client.resolve_url(&self.locator).await {
+                self.provider.invalidate(&old_locator).await;
+                match self.provider.resolve_url(&self.locator).await {
                     Ok(url) => {
                         self.cdn_url = Some(url.clone());
                         Ok(url)
@@ -603,7 +603,7 @@ impl ProxiedMediaFile {
                 // oversized body, or a range mismatch): drop the cached URL + resolution so the next
                 // attempt re-resolves a fresh one.
                 self.cdn_url = None;
-                self.rd_client.invalidate(&self.locator).await;
+                self.provider.invalidate(&self.locator).await;
                 if attempt == 0 {
                     continue;
                 }
@@ -651,7 +651,7 @@ impl ProxiedMediaFile {
                                 MAX_FETCH_SIZE
                             );
                             self.cdn_url = None;
-                            self.rd_client.invalidate(&self.locator).await;
+                            self.provider.invalidate(&self.locator).await;
                             return Err(FsError::GeneralFailure);
                         }
                     }
@@ -679,7 +679,7 @@ impl ProxiedMediaFile {
                     pos
                 );
                 self.cdn_url = None;
-                self.rd_client.invalidate(&self.locator).await;
+                self.provider.invalidate(&self.locator).await;
                 if attempt == 0 {
                     continue;
                 }
@@ -781,7 +781,7 @@ mod tests {
     #[allow(dead_code)]
     fn _assert_proxied_media_file_has_on_demand_fields(
         repair_manager: Arc<RepairManager>,
-        rd_client: Arc<dyn crate::provider::DebridProvider>,
+        provider: Arc<dyn crate::provider::DebridProvider>,
     ) {
         use crate::provider::FileLocator;
         let _ = ProxiedMediaFile {
@@ -791,7 +791,7 @@ mod tests {
             },
             file_size: 0,
             repair_manager,
-            rd_client,
+            provider,
             http_client: reqwest::Client::new(),
             pos: 0,
             cdn_url: None,
@@ -1105,7 +1105,7 @@ mod provider_abstraction_tests {
             locator: loc.clone(),
             file_size: 10,
             repair_manager: repair,
-            rd_client: provider,
+            provider,
             http_client: reqwest::Client::new(),
             pos: 0,
             cdn_url: None,
@@ -1155,7 +1155,7 @@ mod provider_abstraction_tests {
             locator: FileLocator::default(),
             file_size: 1000,
             repair_manager: repair,
-            rd_client: provider,
+            provider,
             http_client: reqwest::Client::new(),
             pos: 500, // a seek to a non-zero offset
             cdn_url: Some(url),
@@ -1213,7 +1213,7 @@ mod provider_abstraction_tests {
             locator: crate::provider::FileLocator::default(),
             file_size,
             repair_manager: repair,
-            rd_client: provider,
+            provider,
             http_client: reqwest::Client::new(),
             pos,
             cdn_url: Some(url),
@@ -1373,7 +1373,7 @@ mod provider_abstraction_tests {
             locator: crate::provider::FileLocator::default(),
             file_size,
             repair_manager: repair,
-            rd_client: provider,
+            provider,
             http_client: reqwest::Client::new(),
             pos,
             cdn_url: Some(url),
@@ -1590,7 +1590,7 @@ mod provider_abstraction_tests {
             locator: crate::provider::FileLocator::default(),
             file_size: 42,
             repair_manager: repair,
-            rd_client: provider,
+            provider,
             http_client: reqwest::Client::new(),
             pos: 0,
             cdn_url: None,
@@ -1627,7 +1627,7 @@ mod provider_abstraction_tests {
             },
             file_size: 10,
             repair_manager: Arc::new(RepairManager::new(provider.clone())),
-            rd_client: provider,
+            provider,
             http_client: reqwest::Client::new(),
             pos: 0,
             cdn_url: None,
@@ -1693,7 +1693,7 @@ mod provider_abstraction_tests {
             },
             file_size: 1000,
             repair_manager: repair,
-            rd_client: provider,
+            provider,
             http_client: reqwest::Client::new(),
             pos: 0,
             cdn_url: None,
@@ -1763,7 +1763,7 @@ mod provider_abstraction_tests {
             },
             file_size: 1000,
             repair_manager: repair,
-            rd_client: provider,
+            provider,
             http_client: reqwest::Client::new(),
             pos: 0,
             cdn_url: Some(url),
@@ -1802,7 +1802,7 @@ mod provider_abstraction_tests {
             locator: crate::provider::FileLocator::default(),
             file_size: 10_000,
             repair_manager: repair,
-            rd_client: provider,
+            provider,
             http_client: reqwest::Client::new(),
             pos: 104,
             cdn_url: None,
@@ -1853,7 +1853,7 @@ mod provider_abstraction_tests {
             },
             file_size: 10,
             repair_manager: repair,
-            rd_client: provider,
+            provider,
             http_client: reqwest::Client::new(),
             pos: 0,
             cdn_url: None,
