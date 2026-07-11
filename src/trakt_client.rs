@@ -227,7 +227,8 @@ impl TraktClientImpl {
                     // out. The URL is scrubbed (it can't carry the OAuth token, but stay consistent).
                     // Skipped for a non-idempotent request (the refresh grant) — see the doc above.
                     if retry_server_errors && attempt < MAX_ATTEMPTS {
-                        let backoff_ms = 200u64.saturating_mul(1u64 << (attempt - 1).min(5));
+                        let backoff_ms =
+                            200u64.saturating_mul(1u64 << (attempt - 1).min(MAX_ATTEMPTS - 1));
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                         continue;
                     }
@@ -256,7 +257,8 @@ impl TraktClientImpl {
             // upstream). Skipped for a non-idempotent request (the refresh grant).
             if status.is_server_error() {
                 if retry_server_errors && attempt < MAX_ATTEMPTS {
-                    let backoff_ms = 200u64.saturating_mul(1u64 << (attempt - 1).min(5));
+                    let backoff_ms =
+                        200u64.saturating_mul(1u64 << (attempt - 1).min(MAX_ATTEMPTS - 1));
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     continue;
                 }
