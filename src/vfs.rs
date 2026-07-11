@@ -19,6 +19,10 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// `.strm` placed under its first episode's season), so a single representative `(season, episode)`
 /// is exactly right.
 fn parse_se(name: &str) -> Option<(u32, u32)> {
+    // The `SxxExx` arm is deliberately NOT word-anchored (unlike `SEASON_RE`), kept byte-identical to
+    // `acquire::parse_se_all` so the VFS and the acquisition engine agree on which file supplies which
+    // episode. A literal `e` must immediately follow the digits, so a mid-token match is very unlikely
+    // in practice; the two must be changed together if this is ever tightened.
     static SE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})e(\d{1,3})").unwrap());
     if let Some(c) = SE.captures(name) {
         return Some((
@@ -198,6 +202,12 @@ pub struct MediaMetadata {
     pub external_id: Option<String>,
 }
 
+// NOTE: the unidentified-title grouping folds case with ASCII-only operations
+// (`eq_ignore_ascii_case` / `to_ascii_lowercase`), so two titles differing ONLY by non-ASCII case
+// (e.g. "Café" vs "CAFÉ") group — and thus folder — separately. This is self-consistent (`Hash` and
+// `Eq` fold identically, so there is no correctness/panic risk), only imperfect dedup for non-ASCII
+// titles; a full Unicode fold is avoided to not pull in a `unicode`-casing dependency. IDENTIFIED
+// titles are compared by `external_id` and are unaffected.
 impl PartialEq for MediaMetadata {
     fn eq(&self, other: &Self) -> bool {
         if self.media_type != other.media_type {
@@ -206,7 +216,7 @@ impl PartialEq for MediaMetadata {
         match (&self.external_id, &other.external_id) {
             // Same external ID → same media, regardless of title/year differences
             (Some(a), Some(b)) => a == b,
-            // Both unidentified → compare title case-insensitively + year
+            // Both unidentified → compare title case-insensitively + year (ASCII-only fold, see above)
             (None, None) => {
                 self.title.eq_ignore_ascii_case(&other.title) && self.year == other.year
             }
@@ -3803,6 +3813,52 @@ mod selection_tests {
         assert_eq!(
             locs[0].hash, "h_small",
             "selection overrides the largest-bytes default"
+        );
+    }
+
+    #[test]
+    fn movie_selection_falls_back_to_streamable_when_selection_is_archive_only() {
+        // The managed selection points at a torrent that yields NO streamable video (archive-only
+        // RAR). The movie must still appear — self-healing to the streamable copy elsewhere in the
+        // group — rather than vanishing because the selected hash has nothing to stream.
+        let archive = TorrentInfo {
+            id: "arch".into(),
+            hash: "h_arch".into(),
+            bytes: 9_000_000_000,
+            status: "downloaded".into(),
+            files: vec![TorrentFile {
+                id: 0,
+                path: "Movie.2023.2160p.rar".into(),
+                bytes: 9_000_000_000,
+                selected: 1,
+            }],
+            ..Default::default()
+        };
+        let streamable = movie_torrent("small", "h_video", 2_000_000_000);
+        let mut sel = SelectionMap::new();
+        sel.insert(
+            movie_slot(27205),
+            SelectionEntry {
+                hash: "h_arch".into(),
+                file_path: "Movie.2023.2160p.rar".into(),
+            },
+        );
+        let vfs = DebridVfs::build(
+            vec![
+                (archive, movie_meta(27205)),
+                (streamable, movie_meta(27205)),
+            ],
+            &sel,
+        );
+        let locs = movie_file_locators(&vfs);
+        assert_eq!(
+            locs.len(),
+            1,
+            "the movie must still appear, self-healed to the streamable copy"
+        );
+        assert_eq!(
+            locs[0].hash, "h_video",
+            "an archive-only selection must fall through to the streamable copy"
         );
     }
 
