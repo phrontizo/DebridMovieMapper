@@ -201,9 +201,23 @@ impl EnrolmentService {
         }
     }
 
-    /// Remove (unlink) one account's stored tokens.
+    /// Remove (unlink) one account's stored tokens AND its materialised `wanted` rows.
+    ///
+    /// Deleting only the tokens would orphan the account's `wanted` rows permanently: the sole
+    /// pruner of `wanted` (`tasks::sync_trakt_user`) only ever processes accounts that still have
+    /// tokens, so a removed slug's rows are never revisited. Left behind, they keep the reconciler
+    /// acquiring the title under the removed user's (now frozen) provenance and perpetually satisfy
+    /// `wants()`, so Trigger-B cleanup can never fire. Prune them here as part of the unlink.
     pub(crate) async fn remove_account(&self, slug: &str) -> Result<(), AppError> {
-        self.store.remove_trakt_tokens(slug.to_string()).await
+        self.store.remove_trakt_tokens(slug.to_string()).await?;
+        for rec in self.store.all_wanted().await {
+            if rec.user == slug {
+                self.store
+                    .remove_wanted(rec.user, rec.media_type, rec.tmdb_id)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -673,6 +687,53 @@ mod tests {
 
         assert!(store.get_trakt_tokens("alice".into()).await.is_none());
         assert!(store.get_trakt_tokens("bob".into()).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn remove_account_also_deletes_that_users_wanted_rows() {
+        // Removing an account must not leave its `wanted` rows behind: the only pruner of `wanted`
+        // (`sync_trakt_user`) iterates accounts that still have tokens, so an orphaned row would
+        // otherwise keep the title acquired forever (and block Trigger-B cleanup) — nobody would
+        // ever process the removed slug again.
+        use crate::store::{WantedRecord, WantedSources, WatchedState};
+        use crate::vfs::MediaType;
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
+            .await
+            .unwrap();
+        store
+            .put_trakt_tokens("bob".into(), tokens_fixture("BT", "Bob"))
+            .await
+            .unwrap();
+        let wanted = |user: &str, tmdb_id: u64| WantedRecord {
+            user: user.to_string(),
+            tmdb_id,
+            media_type: MediaType::Movie,
+            sources: WantedSources {
+                watchlist: true,
+                in_progress: false,
+            },
+            watched_state: WatchedState::Movie { watched: false },
+            show_status: None,
+            imdb_id: None,
+        };
+        store.put_wanted(wanted("alice", 11)).await.unwrap();
+        store.put_wanted(wanted("alice", 22)).await.unwrap();
+        store.put_wanted(wanted("bob", 33)).await.unwrap();
+        let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), store.clone());
+
+        svc.remove_account("alice").await.unwrap();
+
+        let remaining: Vec<_> = store.all_wanted().await;
+        assert!(
+            remaining.iter().all(|r| r.user != "alice"),
+            "alice's wanted rows must be deleted with her account, got {remaining:?}"
+        );
+        assert!(
+            remaining.iter().any(|r| r.user == "bob" && r.tmdb_id == 33),
+            "bob's wanted rows must be untouched"
+        );
     }
 
     #[tokio::test]
