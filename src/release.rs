@@ -161,9 +161,19 @@ fn detect_source(lower: &str) -> Source {
         || lower.contains("web.dl")
         || lower.contains("webrip")
         || lower.contains("web-rip")
+        // Streaming-provider source tags a release may carry INSTEAD of a literal `web` token (e.g.
+        // `...2160p.ATVP.DV.HDR.HEVC-FLUX`). Without these such a release falls to `Source::Other`
+        // (tier 0), ranking below same-resolution HDTV and blocking the HDTV→streaming upgrade. Only
+        // distinctive codes that can't occur as a substring of a common word are matched with a plain
+        // `contains` (`nf.web`/`amzn.web` etc. are already caught by WEB_RE / the web-dl/webrip checks).
         || lower.contains("amzn")
         || lower.contains("dsnp")
-        || lower.contains("nf.web")
+        || lower.contains("atvp")
+        || lower.contains("hmax")
+        || lower.contains("hulu")
+        || lower.contains("pcok")
+        || lower.contains("pmtp")
+        || lower.contains("itunes")
         || WEB_RE.is_match(lower)
     {
         Source::Web
@@ -1294,6 +1304,32 @@ mod tests {
         assert_eq!(parse(&dsnp).source, Source::Web, "DSNP → Web");
         let nf = raw("x", "Movie.2020.1080p.NF.WEB.H264-GRP", "c", None);
         assert_eq!(parse(&nf).source, Source::Web, "NF.WEB → Web");
+        // The subtle case the alias list exists for: a provider tag with NO literal `web` token.
+        // Without the alias these fall to Source::Other (below HDTV) and mis-rank.
+        let atvp = raw("x", "Movie.2021.2160p.ATVP.DV.HDR.HEVC-FLUX", "f", None);
+        assert_eq!(
+            parse(&atvp).source,
+            Source::Web,
+            "ATVP (no web token) → Web"
+        );
+        let hmax = raw("x", "Movie.2021.2160p.HMAX.DV.HDR.HEVC-GRP", "g", None);
+        assert_eq!(
+            parse(&hmax).source,
+            Source::Web,
+            "HMAX (no web token) → Web"
+        );
+        let hulu = raw("x", "Movie.2021.1080p.HULU.DDP5.1.H264-GRP", "h", None);
+        assert_eq!(
+            parse(&hulu).source,
+            Source::Web,
+            "HULU (no web token) → Web"
+        );
+        let itunes = raw("x", "Movie.2021.2160p.iTunes.DV.HEVC-GRP", "i", None);
+        assert_eq!(
+            parse(&itunes).source,
+            Source::Web,
+            "iTunes (no web token) → Web"
+        );
         let bdrip = raw("x", "Movie.2020.1080p.BDRip.x264-GRP", "d", None);
         assert_eq!(parse(&bdrip).source, Source::BluRay, "BDRip → BluRay");
         let brrip = raw("x", "Movie.2020.1080p.BRRip.x264-GRP", "e", None);
@@ -1346,18 +1382,21 @@ mod tests {
 
     #[test]
     fn parse_size_skips_a_non_numeric_run_and_takes_the_next_candidate() {
-        // `[\d.]+` can capture a non-numeric run like `1.2.3`; the size parse must skip it and use the
-        // next well-formed `<n> GB` token rather than silently dropping the size.
+        // `[\d.]+` can capture a non-numeric run like `1.2.3` that DOES form a full `SIZE_RE` match
+        // (`1.2.3 GB`) yet fails `parse::<f64>()`; the size parse must `find_map`-skip it and use the
+        // next well-formed `<n> GB` token rather than silently dropping the size. The bad run is a
+        // real match here (unit-suffixed), so this exercises the parse-fail-then-continue branch —
+        // a single-`captures()` implementation would return None and fail this test.
         let c = raw(
             "x",
-            "Movie.1.2.3.Edition\n\u{1f4be} 7.5 GB \u{1f464} 10",
+            "Bad 1.2.3 GB then\n\u{1f4be} 7.5 GB \u{1f464} 10",
             "a",
             None,
         );
         assert_eq!(
             parse(&c).size_bytes,
             Some((7.5 * 1_000_000_000.0) as u64),
-            "a malformed leading numeric run must not drop the real size"
+            "a malformed but unit-suffixed numeric run must be skipped, not drop the real size"
         );
     }
 
