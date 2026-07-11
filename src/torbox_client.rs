@@ -754,15 +754,26 @@ impl TorBoxClient {
         // via the Authorization header on this endpoint). The token must therefore
         // never reach a log: send_data/send_ok scrub the URL from any reqwest error,
         // and the error below is mapped to AppError::Unavailable without logging the URL.
-        let url = format!(
-            "{}/torrents/requestdl?token={}&torrent_id={}&file_id={}",
-            self.base, self.api_key, loc.torrent_id, loc.file_id
-        );
+        // Build the query with reqwest's encoder rather than a raw `format!` so the token and the
+        // string `torrent_id` are percent-encoded — a URL-reserved character in either can't corrupt
+        // the query (silently truncating the token → perpetual Unavailable/repair) — and the token is
+        // only ever assembled inside reqwest, still stripped from any error by send_data_n.
+        let url = format!("{}/torrents/requestdl", self.base);
+        let file_id = loc.file_id.to_string();
         // Bounded budget (3): this is the synchronous on-read resolve, so a wedged/black-holing
         // endpoint must fail over to instant repair fast rather than run the full 6-attempt loop
         // (mirrors the RD client's fast-fail `unrestrict_link` read path).
         match self
-            .send_data_n::<String, _>(|| self.client.get(&url), 3)
+            .send_data_n::<String, _>(
+                || {
+                    self.client.get(&url).query(&[
+                        ("token", self.api_key.as_str()),
+                        ("torrent_id", loc.torrent_id.as_str()),
+                        ("file_id", file_id.as_str()),
+                    ])
+                },
+                3,
+            )
             .await
         {
             Ok(cdn) => {
@@ -1357,6 +1368,62 @@ mod tests {
             .await
             .expect("a dup-400 must recover the existing torrent");
         assert_eq!(r.id, "7", "must reuse the already-present torrent's id");
+    }
+
+    #[tokio::test]
+    async fn resolve_locator_percent_encodes_token_and_torrent_id() {
+        // A token / string torrent_id containing URL-reserved characters must be percent-encoded in
+        // the requestdl query. A raw `format!` would let a `&`/`=`/`/` in the token corrupt the query
+        // (truncating the token → the endpoint 4xxs every read → perpetual Unavailable/repair);
+        // reqwest's `.query()` encoder prevents that. Capture the request line and assert encoding.
+        use crate::provider::FileLocator;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = r#"{"success":true,"data":"http://cdn.example/file.mkv"}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+            let _ = sock.flush().await;
+            let _ = tx.send(req);
+        });
+        let base = format!("http://{}", addr);
+        let client = TorBoxClient::with_base("x&y=z".to_string(), base);
+        let loc = FileLocator {
+            torrent_id: "1/2".to_string(),
+            file_id: 5,
+            ..Default::default()
+        };
+        let cdn = client.resolve_locator(&loc).await.expect("resolve ok");
+        assert_eq!(cdn, "http://cdn.example/file.mkv");
+        let req = rx.await.unwrap();
+        let request_line = req.lines().next().unwrap_or_default();
+        assert!(
+            request_line.contains("token=x%26y%3Dz"),
+            "token must be percent-encoded, got: {request_line}"
+        );
+        assert!(
+            request_line.contains("torrent_id=1%2F2"),
+            "string torrent_id must be percent-encoded, got: {request_line}"
+        );
+        assert!(
+            request_line.contains("file_id=5"),
+            "file_id must be present, got: {request_line}"
+        );
+        // The raw unescaped `&`/`=` must NOT appear inside the token value (it would break the query).
+        assert!(
+            !request_line.contains("token=x&y=z"),
+            "raw reserved chars must not leak into the query, got: {request_line}"
+        );
     }
 
     #[tokio::test]
