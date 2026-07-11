@@ -333,11 +333,26 @@ struct CachedUrl {
 pub struct TorBoxClient {
     client: reqwest::Client,
     api_key: String,
+    /// The API key as reqwest percent-encodes it in a query value (the `requestdl` URL carries
+    /// `?token=<key>`). Redacted alongside the raw key so a body echoing the ENCODED URL can't leak
+    /// it either. Equals `api_key` for a typical alnum/UUID key (encoding is then a no-op).
+    encoded_api_key: String,
     // API base URL. Always `TORBOX_BASE` in production; overridable only in tests (`with_base`) so
     // the HTTP methods can be pointed at a local mock server.
     base: String,
     rate_limiter: Arc<AdaptiveRateLimiter>,
     resolve_cache: Arc<RwLock<HashMap<(String, u32), CachedUrl>>>,
+}
+
+/// Percent-encode `v` exactly as reqwest encodes a query-parameter value (form-urlencoding), so the
+/// token's URL form can be redacted from logs. Uses the re-exported `url` crate — no new dependency.
+fn form_encode_query_value(v: &str) -> String {
+    let mut u = reqwest::Url::parse("http://x/").expect("static base URL parses");
+    u.query_pairs_mut().append_pair("t", v);
+    u.query()
+        .and_then(|q| q.strip_prefix("t="))
+        .unwrap_or("")
+        .to_string()
 }
 
 impl std::fmt::Debug for TorBoxClient {
@@ -362,9 +377,11 @@ impl TorBoxClient {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| AppError::Config(format!("Failed to build TorBox HTTP client: {}", e)))?;
+        let encoded_api_key = form_encode_query_value(&api_key);
         Ok(Self {
             client,
             api_key,
+            encoded_api_key,
             base: TORBOX_BASE.to_string(),
             rate_limiter: Arc::new(AdaptiveRateLimiter::new()),
             resolve_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -426,9 +443,15 @@ impl TorBoxClient {
     /// token-bearing `requestdl` URL (`?token=<key>`), so log the detail but never the secret.
     fn redact(&self, s: &str) -> String {
         if self.api_key.is_empty() {
-            s.to_string()
+            return s.to_string();
+        }
+        let out = s.replace(&self.api_key, "<token>");
+        // Also strip the query-encoded form, in case a body echoes the encoded `requestdl` URL. For a
+        // typical alnum/UUID key `encoded_api_key == api_key`, so this second pass is a no-op.
+        if self.encoded_api_key != self.api_key {
+            out.replace(&self.encoded_api_key, "<token>")
         } else {
-            s.replace(&self.api_key, "<token>")
+            out
         }
     }
 
@@ -549,8 +572,11 @@ impl TorBoxClient {
                     ),
                 },
                 Err(e) => {
+                    // The serde error carries only position/type (line/column), never body content or
+                    // the token, and the body itself is NOT logged (only its length) — so nothing here
+                    // needs redacting.
                     warn!(
-                        "TorBox decode failed: {} (body {} bytes, redacted)",
+                        "TorBox decode failed: {} (body {} bytes, not logged)",
                         e,
                         text.len()
                     );
@@ -649,8 +675,16 @@ impl TorBoxClient {
     }
 
     pub async fn torrent_info_raw(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
-        let url = format!("{}/torrents/mylist?id={}&bypass_cache=true", self.base, id);
-        let raw: TbTorrent = self.send_data(|| self.client.get(&url)).await?;
+        let url = format!("{}/torrents/mylist", self.base);
+        // Encode `id` via reqwest's `.query()` (like `resolve_locator`) rather than string-interpolating
+        // it into the query — a URL-reserved character in a caller-supplied id can't corrupt the query.
+        let raw: TbTorrent = self
+            .send_data(|| {
+                self.client
+                    .get(&url)
+                    .query(&[("id", id), ("bypass_cache", "true")])
+            })
+            .await?;
         Ok(to_torrent_info(&raw))
     }
 
@@ -842,6 +876,31 @@ impl crate::provider::DebridProvider for TorBoxClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_strips_both_raw_and_query_encoded_token() {
+        // A key containing URL-reserved chars travels percent-encoded in the `requestdl` query; both
+        // the raw form AND the encoded form must be scrubbed from a logged body.
+        let c = TorBoxClient::with_base("ab&cd=ef".into(), "http://x".into());
+        assert_eq!(c.encoded_api_key, "ab%26cd%3Def");
+        let s = "body ...?token=ab&cd=ef... and also ab%26cd%3Def in encoded form";
+        let r = c.redact(s);
+        assert!(!r.contains("ab&cd=ef"), "raw token must be redacted: {r}");
+        assert!(
+            !r.contains("ab%26cd%3Def"),
+            "encoded token must be redacted: {r}"
+        );
+        assert_eq!(r.matches("<token>").count(), 2);
+    }
+
+    #[test]
+    fn redact_is_a_noop_second_pass_for_a_plain_alnum_key() {
+        // For a typical UUID/alnum key the encoded form equals the raw form; redact still works and
+        // doesn't double-count.
+        let c = TorBoxClient::with_base("abc123def".into(), "http://x".into());
+        assert_eq!(c.encoded_api_key, "abc123def");
+        assert_eq!(c.redact("x=abc123def y"), "x=<token> y");
+    }
 
     #[tokio::test]
     async fn delete_torrent_raw_refuses_a_non_positive_or_malformed_id() {

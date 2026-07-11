@@ -196,6 +196,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_throttle_without_retry_after_doubles_interval_but_does_not_advance_next_allowed(
+    ) {
+        // A bare 429 (no Retry-After — Real-Debrid's case) must ONLY double the interval, never park
+        // `next_allowed` in the future. An accidental unconditional advance would add spurious latency
+        // to every subsequent request (incl. the on-read resolve path).
+        let limiter = AdaptiveRateLimiter::new();
+        let before = tokio::time::Instant::now();
+        limiter.record_throttle(None).await;
+        let state = limiter.state.lock().await;
+        assert_eq!(state.interval_ms, 200, "interval must double");
+        assert!(
+            state.next_allowed <= before,
+            "a bare 429 (no Retry-After) must NOT advance next_allowed"
+        );
+    }
+
+    #[tokio::test]
     async fn retry_after_is_capped_to_the_max() {
         // BEHAVIOUR (not a literal pin): a Retry-After far beyond the cap must clamp the wait to
         // MAX_RETRY_AFTER_SECS — a hostile/buggy header must never park the limiter for hours.

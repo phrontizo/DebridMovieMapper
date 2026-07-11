@@ -21,6 +21,25 @@ fn unrestrict_status_is_permanent(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN
 }
 
+/// Build `{base}/{prefix}/{seg}` with `seg` PERCENT-ENCODED as a single path segment, so a
+/// caller-supplied id can't corrupt or escape the path (consistent with how the query params are
+/// encoded). RD ids are alphanumeric, so this is a no-op in practice — a robustness/consistency
+/// guard. Falls back to plain interpolation if `base` somehow isn't a valid absolute URL.
+fn build_id_url(base: &str, prefix: &str, seg: &str) -> String {
+    match reqwest::Url::parse(&format!("{base}/{prefix}")) {
+        Ok(mut u) => {
+            match u.path_segments_mut() {
+                Ok(mut segs) => {
+                    segs.push(seg);
+                }
+                Err(_) => return format!("{base}/{prefix}/{seg}"),
+            }
+            u.to_string()
+        }
+        Err(_) => format!("{base}/{prefix}/{seg}"),
+    }
+}
+
 #[derive(Clone, Default, Deserialize)]
 pub struct Torrent {
     pub id: String,
@@ -386,7 +405,7 @@ impl RealDebridClient {
     }
 
     pub async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
-        let url = format!("{}/torrents/info/{}", self.base_url, id);
+        let url = build_id_url(&self.base_url, "torrents/info", id);
         self.fetch_with_retry(|| self.client.get(&url), &[reqwest::StatusCode::NOT_FOUND])
             .await
     }
@@ -474,7 +493,7 @@ impl RealDebridClient {
         torrent_id: &str,
         file_ids: &str,
     ) -> Result<(), reqwest::Error> {
-        let url = format!("{}/torrents/selectFiles/{}", self.base_url, torrent_id);
+        let url = build_id_url(&self.base_url, "torrents/selectFiles", torrent_id);
         // RD returns 204 No Content on success. We deserialize as
         // serde_json::Value which accepts the "[]" empty-body fallback
         // in fetch_with_retry.
@@ -487,7 +506,7 @@ impl RealDebridClient {
     /// Delete a torrent from Real-Debrid
     /// Returns Ok(()) even if torrent doesn't exist (404), as the end state is the same
     pub async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error> {
-        let url = format!("{}/torrents/delete/{}", self.base_url, torrent_id);
+        let url = build_id_url(&self.base_url, "torrents/delete", torrent_id);
         let result: Result<serde_json::Value, _> = self
             .fetch_with_retry(
                 || self.client.delete(&url),
@@ -1179,6 +1198,48 @@ mod tests {
             matches!(r, Err(crate::error::AppError::Unavailable)),
             "a transport failure on resolve must map to Unavailable, got {r:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_url_maps_a_none_link_to_unavailable() {
+        // A locator with no restricted `link` (e.g. a mirror/repair edge case) must resolve to
+        // Unavailable → instant repair, NOT an Http error or a panic. No network is touched.
+        use crate::provider::DebridProvider as _;
+        let client = RealDebridClient::new("fake".to_string()).unwrap();
+        let loc = crate::provider::FileLocator {
+            hash: "h".to_string(),
+            torrent_id: "t".to_string(),
+            file_id: 0,
+            file_path: "/x.mkv".to_string(),
+            link: None,
+        };
+        assert!(
+            matches!(
+                client.resolve_url(&loc).await,
+                Err(crate::error::AppError::Unavailable)
+            ),
+            "a None link must map to Unavailable"
+        );
+    }
+
+    #[test]
+    fn build_id_url_percent_encodes_the_id_segment() {
+        // A normal id is interpolated unchanged; a path-significant char is percent-encoded so it
+        // can't escape the path segment.
+        assert_eq!(
+            build_id_url(
+                "https://api.real-debrid.com/rest/1.0",
+                "torrents/info",
+                "ABC123"
+            ),
+            "https://api.real-debrid.com/rest/1.0/torrents/info/ABC123"
+        );
+        let evil = build_id_url(
+            "https://api.real-debrid.com/rest/1.0",
+            "torrents/delete",
+            "a/b?x",
+        );
+        assert!(evil.ends_with("/torrents/delete/a%2Fb%3Fx"), "got {evil}");
     }
 
     #[tokio::test]
