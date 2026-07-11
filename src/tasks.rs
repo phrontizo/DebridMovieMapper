@@ -658,11 +658,6 @@ pub(crate) fn build_wanted(
         .collect()
 }
 
-/// For every enrolled Trakt user, refresh near-expiry tokens, pull their Trakt reads + per-show
-/// TMDB status, and rewrite their `wanted` rows. A user whose sync fails is `warn!`ed and flagged
-/// for re-enrolment (`needs_reenrolment = true`); because `sync_trakt_user` performs all of its
-/// `wanted` writes only after every fetch has succeeded, a failure leaves that user's existing
-/// `wanted` rows untouched.
 /// The subset of caught-up, owned shows that are **Ended** (`ShowStatus::Ended`) — the finish-cleanup
 /// candidates. An unknown/absent status is treated conservatively as not-Ended (never finish-removed
 /// on a TMDB hiccup), as is any Returning/in-production show (it may still get more episodes). PURE.
@@ -692,6 +687,11 @@ fn shows_to_fold(
     fold
 }
 
+/// For every enrolled Trakt user, refresh near-expiry tokens, pull their Trakt reads + per-show
+/// TMDB status, and rewrite their `wanted` rows. A user whose sync fails is `warn!`ed and flagged
+/// for re-enrolment (`needs_reenrolment = true`); because `sync_trakt_user` performs all of its
+/// `wanted` writes only after every fetch has succeeded, a failure leaves that user's existing
+/// `wanted` rows untouched.
 pub async fn sync_trakt(
     trakt: &std::sync::Arc<dyn crate::trakt_client::TraktClient>,
     tmdb: &crate::tmdb_client::TmdbClient,
@@ -1107,27 +1107,6 @@ fn mirror_quality(
     Some(summary)
 }
 
-/// Record every identified, present provider torrent the engine doesn't already track as an
-/// **owned record** (the "account mirror"). This makes the reconciler aware of the user's
-/// pre-existing library so it never re-acquires a title that is already present (the duplicate fix)
-/// and so a season pack's episodes count as owned (kills `monitor_episodes` churn).
-///
-/// There is **no protected "manual" class**: a mirrored torrent is recorded with **empty
-/// provenance** (no `Manual` entry), so it is owned exactly like an engine-acquired title — eligible
-/// for the daily quality-upgrade / consolidation path — while still being kept (empty provenance +
-/// no Trakt wanter means neither removal trigger fires). The IMDB id is resolved from TMDB so the
-/// upgrade engine (IMDB-keyed) can actually re-scrape it; a per-title cache avoids repeat lookups in
-/// a pass. A resolution failure is non-fatal — the record is still written, but with an empty
-/// `imdb_id` it is then kept yet NOT upgrade/re-acquire-eligible (both need an IMDB id) until the
-/// hash is re-mirrored; TMDB lookup failures are rare/transient and playback still works via
-/// on-read repair, so this degrades gracefully rather than failing the mirror.
-///
-/// Idempotent and non-destructive: a hash the engine already owns (or a previously-recorded mirror
-/// hash) is left untouched, so an in-flight `Pending` acquisition or an engine record's
-/// provenance/quality/`provides` is never clobbered. `provides` for a show is the SE-parsed set of
-/// its selected video files (a movie's is empty); `quality` is derived from the representative
-/// (largest) video file via [`mirror_quality`] (or `None` when there is no video / it is above the
-/// resolution ceiling, in which case the upgrade path skips it conservatively).
 /// Owned-record hashes safe to reap because their torrent has left the provider: a `Verified`,
 /// EMPTY-provenance (account-mirror) record whose lowercased hash is absent from `present` (the
 /// current provider listing). The torrent is already gone, so reaping only drops a dangling
@@ -1183,6 +1162,27 @@ async fn reap_absent_mirror_owned(
     to_reap.len()
 }
 
+/// Record every identified, present provider torrent the engine doesn't already track as an
+/// **owned record** (the "account mirror"). This makes the reconciler aware of the user's
+/// pre-existing library so it never re-acquires a title that is already present (the duplicate fix)
+/// and so a season pack's episodes count as owned (kills `monitor_episodes` churn).
+///
+/// There is **no protected "manual" class**: a mirrored torrent is recorded with **empty
+/// provenance** (no `Manual` entry), so it is owned exactly like an engine-acquired title — eligible
+/// for the daily quality-upgrade / consolidation path — while still being kept (empty provenance +
+/// no Trakt wanter means neither removal trigger fires). The IMDB id is resolved from TMDB so the
+/// upgrade engine (IMDB-keyed) can actually re-scrape it; a per-title cache avoids repeat lookups in
+/// a pass. A resolution failure is non-fatal — the record is still written, but with an empty
+/// `imdb_id` it is then kept yet NOT upgrade/re-acquire-eligible (both need an IMDB id) until the
+/// hash is re-mirrored; TMDB lookup failures are rare/transient and playback still works via
+/// on-read repair, so this degrades gracefully rather than failing the mirror.
+///
+/// Idempotent and non-destructive: a hash the engine already owns (or a previously-recorded mirror
+/// hash) is left untouched, so an in-flight `Pending` acquisition or an engine record's
+/// provenance/quality/`provides` is never clobbered. `provides` for a show is the SE-parsed set of
+/// its selected video files (a movie's is empty); `quality` is derived from the representative
+/// (largest) video file via [`mirror_quality`] (or `None` when there is no video / it is above the
+/// resolution ceiling, in which case the upgrade path skips it conservatively).
 pub(crate) async fn record_mirror_owned(
     store: &Store,
     tmdb: &TmdbClient,
