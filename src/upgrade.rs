@@ -424,9 +424,13 @@ async fn try_upgrade_movie(
     //    against only the representative (lexicographically-first) copy could "upgrade" past the
     //    worse copy yet DELETE a better one — e.g. own {WEB 1080p, REMUX 1080p}, baseline off WEB,
     //    adopt a BluRay 1080p, prune the REMUX → a downgrade + loss. `best_owned_quality` returns
-    //    `None` (→ skip) if ANY owned copy's quality is unknown (a legacy/untagged mirror record, or
-    //    above the ceiling): comparing against a default (uncached/tier-0) would treat any cached
-    //    candidate as an upgrade and could delete a possibly-better unknown copy. Checked BEFORE the
+    //    `None` (→ skip) if ANY owned copy has `quality: None` — a legacy/untagged mirror record,
+    //    INCLUDING a mirror copy recorded above the ceiling (an over-ceiling file is never given a
+    //    quality snapshot). An over-ceiling ENGINE copy carries a KNOWN quality and is NOT skipped:
+    //    it is deliberately baselined via the ceiling-penalised `effective_score` (see the
+    //    corrective-downgrade path), so only a `quality: None` copy forces the skip. Comparing against
+    //    a default (uncached/tier-0) would treat any cached candidate as an upgrade and could delete a
+    //    possibly-better unknown copy. Checked BEFORE the
     //    scrape so unupgradeable titles don't waste a scrape every tick. (`owned_rec` is still used
     //    below for the request's imdb_id/metadata — only the quality BASELINE is widened here.)
     let Some(current) = best_owned_quality(app, owned_hashes).await else {
@@ -685,9 +689,13 @@ async fn stage_and_verify(
             return Err(UpgradeSkip::Deferred("probe deferred".into()));
         }
     }
-    // Record Verified with sticky provenance from the owned record we are upgrading.
+    // Record Verified with sticky provenance from the owned record we are upgrading. DEFER (don't
+    // return Ok) if either record write fails: the caller repoints the selection + prunes the
+    // superseded copy on Ok, so returning Ok with an unrecorded staged copy would prune against a
+    // replacement that has no owned record (stranding it as an empty-provenance mirror). The staged
+    // torrent is left for the account-mirror/dedup pass to reclaim; a later tick re-stages.
     let prov = base_req_provenance(app, MediaType::Movie, tmdb_id).await;
-    let _ = app
+    if app
         .store
         .put_owned(
             hash.clone(),
@@ -700,11 +708,23 @@ async fn stage_and_verify(
                 quality: Some(QualitySummary::of(cand, &app.config.acquisition.prefs)),
             },
         )
-        .await;
-    let _ = app
+        .await
+        .is_err()
+    {
+        return Err(UpgradeSkip::Deferred(
+            "staged owned-record write failed; deferring swap+prune".into(),
+        ));
+    }
+    if app
         .store
         .put_authoritative(hash.clone(), base_req.metadata.clone())
-        .await;
+        .await
+        .is_err()
+    {
+        return Err(UpgradeSkip::Deferred(
+            "staged authoritative write failed; deferring swap+prune".into(),
+        ));
+    }
     Ok((hash, added.id, selected_path))
 }
 
@@ -1734,7 +1754,12 @@ async fn consolidate_show_seasons(
             }
             // Record the pack owned+verified with full-season provides + sticky provenance.
             let provides: Vec<(u32, u32)> = eps.iter().map(|(s, e, _)| (*s, *e)).collect();
-            let _ = app
+            // Record the pack's owned + authoritative rows FIRST, and DEFER the repoint+prune if
+            // either write fails: pruning the scattered episodes against an unrecorded pack would
+            // strand the pack as an empty-provenance mirror (losing its sticky provenance) while the
+            // originals are gone. The pack torrent is already added, so a deferred tick re-runs the
+            // idempotent consolidation; nothing is lost.
+            if app
                 .store
                 .put_owned(
                     r.info_hash.clone(),
@@ -1751,11 +1776,23 @@ async fn consolidate_show_seasons(
                         quality: Some(QualitySummary::of(&r, &app.config.acquisition.prefs)),
                     },
                 )
-                .await;
-            let _ = app
+                .await
+                .is_err()
+            {
+                return Err(UpgradeSkip::Deferred(format!(
+                    "s{season} pack owned-record write failed; deferring repoint+prune"
+                )));
+            }
+            if app
                 .store
                 .put_authoritative(r.info_hash.clone(), sample.request.metadata.clone())
-                .await;
+                .await
+                .is_err()
+            {
+                return Err(UpgradeSkip::Deferred(format!(
+                    "s{season} pack authoritative write failed; deferring repoint+prune"
+                )));
+            }
             // Repoint every episode slot of this season to the pack. If any repoint fails to
             // persist, DEFER the prune below: deleting a scattered episode whose slot still points at
             // the old (about-to-be-deleted) hash would break that episode's playback. The pack is
