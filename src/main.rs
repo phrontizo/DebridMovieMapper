@@ -30,20 +30,24 @@ const MAX_CONNECTIONS: usize = 256;
 const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// TCP keepalive applied to every accepted connection. `HEADER_READ_TIMEOUT` only bounds the header
-/// phase, NOT response-body streaming — so a peer that dies uncleanly MID-STREAM (half-open TCP, no
-/// FIN/RST: network partition, killed container, yanked cable) would otherwise pin its
-/// `MAX_CONNECTIONS` permit until the OS retransmission timeout fires (many minutes), and enough such
-/// dead-mid-stream connections exhaust the pool. Keepalive makes the kernel probe an idle socket and
-/// tear down a dead peer in ~idle + probes×interval (~90s here) instead, reclaiming the permit —
-/// without affecting active streams (a live peer answers the probes / has traffic).
+/// phase, NOT response-body streaming — so a peer that dies uncleanly (half-open TCP, no FIN/RST:
+/// network partition, killed container, yanked cable) while its connection is IDLE (between range
+/// requests, or holding an idle keep-alive slot) would otherwise pin its `MAX_CONNECTIONS` permit
+/// until the OS retransmission timeout fires (many minutes), and enough such dead connections exhaust
+/// the pool. Keepalive makes the kernel probe the idle socket and tear the dead peer down in
+/// ~idle + probes×interval (~90s here) instead, reclaiming the permit. (A peer that dies WHILE we are
+/// actively writing body bytes is instead reclaimed by the retransmission timer — Linux only sends
+/// keepalive probes on a socket with no unacknowledged data in flight — but this proxy sits idle
+/// between its many small range requests, so keepalive covers the dominant case.) Active streams are
+/// unaffected: a live peer answers the probes / has traffic.
 const TCP_KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 const TCP_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
-/// Enable bounded TCP keepalive on an accepted stream so a mid-stream dead peer can't pin its
-/// connection permit until the OS retransmission timeout. Best-effort: a failure to set the option
-/// (unusual) is logged at debug and the connection proceeds without keepalive rather than being
-/// dropped.
+/// Enable bounded TCP keepalive on an accepted stream so a dead peer that goes idle (between requests
+/// or on a half-open keep-alive slot) can't pin its connection permit until the OS retransmission
+/// timeout. Best-effort: a failure to set the option (unusual) is logged at debug and the connection
+/// proceeds without keepalive rather than being dropped.
 fn set_tcp_keepalive(stream: &TcpStream) {
     let ka = socket2::TcpKeepalive::new()
         .with_time(TCP_KEEPALIVE_IDLE)
