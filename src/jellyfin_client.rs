@@ -7,6 +7,10 @@ use tracing::info;
 // sends, matching the "attempt N/10" log text.
 const MAX_SEND_ATTEMPTS: u32 = 10;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+/// Max number of changed paths rendered into the notify log line. On a first-run / large-delta scan
+/// the change set can be thousands of entries; the full count is always logged, but only a sample of
+/// the paths (the rest collapse to "… and N more") to keep the line from bloating the log.
+const LOG_SAMPLE_MAX: usize = 20;
 /// Delay before sending notification to let rclone's directory cache expire.
 /// Must be longer than rclone's --dir-cache-time (default 10s in compose.yml).
 const NOTIFICATION_DELAY: Duration = Duration::from_secs(15);
@@ -39,6 +43,23 @@ fn classify_status(status: reqwest::StatusCode) -> NotifyOutcome {
         NotifyOutcome::Retry
     } else {
         NotifyOutcome::GiveUp
+    }
+}
+
+/// Render a bounded sample of changed paths for the notify log line: up to `max` paths joined with
+/// ", ", plus a "… and N more" tail when the change set is larger. Keeps a large first-run delta
+/// from producing a multi-KB log line (the full count is logged separately).
+fn sample_change_paths(changes: &[VfsChange], max: usize) -> String {
+    let shown = changes
+        .iter()
+        .take(max)
+        .map(|c| c.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if changes.len() > max {
+        format!("{} … and {} more", shown, changes.len() - max)
+    } else {
+        shown
     }
 }
 
@@ -103,11 +124,7 @@ impl JellyfinClient {
             "Notifying Jellyfin of {} change(s) in {}s: {}",
             changes.len(),
             NOTIFICATION_DELAY.as_secs(),
-            changes
-                .iter()
-                .map(|c| c.path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            sample_change_paths(changes, LOG_SAMPLE_MAX)
         );
 
         // Wait for rclone's directory cache to expire so Jellyfin sees fresh data
@@ -251,6 +268,35 @@ mod tests {
             classify_status(StatusCode::UNAUTHORIZED),
             NotifyOutcome::GiveUp
         );
+    }
+
+    #[test]
+    fn sample_change_paths_truncates_large_change_sets() {
+        let mk = |n: usize| -> Vec<VfsChange> {
+            (0..n)
+                .map(|i| VfsChange {
+                    path: format!("Movies/Film {i}"),
+                    update_type: UpdateType::Created,
+                })
+                .collect()
+        };
+        // Under the cap: all paths, no tail.
+        let s = sample_change_paths(&mk(3), 20);
+        assert_eq!(s, "Movies/Film 0, Movies/Film 1, Movies/Film 2");
+        assert!(!s.contains("more"));
+        // Exactly at the cap: still no tail.
+        assert!(!sample_change_paths(&mk(20), 20).contains("more"));
+        // Over the cap: sample + "… and N more".
+        let big = sample_change_paths(&mk(1000), 20);
+        assert!(big.contains("Movies/Film 0"), "must show the first sample");
+        assert!(big.contains("Movies/Film 19"), "must show up to the cap");
+        assert!(!big.contains("Movies/Film 20"), "must not exceed the cap");
+        assert!(
+            big.ends_with("… and 980 more"),
+            "tail must count the remainder: {big}"
+        );
+        // Empty set → empty string.
+        assert_eq!(sample_change_paths(&[], 20), "");
     }
 
     #[test]
