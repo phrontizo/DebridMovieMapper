@@ -1360,6 +1360,36 @@ mod tests {
             .contains_key("test-link"));
     }
 
+    #[tokio::test]
+    async fn unrestrict_link_fetches_once_then_serves_from_cache() {
+        // End-to-end cache path: the first call hits the API and stores the result; a second call for
+        // the SAME link is served from cache without a second request. (The manually-seeded-cache
+        // tests never exercise the fetch → store → hit round-trip.)
+        use std::sync::atomic::Ordering;
+        let body =
+            r#"{"id":"x","link":"https://real-debrid.com/d/abc","download":"https://cdn/x"}"#;
+        let (url, count) = spawn_counting("HTTP/1.1 200 OK", body).await;
+        let client = RealDebridClient::new("fake".to_string())
+            .unwrap()
+            .with_base_url(url.trim_end_matches('/').to_string());
+        let r1 = client
+            .unrestrict_link("https://real-debrid.com/d/abc")
+            .await
+            .expect("first unrestrict must fetch");
+        assert_eq!(r1.download, "https://cdn/x");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let r2 = client
+            .unrestrict_link("https://real-debrid.com/d/abc")
+            .await
+            .expect("second unrestrict must be a cache hit");
+        assert_eq!(r2.download, "https://cdn/x");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the second call for the same link must be served from cache (no second request)"
+        );
+    }
+
     // --- Serde deserialization robustness ---
 
     #[test]
