@@ -1624,11 +1624,12 @@ pub(crate) fn plan_dedup(
                         keep.push(h.clone()); // unknown coverage → never remove on a guess
                         continue;
                     }
-                    // Never dedup-remove a Manual copy (invariant M-1, see the Movie branch).
-                    if r.provenance.has_manual_entry() {
-                        keep.push(h.clone());
-                        covered.extend(r.provides.iter().copied());
-                    } else if r.provides.iter().any(|e| !covered.contains(e)) {
+                    // Keep this hash if it either adds episode coverage OR is a Manual copy (invariant
+                    // M-1: a Manual copy is never dedup-removed, even when fully covered — see the
+                    // Movie branch); otherwise it is a redundant duplicate → remove.
+                    if r.provenance.has_manual_entry()
+                        || r.provides.iter().any(|e| !covered.contains(e))
+                    {
                         keep.push(h.clone());
                         covered.extend(r.provides.iter().copied());
                     } else {
