@@ -128,8 +128,9 @@ pub fn parse_rd_date(s: &str) -> SystemTime {
         let d: u64 = parts.next()?.parse().ok()?;
         let mut secs = days_from_ymd(y, m, d)? * 86400;
 
-        // Parse time if present: "HH:mm:ss" or "HH:mm:ss.sss"
-        if let Some(time_part) = s.split('T').nth(1) {
+        // Parse the time-of-day if present ("HH:mm:ss" / "HH:mm:ss.sss"), returning None only when
+        // the time itself is malformed/out-of-range.
+        fn time_of_day_secs(time_part: &str) -> Option<u64> {
             let time_str = time_part.trim_end_matches('Z');
             let mut time_parts = time_str.split(':');
             let h: u64 = time_parts.next()?.parse().ok()?;
@@ -139,7 +140,14 @@ pub fn parse_rd_date(s: &str) -> SystemTime {
             if h >= 24 || min >= 60 || sec >= 60 {
                 return None;
             }
-            secs += h * 3600 + min * 60 + sec;
+            Some(h * 3600 + min * 60 + sec)
+        }
+
+        // The DATE is already validated and converted above. If only the TIME is malformed, keep the
+        // good date (add zero, i.e. midnight) rather than discarding the whole timestamp and
+        // reporting a 1970 mtime — a 1970 mtime confuses media-server change detection.
+        if let Some(time_part) = s.split('T').nth(1) {
+            secs += time_of_day_secs(time_part).unwrap_or(0);
         }
 
         Some(UNIX_EPOCH + Duration::from_secs(secs))
@@ -2991,13 +2999,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_rd_date_invalid_time_components_fall_back() {
-        // Out-of-range hours/minutes/seconds should fall back to UNIX_EPOCH
-        assert_eq!(parse_rd_date("2023-01-01T25:00:00Z"), std::time::UNIX_EPOCH);
-        assert_eq!(parse_rd_date("2023-01-01T00:60:00Z"), std::time::UNIX_EPOCH);
-        assert_eq!(parse_rd_date("2023-01-01T00:00:60Z"), std::time::UNIX_EPOCH);
-        // Valid boundary values should work
+    fn parse_rd_date_invalid_time_components_keep_the_date() {
+        // A malformed/out-of-range TIME must keep the (already-validated) DATE at midnight rather
+        // than discarding the whole timestamp for a 1970 mtime (which confuses media-server change
+        // detection). 2023-01-01T00:00:00Z = 1672531200.
+        let midnight = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1672531200);
+        assert_eq!(parse_rd_date("2023-01-01T25:00:00Z"), midnight);
+        assert_eq!(parse_rd_date("2023-01-01T00:60:00Z"), midnight);
+        assert_eq!(parse_rd_date("2023-01-01T00:00:60Z"), midnight);
+        assert_eq!(parse_rd_date("2023-01-01Tgarbage"), midnight);
+        // A valid time still adds its seconds; a malformed DATE still falls back to UNIX_EPOCH.
+        assert_ne!(parse_rd_date("2023-01-01T23:59:59Z"), midnight);
         assert_ne!(parse_rd_date("2023-01-01T23:59:59Z"), std::time::UNIX_EPOCH);
+        assert_eq!(parse_rd_date("2023-13-01T10:00:00Z"), std::time::UNIX_EPOCH);
     }
 
     #[test]
