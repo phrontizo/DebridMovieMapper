@@ -319,7 +319,11 @@ pub const CACHED_BONUS: i64 = 1_000_000;
 /// (`height * 100`, so up to ~216k) — note this intentionally outweighs the source-tier band
 /// (1_000–8_000), since a candidate is only ever scored after the `MAX_RESOLUTION` hard-filter, so
 /// "higher resolution within the allowed ceiling" wins over a lower-resolution higher-tier release;
-/// then source tier, codec/HDR, container, bitrate, and seeders as progressively smaller terms.
+/// then source tier (1_000–8_000). The remaining preference bonuses are ADDITIVE and combine into
+/// the weighted sum rather than forming a strictly-descending tie-break chain: HEVC (+5_000), HDR
+/// (+3_000), verifiable container (+2_000), bitrate (up to +3_000), seeders (up to +2_000) — so,
+/// e.g., the HEVC bonus can outweigh a one-step source-tier difference, and bitrate can outweigh the
+/// container bonus. See the body for exact magnitudes and the `AUDIO_LANGUAGE`-mismatch penalty.
 pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
     // Quality floor: never acquire a cam / telesync / telecine / screener / R5 / workprint source.
     if r.source == Source::Cam {

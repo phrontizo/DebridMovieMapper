@@ -79,8 +79,9 @@ pub trait DebridProvider: Send + Sync + std::fmt::Debug {
     async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error>;
 
     /// Resolve a file to a streamable CDN URL. Returns `AppError::Unavailable` when the
-    /// file's bytes are not currently available (RD: any 5xx OR a transport-level failure on
-    /// unrestrict) so callers can trigger re-acquire/repair.
+    /// file's bytes are not currently available (RD: any 5xx, a transport-level failure, OR a
+    /// stale/expired-link 4xx such as 404 — all recoverable by a re-add-by-hash; only a permanent
+    /// auth 4xx like 401/403 stays a hard error) so callers can trigger re-acquire/repair.
     async fn resolve_url(&self, loc: &FileLocator) -> Result<String, crate::error::AppError>;
 
     /// Drop any cached resolution for `loc` (RD: the unrestrict-cache entry for its link).

@@ -329,12 +329,14 @@ impl RealDebridClient {
         let mut page = 1u32;
         loop {
             // Allow ONE page beyond the cap as an empty-terminator probe. An account holding EXACTLY
-            // MAX_PAGES*PAGE_LIMIT items has a FULL final page at MAX_PAGES, so `page` advances to MAX_PAGES+1
-            // with the listing actually complete — the completion is only proven by the next page
-            // coming back empty (the loop's natural break). Erroring at MAX_PAGES+1 rather than
-            // MAX_PAGES treats that exact-multiple boundary as complete instead of a false truncation
-            // (which would look like a shrunken library → re-acquire storm). A genuinely-truncated
-            // account has a FULL page at MAX_PAGES+1, advancing to MAX_PAGES+2 → error, as intended.
+            // MAX_PAGES*PAGE_LIMIT items has a FULL final page at MAX_PAGES, so `page` advances to
+            // MAX_PAGES+1 with the listing actually complete — completion is only proven by the next
+            // page coming back empty (the loop's natural break). So the probe page MAX_PAGES+1 is
+            // allowed to run; the error below fires only if THAT probe page is itself full, i.e. when
+            // `page` has advanced to MAX_PAGES+2 (the guard is `page > MAX_PAGES + 1`). This treats
+            // the exact-multiple boundary as complete instead of a false truncation (which would look
+            // like a shrunken library → re-acquire storm). A genuinely-truncated account has a FULL
+            // page at MAX_PAGES+1, advancing to MAX_PAGES+2 → error, as intended.
             if page > MAX_PAGES + 1 {
                 warn!(
                     "Reached maximum page limit ({}) with {} torrents; failing the whole listing \
