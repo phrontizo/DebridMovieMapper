@@ -66,6 +66,32 @@ struct TmdbResponse {
     pub results: Vec<TmdbSearchResult>,
 }
 
+/// The outcome of a TMDB search. `Results` (possibly empty) is a genuine answer — an empty vec is a
+/// real "no such title on TMDB". `Unavailable` means the request itself failed after the retry
+/// budget (a transport error or sustained 5xx — a TMDB outage), which is NOT the same as "no match":
+/// `identify_name` short-circuits its multi-stage fallback ladder on `Unavailable` so a single
+/// unidentifiable-during-outage torrent doesn't re-issue a full ~2.5-min retry cycle per stage
+/// (~10 min total). Without the distinction every stage sees "empty" and retries the whole outage.
+#[derive(Debug)]
+pub enum SearchOutcome {
+    Results(Vec<TmdbSearchResult>),
+    Unavailable,
+}
+
+impl SearchOutcome {
+    /// Extract the results, setting `*unavailable = true` when the search FAILED (so the caller can
+    /// stop issuing further doomed fallback searches). A failure yields an empty result set.
+    pub fn into_results(self, unavailable: &mut bool) -> Vec<TmdbSearchResult> {
+        match self {
+            SearchOutcome::Results(v) => v,
+            SearchOutcome::Unavailable => {
+                *unavailable = true;
+                Vec::new()
+            }
+        }
+    }
+}
+
 /// A well-formed IMDB id: `tt` followed by ≥1 ASCII digit (e.g. `tt0111161`). Guards `find_by_imdb`
 /// so a malformed/hostile value can't be interpolated into the request path (unlike the numeric
 /// `tmdb_id` paths, which can't carry a URL-reserved char).
@@ -98,7 +124,7 @@ impl TmdbClient {
         })
     }
 
-    pub async fn search_movie(&self, query: &str, year: Option<&str>) -> Vec<TmdbSearchResult> {
+    pub async fn search_movie(&self, query: &str, year: Option<&str>) -> SearchOutcome {
         let url = "https://api.themoviedb.org/3/search/movie";
         let mut params = vec![("api_key", self.api_key.as_str()), ("query", query)];
         let year_string;
@@ -109,7 +135,7 @@ impl TmdbClient {
         self.search(url, params).await
     }
 
-    pub async fn search_tv(&self, query: &str, year: Option<&str>) -> Vec<TmdbSearchResult> {
+    pub async fn search_tv(&self, query: &str, year: Option<&str>) -> SearchOutcome {
         let url = "https://api.themoviedb.org/3/search/tv";
         let mut params = vec![("api_key", self.api_key.as_str()), ("query", query)];
         let year_string;
@@ -120,15 +146,17 @@ impl TmdbClient {
         self.search(url, params).await
     }
 
-    async fn search(&self, url: &str, params: Vec<(&str, &str)>) -> Vec<TmdbSearchResult> {
+    async fn search(&self, url: &str, params: Vec<(&str, &str)>) -> SearchOutcome {
         match self
             .fetch_with_retry::<TmdbResponse>(|| self.client.get(url).query(&params))
             .await
         {
-            Ok(resp) => resp.results,
+            Ok(resp) => SearchOutcome::Results(resp.results),
             Err(e) => {
+                // A failed request is NOT "no match" — surface it as `Unavailable` so `identify_name`
+                // stops issuing further doomed fallback searches during a TMDB outage.
                 error!("TMDB search failed: {}", e.without_url());
-                Vec::new()
+                SearchOutcome::Unavailable
             }
         }
     }
@@ -548,6 +576,38 @@ mod tests {
         // 42 & 7 (fully valid) and 9 (null votes → Option::None) survive; the id-less row and the
         // negative-vote_count row (11) are dropped rather than failing the whole page.
         assert_eq!(ids, vec![42, 9, 7]);
+    }
+
+    #[test]
+    fn search_outcome_into_results_flags_only_unavailable() {
+        // A genuine (possibly empty) result set leaves the flag untouched — an empty vec is a real
+        // "no match", not an outage, so identification keeps trying its fallback stages.
+        let mut flag = false;
+        assert!(SearchOutcome::Results(Vec::new())
+            .into_results(&mut flag)
+            .is_empty());
+        assert!(!flag, "an empty result set is NOT unavailable");
+
+        let one = SearchOutcome::Results(vec![TmdbSearchResult {
+            id: 42,
+            title: "X".into(),
+            original_title: None,
+            release_date: None,
+            popularity: 0.0,
+            vote_average: None,
+            vote_count: None,
+        }]);
+        assert_eq!(one.into_results(&mut flag).len(), 1);
+        assert!(!flag);
+
+        // A failed request sets the flag (so `identify_name` short-circuits the rest of its ladder)
+        // and still yields an empty result set. Once set, a later Results must not clear it.
+        assert!(SearchOutcome::Unavailable
+            .into_results(&mut flag)
+            .is_empty());
+        assert!(flag, "a failed search must flag unavailable");
+        let _ = SearchOutcome::Results(Vec::new()).into_results(&mut flag);
+        assert!(flag, "the unavailable flag is sticky across later searches");
     }
 
     #[tokio::test]

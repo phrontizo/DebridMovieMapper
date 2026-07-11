@@ -424,14 +424,20 @@ pub async fn identify_name(
         return None;
     }
 
-    // Try TMDB first
-    let (mut tv_results, mut movie_results) = tokio::join!(
+    // Try TMDB first. Track whether the request itself FAILED (a TMDB outage) as distinct from a
+    // genuine empty result: each fallback stage below re-issues a full retry cycle (~2.5 min), so
+    // during an outage a single unidentifiable torrent could otherwise burn ~10 min of doomed
+    // retries. `tmdb_unavailable` short-circuits every remaining stage once any search has failed.
+    let mut tmdb_unavailable = false;
+    let (tv_out, movie_out) = tokio::join!(
         tmdb.search_tv(&cleaned_name, year.as_deref()),
         tmdb.search_movie(&cleaned_name, year.as_deref())
     );
+    let mut tv_results = tv_out.into_results(&mut tmdb_unavailable);
+    let mut movie_results = movie_out.into_results(&mut tmdb_unavailable);
 
     // If no results found, try CamelCase splitting as a fallback
-    if tv_results.is_empty() && movie_results.is_empty() {
+    if !tmdb_unavailable && tv_results.is_empty() && movie_results.is_empty() {
         let split_name = CAMEL_RE.replace_all(&cleaned_name, "$1 $2").to_string();
         if split_name != cleaned_name {
             debug!(
@@ -442,8 +448,8 @@ pub async fn identify_name(
                 tmdb.search_tv(&split_name, year.as_deref()),
                 tmdb.search_movie(&split_name, year.as_deref())
             );
-            tv_results.extend(tv_extra);
-            movie_results.extend(movie_extra);
+            tv_results.extend(tv_extra.into_results(&mut tmdb_unavailable));
+            movie_results.extend(movie_extra.into_results(&mut tmdb_unavailable));
         }
     }
 
@@ -451,7 +457,7 @@ pub async fn identify_name(
     // Goldfinger"). Cap the strip depth at the first few words: a real franchise/garbage prefix is
     // short, while deep strips of a long title both waste rate-limited TMDB calls (2 per attempt) and
     // risk matching an unrelated short title from the title's tail.
-    if tv_results.is_empty() && movie_results.is_empty() {
+    if !tmdb_unavailable && tv_results.is_empty() && movie_results.is_empty() {
         const MAX_STRIP_PREFIX_WORDS: usize = 3;
         let words: Vec<&str> = cleaned_name.split_whitespace().collect();
         let max_start = words.len().min(MAX_STRIP_PREFIX_WORDS + 1);
@@ -468,17 +474,22 @@ pub async fn identify_name(
                 tmdb.search_tv(&stripped, year.as_deref()),
                 tmdb.search_movie(&stripped, year.as_deref())
             );
+            let tv_extra = tv_extra.into_results(&mut tmdb_unavailable);
+            let movie_extra = movie_extra.into_results(&mut tmdb_unavailable);
             if !tv_extra.is_empty() || !movie_extra.is_empty() {
                 tv_results.extend(tv_extra);
                 movie_results.extend(movie_extra);
                 break;
+            }
+            if tmdb_unavailable {
+                break; // outage — further strips will just re-fail
             }
         }
     }
 
     // If still no results and name contains a dash, try the part after the first dash
     // (handles release group prefixes like "d3us-Title" or "m-Title")
-    if tv_results.is_empty() && movie_results.is_empty() {
+    if !tmdb_unavailable && tv_results.is_empty() && movie_results.is_empty() {
         if let Some(pos) = cleaned_name.find('-') {
             let after_dash = cleaned_name[pos + 1..].trim();
             if !after_dash.is_empty() && !is_generic_title(after_dash) {
@@ -490,8 +501,8 @@ pub async fn identify_name(
                     tmdb.search_tv(after_dash, year.as_deref()),
                     tmdb.search_movie(after_dash, year.as_deref())
                 );
-                tv_results.extend(tv_extra);
-                movie_results.extend(movie_extra);
+                tv_results.extend(tv_extra.into_results(&mut tmdb_unavailable));
+                movie_results.extend(movie_extra.into_results(&mut tmdb_unavailable));
             }
         }
     }
@@ -511,13 +522,13 @@ pub async fn identify_name(
     let movie_has_exact = has_exact_match(&movie_results);
 
     // If we have a year but no exact title match yet, try searching without the year
-    if !tv_has_exact && !movie_has_exact && year.is_some() {
+    if !tmdb_unavailable && !tv_has_exact && !movie_has_exact && year.is_some() {
         let (tv_no_year, movie_no_year) = tokio::join!(
             tmdb.search_tv(&cleaned_name, None),
             tmdb.search_movie(&cleaned_name, None)
         );
-        tv_results.extend(tv_no_year);
-        movie_results.extend(movie_no_year);
+        tv_results.extend(tv_no_year.into_results(&mut tmdb_unavailable));
+        movie_results.extend(movie_no_year.into_results(&mut tmdb_unavailable));
     }
 
     // Score all results and pick the best TV and movie matches.
