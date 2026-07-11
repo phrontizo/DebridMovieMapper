@@ -15,7 +15,7 @@ use hyper::Request;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, Semaphore};
 use tracing::info;
 
@@ -28,6 +28,31 @@ const MAX_CONNECTIONS: usize = 256;
 /// only bounds the HEADER phase, never response-body streaming, so long media streams are unaffected;
 /// a client whose idle keep-alive is closed simply reconnects on its next request.
 const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// TCP keepalive applied to every accepted connection. `HEADER_READ_TIMEOUT` only bounds the header
+/// phase, NOT response-body streaming — so a peer that dies uncleanly MID-STREAM (half-open TCP, no
+/// FIN/RST: network partition, killed container, yanked cable) would otherwise pin its
+/// `MAX_CONNECTIONS` permit until the OS retransmission timeout fires (many minutes), and enough such
+/// dead-mid-stream connections exhaust the pool. Keepalive makes the kernel probe an idle socket and
+/// tear down a dead peer in ~idle + probes×interval (~90s here) instead, reclaiming the permit —
+/// without affecting active streams (a live peer answers the probes / has traffic).
+const TCP_KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+const TCP_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// Enable bounded TCP keepalive on an accepted stream so a mid-stream dead peer can't pin its
+/// connection permit until the OS retransmission timeout. Best-effort: a failure to set the option
+/// (unusual) is logged at debug and the connection proceeds without keepalive rather than being
+/// dropped.
+fn set_tcp_keepalive(stream: &TcpStream) {
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES);
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&ka) {
+        tracing::debug!("failed to set TCP keepalive on accepted connection: {e}");
+    }
+}
 
 /// The log-filter directive: `RUST_LOG` when set to something non-empty, else `info` (the prior
 /// default, so logging is unchanged when the var is unset). Parsing/validation of the directive is
@@ -350,7 +375,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             result = listener.accept() => {
                 let (stream, _addr) = match result {
-                    Ok(pair) => pair,
+                    Ok(pair) => {
+                        // Bound how long a mid-stream dead peer can pin its permit (see
+                        // set_tcp_keepalive) — applied before the permit is acquired so it also
+                        // covers a connection that then races into the 503-reject path.
+                        set_tcp_keepalive(&pair.0);
+                        pair
+                    }
                     Err(e) => {
                         // A transient accept() error — fd exhaustion (EMFILE/ENFILE), a peer
                         // that aborted before we accepted (ECONNABORTED), or EINTR — must NOT
@@ -512,7 +543,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         dbg_is_ignorable_disconnect, healthcheck, http1_builder, is_trakt_path, log_directive,
+        set_tcp_keepalive,
     };
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn set_tcp_keepalive_enables_keepalive_on_accepted_socket() {
+        // The accept-loop applies keepalive so a mid-stream dead peer can't pin its permit until the
+        // OS retransmission timeout. Verify SO_KEEPALIVE is actually enabled on the accepted socket.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        set_tcp_keepalive(&server);
+        assert!(
+            socket2::SockRef::from(&server).keepalive().unwrap(),
+            "SO_KEEPALIVE must be enabled on the accepted connection"
+        );
+        drop(client);
+    }
 
     #[test]
     fn is_trakt_path_matches_enrolment_routes_only() {

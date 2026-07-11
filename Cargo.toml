@@ -26,6 +26,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 bytes = "1"
+# TCP keepalive on accepted connections (main.rs): a mid-stream dead peer (half-open TCP, no
+# FIN/RST) otherwise pins its MAX_CONNECTIONS permit until the OS retransmission timeout (minutes).
+# Already in the tree transitively via tokio/hyper-util; declared explicitly for direct use.
+socket2 = "0.6"
 dotenvy = "0.15"
 rand = "0.9"
 redb = "3.1"

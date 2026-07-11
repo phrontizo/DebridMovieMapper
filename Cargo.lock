@@ -180,6 +180,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "socket2",
  "thiserror",
  "tokio",
  "tracing",
