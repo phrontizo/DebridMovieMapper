@@ -634,8 +634,17 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
 /// authoritative "there is an aired episode to watch" signal — non-null ⇒ behind, explicit null ⇒
 /// caught up); if the field is absent (malformed body) it falls back to `completed < aired`.
 pub fn parse_show_progress(v: &serde_json::Value) -> ShowProgress {
-    let aired = v.get("aired").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-    let completed = v.get("completed").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    // Clamp rather than truncate (`as u32` on a pathological >u32::MAX value wraps, which could
+    // invert the `completed < aired` fallback below) — matching `parse_watched_shows`' defensive
+    // `u32::try_from`. Real episode counts are tiny, so the clamp never triggers in practice.
+    let field = |name: &str| -> u32 {
+        v.get(name)
+            .and_then(|x| x.as_u64())
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+            .unwrap_or(0)
+    };
+    let aired = field("aired");
+    let completed = field("completed");
     let behind = match v.get("next_episode") {
         Some(ne) if !ne.is_null() => true, // an aired episode awaits → behind
         Some(_) => false,                  // explicit null → caught up

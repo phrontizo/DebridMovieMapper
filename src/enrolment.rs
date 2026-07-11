@@ -251,16 +251,40 @@ pub async fn poll_to_completion(
         };
         match poll {
             DeviceTokenPoll::Authorized(tok) => {
-                let user = trakt.me(&tok.access_token).await?;
-                let tokens = TraktTokens {
-                    access: tok.access_token,
-                    refresh: tok.refresh_token,
-                    expires_at: token_expires_at(tok.created_at, tok.expires_in),
-                    username: user.username,
-                    needs_reenrolment: false,
-                };
-                store.put_trakt_tokens(user.slug.clone(), tokens).await?;
-                return Ok(user.slug);
+                // The grant succeeded and Trakt has issued (and rotated to) this token pair. Do NOT
+                // throw it away if the immediately-following `me()` (slug lookup) blips — that would
+                // force the operator to redo the whole device-flow approval for a transient hiccup.
+                // Retry `me()` a few times on the poll cadence before giving up.
+                const MAX_ME_ATTEMPTS: u32 = 3;
+                let mut last_err: Option<AppError> = None;
+                for attempt in 1..=MAX_ME_ATTEMPTS {
+                    match trakt.me(&tok.access_token).await {
+                        Ok(user) => {
+                            let tokens = TraktTokens {
+                                access: tok.access_token,
+                                refresh: tok.refresh_token,
+                                expires_at: token_expires_at(tok.created_at, tok.expires_in),
+                                username: user.username,
+                                needs_reenrolment: false,
+                            };
+                            store.put_trakt_tokens(user.slug.clone(), tokens).await?;
+                            return Ok(user.slug);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Trakt me() after authorisation failed (attempt {}/{}): {}",
+                                attempt, MAX_ME_ATTEMPTS, e
+                            );
+                            last_err = Some(e);
+                            if attempt < MAX_ME_ATTEMPTS {
+                                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                            }
+                        }
+                    }
+                }
+                return Err(last_err.unwrap_or_else(|| {
+                    AppError::Config("Trakt me() failed after authorisation".to_string())
+                }));
             }
             DeviceTokenPoll::Pending => {
                 if elapsed >= expires_in_secs {
