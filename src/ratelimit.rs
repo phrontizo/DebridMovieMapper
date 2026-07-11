@@ -105,8 +105,15 @@ impl AdaptiveRateLimiter {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        let wait_secs = (reset_epoch_secs - now_unix).min(MAX_RETRY_AFTER_SECS as f64);
-        if wait_secs > 0.0 {
+        let wait_secs = reset_epoch_secs - now_unix;
+        // A legitimate TorBox reset lands within the current window (seconds, at most ~a minute), so
+        // a delta beyond MAX_RETRY_AFTER_SECS is not a long-but-real wait — it's a bad reading: a
+        // reset sent in MILLISECONDS instead of seconds (e.g. 1.78e12), or a clock set before the
+        // UNIX epoch making `now_unix` 0 (so `reset - 0 ≈ 1.78e9`). Clamping such a value to the cap
+        // (the old `.min(MAX_RETRY_AFTER_SECS)`) would park the SHARED limiter for the full 5 minutes
+        // off one garbage header — the same availability cliff the non-finite guard above avoids — so
+        // ignore an out-of-range delta entirely (the reactive 429 path still protects us).
+        if wait_secs > 0.0 && wait_secs <= MAX_RETRY_AFTER_SECS as f64 {
             let mut state = self.state.lock().await;
             let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(wait_secs);
             if deadline > state.next_allowed {
@@ -259,6 +266,51 @@ mod tests {
         assert_eq!(
             state.next_allowed, before,
             "a non-finite reset must not delay the next request"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_rate_limit_ignores_an_implausibly_large_delta() {
+        // A finite-but-wrong-magnitude reset — a value sent in MILLISECONDS instead of seconds, or a
+        // pre-epoch clock making `now_unix` 0 — yields a delta far beyond the cap. It must be ignored
+        // (not clamped to the 300s cap, which would park all shared provider traffic for 5 minutes).
+        let limiter = AdaptiveRateLimiter::new();
+        let before = { limiter.state.lock().await.next_allowed };
+        // `reset` in milliseconds (~1.78e12) rather than seconds → delta ≈ 1.78e12.
+        limiter.observe_rate_limit(0, 1_780_000_000_000.0).await;
+        // A pre-epoch clock degrades `now_unix` to 0, so `reset - 0` is a whole epoch of seconds.
+        limiter.observe_rate_limit(0, now_unix_secs()).await;
+        let state = limiter.state.lock().await;
+        assert_eq!(
+            state.next_allowed, before,
+            "an out-of-range reset delta must not park the shared limiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_rate_limit_parks_at_the_low_remaining_boundary() {
+        // The pause fires for `remaining <= LOW_REMAINING` and is a no-op above it. Pin the exact
+        // boundary so an off-by-one in `remaining > LOW_REMAINING` is caught: LOW_REMAINING parks,
+        // LOW_REMAINING + 1 does not.
+        let at_boundary = AdaptiveRateLimiter::new();
+        let before = { at_boundary.state.lock().await.next_allowed };
+        at_boundary
+            .observe_rate_limit(LOW_REMAINING, now_unix_secs() + 10.0)
+            .await;
+        assert!(
+            at_boundary.state.lock().await.next_allowed > before,
+            "remaining == LOW_REMAINING must park"
+        );
+
+        let just_above = AdaptiveRateLimiter::new();
+        let before = { just_above.state.lock().await.next_allowed };
+        just_above
+            .observe_rate_limit(LOW_REMAINING + 1, now_unix_secs() + 10.0)
+            .await;
+        assert_eq!(
+            just_above.state.lock().await.next_allowed,
+            before,
+            "remaining == LOW_REMAINING + 1 must NOT park"
         );
     }
 
