@@ -610,9 +610,16 @@ mod tests {
             {"id": 2, "popularity": 12.5}
         ]}"#;
         let resp: super::TmdbResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.results.len(), 2, "no result lost to a null/missing field");
+        assert_eq!(
+            resp.results.len(),
+            2,
+            "no result lost to a null/missing field"
+        );
         assert_eq!(resp.results[0].popularity, 0.0, "null popularity → default");
-        assert_eq!(resp.results[1].title, "", "missing title → empty (ignored), not a decode error");
+        assert_eq!(
+            resp.results[1].title, "",
+            "missing title → empty (ignored), not a decode error"
+        );
     }
 
     #[test]

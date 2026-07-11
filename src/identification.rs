@@ -696,10 +696,10 @@ pub fn is_show_guess(files: &[rd_client::TorrentFile]) -> bool {
 
 pub fn normalize_title(s: &str) -> String {
     let lowered = s.to_lowercase().replace(" and ", " & "); // Standardize 'and' to '&' for comparison
-    // Fold accents/ligatures to their ASCII base, then keep only alphanumerics (spaces/punctuation/
-    // the '&' connector are dropped). A manual push loop (rather than `.map().filter()`) so a single
-    // source char can expand to MULTIPLE ASCII chars — `æ`→`ae`, `œ`→`oe`, `ß`→`ss`, `þ`→`th` — which
-    // a 1:1 `char` map cannot express (e.g. `Æon Flux` → `aeonflux` now matches a filename's `aeonflux`).
+                                                            // Fold accents/ligatures to their ASCII base, then keep only alphanumerics (spaces/punctuation/
+                                                            // the '&' connector are dropped). A manual push loop (rather than `.map().filter()`) so a single
+                                                            // source char can expand to MULTIPLE ASCII chars — `æ`→`ae`, `œ`→`oe`, `ß`→`ss`, `þ`→`th` — which
+                                                            // a 1:1 `char` map cannot express (e.g. `Æon Flux` → `aeonflux` now matches a filename's `aeonflux`).
     let mut out = String::with_capacity(lowered.len());
     for c in lowered.chars() {
         match c {

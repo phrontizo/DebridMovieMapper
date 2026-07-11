@@ -703,7 +703,9 @@ impl Store {
             Err(e) => {
                 // A serialise failure writes nothing → Err, not a phantom Ok (see `flatten_join`).
                 error!("Failed to serialise OwnedRecord for {}: {}", hash, e);
-                return Err(AppError::Task(format!("serialise OwnedRecord for {hash}: {e}")));
+                return Err(AppError::Task(format!(
+                    "serialise OwnedRecord for {hash}: {e}"
+                )));
             }
         };
         let db = self.db.clone();
@@ -736,7 +738,9 @@ impl Store {
                 // Return Err rather than Ok(false): `false` means "already present → left intact" to
                 // the caller, which is semantically WRONG for "serialise failed, nothing happened".
                 error!("Failed to serialise OwnedRecord for {}: {}", hash, e);
-                return Err(AppError::Task(format!("serialise OwnedRecord for {hash}: {e}")));
+                return Err(AppError::Task(format!(
+                    "serialise OwnedRecord for {hash}: {e}"
+                )));
             }
         };
         let db = self.db.clone();
@@ -945,7 +949,9 @@ impl Store {
             Err(e) => {
                 // Nothing written on a serialise failure → Err, not a phantom Ok (see `flatten_join`).
                 error!("Failed to serialise blacklist entry {}: {}", key, e);
-                return Err(AppError::Task(format!("serialise blacklist entry {key}: {e}")));
+                return Err(AppError::Task(format!(
+                    "serialise blacklist entry {key}: {e}"
+                )));
             }
         };
         let db = self.db.clone();
@@ -1119,7 +1125,9 @@ impl Store {
             Err(e) => {
                 // Nothing written on a serialise failure → Err, not a phantom Ok (see `flatten_join`).
                 error!("Failed to serialise TraktTokens for {}: {}", slug, e);
-                return Err(AppError::Task(format!("serialise TraktTokens for {slug}: {e}")));
+                return Err(AppError::Task(format!(
+                    "serialise TraktTokens for {slug}: {e}"
+                )));
             }
         };
         let db = self.db.clone();
@@ -1318,7 +1326,9 @@ impl Store {
             Err(e) => {
                 // Nothing written on a serialise failure → Err, not a phantom Ok (see `flatten_join`).
                 error!("Failed to serialise SelectionEntry for {}: {}", slot, e);
-                return Err(AppError::Task(format!("serialise SelectionEntry for {slot}: {e}")));
+                return Err(AppError::Task(format!(
+                    "serialise SelectionEntry for {slot}: {e}"
+                )));
             }
         };
         // Serialise before opening the transaction to avoid partial writes on serde failure.

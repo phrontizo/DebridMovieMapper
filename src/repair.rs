@@ -1258,8 +1258,14 @@ mod tests {
             manager.note_read_success("t").await;
             let hm = manager.health_status.read().await;
             let h = hm.get("t").expect("entry present");
-            assert_eq!(h.state, state, "a {state:?} torrent must not be resurrected");
-            assert_eq!(h.repair_attempts, 2, "budget untouched on a non-Healthy state");
+            assert_eq!(
+                h.state, state,
+                "a {state:?} torrent must not be resurrected"
+            );
+            assert_eq!(
+                h.repair_attempts, 2,
+                "budget untouched on a non-Healthy state"
+            );
         }
     }
 

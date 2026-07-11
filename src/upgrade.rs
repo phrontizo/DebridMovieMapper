@@ -1406,9 +1406,7 @@ async fn current_show_hashes(app: &AppState, tmdb_id: u64) -> Vec<String> {
         .all_owned()
         .await
         .into_iter()
-        .filter(|(_, rec)| {
-            rec.request.tmdb_id == tmdb_id && rec.request.kind == MediaKind::Series
-        })
+        .filter(|(_, rec)| rec.request.tmdb_id == tmdb_id && rec.request.kind == MediaKind::Series)
         .map(|(hash, _)| hash.to_ascii_lowercase())
         .collect()
 }

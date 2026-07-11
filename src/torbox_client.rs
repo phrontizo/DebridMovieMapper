@@ -1118,7 +1118,10 @@ mod tests {
         let v: TbCreate = serde_json::from_str(r#"{"torrent_id": null, "hash": null}"#).unwrap();
         assert_eq!(v.torrent_id, 0);
         let v: TbCreate = serde_json::from_str(r#"{"torrent_id": "99"}"#).unwrap();
-        assert_eq!(v.torrent_id, 0, "a stringized id defaults rather than erroring");
+        assert_eq!(
+            v.torrent_id, 0,
+            "a stringized id defaults rather than erroring"
+        );
         let v: TbCreate = serde_json::from_str(r#"{"torrent_id": 42, "hash": "abc"}"#).unwrap();
         assert_eq!(v.torrent_id, 42);
     }
