@@ -513,6 +513,18 @@ async fn try_upgrade_movie(
     // The movie baseline spans all owned copies (the swap prunes them all), so the first hash is a
     // stable stand-in for the downgrade preview log.
     let old_hash = owned_hashes.first().map(String::as_str).unwrap_or("");
+    // Merge the title's sticky provenance ONCE from records fetched by hash (a small point-lookup
+    // set), instead of re-scanning the entire owned table via group_owned_by_tmdb inside
+    // stage_and_verify — mirrors the show path (upgrade_show_episodes_and_packs). `owned_hashes` IS
+    // the movie's full group (the swap prunes them all), so the merge equals the old group
+    // provenance; an empty set (every copy raced away) merges to EMPTY — the same non-manual fallback.
+    let mut group_owned: Vec<(String, OwnedRecord)> = Vec::new();
+    for h in owned_hashes {
+        if let Some(r) = app.store.get_owned(h.clone()).await {
+            group_owned.push((h.clone(), r));
+        }
+    }
+    let group_prov = merged_provenance(&group_owned);
     // Try ranked candidates best-first until one is adopted (in-tick fall-through), mirroring the
     // pack-correction/consolidation loops.
     for (cand, imp) in ranked {
@@ -527,7 +539,7 @@ async fn try_upgrade_movie(
                 "library active; deferring upgrade".into(),
             ));
         }
-        match stage_and_verify(app, tmdb_id, &req, &cand).await {
+        match stage_and_verify(app, tmdb_id, &req, &cand, &group_prov).await {
             Ok(staged) => {
                 // Prune the superseded copies — but NOT an over-ceiling copy unless corrective
                 // downgrade is enabled (`supersede_hashes`), so a within-ceiling upgrade never
@@ -594,6 +606,7 @@ async fn stage_and_verify(
     tmdb_id: u64,
     base_req: &crate::store::AcquireRequest,
     cand: &release::ReleaseInfo,
+    prov: &crate::store::Provenance,
 ) -> Result<(String, String, String), UpgradeSkip> {
     let hash = cand.info_hash.clone();
     let magnet = format!("magnet:?xt=urn:btih:{}", hash);
@@ -710,14 +723,15 @@ async fn stage_and_verify(
     // superseded copy on Ok, so returning Ok with an unrecorded staged copy would prune against a
     // replacement that has no owned record (stranding it as an empty-provenance mirror). The staged
     // torrent is left for the account-mirror/dedup pass to reclaim; a later tick re-stages.
-    let prov = base_req_provenance(app, MediaType::Movie, tmdb_id).await;
+    // Sticky provenance = the merge across the title's current owned copies, computed ONCE by the
+    // caller from records already in hand (no full owned-table re-scan) — see `merged_provenance`.
     if app
         .store
         .put_owned(
             hash.clone(),
             OwnedRecord {
                 request: base_req.clone(),
-                provenance: prov,
+                provenance: prov.clone(),
                 added_at: now_secs(),
                 status: OwnedStatus::Verified,
                 provides: vec![],
@@ -768,33 +782,14 @@ async fn prune_owned_hash_in(app: &AppState, hash: &str, torrents: &[crate::rd_c
     }
 }
 
-/// The provenance to keep on a staged upgrade: the merged provenance of the title's current owned
-/// hashes (sticky — preserves Manual / per-user origins across the swap).
-async fn base_req_provenance(
-    app: &AppState,
-    media_type: MediaType,
-    tmdb_id: u64,
-) -> crate::store::Provenance {
-    let groups = crate::tasks::group_owned_by_tmdb(&app.store).await;
-    groups
-        .get(&(media_type, tmdb_id))
-        .map(|g| g.provenance.clone())
-        // An empty group is a race: every owned copy was concurrently pruned (dedup / a lifecycle
-        // removal) between the tick's grouping and here. Fall back to EMPTY provenance (a plain
-        // mirror), NOT manual() — manual() would permanently mislabel this engine-staged upgrade as
-        // a protected manual add (run_upgrade_once skips a manual group, and dedup never
-        // auto-removes a manual copy). This matches the show path's empty-group result
-        // (merged_provenance). NB: `Provenance::default()` == `manual()`, so we build empty here.
-        .unwrap_or_else(|| crate::store::Provenance {
-            entries: Vec::new(),
-        })
-}
-
-/// The merged sticky provenance across a group's owned records — the same value
-/// `base_req_provenance` recovers, but computed from records the caller ALREADY holds instead of
-/// re-scanning the entire `owned` table. `owned` is always the full group here (the show paths build
-/// it from `group_hashes`), so the merge is identical; a group is never empty on these paths (we are
-/// upgrading owned content), so no `manual()` fallback is needed.
+/// The merged sticky provenance across a group's owned records — preserves Manual / per-user origins
+/// across an upgrade swap. Computed from records the caller ALREADY holds (the movie path builds it
+/// from `owned_hashes`, the show paths from `group_hashes`) instead of re-scanning the entire `owned`
+/// table; equals `group_owned_by_tmdb(..).provenance` for the same group because both fold the group's
+/// records with the identical `Provenance::merge`. An empty slice (every owned copy raced away between
+/// grouping and staging) folds to EMPTY provenance — a plain mirror, NOT `manual()` (which would
+/// permanently mislabel an engine-staged copy as a protected manual add). NB: it builds
+/// `entries: []` explicitly, since `Provenance::default()` == `manual()`.
 fn merged_provenance(owned: &[(String, OwnedRecord)]) -> crate::store::Provenance {
     let mut prov = crate::store::Provenance {
         entries: Vec::new(),
@@ -2171,20 +2166,15 @@ mod tests {
         assert_eq!(got2, vec!["se1new".to_string(), "se2".to_string()]);
     }
 
-    #[tokio::test]
-    async fn base_req_provenance_falls_back_to_empty_not_manual_for_a_vanished_group() {
-        // If every owned copy of a movie is concurrently pruned between grouping and staging, the
+    #[test]
+    fn merged_provenance_of_a_vanished_group_is_empty_not_manual() {
+        // If every owned copy of a title is concurrently pruned between grouping and staging, the
         // staged upgrade must inherit EMPTY provenance (a plain mirror) — NOT manual(), which would
         // permanently mislabel an engine-staged copy as a protected manual add (run_upgrade_once
-        // skips a manual group forever, and dedup never auto-removes a manual copy). Consistent with
-        // the show path's empty-group result (merged_provenance yields empty).
-        let store = mem_store();
-        let app = app_with(
-            Arc::new(MockScraper { candidates: vec![] }),
-            Arc::new(MockProvider::default()),
-            store,
-        );
-        let prov = base_req_provenance(&app, MediaType::Movie, 27205).await;
+        // skips a manual group forever, and dedup never auto-removes a manual copy). merged_provenance
+        // over no records folds to empty (it builds `entries: []`, not Provenance::default() ==
+        // manual()) — the same fallback the movie/show upgrade paths rely on.
+        let prov = merged_provenance(&[]);
         assert!(
             prov.entries.is_empty(),
             "a vanished group must fall back to EMPTY provenance, got {:?}",
