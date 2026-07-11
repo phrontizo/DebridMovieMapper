@@ -59,8 +59,9 @@ impl std::fmt::Display for RepairFailure {
 }
 
 impl From<String> for RepairFailure {
-    /// Non-not-cached error strings (from `check_and_begin_repair` / `add_and_select_files`, consumed
-    /// via `?`) are actual failures.
+    /// An error string from `check_and_begin_repair` (cooldown/attempt-cap refusal or a missing
+    /// torrent), consumed via `?`, is an actual failure. (The transient `add_and_select_files` /
+    /// final-info-fetch blips are mapped explicitly to `Deferred` at their call sites instead.)
     fn from(m: String) -> Self {
         RepairFailure::Failed(m)
     }
@@ -507,9 +508,20 @@ impl RepairManager {
         };
 
         info!("Instant repair: adding magnet for hash {}", old_info.hash);
-        let (new_torrent_id, _new_info) = self
+        let (new_torrent_id, _new_info) = match self
             .add_and_select_files(torrent_id, &old_info, Duration::from_millis(500))
-            .await?;
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                // A materialise failure (re-add HTTP error, or the file list not resolving in the
+                // poll window) is transient and produced NO replacement; `add_and_select_files`
+                // already reset the attempt budget and kept the torrent visible. Classify as
+                // `Deferred` (dav_fs logs it at info) — like the settle-blip / info-fetch arms below
+                // — rather than `Failed` (warn): a self-healing retry isn't a genuine failure.
+                return Err(RepairFailure::Deferred(e));
+            }
+        };
         info!("Instant repair: new torrent ID {}", new_torrent_id);
 
         // TorBox re-adds by infohash return the SAME torrent id (createtorrent recovers the existing
@@ -532,7 +544,10 @@ impl RepairManager {
                     self.cleanup_leaked_torrent(&new_torrent_id).await;
                 }
                 self.note_transient_repair_failure(torrent_id).await;
-                return Err(RepairFailure::Failed(format!(
+                // Transient (the re-add succeeded; only the final info fetch blipped) with the budget
+                // reset and the torrent left visible — classify as `Deferred` (info), matching the
+                // settle-blip / materialise arms, not `Failed` (warn).
+                return Err(RepairFailure::Deferred(format!(
                     "Failed to get final torrent info: {}",
                     e
                 )));
