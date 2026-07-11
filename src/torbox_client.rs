@@ -265,13 +265,7 @@ fn bound_cache(cache: &mut HashMap<(String, u32), CachedUrl>, max: usize) {
 /// DETERMINISTIC 5xx — 501 Not Implemented / 505 HTTP Version Not Supported — are NOT retried (a
 /// retry can't fix them), and 4xx are terminal (the request itself is wrong).
 fn is_transient_status(status: reqwest::StatusCode) -> bool {
-    matches!(
-        status,
-        reqwest::StatusCode::INTERNAL_SERVER_ERROR
-            | reqwest::StatusCode::BAD_GATEWAY
-            | reqwest::StatusCode::SERVICE_UNAVAILABLE
-            | reqwest::StatusCode::GATEWAY_TIMEOUT
-    )
+    crate::provider::is_retryable_5xx(status)
 }
 
 /// Whether a `requestdl` failure is a clearly-PERMANENT auth/permission error (401/403) that a
@@ -311,14 +305,7 @@ fn parse_rate_headers(headers: &reqwest::header::HeaderMap) -> Option<(u64, f64)
 /// input we refuse to act on. Centralised so the fallible construction lives in one
 /// place rather than being duplicated (with `.unwrap()`) at every call site.
 fn synthetic_bad_gateway() -> reqwest::Error {
-    reqwest::Response::from(
-        hyper::Response::builder()
-            .status(reqwest::StatusCode::BAD_GATEWAY)
-            .body(hyper::body::Bytes::from_static(b"torbox request failed"))
-            .expect("static BAD_GATEWAY response always builds"),
-    )
-    .error_for_status()
-    .expect_err("BAD_GATEWAY always yields an error status")
+    crate::provider::synthetic_bad_gateway(b"torbox request failed")
 }
 
 struct CachedUrl {

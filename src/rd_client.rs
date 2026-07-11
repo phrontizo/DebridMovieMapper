@@ -11,19 +11,7 @@ use tracing::{debug, error, warn};
 const MAX_CACHE_SIZE: usize = 10_000;
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
 
-/// Build a synthetic Bad Gateway `reqwest::Error` for cases where we must return a
-/// `reqwest::Error` but have no live error response — exhausted retries that only ever produced
-/// deserialisation failures, or (defensively) a success status improbably configured as terminal.
-fn synthetic_bad_gateway(detail: &'static [u8]) -> reqwest::Error {
-    reqwest::Response::from(
-        hyper::Response::builder()
-            .status(reqwest::StatusCode::BAD_GATEWAY)
-            .body(hyper::body::Bytes::from_static(detail))
-            .expect("static BAD_GATEWAY response always builds"),
-    )
-    .error_for_status()
-    .expect_err("BAD_GATEWAY always yields an error status")
-}
+use crate::provider::synthetic_bad_gateway;
 
 /// Whether an `unrestrict/link` failure is a genuinely PERMANENT client error (a bad token) that
 /// instant repair can't fix — only 401/403. Everything else (a 5xx, a transport-level failure, or a
@@ -316,10 +304,7 @@ impl RealDebridClient {
     /// are checked first and abort without retrying (e.g. 503 for `unrestrict_link`).
     fn should_retry_status(status: reqwest::StatusCode) -> bool {
         status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            || status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
-            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            || status == reqwest::StatusCode::BAD_GATEWAY
-            || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+            || crate::provider::is_retryable_5xx(status)
     }
 
     pub async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {

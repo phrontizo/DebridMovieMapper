@@ -1,6 +1,34 @@
 use crate::error::AppError;
 use crate::rd_client::{AddMagnetResponse, Torrent, TorrentInfo};
 
+/// Build a synthetic Bad Gateway `reqwest::Error` for cases where we must return a `reqwest::Error`
+/// but have no live error response (exhausted retries that only produced deserialisation failures, or
+/// an input we refuse to act on). Shared by both provider clients so the fallible construction lives
+/// in exactly one place.
+pub(crate) fn synthetic_bad_gateway(detail: &'static [u8]) -> reqwest::Error {
+    reqwest::Response::from(
+        hyper::Response::builder()
+            .status(reqwest::StatusCode::BAD_GATEWAY)
+            .body(hyper::body::Bytes::from_static(detail))
+            .expect("static BAD_GATEWAY response always builds"),
+    )
+    .error_for_status()
+    .expect_err("BAD_GATEWAY always yields an error status")
+}
+
+/// The set of transient 5xx statuses worth retrying — 500/502/503/504. The DETERMINISTIC 5xx (501
+/// Not Implemented / 505 HTTP Version Not Supported) are excluded, since a retry can't fix them.
+/// Shared by both provider clients so the retryable set can't silently diverge between them.
+pub(crate) fn is_retryable_5xx(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
 /// Identifies a single media file for resolution. Stable identity is
 /// `(hash, file_path)`; `torrent_id`/`file_id`/`link` are re-derivable (e.g. after
 /// a re-acquire). `link` is the provider's per-file restricted link when it has
