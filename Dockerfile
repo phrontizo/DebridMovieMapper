@@ -1,6 +1,9 @@
 # Stage 1: Build the application
-# Use BUILDPLATFORM so the builder always runs natively (no QEMU emulation)
-FROM --platform=$BUILDPLATFORM rust:slim AS builder
+# Use BUILDPLATFORM so the builder always runs natively (no QEMU emulation).
+# Pin the toolchain minor version (not floating `rust:slim`) so the build image is reproducible over
+# time — a new stable Rust / clippy / libc can otherwise change build output or newly fail without any
+# source change. Bump this deliberately alongside the CI stable toolchain.
+FROM --platform=$BUILDPLATFORM rust:1.96-slim AS builder
 
 # Install build dependencies including cross-compilation toolchain for arm64
 RUN apt-get update && apt-get install -y \
