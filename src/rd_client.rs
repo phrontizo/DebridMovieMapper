@@ -1218,6 +1218,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unrestrict_link_5xx_is_terminal_single_attempt_and_resolves_unavailable() {
+        // A 5xx on unrestrict/link is in the terminal set, so the synchronous playback resolve must
+        // hit the API exactly ONCE (fail over to instant repair) rather than run the 3-attempt budget
+        // — which would add latency to a WebDAV read. The other tests use an empty terminal set (so a
+        // 503 retries), leaving THIS fast-fail invariant unpinned. Assert both the single attempt and
+        // the resolve_url → Unavailable mapping.
+        use crate::provider::DebridProvider as _;
+        let (url, count) =
+            spawn_counting("HTTP/1.1 503 Service Unavailable", r#"{"error":"down"}"#).await;
+        let client = RealDebridClient::new("fake".to_string())
+            .unwrap()
+            .with_base_url(url);
+        let loc = crate::provider::FileLocator {
+            hash: "h".to_string(),
+            torrent_id: "t".to_string(),
+            file_id: 0,
+            file_path: "/x.mkv".to_string(),
+            link: Some("https://real-debrid.com/d/abc".to_string()),
+        };
+        assert!(
+            matches!(
+                client.resolve_url(&loc).await,
+                Err(crate::error::AppError::Unavailable)
+            ),
+            "a 5xx on unrestrict must map to Unavailable (→ instant repair)"
+        );
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a 5xx on unrestrict is terminal — exactly one attempt, not the 3-attempt budget"
+        );
+    }
+
+    #[tokio::test]
     async fn wait_for_retry_does_not_sleep_on_final_attempt() {
         // On the final attempt there is nothing to wait for — the caller gives up immediately.
         // A Retry-After header must NOT cause a (capped, up-to-5-minute) sleep here.
