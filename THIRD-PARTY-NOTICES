@@ -33,7 +33,7 @@ Apache-2.0 OR MIT
 Used under the MIT licence:
 
 android_system_properties, async-trait, atomic-waker, autocfg, base64, bitflags,
-block-buffer, bumpalo, cc, cfg-if, chrono,
+block-buffer, bumpalo, cc, cfg-if, chacha20, chrono,
 core-foundation-sys, cpufeatures, crypto-common, derive-where, digest,
 displaydoc, dyn-clone, errno, find-msvc-tools,
 form_urlencoded, futures-channel, futures-core, futures-macro,
@@ -42,7 +42,7 @@ iana-time-zone, iana-time-zone-haiku, idna, idna_adapter, ipnet,
 iri-string, itoa, js-sys, lazy_static, libc, log, mime, num-traits,
 once_cell, percent-encoding, pin-project-lite, pin-utils, ppv-lite86,
 proc-macro2, quinn, quinn-proto, quinn-udp, quote, rand, rand_chacha,
-rand_core, redb, regex, regex-automata, regex-syntax, reqwest, rustc-hash,
+rand_core, rand_pcg, redb, regex, regex-automata, regex-syntax, reqwest, rustc-hash,
 rustls-pki-types, rustversion, serde, serde_core, serde_derive, serde_json,
 serde_urlencoded, sha1, shlex, signal-hook-registry, smallvec, socket2,
 stable_deref_trait, syn,
