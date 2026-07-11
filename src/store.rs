@@ -1552,11 +1552,13 @@ impl Store {
                                     Ok((_, v)) => v,
                                     Err(_) => continue,
                                 };
-                                if let Ok(view) =
-                                    serde_json::from_slice::<OwnedKeyView>(v.value())
+                                if let Ok(view) = serde_json::from_slice::<OwnedKeyView>(v.value())
                                 {
                                     let media_type = media_kind_to_type(view.request.kind);
-                                    keep.insert(upgrade_check_key(&media_type, view.request.tmdb_id));
+                                    keep.insert(upgrade_check_key(
+                                        &media_type,
+                                        view.request.tmdb_id,
+                                    ));
                                 }
                             }
                         }

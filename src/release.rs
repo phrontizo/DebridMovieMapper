@@ -138,6 +138,12 @@ static WEB_RE: LazyLock<Regex> =
 static MULTI_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|[ ._\n-])multi(?:[ ._\n-]|$)").unwrap());
 
+// A separator-bounded Dolby-Vision `dv` token — matches `Movie.2160p.DV.HEVC` (dot-separated, the
+// common Torrentio form) as well as space-separated ` dv `, without false-positiving on words that
+// merely contain "dv". Bounded like `WEB_RE`/`MULTI_RE`.
+static DV_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|[ ._\n-])dv(?:[ ._\n-]|$)").unwrap());
+
 /// Classify the release source from its (lowercased) name/description.
 fn detect_source(lower: &str) -> Source {
     if CAM_RE.is_match(lower) || TS_RE.is_match(lower) {
@@ -192,9 +198,17 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
         digit_res.or(if had_4k { Some(2160) } else { None })
     };
 
-    let codec = if lower.contains("x265") || lower.contains("h265") || lower.contains("hevc") {
+    let codec = if lower.contains("x265")
+        || lower.contains("h265")
+        || lower.contains("h.265")
+        || lower.contains("hevc")
+    {
         Codec::Hevc
-    } else if lower.contains("x264") || lower.contains("h264") || lower.contains("avc") {
+    } else if lower.contains("x264")
+        || lower.contains("h264")
+        || lower.contains("h.264")
+        || lower.contains("avc")
+    {
         Codec::Avc
     } else {
         Codec::Other
@@ -203,11 +217,14 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
     let hdr = lower.contains("hdr")
         || lower.contains("dolby vision")
         || lower.contains("dovi")
-        || lower.contains(" dv ");
+        || DV_RE.is_match(&lower);
 
     let cached = CACHED_RE.is_match(&text) || text.contains('\u{26a1}');
 
-    let size_bytes = SIZE_RE.captures(&text).and_then(|cap| {
+    // Take the FIRST `<number><gb|mb>` whose number actually parses, rather than the first regex
+    // match: `[\d.]+` can capture a non-numeric run like `1.2.3` (which fails `parse::<f64>`), and
+    // without iterating we'd silently drop the size instead of trying the next candidate.
+    let size_bytes = SIZE_RE.captures_iter(&text).find_map(|cap| {
         let n: f64 = cap.get(1)?.as_str().parse().ok()?;
         let unit = cap.get(2)?.as_str().to_ascii_lowercase();
         let mult = if unit == "gb" {
@@ -1279,12 +1296,69 @@ mod tests {
         assert!(parse(&dovi).hdr, "DoVi → hdr");
         let dv = raw("x", "Movie.2020.2160p.WEB-DL dv HEVC-GRP", "b", None);
         assert!(parse(&dv).hdr, "separator-bounded ' dv ' → hdr");
+        let dv_dot = raw("x", "Movie.2020.2160p.WEB-DL.DV.HEVC-GRP", "e", None);
+        assert!(
+            parse(&dv_dot).hdr,
+            "dot-separated '.DV.' (the common Torrentio form) → hdr"
+        );
         let dolby = raw("x", "Movie 2020 2160p Dolby Vision WEB-DL GRP", "c", None);
         assert!(parse(&dolby).hdr, "spaced 'dolby vision' → hdr");
         let screener = raw("x", "Movie.2020.DVDSCR.x264-GRP", "d", None);
         assert!(
             !parse(&screener).hdr,
             "DVDSCR contains 'dv' but must NOT be read as Dolby Vision"
+        );
+        let dvd = raw("x", "Movie.2020.1080p.DVD.x264-GRP", "f", None);
+        assert!(
+            !parse(&dvd).hdr,
+            "'DVD' contains 'dv' but must NOT be read as Dolby Vision"
+        );
+    }
+
+    #[test]
+    fn parse_detects_dotted_h265_and_h264_codecs() {
+        // Torrentio names sometimes spell the codec with a dot (H.265 / H.264); these must map to
+        // Hevc/Avc, not Codec::Other — otherwise a HEVC encode silently loses the PREFER_HEVC bonus.
+        assert_eq!(
+            parse(&raw("x", "Movie.2020.1080p.WEB-DL.H.265-GRP", "a", None)).codec,
+            Codec::Hevc,
+            "H.265 → Hevc"
+        );
+        assert_eq!(
+            parse(&raw("x", "Movie.2020.1080p.WEB-DL.H.264-GRP", "b", None)).codec,
+            Codec::Avc,
+            "H.264 → Avc"
+        );
+    }
+
+    #[test]
+    fn parse_size_skips_a_non_numeric_run_and_takes_the_next_candidate() {
+        // `[\d.]+` can capture a non-numeric run like `1.2.3`; the size parse must skip it and use the
+        // next well-formed `<n> GB` token rather than silently dropping the size.
+        let c = raw(
+            "x",
+            "Movie.1.2.3.Edition\n\u{1f4be} 7.5 GB \u{1f464} 10",
+            "a",
+            None,
+        );
+        assert_eq!(
+            parse(&c).size_bytes,
+            Some((7.5 * 1_000_000_000.0) as u64),
+            "a malformed leading numeric run must not drop the real size"
+        );
+    }
+
+    #[test]
+    fn score_passes_through_a_resolution_less_release() {
+        // A release with no parseable resolution token must still be SCORED (passed through the
+        // MAX_RESOLUTION ceiling), not excluded. Cached so the uncached-zero-seeder floor doesn't
+        // confound the ceiling behaviour under test.
+        let c = raw("x", "Movie.BluRay.x265-GRP\nRD+", "a", None);
+        let r = parse(&c);
+        assert_eq!(r.resolution, None, "no resolution token → None");
+        assert!(
+            score(&r, &prefs()).is_some(),
+            "a resolution-less release must still be scored, not excluded by the ceiling"
         );
     }
 
