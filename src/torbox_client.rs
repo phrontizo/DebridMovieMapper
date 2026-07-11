@@ -453,6 +453,11 @@ impl TorBoxClient {
                     let e = e.without_url();
                     if attempt < max_attempts {
                         warn!("TorBox request error (attempt {}): {}", attempt, e);
+                        // Small backoff before retrying a statusless transport error (connection
+                        // refused/reset) — mirrors the RD client; the rate limiter's baseline spacing
+                        // alone would let a fast-failing endpoint spin the budget in a tight loop.
+                        tokio::time::sleep(Duration::from_millis((100 * attempt as u64).min(1_000)))
+                            .await;
                         continue;
                     }
                     return Err(e);
@@ -564,6 +569,10 @@ impl TorBoxClient {
                     let e = e.without_url();
                     if attempt < max_attempts {
                         warn!("TorBox request error (attempt {}): {}", attempt, e);
+                        // Small backoff before retrying a statusless transport error (mirrors the RD
+                        // client / send_data_n) so a fast-failing endpoint doesn't spin the budget.
+                        tokio::time::sleep(Duration::from_millis((100 * attempt as u64).min(1_000)))
+                            .await;
                         continue;
                     }
                     return Err(e);

@@ -687,6 +687,17 @@ impl RealDebridClient {
                         attempt, max_attempts, e
                     );
                     last_error = Some(e);
+                    // Small backoff before retrying a statusless transport error (connection
+                    // refused/reset, timeout). Without it a fast-failing endpoint (e.g. connection
+                    // refused) spins the whole budget in a tight warn loop — the rate limiter's 100ms
+                    // baseline spacing isn't enough. Kept SMALL (100ms·attempt, capped 1s) rather than
+                    // the 5xx exponential backoff (up to 30s) so the latency-sensitive
+                    // `unrestrict_link` resolve path still fails over to instant repair quickly.
+                    // Skipped on the final attempt (nothing follows it).
+                    if attempt < max_attempts {
+                        let backoff = Duration::from_millis((100 * attempt as u64).min(1_000));
+                        tokio::time::sleep(backoff).await;
+                    }
                 }
             }
         }
