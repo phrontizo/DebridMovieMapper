@@ -1635,7 +1635,7 @@ pub(crate) fn plan_dedup(
     present: &std::collections::HashSet<String>,
     selected: &std::collections::HashSet<String>,
 ) -> Vec<DedupPlan> {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     let mut groups: BTreeMap<(MediaType, u64), Vec<(String, &OwnedRecord)>> = BTreeMap::new();
     for (hash, rec) in owned {
         let h = hash.to_ascii_lowercase();
@@ -1710,6 +1710,43 @@ pub(crate) fn plan_dedup(
                         covered.extend(r.provides.iter().copied());
                     } else {
                         remove.push(h.clone());
+                    }
+                }
+                // Second sweep — reclaim a fully-redundant kept hash that the greedy pass missed
+                // because it sorted BEFORE its covering superset (e.g. a higher-score/served singleton
+                // kept ahead of the lower-priority pack that also covers it). Remove any kept
+                // non-Manual, known-coverage hash whose EVERY episode is provided by the union of the
+                // OTHER still-kept hashes. Processed lowest-keep-priority first (keep is priority-DESC,
+                // so iterate in reverse) and re-checked against the CURRENT kept set after each removal
+                // — so a mutually-covering cycle (A⊆B∪C, B⊆A∪C, C⊆A∪B) drops only the redundant ones
+                // and never breaks total coverage.
+                let provides_of: HashMap<&str, &Vec<(u32, u32)>> =
+                    hashes.iter().map(|(h, r)| (h.as_str(), &r.provides)).collect();
+                let protected_from_removal: HashSet<&str> = hashes
+                    .iter()
+                    .filter(|(_, r)| r.provenance.has_manual_entry() || r.provides.is_empty())
+                    .map(|(h, _)| h.as_str())
+                    .collect();
+                let mut i = keep.len();
+                while i > 0 {
+                    i -= 1;
+                    let h = keep[i].clone();
+                    if protected_from_removal.contains(h.as_str()) {
+                        continue; // Manual / unknown-coverage: never removed
+                    }
+                    let my_provides = match provides_of.get(h.as_str()) {
+                        Some(p) => *p,
+                        None => continue,
+                    };
+                    let others_cover: HashSet<(u32, u32)> = keep
+                        .iter()
+                        .filter(|k| k.as_str() != h.as_str())
+                        .filter_map(|k| provides_of.get(k.as_str()))
+                        .flat_map(|p| p.iter().copied())
+                        .collect();
+                    if my_provides.iter().all(|e| others_cover.contains(e)) {
+                        keep.remove(i);
+                        remove.push(h);
                     }
                 }
             }
@@ -3186,6 +3223,69 @@ mod tests {
             plans[0].remove,
             vec!["single"],
             "the single is fully covered by the pack → redundant"
+        );
+    }
+
+    #[test]
+    fn plan_dedup_show_reclaims_a_higher_priority_subset_covered_by_a_lower_priority_pack() {
+        use crate::scraper::MediaKind;
+        // TASK1 regression: a higher-SCORE single sorts BEFORE its lower-score covering pack, so the
+        // greedy pass keeps BOTH. The second redundancy sweep must reclaim the single (fully covered
+        // by the pack) rather than leaving it as a permanent missed dedup.
+        let owned = vec![
+            (
+                "single".to_string(),
+                dedup_rec(MediaKind::Series, 7, vec![(1, 1)], Some(100)),
+            ),
+            (
+                "pack".to_string(),
+                dedup_rec(MediaKind::Series, 7, vec![(1, 1), (1, 2)], Some(50)),
+            ),
+        ];
+        let plans = plan_dedup(&owned, &hset(&["single", "pack"]), &hset(&[]));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].keep, vec!["pack"], "the covering pack is kept");
+        assert_eq!(
+            plans[0].remove,
+            vec!["single"],
+            "the higher-priority subset single is reclaimed (order-independent redundancy)"
+        );
+    }
+
+    #[test]
+    fn plan_dedup_show_keeps_a_mutually_covering_cycle_minus_the_redundant() {
+        use crate::scraper::MediaKind;
+        // A⊆B∪C, B⊆A∪C, C⊆A∪B — the second sweep must NOT strip all three (that would lose coverage);
+        // it drops only the lowest-priority redundant one and keeps a covering set.
+        let owned = vec![
+            (
+                "a".to_string(),
+                dedup_rec(MediaKind::Series, 8, vec![(1, 1), (1, 2)], Some(30)),
+            ),
+            (
+                "b".to_string(),
+                dedup_rec(MediaKind::Series, 8, vec![(1, 2), (1, 3)], Some(20)),
+            ),
+            (
+                "c".to_string(),
+                dedup_rec(MediaKind::Series, 8, vec![(1, 1), (1, 3)], Some(10)),
+            ),
+        ];
+        let plans = plan_dedup(&owned, &hset(&["a", "b", "c"]), &hset(&[]));
+        // Coverage of the KEPT set must remain {(1,1),(1,2),(1,3)} — never lose an episode.
+        let kept: std::collections::HashSet<&str> = plans
+            .first()
+            .map(|p| p.keep.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_else(|| ["a", "b", "c"].into_iter().collect());
+        let mut covered = std::collections::HashSet::new();
+        for (h, r) in &owned {
+            if kept.contains(h.as_str()) {
+                covered.extend(r.provides.iter().copied());
+            }
+        }
+        assert!(
+            [(1, 1), (1, 2), (1, 3)].iter().all(|e| covered.contains(e)),
+            "the kept set must still cover every episode, got kept {kept:?}"
         );
     }
 
