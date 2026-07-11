@@ -456,7 +456,9 @@ impl ProxiedMediaFile {
         }
 
         let pos = self.pos;
-        let buffer_end = self.buffer_start + self.buffer.len() as u64;
+        // Saturating add (consistent with the deliberate saturating range math below): a pathological
+        // `buffer_start` near `u64::MAX` from a garbage provider `bytes` field must not overflow.
+        let buffer_end = self.buffer_start.saturating_add(self.buffer.len() as u64);
 
         // Buffer hit — serve directly without any network I/O.
         if pos >= self.buffer_start && pos < buffer_end {
