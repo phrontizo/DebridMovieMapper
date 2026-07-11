@@ -16,20 +16,23 @@ const NOTIFICATION_DELAY: Duration = Duration::from_secs(15);
 enum NotifyOutcome {
     /// 2xx — notification accepted; stop.
     Done,
-    /// Transient server error (502/503/504) — retry.
+    /// Transient server error (502/503/504) or 429 rate-limit — retry.
     Retry,
     /// Any other status (4xx, 500, …) — a retry won't help; stop.
     GiveUp,
 }
 
 /// Classify a Jellyfin notification response status. Note 500 is NOT retried (it usually
-/// signals a genuine error), whereas 502/503/504 are transient and worth retrying.
+/// signals a genuine error), whereas 502/503/504 are transient and worth retrying. 429
+/// (Too Many Requests) is the canonical "back off and retry" signal, so it is retried too —
+/// giving up on it would silently drop a library-update notification a short delay would deliver.
 fn classify_status(status: reqwest::StatusCode) -> NotifyOutcome {
     if status.is_success() {
         NotifyOutcome::Done
     } else if matches!(
         status,
-        reqwest::StatusCode::SERVICE_UNAVAILABLE
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
             | reqwest::StatusCode::BAD_GATEWAY
             | reqwest::StatusCode::GATEWAY_TIMEOUT
     ) {
@@ -220,6 +223,11 @@ mod tests {
         // Transient 5xx → Retry
         assert_eq!(
             classify_status(StatusCode::SERVICE_UNAVAILABLE),
+            NotifyOutcome::Retry
+        );
+        // 429 Too Many Requests is the canonical "back off and retry" signal → Retry
+        assert_eq!(
+            classify_status(StatusCode::TOO_MANY_REQUESTS),
             NotifyOutcome::Retry
         );
         assert_eq!(
