@@ -807,8 +807,9 @@ impl DebridVfs {
 }
 
 /// Replace characters that are invalid in filenames or interpreted as path separators.
-/// Covers POSIX path separators and Windows-reserved characters (important for
-/// WebDAV clients accessing via rclone on Windows/SMB).
+/// Covers POSIX path separators, Windows-reserved characters, trailing dots/spaces (which Windows
+/// silently strips), and bare Windows reserved device names (CON, NUL, COM1…) — important for
+/// WebDAV clients accessing via rclone on Windows/SMB.
 ///
 /// NOTE on a deliberate asymmetry: this is applied to library-CONSTRUCTED names — Movie/Show folder
 /// names, season folders, and NFO file names — but NOT to media-file LEAF names, which keep the exact
@@ -830,13 +831,54 @@ fn sanitize_filename(name: &str) -> String {
         }
     }
     let cleaned = replaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Windows strips a trailing dot (and space) from a name, so a directory key ending in one would
+    // diverge from its on-disk name over rclone/SMB (e.g. "Adam." → "Adam"), and rclone can then
+    // mis-map or error. `split_whitespace` already dropped trailing spaces; strip trailing dots too.
+    let cleaned = cleaned.trim_end_matches('.').trim_end().to_string();
     // A name that sanitizes to empty, "." or ".." would create a junk/unusable directory key
     // ("."/".." are also path-navigation names). Fold them to a stable placeholder. Only reachable
     // for unidentified content (identified titles carry a real TMDB-derived name).
-    match cleaned.as_str() {
-        "" | "." | ".." => "untitled".to_string(),
+    let cleaned = match cleaned.as_str() {
+        "" | "." | ".." => return "untitled".to_string(),
         _ => cleaned,
+    };
+    // A bare Windows reserved DEVICE name (CON, NUL, COM1…) cannot be created verbatim on Windows/SMB.
+    // These are constructed DIRECTORY names (no extension), so an exact whole-name match is correct
+    // and avoids false-positiving a real title like "Con Air". Suffix so the key is usable there.
+    if is_windows_reserved_name(&cleaned) {
+        return format!("{cleaned}_");
     }
+    cleaned
+}
+
+/// `true` if `name` is exactly a Windows reserved device name (case-insensitive) — these cannot be
+/// used as a file/directory name on Windows/SMB.
+fn is_windows_reserved_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 /// Regex matching filenames that should be excluded from the VFS.
@@ -2356,6 +2398,22 @@ mod tests {
         assert_eq!(sanitize_filename("."), "untitled");
         assert_eq!(sanitize_filename("***"), "untitled");
         assert_eq!(sanitize_filename("   "), "untitled");
+    }
+
+    #[test]
+    fn sanitize_filename_strips_trailing_dots_and_guards_reserved_names() {
+        // Windows silently strips a trailing dot, so the key must not end in one (would diverge from
+        // the on-disk name over rclone/SMB).
+        assert_eq!(sanitize_filename("Adam."), "Adam");
+        assert_eq!(sanitize_filename("Title..."), "Title");
+        // Bare reserved device names are suffixed so they're creatable on Windows...
+        assert_eq!(sanitize_filename("CON"), "CON_");
+        assert_eq!(sanitize_filename("nul"), "nul_");
+        assert_eq!(sanitize_filename("Com1"), "Com1_");
+        // ...but a real title that merely contains a reserved word is untouched.
+        assert_eq!(sanitize_filename("Con Air"), "Con Air");
+        assert_eq!(sanitize_filename("Conan"), "Conan");
+        assert_eq!(sanitize_filename("Aux Battements"), "Aux Battements");
     }
 
     #[test]
