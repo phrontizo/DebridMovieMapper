@@ -43,14 +43,17 @@ static STOP_RE: LazyLock<Regex> = LazyLock::new(|| {
     // token (resolution/codec/source) that truncates instead; when it is a title word the query keeps
     // it, which TMDB's fuzzy scoring tolerates — exactly as for the ISO codes above.
     // The resolution alternatives accept an optional 2-3 digit framerate suffix
-    // (`1080p60`/`2160p50`) so a framerate-glued quality tag still truncates the title rather than
-    // leaking into the TMDB query — mirroring the same fix on `release::RES_RE`.
+    // (`1080p60`/`2160p50`) followed by an optional glued letter run (`[a-z]*`, e.g. the bit-depth
+    // tag in `1080p10bit`/`2160p10bit`), so a framerate- OR bit-depth-glued quality tag still
+    // truncates the title rather than leaking into the TMDB query. The trailing `[a-z]*` mirrors
+    // `release::RES_RE`'s boundary relaxation (the shared `\b(...)\b` would otherwise refuse to
+    // match a token whose suffix runs straight into the closing word char).
     // NB: the `WxH` resolution alternative is bounded to `\d{3,4}x\d{3,4}` (e.g. 1920x1080, 720x480)
     // rather than an unbounded `\d+x\d+`. An unbounded form consumed a movie literally named `10x10`
     // as a leftmost-match truncation point, collapsing the title to its trailing year.
     // `web[\s-]?dl` (not just `web-dl`) so the dot form `WEB.DL` — which step-2 dot→space replacement
     // turns into `WEB DL` — also truncates, rather than leaking `WEB DL` into the TMDB query.
-    Regex::new(r"(?i)\b(1080p(?:\d{2,3})?|720p(?:\d{2,3})?|2160p(?:\d{2,3})?|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d{3,4}x\d{3,4}|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web[\s-]?dl|h264|h265|x264|x265|remux|vff|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack)\b").unwrap()
+    Regex::new(r"(?i)\b(1080p(?:\d{2,3})?[a-z]*|720p(?:\d{2,3})?[a-z]*|2160p(?:\d{2,3})?[a-z]*|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d{3,4}x\d{3,4}|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web[\s-]?dl|h264|h265|x264|x265|remux|vff|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack)\b").unwrap()
 });
 
 static YEAR_RANGE_RE: LazyLock<Regex> =
@@ -1075,6 +1078,13 @@ mod tests {
         assert_eq!(
             clean_name("Spider-Man - Far From Home 2160p60 WEB-DL").0,
             "Spider-Man - Far From Home"
+        );
+        // A bit-depth-glued quality tag ("1080p10bit"/"2160p10bit") — no separator between the
+        // resolution and the bit-depth — must likewise truncate rather than leak into the query.
+        assert_eq!(clean_name("Movie.1080p10bit.mkv").0, "Movie");
+        assert_eq!(
+            clean_name("Some Show 2160p10bit HEVC").0,
+            "Some Show"
         );
     }
 
