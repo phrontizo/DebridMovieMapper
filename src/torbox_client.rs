@@ -164,9 +164,15 @@ fn map_listed_torrents(raw: &[TbTorrent]) -> Vec<Torrent> {
 }
 
 /// Drive offset/limit pagination: call `fetch_page(offset)` for `offset = 0, limit, 2*limit, …`,
-/// accumulating pages until a SHORT page (fewer than `limit` items) signals the natural end, or
-/// `max_pages` is reached (a defensive backstop, e.g. against an API that ignores `offset` and would
-/// otherwise loop forever). Any page error propagates.
+/// accumulating pages until an EMPTY page signals the natural end, or `max_pages` is reached (a
+/// defensive backstop, e.g. against an API that ignores `offset` and would otherwise loop forever).
+/// Any page error propagates.
+///
+/// Termination is on an EMPTY page, NOT merely a short one (mirroring the RD client's
+/// `get_torrents`): a server that returns fewer than `limit` items on a non-final page — a
+/// short-but-not-last page — must not be mistaken for end-of-list, or the listing truncates and
+/// downstream treats the dropped-page titles as lapsed → a re-acquisition storm + duplicate adds.
+/// This costs exactly one extra (empty terminator) fetch per complete listing.
 ///
 /// Returns `(items, hit_cap)`. `hit_cap` is `true` when the loop stopped because it reached
 /// `max_pages` while the FINAL page was still full — i.e. more pages likely remain and `items` is
@@ -184,13 +190,13 @@ where
     Fut: std::future::Future<Output = Result<Vec<T>, E>>,
 {
     let mut all: Vec<T> = Vec::new();
-    let mut hit_cap = true; // cleared only if we reach a natural (short) end
+    let mut hit_cap = true; // cleared only if we reach a natural (empty) end
     for page in 0..max_pages {
         let items = fetch_page(page * limit).await?;
-        let short = items.len() < limit;
+        let empty = items.is_empty();
         all.extend(items);
-        if short {
-            hit_cap = false; // last (short/empty) page — the listing is complete
+        if empty {
+            hit_cap = false; // an empty page is the natural end — the listing is complete
             break;
         }
     }
@@ -1015,29 +1021,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paginate_fetches_until_a_short_page() {
+    async fn paginate_fetches_until_an_empty_page() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = AtomicUsize::new(0);
-        // Two FULL pages (limit=3) then a short page → 7 items total, exactly 3 fetches.
+        // Two FULL pages (limit=3) then a short page then the empty terminator → 7 items total,
+        // 4 fetches. Termination is on the EMPTY page, not the short one, so a short-but-non-final
+        // page can never truncate the listing.
         let r: Result<(Vec<u32>, bool), &str> = paginate(3, 50, |offset| {
             calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 Ok(match offset {
                     0 => vec![1, 2, 3],
                     3 => vec![4, 5, 6],
-                    6 => vec![7], // short → stop
-                    _ => vec![],
+                    6 => vec![7], // short — continue past it
+                    _ => vec![],  // empty → stop
                 })
             }
         })
         .await;
         let (items, hit_cap) = r.unwrap();
         assert_eq!(items, vec![1, 2, 3, 4, 5, 6, 7]);
-        assert!(!hit_cap, "a natural short-page end is NOT a truncation");
+        assert!(!hit_cap, "a natural empty-page end is NOT a truncation");
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            3,
-            "stops on the first short page"
+            4,
+            "continues past the short page and stops on the empty terminator"
+        );
+    }
+
+    #[tokio::test]
+    async fn paginate_does_not_truncate_on_a_short_non_final_page() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        // A SHORT but NON-FINAL page (TorBox returns fewer than `limit` before the true end) must
+        // NOT be mistaken for end-of-list: pagination continues until an EMPTY page, mirroring the
+        // RD client. Here offset 0 is short (2 < 3) yet more items follow; stopping there would
+        // silently drop items 3..6 → a truncated library → re-acquire storm + duplicate adds.
+        let r: Result<(Vec<u32>, bool), &str> = paginate(3, 50, |offset| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok(match offset {
+                    0 => vec![1, 2],       // short, but NOT the end
+                    3 => vec![3, 4, 5],    // full
+                    6 => vec![6],          // short again
+                    _ => vec![],           // empty → true end
+                })
+            }
+        })
+        .await;
+        let (items, hit_cap) = r.unwrap();
+        assert_eq!(
+            items,
+            vec![1, 2, 3, 4, 5, 6],
+            "a short non-final page must not truncate the listing"
+        );
+        assert!(!hit_cap, "reaching the empty terminator is a complete, non-truncated listing");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "paginates past every short page until the empty terminator"
         );
     }
 
