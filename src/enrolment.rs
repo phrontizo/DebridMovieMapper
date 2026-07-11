@@ -312,8 +312,10 @@ fn esc(s: &str) -> String {
 /// Percent-encode a single URL path segment so a slug can never break out of the
 /// `/trakt/accounts/<slug>/…` route. Real Trakt slugs are `[a-z0-9_-]`, so this is a no-op for them;
 /// it is defence-in-depth against a path-significant character (`/`, `?`, `#`, space, …) arriving in
-/// a malformed slug. Encodes everything outside the RFC 3986 unreserved set (`esc` is still applied
-/// separately for the HTML-attribute layer).
+/// a malformed slug. Encodes everything outside the RFC 3986 unreserved set — which ALSO neutralises
+/// HTML metacharacters (`"`→`%22`, `<`→`%3C`, `&`→`%26`, …), so the encoded value is safe interpolated
+/// directly inside the double-quoted `action="…"` attribute WITHOUT a separate `esc()`. `esc()` is
+/// applied to the slug's TEXT rendering (`(slug: …)`), not to this action URL.
 fn encode_path_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
