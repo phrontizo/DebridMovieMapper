@@ -1084,15 +1084,25 @@ impl Store {
     pub async fn prune_blacklist_before(&self, cutoff_at: u64) -> usize {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || -> usize {
+            // A begin_write/open_table/iter/commit failure here means the append-only blacklist
+            // stopped pruning — `warn!` it rather than silently returning 0, so a persistent write
+            // failure (which would let the table grow unbounded) is visible in the logs instead of
+            // reading as "nothing was stale".
             let txn = match db.begin_write() {
                 Ok(t) => t,
-                Err(_) => return 0,
+                Err(e) => {
+                    warn!("blacklist prune skipped: begin_write failed: {}", e);
+                    return 0;
+                }
             };
             let mut removed = 0usize;
             {
                 let mut table = match txn.open_table(BLACKLIST_TABLE) {
                     Ok(t) => t,
-                    Err(_) => return 0,
+                    Err(e) => {
+                        warn!("blacklist prune skipped: open_table failed: {}", e);
+                        return 0;
+                    }
                 };
                 // Collect stale keys first (can't remove during the borrowing iteration). Log a
                 // per-row read error rather than `.flatten()`-swallowing it, matching the `all_*`
@@ -1114,7 +1124,10 @@ impl Store {
                             (at < cutoff_at).then(|| k.value().to_string())
                         })
                         .collect(),
-                    Err(_) => return 0,
+                    Err(e) => {
+                        warn!("blacklist prune skipped: table iter failed: {}", e);
+                        return 0;
+                    }
                 };
                 for k in &stale {
                     if table.remove(k.as_str()).is_ok() {
@@ -1123,7 +1136,11 @@ impl Store {
                 }
             }
             // A failed commit rolls back the removals — report 0 (nothing persisted).
-            if txn.commit().is_err() {
+            if let Err(e) = txn.commit() {
+                warn!(
+                    "blacklist prune commit failed (removals rolled back): {}",
+                    e
+                );
                 return 0;
             }
             removed
@@ -1641,15 +1658,25 @@ impl Store {
             .unwrap_or_default()
         };
         tokio::task::spawn_blocking(move || -> usize {
+            // As in `prune_blacklist_before`: surface a begin_write/open_table/iter/commit failure
+            // via `warn!` rather than a silent 0, so a persistent write failure that stalls pruning
+            // of this otherwise append-only cursor table is visible instead of reading as "nothing
+            // stale".
             let txn = match db.begin_write() {
                 Ok(t) => t,
-                Err(_) => return 0,
+                Err(e) => {
+                    warn!("upgrade_checks prune skipped: begin_write failed: {}", e);
+                    return 0;
+                }
             };
             let mut removed = 0usize;
             {
                 let mut table = match txn.open_table(UPGRADE_CHECKS_TABLE) {
                     Ok(t) => t,
-                    Err(_) => return 0,
+                    Err(e) => {
+                        warn!("upgrade_checks prune skipped: open_table failed: {}", e);
+                        return 0;
+                    }
                 };
                 // Collect keys not in the owned keep-set first (can't remove during iteration). Log a
                 // per-row read error rather than `.flatten()`-swallowing it (matching the `all_*`
@@ -1671,7 +1698,10 @@ impl Store {
                             (!keep.contains(&key)).then_some(key)
                         })
                         .collect(),
-                    Err(_) => return 0,
+                    Err(e) => {
+                        warn!("upgrade_checks prune skipped: table iter failed: {}", e);
+                        return 0;
+                    }
                 };
                 for k in &stale {
                     if table.remove(k.as_str()).is_ok() {
@@ -1680,7 +1710,11 @@ impl Store {
                 }
             }
             // A failed commit rolls back the removals — report 0 (nothing persisted).
-            if txn.commit().is_err() {
+            if let Err(e) = txn.commit() {
+                warn!(
+                    "upgrade_checks prune commit failed (removals rolled back): {}",
+                    e
+                );
                 return 0;
             }
             removed
