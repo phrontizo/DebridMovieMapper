@@ -1225,6 +1225,74 @@ mod tests {
         );
     }
 
+    /// Spawn a loopback server that CLOSES the first accepted connection without sending any HTTP
+    /// response (a statusless transport error — EOF before any status/headers), then serves `body`
+    /// under `status_line` on every later connection. Lets a test drive the "transient transport
+    /// error → retry → succeed" arm. Returns (base_url, connection_count).
+    async fn spawn_fail_first_then_serve(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = count.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let seen = c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                if seen == 0 {
+                    // First connection: drain the request then drop the socket WITHOUT any HTTP
+                    // response, so the client's `send()` fails at the transport level (EOF before
+                    // headers → no HTTP status) — exercising the statusless-transport-error retry arm.
+                    drop(sock);
+                    continue;
+                }
+                let head = format!(
+                    "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status_line,
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{}/", addr), count)
+    }
+
+    #[tokio::test]
+    async fn unrestrict_retries_transport_error_then_succeeds() {
+        // Complement to `resolve_url_maps_transport_failure_to_unavailable`, which only pins the
+        // statusless-transport-error arm to FAILURE (every attempt refused). Here the FIRST connection
+        // is dropped without an HTTP response (a transport error, no status) and the RETRY is served
+        // valid unrestrict JSON — so the small-backoff/retry-within-budget arm must recover and
+        // ultimately SUCCEED. Asserts both the Ok result and that it took exactly two connection
+        // attempts (fail once, then succeed) — the retry actually re-connected, not a cache hit.
+        use std::sync::atomic::Ordering;
+        let body =
+            r#"{"id":"x","link":"https://real-debrid.com/d/abc","download":"https://cdn/x"}"#;
+        let (url, count) = spawn_fail_first_then_serve("HTTP/1.1 200 OK", body).await;
+        let client = RealDebridClient::new("fake".to_string())
+            .unwrap()
+            .with_base_url(url);
+        let resp = client
+            .unrestrict_link("https://real-debrid.com/d/abc")
+            .await
+            .expect("a transient transport error must be retried and then succeed");
+        assert_eq!(
+            resp.download, "https://cdn/x",
+            "the retry's valid response must be returned"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "the first (dropped) connection fails at transport; the second (served) succeeds"
+        );
+    }
+
     #[tokio::test]
     async fn resolve_url_maps_a_none_link_to_unavailable() {
         // A locator with no restricted `link` (e.g. a mirror/repair edge case) must resolve to
