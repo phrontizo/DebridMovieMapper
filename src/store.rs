@@ -1527,16 +1527,46 @@ impl Store {
     /// from the scan loop. The keep-set is derived from the current owned set exactly as the upgrade
     /// job stamps the cursor (`upgrade_check_key(media_type, tmdb_id)`). Returns rows removed.
     pub async fn prune_upgrade_checks_not_owned(&self) -> usize {
-        let keep: std::collections::HashSet<String> = self
-            .all_owned()
-            .await
-            .into_iter()
-            .map(|(_, rec)| {
-                let media_type = media_kind_to_type(rec.request.kind);
-                upgrade_check_key(&media_type, rec.request.tmdb_id)
-            })
-            .collect();
         let db = self.db.clone();
+        // Build the keep-set reading ONLY request.kind + request.tmdb_id from each owned row (via a
+        // minimal serde view), not the full OwnedRecord — this runs ~daily over the whole owned
+        // table, whose provenance/provides/quality blobs are irrelevant to the cursor key.
+        let keep: std::collections::HashSet<String> = {
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || {
+                #[derive(serde::Deserialize)]
+                struct OwnedKeyReq {
+                    kind: crate::scraper::MediaKind,
+                    tmdb_id: u64,
+                }
+                #[derive(serde::Deserialize)]
+                struct OwnedKeyView {
+                    request: OwnedKeyReq,
+                }
+                let mut keep = std::collections::HashSet::new();
+                if let Ok(txn) = db.begin_read() {
+                    if let Ok(table) = txn.open_table(OWNED_TABLE) {
+                        if let Ok(iter) = table.iter() {
+                            for entry in iter {
+                                let v = match entry {
+                                    Ok((_, v)) => v,
+                                    Err(_) => continue,
+                                };
+                                if let Ok(view) =
+                                    serde_json::from_slice::<OwnedKeyView>(v.value())
+                                {
+                                    let media_type = media_kind_to_type(view.request.kind);
+                                    keep.insert(upgrade_check_key(&media_type, view.request.tmdb_id));
+                                }
+                            }
+                        }
+                    }
+                }
+                keep
+            })
+            .await
+            .unwrap_or_default()
+        };
         tokio::task::spawn_blocking(move || -> usize {
             let txn = match db.begin_write() {
                 Ok(t) => t,
