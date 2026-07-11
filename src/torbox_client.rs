@@ -719,9 +719,14 @@ impl TorBoxClient {
 
     pub async fn delete_torrent_raw(&self, id: &str) -> Result<(), reqwest::Error> {
         let url = format!("{}/torrents/controltorrent", TORBOX_BASE);
-        // Refuse to act on a malformed id rather than defaulting to 0, which would
-        // issue a delete against an unintended torrent and report success.
+        // Refuse to act on a malformed OR semantically-invalid id rather than defaulting to 0, which
+        // would issue a delete against an unintended torrent and report success. `map_listed_torrents`
+        // already drops id-0 entries, but enforce the `> 0` invariant locally so a future caller that
+        // passes an unvalidated "0"/negative id can never delete against `torrent_id: 0`.
         let torrent_id: i64 = id.parse().map_err(|_| synthetic_bad_gateway())?;
+        if torrent_id <= 0 {
+            return Err(synthetic_bad_gateway());
+        }
         let body = serde_json::json!({ "torrent_id": torrent_id, "operation": "delete" });
         // NOTE: unlike Real-Debrid (which maps a 404 on delete to `Ok(())` for idempotency), TorBox
         // has no clean "already gone" signal here — controltorrent returns `success:false` with an
@@ -818,6 +823,19 @@ impl crate::provider::DebridProvider for TorBoxClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn delete_torrent_raw_refuses_a_non_positive_or_malformed_id() {
+        // The "won't act on an unusable id" guarantee must hold locally: a non-numeric, "0", or
+        // negative id must error WITHOUT issuing a delete (which would hit torrent_id: 0 / a bogus id).
+        let client = TorBoxClient::new("fake".to_string()).unwrap();
+        for id in ["", "abc", "0", "-5", "  "] {
+            assert!(
+                client.delete_torrent_raw(id).await.is_err(),
+                "delete_torrent_raw({id:?}) must refuse an unusable id"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn resolve_cache_invalidate_and_evict() {
