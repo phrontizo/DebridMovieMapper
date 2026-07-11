@@ -1383,6 +1383,44 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn refresh_does_not_retry_a_5xx_single_use_token() {
+        // The refresh grant is single-use: a 5xx may mean Trakt already processed it and rotated the
+        // token, so resending would double-spend and could turn a transient blip into a false
+        // needs_reenrolment. refresh() must NOT retry a 5xx (only a read like me() does) — exactly
+        // ONE request, then surface the error. Guards the retry_server_errors == false path.
+        let (url, counter) = spawn_status_repeating(503).await;
+        let client = TraktClientImpl::new("cid".into(), "secret".into(), reqwest::Client::new())
+            .with_base_url(url);
+        assert!(
+            client.refresh("rt").await.is_err(),
+            "a 5xx on refresh must surface as an error"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "refresh must NOT retry a 5xx (single-use token): exactly one request"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_does_not_retry_a_transport_error_single_use_token() {
+        // Same single-use guarantee for a transport error (dropped connection): refresh must not
+        // resend — exactly one attempt — unlike me(), which retries a transient transport error.
+        let (url, counter) = spawn_drop_then_json(1, r#"{"access_token":"a"}"#).await;
+        let client = TraktClientImpl::new("cid".into(), "secret".into(), reqwest::Client::new())
+            .with_base_url(url);
+        assert!(
+            client.refresh("rt").await.is_err(),
+            "a dropped connection on refresh must surface as an error, not retry"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "refresh must NOT retry a transport error (single-use token): exactly one request"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn send_with_retry_recovers_from_a_429_then_success() {
         // A single 429 (rate-limited) must record the throttle and RETRY, recovering on the next
         // 200 — not surface as an error. Guards the 429 record_throttle+retry branch. `start_paused`
