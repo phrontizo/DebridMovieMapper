@@ -1063,10 +1063,10 @@ mod tests {
             calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 Ok(match offset {
-                    0 => vec![1, 2],       // short, but NOT the end
-                    3 => vec![3, 4, 5],    // full
-                    6 => vec![6],          // short again
-                    _ => vec![],           // empty → true end
+                    0 => vec![1, 2],    // short, but NOT the end
+                    3 => vec![3, 4, 5], // full
+                    6 => vec![6],       // short again
+                    _ => vec![],        // empty → true end
                 })
             }
         })
@@ -1077,7 +1077,10 @@ mod tests {
             vec![1, 2, 3, 4, 5, 6],
             "a short non-final page must not truncate the listing"
         );
-        assert!(!hit_cap, "reaching the empty terminator is a complete, non-truncated listing");
+        assert!(
+            !hit_cap,
+            "reaching the empty terminator is a complete, non-truncated listing"
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             4,

@@ -399,13 +399,19 @@ mod tests {
         });
         let cands = parse_streams(&json);
         assert_eq!(cands.len(), 2);
-        assert_eq!(cands[0].info_hash, "aabbccddeeff00112233445566778899aabbccdd");
+        assert_eq!(
+            cands[0].info_hash,
+            "aabbccddeeff00112233445566778899aabbccdd"
+        );
         assert_eq!(cands[0].file_idx, Some(0));
         assert_eq!(
             cands[0].file_name.as_deref(),
             Some("Movie.2023.1080p.x265-GRP.mkv")
         );
-        assert_eq!(cands[1].info_hash, "1122334455667788990011223344556677889900");
+        assert_eq!(
+            cands[1].info_hash,
+            "1122334455667788990011223344556677889900"
+        );
         assert_eq!(cands[1].file_idx, None);
     }
 
@@ -434,7 +440,10 @@ mod tests {
         });
         let cands = parse_streams(&json);
         assert_eq!(cands.len(), 1);
-        assert_eq!(cands[0].info_hash, "64877b5490208c3015c0f5121287949d62622e54");
+        assert_eq!(
+            cands[0].info_hash,
+            "64877b5490208c3015c0f5121287949d62622e54"
+        );
     }
 
     #[test]
