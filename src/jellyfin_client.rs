@@ -3,7 +3,9 @@ use reqwest::header::HeaderValue;
 use std::time::Duration;
 use tracing::info;
 
-const MAX_RETRIES: u32 = 10;
+// Total number of send attempts (the loop is `0..MAX_SEND_ATTEMPTS`), NOT 1 + N retries — i.e. 10
+// sends, matching the "attempt N/10" log text.
+const MAX_SEND_ATTEMPTS: u32 = 10;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 /// Delay before sending notification to let rclone's directory cache expire.
 /// Must be longer than rclone's --dir-cache-time (default 10s in compose.yml).
@@ -109,7 +111,7 @@ impl JellyfinClient {
         // when it checks the filesystem after receiving our notification.
         tokio::time::sleep(NOTIFICATION_DELAY).await;
 
-        for attempt in 0..MAX_RETRIES {
+        for attempt in 0..MAX_SEND_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(RETRY_DELAY).await;
             }
@@ -135,7 +137,7 @@ impl JellyfinClient {
                                 "Jellyfin returned {} (transient), attempt {}/{}",
                                 status,
                                 attempt + 1,
-                                MAX_RETRIES
+                                MAX_SEND_ATTEMPTS
                             );
                             continue;
                         }
@@ -161,7 +163,7 @@ impl JellyfinClient {
                             "cannot connect"
                         },
                         attempt + 1,
-                        MAX_RETRIES
+                        MAX_SEND_ATTEMPTS
                     );
                     continue;
                 }
@@ -174,7 +176,7 @@ impl JellyfinClient {
 
         tracing::warn!(
             "Jellyfin notification failed after {} attempts",
-            MAX_RETRIES
+            MAX_SEND_ATTEMPTS
         );
     }
 
