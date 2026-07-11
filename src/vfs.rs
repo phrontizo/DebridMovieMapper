@@ -469,27 +469,38 @@ impl DebridVfs {
                     // only when `links` is empty (TorBox) or has a link at its position — otherwise
                     // present_files would mark a file "present" that the emit loop then refuses to
                     // emit, suppressing every other torrent's copy and vanishing the episode.
-                    // Computed BEFORE the loop below moves `torrents`.
-                    let present_files: std::collections::HashSet<(String, String)> = torrents
-                        .iter()
-                        .flat_map(|t| {
-                            let h = t.hash.to_ascii_lowercase();
-                            let links_empty = t.links.is_empty();
-                            let mut link_idx = 0usize;
-                            let mut out: Vec<(String, String)> = Vec::new();
-                            for f in &t.files {
-                                if f.selected == 1 {
-                                    if is_video_file(&f.path)
-                                        && (links_empty || t.links.get(link_idx).is_some())
-                                    {
-                                        out.push((h.clone(), f.path.clone()));
+                    // Computed BEFORE the loop below moves `torrents`. `present_files` is consulted
+                    // ONLY inside the `if let Some(sel) = selection.get(episode_slot(...))` branch
+                    // below, which can't fire when this show is unidentified (no `show_tmdb`) or the
+                    // deployment holds no managed selections at all. Skip the build (a per-tick clone
+                    // of every selected video file in the group) in those cases — the common
+                    // mirror-only / pre-SP3 deployment has an empty `selection`, so this avoids the
+                    // work entirely there.
+                    let present_files: std::collections::HashSet<(String, String)> =
+                        if show_tmdb.is_some() && !selection.is_empty() {
+                            torrents
+                                .iter()
+                                .flat_map(|t| {
+                                    let h = t.hash.to_ascii_lowercase();
+                                    let links_empty = t.links.is_empty();
+                                    let mut link_idx = 0usize;
+                                    let mut out: Vec<(String, String)> = Vec::new();
+                                    for f in &t.files {
+                                        if f.selected == 1 {
+                                            if is_video_file(&f.path)
+                                                && (links_empty || t.links.get(link_idx).is_some())
+                                            {
+                                                out.push((h.clone(), f.path.clone()));
+                                            }
+                                            link_idx += 1;
+                                        }
                                     }
-                                    link_idx += 1;
-                                }
-                            }
-                            out
-                        })
-                        .collect();
+                                    out
+                                })
+                                .collect()
+                        } else {
+                            std::collections::HashSet::new()
+                        };
                     for torrent in torrents {
                         let torrent_ts = parse_rd_date(&torrent.added);
                         if torrent_ts > show_max_ts {
