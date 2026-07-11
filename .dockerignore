@@ -6,6 +6,10 @@ metadata.db/
 .idea/
 # Logs (any *.log, not just the old run.log name) — keeps stray logs out of the build context.
 *.log
+# Review-loop iteration scratch files (git-ignored, so absent from a clean CI clone, but present on
+# a local `docker build .` where they bloat the context sent to the daemon). Mirror .gitignore.
+iter-*.jsonl
+iter-*.err
 # Repo content the build never COPYs — excluded to shrink the context sent to the daemon.
 docs/
 examples/
