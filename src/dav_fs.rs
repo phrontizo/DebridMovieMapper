@@ -1507,6 +1507,48 @@ mod provider_abstraction_tests {
         );
     }
 
+    /// Always replies `206 Partial Content` advertising a Content-Length far above the fetch window
+    /// (a non-compliant CDN echoing a huge body as "partial"). Content-Range start = 0 so ONLY the
+    /// oversized guard fires, not the range-mismatch guard.
+    async fn spawn_always_oversized_206(content_length: u64) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    content_length - 1,
+                    content_length,
+                    content_length
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{}/", addr)
+    }
+
+    #[tokio::test]
+    async fn fetch_cdn_range_rejects_and_invalidates_on_oversized_206() {
+        // A 206 whose advertised Content-Length exceeds the 16 MB fetch cap (a non-compliant CDN
+        // echoing a huge body as "partial") must be rejected as unusable and the cached URL dropped
+        // for re-resolution — the 206 analogue of the whole-object-200 rejection.
+        let url = spawn_always_oversized_206(MAX_FETCH_SIZE as u64 + 1_000_000).await;
+        let (mut f, invalidate_calls) = proxied_with_counter(url, 0, 5_000_000_000);
+        let result = f.fetch_bytes(8).await;
+        assert!(result.is_err(), "an oversized 206 must be rejected");
+        assert!(
+            invalidate_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "an oversized 206 must invalidate the cached resolution for re-resolution"
+        );
+    }
+
     #[tokio::test]
     async fn fetch_cdn_range_does_not_invalidate_on_connection_error() {
         // A transient TCP failure must NOT invalidate — the URL is still valid, and many
