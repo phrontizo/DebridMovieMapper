@@ -634,7 +634,8 @@ impl TorBoxClient {
         // 10000 supported) and accepts `offset`. A single unbounded fetch would SILENTLY TRUNCATE
         // the library for accounts with >1000 torrents — and downstream treats an owned title absent
         // from the listing as lapsed → re-acquire, so truncation would cause a re-acquisition storm +
-        // duplicate adds. Paginate until a short page, mirroring the RD client's `get_torrents`.
+        // duplicate adds. Paginate until an EMPTY page, mirroring the RD client's `get_torrents`
+        // (a short-but-non-final page must NOT be mistaken for end-of-list — see `paginate`).
         const PAGE: usize = 1000;
         const MAX_PAGES: usize = 50; // 50k-torrent backstop against an offset-ignoring API
         let (raw, hit_cap) = paginate(PAGE, MAX_PAGES, |offset| {
