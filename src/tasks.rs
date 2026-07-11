@@ -3302,6 +3302,40 @@ mod tests {
     }
 
     #[test]
+    fn plan_dedup_never_removes_a_manual_show_copy() {
+        use crate::scraper::MediaKind;
+        // M-1 for the SHOW branch (the Movie branch is covered by
+        // `plan_dedup_never_removes_a_manual_copy`): a Manual show singleton that is FULLY covered by a
+        // higher-priority pack must NEVER be dedup-removed, even though it is redundant — only the
+        // genuinely-redundant NON-manual duplicate is removed. Guards both the greedy-pass keep
+        // (`has_manual_entry()`, tasks.rs:1765) and the second-sweep `protected_from_removal` set
+        // (tasks.rs:1786-1795); dropping the guard from either would delete "man" here.
+        let pack = dedup_rec(MediaKind::Series, 1, vec![(1, 1), (1, 2)], Some(999));
+        let mut man = dedup_rec(MediaKind::Series, 1, vec![(1, 1)], Some(10));
+        man.provenance = Provenance::manual();
+        let dup = dedup_rec(MediaKind::Series, 1, vec![(1, 1)], Some(1));
+        let owned = vec![
+            ("pack".to_string(), pack),
+            ("man".to_string(), man),
+            ("dup".to_string(), dup),
+        ];
+        // `pack` is `selected` so it wins the keep slot; `man` and `dup` are both fully covered by it.
+        let plans = plan_dedup(&owned, &hset(&["pack", "man", "dup"]), &hset(&["pack"]));
+        assert_eq!(plans.len(), 1);
+        assert!(
+            !plans[0].remove.contains(&"man".to_string()),
+            "a Manual show copy must never be dedup-removed, even when fully covered"
+        );
+        assert_eq!(
+            plans[0].remove,
+            vec!["dup"],
+            "only the redundant non-manual duplicate is removed"
+        );
+        assert!(plans[0].keep.contains(&"pack".to_string()));
+        assert!(plans[0].keep.contains(&"man".to_string()));
+    }
+
+    #[test]
     fn plan_dedup_show_pack_supersedes_redundant_single() {
         use crate::scraper::MediaKind;
         let owned = vec![
