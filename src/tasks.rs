@@ -767,11 +767,21 @@ pub async fn sync_trakt(
                 // resurrect it from the stale snapshot.
                 continue;
             };
-            let flagged = crate::store::TraktTokens {
-                needs_reenrolment: true,
-                ..current
-            };
-            if let Err(pe) = store.put_trakt_tokens(slug, flagged).await {
+            // Flip ONLY the flag via the same refresh-keyed compare-and-swap the refresh paths use
+            // (`update_trakt_tokens_if_refresh_matches`). A blind `put_trakt_tokens` here would
+            // resurrect an account removed — or clobber a token rotated by a concurrent `/refresh` —
+            // in the get→write window; the CAS makes both a no-op. Setting the flag never rotates
+            // `refresh`, so keying on `current.refresh` is safe.
+            if let Err(pe) = store
+                .update_trakt_tokens_if_refresh_matches(
+                    slug.clone(),
+                    current.refresh.clone(),
+                    |c| {
+                        c.needs_reenrolment = true;
+                    },
+                )
+                .await
+            {
                 error!("Failed to persist re-enrolment flag for account: {}", pe);
             }
         }
@@ -1030,26 +1040,25 @@ async fn sync_trakt_user(
         store.put_wanted(rec).await?;
     }
 
-    // Clear a stale re-enrolment flag now that this sync has succeeded. RE-READ the current record
-    // and flip ONLY the flag (read-modify-write) rather than writing back the snapshot `tokens`:
-    // this branch runs only when NO refresh occurred this cycle (so `tokens` is the pre-sync
-    // snapshot), and a concurrent `/refresh`/enrolment may have rotated access/refresh during this
-    // user's read window — writing the stale snapshot back would clobber the fresh token. Also skip
-    // if the account was concurrently removed (don't resurrect it). Mirrors `enrolment::refresh_account`.
+    // Clear a stale re-enrolment flag now that this sync has succeeded, via the same refresh-keyed
+    // compare-and-swap the refresh paths use (`update_trakt_tokens_if_refresh_matches`). This branch
+    // runs only when NO refresh occurred this cycle (a refresh already clears the flag and leaves
+    // `tokens.needs_reenrolment == false`), so `tokens` is the pre-sync snapshot; a concurrent
+    // `/refresh`/enrolment may have rotated access/refresh during this user's read window. The CAS
+    // writes only while the stored refresh still equals the snapshot's, so it can neither clobber a
+    // freshly-rotated token nor resurrect a concurrently-removed account (a plain get-then-put
+    // would race in the get→write window). Clearing the flag never rotates `refresh`, so keying on
+    // `tokens.refresh` is safe.
     if tokens.needs_reenrolment {
-        if let Some(current) = store.get_trakt_tokens(slug.to_string()).await {
-            if current.needs_reenrolment {
-                store
-                    .put_trakt_tokens(
-                        slug.to_string(),
-                        TraktTokens {
-                            needs_reenrolment: false,
-                            ..current
-                        },
-                    )
-                    .await?;
-            }
-        }
+        store
+            .update_trakt_tokens_if_refresh_matches(
+                slug.to_string(),
+                tokens.refresh.clone(),
+                |c| {
+                    c.needs_reenrolment = false;
+                },
+            )
+            .await?;
     }
 
     Ok(())
