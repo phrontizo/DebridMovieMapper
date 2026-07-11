@@ -90,11 +90,16 @@ pub struct ReleaseInfo {
 
 // An optional 2-3 digit framerate suffix (`(?:\d{2,3})?`) is tolerated after the `p` so a
 // framerate-glued token like "2160p60"/"1080p50" is still recognised as its base resolution.
-// Without it those tokens matched nothing → `resolution: None`, and `score` lets a None-resolution
-// release THROUGH the ceiling check, silently bypassing the `MAX_RESOLUTION` hard-filter. The
-// trailing `\b` still rejects "1080part" (the empty framerate match leaves `p`→`a`, no boundary).
+// There is NO trailing word-boundary: a token glued to a following letter/bit-depth marker
+// ("2160p10bit"/"2160pHDR"/"2160pHEVC") must still read as its base resolution, because `score`
+// lets a `resolution: None` release THROUGH the ceiling check, silently bypassing the
+// `MAX_RESOLUTION` hard-filter. A `\b` there (the prior form) made those tokens match nothing →
+// over-ceiling bypass. The LEADING `\b` is kept (rejecting "x2160p"), and only a literal `\d{3,4}p`
+// run is matched, so a glued suffix can only turn a would-be-`None` into the correct base
+// resolution — never mis-tag a non-resolution token (no real release name has such a token). The
+// `regex` crate has no lookahead, so this boundary-free form is the portable fix.
 static RES_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(\d{3,4})p(?:\d{2,3})?\b|\b(4k|uhd)\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\b(\d{3,4})p(?:\d{2,3})?|\b(4k|uhd)\b").unwrap());
 static SIZE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)([\d.]+)\s*(gb|mb)").unwrap());
 static SEED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{1f464}\s*(\d+)").unwrap());
 // The debrid-cached marker (`RD+`/`TB+`) matched as a WORD-BOUNDED token, not a raw substring, so a
@@ -623,6 +628,31 @@ mod tests {
         assert_eq!(r.resolution, Some(2160), "2160p60 must parse as 2160");
         // Excluded at a 1080 ceiling.
         assert_eq!(score(&r, &prefs()), None);
+    }
+
+    #[test]
+    fn letter_glued_resolution_token_is_still_parsed_and_ceiling_filtered() {
+        // A resolution token glued directly to a following bit-depth/HDR/codec marker
+        // ("2160p10bit", "2160pHDR", "2160pHEVC") must still read as 2160 so the MAX_RESOLUTION
+        // hard-filter can exclude it. The old trailing word-boundary made such tokens match nothing
+        // (`resolution: None`), and `score` lets a None-resolution release THROUGH the ceiling — the
+        // same over-ceiling bypass the framerate-suffix case fixed, but for a glued LETTER. The clean
+        // Torrentio `name` line is omitted so only the glued description-side token is available.
+        for token in ["2160p10bit", "2160pHDR", "2160pHEVC"] {
+            let c = raw(
+                "Torrentio",
+                &format!("Movie.2023.{token}.WEB-DL-GRP\n\u{1f4be} 30 GB \u{1f464} 9\nRD+"),
+                "fps",
+                Some("Movie.2023.mkv"),
+            );
+            let r = parse(&c);
+            assert_eq!(r.resolution, Some(2160), "{token} must parse as 2160");
+            assert_eq!(
+                score(&r, &prefs()),
+                None,
+                "{token} must be excluded at a 1080 ceiling"
+            );
+        }
     }
 
     #[test]
