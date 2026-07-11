@@ -828,6 +828,16 @@ pub async fn probe_tracks(http: &reqwest::Client, cdn_url: &str) -> Result<Vec<T
                         // request. (Unlike the MP4 path, whose `moov` extent CONTAINS the tracks.)
                         let bigger =
                             fetch_range(http, cdn_url, 0, MAX_PROBE_FETCH as u64 - 1).await?;
+                        // The recovery fetch hits the SAME offset 0 whose front read just returned
+                        // valid MKV magic, so a body that came back shorter than that front read is
+                        // a transient CDN truncation, NOT a broken release. Guard it: on a
+                        // truncated/garbled buffer `parse_mkv_tracks` returns `Corrupt`, which
+                        // `acquire` treats as definitive and blacklists the hash for 30 days. Defer +
+                        // retry instead. (The MP4 sibling is naturally safe here — a short recovery
+                        // buffer yields `TracksNotFound`/accept, never `Corrupt`.)
+                        if bigger.len() < front.len() {
+                            return Err(ProbeError::Transient);
+                        }
                         parse_mkv_tracks(&bigger)
                     }
                     Some(_) => Err(ProbeError::TracksNotFound), // overrun > cap → accept, don't churn
@@ -1420,6 +1430,70 @@ mod tests {
             "a sub-magic front read must defer, not accept as Unsupported; got {result:?}"
         );
     }
+    #[tokio::test]
+    async fn probe_tracks_mkv_recovery_truncated_refetch_defers_not_corrupt() {
+        // The MKV large-/pre-`Tracks` recovery issues a SECOND (larger) fetch to offset 0. The front
+        // read already returned valid MKV magic, so a truncated recovery body is a transient CDN
+        // hiccup, NOT a broken release — it must DEFER (Transient), never be classified `Corrupt`
+        // (a 30-day blacklist of a valid file).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Front body: valid EBML header + a Segment whose pre-`Tracks` Void declares a ~5 MB extent
+        // past the front window, so the front parse defers and `front_mkv_tracks_extent` reports an
+        // in-cap recovery end (same shape as `front_mkv_tracks_extent_reports_a_pre_tracks_overrun`).
+        let void = ebml_elem_sized(0xEC, 5_000_000, &[0u8; 4]);
+        let mut audio = Vec::new();
+        audio.extend(ebml_elem(0x83, &[2]));
+        audio.extend(ebml_elem(0x22B59C, b"eng"));
+        let mut seg_payload = void;
+        seg_payload.extend(ebml_elem(0x1654AE6B, &ebml_elem(0xAE, &audio)));
+        let segment = ebml_elem_sized(0x18538067, 8_000_000_000, &seg_payload);
+        let mut front_body = ebml_elem(0x1A45DFA3, &[]);
+        front_body.extend(segment);
+        assert!(
+            front_body.len() > 8,
+            "front body must exceed the container magic"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // 1st request (front read): serve the overrunning-but-valid front body.
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/9000000000\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    front_body.len() - 1,
+                    front_body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&front_body).await;
+                let _ = sock.flush().await;
+            }
+            // 2nd request (recovery read): serve a truncated 4-byte body (a transient origin hiccup),
+            // shorter than the front read — the guard must map this to Transient, not Corrupt.
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let body = b"\x1a\x45\xdf\xa3"; // 4 bytes — shorter than the front body
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/9000000000\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let url = format!("http://{}/", addr);
+        let result = probe_tracks(&reqwest::Client::new(), &url).await;
+        assert!(
+            matches!(result, Err(ProbeError::Transient)),
+            "a truncated MKV recovery re-fetch must defer, not blacklist as Corrupt; got {result:?}"
+        );
+    }
+
     #[test]
     fn verify_audio_original_and_subtitle_rules() {
         let tracks = vec![
