@@ -1279,6 +1279,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_url_success_returns_the_download_link() {
+        // The trait-level `resolve_url` SUCCESS path returns the unrestricted `download` URL (the
+        // field `dav_fs` streams bytes from), NOT `link`. The error paths are covered above; this
+        // pins the happy path so a future refactor can't silently return the wrong field.
+        use crate::provider::DebridProvider as _;
+        let loc = crate::provider::FileLocator {
+            hash: "h".to_string(),
+            torrent_id: "t".to_string(),
+            file_id: 0,
+            file_path: "/x.mkv".to_string(),
+            link: Some("https://real-debrid.com/d/abc".to_string()),
+        };
+        let body =
+            r#"{"id":"x","link":"https://real-debrid.com/d/abc","download":"https://cdn/x"}"#;
+        let (url, _c) = spawn_counting("HTTP/1.1 200 OK", body).await;
+        let client = RealDebridClient::new("fake".to_string())
+            .unwrap()
+            .with_base_url(url);
+        assert_eq!(
+            client.resolve_url(&loc).await.unwrap(),
+            "https://cdn/x",
+            "resolve_url must return the `download` URL on success"
+        );
+    }
+
+    #[tokio::test]
     async fn unrestrict_link_5xx_is_terminal_single_attempt_and_resolves_unavailable() {
         // A 5xx on unrestrict/link is in the terminal set, so the synchronous playback resolve must
         // hit the API exactly ONCE (fail over to instant repair) rather than run the 3-attempt budget
