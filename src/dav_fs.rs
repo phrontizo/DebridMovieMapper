@@ -1122,7 +1122,7 @@ mod provider_abstraction_tests {
 
     #[tokio::test]
     async fn opened_nfo_reports_the_real_mtime_not_unix_epoch() {
-        use dav_server::fs::{DavFile, DavFileSystem, OpenOptions};
+        use dav_server::fs::{DavFileSystem, OpenOptions};
 
         let torrents = vec![(
             crate::rd_client::TorrentInfo {
