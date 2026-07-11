@@ -725,6 +725,24 @@ impl Store {
         }
     }
 
+    /// Like `flatten_join`, but for a blocking closure that itself returns `Result<T, AppError>`
+    /// (its inner error is already an `AppError` — e.g. a `serde` re-serialise failure — so it can't
+    /// go through `flatten_join`, which maps a `redb::Error`). Collapses the `spawn_blocking`
+    /// JoinError into an `AppError::Task` identically.
+    fn flatten_join_app<T>(
+        result: Result<Result<T, AppError>, tokio::task::JoinError>,
+    ) -> Result<T, AppError> {
+        match result {
+            Ok(inner) => inner,
+            Err(e) => {
+                error!("redb blocking write task did not complete: {:?}", e);
+                Err(AppError::Task(format!(
+                    "redb blocking task did not complete: {e}"
+                )))
+            }
+        }
+    }
+
     /// Log a read error (with `ctx`) and map it to `None`, so a point-lookup accessor distinguishes a
     /// genuine miss (`Ok(None)`) from a transient begin_read/open_table/get/deserialise failure that a
     /// bare `.ok()` would silently swallow — a false "absent" on an authoritative table (owned/wanted/
@@ -888,15 +906,7 @@ impl Store {
             Ok(())
         })
         .await;
-        match result {
-            Ok(inner) => inner,
-            Err(e) => {
-                error!("redb blocking write task did not complete: {:?}", e);
-                Err(AppError::Task(format!(
-                    "redb blocking task did not complete: {e}"
-                )))
-            }
-        }
+        Self::flatten_join_app(result)
     }
 
     pub async fn remove_owned(&self, hash: String) -> Result<(), AppError> {
@@ -1341,15 +1351,7 @@ impl Store {
             Ok(applied)
         })
         .await;
-        match result {
-            Ok(inner) => inner,
-            Err(e) => {
-                error!("redb blocking write task did not complete: {:?}", e);
-                Err(AppError::Task(format!(
-                    "redb blocking task did not complete: {e}"
-                )))
-            }
-        }
+        Self::flatten_join_app(result)
     }
 
     pub async fn get_trakt_tokens(&self, slug: String) -> Option<TraktTokens> {
