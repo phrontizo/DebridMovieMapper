@@ -66,7 +66,11 @@ impl EnrolmentService {
                 self.accounts_page().await
             }
             (&Method::POST, ["trakt", "accounts", slug, "refresh"]) => {
-                if let Err(e) = self.refresh_account(slug).await {
+                // Decode the percent-encoded path segment back to the raw stored slug (see
+                // `decode_path_segment`) — otherwise a fallback slug with a space/special byte
+                // never matches the stored key and the button silently no-ops.
+                let slug = decode_path_segment(slug);
+                if let Err(e) = self.refresh_account(&slug).await {
                     // refresh_account already logs + flags the account on a Trakt-refresh failure;
                     // the only error surfaced here is a token-store write failure, which would
                     // otherwise be lost silently (unlike the `remove` arm below).
@@ -75,7 +79,8 @@ impl EnrolmentService {
                 redirect("/trakt/accounts")
             }
             (&Method::POST, ["trakt", "accounts", slug, "remove"]) => {
-                if let Err(e) = self.remove_account(slug).await {
+                let slug = decode_path_segment(slug);
+                if let Err(e) = self.remove_account(&slug).await {
                     warn!("Trakt token removal failed for '{}': {}", slug, e);
                 }
                 redirect("/trakt/accounts")
@@ -327,6 +332,33 @@ fn encode_path_segment(s: &str) -> String {
         }
     }
     out
+}
+
+/// Percent-decode a single URL path segment — the exact inverse of `encode_path_segment`, so a
+/// slug rendered into the `/trakt/accounts/<slug>/…` action URL round-trips back to its stored
+/// key. Without this, a username-fallback slug carrying a non-unreserved byte (a space, `.`
+/// exempt — e.g. `"Bob Smith"` → encoded `"Bob%20Smith"`) would arrive at the refresh/remove
+/// handler still percent-encoded and never match the token stored under the raw slug, silently
+/// no-op-ing the button. A malformed `%` escape is passed through literally; the decoded bytes
+/// are interpreted as UTF-8 (lossy) so a non-ASCII slug still round-trips.
+fn decode_path_segment(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The enrolment instructions page (shows the device user_code + verification URL).
@@ -782,6 +814,27 @@ mod tests {
         // A path-significant character can't break out of the /trakt/accounts/<slug>/… route.
         assert_eq!(encode_path_segment("a/b"), "a%2Fb");
         assert_eq!(encode_path_segment("a b?c#d"), "a%20b%3Fc%23d");
+    }
+
+    #[test]
+    fn decode_path_segment_inverts_encode() {
+        // Every slug the router might receive must round-trip back to its stored key, otherwise
+        // the refresh/remove buttons silently no-op for a fallback slug (see the space case).
+        for slug in [
+            "kiril-p",
+            "user_123.x~y",
+            "Bob Smith",
+            "a/b",
+            "a b?c#d",
+            "naïve.usér",
+            "100%done",
+        ] {
+            assert_eq!(decode_path_segment(&encode_path_segment(slug)), slug);
+        }
+        // A malformed `%` escape is passed through literally rather than dropped or panicking.
+        assert_eq!(decode_path_segment("ab%"), "ab%");
+        assert_eq!(decode_path_segment("ab%4"), "ab%4");
+        assert_eq!(decode_path_segment("ab%zz"), "ab%zz");
     }
 
     #[test]
