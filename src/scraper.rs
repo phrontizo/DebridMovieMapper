@@ -147,10 +147,17 @@ fn hash_idx_from_url(url: &str) -> Option<(String, Option<usize>)> {
 }
 
 /// Whether a 4xx status from the addon indicates a PERMANENT config problem (misconfigured URL /
-/// revoked provider token) worth a distinct operator warning — as opposed to a transient 429
-/// rate-limit. `404` is handled earlier as "no streams" and never reaches this predicate.
+/// revoked provider token) worth the distinct operator warning. Scoped to the auth/config statuses
+/// (400/401/403) ONLY — a transient/unrelated 4xx (408 Request Timeout, 425 Too Early, 451, …) must
+/// NOT trigger the alarming "misconfigured/revoked token" message. `404` is handled earlier as "no
+/// streams" and `429` is the transient rate-limit; neither reaches (or matches) this predicate.
 fn is_config_error_status(status: reqwest::StatusCode) -> bool {
-    status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST
+            | reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN
+    )
 }
 
 /// Whether `h` is a structurally-valid (already-lowercased) BitTorrent infohash: 40 hex chars
@@ -661,8 +668,14 @@ mod tests {
         assert!(is_config_error_status(StatusCode::BAD_REQUEST));
         assert!(is_config_error_status(StatusCode::UNAUTHORIZED));
         assert!(is_config_error_status(StatusCode::FORBIDDEN));
-        // Transient / non-config → NOT warn-worthy.
+        // Transient / non-config → NOT warn-worthy (a 4xx that isn't an auth/config error must not
+        // masquerade as "misconfigured/revoked token").
         assert!(!is_config_error_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!is_config_error_status(StatusCode::REQUEST_TIMEOUT)); // 408
+        assert!(!is_config_error_status(StatusCode::TOO_EARLY)); // 425
+        assert!(!is_config_error_status(
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS // 451
+        ));
         assert!(!is_config_error_status(StatusCode::SERVICE_UNAVAILABLE));
         assert!(!is_config_error_status(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(!is_config_error_status(StatusCode::OK));
