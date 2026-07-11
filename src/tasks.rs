@@ -846,7 +846,11 @@ async fn sync_trakt_user(
         let new_tokens = TraktTokens {
             access: r.access_token,
             refresh,
-            expires_at: r.created_at.saturating_add(r.expires_in),
+            // Share `enrolment::token_expires_at` so a refresh response that omits `created_at`
+            // (parsed to `0`) falls back to the wall clock instead of stamping expiry ~90 days
+            // after the 1970 epoch — which would read as permanently expired and force a
+            // single-use-token refresh on every sync tick (refresh churn against the rate limiter).
+            expires_at: crate::enrolment::token_expires_at(r.created_at, r.expires_in),
             username: tokens.username.clone(),
             needs_reenrolment: false,
         };
@@ -4089,6 +4093,48 @@ mod trakt_sync_tests {
             .get_wanted("alice".to_string(), MediaType::Movie, 27205)
             .await
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn sync_trakt_refresh_missing_created_at_anchors_expiry_on_wall_clock() {
+        // Regression: a refresh response that omits `created_at` (parsed to `0`) must anchor the
+        // stored expiry on the wall clock via `enrolment::token_expires_at`, NOT `0 + expires_in`
+        // (which lands ~90 days after the 1970 epoch → reads as permanently expired → refresh churn
+        // on every sync tick). Mirrors `enrolment`'s two token-write paths.
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".to_string(), tokens("old", 0, false))
+            .await
+            .unwrap();
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            token: TraktTokenResponse {
+                access_token: "REFRESHED".into(),
+                refresh_token: "newref".into(),
+                expires_in: 7_776_000,
+                created_at: 0, // Trakt omitted it
+            },
+            watchlist: vec![item(MediaType::Movie, 27205)],
+            watched: WatchedData::default(),
+            ..Default::default()
+        });
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+
+        let before = crate::now_unix_secs();
+        sync_trakt(&trakt, &tmdb, &store, None, false).await;
+
+        let tok = store.get_trakt_tokens("alice".to_string()).await.unwrap();
+        assert_eq!(
+            tok.access, "REFRESHED",
+            "refresh must have run and persisted"
+        );
+        // Wall-clock-anchored: expiry is roughly `now + expires_in`, far above the epoch-anchored
+        // `0 + expires_in` (7_776_000) the buggy inline calc would have produced.
+        assert!(
+            tok.expires_at >= before.saturating_add(7_776_000),
+            "expiry must anchor on the wall clock (got {}, expected >= {})",
+            tok.expires_at,
+            before.saturating_add(7_776_000)
+        );
     }
 
     #[tokio::test]

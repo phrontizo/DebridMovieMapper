@@ -324,8 +324,9 @@ pub async fn poll_to_completion(
 /// Compute a token's absolute expiry (epoch secs). Trakt anchors `expires_in` on `created_at`;
 /// if Trakt ever omits `created_at` (parsed as `0` by `u64_field`), fall back to the wall clock
 /// so a brand-new token is not stamped as having expired in 1970 — which would otherwise read as
-/// permanently expired and drive perpetual refresh churn.
-fn token_expires_at(created_at: u64, expires_in: u64) -> u64 {
+/// permanently expired and drive perpetual refresh churn. `pub(crate)` so the background
+/// `tasks::sync_trakt_user` refresh path shares the exact same fallback (not a divergent inline calc).
+pub(crate) fn token_expires_at(created_at: u64, expires_in: u64) -> u64 {
     let anchor = if created_at == 0 {
         crate::now_unix_secs()
     } else {
