@@ -632,13 +632,17 @@ pub(crate) fn build_wanted(
     // scan per show (which made the final map O(shows²)).
     let watched_by_id: std::collections::HashMap<u64, &_> =
         watched.shows.iter().map(|s| (s.tmdb_id, s)).collect();
+    // Same for watched movies — a `Vec::contains` per aggregated movie was O(movies × watched_movies);
+    // index into a set once so the membership test below is O(1).
+    let watched_movie_ids: std::collections::HashSet<u64> =
+        watched.movies.iter().copied().collect();
 
     agg.into_iter()
         .map(|((_mt, tmdb_id), a)| {
             let (watched_state, status) = match a.media_type {
                 MediaType::Movie => (
                     WatchedState::Movie {
-                        watched: watched.movies.contains(&tmdb_id),
+                        watched: watched_movie_ids.contains(&tmdb_id),
                     },
                     None,
                 ),
