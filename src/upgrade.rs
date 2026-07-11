@@ -1287,6 +1287,15 @@ async fn upgrade_show_episodes_and_packs(
     let group_prov = merged_provenance(&owned);
 
     // (a) Per-singleton-episode upgrade/downgrade.
+    // ACCEPTED ASYMMETRY with the movie path's `served_slot_is_retained_over_ceiling` guard: this
+    // per-episode upgrade baselines on the SINGLETON's own quality, not on what the episode slot
+    // currently serves. So if the slot happens to point at a co-providing OVER-ceiling pack (higher
+    // served resolution) while this singleton is within-ceiling, a within-ceiling "upgrade" of the
+    // singleton would repoint the slot DOWN in served resolution with the downgrade flag off. This
+    // requires owning BOTH a within-ceiling singleton AND an over-ceiling pack for the same episode
+    // with the slot on the pack — a duplicate state the `provides` owned-episode mechanism normally
+    // prevents from being acquired, and which the duplicate-dedup pass reclaims — so it is left
+    // unguarded here rather than complicating the per-episode swap.
     for (hash, rec) in owned.iter().filter(|(_, r)| r.provides.len() == 1) {
         let Some(q) = rec.quality.clone() else {
             continue; // untagged → no baseline, skip
@@ -1298,6 +1307,11 @@ async fn upgrade_show_episodes_and_packs(
             episode: Some(episode),
             ..rec.request.clone()
         };
+        // COST NOTE: this issues ONE scraper call per owned singleton episode per tick (not bounded by
+        // UPGRADE_BUDGET_PER_TICK, which counts titles). A heavily-scattered season held as N
+        // never-consolidated singletons produces an N-scrape burst for one title; the shared rate
+        // limiter absorbs it (it's paced, not an error), but it dominates that title's tick until
+        // consolidation folds the singletons into a pack.
         let raws = match app
             .scraper
             .find(&imdb_id, MediaKind::Series, Some(season), Some(episode))
@@ -1391,8 +1405,10 @@ async fn upgrade_show_episodes_and_packs(
 /// REGARDLESS of consolidation's own result, so `run_upgrade_once` leaves the round-robin cursor
 /// unstamped and the skipped episodes/pack-correction are reconsidered next tick rather than
 /// waiting a full cursor wrap (a `NoChange`/`Ok` from a scatter-free consolidation would otherwise
-/// stamp it). When the phase did NOT defer, propagate consolidation's own `Result`. Consolidation
-/// still runs in both cases (its swap/prune is independently idle-gated).
+/// stamp it). When the phase did NOT defer, propagate consolidation's own `Result`. Consolidation is
+/// SKIPPED (its live TMDB + per-season scrapes would be wasted) when the phase deferred AND the
+/// library is still active — since consolidation's own idle gate would discard the work anyway; a
+/// defer with an idle library (e.g. a transient listing failure) still lets consolidation run.
 async fn try_upgrade_show(
     app: &AppState,
     tmdb_id: u64,
@@ -1400,6 +1416,15 @@ async fn try_upgrade_show(
     idle_window: Duration,
 ) -> Result<(), UpgradeSkip> {
     let deferred = upgrade_show_episodes_and_packs(app, tmdb_id, group_hashes, idle_window).await;
+    // If the episode/pack phase deferred because the library went ACTIVE mid-tick, consolidation's
+    // own idle gate would discard its swap/prune — so skip its network calls (aired-episode lookup +
+    // per-season scrapes) entirely rather than issuing them just to throw the result away.
+    if deferred && !app.read_activity.all_idle(idle_window).await {
+        return Err(UpgradeSkip::Deferred(
+            "show per-episode/pack upgrade deferred mid-tick (library active); skipping consolidation"
+                .into(),
+        ));
+    }
     // Re-derive the CURRENT group membership from the store before consolidation. The per-episode
     // phase above can stage a NEW hash and prune the OLD singleton within THIS tick, so the
     // tick-start `group_hashes` snapshot is stale: consolidating against it would miss a
