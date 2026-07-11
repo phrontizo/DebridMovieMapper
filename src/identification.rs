@@ -1119,10 +1119,7 @@ mod tests {
         // A bit-depth-glued quality tag ("1080p10bit"/"2160p10bit") — no separator between the
         // resolution and the bit-depth — must likewise truncate rather than leak into the query.
         assert_eq!(clean_name("Movie.1080p10bit.mkv").0, "Movie");
-        assert_eq!(
-            clean_name("Some Show 2160p10bit HEVC").0,
-            "Some Show"
-        );
+        assert_eq!(clean_name("Some Show 2160p10bit HEVC").0, "Some Show");
     }
 
     #[test]
