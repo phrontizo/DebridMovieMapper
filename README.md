@@ -27,7 +27,7 @@ This was 100% vibe coded using a mix of Claude and Junie as further AI experimen
 - **Trakt Integration (optional)**: Drive the library from your Trakt account(s) — watchlisted and in-progress movies/shows are auto-acquired, new episodes of tracked shows are picked up as they air, and content is automatically removed once everyone who wanted it has finished (or abandoned) it. Link one or more accounts via a local-network enrolment page. Disabled by default; when not configured the service runs exactly as before.
 - **Persistent Cache**: Uses an embedded database (`redb`) to cache media identifications, reducing API calls and speeding up restarts.
 - **Configurable Scan Interval**: Customizable scan interval via environment variable.
-- **Robust Identification Logic**: Handles complex torrent naming conventions, including CamelCase splitting, technical metadata stripping, and multi-service fallback strategies.
+- **Robust Identification Logic**: Handles complex torrent naming conventions, including CamelCase splitting, technical metadata stripping, and multi-strategy TMDB fallbacks (separate movie/TV search, year-less retry).
 - **Jellyfin Notifications**: Optionally notifies Jellyfin when content changes so new episodes and movies appear immediately without waiting for a full library scan.
 
 ## Prerequisites

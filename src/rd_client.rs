@@ -90,6 +90,12 @@ pub struct TorrentInfo {
     pub added: String,
     #[serde(default)]
     pub files: Vec<TorrentFile>,
+    // RD restricted capability links. NOTE: `Serialize` persists these to the `matches` cache in
+    // `metadata.db` (the VFS reads `t.links` to build FileLocators, so they can't be `serde(skip)`ped
+    // without forcing a re-resolution). The redacted `Debug` below only guards LOGS; the on-disk
+    // copy is deliberate. These are *restricted* links (not the directly-fetchable signed CDN URL,
+    // which is only ever held in the in-memory unrestrict cache), and unrestricting one still
+    // requires the account token — so a reader of the DB file gains nothing without the token.
     #[serde(default)]
     pub links: Vec<String>,
     pub ended: Option<String>,
@@ -301,7 +307,8 @@ impl RealDebridClient {
     /// (500/502/503/504). A 500 is a server-side failure, usually transient, so it joins the
     /// bounded-retry set; 4xx (and the deterministic 5xx 501/505) are terminal — a retry can't fix
     /// the request. Callers can still override via `terminal_statuses` in `fetch_with_retry`, which
-    /// are checked first and abort without retrying (e.g. 503 for `unrestrict_link`).
+    /// are checked first and abort without retrying (e.g. the full 5xx set — 500/502/503/504 — for
+    /// `unrestrict_link`, so the on-read playback resolve fails fast to repair).
     fn should_retry_status(status: reqwest::StatusCode) -> bool {
         status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || crate::provider::is_retryable_5xx(status)

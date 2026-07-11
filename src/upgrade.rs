@@ -1082,8 +1082,9 @@ async fn stage_episode_candidate(
 /// downgrade (`ALLOW_RESOLUTION_DOWNGRADE`). Keeps the old pack when no conforming replacement
 /// exists — a sole over-ceiling copy is never deleted with nothing to replace it.
 ///
-/// Returns `true` iff it bailed early because the library became active (a non-idle `all_idle`
-/// check) — so the caller can leave the round-robin cursor unstamped and reconsider next tick;
+/// Returns `true` if it DEFERRED mid-tick — the library became active (a non-idle `all_idle`
+/// check) OR a post-stage `apply_upgrade` step failed (a provider-listing fetch or a `put_selection`
+/// write) — so the caller can leave the round-robin cursor unstamped and reconsider next tick;
 /// `false` on normal completion (whether or not a correction was applied).
 async fn correct_over_ceiling_packs(
     app: &AppState,
@@ -1275,10 +1276,11 @@ async fn correct_over_ceiling_packs(
 /// (Deferred/NoChange/staged) never aborts the rest of the group — every branch already classifies +
 /// logs its own outcome.
 ///
-/// Returns `true` iff it stopped early because the library became active mid-tick (a non-idle
-/// `all_idle` check, in the per-episode loop or in `correct_over_ceiling_packs`). The caller uses
-/// this to signal `Deferred` so the round-robin cursor is NOT stamped and the skipped work is
-/// reconsidered next tick (rather than waiting a full cursor wrap). `false` on normal completion.
+/// Returns `true` if it DEFERRED mid-tick — the library became active (a non-idle `all_idle` check,
+/// in the per-episode loop or in `correct_over_ceiling_packs`) OR a post-stage `apply_upgrade` step
+/// failed (a provider-listing fetch or a `put_selection` write). The caller uses this to signal
+/// `Deferred` so the round-robin cursor is NOT stamped and the skipped work is reconsidered next
+/// tick (rather than waiting a full cursor wrap). `false` on normal completion.
 async fn upgrade_show_episodes_and_packs(
     app: &AppState,
     tmdb_id: u64,
