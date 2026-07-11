@@ -1651,7 +1651,7 @@ mod tests {
     // --- Helper for best_scored_result / select_best_match tests ---
 
     fn make_result(
-        id: u32,
+        id: u64,
         title: &str,
         release_date: Option<&str>,
         popularity: f64,
