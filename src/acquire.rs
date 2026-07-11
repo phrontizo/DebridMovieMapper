@@ -565,6 +565,16 @@ impl AcquisitionEngine {
                     let _ = self.provider.select_files(&added.id, &csv).await;
                 }
             }
+            // A DIFFERENT owned hash for this exact slot may have lapsed off the provider (we just
+            // added a better/replacement release above it). Reap its orphaned records — but only
+            // against a confirmed, non-empty listing (reuse the pre-scan's `present`); skip on an
+            // unknown/empty listing so a transient glitch can't reap a still-owned record.
+            if let Some(Some(present_set)) = present.as_ref() {
+                if !present_set.is_empty() {
+                    self.reap_lapsed_superseded(&req, &cand.info_hash, present_set)
+                        .await;
+                }
+            }
             return AcquireOutcome::Pending(cand.info_hash);
         }
         debug!(
@@ -1205,6 +1215,59 @@ impl AcquisitionEngine {
             // gone. `monitor_episodes` re-acquires the full missing set (owned-episode coverage via
             // the `provides` union) on its next cycle, so the gap is bounded latency, not lost content.
             let _ = self.acquire(req.clone(), provenance.clone()).await; // promotes the next candidate (bad hash now blacklisted)
+        }
+    }
+
+    /// After adding a NEW hash for `req`, reap a DIFFERENT owned record for this EXACT slot that has
+    /// lapsed off the provider (absent from `present`). Such a record is provenance-bearing, so
+    /// `reap_absent_mirror_owned` (empty-provenance only) never cleans it, `dedup`/`observe` ignore
+    /// an absent hash, and it lingers as a `Verified`-but-absent zombie until the daily upgrade or
+    /// Trigger-B. Store-only — the torrent is already gone, so there is no provider delete and no
+    /// stream to interrupt (hence no idle-gate). Conservative to avoid ever reaping a live record:
+    /// only an EXACT slot supersede (a same-tmdb movie, or a singleton episode == the requested one)
+    /// and only a NON-manual record (invariant M-1) is reaped; a pack covering other episodes, any
+    /// still-present copy, and `new_hash` itself are all kept. `present` must be a confirmed,
+    /// non-empty listing (the caller guards off an unknown/empty one, like `observe`).
+    async fn reap_lapsed_superseded(
+        &self,
+        req: &AcquireRequest,
+        new_hash: &str,
+        present: &std::collections::HashSet<String>,
+    ) {
+        for (hash, rec) in self.store.all_owned().await {
+            if hash.eq_ignore_ascii_case(new_hash) {
+                continue;
+            }
+            if rec.request.tmdb_id != req.tmdb_id || rec.request.kind != req.kind {
+                continue;
+            }
+            if rec.provenance.has_manual_entry() {
+                continue; // never auto-remove manual content (M-1)
+            }
+            let same_slot = match (req.kind, req.season, req.episode) {
+                (MediaKind::Series, Some(s), Some(e)) => {
+                    rec.provides.len() == 1 && rec.provides[0] == (s, e)
+                }
+                (MediaKind::Movie, _, _) => rec.provides.is_empty(),
+                _ => false,
+            };
+            if !same_slot {
+                continue;
+            }
+            if present.contains(&hash.to_ascii_lowercase()) {
+                continue; // still present on the provider → keep
+            }
+            debug!(
+                "acquire: tmdb {} — reaping lapsed superseded owned {} (replaced by {})",
+                req.tmdb_id, hash, new_hash
+            );
+            let _ = self.store.remove_owned(hash.clone()).await;
+            let _ = self.store.remove_authoritative(hash.clone()).await;
+            for (slot, entry) in self.store.all_selection().await {
+                if entry.hash.eq_ignore_ascii_case(&hash) {
+                    let _ = self.store.remove_selection(slot).await;
+                }
+            }
         }
     }
 }
@@ -1909,6 +1972,73 @@ mod tests {
             eng.acquire(req(), Provenance::watchlist("alice")).await,
             AcquireOutcome::Pending("h1".into()),
             "an owned-but-absent title must be re-acquired, not treated as already-acquired"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_reaps_a_lapsed_superseded_owned_record() {
+        // A watchlist-owned copy hB has lapsed off the provider (absent), while the scrape now tops
+        // with a BETTER, un-owned release hA. acquire adds hA (Pending) and must reap hB's
+        // now-orphaned record — otherwise it lingers as a Verified-but-absent zombie
+        // (`reap_absent_mirror_owned` cleans only empty-provenance mirrors).
+        let st = store();
+        st.put_owned(
+            "hB".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::watchlist("alice"),
+                added_at: 1,
+                status: OwnedStatus::Verified,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        // Listing is non-empty (an unrelated torrent) but hB is absent; add/info succeed for hA.
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![torrent("tid_other", "other", "downloaded", 100.0)],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_hA".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TI {
+                id: "tid_hA".into(),
+                hash: "hA".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // hA is 1080p (ranks above the 720p hB), both cached — so hA is added and hB is the lapsed
+        // owned copy that must be reaped.
+        let hb_720 = RawCandidate {
+            name: "Torrentio\n720p".into(),
+            description: "Movie.2023.720p.x265\nRD+".into(),
+            info_hash: "hB".into(),
+            file_idx: Some(0),
+            file_name: Some("Movie.2023.720p.x265.mkv".into()),
+        };
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper {
+                candidates: vec![cand("hA", true), hb_720],
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        assert_eq!(
+            eng.acquire(req(), Provenance::watchlist("alice")).await,
+            AcquireOutcome::Pending("hA".into()),
+        );
+        assert!(
+            st.get_owned("hB".into()).await.is_none(),
+            "the lapsed superseded owned record must be reaped"
+        );
+        assert!(
+            st.get_owned("hA".into()).await.is_some(),
+            "the newly added hash must be recorded Pending"
         );
     }
 
