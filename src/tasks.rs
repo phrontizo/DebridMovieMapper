@@ -707,13 +707,35 @@ fn shows_to_fold(
 /// for re-enrolment (`needs_reenrolment = true`); because `sync_trakt_user` performs all of its
 /// `wanted` writes only after every fetch has succeeded, a failure leaves that user's existing
 /// `wanted` rows untouched.
+/// Outcome of one `sync_trakt` pass: how many accounts were enrolled and how many synced without
+/// error. Consumed by the scheduler to decide whether the freshly-materialised `wanted` set is
+/// trustworthy enough to drive removals this cycle (see `removals_trustworthy`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncSummary {
+    pub enrolled: usize,
+    pub succeeded: usize,
+}
+
+impl SyncSummary {
+    /// Whether Trigger-A/B removals may fire against this cycle's `wanted` set. Removal decisions are
+    /// cross-user (a title is removed only when NO user wants it), so an untrustworthy `wanted` set can
+    /// delete engine-acquired content that a successful sync would re-confirm. The set is trustworthy
+    /// iff there are no enrolled accounts (an empty `wanted` set is then authoritative — nobody to want
+    /// anything) OR at least one account synced successfully this cycle. The dangerous case it guards:
+    /// the first tick after the v4→v5 migration CLEARS `wanted` while every account's sync fails (Trakt
+    /// unreachable), leaving an empty set that would otherwise Trigger-B-remove owned watchlist content.
+    pub fn removals_trustworthy(&self) -> bool {
+        self.enrolled == 0 || self.succeeded > 0
+    }
+}
+
 pub async fn sync_trakt(
     trakt: &std::sync::Arc<dyn crate::trakt_client::TraktClient>,
     tmdb: &crate::tmdb_client::TmdbClient,
     store: &crate::store::Store,
     catchup_lookback_secs: Option<u64>,
     remove_finished_shows: bool,
-) {
+) -> SyncSummary {
     // The owned SHOW library is one shared household library, identical for every enrolled user, so
     // read it ONCE per sync cycle rather than re-scanning `all_owned()` inside each `sync_trakt_user`
     // (the catch-up finish-cleanup gate only needs the set of owned show tmdb ids). A view that is at
@@ -741,7 +763,9 @@ pub async fn sync_trakt(
             .push((r.media_type.clone(), r.tmdb_id));
     }
 
+    let mut summary = SyncSummary::default();
     for (slug, tokens) in store.all_trakt_tokens().await {
+        summary.enrolled += 1;
         if let Err(e) = sync_trakt_user(
             trakt,
             tmdb,
@@ -788,8 +812,11 @@ pub async fn sync_trakt(
             {
                 error!("Failed to persist re-enrolment flag for account: {}", pe);
             }
+        } else {
+            summary.succeeded += 1;
         }
     }
+    summary
 }
 
 /// Sync one user. Returns `Err` (so `sync_trakt` flags the account) on a token-refresh or
@@ -2172,7 +2199,7 @@ async fn execute_acquire(
 /// Reconcile the combined wanted-set against owned-and-available content: acquire missing/lapsed
 /// titles (recording per-user provenance) and remove engine-owned titles per the removal
 /// lifecycle. Idempotent — re-derives every decision from the store + provider listing each call.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // shared handles + per-cycle sync-trust flag; one real caller
 pub async fn reconcile_wanted(
     engine: &AcquisitionEngine,
     provider: &Arc<dyn DebridProvider>,
@@ -2180,6 +2207,7 @@ pub async fn reconcile_wanted(
     store: &Store,
     read_activity: &Arc<crate::read_activity::ReadActivity>,
     idle_window: Duration,
+    removals_trustworthy: bool,
 ) {
     let torrents = match provider.get_torrents().await {
         Ok(t) => t,
@@ -2188,7 +2216,23 @@ pub async fn reconcile_wanted(
             return;
         }
     };
-    let ops = plan_reconcile_ops(store, &torrents).await;
+    let mut ops = plan_reconcile_ops(store, &torrents).await;
+    // Cross-user removals are only safe against a `wanted` set a sync actually confirmed. When no
+    // enrolled account synced this cycle (e.g. the first tick after the v4→v5 migration cleared
+    // `wanted` with Trakt unreachable), drop every Remove so a spuriously-empty set can't delete
+    // engine-acquired content; acquires are unaffected (an empty set produces none). Self-heals once
+    // a sync repopulates the set. Mirrors the get_torrents / empty-listing guards elsewhere.
+    if !removals_trustworthy {
+        let before = ops.len();
+        ops.retain(|o| !matches!(o, ReconcileOp::Remove { .. }));
+        let suppressed = before - ops.len();
+        if suppressed > 0 {
+            warn!(
+                "reconcile: suppressing {} removal(s) this tick — no Trakt account synced successfully, so the `wanted` set is untrustworthy (e.g. just after a schema migration cleared it); removals resume once a sync confirms it",
+                suppressed
+            );
+        }
+    }
     if !ops.is_empty() {
         let acquires = ops
             .iter()
@@ -5429,6 +5473,7 @@ mod reconcile_wanted_tests {
             &store,
             &idle,
             Duration::from_secs(300),
+            true,
         )
         .await;
 
@@ -5439,6 +5484,123 @@ mod reconcile_wanted_tests {
         assert!(
             store.get_owned("aaa".to_string()).await.is_some(),
             "owned record must survive a skipped tick"
+        );
+    }
+
+    #[test]
+    fn sync_summary_removals_trustworthy_logic() {
+        // No enrolled accounts → an empty `wanted` set is authoritative (nobody to want anything).
+        assert!(SyncSummary {
+            enrolled: 0,
+            succeeded: 0
+        }
+        .removals_trustworthy());
+        // Accounts exist and at least one synced → the set was confirmed this cycle.
+        assert!(SyncSummary {
+            enrolled: 2,
+            succeeded: 1
+        }
+        .removals_trustworthy());
+        // Accounts exist but NONE synced (post-migration blackout / Trakt unreachable) → untrustworthy.
+        assert!(!SyncSummary {
+            enrolled: 2,
+            succeeded: 0
+        }
+        .removals_trustworthy());
+        assert!(!SyncSummary {
+            enrolled: 1,
+            succeeded: 0
+        }
+        .removals_trustworthy());
+    }
+
+    #[tokio::test]
+    async fn reconcile_wanted_suppresses_removal_when_wanted_untrustworthy() {
+        use crate::config::AcquisitionConfig;
+
+        // An engine-owned (watchlist-provenance) show, present in the listing, with an EMPTY `wanted`
+        // set — the state left transiently by the v4→v5 migration clearing `wanted`. With an
+        // untrustworthy set (no sync confirmed it), Trigger-B removal must be SUPPRESSED; once a sync
+        // confirms the (still-empty) set, the same reconcile removes it. Guards finding 7.1: a failed
+        // first post-migration sync must not delete engine-acquired content.
+        let store = mem_store();
+        store
+            .put_owned(
+                "aaa".into(),
+                owned_record(1396, MediaKind::Series, Provenance::watchlist("alice")),
+            )
+            .await
+            .unwrap();
+
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![torrent("t1", "AAA")],
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let scraper: Arc<dyn crate::scraper::Scraper> =
+            Arc::new(crate::scraper::TorrentioScraper::new(
+                None,
+                crate::provider::ProviderKind::TorBox,
+                "tok",
+                reqwest::Client::new(),
+            ));
+        let validator: Arc<dyn crate::acquire::TitleValidator> =
+            Arc::new(crate::acquire::TmdbTitleValidator {
+                tmdb: Arc::new(crate::tmdb_client::TmdbClient::new("k".into()).unwrap()),
+            });
+        let prober: Arc<dyn crate::acquire::Prober> = Arc::new(crate::acquire::HttpProber {
+            http: reqwest::Client::new(),
+        });
+        let engine = crate::acquire::AcquisitionEngine::new(
+            provider.clone(),
+            scraper,
+            validator,
+            prober,
+            store.clone(),
+            AcquisitionConfig::default().prefs,
+            5,
+            std::time::Duration::from_secs(1800),
+            std::time::Duration::from_secs(600),
+        );
+        let tmdb = crate::tmdb_client::TmdbClient::new("k".into()).unwrap();
+        let idle = Arc::new(crate::read_activity::ReadActivity::new());
+
+        // Untrustworthy (no sync confirmed the set): removal suppressed.
+        reconcile_wanted(
+            &engine,
+            &provider,
+            &tmdb,
+            &store,
+            &idle,
+            Duration::from_secs(300),
+            false,
+        )
+        .await;
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "an untrustworthy (unconfirmed) empty wanted set must NOT delete engine-acquired content"
+        );
+        assert!(
+            store.get_owned("aaa".to_string()).await.is_some(),
+            "the owned record must survive the suppressed tick"
+        );
+
+        // Trustworthy (a sync confirmed the set): the genuine abandonment IS removed.
+        reconcile_wanted(
+            &engine,
+            &provider,
+            &tmdb,
+            &store,
+            &idle,
+            Duration::from_secs(300),
+            true,
+        )
+        .await;
+        assert_eq!(
+            deleted.lock().unwrap().as_slice(),
+            &["t1".to_string()],
+            "a confirmed abandonment must delete the engine-acquired torrent"
         );
     }
 }

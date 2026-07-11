@@ -177,7 +177,7 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
                                 .trakt
                                 .as_ref()
                                 .and_then(|t| t.catchup_lookback_secs);
-                            sync_trakt(
+                            let summary = sync_trakt(
                                 trakt,
                                 &app.tmdb_client,
                                 &app.store,
@@ -185,6 +185,11 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
                                 app.config.remove_finished_shows,
                             )
                             .await;
+                            // Only let this tick's reconcile REMOVE content if the sync actually
+                            // confirmed the `wanted` set (≥1 account synced, or none enrolled) —
+                            // otherwise a transiently-empty set (e.g. just after a migration cleared
+                            // it) could Trigger-B-delete engine-acquired content. Acquires are
+                            // unaffected; removals resume next cycle once a sync succeeds.
                             reconcile_wanted(
                                 app.engine.as_ref(),
                                 &app.provider,
@@ -192,6 +197,7 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
                                 &app.store,
                                 &app.read_activity,
                                 Duration::from_secs(app.config.upgrade.idle_secs),
+                                summary.removals_trustworthy(),
                             )
                             .await;
                         }
