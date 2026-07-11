@@ -398,6 +398,15 @@ pub async fn identify_name(
     let is_show_guess = is_show_guess(files);
 
     let normalized_cleaned = normalize_title(&cleaned_name);
+    // A cleaned name that survives the empty/generic guard but normalizes to empty — e.g. an
+    // entirely-punctuation title like "()" (kept non-empty by `clean_name`, emptied by
+    // `normalize_title`, which keeps only alphanumerics) — has nothing to match on. Left to fall
+    // through, `score_result`'s `normalized_title.contains(normalized_query)` would be TRUE for
+    // every TMDB candidate (an empty needle matches anything), so selection would collapse to
+    // popularity/recency and could confidently mis-identify the title. Bail instead.
+    if normalized_cleaned.is_empty() {
+        return None;
+    }
 
     // Try TMDB first
     let (mut tv_results, mut movie_results) = tokio::join!(
@@ -836,6 +845,25 @@ mod tests {
         assert_eq!(normalize_title("Gdańsk"), normalize_title("Gdansk")); // ń→n
         assert_eq!(normalize_title("Wałęsa"), normalize_title("Walesa")); // ł→l, ę→e
         assert_eq!(normalize_title("Međimurje"), normalize_title("Medimurje")); // đ→d
+    }
+
+    #[tokio::test]
+    async fn identify_name_bails_on_a_title_that_normalizes_to_empty() {
+        // "()" survives `clean_name` (stays non-empty) and is not generic, but `normalize_title`
+        // keeps only alphanumerics so it collapses to "". Such a title must return None rather than
+        // fall through to universal partial-match scoring (an empty needle matches every candidate),
+        // which would confidently mis-identify it. The guard returns before any TMDB call, so this
+        // needs no network.
+        let (cleaned, _year) = clean_name("()");
+        assert!(
+            !cleaned.is_empty() && normalize_title(&cleaned).is_empty(),
+            "precondition: '()' must clean non-empty yet normalize to empty (got cleaned={cleaned:?})"
+        );
+        let tmdb = TmdbClient::new("test-key".into()).unwrap();
+        assert!(
+            identify_name("()", &[], &tmdb).await.is_none(),
+            "a title that normalizes to empty must not be identified"
+        );
     }
 
     #[tokio::test]
