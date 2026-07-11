@@ -73,6 +73,20 @@ pub struct JellyfinClient {
 
 impl JellyfinClient {
     pub fn new(url: String, api_key: String, mount_path: String) -> Result<Self, String> {
+        let url = url.trim_end_matches('/').to_string();
+        // Validate the URL parses and carries an http(s) scheme NOW, at construction. A typo (missing
+        // scheme like `jellyfin:8096`, or `htp://…`) otherwise builds a client that logs "enabled" at
+        // startup but then fails EVERY `notify_changes` — 15s of dead sleep + a confusing per-scan
+        // "Failed to notify Jellyfin" warning — for the deployment's life. Fail loudly at startup
+        // instead (from_env logs a clear "Failed to create Jellyfin client"), like the API-key check.
+        let parsed = reqwest::Url::parse(&url)
+            .map_err(|e| format!("JELLYFIN_URL is not a valid URL ({url:?}): {e}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(format!(
+                "JELLYFIN_URL must be an http(s) URL, got scheme {:?} in {url:?}",
+                parsed.scheme()
+            ));
+        }
         let mut api_key_header = HeaderValue::from_str(&api_key).map_err(|e| {
             format!(
                 "Jellyfin API key contains invalid HTTP header characters: {}",
@@ -85,7 +99,7 @@ impl JellyfinClient {
             .build()
             .map_err(|e| format!("Failed to build Jellyfin HTTP client: {}", e))?;
         Ok(Self {
-            url: url.trim_end_matches('/').to_string(),
+            url,
             api_key_header,
             mount_path: mount_path.trim_end_matches('/').to_string(),
             http,
@@ -410,6 +424,32 @@ mod tests {
     }
 
     #[test]
+    fn new_rejects_a_malformed_or_schemeless_url() {
+        // A URL typo must fail at construction, not silently break every notify (a 15s dead sleep +
+        // per-scan warning) despite a "Jellyfin notification enabled" startup log.
+        for bad in [
+            "jellyfin:8096",
+            "htp://jellyfin:8096",
+            "not a url",
+            "",
+            "/media",
+        ] {
+            assert!(
+                JellyfinClient::new(bad.to_string(), "k".to_string(), "/media".to_string())
+                    .is_err(),
+                "malformed/schemeless JELLYFIN_URL {bad:?} must be rejected"
+            );
+        }
+        // https and a trailing slash are fine (the slash is trimmed).
+        assert!(JellyfinClient::new(
+            "https://jellyfin.local:8920/".to_string(),
+            "k".to_string(),
+            "/media".to_string()
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn from_env_trims_values_and_treats_blank_as_unset() {
         // Use uniquely-scoped restore so this test doesn't disturb a real environment if one is set.
         let restore = |k: &str, v: Option<String>| match v {
@@ -512,6 +552,77 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "a 500 is not retried — exactly one request"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notify_changes_retries_forever_up_to_the_attempt_cap() {
+        // A persistently-transient upstream (always 503) must be retried EXACTLY MAX_SEND_ATTEMPTS
+        // times and then stop — guarding the loop bound against an off-by-one or an early return in
+        // the Retry arm that would change the total request count.
+        use std::sync::atomic::Ordering;
+        let (url, counter) = spawn_counting_server(503, 1000).await;
+        let client = JellyfinClient::new(url, "key".to_string(), "/media".to_string()).unwrap();
+        client.notify_changes(&one_change()).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            MAX_SEND_ATTEMPTS as usize,
+            "a persistent transient error is retried exactly MAX_SEND_ATTEMPTS times"
+        );
+    }
+
+    /// Loopback that, on the first `hang_n` connections, reads the request then holds the connection
+    /// open WITHOUT responding (the client times out → a transient transport error) before serving a
+    /// 200 on the next connection. Counts every accepted connection.
+    async fn spawn_timeout_then_200(
+        hang_n: usize,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c2 = counter.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut seen = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                c2.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                if seen < hang_n {
+                    seen += 1;
+                    // Never respond: block reading until the client times out and drops the socket
+                    // (read then returns EOF), so this connection produces an is_timeout() error.
+                    let mut sink = [0u8; 1];
+                    let _ = sock.read(&mut sink).await;
+                    continue;
+                }
+                let head = "HTTP/1.1 200 STATUS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{}", addr), counter)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notify_changes_retries_a_transient_timeout_then_succeeds() {
+        // A transport-level timeout (Jellyfin slow/overloaded) hits the is_connect()||is_timeout()
+        // retry branch — the reason that branch exists — and must recover on the next 200. Guards
+        // against a regression narrowing that guard (which would silently drop notifications during a
+        // Jellyfin restart). `start_paused` auto-advances the reqwest request timeout so it is instant.
+        use std::sync::atomic::Ordering;
+        let (url, counter) = spawn_timeout_then_200(1).await;
+        let client = JellyfinClient::new(url, "key".to_string(), "/media".to_string()).unwrap();
+        client.notify_changes(&one_change()).await;
+        // ≥2 connections proves the timeout was RETRIED past the hang (the exact count is left loose:
+        // reqwest's connect/pool behaviour under a paused clock can add a connection). A regression
+        // that narrowed the is_connect()||is_timeout() guard would give up after the first hang = 1.
+        assert!(
+            counter.load(Ordering::SeqCst) >= 2,
+            "a transient timeout must be retried (>=2 connections), got {}",
+            counter.load(Ordering::SeqCst)
         );
     }
 }
