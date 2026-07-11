@@ -19,10 +19,12 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// `.strm` placed under its first episode's season), so a single representative `(season, episode)`
 /// is exactly right.
 fn parse_se(name: &str) -> Option<(u32, u32)> {
-    // The `SxxExx` arm is deliberately NOT word-anchored (unlike `SEASON_RE`), kept byte-identical to
-    // `acquire::parse_se_all` so the VFS and the acquisition engine agree on which file supplies which
-    // episode. A literal `e` must immediately follow the digits, so a mid-token match is very unlikely
-    // in practice; the two must be changed together if this is ever tightened.
+    // The `SxxExx` arm is deliberately NOT word-anchored (unlike `SEASON_RE`). Its leading
+    // `s\d{1,2}e\d{1,3}` sub-pattern matches `acquire::parse_se_all`'s so the VFS and the acquisition
+    // engine agree on which file supplies which episode; the multi-episode continuation group
+    // `acquire::parse_se_all` appends is intentionally omitted here (see the fn doc — VFS keys off the
+    // FIRST episode only). A literal `e` must immediately follow the digits, so a mid-token match is
+    // very unlikely in practice; the shared leading sub-pattern must be changed in both if tightened.
     static SE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})e(\d{1,3})").unwrap());
     if let Some(c) = SE.captures(name) {
         return Some((
