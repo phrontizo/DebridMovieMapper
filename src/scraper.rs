@@ -153,6 +153,15 @@ fn is_config_error_status(status: reqwest::StatusCode) -> bool {
     status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
+/// Whether `h` is a structurally-valid (already-lowercased) BitTorrent infohash: 40 hex chars
+/// (v1) or a 32-char base32 hash (a-z2-7). Guards the explicit-`infoHash` field so a malformed
+/// value (e.g. a truncated `aabbcc`) can't build an invalid `magnet:?xt=urn:btih:…` and burn a
+/// provider add — mirroring the strictness of the URL-recovery path (`RESOLVE_RE` requires 40-hex).
+fn is_valid_infohash(h: &str) -> bool {
+    (h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        || (h.len() == 32 && h.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')))
+}
+
 /// Parse a Stremio stream response into raw candidates. Uses the explicit `infoHash` field when
 /// present (public Torrentio); otherwise recovers the hash from a debrid-resolved `url`
 /// (debrid-keyed Torrentio). Streams with neither are skipped.
@@ -162,14 +171,17 @@ pub fn parse_streams(v: &serde_json::Value) -> Vec<RawCandidate> {
         return out;
     };
     for s in streams {
-        let (info_hash, url_idx) = match s
+        // Take the explicit `infoHash` only when it is structurally valid (40-hex / 32 base32).
+        // A present-but-EMPTY or malformed infoHash is degenerate (would build an invalid
+        // `magnet:?xt=urn:btih:…`), so treat it like a missing one — fall through to the debrid-url
+        // hash recovery (else skip). `is_valid_infohash` mirrors the URL-recovery path's strictness.
+        let explicit_hash = s
             .get("infoHash")
             .and_then(|h| h.as_str())
-            .filter(|h| !h.is_empty())
-        {
-            // A present-but-EMPTY infoHash is degenerate (would build `magnet:?xt=urn:btih:`), so
-            // treat it like a missing one — fall through to the debrid-url hash recovery (else skip).
-            Some(h) => (h.to_ascii_lowercase(), None),
+            .map(|h| h.to_ascii_lowercase())
+            .filter(|h| is_valid_infohash(h));
+        let (info_hash, url_idx) = match explicit_hash {
+            Some(h) => (h, None),
             None => match s
                 .get("url")
                 .and_then(|u| u.as_str())
@@ -378,23 +390,51 @@ mod tests {
                 {
                     "name": "Torrentio\n1080p",
                     "title": "Movie.2023.1080p.x265-GRP\n\u{1f4be} 8 GB \u{1f464} 12\nRD+",
-                    "infoHash": "aabbcc",
+                    "infoHash": "aabbccddeeff00112233445566778899aabbccdd",
                     "fileIdx": 0,
                     "behaviorHints": {"filename": "Movie.2023.1080p.x265-GRP.mkv"}
                 },
-                { "name": "Torrentio\n720p", "title": "Movie.720p.x264", "infoHash": "ddeeff" }
+                { "name": "Torrentio\n720p", "title": "Movie.720p.x264", "infoHash": "1122334455667788990011223344556677889900" }
             ]
         });
         let cands = parse_streams(&json);
         assert_eq!(cands.len(), 2);
-        assert_eq!(cands[0].info_hash, "aabbcc");
+        assert_eq!(cands[0].info_hash, "aabbccddeeff00112233445566778899aabbccdd");
         assert_eq!(cands[0].file_idx, Some(0));
         assert_eq!(
             cands[0].file_name.as_deref(),
             Some("Movie.2023.1080p.x265-GRP.mkv")
         );
-        assert_eq!(cands[1].info_hash, "ddeeff");
+        assert_eq!(cands[1].info_hash, "1122334455667788990011223344556677889900");
         assert_eq!(cands[1].file_idx, None);
+    }
+
+    #[test]
+    fn parse_streams_rejects_a_malformed_explicit_infohash() {
+        // A non-empty but structurally-invalid explicit infoHash (not 40-hex, not 32 base32) must
+        // be treated like a missing one — it would otherwise build an invalid
+        // `magnet:?xt=urn:btih:aabbcc` and burn a provider add. With no recoverable url, it's skipped.
+        let json = serde_json::json!({
+            "streams": [
+                { "name": "x", "title": "y", "infoHash": "aabbcc" },          // too short → skip
+                { "name": "x", "title": "y", "infoHash": "not-hex-not-hex-not-hex-not-hex-not-hex01" }, // 40 chars, non-hex → skip
+            ]
+        });
+        assert!(
+            parse_streams(&json).is_empty(),
+            "a malformed explicit infoHash with no recoverable url must be skipped"
+        );
+
+        // A malformed explicit infoHash with a RESOLVABLE debrid url falls through to url recovery.
+        let json = serde_json::json!({
+            "streams": [
+                { "name": "x", "title": "y", "infoHash": "aabbcc",
+                  "url": "https://torrentio.strem.fun/resolve/torbox/TBKEY/64877b5490208c3015c0f5121287949d62622e54/null/0/Movie.mkv" }
+            ]
+        });
+        let cands = parse_streams(&json);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].info_hash, "64877b5490208c3015c0f5121287949d62622e54");
     }
 
     #[test]
