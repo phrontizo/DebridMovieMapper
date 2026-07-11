@@ -268,16 +268,17 @@ pub struct WantedRecord {
 
 /// Why opening the on-disk database failed, split by recovery strategy.
 enum OpenFailure {
-    /// The file is genuinely damaged/unreadable (bad magic, truncated, redb repair aborted), or was
-    /// written by a NEWER build of this app (our schema version is ahead of the binary) — safe to
-    /// move aside and recreate. The regenerable `matches` cache makes this lossless in practice;
+    /// The file is genuinely damaged/unreadable (bad magic, truncated, redb repair aborted) — safe
+    /// to move aside and recreate. The regenerable `matches` cache makes this lossless in practice;
     /// forward migrations bring an older OUR-schema DB up to date instead of discarding it.
     Corrupt(String),
     /// A transient/operational failure: another instance holds the lock, the path is not writable,
-    /// disk is full, etc. — OR an INTACT database in an older redb on-disk format
-    /// (`UpgradeRequired`, e.g. after a redb dependency bump). The file is intact, so discarding it
-    /// would lose authoritative data; the caller fails startup and lets the operator fix the
-    /// underlying condition (back up / migrate) instead.
+    /// disk is full, etc. — OR an INTACT database that this binary cannot safely use but must not
+    /// discard: an older redb on-disk format (`UpgradeRequired`, e.g. after a redb dependency bump),
+    /// or a schema written by a NEWER build of this app (version ahead of the binary, e.g. after a
+    /// rollback). In every case the file is intact and holds non-regenerable authoritative data, so
+    /// the caller fails startup and lets the operator fix the underlying condition (back up /
+    /// migrate / roll the binary forward) instead.
     Transient(String),
 }
 
@@ -359,12 +360,13 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (or create) the database at `path`, recovering automatically from an
-    /// unreadable / incompatible / corrupt / newer-than-binary file rather than
-    /// failing startup. A *transient* failure (another instance holds the lock, the
-    /// path is not writable, disk full, …) leaves the file intact and fails startup
-    /// instead — discarding a possibly-intact database would lose authoritative data.
-    /// Synchronous — called once at startup.
+    /// Open (or create) the database at `path`, recovering automatically from a genuinely
+    /// unreadable / corrupt file (bad magic, truncated, redb repair aborted) rather than failing
+    /// startup. A *transient/incompatible* failure — another instance holds the lock, the path is
+    /// not writable, disk full, an older redb on-disk format (`UpgradeRequired`), OR a schema written
+    /// by a NEWER build of this app (e.g. after a rollback) — leaves the file intact and fails
+    /// startup instead, because discarding a possibly-intact database would lose non-regenerable
+    /// authoritative data. Synchronous — called once at startup.
     pub fn open(path: &str) -> Result<Self, AppError> {
         let db = match Self::try_open(path) {
             Ok(db) => db,
@@ -409,10 +411,17 @@ impl Store {
         let version =
             Self::read_version(&db).map_err(|e| schema_failure("schema read failed", e))?;
         if version > SCHEMA_VERSION {
-            // Newer-than-binary is an incompatibility we recover from (move aside), per the
-            // documented self-heal contract.
-            return Err(OpenFailure::Corrupt(format!(
-                "schema v{version} is newer than supported v{SCHEMA_VERSION}"
+            // A DB written by a NEWER build of this app (e.g. after rolling a bad deploy back to an
+            // older binary) is INTACT and full of non-regenerable authoritative data
+            // (owned/wanted/trakt_tokens/selection). Moving it aside would silently discard that —
+            // exactly the loss the `UpgradeRequired` (older redb on-disk format) path already refuses
+            // — so treat it as transient and FAIL STARTUP, letting the operator roll the binary
+            // forward or restore, rather than recreate an empty DB. Mirrors `from_database`, which
+            // also refuses a newer-than-supported schema.
+            return Err(OpenFailure::Transient(format!(
+                "schema v{version} is newer than supported v{SCHEMA_VERSION}: the database was \
+                 written by a newer build of this app. Refusing to discard it — run a build at \
+                 schema v{version} or newer, or back up and remove {path}."
             )));
         }
         Self::ensure_schema(&db, version).map_err(|e| schema_failure("schema init failed", e))?;
@@ -1907,7 +1916,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_recovers_from_newer_version() {
+    async fn open_refuses_a_newer_version_without_discarding_it() {
+        // A DB written by a NEWER build of this app (schema ahead of the binary, e.g. after a
+        // rollback) is intact and holds non-regenerable authoritative data. `open` must FAIL STARTUP
+        // and leave the file in place — NOT move it aside and recreate an empty DB (which would
+        // silently lose owned/wanted/trakt_tokens/selection), mirroring the `UpgradeRequired` path.
         let tmp = TempDb::new("newer");
         {
             let db = Database::create(&tmp.path).unwrap();
@@ -1919,16 +1932,19 @@ mod tests {
             }
             txn.commit().unwrap();
         }
-        let store = Store::open(&tmp.path).unwrap();
+        let result = Store::open(&tmp.path);
         assert!(
-            std::path::Path::new(&tmp.corrupt_path()).exists(),
-            "a newer-than-binary DB should be moved aside"
+            matches!(result, Err(AppError::Config(_))),
+            "a newer-schema DB must fail startup as a transient/incompatible failure"
         );
-        store
-            .put_matches(vec![("a".to_string(), info("a"), movie("A"))])
-            .await
-            .unwrap();
-        assert!(store.get_match("a".to_string()).await.is_some());
+        assert!(
+            !std::path::Path::new(&tmp.corrupt_path()).exists(),
+            "a newer-than-binary DB must NOT be moved aside (its authoritative data is not regenerable)"
+        );
+        assert!(
+            std::path::Path::new(&tmp.path).exists(),
+            "the intact DB must be preserved for the operator to migrate/restore"
+        );
     }
 
     // ── SP1 Task 6 tests ──────────────────────────────────────────────────────
