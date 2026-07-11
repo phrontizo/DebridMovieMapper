@@ -1494,6 +1494,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn probe_tracks_mkv_recovery_refetch_succeeds_and_returns_tracks() {
+        // The HAPPY path of the MKV pre-`Tracks` recovery: the front read defers (a Void declares more
+        // than the truncated front body carries), then the SECOND (larger) fetch returns the full body
+        // whose Void payload is present, so the re-parse skips it and reads the eng audio track. Guards
+        // the recovery orchestration's success case (only the extent computation + the defer case were
+        // covered), which a wrong second-fetch window would silently break (defer-forever → blacklist).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut audio = Vec::new();
+        audio.extend(ebml_elem(0x83, &[2])); // TrackType = audio
+        audio.extend(ebml_elem(0x22B59C, b"eng")); // Language
+        let tracks = ebml_elem(0x1654AE6B, &ebml_elem(0xAE, &audio));
+
+        // Front body: a pre-`Tracks` Void DECLARING 5000 bytes but carrying only 4 — overruns the tiny
+        // front buffer → the front parse defers, and front_mkv_tracks_extent reports an in-cap extent.
+        let build = |void: Vec<u8>| {
+            let mut seg = void;
+            seg.extend(tracks.clone());
+            let segment = ebml_elem_sized(0x18538067, 8_000_000_000, &seg);
+            let mut body = ebml_elem(0x1A45DFA3, &[]);
+            body.extend(segment);
+            body
+        };
+        let front_body = build(ebml_elem_sized(0xEC, 5000, &[0u8; 4]));
+        // Recovery body: the SAME structure with the Void's full 5000-byte payload present → parseable.
+        let recovery_body = build(ebml_elem_sized(0xEC, 5000, &[0u8; 5000]));
+        assert!(recovery_body.len() >= front_body.len());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for body in [front_body, recovery_body] {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/9000000000\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len() - 1,
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                    let _ = sock.flush().await;
+                }
+            }
+        });
+        let url = format!("http://{}/", addr);
+        let tracks = probe_tracks(&reqwest::Client::new(), &url)
+            .await
+            .expect("recovery re-fetch must yield tracks");
+        assert!(
+            tracks
+                .iter()
+                .any(|t| matches!(t.kind, TrackKind::Audio) && t.language.as_deref() == Some("eng")),
+            "the recovered probe must report the eng audio track, got {tracks:?}"
+        );
+    }
+
     #[test]
     fn verify_audio_original_and_subtitle_rules() {
         let tracks = vec![

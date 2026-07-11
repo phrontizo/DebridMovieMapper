@@ -1911,6 +1911,128 @@ mod provider_abstraction_tests {
     }
 
     #[tokio::test]
+    async fn fetch_cdn_range_persistent_5xx_instant_repair_recovers_and_serves_bytes() {
+        // The HAPPY path of the persistent-5xx escalation: instant repair yields a working (repaired)
+        // URL and the byte read then COMPLETES inline. The escalation test above proves repair is
+        // attempted; this proves the post-repair re-fetch (the `continue` after attempt_instant_repair)
+        // actually recovers — so a persistent 500 self-heals instead of retry-storming the player.
+        use crate::provider::FileLocator;
+        use crate::rd_client::{AddMagnetResponse, TorrentFile, TorrentInfo};
+        let body: &[u8] = b"REPAIREDBYTES!!!"; // 16 bytes
+        let url_500 = spawn_always_status("500 Internal Server Error").await;
+        let url_206 = spawn_206_no_content_length(body).await;
+        // The ORIGINAL torrent resolves to the 500 CDN; the REPAIRED torrent resolves to the 206 CDN.
+        let mut by_tid = std::collections::HashMap::new();
+        by_tid.insert("old_tid".to_string(), url_500.clone());
+        by_tid.insert("new_tid".to_string(), url_206);
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            resolved_url_by_torrent_id: by_tid,
+            add_magnet: Some(AddMagnetResponse {
+                id: "new_tid".to_string(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "new_tid".to_string(),
+                hash: "H".to_string(),
+                status: "downloaded".to_string(),
+                files: vec![TorrentFile {
+                    id: 5,
+                    path: "/Movie.mkv".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                }],
+                links: vec!["https://rd/newlink".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let repair = Arc::new(RepairManager::new(provider.clone()));
+        let mut f = ProxiedMediaFile {
+            name: "Movie.mkv".to_string(),
+            locator: FileLocator {
+                hash: "H".to_string(),
+                torrent_id: "old_tid".to_string(),
+                file_id: 1,
+                file_path: "/Movie.mkv".to_string(),
+                link: Some("https://rd/oldlink".to_string()),
+            },
+            file_size: body.len() as u64,
+            repair_manager: repair,
+            provider,
+            http_client: reqwest::Client::new(),
+            pos: 0,
+            cdn_url: Some(url_500),
+            buffer: bytes::Bytes::new(),
+            buffer_start: 0,
+            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            vfs_path: String::new(),
+            modified_time: SystemTime::UNIX_EPOCH,
+            confirmed_read: false,
+            first_read_bytes: BUFFER_SIZE as u64,
+        };
+        let data = f
+            .fetch_bytes(8)
+            .await
+            .expect("persistent 5xx → repair → repaired 206 must serve bytes");
+        assert_eq!(&data[..], b"REPAIRED");
+        assert_eq!(
+            f.locator.torrent_id, "new_tid",
+            "the locator must have swapped to the repaired torrent"
+        );
+    }
+
+    /// Server that DROPS the first accepted connection (a transport error on the client) then serves a
+    /// valid `206` on the next — to exercise the attempt-0 connection-error retry-then-recover branch.
+    async fn spawn_close_then_206(body: &'static [u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut first = true;
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                if first {
+                    first = false;
+                    drop(sock); // close immediately → connection error on the client
+                    continue;
+                }
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{}/", addr)
+    }
+
+    #[tokio::test]
+    async fn fetch_cdn_range_recovers_from_a_transient_connection_error() {
+        // A transient TCP failure on attempt 0 (connection dropped) must be retried on the SAME url and
+        // recover on the next 206 — without invalidating the resolution (the URL is still valid). The
+        // existing connection-error test only covers the terminal-fail case; this covers recovery.
+        let body: &[u8] = b"AFTERCLOSE123456"; // 16 bytes
+        let url = spawn_close_then_206(body).await;
+        let (mut f, invalidate_calls) = proxied_with_counter(url, 0, body.len() as u64);
+        let data = f
+            .fetch_bytes(8)
+            .await
+            .expect("a dropped connection on attempt 0 then a 206 must recover");
+        assert_eq!(&data[..], b"AFTERCLO");
+        assert_eq!(
+            invalidate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a transient connection error must NOT invalidate the cached resolution"
+        );
+    }
+
+    #[tokio::test]
     async fn fetch_bytes_serves_from_read_ahead_buffer_without_network() {
         // A read fully inside the 2 MB read-ahead buffer must be served from it — no CDN fetch, no
         // invalidate — with correct offset math. This core buffer-hit branch had no coverage (every

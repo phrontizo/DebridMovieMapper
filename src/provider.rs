@@ -152,6 +152,10 @@ pub struct MockProvider {
     /// Infohashes whose `add_magnet` returns a `reqwest::Error`, so a test can drive the acquisition
     /// engine's "add failed → try the next candidate" fall-through for one specific candidate.
     pub fail_add_magnet_hashes: std::collections::HashSet<String>,
+    /// Per-torrent-id resolved URL. When a locator's `torrent_id` is present here, `resolve_url`
+    /// returns that URL instead of the flat `resolved_url` — letting a test resolve the ORIGINAL and
+    /// the REPAIRED torrent to different CDN endpoints (e.g. the original 5xxs, the repaired serves).
+    pub resolved_url_by_torrent_id: std::collections::HashMap<String, String>,
 }
 
 #[cfg(test)]
@@ -217,6 +221,9 @@ impl DebridProvider for MockProvider {
     async fn resolve_url(&self, loc: &FileLocator) -> Result<String, crate::error::AppError> {
         if self.unavailable_torrent_ids.contains(&loc.torrent_id) {
             return Err(crate::error::AppError::Unavailable);
+        }
+        if let Some(u) = self.resolved_url_by_torrent_id.get(&loc.torrent_id) {
+            return Ok(u.clone());
         }
         match &self.resolved_url {
             Some(u) => Ok(u.clone()),
