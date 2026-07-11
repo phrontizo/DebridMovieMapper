@@ -140,30 +140,15 @@ pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) 
         "Could not identify torrent: {}. Filename: {}.",
         info.filename, representative_name
     );
-    let (cleaned_torrent, year_t) = clean_name(&info.filename);
-    if !cleaned_torrent.is_empty() {
-        return MediaMetadata {
-            title: cleaned_torrent,
-            year: year_t,
-            media_type: if is_show_guess(&info.files) {
-                MediaType::Show
-            } else {
-                MediaType::Movie
-            },
-            external_id: None,
-        };
-    }
-
-    let (cleaned_file, year_f) = clean_name(representative_name);
-    let final_title = if !cleaned_file.is_empty() {
-        cleaned_file
-    } else {
-        representative_name.to_string()
-    };
+    let (title, year) = fallback_title(
+        clean_name(&info.filename),
+        clean_name(representative_name),
+        representative_name,
+    );
 
     MediaMetadata {
-        title: final_title,
-        year: year_f,
+        title,
+        year,
         media_type: if is_show_guess(&info.files) {
             MediaType::Show
         } else {
@@ -171,6 +156,28 @@ pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) 
         },
         external_id: None,
     }
+}
+
+/// Last-resort title when neither the file nor the torrent name matched TMDB. Prefer the first
+/// cleaned candidate (torrent name, then representative file name) that is neither empty NOR
+/// GENERIC: a bare "Season 1"/"Episode" is a junk library entry — worse than the raw filename it
+/// was cleaned from — so a generic candidate is skipped in favour of the next source, and the raw
+/// file name is used only when every cleaned candidate is empty or generic. Each candidate keeps
+/// its own paired year token.
+fn fallback_title(
+    cleaned_torrent: (String, Option<String>),
+    cleaned_file: (String, Option<String>),
+    raw_file: &str,
+) -> (String, Option<String>) {
+    let (torrent_title, torrent_year) = cleaned_torrent;
+    if !torrent_title.is_empty() && !is_generic_title(&torrent_title) {
+        return (torrent_title, torrent_year);
+    }
+    let (file_title, file_year) = cleaned_file;
+    if !file_title.is_empty() && !is_generic_title(&file_title) {
+        return (file_title, file_year);
+    }
+    (raw_file.to_string(), file_year)
 }
 
 fn best_scored_result<'a>(
@@ -978,6 +985,36 @@ mod tests {
         assert_eq!(metadata.media_type, MediaType::Show);
         assert_eq!(metadata.title, "Peaky Blinders");
         assert_eq!(metadata.external_id, Some("tmdb:60574".to_string()));
+    }
+
+    #[test]
+    fn fallback_title_skips_a_generic_cleaned_name() {
+        // Torrent name cleans to a generic folder token → skip it in favour of the file name,
+        // which cleans to a real title (with its own year), rather than emitting junk "Season 1".
+        let (title, year) = fallback_title(
+            ("Season 1".to_string(), None),
+            ("Real Show".to_string(), Some("2019".to_string())),
+            "Real.Show.S01E01.mkv",
+        );
+        assert_eq!(title, "Real Show");
+        assert_eq!(year, Some("2019".to_string()));
+
+        // A real torrent title is used as-is, paired with its own year.
+        let (title, year) = fallback_title(
+            ("Some Movie".to_string(), Some("2020".to_string())),
+            ("Whatever".to_string(), None),
+            "raw.mkv",
+        );
+        assert_eq!(title, "Some Movie");
+        assert_eq!(year, Some("2020".to_string()));
+
+        // Every cleaned candidate is generic or empty → the raw file name is the last resort.
+        let (title, _year) = fallback_title(
+            ("Episode".to_string(), None),
+            (String::new(), None),
+            "mystery-blob.mkv",
+        );
+        assert_eq!(title, "mystery-blob.mkv");
     }
 
     #[tokio::test]
