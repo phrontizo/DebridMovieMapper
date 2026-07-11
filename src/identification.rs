@@ -93,8 +93,14 @@ fn filename_has_show_marker(filename: &str) -> bool {
     false
 }
 
-static GENERIC_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^(episode|season|part|volume|vol)\s*(\d+|[a-z])?$").unwrap());
+// A LETTER designator (e.g. "Part A") must be separated from the stop-word by whitespace, so a
+// stop-word glued to a single trailing letter — which forms a real word: "Episodes", "Parts",
+// "Seasons", "Party", "Volo" — is NOT treated as generic (that would strip its TMDB identity before
+// any lookup). A NUMBER designator still allows the glued form ("Season1"), which is unambiguously
+// a generic folder name.
+static GENERIC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(episode|season|part|volume|vol)(\s*\d+|\s+[a-z])?$").unwrap()
+});
 
 /// A bare " - NNN - " episode-number separator (e.g. "Rick and Morty - 409 - Childrick of
 /// Mort": the absolute/SxxEyy code some packs use instead of "S04E09"). The show name
@@ -982,10 +988,20 @@ mod tests {
         assert!(is_generic_title("Vol 3"));
         assert!(is_generic_title("Episode"));
         assert!(is_generic_title("Part A"));
+        // A glued number is still a generic folder name (no separating space required).
+        assert!(is_generic_title("Season1"));
 
         assert!(!is_generic_title("Inception"));
         assert!(!is_generic_title("2012")); // 4 digits, but not < 10
         assert!(!is_generic_title("The Episode"));
+        // A stop-word GLUED to a single trailing letter forms a real word — it must NOT be
+        // treated as generic, or the title loses its TMDB identity before any lookup runs
+        // (Showtime's "Episodes", the films/shows "Parts"/"Seasons"/"Party", the show "Volo").
+        assert!(!is_generic_title("Episodes"));
+        assert!(!is_generic_title("Parts"));
+        assert!(!is_generic_title("Seasons"));
+        assert!(!is_generic_title("Party"));
+        assert!(!is_generic_title("Volo"));
     }
 
     #[test]
