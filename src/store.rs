@@ -1081,15 +1081,29 @@ impl Store {
         let key = blacklist_key(kind, tmdb_id, &hash);
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
+            // Log-then-default on a transient read failure, matching `read_or_log`'s convention: a
+            // silent false "not blacklisted" would let a rejected hash be re-added, invisibly.
             let txn = match db.begin_read() {
                 Ok(t) => t,
-                Err(_) => return false,
+                Err(e) => {
+                    error!("is_blacklisted begin_read: {e}");
+                    return false;
+                }
             };
             let table = match txn.open_table(BLACKLIST_TABLE) {
                 Ok(t) => t,
-                Err(_) => return false,
+                Err(e) => {
+                    error!("is_blacklisted open_table: {e}");
+                    return false;
+                }
             };
-            matches!(table.get(key.as_str()), Ok(Some(_)))
+            match table.get(key.as_str()) {
+                Ok(v) => v.is_some(),
+                Err(e) => {
+                    error!("is_blacklisted get: {e}");
+                    false
+                }
+            }
         })
         .await
         .unwrap_or(false)
@@ -1678,20 +1692,29 @@ impl Store {
         let key = upgrade_check_key(media_type, tmdb_id);
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
+            // Log-then-default on a transient read failure, matching `read_or_log`'s convention: a
+            // silent 0 ("never checked") would make an already-checked title re-process early, invisibly.
             let txn = match db.begin_read() {
                 Ok(t) => t,
-                Err(_) => return 0,
+                Err(e) => {
+                    error!("get_upgrade_checked begin_read: {e}");
+                    return 0;
+                }
             };
             let table = match txn.open_table(UPGRADE_CHECKS_TABLE) {
                 Ok(t) => t,
-                Err(_) => return 0,
+                Err(e) => {
+                    error!("get_upgrade_checked open_table: {e}");
+                    return 0;
+                }
             };
-            table
-                .get(key.as_str())
-                .ok()
-                .flatten()
-                .map(|g| g.value())
-                .unwrap_or(0)
+            match table.get(key.as_str()) {
+                Ok(v) => v.map(|g| g.value()).unwrap_or(0),
+                Err(e) => {
+                    error!("get_upgrade_checked get: {e}");
+                    0
+                }
+            }
         })
         .await
         .unwrap_or(0)
