@@ -1151,6 +1151,13 @@ impl AcquisitionEngine {
             // torrent for the title and every subsequent stuck tick re-scrapes until the delete
             // succeeds. The kept record's next observe tick performs the delete-then-re-acquire.
             // Sticky provenance: re-acquire preserves the failed record's origin (Trigger B correctness).
+            //
+            // SCOPE for a multi-episode pack: `req` carries only the single originally-requested
+            // (season, episode), so this immediately restores that ONE episode. The pack's OTHER
+            // episodes (whose selection slots were cleared above) are left un-selected here — but the
+            // pack is only reaped when the provider actually lost it, so those episodes were already
+            // gone. `monitor_episodes` re-acquires the full missing set (owned-episode coverage via
+            // the `provides` union) on its next cycle, so the gap is bounded latency, not lost content.
             let _ = self.acquire(req.clone(), provenance.clone()).await; // promotes the next candidate (bad hash now blacklisted)
         }
     }
