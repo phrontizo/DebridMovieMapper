@@ -926,12 +926,34 @@ pub fn is_video_file(path: &str) -> bool {
             if component == filename {
                 continue;
             }
-            if EXCLUDED_DIRS.contains(&component) {
+            // Normalise scene separators (`Deleted.Scenes`, `behind_the_scenes`) to spaces so the
+            // dotted/underscored directory forms match the space-separated EXCLUDED_DIRS entries —
+            // not only literal-space directory names.
+            let normalized = normalize_dir_component(component);
+            if EXCLUDED_DIRS.iter().any(|d| *d == normalized.as_ref()) {
                 return false;
             }
         }
     }
     VIDEO_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// Collapse `.`/`_`/`-`/space runs in a directory component to single spaces so scene-style names
+/// (`Behind.The.Scenes`, `deleted_scenes`) compare equal to the space-separated `EXCLUDED_DIRS`
+/// entries. Returns the component borrowed unchanged when it has no such separators (the common
+/// case), so a normal component costs no allocation.
+fn normalize_dir_component(component: &str) -> std::borrow::Cow<'_, str> {
+    if component.contains(['.', '_', '-']) {
+        std::borrow::Cow::Owned(
+            component
+                .split(['.', '_', '-', ' '])
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(component)
+    }
 }
 
 /// Extract a season number from an arbitrary string (filename or directory portion) via SEASON_RE,
@@ -3408,9 +3430,17 @@ mod tests {
         assert!(!is_video_file("/path/Interviews/interview.mkv"));
         assert!(!is_video_file("/path/Trailers/trailer.mkv"));
         assert!(!is_video_file("/path/Samples/sample_clip.mkv"));
+        // Dotted/underscored scene-style directory names (the common remux/scene layout) must be
+        // excluded too — not only literal-space directory names.
+        assert!(!is_video_file("/path/Behind.The.Scenes/clip.mkv"));
+        assert!(!is_video_file("/path/Deleted.Scenes/scene1.mkv"));
+        assert!(!is_video_file("/path/Behind_The_Scenes/bts.mkv"));
+        assert!(!is_video_file("/path/deleted-scenes/scene.mp4"));
         // Normal directories should not be excluded
         assert!(is_video_file("/path/Season 01/episode.mkv"));
         assert!(is_video_file("/path/Show/S01E01.mkv"));
+        // A dotted normal directory must still pass (normalisation must not over-match).
+        assert!(is_video_file("/path/The.Movie.2020/feature.mkv"));
     }
 
     // --- L4: SEASON_RE handles "Part N" numbering ---
