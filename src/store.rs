@@ -722,6 +722,11 @@ impl Store {
     // ── owned_hashes accessors ────────────────────────────────────────────────
 
     pub async fn put_owned(&self, hash: String, rec: OwnedRecord) -> Result<(), AppError> {
+        // Normalise the key to lowercase so the owned table is case-consistent regardless of caller
+        // (the mirror lowercases; the scraper emits lowercase infohashes). This makes the exact-match
+        // get/put/remove and `put_owned_if_absent`'s atomic dedup caller-proof — a differently-cased
+        // write can never produce a duplicate record for one physical torrent.
+        let hash = hash.to_ascii_lowercase();
         // Serialise before opening the transaction to avoid partial writes on
         // serde failure (mirrors `replace_match`).
         let bytes = match serde_json::to_vec(&rec) {
@@ -758,6 +763,7 @@ impl Store {
         hash: String,
         rec: OwnedRecord,
     ) -> Result<bool, AppError> {
+        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
         let bytes = match serde_json::to_vec(&rec) {
             Ok(b) => b,
             Err(e) => {
@@ -790,6 +796,7 @@ impl Store {
     }
 
     pub async fn get_owned(&self, hash: String) -> Option<OwnedRecord> {
+        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let txn = db.begin_read().ok()?;
@@ -807,6 +814,7 @@ impl Store {
         hash: String,
         status: OwnedStatus,
     ) -> Result<(), AppError> {
+        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), AppError> {
             let txn = db.begin_write().map_err(|e| AppError::Db(e.into()))?;
@@ -866,6 +874,7 @@ impl Store {
     }
 
     pub async fn remove_owned(&self, hash: String) -> Result<(), AppError> {
+        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
@@ -2213,6 +2222,43 @@ mod tests {
             !kept.provenance.entries.is_empty(),
             "the existing engine record's provenance must NOT be clobbered by the mirror write"
         );
+    }
+
+    #[tokio::test]
+    async fn owned_accessors_are_case_insensitive_on_the_hash_key() {
+        // The owned table is keyed case-insensitively: a mixed-case write is found by a lowercase
+        // read, `put_owned_if_absent` dedups across case (so one physical torrent can't produce two
+        // records), and remove works regardless of case. Guards the invariant against a future
+        // non-lowercasing hash source.
+        let store = mem_store();
+        let rec = OwnedRecord {
+            request: req("tt1", 27205),
+            provenance: Provenance::watchlist("alice"),
+            added_at: 1,
+            status: OwnedStatus::Pending,
+            provides: vec![],
+            quality: None,
+        };
+        store.put_owned("AbCdEf".into(), rec.clone()).await.unwrap();
+        assert!(
+            store.get_owned("abcdef".into()).await.is_some(),
+            "a lowercase read must find a mixed-case write"
+        );
+        // A differently-cased if-absent write must see the existing record (dedup), returning false.
+        assert!(
+            !store
+                .put_owned_if_absent("ABCDEF".into(), rec)
+                .await
+                .unwrap(),
+            "put_owned_if_absent must treat a differently-cased hash as already present"
+        );
+        assert_eq!(
+            store.all_owned().await.len(),
+            1,
+            "no duplicate record across case"
+        );
+        store.remove_owned("aBcDeF".into()).await.unwrap();
+        assert!(store.get_owned("abcdef".into()).await.is_none());
     }
 
     #[tokio::test]
