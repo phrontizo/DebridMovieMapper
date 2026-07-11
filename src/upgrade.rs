@@ -1380,13 +1380,37 @@ async fn try_upgrade_show(
     idle_window: Duration,
 ) -> Result<(), UpgradeSkip> {
     let deferred = upgrade_show_episodes_and_packs(app, tmdb_id, group_hashes, idle_window).await;
-    let consolidated = try_consolidate_show(app, tmdb_id, group_hashes, idle_window).await;
+    // Re-derive the CURRENT group membership from the store before consolidation. The per-episode
+    // phase above can stage a NEW hash and prune the OLD singleton within THIS tick, so the
+    // tick-start `group_hashes` snapshot is stale: consolidating against it would miss a
+    // just-upgraded episode (invisible to consolidation's no-regression gate → a lower-quality pack
+    // silently regresses it, and the freshly-staged higher-quality copy is orphaned → later deleted
+    // by dedup). Feeding consolidation the fresh set makes `season_owned_quality` see the upgraded
+    // episode, so the no-regression gate correctly rejects a lower-quality pack.
+    let fresh_hashes = current_show_hashes(app, tmdb_id).await;
+    let consolidated = try_consolidate_show(app, tmdb_id, &fresh_hashes, idle_window).await;
     if deferred {
         return Err(UpgradeSkip::Deferred(
             "show per-episode/pack upgrade deferred mid-tick (library active)".into(),
         ));
     }
     consolidated
+}
+
+/// Re-derive the CURRENT owned hashes for a show group `(Series, tmdb_id)` from the store, lowercased.
+/// Used to refresh the consolidation view after the per-episode upgrade phase mutates the group's
+/// membership within a tick (see [`try_upgrade_show`]). Filters by `MediaKind::Series` so a movie
+/// sharing the numeric `tmdb_id` is never folded into the show's set.
+async fn current_show_hashes(app: &AppState, tmdb_id: u64) -> Vec<String> {
+    app.store
+        .all_owned()
+        .await
+        .into_iter()
+        .filter(|(_, rec)| {
+            rec.request.tmdb_id == tmdb_id && rec.request.kind == MediaKind::Series
+        })
+        .map(|(hash, _)| hash.to_ascii_lowercase())
+        .collect()
 }
 
 /// Consolidate a show's scattered per-episode torrents into a full-season CACHED pack, season by
@@ -1969,6 +1993,74 @@ mod tests {
             trakt_client: None,
             read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn current_show_hashes_reflects_store_and_excludes_same_id_movie() {
+        // Guards the F1 fix: consolidation must see the CURRENT show membership, not a stale
+        // tick-start snapshot. The helper reflects live store state and excludes a movie sharing
+        // the numeric tmdb id.
+        let store = mem_store();
+        let series_req = |tmdb: u64| AcquireRequest {
+            imdb_id: "tt9".into(),
+            tmdb_id: tmdb,
+            kind: MediaKind::Series,
+            season: Some(1),
+            episode: Some(1),
+            original_language: Some("eng".into()),
+            metadata: movie_meta(),
+        };
+        let rec = |req: AcquireRequest| OwnedRecord {
+            request: req,
+            provenance: Provenance::watchlist("a"),
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides: vec![(1, 1)],
+            quality: None,
+        };
+        store
+            .put_owned("se1".into(), rec(series_req(100)))
+            .await
+            .unwrap();
+        store
+            .put_owned("se2".into(), rec(series_req(100)))
+            .await
+            .unwrap();
+        // A MOVIE sharing tmdb 100 must NOT be folded into the show set.
+        store
+            .put_owned(
+                "mov".into(),
+                OwnedRecord {
+                    request: movie_req_for(100, "tt1"),
+                    ..rec(series_req(100))
+                },
+            )
+            .await
+            .unwrap();
+        // A different show id.
+        store
+            .put_owned("other".into(), rec(series_req(200)))
+            .await
+            .unwrap();
+
+        let app = app_with(
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(MockProvider::default()),
+            store.clone(),
+        );
+        let mut got = current_show_hashes(&app, 100).await;
+        got.sort();
+        assert_eq!(got, vec!["se1".to_string(), "se2".to_string()]);
+
+        // Reflects a mid-tick membership change: prune se1, stage a fresh higher-quality copy.
+        store.remove_owned("se1".into()).await.unwrap();
+        store
+            .put_owned("se1new".into(), rec(series_req(100)))
+            .await
+            .unwrap();
+        let mut got2 = current_show_hashes(&app, 100).await;
+        got2.sort();
+        assert_eq!(got2, vec!["se1new".to_string(), "se2".to_string()]);
     }
 
     #[tokio::test]
