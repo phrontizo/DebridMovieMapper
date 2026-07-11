@@ -178,6 +178,40 @@ async fn supersede_hashes(app: &AppState, owned_hashes: &[String]) -> Vec<String
     prunable
 }
 
+/// Whether `slot`'s current selection points at an owned copy of this group that is ABOVE the
+/// `MAX_RESOLUTION` ceiling while corrective downgrade is gated OFF (`ALLOW_RESOLUTION_DOWNGRADE`
+/// unset). In that state `supersede_hashes` deliberately RETAINS the over-ceiling copy — but the
+/// swap tail still repoints the slot unconditionally, so adopting a within-ceiling "upgrade" (rated
+/// `Improvement::Upgrade` relative to a *separate* within-ceiling copy in the same group, not a
+/// gated `Downgrade`) would silently move the SERVED resolution down. That is a corrective downgrade
+/// the contract reserves for the gated path, so callers skip the swap when this returns `true`.
+/// Always `false` when the flag is on (the gated downgrade path handles it) or when the slot has no
+/// selection / points outside the group / at a within-ceiling copy.
+async fn served_slot_is_retained_over_ceiling(
+    app: &AppState,
+    slot: &str,
+    owned_hashes: &[String],
+) -> bool {
+    if app.config.allow_resolution_downgrade {
+        return false;
+    }
+    let Some(sel) = app.store.get_selection(slot.to_string()).await else {
+        return false;
+    };
+    if !owned_hashes
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(&sel.hash))
+    {
+        return false;
+    }
+    let ceiling = app.config.acquisition.prefs.max_resolution.height();
+    app.store
+        .get_owned(sel.hash.clone())
+        .await
+        .and_then(|r| r.quality)
+        .is_some_and(|q| q.resolution > ceiling)
+}
+
 /// The IMDB id to scrape a group with: prefer ANY owned copy that actually carries a non-empty
 /// IMDB id (Torrentio is IMDB-keyed) over only the lexicographically-first representative — in a
 /// mixed group the representative can be an empty-imdb account-mirror record, which would otherwise
@@ -400,6 +434,26 @@ async fn try_upgrade_movie(
             "current quality unknown/mixed; not upgrading (avoids regression)".into(),
         ));
     };
+    // Corrective-downgrade guard: if the baseline is a WITHIN-ceiling copy (so any adopted candidate
+    // is rated `Improvement::Upgrade`, bypassing the downgrade gate) yet the SERVED slot points at a
+    // separate over-ceiling copy we are deliberately RETAINING (ALLOW_RESOLUTION_DOWNGRADE off), then
+    // adopting that "upgrade" would repoint the served slot DOWN in resolution — a corrective
+    // downgrade the contract reserves for the gated path. Skip (preview only). The `current` <=
+    // ceiling condition is what distinguishes this from the genuine sole-over-ceiling-copy downgrade
+    // case (baseline over-ceiling → candidates rated `Downgrade` → handled by `downgrade_allowed_or_log`).
+    // Checked before the scrape so it costs no network call.
+    let ceiling = app.config.acquisition.prefs.max_resolution.height();
+    if current.resolution <= ceiling
+        && served_slot_is_retained_over_ceiling(app, &movie_slot(tmdb_id), owned_hashes).await
+    {
+        debug!(
+            "upgrade: tmdb {} served movie copy is over-ceiling and retained; not repointing (corrective downgrade gated off)",
+            tmdb_id
+        );
+        return Err(UpgradeSkip::NoChange(
+            "served copy is over-ceiling and retained (corrective downgrade gated off)".into(),
+        ));
+    }
     // Torrentio is IMDB-keyed: a record whose IMDB id never resolved (stored empty) can't be
     // scraped, so skip before the network call rather than issuing a fruitless empty-key request
     // every budgeted tick (mirrors `build_acquire_request`'s skip on the acquisition path). Resolve
@@ -2151,6 +2205,106 @@ mod tests {
             !deleted.lock().unwrap().contains(&"t2160".to_string()),
             "the over-ceiling torrent must not be deleted from the provider"
         );
+    }
+
+    #[tokio::test]
+    async fn movie_upgrade_does_not_downgrade_a_served_over_ceiling_copy() {
+        // Same mixed group as above, but the SERVED slot points at the over-ceiling 2160p copy
+        // ("h2160") — the realistic state for an engine copy acquired under a previously-higher
+        // ceiling. Adopting the within-ceiling REMUX would repoint the served slot from 2160p down
+        // to 1080p, an un-opted corrective downgrade. With ALLOW_RESOLUTION_DOWNGRADE off the swap
+        // must be skipped entirely (no new copy adopted, both copies kept, selection unchanged).
+        let store = mem_store();
+        for (hash, tier, res, score) in [
+            ("hold", 3_000i64, 1080u16, 10i64),
+            ("h2160", 8_000, 2160, 1_008_000),
+        ] {
+            store
+                .put_owned(
+                    hash.into(),
+                    OwnedRecord {
+                        request: movie_req(),
+                        provenance: Provenance::watchlist("a"),
+                        added_at: 1,
+                        status: OwnedStatus::Verified,
+                        provides: vec![],
+                        quality: Some(QualitySummary {
+                            cached: true,
+                            source_tier: tier,
+                            resolution: res,
+                            score,
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        // The served slot is the OVER-CEILING copy this time.
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "h2160".into(),
+                    file_path: "big.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![remux_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "told".into(),
+                    hash: "hold".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "t2160".into(),
+                    hash: "h2160".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            }),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+        assert!(!app.config.allow_resolution_downgrade);
+
+        let rec = store.get_owned("hold".into()).await.unwrap();
+        let r = try_upgrade_movie(
+            &app,
+            27205,
+            &["h2160".to_string(), "hold".to_string()],
+            &rec,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(
+            matches!(r, Err(UpgradeSkip::NoChange(_))),
+            "the swap is skipped (served copy is over-ceiling and retained), got {r:?}"
+        );
+        assert!(
+            store.get_owned("hnew".into()).await.is_none(),
+            "no within-ceiling copy is adopted"
+        );
+        assert!(store.get_owned("hold".into()).await.is_some());
+        assert!(store.get_owned("h2160".into()).await.is_some());
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "h2160",
+            "the served selection stays on the over-ceiling copy"
+        );
+        assert!(deleted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
