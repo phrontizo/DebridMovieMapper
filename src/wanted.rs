@@ -174,18 +174,21 @@ fn episode_covered(title: &TitleView, e: &(u32, u32)) -> bool {
 /// Decide the actions for ONE title. Removal takes precedence over acquisition.
 pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
     // Trigger A (finished) is invariant within this call and consulted in three places (the removal
-    // reason below and both acquire branches' flip-flop guards), so compute it once here. `wanted`
+    // decision below and both acquire branches' flip-flop guards), so compute it ONCE here. `wanted`
     // and `aired_episodes` don't change during a reconcile, so this is behaviour-identical to the
-    // former repeated evaluations. (`should_remove` still evaluates it internally.)
+    // former repeated evaluations.
     let finished = trigger_a_finished(&title.wanted, &title.aired_episodes);
 
-    // Removal first: if a title qualifies for removal we never also acquire it.
-    // `owned` is bound only to read `owned.hash`; `should_remove` already returns false when owned is None.
+    // Removal first: if a title qualifies for removal we never also acquire it. Reuse `finished`
+    // rather than routing through `should_remove` (which would recompute Trigger A): removal is
+    // `owned && !manual && (A || B)`, and inside this branch `owned` holds, so `A == finished`.
     if let Some(owned) = &title.owned {
-        if should_remove(title) {
+        let removable = !owned.provenance.has_manual_entry()
+            && (finished || trigger_b_abandoned(&title.wanted, &owned.provenance));
+        if removable {
             // Distinguish the trigger so the executor removes the right hash set: Trigger A
             // (finished) is a full cleanup incl. mirror copies; Trigger B (abandoned) keeps mirror.
-            // should_remove == A || B, so if A didn't fire it must be B.
+            // removable == A || B, so if A didn't fire it must be B.
             let reason = if finished {
                 RemoveReason::Finished
             } else {
