@@ -1723,6 +1723,36 @@ mod tests {
         assert!(store.get_match("a".to_string()).await.is_some());
     }
 
+    #[tokio::test]
+    async fn open_recovers_twice_when_corrupt_backup_already_exists() {
+        // A SECOND recovery when `<path>.corrupt` already exists must rename to `<path>.corrupt.1`
+        // (never clobbering the earlier backup) and still yield a working DB — the whole reason
+        // `unique_backup_path` exists (Windows can't rename onto an existing file). Exercises
+        // `move_aside_and_create`'s numbered-fallback branch end-to-end.
+        let tmp = TempDb::new("corrupt_twice");
+        let corrupt = tmp.corrupt_path();
+        let corrupt1 = format!("{}.corrupt.1", tmp.path);
+        let _ = std::fs::remove_file(&corrupt1);
+        std::fs::write(&tmp.path, b"not a redb file").unwrap();
+        std::fs::write(&corrupt, b"an earlier backup").unwrap();
+        let store = Store::open(&tmp.path).expect("must recover a second time, not error");
+        assert!(
+            std::path::Path::new(&corrupt1).exists(),
+            "the new corrupt file must move aside to .corrupt.1, not clobber the existing .corrupt"
+        );
+        assert_eq!(
+            std::fs::read(&corrupt).unwrap(),
+            b"an earlier backup",
+            "the earlier .corrupt backup is preserved untouched"
+        );
+        store
+            .put_matches(vec![("a".to_string(), info("a"), movie("A"))])
+            .await
+            .unwrap();
+        assert!(store.get_match("a".to_string()).await.is_some());
+        let _ = std::fs::remove_file(&corrupt1);
+    }
+
     #[test]
     fn db_open_failure_keeps_intact_db_on_transient_errors() {
         // Lock contention (another instance) and I/O / permission errors must NOT move the DB
@@ -2833,6 +2863,64 @@ mod tests {
             bt.iter().unwrap().count(),
             0,
             "the legacy bare-key blacklist row must be cleared by the v6→v7 migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrates_v3_db_clears_legacy_blacklist_through_the_ladder() {
+        // The `< 7` blacklist clear must fire for a LOWER from_version too (not just v6→v7): a v3 DB
+        // carrying an old bare-key blacklist row has it cleared through the full migration ladder,
+        // while its authoritative owned row survives.
+        let tmp = TempDb::new("migrate_v3_blacklist");
+        {
+            let db = Database::create(&tmp.path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let bdef: TableDefinition<&str, &[u8]> = TableDefinition::new("blacklist");
+                let mut bt = txn.open_table(bdef).unwrap();
+                bt.insert(
+                    "1396|deadbeef",
+                    serde_json::to_vec(&serde_json::json!({"reason":"WrongTitle","at":1}))
+                        .unwrap()
+                        .as_slice(),
+                )
+                .unwrap();
+
+                let odef: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_hashes");
+                let mut ot = txn.open_table(odef).unwrap();
+                let rec = OwnedRecord {
+                    request: req("tt3", 1396),
+                    provenance: Provenance::manual(),
+                    added_at: 3,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                };
+                ot.insert("hash3b", serde_json::to_vec(&rec).unwrap().as_slice())
+                    .unwrap();
+
+                let vdef: TableDefinition<&str, u64> = TableDefinition::new("meta");
+                let mut v = txn.open_table(vdef).unwrap();
+                v.insert("schema_version", &3u64).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = Store::open(&tmp.path).unwrap();
+        assert_eq!(
+            store.get_owned("hash3b".to_string()).await.unwrap().status,
+            OwnedStatus::Verified,
+            "owned rows must survive the v3→v7 migration"
+        );
+        drop(store);
+        let db = Database::create(&tmp.path).unwrap();
+        assert_eq!(Store::read_version(&db).unwrap(), SCHEMA_VERSION);
+        let txn = db.begin_read().unwrap();
+        let bdef: TableDefinition<&str, &[u8]> = TableDefinition::new("blacklist");
+        let bt = txn.open_table(bdef).unwrap();
+        assert_eq!(
+            bt.iter().unwrap().count(),
+            0,
+            "a legacy blacklist row must be cleared for a pre-v6 from_version too"
         );
     }
 
