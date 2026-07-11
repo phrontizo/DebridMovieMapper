@@ -22,6 +22,15 @@ struct Envelope<T> {
     data: Option<T>,
 }
 
+/// The verdict `send_enveloped` reaches on a decoded `Envelope<D>`: a usable result, a
+/// `success:true` response missing the required `data`, or a `success:false` soft failure (carrying
+/// TorBox's `detail`). Lets `send_data_n` (data required) and `send_ok` (success only) share one loop.
+enum EnvVerdict<R> {
+    Done(R),
+    SuccessButNoData,
+    NotSuccess(Option<String>),
+}
+
 /// Deserialize a field that TorBox may send as JSON `null`, omit, OR send with the WRONG TYPE (e.g.
 /// a stringized number, or `download_state` as a number) into the type's default, instead of failing
 /// the whole response decode. TorBox's `mylist` is loose: a single torrent with e.g. `"files": null`,
@@ -438,10 +447,22 @@ impl TorBoxClient {
     /// (`resolve_locator`) passes a SMALL budget (3) so a black-holing endpoint (packets dropped →
     /// repeated 10s connect timeouts) fails over to instant repair in ~30s rather than ~60s — the
     /// same fast-fail rationale as the RD client's 3-attempt `unrestrict_link` read path.
-    async fn send_data_n<T, F>(&self, make: F, max_attempts: u32) -> Result<T, reqwest::Error>
+    /// The single TorBox request loop behind `send_data_n` and `send_ok`: send with rate-limit
+    /// pacing; retry a statusless transport error, a 429, a transient 5xx, or a decode blip within
+    /// `max_attempts` (surfacing the REAL 429/5xx over the synthetic 502 on the final attempt); then
+    /// decode the body into an `Envelope<D>` and hand it to `verdict`. All URL/`detail` redaction —
+    /// the `requestdl` URL and error bodies carry the token — lives here so neither caller can leak
+    /// it. `verdict` decides what counts as success (data required vs `success` only).
+    async fn send_enveloped<D, R, F, V>(
+        &self,
+        make: F,
+        max_attempts: u32,
+        verdict: V,
+    ) -> Result<R, reqwest::Error>
     where
-        T: serde::de::DeserializeOwned,
+        D: serde::de::DeserializeOwned,
         F: Fn() -> reqwest::RequestBuilder,
+        V: Fn(Envelope<D>) -> EnvVerdict<R>,
     {
         for attempt in 1..=max_attempts {
             self.rate_limiter.wait_for_token().await;
@@ -497,38 +518,34 @@ impl TorBoxClient {
                 warn!("TorBox {} error body: {:.300}", status, self.redact(&body));
                 return Err(e.without_url());
             }
-            // Scrub the URL from a body-read error: the `requestdl` URL carries the token, and the
-            // comment below promises send_data/send_ok never surface it. (`error_for_status_ref`
-            // errors are already scrubbed above.)
+            // Scrub the URL from a body-read error: the `requestdl` URL carries the token, and
+            // send_data/send_ok promise never to surface it. (`error_for_status_ref` errors are
+            // already scrubbed above.)
             let text = resp.text().await.map_err(|e| e.without_url())?;
-            match serde_json::from_str::<Envelope<T>>(&text) {
-                Ok(env) if env.success => {
-                    if let Some(data) = env.data {
-                        // Only a genuinely useful response (success AND data) counts as success for
-                        // the rate limiter — a 200 with `success:false`, or `success:true` carrying
-                        // no `data`, is a soft failure we must not reward by speeding the limiter up.
+            match serde_json::from_str::<Envelope<D>>(&text) {
+                Ok(env) => match verdict(env) {
+                    EnvVerdict::Done(r) => {
+                        // Only a genuinely useful response counts as success for the rate limiter — a
+                        // 200 with `success:false`, or `success:true` carrying no required `data`, is a
+                        // soft failure we must not reward by speeding the limiter up.
                         self.rate_limiter.record_success().await;
-                        return Ok(data);
+                        return Ok(r);
                     }
-                    // Redact the body: `send_data::<String>` serves `requestdl` (the resolved CDN
-                    // URL is the data), so a malformed body could carry a capability URL — never log
-                    // it. The structured `detail` (below) is safe; the length flags a schema change.
-                    warn!(
+                    // Redact the body: `send_data::<String>` serves `requestdl` (the resolved CDN URL
+                    // is the data), so a malformed body could carry a capability URL — never log it.
+                    EnvVerdict::SuccessButNoData => warn!(
                         "TorBox response success but no data ({} bytes, redacted)",
                         text.len()
-                    );
-                }
-                Ok(env) => {
-                    // Redact `detail` before logging: `send_data::<String>` serves `requestdl` and a
-                    // TorBox error body can echo the token-bearing URL (`?token=<key>`), so the
-                    // API-controlled `detail` string is NOT assumed safe (matches the redaction the
-                    // `error_for_status_ref` branch above already applies).
-                    warn!(
+                    ),
+                    // Redact `detail`: a TorBox error body can echo the token-bearing `?token=<key>`
+                    // URL, so the API-controlled `detail` string is NOT assumed safe (matches the
+                    // `error_for_status_ref` redaction above).
+                    EnvVerdict::NotSuccess(detail) => warn!(
                         "TorBox response not success: {:?} (body {} bytes, redacted)",
-                        env.detail.as_deref().map(|d| self.redact(d)),
+                        detail.as_deref().map(|d| self.redact(d)),
                         text.len()
-                    );
-                }
+                    ),
+                },
                 Err(e) => {
                     warn!(
                         "TorBox decode failed: {} (body {} bytes, redacted)",
@@ -553,101 +570,43 @@ impl TorBoxClient {
         Err(synthetic_bad_gateway())
     }
 
-    /// Like `send_data` but only checks `success` and ignores `data` (for endpoints with no
-    /// data payload, e.g. controltorrent). Returns Ok(()) on success.
+    /// Send a request whose success requires `success:true` AND a `data` payload, returning the
+    /// decoded `data`. A `success:true` with no `data` — or a `success:false` — is a soft failure
+    /// (retried/surfaced as a synthetic 502 by `send_enveloped`), never rewarded to the limiter.
+    async fn send_data_n<T, F>(&self, make: F, max_attempts: u32) -> Result<T, reqwest::Error>
+    where
+        T: serde::de::DeserializeOwned,
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        self.send_enveloped::<T, T, _, _>(make, max_attempts, |env| {
+            if env.success {
+                match env.data {
+                    Some(data) => EnvVerdict::Done(data),
+                    None => EnvVerdict::SuccessButNoData,
+                }
+            } else {
+                EnvVerdict::NotSuccess(env.detail)
+            }
+        })
+        .await
+    }
+
+    /// Like `send_data` but only checks `success` and ignores `data` (for endpoints with no data
+    /// payload, e.g. controltorrent). A 200 can still carry `{"success":false}` (a TorBox soft
+    /// failure, e.g. controltorrent rejecting a delete) — that is NOT success, so a caller's "delete
+    /// the leaked torrent" invariant isn't defeated by a silent no-op. Returns Ok(()) on success.
     async fn send_ok<F>(&self, make: F) -> Result<(), reqwest::Error>
     where
         F: Fn() -> reqwest::RequestBuilder,
     {
-        let max_attempts = 6u32;
-        for attempt in 1..=max_attempts {
-            self.rate_limiter.wait_for_token().await;
-            let resp = match make().send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    // Scrub the URL in case it carries the API key as a query param.
-                    let e = e.without_url();
-                    if attempt < max_attempts {
-                        warn!("TorBox request error (attempt {}): {}", attempt, e);
-                        // Small backoff before retrying a statusless transport error (mirrors the RD
-                        // client / send_data_n) so a fast-failing endpoint doesn't spin the budget.
-                        tokio::time::sleep(Duration::from_millis((100 * attempt as u64).min(1_000)))
-                            .await;
-                        continue;
-                    }
-                    return Err(e);
-                }
-            };
-            self.observe_rate_headers(&resp).await;
-            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                let retry_after = resp
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|h| h.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok());
-                self.rate_limiter.record_throttle(retry_after).await;
-                if attempt < max_attempts {
-                    continue;
-                }
-                // Final attempt still throttled: surface the real 429, not the synthetic 502 below.
-                return Err(resp
-                    .error_for_status_ref()
-                    .err()
-                    .map(|e| e.without_url())
-                    .unwrap_or_else(synthetic_bad_gateway));
+        self.send_enveloped::<serde_json::Value, (), _, _>(make, 6, |env| {
+            if env.success {
+                EnvVerdict::Done(())
+            } else {
+                EnvVerdict::NotSuccess(env.detail)
             }
-            if is_transient_status(resp.status()) && attempt < max_attempts {
-                warn!("TorBox {} (attempt {}), retrying", resp.status(), attempt);
-                tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
-                continue;
-            }
-            let status = resp.status();
-            if let Err(e) = resp.error_for_status_ref() {
-                let body = resp.text().await.unwrap_or_default();
-                warn!("TorBox {} error body: {:.300}", status, self.redact(&body));
-                return Err(e.without_url());
-            }
-            // A 200 can still carry `{"success":false}` (TorBox soft failure, e.g. controltorrent
-            // rejecting a delete) — that is NOT success. Parse the envelope and require `success`,
-            // so a caller's "delete the leaked torrent" invariant isn't defeated by a silent no-op.
-            // Scrub the URL from a body-read error: the `requestdl` URL carries the token, and the
-            // comment below promises send_data/send_ok never surface it. (`error_for_status_ref`
-            // errors are already scrubbed above.)
-            let text = resp.text().await.map_err(|e| e.without_url())?;
-            match serde_json::from_str::<Envelope<serde_json::Value>>(&text) {
-                Ok(env) if env.success => {
-                    self.rate_limiter.record_success().await;
-                    return Ok(());
-                }
-                Ok(env) => {
-                    // Redact `detail` before logging: a TorBox error body can echo the token-bearing
-                    // URL, so the API-controlled `detail` string is scrubbed like the
-                    // `error_for_status_ref` branch above (never assumed secret-free).
-                    warn!(
-                        "TorBox response not success: {:?} (body {} bytes, redacted)",
-                        env.detail.as_deref().map(|d| self.redact(d)),
-                        text.len()
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "TorBox decode failed: {} (body {} bytes, redacted)",
-                        e,
-                        text.len()
-                    );
-                    // A truncated/partial 200 body is transient — retry rather than discard the whole
-                    // call on a one-off hiccup (symmetry with send_data and the RD client's
-                    // decode-retry). A persistent schema mismatch exhausts the budget and returns the
-                    // synthetic 502 below.
-                    if attempt < max_attempts {
-                        tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
-                        continue;
-                    }
-                }
-            }
-            break;
-        }
-        Err(synthetic_bad_gateway())
+        })
+        .await
     }
 
     pub async fn list_torrents_raw(&self) -> Result<Vec<Torrent>, reqwest::Error> {
