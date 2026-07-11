@@ -15,3 +15,6 @@ test_output.log
 .claude/
 rclone/
 .sync-exclude.lst
+# Review-loop tooling scratch output (per-iteration transcripts / stderr)
+iter-*.jsonl
+iter-*.err
