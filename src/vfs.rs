@@ -944,6 +944,19 @@ static EXCLUDED_VIDEO_RE: LazyLock<Regex> =
 static EXCLUDED_LEADING_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(trailer|extras?)[._\s-]").unwrap());
 
+/// A leading `trailer`/`extras` keyword immediately followed by a RESOLUTION or SOURCE/quality tag
+/// (`Trailer.1080p.WEB-DL`, `Extras.720p`) is an ancillary CLIP, not a real title — so it must NOT
+/// receive the `EXCLUDED_LEADING_RE` title-exemption. A genuine leading-keyword title instead keeps a
+/// real word or a year after the keyword (`Trailer.Park.Boys`, `Extras.2005`, `Extras.2020.1080p…` —
+/// a bare 4-digit year is NOT a resolution, so it is preserved). Anchored so the metadata token must
+/// come IMMEDIATELY after the keyword+separator. Matched against the filename stem.
+static EXCLUDED_LEADING_METADATA_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^(?:trailer|extras?)[._\s-](?:\d{3,4}p|4k|uhd|web|webdl|web-dl|webrip|web-rip|bluray|blu-ray|bdrip|brrip|hdtv|dvdrip|remux|hdr|hevc|x264|x265)\b",
+    )
+    .unwrap()
+});
+
 /// An SxxExx episode code marks a real episode — a sample/trailer/extra never carries one — so a
 /// file with one is kept even if its title contains an excluded keyword mid-name (or it is a real
 /// episode mis-foldered under an extras/bonus directory).
@@ -997,7 +1010,10 @@ pub fn is_video_file(path: &str) -> bool {
     let ancillary = match EXCLUDED_VIDEO_RE.find(stem) {
         None => false,
         Some(kw) => {
-            if EXCLUDED_LEADING_RE.is_match(stem) {
+            // Grant the leading-title exemption only when the keyword truly leads a real title — NOT
+            // when it is immediately followed by a resolution/source tag (a metadata-suffixed clip
+            // like `Trailer.1080p.WEB-DL`, which would otherwise be surfaced as a bogus "movie").
+            if EXCLUDED_LEADING_RE.is_match(stem) && !EXCLUDED_LEADING_METADATA_RE.is_match(stem) {
                 false
             } else {
                 match &episode {
@@ -2169,6 +2185,24 @@ mod tests {
             !content.contains("&<"),
             "No unescaped special characters should appear"
         );
+        // Apostrophe and double-quote must ALSO be escaped (the prior assertions only covered
+        // &/</>). A direct check pins all five metacharacters, and an NFO round-trip proves a
+        // title like "It's a \"Test\"" is emitted safely (these reach `<uniqueid type="…">` too).
+        assert_eq!(
+            xml_escape("O'Brien \"Q\" & <b>"),
+            "O&apos;Brien &quot;Q&quot; &amp; &lt;b&gt;"
+        );
+        let quoted = MediaMetadata {
+            title: "It's a \"Test\"".to_string(),
+            year: Some("2024".to_string()),
+            media_type: MediaType::Movie,
+            external_id: Some("tmdb:123".to_string()),
+        };
+        let quoted_nfo = String::from_utf8(DebridVfs::generate_nfo(&quoted)).unwrap();
+        assert!(
+            quoted_nfo.contains("<title>It&apos;s a &quot;Test&quot;</title>"),
+            "apostrophe and double-quote in a title must be XML-escaped"
+        );
     }
 
     #[test]
@@ -2388,6 +2422,22 @@ mod tests {
         assert!(!is_video_file("The.Movie.Name.Trailer.mkv"));
         assert!(!is_video_file("Movie.2020/Extras/featurette.mkv"));
         assert!(!is_video_file("sample.mkv"));
+    }
+
+    #[test]
+    fn is_video_file_excludes_metadata_suffixed_trailer_and_extras_clips() {
+        // A leading keyword immediately followed by a RESOLUTION/SOURCE tag is an ancillary clip, not
+        // a real title — the exemption must NOT apply (previously these leaked into the movie folder
+        // as bogus playable "movies", inconsistent with `Trailer.mkv` being correctly excluded).
+        assert!(!is_video_file("Trailer.1080p.WEB-DL.mkv"));
+        assert!(!is_video_file("Extras.1080p.mkv"));
+        assert!(!is_video_file("Extras.720p.WEB.x264.mkv"));
+        assert!(!is_video_file("Trailer.2160p.HDR.HEVC.mkv"));
+        assert!(!is_video_file("Extra.480p.mkv"));
+        // The genuine-title cases (a real word or a bare year after the keyword) are still KEPT —
+        // a year is not a resolution, so the exemption survives.
+        assert!(is_video_file("Extras.2020.1080p.BluRay.mkv"));
+        assert!(is_video_file("Trailer.Park.Boys.2005.1080p.WEB.mkv"));
     }
 
     #[test]
