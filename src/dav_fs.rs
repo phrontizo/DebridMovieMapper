@@ -461,7 +461,13 @@ impl ProxiedMediaFile {
             BUFFER_SIZE as u64
         };
         let fetch_size = (len as u64).max(min_window).min(MAX_FETCH_SIZE as u64);
-        let range_end = std::cmp::min(pos + fetch_size - 1, self.file_size - 1);
+        // Saturating range math (mirrors `fetch_cdn_range`'s `want` and `VirtualFile::read_bytes`): a
+        // pathological `file_size`/`pos` from a garbage provider `bytes` field can't overflow the add
+        // before the `min` clamps it. Bounded by `file_size - 1` (also saturating).
+        let range_end = std::cmp::min(
+            pos.saturating_add(fetch_size).saturating_sub(1),
+            self.file_size.saturating_sub(1),
+        );
         let body = self.fetch_cdn_range(pos, range_end).await?;
 
         // A successful CDN fetch confirms the file genuinely works — reset its repair budget once per
