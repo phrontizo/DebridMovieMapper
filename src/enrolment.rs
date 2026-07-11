@@ -162,7 +162,7 @@ impl EnrolmentService {
                 if !fresh.refresh_token.is_empty() {
                     current.refresh = fresh.refresh_token;
                 }
-                current.expires_at = fresh.created_at.saturating_add(fresh.expires_in);
+                current.expires_at = token_expires_at(fresh.created_at, fresh.expires_in);
                 current.needs_reenrolment = false;
             }
             Err(e) => {
@@ -240,7 +240,7 @@ pub async fn poll_to_completion(
                 let tokens = TraktTokens {
                     access: tok.access_token,
                     refresh: tok.refresh_token,
-                    expires_at: tok.created_at.saturating_add(tok.expires_in),
+                    expires_at: token_expires_at(tok.created_at, tok.expires_in),
                     username: user.username,
                     needs_reenrolment: false,
                 };
@@ -266,6 +266,19 @@ pub async fn poll_to_completion(
     }
 }
 
+/// Compute a token's absolute expiry (epoch secs). Trakt anchors `expires_in` on `created_at`;
+/// if Trakt ever omits `created_at` (parsed as `0` by `u64_field`), fall back to the wall clock
+/// so a brand-new token is not stamped as having expired in 1970 — which would otherwise read as
+/// permanently expired and drive perpetual refresh churn.
+fn token_expires_at(created_at: u64, expires_in: u64) -> u64 {
+    let anchor = if created_at == 0 {
+        crate::now_unix_secs()
+    } else {
+        created_at
+    };
+    anchor.saturating_add(expires_in)
+}
+
 // --- Pure HTML builders ---------------------------------------------------------------------
 
 /// Best-effort same-origin guard for the unauthenticated, state-changing POST routes. Modern
@@ -276,7 +289,10 @@ pub async fn poll_to_completion(
 fn is_cross_origin<B>(req: &hyper::Request<B>) -> bool {
     let headers = req.headers();
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
-        if site.eq_ignore_ascii_case("cross-site") || site.eq_ignore_ascii_case("cross-origin") {
+        // Per the Fetch spec, Sec-Fetch-Site is only ever `same-origin`/`same-site`/`cross-site`/
+        // `none`; `cross-site` is the drive-by case. (A `same-site` sibling-subdomain POST is still
+        // caught below by the Origin↔Host mismatch, which browsers always attach to a POST.)
+        if site.eq_ignore_ascii_case("cross-site") {
             return true;
         }
     }
@@ -305,13 +321,16 @@ fn is_cross_origin<B>(req: &hyper::Request<B>) -> bool {
     false
 }
 
-/// HTML-escape `s` for safe use in both element text and double-quoted attributes (`href="..."`,
-/// `action="..."`). Covers `&`, `<`, `>`, and `"` (`&` first to avoid double-escaping).
+/// HTML-escape `s` for safe use in element text and BOTH double- and single-quoted attributes.
+/// Covers `&`, `<`, `>`, `"`, and `'` (`&` first to avoid double-escaping). Every attribute this
+/// module renders is currently double-quoted, so `'` escaping is defence-in-depth against a future
+/// single-quoted attribute becoming a break-out vector.
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// Percent-encode a single URL path segment so a slug can never break out of the
@@ -802,7 +821,7 @@ mod tests {
     fn esc_neutralises_html_metacharacters() {
         assert_eq!(
             esc(r#"<script>alert("1")&'</script>"#),
-            "&lt;script&gt;alert(&quot;1&quot;)&amp;'&lt;/script&gt;"
+            "&lt;script&gt;alert(&quot;1&quot;)&amp;&#39;&lt;/script&gt;"
         );
     }
 
@@ -814,6 +833,20 @@ mod tests {
         // A path-significant character can't break out of the /trakt/accounts/<slug>/… route.
         assert_eq!(encode_path_segment("a/b"), "a%2Fb");
         assert_eq!(encode_path_segment("a b?c#d"), "a%20b%3Fc%23d");
+    }
+
+    #[test]
+    fn token_expires_at_falls_back_to_now_when_created_at_missing() {
+        // Normal path: expiry is anchored on Trakt's created_at.
+        assert_eq!(token_expires_at(1_000_000, 7_776_000), 8_776_000);
+        // created_at == 0 (Trakt omitted the field) must NOT stamp expiry near the 1970 epoch —
+        // it anchors on the wall clock, so the token stays valid for ~expires_in from now.
+        let now = crate::now_unix_secs();
+        let got = token_expires_at(0, 7_776_000);
+        assert!(
+            got >= now + 7_776_000 && got <= now + 7_776_000 + 5,
+            "expected ~now+expires_in, got {got} (now={now})"
+        );
     }
 
     #[test]
