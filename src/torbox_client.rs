@@ -81,11 +81,16 @@ struct TbTorrent {
 
 #[derive(Debug, Deserialize)]
 struct TbCreate {
-    #[serde(default)]
+    // Defensive decode like every other TorBox field: `#[serde(default)]` alone covers a MISSING
+    // key but a present `null` or a stringized number would still fail the whole `Envelope<TbCreate>`
+    // decode. `null_to_default` tolerates both so a loosely-typed createtorrent response can't fail
+    // the add (which would otherwise self-heal via the synthetic-502 → add_magnet recovery, but at
+    // the cost of an extra round-trip).
+    #[serde(default, deserialize_with = "null_to_default")]
     torrent_id: i64,
     // Returned by createtorrent but not used (we derive the canonical torrent later).
     #[allow(dead_code)]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     hash: String,
 }
 
@@ -187,6 +192,21 @@ where
         if short {
             hit_cap = false; // last (short/empty) page — the listing is complete
             break;
+        }
+    }
+    // If the loop exhausted `max_pages` with the final page still FULL, the account holds either
+    // EXACTLY `max_pages * limit` items (complete) or more (genuinely truncated) — indistinguishable
+    // without one more look. Probe the next offset: an empty probe means the listing was exactly
+    // complete, so clear `hit_cap` rather than raising a false-truncation Err at the exact
+    // page-count boundary. A non-empty probe confirms real truncation (its items are folded in but
+    // `hit_cap` stays set, so the caller still fails the tick). This only ever fires on an account
+    // at/above the defensive `max_pages` backstop, so it costs nothing in normal operation.
+    if hit_cap {
+        let probe = fetch_page(max_pages * limit).await?;
+        if probe.is_empty() {
+            hit_cap = false;
+        } else {
+            all.extend(probe);
         }
     }
     Ok((all, hit_cap))
@@ -1037,21 +1057,70 @@ mod tests {
     async fn paginate_max_pages_backstops_and_flags_truncation() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = AtomicUsize::new(0);
-        // Every page is FULL (an API ignoring `offset`, or a >cap library) → bounded by max_pages,
-        // never infinite, AND `hit_cap` is set so the caller refuses the truncated listing rather
-        // than returning a partial Ok (which would look like a shrunken library → re-acquire storm).
+        // Every page is FULL (an API ignoring `offset`, or a >cap library) → bounded by max_pages
+        // (+ one terminator probe), never infinite, AND `hit_cap` is set so the caller refuses the
+        // truncated listing rather than returning a partial Ok (which would look like a shrunken
+        // library → re-acquire storm). The probe also comes back full → truncation confirmed.
         let r: Result<(Vec<u32>, bool), &str> = paginate(2, 4, |_| {
             calls.fetch_add(1, Ordering::SeqCst);
             async move { Ok(vec![0u32, 1]) }
         })
         .await;
         let (items, hit_cap) = r.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 4, "capped at max_pages");
-        assert_eq!(items.len(), 8);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "capped at max_pages + one terminator probe"
+        );
+        assert_eq!(items.len(), 10);
         assert!(
             hit_cap,
-            "a full final page at the cap must flag truncation (caller fails, not partial Ok)"
+            "a full final page AND a non-empty probe must flag truncation (caller fails)"
         );
+    }
+
+    #[tokio::test]
+    async fn paginate_exact_boundary_is_not_truncated() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        // The account holds EXACTLY max_pages*limit (4*2 = 8) items: pages 0..4 are all full, and the
+        // terminator probe at offset 8 is empty → the listing is complete, NOT truncated. Without the
+        // probe this exact multiple would raise a false-truncation Err (re-acquire storm).
+        let r: Result<(Vec<u32>, bool), &str> = paginate(2, 4, |offset| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if offset < 8 {
+                    Ok(vec![0u32, 1])
+                } else {
+                    Ok(vec![]) // terminator: no more items
+                }
+            }
+        })
+        .await;
+        let (items, hit_cap) = r.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "4 full pages + one empty terminator probe"
+        );
+        assert_eq!(items.len(), 8);
+        assert!(
+            !hit_cap,
+            "an exactly-complete listing at the cap must NOT be flagged as truncated"
+        );
+    }
+
+    #[test]
+    fn tbcreate_tolerates_null_or_mistyped_torrent_id() {
+        // createtorrent's torrent_id is decoded defensively (null_to_default), so a present `null`
+        // or a wrong type defaults to 0 rather than failing the whole Envelope<TbCreate> decode
+        // (which every other TorBox field already tolerates).
+        let v: TbCreate = serde_json::from_str(r#"{"torrent_id": null, "hash": null}"#).unwrap();
+        assert_eq!(v.torrent_id, 0);
+        let v: TbCreate = serde_json::from_str(r#"{"torrent_id": "99"}"#).unwrap();
+        assert_eq!(v.torrent_id, 0, "a stringized id defaults rather than erroring");
+        let v: TbCreate = serde_json::from_str(r#"{"torrent_id": 42, "hash": "abc"}"#).unwrap();
+        assert_eq!(v.torrent_id, 42);
     }
 
     #[test]
