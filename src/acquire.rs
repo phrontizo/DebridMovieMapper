@@ -1308,6 +1308,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_se_all_documented_limitations_are_stable() {
+        // Pin the CURRENT (documented) behaviour so a silent regression is caught.
+
+        // Contiguous multi-episode forms parse FULLY.
+        assert_eq!(parse_se_all("Show.S01E01E02.mkv"), vec![(1, 1), (1, 2)]);
+        assert_eq!(parse_se_all("Show.S01E01-E02.mkv"), vec![(1, 1), (1, 2)]);
+        assert_eq!(
+            parse_se_all("Show.S01E01E02E03.mkv"),
+            vec![(1, 1), (1, 2), (1, 3)]
+        );
+
+        // KNOWN LIMITATION: a >2-episode RANGE records only the explicit endpoints, dropping the
+        // middle — "S01E01-E03" → [(1,1),(1,3)], NOT (1,2).
+        assert_eq!(
+            parse_se_all("Show.S01E01-E03.1080p.mkv"),
+            vec![(1, 1), (1, 3)]
+        );
+
+        // KNOWN LIMITATION: the dash-concatenated code fallback requires SPACE-dash-SPACE, so a
+        // DOT-separated Torrentio name is not matched and yields empty `provides`.
+        assert!(parse_se_all("Rick.and.Morty.-.409.-.Childrick.of.Mort.mkv").is_empty());
+
+        // KNOWN LIMITATION: anime ABSOLUTE numbering is indistinguishable from a concatenated
+        // SxxEyy code, so absolute "409" decodes to a phantom (4, 9) rather than the real ep 409.
+        assert_eq!(parse_se_all("One Piece - 409 - Return.mkv"), vec![(4, 9)]);
+    }
+
+    #[test]
     fn parse_se_all_handles_multi_episode_files() {
         // Contiguous multi-episode files contribute ALL their episodes (so `provides` is complete and
         // the reconciler doesn't re-acquire a contained episode as a duplicate singleton).
