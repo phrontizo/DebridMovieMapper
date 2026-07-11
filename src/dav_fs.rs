@@ -306,8 +306,8 @@ impl DavDirEntry for DebridDirEntry {
 
 /// A media file that lazily resolves its `FileLocator` to a CDN URL via the active provider and
 /// proxies the CDN bytes (provider-neutral — Real-Debrid unrestricts a per-file link, TorBox
-/// resolves by `(torrent_id, file_id)`). The CDN URL is cached per open instance. Reads use a 2 MB
-/// read-ahead buffer.
+/// resolves by `(torrent_id, file_id)`). The CDN URL is cached per open instance. Warm-buffer reads
+/// use a 2 MB read-ahead buffer; the first fetch (empty buffer) may be larger — see `first_read_bytes`.
 struct ProxiedMediaFile {
     name: String,
     locator: crate::provider::FileLocator,
