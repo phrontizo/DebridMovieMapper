@@ -25,7 +25,7 @@ fn synthetic_bad_gateway(detail: &'static [u8]) -> reqwest::Error {
     .expect_err("BAD_GATEWAY always yields an error status")
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct Torrent {
     pub id: String,
     #[serde(default)]
@@ -49,7 +49,27 @@ pub struct Torrent {
     pub ended: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+// Hand-written Debug: `links` are RD restricted capability links (secrets) — print only their
+// count, mirroring `FileLocator`'s redacted Debug, so a future `{:?}` can't leak them.
+impl std::fmt::Debug for Torrent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Torrent")
+            .field("id", &self.id)
+            .field("filename", &self.filename)
+            .field("hash", &self.hash)
+            .field("bytes", &self.bytes)
+            .field("host", &self.host)
+            .field("split", &self.split)
+            .field("progress", &self.progress)
+            .field("status", &self.status)
+            .field("added", &self.added)
+            .field("links", &format_args!("<{} link(s)>", self.links.len()))
+            .field("ended", &self.ended)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct TorrentInfo {
     pub id: String,
     #[serde(default)]
@@ -79,6 +99,29 @@ pub struct TorrentInfo {
     pub ended: Option<String>,
 }
 
+// Hand-written Debug: `links` are RD restricted capability links (secrets) — print only their
+// count, mirroring `FileLocator`'s redacted Debug, so a future `{:?}` can't leak them.
+impl std::fmt::Debug for TorrentInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TorrentInfo")
+            .field("id", &self.id)
+            .field("filename", &self.filename)
+            .field("original_filename", &self.original_filename)
+            .field("hash", &self.hash)
+            .field("bytes", &self.bytes)
+            .field("original_bytes", &self.original_bytes)
+            .field("host", &self.host)
+            .field("split", &self.split)
+            .field("progress", &self.progress)
+            .field("status", &self.status)
+            .field("added", &self.added)
+            .field("files", &self.files)
+            .field("links", &format_args!("<{} link(s)>", self.links.len()))
+            .field("ended", &self.ended)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TorrentFile {
     #[serde(default)]
@@ -91,7 +134,7 @@ pub struct TorrentFile {
     pub selected: u32,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct UnrestrictResponse {
     pub id: String,
     #[serde(default)]
@@ -110,6 +153,33 @@ pub struct UnrestrictResponse {
     pub download: String,
     #[serde(default)]
     pub streamable: u32,
+}
+
+// Hand-written Debug: `link` (RD restricted capability link) and `download` (signed CDN URL) are
+// secrets — print presence only, mirroring `FileLocator`'s redacted Debug. `CachedUnrestrictResponse`
+// derives Debug and embeds this, so it inherits the redaction.
+impl std::fmt::Debug for UnrestrictResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |s: &str| {
+            if s.is_empty() {
+                "<none>"
+            } else {
+                "<redacted>"
+            }
+        };
+        f.debug_struct("UnrestrictResponse")
+            .field("id", &self.id)
+            .field("filename", &self.filename)
+            .field("mime_type", &self.mime_type)
+            .field("filesize", &self.filesize)
+            .field("link", &redact(&self.link))
+            .field("host", &self.host)
+            .field("chunks", &self.chunks)
+            .field("crc", &self.crc)
+            .field("download", &redact(&self.download))
+            .field("streamable", &self.streamable)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -254,7 +324,14 @@ impl RealDebridClient {
         let mut all_torrents = Vec::new();
         let mut page = 1u32;
         loop {
-            if page > MAX_PAGES {
+            // Allow ONE page beyond the cap as an empty-terminator probe. An account holding EXACTLY
+            // MAX_PAGES*50 items has a FULL final page at MAX_PAGES, so `page` advances to MAX_PAGES+1
+            // with the listing actually complete — the completion is only proven by the next page
+            // coming back empty (the loop's natural break). Erroring at MAX_PAGES+1 rather than
+            // MAX_PAGES treats that exact-multiple boundary as complete instead of a false truncation
+            // (which would look like a shrunken library → re-acquire storm). A genuinely-truncated
+            // account has a FULL page at MAX_PAGES+1, advancing to MAX_PAGES+2 → error, as intended.
+            if page > MAX_PAGES + 1 {
                 warn!(
                     "Reached maximum page limit ({}) with {} torrents; failing the whole listing \
                      rather than returning a truncated list (which would churn the dropped pages)",
@@ -695,6 +772,46 @@ impl crate::provider::DebridProvider for RealDebridClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- capability-link Debug redaction ---
+
+    #[test]
+    fn debug_redacts_capability_links() {
+        // A restricted link / signed CDN URL must never appear in a `{:?}` render (defence-in-depth
+        // against a future debug log of one of these structs), mirroring FileLocator's redaction.
+        let unr = UnrestrictResponse {
+            id: "x".into(),
+            link: "https://real-debrid.com/d/SECRETLINK".into(),
+            download: "https://cdn.example/SIGNEDURL?token=abc".into(),
+            ..Default::default()
+        };
+        let s = format!("{unr:?}");
+        assert!(!s.contains("SECRETLINK"), "restricted link leaked: {s}");
+        assert!(!s.contains("SIGNEDURL"), "signed CDN url leaked: {s}");
+        assert!(s.contains("<redacted>"));
+        // The cached wrapper embeds it → inherits the redaction.
+        let cached = CachedUnrestrictResponse {
+            response: unr,
+            cached_at: std::time::Instant::now(),
+        };
+        assert!(!format!("{cached:?}").contains("SECRETLINK"));
+
+        let ti = TorrentInfo {
+            id: "t".into(),
+            links: vec!["https://real-debrid.com/d/RESTRICTED".into()],
+            ..Default::default()
+        };
+        let s = format!("{ti:?}");
+        assert!(!s.contains("RESTRICTED"), "TorrentInfo link leaked: {s}");
+        assert!(s.contains("<1 link(s)>"));
+
+        let t = Torrent {
+            id: "t".into(),
+            links: vec!["https://real-debrid.com/d/RESTRICTED".into()],
+            ..Default::default()
+        };
+        assert!(!format!("{t:?}").contains("RESTRICTED"));
+    }
 
     // --- should_retry_status ---
 
