@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 /// Deserialize a possibly-null/absent/mistyped field to its `Default` (TMDB occasionally sends
 /// `popularity: null`; a plain `#[serde(default)]` covers a MISSING key but NOT a present `null`,
@@ -43,10 +43,34 @@ pub struct TmdbSearchResult {
     pub vote_count: Option<u32>,
 }
 
+/// Deserialize the results array LENIENTLY: parse each element independently and DROP any that fail
+/// (a row missing `id`, or with a malformed `vote_count`/`vote_average`) rather than failing the
+/// whole page. `title`/`popularity` were already field-hardened so one bad element can't sink the
+/// page; this extends that to `id`/`vote_*` at ROW granularity — losing one row is far cheaper than
+/// losing every other (valid) result and failing an identification that a good match on the page
+/// would have satisfied.
+fn deserialize_lenient_results<'de, D>(deserializer: D) -> Result<Vec<TmdbSearchResult>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rows = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<TmdbSearchResult>(v).ok())
+        .collect())
+}
+
 #[derive(Debug, Deserialize)]
 struct TmdbResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_results")]
     pub results: Vec<TmdbSearchResult>,
+}
+
+/// A well-formed IMDB id: `tt` followed by ≥1 ASCII digit (e.g. `tt0111161`). Guards `find_by_imdb`
+/// so a malformed/hostile value can't be interpolated into the request path (unlike the numeric
+/// `tmdb_id` paths, which can't carry a URL-reserved char).
+fn is_well_formed_imdb_id(id: &str) -> bool {
+    matches!(id.strip_prefix("tt"), Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Minimum interval between TMDB requests (TMDB allows ~40 req/s; 100ms is conservative).
@@ -114,6 +138,15 @@ impl TmdbClient {
         &self,
         imdb_id: &str,
     ) -> Result<Option<(u64, crate::vfs::MediaType)>, reqwest::Error> {
+        // Refuse a malformed id rather than interpolate it into the path: TMDB /find is IMDB-keyed
+        // (`tt<digits>`), so a non-conforming value can only produce a failed request anyway.
+        if !is_well_formed_imdb_id(imdb_id) {
+            debug!(
+                "find_by_imdb: skipping malformed IMDB id {:?} (expected `tt<digits>`)",
+                imdb_id
+            );
+            return Ok(None);
+        }
         let url = format!("https://api.themoviedb.org/3/find/{}", imdb_id);
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
@@ -498,6 +531,37 @@ pub(crate) fn parse_season_numbers(v: &serde_json::Value) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tmdb_response_drops_a_malformed_row_but_keeps_valid_results() {
+        // One bad element (missing `id`, or a `vote_count` that isn't a non-negative int) must NOT
+        // sink the whole page: the valid rows survive and identification still sees the good match.
+        let json = r#"{"results":[
+            {"title":"Good","id":42},
+            {"title":"NoIdRow","popularity":9.9},
+            {"id":9,"title":"NullVotes","vote_count":null,"vote_average":null},
+            {"id":11,"title":"BadVotes","vote_count":-1},
+            {"id":7,"title":"AlsoGood","vote_count":100,"vote_average":8.1}
+        ]}"#;
+        let resp: TmdbResponse = serde_json::from_str(json).unwrap();
+        let ids: Vec<u64> = resp.results.iter().map(|r| r.id).collect();
+        // 42 & 7 (fully valid) and 9 (null votes → Option::None) survive; the id-less row and the
+        // negative-vote_count row (11) are dropped rather than failing the whole page.
+        assert_eq!(ids, vec![42, 9, 7]);
+    }
+
+    #[tokio::test]
+    async fn find_by_imdb_rejects_a_malformed_id_without_a_request() {
+        // A malformed id short-circuits to Ok(None) before any request — no path interpolation.
+        let c = TmdbClient::new("k".into()).unwrap();
+        assert_eq!(c.find_by_imdb("../evil").await.unwrap(), None);
+        assert_eq!(c.find_by_imdb("").await.unwrap(), None);
+        assert_eq!(c.find_by_imdb("tt").await.unwrap(), None); // prefix but no digits
+        assert_eq!(c.find_by_imdb("tt12a34").await.unwrap(), None); // non-digit tail
+                                                                    // Well-formed ids pass the shape gate (this asserts the guard, not the network round-trip).
+        assert!(is_well_formed_imdb_id("tt0111161"));
+        assert!(is_well_formed_imdb_id("tt15239678"));
+    }
 
     #[test]
     fn synthetic_exhausted_error_is_a_bad_gateway_error_not_a_panic() {
