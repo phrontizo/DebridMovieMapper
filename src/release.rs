@@ -482,7 +482,16 @@ pub fn is_target_improvement(
         // carries e.g. a wrong-audio penalty; that must NOT prune the higher-res copy). Guarding on
         // the ceiling keeps `rank_changes`'s direction-homogeneous assumption true: an over-ceiling
         // `current` yields only `Downgrade`s, a within-ceiling `current` only `Upgrade`s.
-        if current.resolution > prefs.max_resolution.height() {
+        //
+        // Additionally require the candidate to carry a KNOWN resolution (`> 0`). `score()` lets an
+        // untagged release (`resolution == None` -> `0`) through its ceiling filter, so an untagged
+        // candidate is NOT proven within the ceiling — and a corrective downgrade DELETES the known
+        // over-ceiling copy. Adopting an unverifiable-resolution release could leave us still over the
+        // ceiling and record a within-ceiling `resolution: 0` lie. Skip it (`None`): the sole
+        // over-ceiling copy is then kept, matching "no conforming replacement -> keep". A `None` here
+        // is filtered by `rank_changes`, so direction-homogeneity is preserved (the remaining
+        // `Downgrade`s all carry a tagged, provably-within-ceiling resolution).
+        if current.resolution > prefs.max_resolution.height() && candidate.resolution > 0 {
             Improvement::Downgrade
         } else {
             Improvement::None
@@ -1520,6 +1529,30 @@ mod tests {
             let cand = cached(1080, 6_000);
             assert_eq!(
                 is_target_improvement(&cur, &cand, &prefs(MaxResolution::P1080)),
+                Improvement::Downgrade
+            );
+        }
+
+        #[test]
+        fn over_ceiling_current_and_untagged_candidate_is_not_downgrade() {
+            // A corrective downgrade DELETES the known over-ceiling copy, so it must only ever replace
+            // it with a PROVABLY within-ceiling release. An untagged candidate (`resolution == 0`) is
+            // NOT filtered by `score()` (it lets unknown resolutions through), so it might actually
+            // still be over the ceiling — and would then be pruned-in and recorded as a within-ceiling
+            // `resolution: 0` lie. It must read as `None`, so the sole over-ceiling copy is kept rather
+            // than swapped for an unverifiable one.
+            let cur = cached(2160, 8_000);
+            let mut untagged = cached(1080, 6_000);
+            untagged.resolution = 0; // scraper failed to tag the resolution
+            assert_eq!(
+                is_target_improvement(&cur, &untagged, &prefs(MaxResolution::P1080)),
+                Improvement::None,
+                "an untagged-resolution candidate must not trigger a corrective downgrade"
+            );
+            // A tagged within-ceiling candidate still downgrades (guard is scoped to untagged only).
+            let tagged = cached(1080, 6_000);
+            assert_eq!(
+                is_target_improvement(&cur, &tagged, &prefs(MaxResolution::P1080)),
                 Improvement::Downgrade
             );
         }
