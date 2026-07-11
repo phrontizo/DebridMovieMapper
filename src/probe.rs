@@ -820,6 +820,12 @@ pub async fn probe_tracks(http: &reqwest::Client, cdn_url: &str) -> Result<Vec<T
                 // Mirrors the MP4 large-`moov` recovery above.
                 match front_mkv_tracks_extent(&front) {
                     Some(end) if end <= MAX_PROBE_FETCH as u64 => {
+                        // Fetch the full MAX_PROBE_FETCH window rather than exactly `[0, end)`: `end`
+                        // is the extent of the FIRST overrunning Segment child, which for a large
+                        // pre-`Tracks` block (Void/Attachments) is that block's end — `Tracks` follows
+                        // it, so `[0, end)` would miss `Tracks` and defer again. Over-fetching to the
+                        // cap covers both the pre-`Tracks` case and a large `Tracks` element in one
+                        // request. (Unlike the MP4 path, whose `moov` extent CONTAINS the tracks.)
                         let bigger =
                             fetch_range(http, cdn_url, 0, MAX_PROBE_FETCH as u64 - 1).await?;
                         parse_mkv_tracks(&bigger)
