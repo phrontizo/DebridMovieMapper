@@ -647,8 +647,13 @@ impl Store {
         let bytes = match serde_json::to_vec(&(&info, &metadata)) {
             Ok(bytes) => bytes,
             Err(e) => {
+                // A serialise failure means NOTHING is written — return Err rather than a phantom
+                // Ok (which would report a persistence success that never happened, contradicting
+                // `flatten_join`'s contract). Unreachable in practice (plain structs), but consistent.
                 error!("Failed to serialise replacement match {}: {}", new_id, e);
-                return Ok(());
+                return Err(AppError::Task(format!(
+                    "serialise replacement match {new_id}: {e}"
+                )));
             }
         };
         let db = self.db.clone();
@@ -696,8 +701,9 @@ impl Store {
         let bytes = match serde_json::to_vec(&rec) {
             Ok(b) => b,
             Err(e) => {
+                // A serialise failure writes nothing → Err, not a phantom Ok (see `flatten_join`).
                 error!("Failed to serialise OwnedRecord for {}: {}", hash, e);
-                return Ok(());
+                return Err(AppError::Task(format!("serialise OwnedRecord for {hash}: {e}")));
             }
         };
         let db = self.db.clone();
@@ -727,8 +733,10 @@ impl Store {
         let bytes = match serde_json::to_vec(&rec) {
             Ok(b) => b,
             Err(e) => {
+                // Return Err rather than Ok(false): `false` means "already present → left intact" to
+                // the caller, which is semantically WRONG for "serialise failed, nothing happened".
                 error!("Failed to serialise OwnedRecord for {}: {}", hash, e);
-                return Ok(false);
+                return Err(AppError::Task(format!("serialise OwnedRecord for {hash}: {e}")));
             }
         };
         let db = self.db.clone();
@@ -869,11 +877,14 @@ impl Store {
         let bytes = match serde_json::to_vec(&meta) {
             Ok(b) => b,
             Err(e) => {
+                // Nothing written on a serialise failure → Err, not a phantom Ok (see `flatten_join`).
                 error!(
                     "Failed to serialise authoritative metadata for {}: {}",
                     hash, e
                 );
-                return Ok(());
+                return Err(AppError::Task(format!(
+                    "serialise authoritative metadata for {hash}: {e}"
+                )));
             }
         };
         let db = self.db.clone();
@@ -932,8 +943,9 @@ impl Store {
         let bytes = match serde_json::to_vec(&serde_json::json!({"reason": reason, "at": at})) {
             Ok(b) => b,
             Err(e) => {
+                // Nothing written on a serialise failure → Err, not a phantom Ok (see `flatten_join`).
                 error!("Failed to serialise blacklist entry {}: {}", key, e);
-                return Ok(());
+                return Err(AppError::Task(format!("serialise blacklist entry {key}: {e}")));
             }
         };
         let db = self.db.clone();
@@ -1105,8 +1117,9 @@ impl Store {
         let bytes = match serde_json::to_vec(&tokens) {
             Ok(b) => b,
             Err(e) => {
+                // Nothing written on a serialise failure → Err, not a phantom Ok (see `flatten_join`).
                 error!("Failed to serialise TraktTokens for {}: {}", slug, e);
-                return Ok(());
+                return Err(AppError::Task(format!("serialise TraktTokens for {slug}: {e}")));
             }
         };
         let db = self.db.clone();
@@ -1193,11 +1206,15 @@ impl Store {
         let bytes = match serde_json::to_vec(&rec) {
             Ok(b) => b,
             Err(e) => {
+                // Nothing written on a serialise failure → Err, not a phantom Ok (see `flatten_join`).
                 error!(
                     "Failed to serialise WantedRecord for {}|{}: {}",
                     rec.user, rec.tmdb_id, e
                 );
-                return Ok(());
+                return Err(AppError::Task(format!(
+                    "serialise WantedRecord for {}|{}: {e}",
+                    rec.user, rec.tmdb_id
+                )));
             }
         };
         let key = wanted_key(&rec.user, &rec.media_type, rec.tmdb_id);
@@ -1299,8 +1316,9 @@ impl Store {
         let bytes = match serde_json::to_vec(&entry) {
             Ok(b) => b,
             Err(e) => {
+                // Nothing written on a serialise failure → Err, not a phantom Ok (see `flatten_join`).
                 error!("Failed to serialise SelectionEntry for {}: {}", slot, e);
-                return Ok(());
+                return Err(AppError::Task(format!("serialise SelectionEntry for {slot}: {e}")));
             }
         };
         // Serialise before opening the transaction to avoid partial writes on serde failure.
