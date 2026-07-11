@@ -85,24 +85,28 @@ impl RepairManager {
         {
             let health_map = self.health_status.read().await;
             match health_map.get(torrent_id) {
-                // Skip while a repair is mid-flight on this id: flipping Repairing→Healthy here would
-                // clear the in-progress guard + cooldown, letting a concurrent reader kick off a
-                // redundant re-add. The in-flight repair's own completion path resets the budget.
+                // Only reset from `Healthy`. Skipping `Repairing` avoids clearing an in-flight
+                // repair's guard/cooldown (its own completion path resets the budget). Skipping
+                // `Broken`/`Failed` is the important guard: a read that resolved BEFORE the non-cached
+                // repair path deleted+marked-Broken the old id could complete successfully and call
+                // this — flipping Broken→Healthy would UN-HIDE a torrent that no longer exists on the
+                // provider (`should_hide_torrent`→false → next read re-resolves a deleted id → repair
+                // churn). The state must never be resurrected here.
                 Some(h)
-                    if h.state != RepairState::Repairing
+                    if h.state == RepairState::Healthy
                         && (h.repair_attempts > 0 || h.last_repair_trigger.is_some()) => {}
-                _ => return, // no entry, mid-repair, or already a clean budget — nothing to reset
+                _ => return, // no entry, not Healthy, or already a clean budget — nothing to reset
             }
         }
         let mut health_map = self.health_status.write().await;
         if let Some(h) = health_map.get_mut(torrent_id) {
-            // Re-check under the write lock: another task may have begun a repair between locks.
-            if h.state == RepairState::Repairing {
+            // Re-check under the write lock: another task may have transitioned the state (begun a
+            // repair, or marked it Broken) between the read and write locks.
+            if h.state != RepairState::Healthy {
                 return;
             }
             h.repair_attempts = 0;
             h.last_repair_trigger = None;
-            h.state = RepairState::Healthy;
         }
     }
 
@@ -1229,6 +1233,34 @@ mod tests {
             h.last_repair_trigger.is_some(),
             "cooldown not cleared mid-repair"
         );
+    }
+
+    #[tokio::test]
+    async fn note_read_success_does_not_resurrect_a_broken_torrent() {
+        // A read that resolved BEFORE the non-cached repair path deleted + marked the old id Broken
+        // can still complete successfully and call note_read_success on that id. It must NOT flip
+        // Broken→Healthy — un-hiding a torrent that no longer exists on the provider would let the
+        // next read re-resolve a deleted id and churn repair.
+        let manager = make_test_manager();
+        for state in [RepairState::Broken, RepairState::Failed] {
+            {
+                let mut hm = manager.health_status.write().await;
+                hm.insert(
+                    "t".to_string(),
+                    TorrentHealth {
+                        torrent_id: "t".to_string(),
+                        state: state.clone(),
+                        repair_attempts: 2,
+                        last_repair_trigger: Some(std::time::Instant::now()),
+                    },
+                );
+            }
+            manager.note_read_success("t").await;
+            let hm = manager.health_status.read().await;
+            let h = hm.get("t").expect("entry present");
+            assert_eq!(h.state, state, "a {state:?} torrent must not be resurrected");
+            assert_eq!(h.repair_attempts, 2, "budget untouched on a non-Healthy state");
+        }
     }
 
     #[tokio::test]
