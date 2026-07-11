@@ -1321,20 +1321,35 @@ async fn upgrade_show_episodes_and_packs(
     let group_prov = merged_provenance(&owned);
 
     // (a) Per-singleton-episode upgrade/downgrade.
-    // ACCEPTED ASYMMETRY with the movie path's `served_slot_is_retained_over_ceiling` guard: this
-    // per-episode upgrade baselines on the SINGLETON's own quality, not on what the episode slot
-    // currently serves. So if the slot happens to point at a co-providing OVER-ceiling pack (higher
-    // served resolution) while this singleton is within-ceiling, a within-ceiling "upgrade" of the
-    // singleton would repoint the slot DOWN in served resolution with the downgrade flag off. This
-    // requires owning BOTH a within-ceiling singleton AND an over-ceiling pack for the same episode
-    // with the slot on the pack — a duplicate state the `provides` owned-episode mechanism normally
-    // prevents from being acquired, and which the duplicate-dedup pass reclaims — so it is left
-    // unguarded here rather than complicating the per-episode swap.
+    let ceiling = app.config.acquisition.prefs.max_resolution.height();
     for (hash, rec) in owned.iter().filter(|(_, r)| r.provides.len() == 1) {
         let Some(q) = rec.quality.clone() else {
             continue; // untagged → no baseline, skip
         };
         let (season, episode) = rec.provides[0];
+        // Corrective-downgrade guard, mirroring the movie path's `served_slot_is_retained_over_ceiling`:
+        // this per-episode upgrade baselines on the SINGLETON's own quality, not on what the episode
+        // slot currently serves. If this singleton is within-ceiling (so any adopted candidate is
+        // rated `Improvement::Upgrade`, bypassing the downgrade gate) yet the slot points at a
+        // separate retained OVER-ceiling copy (e.g. a co-providing pack, ALLOW_RESOLUTION_DOWNGRADE
+        // off), repointing the slot to the singleton's "upgrade" would move the SERVED resolution
+        // DOWN — a corrective downgrade the contract reserves for the gated path. Skip this episode.
+        // (Rare — it needs owning BOTH a within-ceiling singleton AND an over-ceiling pack for the
+        // same episode with the slot on the pack — but no longer left unguarded.)
+        if q.resolution <= ceiling
+            && served_slot_is_retained_over_ceiling(
+                app,
+                &crate::store::episode_slot(tmdb_id, season, episode),
+                group_hashes,
+            )
+            .await
+        {
+            debug!(
+                "upgrade: tmdb {} s{}e{} served copy is over-ceiling and retained; not repointing (corrective downgrade gated off)",
+                tmdb_id, season, episode
+            );
+            continue;
+        }
         let req = crate::store::AcquireRequest {
             imdb_id: imdb_id.clone(),
             season: Some(season),
@@ -5747,6 +5762,143 @@ mod tests {
                 .hash,
             h.cand_1080_hash,
             "episode slot repointed to the within-ceiling replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_episode_upgrade_does_not_downgrade_a_served_over_ceiling_slot() {
+        // The duplicate state the per-episode downgrade guard protects: own a WITHIN-ceiling 720p
+        // singleton for S1E1 AND an OVER-ceiling 2160p pack that also provides S1E1, with the episode
+        // slot pointing at the pack. A scraped 1080p upgrade of the singleton is rated
+        // `Improvement::Upgrade` (vs the 720p baseline), so absent the guard the per-episode swap
+        // would repoint the slot 2160p→1080p — a corrective downgrade with ALLOW_RESOLUTION_DOWNGRADE
+        // OFF. The guard must keep the slot on the pack when the flag is off, and only allow the swap
+        // when it is on.
+        let store = mem_store();
+        let single_hash = "e720".to_string();
+        let pack_hash = "pack2160".to_string();
+        store
+            .put_owned(single_hash.clone(), ep_record(1, 1, q720_web()))
+            .await
+            .unwrap();
+        let pack_rec = OwnedRecord {
+            request: AcquireRequest {
+                imdb_id: "tt9".into(),
+                tmdb_id: SHOW_TMDB,
+                kind: MediaKind::Series,
+                season: Some(1),
+                episode: Some(1),
+                original_language: Some("eng".into()),
+                metadata: show_meta(),
+            },
+            provenance: Provenance::watchlist("a"),
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides: vec![(1, 1), (1, 2)],
+            quality: Some(q2160_remux()),
+        };
+        store.put_owned(pack_hash.clone(), pack_rec).await.unwrap();
+        // The episode slot serves the OVER-ceiling pack, not the singleton.
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 1),
+                SelectionEntry {
+                    hash: pack_hash.clone(),
+                    file_path: "S.S01E01.2160p.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 2),
+                SelectionEntry {
+                    hash: pack_hash.clone(),
+                    file_path: "S.S01E02.2160p.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let cand = ep_1080_web_candidate();
+        let cand_hash = cand.info_hash.clone();
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![cand],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "told720".into(),
+                    hash: single_hash.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tpack2160".into(),
+                    hash: pack_hash.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tep1080".into(),
+                    hash: cand_hash.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tep1080".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tep1080".into(),
+                hash: cand_hash.clone(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "S.S01E01.1080p.WEB-DL.mkv".into(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/ep1080".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/ep1080".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let mut app = app_with(scraper, provider, store.clone());
+        let group_hashes = vec![single_hash.clone(), pack_hash.clone()];
+
+        // Flag OFF (default): the guard keeps the slot on the over-ceiling pack.
+        assert!(!app.config.allow_resolution_downgrade);
+        upgrade_show_episodes_and_packs(&app, SHOW_TMDB, &group_hashes, Duration::from_secs(0)).await;
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            pack_hash,
+            "flag off: the per-episode swap must NOT repoint the slot off the served over-ceiling pack"
+        );
+
+        // Flag ON: the guard steps aside and the per-episode upgrade proceeds.
+        {
+            let mut cfg = (*app.config).clone();
+            cfg.allow_resolution_downgrade = true;
+            app.config = Arc::new(cfg);
+        }
+        upgrade_show_episodes_and_packs(&app, SHOW_TMDB, &group_hashes, Duration::from_secs(0)).await;
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            cand_hash,
+            "flag on: the per-episode upgrade repoints the slot to the within-ceiling replacement"
         );
     }
 
