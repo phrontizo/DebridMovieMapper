@@ -1080,6 +1080,18 @@ async fn sync_trakt_user(
     // Prune rows no longer wanted, keyed by (media_type, tmdb_id) so a movie and a show that share
     // a numeric id are tracked independently. `existing_wanted` is this user's slice of the
     // once-per-cycle `all_wanted` snapshot taken by `sync_trakt` (no per-user re-scan).
+    // An account removed mid-cycle (the operator clicked "Remove" on /trakt/accounts since
+    // `sync_trakt` snapshotted the token list) has already had its tokens AND its `wanted` rows
+    // deleted (`enrolment::remove_account`). Our in-memory access token is still valid — removing
+    // locally does not revoke it at Trakt — and no refresh may have run this cycle, so the refresh
+    // CAS never fired. Without this re-check the writes below would RESURRECT the pruned rows as
+    // permanent orphans: the only pruner of `wanted` is this function, which never processes a
+    // tokenless slug again, so each resurrected row pins its title as wanted forever and blocks
+    // Trigger-B cleanup — exactly the leak `remove_account` exists to prevent. Skip all writes.
+    if store.get_trakt_tokens(slug.to_string()).await.is_none() {
+        debug!("trakt: {slug} — account removed mid-cycle; skipping wanted writes");
+        return Ok(UserSync::Skipped);
+    }
     let new_keys: std::collections::HashSet<(MediaType, u64)> = new
         .iter()
         .map(|r| (r.media_type.clone(), r.tmdb_id))
@@ -4388,6 +4400,76 @@ mod trakt_sync_tests {
         assert!(
             !summary.removals_trustworthy(),
             "an unconfirmed wanted set (only a CAS-skip this cycle) is not trustworthy for removals"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_removed_mid_cycle_is_not_resurrected_by_wanted_writes() {
+        // Token far from expiry → no refresh → the refresh CAS guard never fires. If the operator
+        // removes the account mid-cycle (here: during the watchlist read), the pre-write token
+        // re-check must skip ALL writes — otherwise the just-built wanted rows would be resurrected
+        // as permanent orphans that pin the title forever (nothing re-prunes a tokenless slug).
+        use crate::error::AppError;
+        use crate::trakt_client::{DeviceCode, DeviceTokenPoll, ShowProgress, TraktUser};
+        struct RemoveOnRead {
+            store: Store,
+        }
+        #[async_trait::async_trait]
+        impl TraktClient for RemoveOnRead {
+            async fn watchlist(&self, _a: &str) -> Result<Vec<TraktItem>, AppError> {
+                // The operator clicks "Remove" mid-cycle (deletes tokens + wanted rows).
+                self.store
+                    .remove_trakt_tokens("alice".into())
+                    .await
+                    .unwrap();
+                Ok(vec![item(MediaType::Movie, 42)])
+            }
+            async fn in_progress(&self, _a: &str) -> Result<Vec<TraktItem>, AppError> {
+                Ok(vec![])
+            }
+            async fn watched(&self, _a: &str) -> Result<WatchedData, AppError> {
+                Ok(WatchedData::default())
+            }
+            async fn refresh(&self, _rt: &str) -> Result<TraktTokenResponse, AppError> {
+                unreachable!("token is far from expiry — no refresh")
+            }
+            async fn device_code(&self) -> Result<DeviceCode, AppError> {
+                unreachable!()
+            }
+            async fn poll_token(&self, _d: &str) -> Result<DeviceTokenPoll, AppError> {
+                unreachable!()
+            }
+            async fn me(&self, _a: &str) -> Result<TraktUser, AppError> {
+                unreachable!()
+            }
+            async fn show_progress(&self, _a: &str, _t: u64) -> Result<ShowProgress, AppError> {
+                unreachable!()
+            }
+        }
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".into(), tokens("acc", 9_999_999_999, false))
+            .await
+            .unwrap();
+        let trakt: Arc<dyn TraktClient> = Arc::new(RemoveOnRead {
+            store: store.clone(),
+        });
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+
+        let summary = sync_trakt(&trakt, &tmdb, &store, None, false).await;
+
+        assert!(
+            store.get_trakt_tokens("alice".to_string()).await.is_none(),
+            "the account must stay removed"
+        );
+        let rows = store.all_wanted().await;
+        assert!(
+            rows.iter().all(|r| r.user != "alice"),
+            "a removed account's wanted rows must not be resurrected (found {rows:?})"
+        );
+        assert_eq!(
+            summary.succeeded, 0,
+            "a mid-cycle removal is a skip, not a confirmed sync"
         );
     }
 
