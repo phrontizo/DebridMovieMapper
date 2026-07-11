@@ -70,8 +70,10 @@ impl ReadActivity {
 
     /// `true` if `path` has had no read within `window` (never-read counts as idle). The per-path
     /// sibling of [`all_idle`](Self::all_idle); the upgrade engine deliberately gates on `all_idle`
-    /// (library-wide) rather than this, so `is_idle` is retained as the per-path query for tests and
-    /// a future per-slot idle gate. Kept intentionally; not dead code.
+    /// (library-wide) rather than this. Currently exercised only by tests (all its callers are
+    /// in-crate `#[cfg(test)]` modules), so it is gated `#[cfg(test)]` to keep the production API
+    /// surface honest — promote it back to `pub` when a real per-slot idle gate lands.
+    #[cfg(test)]
     pub async fn is_idle(&self, path: &str, window: Duration) -> bool {
         match self.last_read.read().await.get(path) {
             Some(t) => t.elapsed() >= window,

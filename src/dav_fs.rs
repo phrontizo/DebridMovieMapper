@@ -315,9 +315,11 @@ struct ProxiedMediaFile {
     /// Set once the first CDN fetch succeeds, so the repair-budget reset (`note_read_success`) fires
     /// at most once per opened file rather than per chunk.
     confirmed_read: bool,
-    /// Size of the FIRST read-ahead fetch (while the buffer is still empty) — front-loads the
-    /// container header/early index so the open/ffprobe burst needs fewer cold CDN round-trips.
-    /// Later (warm-buffer) fetches use `BUFFER_SIZE`.
+    /// Size of the enlarged read-ahead fetch used whenever the read-ahead buffer is empty — the FIRST
+    /// fetch of an opened file (front-loading the container header/early index so the open/ffprobe
+    /// burst needs fewer cold CDN round-trips) and again after an instant-repair buffer reset (which
+    /// re-primes the read-ahead from the current position). Later (warm-buffer) fetches use
+    /// `BUFFER_SIZE`.
     first_read_bytes: u64,
 }
 
@@ -450,11 +452,12 @@ impl ProxiedMediaFile {
             return Ok(data);
         }
 
-        // Buffer miss — fetch from CDN (with retry on expired URL). The FIRST fetch of an opened file
-        // (buffer still empty) uses the larger `first_read_bytes` window so a player's open/ffprobe
-        // burst (header + early index) is satisfied from one cold fetch instead of several; later
-        // (warm-buffer) fetches use the normal `BUFFER_SIZE` read-ahead. `first_read_bytes` is already
-        // clamped to [BUFFER_SIZE, MAX_FETCH_SIZE]; clamp again defensively.
+        // Buffer miss — fetch from CDN (with retry on expired URL). Whenever the read-ahead buffer is
+        // empty — the FIRST fetch of an opened file, and again after an instant-repair buffer reset —
+        // use the larger `first_read_bytes` window so a player's open/ffprobe burst (header + early
+        // index) is satisfied from one cold fetch instead of several; later (warm-buffer) fetches use
+        // the normal `BUFFER_SIZE` read-ahead. `first_read_bytes` is already clamped to
+        // [BUFFER_SIZE, MAX_FETCH_SIZE]; clamp again defensively.
         let min_window = if self.buffer.is_empty() {
             self.first_read_bytes
                 .clamp(BUFFER_SIZE as u64, MAX_FETCH_SIZE as u64)
@@ -1519,6 +1522,27 @@ mod provider_abstraction_tests {
             invalidate_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "a valid Range-ignoring 200 must not invalidate the cached resolution"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_cdn_range_truncates_an_oversending_200_to_the_window() {
+        // The DoS backstop: at pos==0 a Range-ignoring 200 that physically streams MORE than the
+        // fetch window must be read only up to the window and truncated (connection dropped), never
+        // buffered whole. The 200 declares a 5 GB Content-Length and here actually sends 36 bytes,
+        // exceeding the 10-byte window — the read must stop and keep only 10.
+        let body: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; // 36 bytes > the 10-byte window
+        let url = spawn_range_ignoring_200_huge_cl(body).await;
+        let (mut f, _inv) = proxied_with_counter(url, 0, 10); // file_size 10 → 10-byte window
+        let data = f
+            .fetch_bytes(8)
+            .await
+            .expect("a window-bounded oversending 200 at offset 0 must serve its window");
+        assert_eq!(&data[..], &body[..8]);
+        assert_eq!(
+            f.buffer.len(),
+            10,
+            "the over-sent 200 must be truncated to the 10-byte window, not buffered whole"
         );
     }
 
