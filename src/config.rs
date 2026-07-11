@@ -34,7 +34,8 @@ impl MaxResolution {
             MaxResolution::P2160 => 2160,
         }
     }
-    /// Parse "720"/"1080"/"2160"/"4k" into a known ceiling; `None` if unrecognised.
+    /// Parse a resolution ceiling: `720`/`1080`/`2160` (each also accepted with a `p` suffix), or
+    /// the `2160` synonyms `4k`/`uhd`; case-insensitive. `None` if unrecognised.
     pub fn try_parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "720" | "720p" => Some(MaxResolution::P720),
@@ -43,8 +44,9 @@ impl MaxResolution {
             _ => None,
         }
     }
-    /// Parse "720"/"1080"/"2160"/"4k"; anything else → default 1080p. Test-only convenience;
-    /// production uses `try_parse` directly (it logs a warning on an unrecognised value).
+    /// Parse a resolution ceiling (see `try_parse` for the accepted forms); anything else →
+    /// default 1080p. Test-only convenience; production uses `try_parse` directly (it logs a
+    /// warning on an unrecognised value).
     #[cfg(test)]
     pub fn parse(s: &str) -> Self {
         Self::try_parse(s).unwrap_or(MaxResolution::P1080)
@@ -343,7 +345,7 @@ impl AcquisitionConfig {
                         MaxResolution::try_parse(&s).unwrap_or_else(|| {
                             warn!(
                                 "Invalid MAX_RESOLUTION value '{}', falling back to 1080p \
-                                 (expected 720/1080/2160/4k)",
+                                 (expected 720/1080/2160, optionally 'p'-suffixed, or 4k/uhd)",
                                 s
                             );
                             MaxResolution::P1080

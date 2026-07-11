@@ -63,7 +63,7 @@ docker compose up -d
 - `JELLYFIN_RCLONE_MOUNT_PATH` — rclone mount path as seen by Jellyfin (e.g. `/media`)
 
 **Optional — Acquisition quality preferences (SP1):** (full descriptions in `README.md`'s env-var table)
-- `MAX_RESOLUTION` (default: `1080`) — hard resolution ceiling for acquisition (`720`/`1080`/`2160`); candidates above it are excluded.
+- `MAX_RESOLUTION` (default: `1080`) — hard resolution ceiling for acquisition (`720`/`1080`/`2160`, each also accepted with a `p` suffix, or the `2160` synonyms `4k`/`uhd`); candidates above it are excluded.
 - `AUDIO_LANGUAGE` (default: `original`) — required audio language: a 2-/3-letter ISO code or `original` (TMDB's original language).
 - `SUBTITLE_LANGUAGE` (default: unset = `none`) — required subtitle language (ISO code), or `none`/unset to skip the check.
 - `PREFER_HEVC` (default: `true`) / `PREFER_HDR` (default: `false`) — scoring preferences for HEVC and HDR/Dolby-Vision encodes.
