@@ -2889,6 +2889,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrates_v4_db_clears_legacy_upgrade_checks_through_the_ladder() {
+        // The `from_version < 6` upgrade_checks clear must fire for a from_version BELOW 5, not only
+        // for the v5→v6 step — v4 is where upgrade_checks was introduced, so it's the version most
+        // likely to hold legacy bare-key rows. Mirrors the sibling
+        // migrates_v3_db_clears_legacy_blacklist_through_the_ladder.
+        let tmp = TempDb::new("migrate_v4_ladder_uc");
+        {
+            let db = Database::create(&tmp.path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                // Legacy bare-`tmdb_id` upgrade_checks row (pre-v6 format).
+                let udef: TableDefinition<&str, u64> = TableDefinition::new("upgrade_checks");
+                let mut ut = txn.open_table(udef).unwrap();
+                ut.insert("1396", &1_700_000_000u64).unwrap();
+
+                // An owned row must SURVIVE (authoritative, not regenerable).
+                let odef: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_hashes");
+                let mut ot = txn.open_table(odef).unwrap();
+                let rec = OwnedRecord {
+                    request: req("tt4", 1396),
+                    provenance: Provenance::manual(),
+                    added_at: 9,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                };
+                ot.insert("hash4", serde_json::to_vec(&rec).unwrap().as_slice())
+                    .unwrap();
+
+                let vdef: TableDefinition<&str, u64> = TableDefinition::new("meta");
+                let mut v = txn.open_table(vdef).unwrap();
+                v.insert("schema_version", &4u64).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = Store::open(&tmp.path).unwrap();
+        assert_eq!(
+            store.get_owned("hash4".to_string()).await.unwrap().status,
+            OwnedStatus::Verified,
+            "owned rows must survive the v4 ladder migration"
+        );
+        drop(store);
+        let db = Database::create(&tmp.path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let udef: TableDefinition<&str, u64> = TableDefinition::new("upgrade_checks");
+        let ut = txn.open_table(udef).unwrap();
+        assert_eq!(
+            ut.iter().unwrap().count(),
+            0,
+            "the legacy bare-key upgrade_checks row must be cleared for a v4 (< 6) from_version"
+        );
+    }
+
+    #[tokio::test]
     async fn migrates_v6_db_clears_legacy_blacklist_but_keeps_owned() {
         let tmp = TempDb::new("migrate_v6_v7");
         {
