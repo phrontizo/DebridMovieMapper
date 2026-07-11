@@ -47,11 +47,30 @@ const BLACKLIST_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blac
 /// is a single char, `tmdb_id` is decimal, and a torrent infohash is hex. `all_blacklisted_hashes`'
 /// `rsplit_once('|')` relies on this; a future non-hex key source would break it.
 fn blacklist_key(kind: crate::scraper::MediaKind, tmdb_id: u64, hash: &str) -> String {
-    let disc = match kind {
-        crate::scraper::MediaKind::Movie => 'm',
-        crate::scraper::MediaKind::Series => 's',
-    };
+    let disc = media_type_disc(&media_kind_to_type(kind));
     format!("{}|{}|{}", disc, tmdb_id, hash.to_ascii_lowercase())
+}
+
+/// The SINGLE source of truth for the media-type discriminator char used in every key space
+/// (`blacklist_key` over `MediaKind`, `wanted_key`/`upgrade_check_key` over `MediaType`). Keeping the
+/// mapping in one place stops the key spaces from silently desyncing (e.g. `set_upgrade_checked`
+/// stamping one char while the prune derives another), which would strand or wrongly prune cursor
+/// rows.
+fn media_type_disc(media_type: &crate::vfs::MediaType) -> char {
+    match media_type {
+        crate::vfs::MediaType::Movie => 'm',
+        crate::vfs::MediaType::Show => 's',
+    }
+}
+
+/// Map the acquisition/upgrade engines' `MediaKind` onto the `vfs::MediaType` discriminator, so the
+/// blacklist key space (keyed by `MediaKind`) stays in lockstep with `wanted`/`upgrade_checks`
+/// (keyed by `MediaType`). The single place this remap lives.
+fn media_kind_to_type(kind: crate::scraper::MediaKind) -> crate::vfs::MediaType {
+    match kind {
+        crate::scraper::MediaKind::Movie => crate::vfs::MediaType::Movie,
+        crate::scraper::MediaKind::Series => crate::vfs::MediaType::Show,
+    }
 }
 /// Per-user Trakt OAuth tokens: user_slug -> serde_json(TraktTokens).
 const TRAKT_TOKENS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("trakt_tokens");
@@ -64,21 +83,13 @@ const WANTED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wanted"
 /// delimiter-safe: a Trakt user slug contains no `|`, the discriminator is one char, and `tmdb_id` is
 /// decimal (so `all_wanted`'s key parsing is unambiguous).
 fn wanted_key(user: &str, media_type: &crate::vfs::MediaType, tmdb_id: u64) -> String {
-    let disc = match media_type {
-        crate::vfs::MediaType::Movie => 'm',
-        crate::vfs::MediaType::Show => 's',
-    };
-    format!("{}|{}|{}", user, disc, tmdb_id)
+    format!("{}|{}|{}", user, media_type_disc(media_type), tmdb_id)
 }
 
 /// Key for the `upgrade_checks` round-robin cursor — discriminated by media type so a movie and a
 /// show sharing a numeric TMDB id keep independent cursors (mirrors `wanted_key`'s discriminator).
 fn upgrade_check_key(media_type: &crate::vfs::MediaType, tmdb_id: u64) -> String {
-    let disc = match media_type {
-        crate::vfs::MediaType::Movie => 'm',
-        crate::vfs::MediaType::Show => 's',
-    };
-    format!("{}|{}", disc, tmdb_id)
+    format!("{}|{}", media_type_disc(media_type), tmdb_id)
 }
 /// SP3 live-selection: slot ("m|tmdb" / "e|tmdb|s|e") -> serde_json(SelectionEntry).
 const SELECTION_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("selection");
@@ -1037,8 +1048,18 @@ impl Store {
             if let Ok(txn) = db.begin_read() {
                 if let Ok(table) = txn.open_table(BLACKLIST_TABLE) {
                     if let Ok(iter) = table.iter() {
-                        for entry in iter.flatten() {
-                            let (k, _) = entry;
+                        for entry in iter {
+                            // Log a per-row read error rather than `.flatten()`-swallowing it: a
+                            // dropped blacklist row silently re-adopts a hash the engine rejected.
+                            // (Regenerable via the TTL, so it self-heals — but keep it diagnosable,
+                            // consistent with the other `all_*` accessors.)
+                            let (k, _) = match entry {
+                                Ok(kv) => kv,
+                                Err(e) => {
+                                    error!("blacklist row read failed (skipped): {}", e);
+                                    continue;
+                                }
+                            };
                             // key = "<m|s>|tmdb_id|hash" → the hash is everything after the LAST '|'.
                             if let Some((_, hash)) = k.value().rsplit_once('|') {
                                 out.insert(hash.to_ascii_lowercase());
@@ -1511,10 +1532,7 @@ impl Store {
             .await
             .into_iter()
             .map(|(_, rec)| {
-                let media_type = match rec.request.kind {
-                    crate::scraper::MediaKind::Movie => crate::vfs::MediaType::Movie,
-                    crate::scraper::MediaKind::Series => crate::vfs::MediaType::Show,
-                };
+                let media_type = media_kind_to_type(rec.request.kind);
                 upgrade_check_key(&media_type, rec.request.tmdb_id)
             })
             .collect();
