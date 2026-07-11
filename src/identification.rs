@@ -235,7 +235,12 @@ fn select_best_match(
                 (movie, MediaType::Movie)
             } else if tv_exact && !movie_exact {
                 (tv, MediaType::Show)
-            } else if movie_exact && !tv_exact {
+            } else if movie_exact && !tv_exact && !is_show_guess {
+                // A bare exact MOVIE-title match only wins here when the file does NOT carry an
+                // episode marker. With `is_show_guess` (an SxxExx marker present), a decorated TV
+                // title ("Show (US)" → not exact) must not be overridden by an exact same-named movie
+                // — the episode marker is the stronger signal, so fall through to the `is_show_guess`
+                // Show branch below.
                 (movie, MediaType::Movie)
             } else if tv_year_match && !movie_year_match {
                 (tv, MediaType::Show)
@@ -1820,6 +1825,36 @@ mod tests {
         assert_eq!(title, "Breaking Bad");
         assert_eq!(id, "100");
         assert_eq!(media_type, MediaType::Show);
+    }
+
+    #[test]
+    fn select_best_match_episode_marker_beats_exact_movie_coincidence() {
+        // ID2 regression: with an SxxExx marker (is_show_guess=true), a decorated TV title (not an
+        // exact match to the query) must NOT be overridden by an exact same-named MOVIE — the episode
+        // marker is the stronger signal.
+        let tv = make_result(
+            300,
+            "Show Origins",
+            Some("2015-01-01"),
+            50.0,
+            Some(7.0),
+            Some(500),
+        );
+        let movie = make_result(400, "Show", Some("1999-01-01"), 40.0, Some(6.5), Some(800));
+        let got = select_best_match(
+            Some(&tv),
+            Some(&movie),
+            &normalize_title("Show"),
+            &None,
+            true,
+        );
+        let (_title, _date, id, media_type) = got.unwrap();
+        assert_eq!(
+            media_type,
+            MediaType::Show,
+            "an episode marker must beat an exact movie-title coincidence"
+        );
+        assert_eq!(id, "300");
     }
 
     #[test]

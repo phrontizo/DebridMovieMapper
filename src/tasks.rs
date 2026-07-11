@@ -1728,8 +1728,10 @@ pub(crate) fn plan_dedup(
                 // so iterate in reverse) and re-checked against the CURRENT kept set after each removal
                 // — so a mutually-covering cycle (A⊆B∪C, B⊆A∪C, C⊆A∪B) drops only the redundant ones
                 // and never breaks total coverage.
-                let provides_of: HashMap<&str, &Vec<(u32, u32)>> =
-                    hashes.iter().map(|(h, r)| (h.as_str(), &r.provides)).collect();
+                let provides_of: HashMap<&str, &Vec<(u32, u32)>> = hashes
+                    .iter()
+                    .map(|(h, r)| (h.as_str(), &r.provides))
+                    .collect();
                 let protected_from_removal: HashSet<&str> = hashes
                     .iter()
                     .filter(|(_, r)| r.provenance.has_manual_entry() || r.provides.is_empty())
