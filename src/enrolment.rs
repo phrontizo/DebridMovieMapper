@@ -176,6 +176,17 @@ impl EnrolmentService {
                     .await?;
                 Ok(())
             }
+            Err(AppError::RateLimited) => {
+                // A rate-limit (persistent 429) is transient, NOT an auth failure: the grant was
+                // never processed, so the single-use refresh token is untouched and next cycle will
+                // retry. Flagging `needs_reenrolment` here would make background jobs skip a healthy
+                // account until a manual re-enrolment, which never self-heals. Leave the record intact.
+                info!(
+                    "Trakt refresh for '{}' was rate-limited (429) — not flagging, will retry next cycle",
+                    slug
+                );
+                Ok(())
+            }
             Err(e) => {
                 // Only flag re-enrolment if the stored refresh is STILL the one we failed against. If
                 // a concurrent refresh already rotated it, Trakt invalidated our token on that other
@@ -1141,6 +1152,65 @@ mod tests {
         assert!(
             tok.needs_reenrolment,
             "a genuine refresh failure must flag re-enrolment"
+        );
+    }
+
+    /// A TraktClient whose `refresh` always reports a rate-limit (persistent 429).
+    struct RateLimitedRefresh;
+    #[async_trait::async_trait]
+    impl TraktClient for RateLimitedRefresh {
+        async fn device_code(&self) -> Result<DeviceCode, AppError> {
+            Err(AppError::Unavailable)
+        }
+        async fn poll_token(&self, _dc: &str) -> Result<DeviceTokenPoll, AppError> {
+            Err(AppError::Unavailable)
+        }
+        async fn refresh(&self, _refresh_token: &str) -> Result<TraktTokenResponse, AppError> {
+            Err(AppError::RateLimited)
+        }
+        async fn me(&self, _at: &str) -> Result<TraktUser, AppError> {
+            Err(AppError::Unavailable)
+        }
+        async fn watchlist(
+            &self,
+            _at: &str,
+        ) -> Result<Vec<crate::trakt_client::TraktItem>, AppError> {
+            Err(AppError::Unavailable)
+        }
+        async fn in_progress(
+            &self,
+            _at: &str,
+        ) -> Result<Vec<crate::trakt_client::TraktItem>, AppError> {
+            Err(AppError::Unavailable)
+        }
+        async fn watched(&self, _at: &str) -> Result<crate::trakt_client::WatchedData, AppError> {
+            Err(AppError::Unavailable)
+        }
+        async fn show_progress(
+            &self,
+            _at: &str,
+            _trakt_id: u64,
+        ) -> Result<crate::trakt_client::ShowProgress, AppError> {
+            Err(AppError::Unavailable)
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_rate_limit_does_not_flag_reenrolment() {
+        // A persistent 429 during refresh is transient throttling, not an auth failure — the single-
+        // use grant was never processed. It must NOT flag re-enrolment (which never self-heals, since
+        // background jobs skip flagged accounts), unlike the genuine-failure case above.
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
+            .await
+            .unwrap();
+        let svc = EnrolmentService::new(Arc::new(RateLimitedRefresh), store.clone());
+        svc.refresh_account("alice").await.unwrap();
+        let tok = store.get_trakt_tokens("alice".into()).await.unwrap();
+        assert!(
+            !tok.needs_reenrolment,
+            "a rate-limited refresh must NOT flag re-enrolment"
         );
     }
 }

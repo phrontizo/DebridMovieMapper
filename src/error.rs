@@ -19,6 +19,9 @@ pub enum AppError {
 
     #[error("Debrid resource temporarily unavailable")]
     Unavailable,
+
+    #[error("Upstream API rate limit exceeded")]
+    RateLimited,
 }
 
 #[cfg(test)]
@@ -29,6 +32,14 @@ mod tests {
     fn unavailable_variant_displays() {
         let e = AppError::Unavailable;
         assert_eq!(e.to_string(), "Debrid resource temporarily unavailable");
+    }
+
+    #[test]
+    fn rate_limited_variant_displays() {
+        // This variant is the "transient throttle, not an auth failure" signal the Trakt refresh
+        // path returns for a persistent 429 so `refresh_account` does NOT flag needs_reenrolment.
+        let e = AppError::RateLimited;
+        assert_eq!(e.to_string(), "Upstream API rate limit exceeded");
     }
 
     #[test]

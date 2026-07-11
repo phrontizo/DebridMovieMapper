@@ -343,6 +343,14 @@ impl TraktClient for TraktClientImpl {
                 false,
             )
             .await?;
+        // A persistent 429 (rate-limit) exhausted the retry budget and is returned raw here. It is a
+        // throttle, NOT an auth failure — the grant was never processed, so the single-use refresh
+        // token is untouched. Map it to `RateLimited` so `refresh_account` treats it as transient and
+        // does NOT flag `needs_reenrolment` (which would make background jobs skip a healthy account
+        // and never self-heal). A genuine `invalid_grant` still arrives as a 4xx via error_for_status.
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(AppError::RateLimited);
+        }
         let resp = resp.error_for_status().map_err(AppError::Http)?;
         let v: serde_json::Value = resp.json().await.map_err(AppError::Http)?;
         Ok(parse_token_response(&v))
@@ -1438,6 +1446,30 @@ mod tests {
             counter.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "refresh must NOT retry a transport error (single-use token): exactly one request"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_maps_a_persistent_429_to_rate_limited_not_http() {
+        // A persistent 429 exhausts the retry budget (5 attempts) and MUST surface as the transient
+        // `RateLimited` signal, NOT an `AppError::Http`. `refresh_account` relies on this distinction
+        // to avoid flagging a healthy account `needs_reenrolment` on mere throttling. `start_paused`
+        // auto-advances the limiter's post-throttle waits so the test is instant.
+        let (url, counter) = spawn_status_repeating(429).await;
+        let client = TraktClientImpl::new("cid".into(), "secret".into(), reqwest::Client::new())
+            .with_base_url(url);
+        let err = client
+            .refresh("rt")
+            .await
+            .expect_err("a persistent 429 must be an error");
+        assert!(
+            matches!(err, AppError::RateLimited),
+            "a persistent 429 on refresh must map to RateLimited, got {err:?}"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "a 429 is retried for the full MAX_ATTEMPTS budget before surfacing"
         );
     }
 
