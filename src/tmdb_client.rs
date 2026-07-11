@@ -28,7 +28,9 @@ pub struct TmdbSearchResult {
     // and harmlessly ignored) instead of failing the whole result page (losing every other result).
     #[serde(default, alias = "name")]
     pub title: String,
-    #[serde(alias = "original_name", alias = "original_title")]
+    // `alias = "original_name"` catches the TV variant; the field name already matches the movie key
+    // `original_title`, so no self-alias is needed.
+    #[serde(alias = "original_name")]
     pub original_title: Option<String>,
     #[serde(alias = "first_air_date")]
     pub release_date: Option<String>,
@@ -322,12 +324,13 @@ impl TmdbClient {
         if let Some(e) = last_error {
             Err(e)
         } else {
-            // All attempts exhausted without a reqwest::Error being recorded.
-            // This happens when every attempt returned a retryable status code
-            // (429/503/502/504) and the loop never fell through to error_for_status().
-            // Build a synthetic error to avoid panicking.
+            // DEFENSIVE-ONLY fallback: in practice unreachable, because every retryable-status
+            // iteration records the real `error_for_status_ref()` error into `last_error` above, so a
+            // budget exhausted purely on retryable statuses surfaces that REAL status via the branch
+            // above. This synthetic error only guards a future refactor that stopped recording it —
+            // it must never panic.
             error!(
-                "TMDB fetch_with_retry: all {} attempts exhausted (retryable status codes)",
+                "TMDB fetch_with_retry: all {} attempts exhausted with no recorded error (unexpected)",
                 max_attempts
             );
             Err(synthetic_exhausted_error())
