@@ -484,17 +484,21 @@ impl ProxiedMediaFile {
         Ok(data)
     }
 
-    /// Fetch a byte range from the CDN with one retry per error type:
+    /// Fetch a byte range from the CDN with up to 3 attempts, branching by failure kind (each arm's
+    /// full rationale is in the inline comments):
     ///
-    /// - **Connection error** (TCP failure, timeout): retry immediately with the
-    ///   same CDN URL — the URL is still valid, the error is transient.  The cache
-    ///   is intentionally left intact so concurrent readers do not all re-call
-    ///   `resolve_url` through the rate-limiter at once.
+    /// - **Connection error** (TCP failure, timeout): retry the SAME url — the URL is still valid,
+    ///   the error is transient. `cdn_url`/the resolution are intentionally left intact so many
+    ///   concurrent readers don't all re-resolve through the rate-limiter at once (a stampede).
     ///
-    /// - **HTTP error** (non-2xx/206): the CDN URL has likely expired (~1 h TTL).
-    ///   Clear `cdn_url` and invalidate the unrestrict cache, then retry to get a
-    ///   fresh URL.  `resolve_cdn_url` will call `resolve_url`, which blocks on
-    ///   the adaptive rate-limiter (up to `MAX_INTERVAL_MS` / 2 s under 429 storm).
+    /// - **Persistent 5xx**: NOT a stale URL — the file is (transiently) broken on the provider, so
+    ///   again do NOT invalidate. Retry the same url; once a retry still 5xxs, escalate to instant
+    ///   repair (re-add by hash) ONCE — a cached replacement fixes playback inline, else the read
+    ///   fails (rather than the player retry-storming a 500 forever).
+    ///
+    /// - **Genuinely stale / non-compliant** (expired 403/410, a Range-ignoring 200 on a seek, an
+    ///   oversized body, or a Content-Range mismatch): drop `cdn_url` + invalidate the resolution so
+    ///   the next attempt re-resolves a fresh URL.
     async fn fetch_cdn_range(&mut self, pos: u64, range_end: u64) -> Result<Bytes, FsError> {
         // Three attempts: original url, one cheap fresh-url retry, then (only if a 5xx persisted) one
         // post-instant-repair fetch. `repaired` caps the repair escalation at once per call.
