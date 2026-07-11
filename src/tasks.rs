@@ -614,6 +614,13 @@ pub(crate) fn build_wanted(
                 in_progress: false,
                 imdb_id: None,
             });
+        // Carry Trakt's IMDB id so a catch-up-ONLY show (not watchlisted/in-progress, so no
+        // TraktItem supplied one) is still scrapable — TMDB's IMDB mapping is incomplete for some
+        // titles (e.g. TVDB-only shows), and without this the show resolves to no IMDB id and is
+        // silently skipped by the acquire path.
+        if a.imdb_id.is_none() {
+            a.imdb_id = show.imdb_id.clone();
+        }
         // A watchlisted show already wants its whole run, so catch-up is redundant there — only
         // mark shows that aren't already on the watchlist.
         if !a.watchlist {
@@ -3647,6 +3654,7 @@ mod trakt_sync_tests {
             shows: vec![WatchedShow {
                 tmdb_id: 1396,
                 trakt_id: None,
+                imdb_id: None,
                 watched_episodes: vec![(1, 1), (1, 2)],
                 last_watched_at: None,
             }],
@@ -3805,6 +3813,7 @@ mod trakt_sync_tests {
             shows: vec![WatchedShow {
                 tmdb_id: 1396,
                 trakt_id: Some(1390),
+                imdb_id: None,
                 watched_episodes: vec![(1, 1)],
                 last_watched_at: Some(1_000_000),
             }],
@@ -3861,6 +3870,35 @@ mod trakt_sync_tests {
     }
 
     #[test]
+    fn build_wanted_catchup_only_show_carries_trakt_imdb_id() {
+        use crate::trakt_client::{WatchedData, WatchedShow};
+        // A show that enters the wanted-set ONLY via catch-up (watched + behind, NOT
+        // watchlisted/in-progress, so no TraktItem contributes an IMDB id) must still carry Trakt's
+        // IMDB id — otherwise a TVDB-only show (whose TMDB IMDB mapping is missing) resolves to no
+        // IMDB id and is silently skipped by the acquire path.
+        let watched = WatchedData {
+            movies: vec![],
+            shows: vec![WatchedShow {
+                tmdb_id: 1396,
+                trakt_id: Some(1390),
+                imdb_id: Some("tt0903747".into()),
+                watched_episodes: vec![(1, 1)],
+                last_watched_at: Some(1_000_000),
+            }],
+        };
+        let mut status = HashMap::new();
+        status.insert(1396u64, ShowStatus::Returning);
+        let got = build_wanted("alice", &[], &[], &watched, &status, None, None);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].sources.in_progress && !got[0].sources.watchlist);
+        assert_eq!(
+            got[0].imdb_id.as_deref(),
+            Some("tt0903747"),
+            "a catch-up-only show must carry Trakt's IMDB id so it can be scraped"
+        );
+    }
+
+    #[test]
     fn build_wanted_catchup_behind_gate_excludes_caught_up_show() {
         use crate::trakt_client::{WatchedData, WatchedShow};
         let watched = WatchedData {
@@ -3868,6 +3906,7 @@ mod trakt_sync_tests {
             shows: vec![WatchedShow {
                 tmdb_id: 1396,
                 trakt_id: Some(1390),
+                imdb_id: None,
                 watched_episodes: vec![(1, 1)],
                 last_watched_at: Some(1_000_000),
             }],
@@ -3955,12 +3994,14 @@ mod trakt_sync_tests {
                 WatchedShow {
                     tmdb_id: 500,
                     trakt_id: Some(100),
+                    imdb_id: None,
                     watched_episodes: vec![(1, 1)],
                     last_watched_at: Some(1_000_000),
                 },
                 WatchedShow {
                     tmdb_id: 600,
                     trakt_id: Some(200),
+                    imdb_id: None,
                     watched_episodes: vec![(1, 1)],
                     last_watched_at: Some(1_000_000),
                 },

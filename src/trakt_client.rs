@@ -92,6 +92,12 @@ pub struct WatchedShow {
     /// endpoint takes (it does not accept a TMDB id). `None` if Trakt omitted it; the catch-up
     /// "behind?" check then conservatively includes the show. Distinct from `tmdb_id`.
     pub trakt_id: Option<u64>,
+    /// The show's IMDB id (`show.ids.imdb`), if Trakt supplied it. Threaded into the catch-up
+    /// wanted record so a catch-up-ONLY show (watched + behind, not watchlisted/in-progress) can
+    /// still be scraped: Torrentio is IMDB-keyed, and TMDB's IMDB mapping is incomplete for some
+    /// titles (e.g. a TVDB-only show), so without Trakt's id such a show would resolve to no IMDB
+    /// id and be silently skipped. Mirrors `TraktItem.imdb_id`.
+    pub imdb_id: Option<String>,
     pub watched_episodes: Vec<(u32, u32)>,
     /// When the user last watched any episode of this show, as a Unix timestamp (seconds). `None`
     /// if Trakt omitted/malformed `last_watched_at`. Drives the catch-up lookback window (SP2.5).
@@ -591,6 +597,7 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
         .filter_map(|e| {
             let tmdb_id = e.get("show").and_then(tmdb_id_of)?;
             let trakt_id = e.get("show").and_then(trakt_id_of);
+            let imdb_id = e.get("show").and_then(imdb_id_of);
             let mut watched_episodes = Vec::new();
             if let Some(seasons) = e.get("seasons").and_then(|s| s.as_array()) {
                 for season in seasons {
@@ -623,6 +630,7 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
             Some(WatchedShow {
                 tmdb_id,
                 trakt_id,
+                imdb_id,
                 watched_episodes,
                 last_watched_at,
             })
@@ -1082,14 +1090,14 @@ mod tests {
         let v = serde_json::json!([
             {
                 "last_watched_at": "2021-01-01T00:00:00.000Z",
-                "show": { "ids": { "tmdb": 1396, "trakt": 1390 } },
+                "show": { "ids": { "tmdb": 1396, "trakt": 1390, "imdb": "tt0903747" } },
                 "seasons": [
                     { "number": 1, "episodes": [{ "number": 1 }, { "number": 2 }] },
                     { "number": 2, "episodes": [{ "number": 1 }] },
                 ]
             },
             {
-                // no last_watched_at → None; no trakt id → None (both still parsed)
+                // no last_watched_at → None; no trakt/imdb id → None (all still parsed)
                 "show": { "ids": { "tmdb": 1399 } },
                 "seasons": [{ "number": 1, "episodes": [{ "number": 1 }] }]
             }
@@ -1100,12 +1108,14 @@ mod tests {
                 WatchedShow {
                     tmdb_id: 1396,
                     trakt_id: Some(1390),
+                    imdb_id: Some("tt0903747".into()),
                     watched_episodes: vec![(1, 1), (1, 2), (2, 1)],
                     last_watched_at: Some(1_609_459_200), // 2021-01-01T00:00:00Z
                 },
                 WatchedShow {
                     tmdb_id: 1399,
                     trakt_id: None,
+                    imdb_id: None,
                     watched_episodes: vec![(1, 1)],
                     last_watched_at: None,
                 },
