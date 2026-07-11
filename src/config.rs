@@ -380,34 +380,32 @@ impl AcquisitionConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
             {
-                Some(s) => s
-                    .parse::<u64>()
-                    .unwrap_or_else(|_| {
-                        warn!(
-                            "Invalid STALL_TIMEOUT_SECS value '{}', falling back to {}",
-                            s, DEFAULT_STALL_TIMEOUT_SECS
-                        );
-                        DEFAULT_STALL_TIMEOUT_SECS
-                    })
-                    .max(MIN_STALL_TIMEOUT_SECS),
+                Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
+                    warn!(
+                        "Invalid STALL_TIMEOUT_SECS value '{}', falling back to {}",
+                        s, DEFAULT_STALL_TIMEOUT_SECS
+                    );
+                    DEFAULT_STALL_TIMEOUT_SECS
+                }),
                 None => DEFAULT_STALL_TIMEOUT_SECS,
-            },
+            }
+            // Clamp the WHOLE match (parsed and default arms alike), so lowering the default below
+            // the floor can't silently skip the clamp — matching `scan_interval_secs`.
+            .max(MIN_STALL_TIMEOUT_SECS),
             max_acquire_attempts: match max_acquire_attempts
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
             {
-                Some(s) => s
-                    .parse::<u32>()
-                    .unwrap_or_else(|_| {
-                        warn!(
-                            "Invalid MAX_ACQUIRE_ATTEMPTS value '{}', falling back to {}",
-                            s, DEFAULT_MAX_ACQUIRE_ATTEMPTS
-                        );
-                        DEFAULT_MAX_ACQUIRE_ATTEMPTS
-                    })
-                    .max(MIN_MAX_ACQUIRE_ATTEMPTS),
+                Some(s) => s.parse::<u32>().unwrap_or_else(|_| {
+                    warn!(
+                        "Invalid MAX_ACQUIRE_ATTEMPTS value '{}', falling back to {}",
+                        s, DEFAULT_MAX_ACQUIRE_ATTEMPTS
+                    );
+                    DEFAULT_MAX_ACQUIRE_ATTEMPTS
+                }),
                 None => DEFAULT_MAX_ACQUIRE_ATTEMPTS,
-            },
+            }
+            .max(MIN_MAX_ACQUIRE_ATTEMPTS),
             scraper_addon_url: None,
             scraper_proxy_url: None,
             acquire_dead_timeout_secs: DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS,
@@ -442,18 +440,17 @@ impl AcquisitionConfig {
     /// treated as unset), and any value is clamped up to the 120s floor. Pure for unit-testability.
     fn parse_dead_timeout(raw: Option<String>) -> u64 {
         match raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-            Some(s) => s
-                .parse::<u64>()
-                .unwrap_or_else(|_| {
-                    warn!(
-                        "Invalid ACQUIRE_DEAD_TIMEOUT_SECS value '{}', falling back to {}",
-                        s, DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS
-                    );
-                    DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS
-                })
-                .max(MIN_ACQUIRE_DEAD_TIMEOUT_SECS),
+            Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
+                warn!(
+                    "Invalid ACQUIRE_DEAD_TIMEOUT_SECS value '{}', falling back to {}",
+                    s, DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS
+                );
+                DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS
+            }),
             None => DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS,
         }
+        // Clamp the WHOLE match (parsed and default arms alike) — see `scan_interval_secs`.
+        .max(MIN_ACQUIRE_DEAD_TIMEOUT_SECS)
     }
 }
 
