@@ -1158,17 +1158,53 @@ async fn reap_absent_mirror_owned(
     if to_reap.is_empty() {
         return 0;
     }
-    let selection = store.all_selection().await;
+    // Index selection slots by (lowercased) hash ONCE so per-hash slot cleanup is O(1) rather than an
+    // O(reaped × selection-table) nested scan.
+    let slots_by_hash = index_selection_slots_by_hash(&store.all_selection().await);
+    let mut reaped = 0;
     for h in &to_reap {
-        let _ = store.remove_owned(h.clone()).await;
-        let _ = store.remove_authoritative(h.clone()).await;
-        for (slot, entry) in &selection {
-            if entry.hash.eq_ignore_ascii_case(h) {
-                let _ = store.remove_selection(slot.clone()).await;
+        // Only count a record as reaped once its owned row is ACTUALLY gone — log (don't swallow via
+        // `let _`) a transient store error so a reported reap count can't overstate what happened.
+        // The record survives and is retried on the next daily prune tick.
+        match store.remove_owned(h.clone()).await {
+            Ok(()) => reaped += 1,
+            Err(e) => {
+                warn!(
+                    "reap: failed to remove absent-mirror owned record {} ({}); will retry next tick",
+                    h, e
+                );
+                continue;
+            }
+        }
+        if let Err(e) = store.remove_authoritative(h.clone()).await {
+            warn!("reap: failed to remove authoritative id for {} ({})", h, e);
+        }
+        if let Some(slots) = slots_by_hash.get(&h.to_ascii_lowercase()) {
+            for slot in slots {
+                if let Err(e) = store.remove_selection(slot.clone()).await {
+                    warn!(
+                        "reap: failed to remove dangling selection slot {} for {} ({})",
+                        slot, h, e
+                    );
+                }
             }
         }
     }
-    to_reap.len()
+    reaped
+}
+
+/// Index selection slots by lowercased hash, so a destructive pass that removes many hashes can look
+/// up each hash's slots in O(1) instead of re-scanning the whole selection snapshot per hash.
+fn index_selection_slots_by_hash(
+    selection: &[(String, crate::store::SelectionEntry)],
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for (slot, entry) in selection {
+        map.entry(entry.hash.to_ascii_lowercase())
+            .or_default()
+            .push(slot.clone());
+    }
+    map
 }
 
 /// Record every identified, present provider torrent the engine doesn't already track as an
@@ -1234,20 +1270,33 @@ pub(crate) async fn record_mirror_owned(
         .map(|(h, _)| h.clone())
         .collect();
     if !phantoms.is_empty() {
-        let selection = store.all_selection().await;
+        let slots_by_hash = index_selection_slots_by_hash(&store.all_selection().await);
+        let mut reaped = 0;
         for h in &phantoms {
-            let _ = store.remove_owned(h.clone()).await;
-            let _ = store.remove_authoritative(h.clone()).await;
-            for (slot, entry) in &selection {
-                if entry.hash.eq_ignore_ascii_case(h) {
-                    let _ = store.remove_selection(slot.clone()).await;
+            // Count only records whose owned row was ACTUALLY removed; log (don't swallow) a transient
+            // store error so the reaped count can't overstate what happened (retried next tick).
+            match store.remove_owned(h.clone()).await {
+                Ok(()) => reaped += 1,
+                Err(e) => {
+                    warn!(
+                        "mirror: failed to reap phantom owned record {} ({}); will retry",
+                        h, e
+                    );
+                    continue;
+                }
+            }
+            if let Err(e) = store.remove_authoritative(h.clone()).await {
+                warn!("mirror: failed to remove authoritative id for {} ({})", h, e);
+            }
+            if let Some(slots) = slots_by_hash.get(&h.to_ascii_lowercase()) {
+                for slot in slots {
+                    if let Err(e) = store.remove_selection(slot.clone()).await {
+                        warn!("mirror: failed to remove selection slot {} for {} ({})", slot, h, e);
+                    }
                 }
             }
         }
-        info!(
-            "mirror: reaped {} blacklisted phantom owned record(s)",
-            phantoms.len()
-        );
+        info!("mirror: reaped {} blacklisted phantom owned record(s)", reaped);
     }
     let mut recorded = 0usize;
     for (info, metadata) in current_data {
@@ -1700,6 +1749,8 @@ pub(crate) async fn dedup_owned(app: &AppState, torrents: &[crate::rd_client::To
         .iter()
         .map(|(_, e)| e.hash.to_ascii_lowercase())
         .collect();
+    // Index slots by hash ONCE so per-removed-hash selection cleanup is O(1), not O(removed × table).
+    let slots_by_hash = index_selection_slots_by_hash(&selection);
 
     let mut plans = plan_dedup(&owned, &present, &selected);
     // Don't dedup a title with a FRESHLY-staged copy. The upgrade engine adds a new (better) hash and
@@ -1778,9 +1829,11 @@ pub(crate) async fn dedup_owned(app: &AppState, torrents: &[crate::rd_client::To
             }
             // Clear any selection slot that pointed at the removed hash (the VFS re-derives it from
             // the kept covering hash on the next scan).
-            for (slot, entry) in &selection {
-                if entry.hash.eq_ignore_ascii_case(h) {
-                    let _ = app.store.remove_selection(slot.clone()).await;
+            if let Some(slots) = slots_by_hash.get(&h.to_ascii_lowercase()) {
+                for slot in slots {
+                    if let Err(e) = app.store.remove_selection(slot.clone()).await {
+                        warn!("dedup: remove selection slot {} for {} failed: {}", slot, short(h), e);
+                    }
                 }
             }
             removed += 1;
@@ -1960,8 +2013,9 @@ async fn execute_remove(
     // so this path is exercised only in integration/production; no unit test added for the failure
     // branch — the code fix is self-evident.
     //
-    // Read the selection table ONCE (we only ever remove from it below), not per-hash.
-    let selection = store.all_selection().await;
+    // Read + index the selection table ONCE (we only ever remove from it below), so per-hash slot
+    // cleanup is O(1) rather than an O(hashes × table) nested scan.
+    let slots_by_hash = index_selection_slots_by_hash(&store.all_selection().await);
     for hash in hashes {
         if let Some(t) = torrents.iter().find(|t| t.hash.eq_ignore_ascii_case(hash)) {
             if let Err(e) = provider.delete_torrent(&t.id).await {
@@ -1977,9 +2031,14 @@ async fn execute_remove(
             continue;
         }
         // SP3: drop any selection slots this hash represented.
-        for (slot, entry) in &selection {
-            if entry.hash.eq_ignore_ascii_case(hash) {
-                let _ = store.remove_selection(slot.clone()).await;
+        if let Some(slots) = slots_by_hash.get(&hash.to_ascii_lowercase()) {
+            for slot in slots {
+                if let Err(e) = store.remove_selection(slot.clone()).await {
+                    warn!(
+                        "reconcile: remove selection slot {} for {} failed: {}",
+                        slot, hash, e
+                    );
+                }
             }
         }
     }
