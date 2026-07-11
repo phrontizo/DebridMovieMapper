@@ -350,23 +350,28 @@ impl DebridVfs {
                 candidate
             };
 
-            // Warn about archive-only torrents that can't be streamed
-            for torrent in &torrents {
-                let has_video = torrent
-                    .files
-                    .iter()
-                    .any(|f| f.selected == 1 && is_video_file(&f.path));
-                if !has_video {
-                    let has_archive = torrent
+            // Warn about archive-only torrents that can't be streamed. This is a purely diagnostic
+            // pass that re-scans every selected file with `is_video_file`/`is_archive_file` (which the
+            // emit path below also does); skip it entirely when warn-level logging is disabled so it
+            // costs nothing then.
+            if tracing::enabled!(tracing::Level::WARN) {
+                for torrent in &torrents {
+                    let has_video = torrent
                         .files
                         .iter()
-                        .any(|f| f.selected == 1 && is_archive_file(&f.path));
-                    if has_archive {
-                        tracing::warn!(
-                            "Torrent '{}' contains only archive files (RAR/ZIP) and cannot be streamed — \
-                             replace it with a non-archive version on your debrid service",
-                            torrent.filename
-                        );
+                        .any(|f| f.selected == 1 && is_video_file(&f.path));
+                    if !has_video {
+                        let has_archive = torrent
+                            .files
+                            .iter()
+                            .any(|f| f.selected == 1 && is_archive_file(&f.path));
+                        if has_archive {
+                            tracing::warn!(
+                                "Torrent '{}' contains only archive files (RAR/ZIP) and cannot be streamed — \
+                                 replace it with a non-archive version on your debrid service",
+                                torrent.filename
+                            );
+                        }
                     }
                 }
             }
