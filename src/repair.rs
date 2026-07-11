@@ -646,11 +646,15 @@ impl RepairManager {
         }
     }
 
-    /// Force a torrent into the `Broken` state (hidden from WebDAV until a replacement
-    /// is surfaced). The live playback path no longer calls this — a 503/`Unavailable`
-    /// now drives synchronous instant repair (`try_instant_repair`) instead — so this is
-    /// the primitive used to simulate a broken torrent in tests and remains available for
-    /// any caller that needs to mark a torrent broken directly.
+    /// Force a torrent into the `Broken` state (hidden from WebDAV until a replacement is
+    /// surfaced). TEST-SUPPORT ONLY (also consumed by the `repair_integration_test` binary, so it
+    /// stays `pub` rather than `#[cfg(test)]`; `#[doc(hidden)]` keeps it out of the public API
+    /// surface): the live playback path no longer calls this — a 503/`Unavailable` now drives
+    /// synchronous instant repair (`try_instant_repair`) instead, which records a replacement before
+    /// hiding the original. Marking a torrent `Broken` with NO recorded replacement would trap it
+    /// hidden until restart (reads short-circuit on `should_hide_torrent`, so it can never
+    /// re-trigger repair), so this must NEVER be re-wired into a production path.
+    #[doc(hidden)]
     pub async fn mark_broken(&self, torrent_id: &str) {
         let mut health_map = self.health_status.write().await;
 
