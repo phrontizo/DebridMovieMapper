@@ -43,7 +43,10 @@ impl EnrolmentService {
     }
 
     /// Route a `/trakt*` request by method + path. Unknown `/trakt` paths return 404.
-    pub async fn handle(&self, req: hyper::Request<hyper::body::Incoming>) -> Response<Body> {
+    // Generic over the body type — `handle` inspects only method/path/headers, never the body — so
+    // the router (incl. the CSRF guard, 404 fallback, and slug decoding) is unit-testable with a
+    // lightweight `Request<()>` rather than a real streaming `Incoming` body.
+    pub async fn handle<B>(&self, req: hyper::Request<B>) -> Response<Body> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -221,6 +224,9 @@ impl EnrolmentService {
     /// `wants()`, so Trigger-B cleanup can never fire. Prune them here as part of the unlink.
     pub(crate) async fn remove_account(&self, slug: &str) -> Result<(), AppError> {
         self.store.remove_trakt_tokens(slug.to_string()).await?;
+        // Intentional full `wanted` scan: account removal is rare and operator-initiated, and the
+        // store exposes no user-prefixed range delete, so the O(all-users × all-titles) scan here is
+        // acceptable (and simpler than adding a prefix index for a cold path).
         for rec in self.store.all_wanted().await {
             if rec.user == slug {
                 self.store
@@ -375,17 +381,34 @@ fn is_cross_origin<B>(req: &hyper::Request<B>) -> bool {
             .unwrap_or("");
         let same_origin = origin
             .split_once("://")
-            .map(|(_, h)| h)
-            .is_some_and(|origin_host| {
+            .is_some_and(|(scheme, origin_host)| {
                 !origin_host.is_empty()
                     && !host.is_empty()
-                    && origin_host.eq_ignore_ascii_case(host)
+                    // Normalise the default port for the scheme so a same-origin POST that carries the
+                    // default port on one side but omits it on the other (e.g. a reverse proxy that
+                    // rewrites Host but not Origin) isn't falsely rejected as CSRF.
+                    && strip_default_port(scheme, origin_host)
+                        .eq_ignore_ascii_case(strip_default_port(scheme, host))
             });
         if !same_origin {
             return true;
         }
     }
     false
+}
+
+/// Strip the DEFAULT port for `scheme` (`:80` for http, `:443` for https) from a `host[:port]`, so a
+/// host with the explicit default port compares equal to the same host without it. A non-default port
+/// (or a non-http(s) scheme) is left intact.
+fn strip_default_port<'a>(scheme: &str, host_port: &'a str) -> &'a str {
+    let default = if scheme.eq_ignore_ascii_case("http") {
+        ":80"
+    } else if scheme.eq_ignore_ascii_case("https") {
+        ":443"
+    } else {
+        return host_port;
+    };
+    host_port.strip_suffix(default).unwrap_or(host_port)
 }
 
 /// HTML-escape `s` for safe use in element text and BOTH double- and single-quoted attributes.
@@ -511,11 +534,19 @@ fn accounts_html(accounts: &[(String, TraktTokens)]) -> String {
 
 // --- Response helpers -----------------------------------------------------------------------
 
-/// Build an HTML response of the WebDAV body type.
+/// Build an HTML response of the WebDAV body type. Output is already `esc`/`encode_path_segment`-safe;
+/// the hardening headers are defence-in-depth: `nosniff` stops a browser MIME-sniffing the page as
+/// something executable, and a `default-src 'none'` CSP (the pages use no scripts) neutralises any
+/// future escaping regression on these unauthenticated LAN pages.
 fn html(status: StatusCode, body: String) -> Response<Body> {
     Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(
+            hyper::header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+        )
         .body(Body::from(body))
         .expect("building a static HTML response cannot fail")
 }
@@ -999,6 +1030,32 @@ mod tests {
     }
 
     #[test]
+    fn accounts_html_action_url_is_breakout_safe() {
+        // The slug is percent-encoded (NOT merely esc'd) inside the double-quoted action="…" URL, so
+        // a break-out attempt (`"`, space, `<`) is neutralised as `%22`/`%20`/`%3C` rather than
+        // injecting an attribute. Pins that encode_path_segment (not esc) is what makes the URL safe.
+        let accounts = vec![(
+            "a\" onmouseover=alert(1) <x".to_string(),
+            tokens_fixture("AT", "u"),
+        )];
+        let page = accounts_html(&accounts);
+        assert!(
+            page.contains("%22"),
+            "the double-quote must be percent-encoded in the action URL"
+        );
+        assert!(
+            page.contains("%20"),
+            "spaces must be percent-encoded in the action URL"
+        );
+        assert!(
+            page.contains("%3C") || page.contains("%3c"),
+            "`<` must be percent-encoded"
+        );
+        // The raw break-out sequence must appear nowhere (the text rendering esc's the quote to &quot;).
+        assert!(!page.contains("a\" onmouseover"));
+    }
+
+    #[test]
     fn enrol_html_escapes_and_guards_non_web_verification_url() {
         let dc = DeviceCode {
             device_code: "dc".into(),
@@ -1053,6 +1110,104 @@ mod tests {
         // No CSRF-relevant headers (curl/tests) → allowed under the trusted-LAN model.
         let req = post_req(&[("host", "host.local")]);
         assert!(!is_cross_origin(&req));
+    }
+
+    #[test]
+    fn same_origin_default_port_normalisation() {
+        // A same-origin POST where one side carries the scheme's DEFAULT port and the other omits it
+        // (e.g. a reverse proxy rewriting Host but not Origin) must NOT be rejected as cross-origin.
+        let req = post_req(&[("host", "host.local"), ("origin", "http://host.local:80")]);
+        assert!(!is_cross_origin(&req));
+        let req = post_req(&[("host", "host.local:80"), ("origin", "http://host.local")]);
+        assert!(!is_cross_origin(&req));
+        let req = post_req(&[("host", "host.local"), ("origin", "https://host.local:443")]);
+        assert!(!is_cross_origin(&req));
+        // A NON-default port that genuinely differs is still cross-origin.
+        let req = post_req(&[("host", "host.local"), ("origin", "http://host.local:8443")]);
+        assert!(is_cross_origin(&req));
+        // The http default (:80) must not be stripped from an https origin (scheme mismatch case).
+        let req = post_req(&[("host", "host.local"), ("origin", "https://host.local:80")]);
+        assert!(is_cross_origin(&req));
+    }
+
+    fn routed_req(method: Method, uri: &str, same_origin: bool) -> hyper::Request<()> {
+        let origin = if same_origin {
+            "http://host.local"
+        } else {
+            "https://evil.example"
+        };
+        hyper::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "host.local")
+            .header("origin", origin)
+            .body(())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn handle_routes_and_enforces_csrf_and_decodes_slug() {
+        // Exercises the router end-to-end: the CSRF guard precedes routing, each method+path arm
+        // dispatches, an unknown path 404s, and a percent-encoded slug is decoded before dispatch.
+        let store = mem_store();
+        let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), store.clone());
+
+        // Cross-origin POST → 403 (guard fires before the route match).
+        let r = svc
+            .handle(routed_req(
+                Method::POST,
+                "http://host.local/trakt/enrol",
+                false,
+            ))
+            .await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+        // Same-origin POST /trakt/enrol → start_enrolment (MockTrakt device_code Ok → 200).
+        let r = svc
+            .handle(routed_req(
+                Method::POST,
+                "http://host.local/trakt/enrol",
+                true,
+            ))
+            .await;
+        assert_eq!(r.status(), StatusCode::OK);
+
+        // GET /trakt and /trakt/accounts → the accounts page.
+        for uri in [
+            "http://host.local/trakt",
+            "http://host.local/trakt/accounts",
+        ] {
+            let r = svc.handle(routed_req(Method::GET, uri, true)).await;
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+
+        // Unknown /trakt path → 404.
+        let r = svc
+            .handle(routed_req(
+                Method::GET,
+                "http://host.local/trakt/nope",
+                true,
+            ))
+            .await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+        // A percent-encoded slug is decoded before dispatch: remove the account keyed "a b".
+        store
+            .put_trakt_tokens("a b".into(), tokens_fixture("AT", "Alice"))
+            .await
+            .unwrap();
+        let r = svc
+            .handle(routed_req(
+                Method::POST,
+                "http://host.local/trakt/accounts/a%20b/remove",
+                true,
+            ))
+            .await;
+        assert_eq!(r.status(), StatusCode::SEE_OTHER);
+        assert!(
+            store.get_trakt_tokens("a b".into()).await.is_none(),
+            "the percent-encoded slug must decode to 'a b' and reach remove_account"
+        );
     }
 
     /// A TraktClient whose `refresh` simulates a CONCURRENT refresh: it rotates the stored token's
