@@ -482,22 +482,18 @@ impl AcquisitionEngine {
             // Reuse the pre-scan's owned lookup rather than re-reading redb (defensive `unwrap_or`:
             // the pre-scan visited every candidate before reaching here, so this is always populated).
             if owned_cache.get(&cand.info_hash).copied().unwrap_or(false) {
-                if present.is_none() {
-                    present = Some(self.provider.get_torrents().await.ok().map(|ts| {
-                        ts.iter()
-                            .map(|t| t.hash.to_ascii_lowercase())
-                            .collect::<std::collections::HashSet<String>>()
-                    }));
-                }
-                // Short-circuit as idempotent "already acquired" ONLY when the torrent is confirmed
-                // PRESENT on the provider. If the listing is unavailable, preserve the old idempotent
-                // behaviour (avoid spurious re-adds on a transient listing failure). If confirmed
-                // ABSENT, fall through to re-add — the title lapsed (cache lost / externally deleted),
-                // which is exactly the documented availability-re-acquire case.
-                let confirmed_absent = match present.as_ref().expect("just fetched") {
-                    Some(p) => !p.contains(&cand.info_hash.to_ascii_lowercase()),
-                    None => false,
-                };
+                // `present` is already populated: the pre-scan fetches it on the FIRST owned candidate
+                // it encounters, and it visits every candidate before this add loop runs, so any owned
+                // candidate reaching here was preceded by that fetch (the re-fetch this branch used to
+                // do was dead code). Short-circuit as idempotent "already acquired" ONLY when the
+                // torrent is confirmed PRESENT. A confirmed-ABSENT owned hash falls through to re-add —
+                // the title lapsed (cache lost / externally deleted), the documented re-acquire case.
+                // An unknown listing (fetch failed, or — defensively — never fetched) is treated as
+                // present, preserving the old idempotent behaviour rather than a spurious re-add.
+                let confirmed_absent = matches!(
+                    present.as_ref(),
+                    Some(Some(p)) if !p.contains(&cand.info_hash.to_ascii_lowercase())
+                );
                 if !confirmed_absent {
                     debug!(
                         "acquire: tmdb {} — {} already owned + present (idempotent, no re-add)",
