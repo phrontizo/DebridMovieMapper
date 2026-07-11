@@ -139,14 +139,16 @@ fn to_torrent_file(f: &TbFile) -> TorrentFile {
 }
 
 /// Map a decoded `mylist` into canonical torrents, DROPPING any entry with an unusable identity
-/// (id 0 or empty hash). `null_to_default` defaults a null/missing/type-mismatched id→0 and hash→""
-/// rather than failing the whole list decode; such an entry can't be acted on (a delete against id
-/// "0", or a hash-keyed lookup on ""), so skip it instead of surfacing a phantom torrent. A real
-/// TorBox torrent always has both.
+/// (id ≤ 0 or empty hash). `null_to_default` defaults a null/missing/type-mismatched id→0 and
+/// hash→"" rather than failing the whole list decode; such an entry can't be acted on (a delete
+/// against id "0", or a hash-keyed lookup on ""), so skip it instead of surfacing a phantom torrent.
+/// The filter is `id > 0` (not `id != 0`) to match `delete_torrent_raw`'s own `> 0` guard: a
+/// (garbage) negative id would otherwise surface as an owned torrent that can never be deleted.
+/// A real TorBox torrent always has a positive id and a non-empty hash.
 fn map_listed_torrents(raw: &[TbTorrent]) -> Vec<Torrent> {
     let mapped: Vec<Torrent> = raw
         .iter()
-        .filter(|t| t.id != 0 && !t.hash.is_empty())
+        .filter(|t| t.id > 0 && !t.hash.is_empty())
         .map(to_torrent)
         .collect();
     // Surface a count when entries are dropped: normally zero, but if TorBox ever changed the wire
@@ -1496,16 +1498,24 @@ mod tests {
             "id": "notanumber", "hash": 123, "name": "X",
             "download_finished": true, "download_state": "cached", "files": []
         }"#;
+        // A NEGATIVE id (garbage the wire could theoretically carry) is likewise unusable —
+        // `delete_torrent_raw` guards `id > 0`, so a `-5` torrent could never be deleted; it must be
+        // dropped here rather than surfaced as a non-actionable phantom.
+        let negative = r#"{
+            "id": -5, "hash": "abc", "name": "Y",
+            "download_finished": true, "download_state": "cached", "files": []
+        }"#;
         let raw: Vec<TbTorrent> =
-            serde_json::from_str(&format!("[{},{}]", MYLIST_ITEM, bad)).unwrap();
-        assert_eq!(raw.len(), 2, "both entries decode (lenient)");
+            serde_json::from_str(&format!("[{},{},{}]", MYLIST_ITEM, bad, negative)).unwrap();
+        assert_eq!(raw.len(), 3, "all entries decode (lenient)");
         let mapped = map_listed_torrents(&raw);
         assert_eq!(
             mapped.len(),
             1,
-            "the unusable (id 0 / empty hash) entry is dropped"
+            "the unusable (id ≤ 0 / empty hash) entries are dropped"
         );
         assert_ne!(mapped[0].id, "0");
+        assert_ne!(mapped[0].id, "-5");
         assert!(!mapped[0].hash.is_empty());
     }
 
