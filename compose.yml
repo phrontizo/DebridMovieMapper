@@ -26,6 +26,8 @@ services:
       - DB_PATH=/data/metadata.db
       # Provider poll cadence (seconds; default 60, min 10). Uncomment to override.
       # - SCAN_INTERVAL_SECS=60
+      # Size (MB) of the first read-ahead CDN fetch when a media file is opened (default 8, clamped 2–16).
+      # - CDN_FIRST_READ_MB=8
       # Log verbosity (default: info). Scope to this crate to avoid dependency noise; takes
       # effect on restart. e.g. debridmoviemapper=debug, or debridmoviemapper::acquire=debug,info
       - RUST_LOG=${RUST_LOG:-info}
@@ -80,6 +82,7 @@ services:
       # - UPGRADE_BUDGET_PER_TICK=20     # owned titles re-scored per tick (min 1)
       # - UPGRADE_IDLE_SECS=300          # read-inactivity before a swap/prune (min 30)
       # - UPGRADE_STAGE_MAX_SECS=604800  # reserved (min 3600)
+      # - ALLOW_RESOLUTION_DOWNGRADE=false # true = correct an above-ceiling owned copy to a within-ceiling cached release (default: preview/log only)
     volumes:
       - metadata:/data
     # Overrides Dockerfile HEALTHCHECK with faster intervals for depends_on startup ordering
