@@ -2080,6 +2080,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acquire_reaps_a_lapsed_superseded_episode_singleton() {
+        // Series analogue of the movie reap: after adding a NEW hash hA for the S01E01 request, a
+        // DIFFERENT owned record that is a SINGLETON for that EXACT (season, episode) and has lapsed
+        // off the provider (absent) is reaped — while records that are NOT an exact-slot supersede are
+        // KEPT: a singleton for a DIFFERENT episode, a PACK covering it plus others, and a
+        // still-PRESENT singleton for the same episode.
+        let st = store();
+        let series_req = AcquireRequest {
+            imdb_id: "tt1".into(),
+            tmdb_id: 27205,
+            kind: MediaKind::Series,
+            season: Some(1),
+            episode: Some(1),
+            original_language: Some("eng".into()),
+            metadata: MediaMetadata {
+                title: "Show".into(),
+                year: Some("2023".into()),
+                media_type: MediaType::Show,
+                external_id: Some("tmdb:27205".into()),
+            },
+        };
+        // hB — lapsed singleton for the requested (1,1): the record that must be reaped.
+        st.put_owned(
+            "hB".into(),
+            OwnedRecord {
+                request: series_req.clone(),
+                provenance: Provenance::watchlist("alice"),
+                added_at: 1,
+                status: OwnedStatus::Verified,
+                provides: vec![(1, 1)],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        // hOther — lapsed singleton for a DIFFERENT episode (1,2): wrong slot → KEPT.
+        st.put_owned(
+            "hOther".into(),
+            OwnedRecord {
+                request: series_req.clone(),
+                provenance: Provenance::watchlist("alice"),
+                added_at: 1,
+                status: OwnedStatus::Verified,
+                provides: vec![(1, 2)],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        // hPack — lapsed PACK covering (1,1) plus another episode: not a singleton → KEPT.
+        st.put_owned(
+            "hPack".into(),
+            OwnedRecord {
+                request: series_req.clone(),
+                provenance: Provenance::watchlist("alice"),
+                added_at: 1,
+                status: OwnedStatus::Verified,
+                provides: vec![(1, 1), (1, 2)],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        // hPresent — singleton for the requested (1,1) but STILL PRESENT on the provider → KEPT.
+        st.put_owned(
+            "hPresent".into(),
+            OwnedRecord {
+                request: series_req.clone(),
+                provenance: Provenance::watchlist("alice"),
+                added_at: 1,
+                status: OwnedStatus::Verified,
+                provides: vec![(1, 1)],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        // Listing is non-empty and contains hPresent (so it reads as still present); hB/hOther/hPack
+        // are absent. add/info succeed for the newly-added hA.
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![torrent("tid_hPresent", "hPresent", "downloaded", 100.0)],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_hA".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TI {
+                id: "tid_hA".into(),
+                hash: "hA".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // hA is 1080p (ranks above the 720p hB), both cached — so hA is added and hB is the lapsed
+        // singleton that must be reaped. hB is also the (owned but absent) candidate that triggers the
+        // pre-scan's present-listing fetch, exactly as in the movie case.
+        let hb_720 = RawCandidate {
+            name: "Torrentio\n720p".into(),
+            description: "Show.S01E01.720p.x265\nRD+".into(),
+            info_hash: "hB".into(),
+            file_idx: Some(0),
+            file_name: Some("Show.S01E01.720p.x265.mkv".into()),
+        };
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper {
+                candidates: vec![cand("hA", true), hb_720],
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        assert_eq!(
+            eng.acquire(series_req.clone(), Provenance::watchlist("alice"))
+                .await,
+            AcquireOutcome::Pending("hA".into()),
+        );
+        assert!(
+            st.get_owned("hB".into()).await.is_none(),
+            "the lapsed singleton for the exact requested episode must be reaped"
+        );
+        assert!(
+            st.get_owned("hOther".into()).await.is_some(),
+            "a singleton for a DIFFERENT episode must be kept"
+        );
+        assert!(
+            st.get_owned("hPack".into()).await.is_some(),
+            "a pack covering the episode plus others must be kept"
+        );
+        assert!(
+            st.get_owned("hPresent".into()).await.is_some(),
+            "a still-present singleton for the same episode must be kept"
+        );
+        assert!(
+            st.get_owned("hA".into()).await.is_some(),
+            "the newly added hash must be recorded Pending"
+        );
+    }
+
+    #[tokio::test]
     async fn acquire_returns_temporarily_unavailable_on_scrape_error() {
         // A scraper error (a retryable addon outage) must surface as TemporarilyUnavailable so the
         // reconciler retries next tick, NOT NoAcceptableRelease. MockScraper always succeeds, so this
@@ -3344,6 +3484,88 @@ mod tests {
             st.is_blacklisted(crate::scraper::MediaKind::Series, 27205, "hp".into())
                 .await,
             "the wrong-pack hash must be blacklisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_does_not_reap_episode_missing_within_dead_timeout() {
+        // Same wrong-pack setup as observe_series_reaps_pack_missing_requested_episode, but the record
+        // is fresh (added just now) and the engine's dead-timeout is the default 600s — so the
+        // requested episode being absent is still WITHIN the window: observe must WAIT (metadata may
+        // still be settling), NOT reap or blacklist. Guards the else-branch of the EpisodeMissing arm.
+        let st = store();
+        let series_req = AcquireRequest {
+            imdb_id: "tt1".into(),
+            tmdb_id: 27205,
+            kind: MediaKind::Series,
+            season: Some(1),
+            episode: Some(1),
+            original_language: Some("eng".into()),
+            metadata: MediaMetadata {
+                title: "Show".into(),
+                year: Some("2023".into()),
+                media_type: MediaType::Show,
+                external_id: Some("tmdb:27205".into()),
+            },
+        };
+        st.put_owned(
+            "hp".into(),
+            OwnedRecord {
+                request: series_req.clone(),
+                provenance: Provenance::manual(),
+                added_at: now_secs(), // fresh — well within the 600s dead-timeout
+                status: OwnedStatus::Pending,
+                provides: vec![(1, 1)],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        // The pack contains only S01E05 — the requested S01E01 is absent.
+        let wrong_pack: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_hp".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TI {
+                id: "tid_hp".into(),
+                hash: "hp".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "Show.S01E05.1080p.mkv".into(),
+                    bytes: 1_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/e05".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/e05".into()),
+            ..Default::default()
+        });
+        // Default engine → 600s dead-timeout (NOT engine_dead(.., 0)).
+        let eng = engine(
+            wrong_pack,
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_hp", "hp", "downloaded", 100.0)])
+            .await;
+        let rec = st
+            .get_owned("hp".into())
+            .await
+            .expect("record must be kept while within the dead-timeout — wait, don't reap early");
+        assert_eq!(
+            rec.status,
+            OwnedStatus::Pending,
+            "the record must stay Pending (not reaped/finalised) while waiting"
+        );
+        assert!(
+            !st.is_blacklisted(crate::scraper::MediaKind::Series, 27205, "hp".into())
+                .await,
+            "the hash must NOT be blacklisted while still within the dead-timeout"
         );
     }
 
