@@ -358,6 +358,9 @@ async fn rank_changes(
     owned_hashes: &[String],
 ) -> Vec<(release::ReleaseInfo, release::Improvement)> {
     let prefs = &app.config.acquisition.prefs;
+    // Fetch the per-title blacklist ONCE and test membership in memory, rather than one awaited redb
+    // read per candidate (Torrentio commonly returns dozens of streams per title) — mirrors `acquire`.
+    let blacklist = app.store.blacklisted_hashes_for(media, tmdb_id).await;
     let mut scored: Vec<(i64, release::ReleaseInfo, release::Improvement)> = Vec::new();
     for raw in raws {
         let r = release::parse(raw);
@@ -367,11 +370,7 @@ async fn rank_changes(
         {
             continue;
         }
-        if app
-            .store
-            .is_blacklisted(media, tmdb_id, r.info_hash.clone())
-            .await
-        {
+        if blacklist.contains(&r.info_hash.to_ascii_lowercase()) {
             continue;
         }
         if release::score(&r, prefs).is_none() {
