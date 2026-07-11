@@ -1134,6 +1134,8 @@ impl AcquisitionEngine {
         // re-adoption.
         let removed =
             torrent_id.is_empty() || self.provider.delete_torrent(torrent_id).await.is_ok();
+        self.progress.lock().await.remove(torrent_id);
+        self.verify_attempts.lock().await.remove(hash);
         if removed {
             let _ = self.store.remove_owned(hash.to_string()).await;
             let _ = self.store.remove_authoritative(hash.to_string()).await;
@@ -1143,11 +1145,14 @@ impl AcquisitionEngine {
                     let _ = self.store.remove_selection(slot).await;
                 }
             }
+            // Re-acquire ONLY once the dead record was actually cleared. On a transient delete
+            // failure the record is deliberately KEPT for the next tick to retry the delete — so we
+            // must NOT also add a replacement now, or the dead hash stays present alongside a second
+            // torrent for the title and every subsequent stuck tick re-scrapes until the delete
+            // succeeds. The kept record's next observe tick performs the delete-then-re-acquire.
+            // Sticky provenance: re-acquire preserves the failed record's origin (Trigger B correctness).
+            let _ = self.acquire(req.clone(), provenance.clone()).await; // promotes the next candidate (bad hash now blacklisted)
         }
-        self.progress.lock().await.remove(torrent_id);
-        self.verify_attempts.lock().await.remove(hash);
-        // Sticky provenance: re-acquire preserves the failed record's origin (Trigger B correctness).
-        let _ = self.acquire(req.clone(), provenance.clone()).await; // promotes the next candidate (bad hash now blacklisted)
     }
 }
 
@@ -2257,6 +2262,83 @@ mod tests {
                 .await
         );
         assert_eq!(*deleted.lock().unwrap(), vec!["tid_h1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn observe_dead_delete_failure_keeps_record_and_does_not_reacquire() {
+        // When the provider delete FAILS transiently, fail_and_reacquire deliberately KEEPS the
+        // owned/authoritative/selection records so a later tick retries the delete. It must NOT
+        // also re-acquire a replacement in the same tick — doing so leaves the dead hash present
+        // AND a second torrent for the title, and re-scrapes on every subsequent stuck tick until
+        // the delete finally succeeds. The re-acquire is gated on the delete having succeeded.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(), // imdb tt1 → re-scrapable
+                provenance: Provenance::watchlist("a"),
+                added_at: now_secs(),
+                status: OwnedStatus::Verified,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![torrent("tid_h1", "h1", "dead", 0.0)],
+            deleted: deleted.clone(),
+            fail_delete: true, // the delete transiently fails → records must be kept, no re-acquire
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_h2".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TI {
+                id: "tid_h2".into(),
+                hash: "h2".into(),
+                status: "downloading".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "Movie.2023.1080p.x265.mkv".into(),
+                    bytes: 10,
+                    selected: 1,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // The scraper offers a cached replacement h2 — if re-acquire wrongly fired, h2 would become
+        // an owned Pending record.
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper {
+                candidates: vec![cand("h2", true)],
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "dead", 0.0)]).await;
+
+        assert_eq!(
+            *deleted.lock().unwrap(),
+            vec!["tid_h1".to_string()],
+            "the delete was attempted"
+        );
+        assert!(
+            st.get_owned("h1".into()).await.is_some(),
+            "a failed delete keeps the owned record for a later retry tick"
+        );
+        assert!(
+            st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await,
+            "the dead hash is still blacklisted"
+        );
+        assert!(
+            st.get_owned("h2".into()).await.is_none(),
+            "no replacement is acquired while the dead torrent's delete is still failing"
+        );
     }
 
     #[tokio::test]
