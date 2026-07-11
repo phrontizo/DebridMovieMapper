@@ -282,10 +282,12 @@ pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
                     }
                 }
             };
-            // Previously-owned episodes (for manual restore-on-lapse). A manual show is never
-            // removed, so an episode it owned that has lapsed must be restored even though it's been
-            // watched — but we do NOT auto-expand a manual show to aired episodes it never owned (it
-            // is user-curated, not a catch-up subscription), so the restore is scoped to this set.
+            // Previously-owned episodes (for manual restore-on-lapse). A manual show is never removed,
+            // so an episode it owned that has lapsed must be restored even though it's been WATCHED.
+            // NOTE the scope: this `owned_eps` set only widens the acquire set with already-WATCHED
+            // owned episodes (the `manual && owned_eps.contains(e)` clause below). It does NOT restrict
+            // the base catch-up rule — a manual show that is ALSO Trakt-wanted still acquires its
+            // unwatched aired episodes via the normal `!watched` path, even ones it never owned.
             let owned_eps: std::collections::HashSet<(u32, u32)> = title
                 .owned
                 .as_ref()

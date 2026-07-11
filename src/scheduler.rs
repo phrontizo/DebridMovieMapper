@@ -21,7 +21,10 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::info;
 
-/// Run `job` immediately, then once every `interval`, until `shutdown` flips to true.
+/// Run `job` immediately, then sleep `interval` after EACH tick completes (a fixed-DELAY cadence, so
+/// the effective period is `tick_duration + interval`), until `shutdown` flips to true. Fixed-delay
+/// (not fixed-rate) is deliberate: it can never overlap two ticks of the same job, and for the
+/// daily/15-min cadences here the tick-duration drift is negligible.
 pub async fn periodic<F, Fut>(interval: Duration, mut shutdown: watch::Receiver<bool>, mut job: F)
 where
     F: FnMut() -> Fut,

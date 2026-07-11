@@ -94,7 +94,7 @@ docker compose up -d
 
 The project is structured as both a binary (`main.rs`) and a library (`mapper.rs` as lib root).
 
-**Background tasks (the scheduler model, SP2):** `main.rs` spawns `scheduler::run`, which spins up cooperating independent periodic jobs over the shared `AppState` (each driven by the `scheduler::periodic` primitive — run immediately, then every interval, until shutdown):
+**Background tasks (the scheduler model, SP2):** `main.rs` spawns `scheduler::run`, which spins up cooperating independent jobs over the shared `AppState`. The Trakt/episode/upgrade jobs are each driven by the `scheduler::periodic` primitive (run immediately, then `interval` after each tick completes — a fixed-DELAY cadence — until shutdown); the scan loop instead runs under `supervise` with its own internal cadence and shutdown-aware awaits:
 - **Scan loop** = `run_scan_loop` (every `SCAN_INTERVAL_SECS`, behaviour-preserving): two conceptual sub-steps (NOT separate functions — both inlined in `run_scan_loop`) sharing one `get_torrents` per tick — the *account sync* (poll the active debrid provider → identify torrents via TMDB → `update_vfs` + `record_mirror_owned` + `dedup_owned`) **plus** *acquisition verification* (`engine.observe`). Implemented in `tasks.rs`.
 - **Trakt cycle** = `sync_trakt` then `reconcile_wanted` (sequentially, so the reconciler sees the just-synced wanted set), every `TRAKT_SYNC_INTERVAL_SECS`. Spawned **only** when Trakt is configured.
 - **Episode monitor** = `monitor_episodes` (every `TRAKT_EPISODE_CHECK_INTERVAL_SECS`). Spawned only when Trakt is configured.
