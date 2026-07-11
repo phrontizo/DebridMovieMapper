@@ -1552,6 +1552,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn probe_tracks_mp4_recovery_refetch_succeeds_and_returns_tracks() {
+        // The HAPPY path of the MP4 large-`moov` recovery (sibling of the MKV recovery success test):
+        // a faststart MP4 whose front `moov` declares an extent PAST the front window makes
+        // `parse_mp4_tracks(&front)` defer (Transient), so `probe_tracks` reads `front_moov_extent`
+        // and issues ONE larger targeted fetch (`fetch_range(0, end - 1)`) covering the whole moov,
+        // then re-parses. This drives that re-fetch + re-parse WIRING through an HTTP fixture — only
+        // the `front_moov_extent` unit helper was covered — so an off-by-one in the `end - 1` window
+        // or a wrong-offset fetch (which would defer forever and blacklist a valid file after the
+        // verify deadline) is caught.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Full faststart MP4: ftyp + a front moov carrying an eng audio + ger subtitle track.
+        let full = mp4_with(&[(b"soun", packed("eng")), (b"subt", packed("ger"))]);
+        // Front body: the same MP4 with the moov's tail cut off — the moov header still DECLARES the
+        // full size (which now overruns the shortened body), so the front parse defers and
+        // `front_moov_extent` reports the full declared end (same shape as
+        // `front_moov_extent_reports_declared_end_of_a_truncated_front_moov`).
+        let mut front_body = full.clone();
+        front_body.truncate(front_body.len() - 4);
+        let recovery_body = full;
+        assert!(
+            front_body.len() > 8,
+            "front body must exceed the container magic"
+        );
+        assert!(recovery_body.len() > front_body.len());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // 1st request (front read): the overrunning-but-valid truncated moov → defer.
+            // 2nd request (recovery read): the full moov → parseable.
+            for body in [front_body, recovery_body] {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/9000000000\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len() - 1,
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                    let _ = sock.flush().await;
+                }
+            }
+        });
+        let url = format!("http://{}/", addr);
+        let tracks = probe_tracks(&reqwest::Client::new(), &url)
+            .await
+            .expect("MP4 recovery re-fetch must yield tracks");
+        assert!(
+            tracks
+                .iter()
+                .any(|t| matches!(t.kind, TrackKind::Audio) && t.language.as_deref() == Some("eng")),
+            "the recovered probe must report the eng audio track, got {tracks:?}"
+        );
+        assert!(
+            tracks
+                .iter()
+                .any(|t| matches!(t.kind, TrackKind::Subtitle)
+                    && t.language.as_deref() == Some("ger")),
+            "the recovered probe must report the ger subtitle track, got {tracks:?}"
+        );
+    }
+
     #[test]
     fn verify_audio_original_and_subtitle_rules() {
         let tracks = vec![
