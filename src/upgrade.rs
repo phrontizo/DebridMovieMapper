@@ -1875,10 +1875,12 @@ async fn consolidate_show_seasons(
             }
             // Repoint every episode slot of this season to the pack. If any repoint fails to
             // persist, DEFER the prune below: deleting a scattered episode whose slot still points at
-            // the old (about-to-be-deleted) hash would break that episode's playback. The pack is
-            // already recorded owned, so nothing is lost — a later consolidation re-runs the
-            // idempotent repoint, and the duplicate-dedup pass reclaims the now-redundant scattered
-            // episodes either way. (A put_selection failure is a rare redb-write/disk error.)
+            // the old (about-to-be-deleted) hash would break that episode's playback. Nothing is lost
+            // — every episode is still served by its (un-pruned) scattered hash, and the pack is
+            // already recorded owned. NOTE: once the pack owned-record has persisted, `already_pack`
+            // short-circuits this season on subsequent ticks, so consolidation does NOT re-run the
+            // failed repoint; recovery of the now-redundant scattered records is via the
+            // duplicate-dedup pass. (A put_selection failure is a rare redb-write/disk error.)
             let mut repoint_ok = true;
             for (s, e, path) in &eps {
                 if *s != season {
@@ -5409,6 +5411,102 @@ mod tests {
                 .hash,
             "e2",
             "E02 slot still points at its scattered episode"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_consolidation_skips_a_season_left_partially_repointed() {
+        // Guards the recovery behaviour documented at the repoint-failure branch: after a PARTIAL
+        // repoint (pack owned-record persisted, E01 repointed to the pack, E02's repoint failed so its
+        // slot still points at the scattered singleton, and the deferred prune left both singletons
+        // owned), the NEXT consolidation tick must NOT re-run — `already_pack` sees the persisted pack
+        // covering the season and short-circuits it. So nothing is deleted (no re-consolidation churn),
+        // both scattered singletons persist (recovery is the duplicate-dedup pass's job, not
+        // consolidation's), and — critically — no selection slot resolves to a deleted/absent hash.
+        let store = mem_store();
+        // The residue a partial repoint leaves: two scattered singletons still owned + the pack owned.
+        seed_two_scattered_episodes(&store).await;
+        let pack = OwnedRecord {
+            provides: vec![(1, 1), (1, 2)],
+            ..ep_record(1, 1, q1080_bluray())
+        };
+        store.put_owned("hpack".into(), pack.clone()).await.unwrap();
+        // E01 was repointed to the pack; E02's repoint failed, so its slot still points at the singleton.
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 1),
+                SelectionEntry {
+                    hash: "hpack".into(),
+                    file_path: "S.S01E01.1080p.BluRay.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![season_pack_candidate()],
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(pack_info()),
+            resolved_url: Some("https://cdn/p1".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        // The current store state (both singletons + the pack) is what this tick observes.
+        let owned = vec![
+            ("e1".to_string(), ep_record(1, 1, q1080_web())),
+            ("e2".to_string(), ep_record(1, 2, q1080_web())),
+            ("hpack".to_string(), pack),
+        ];
+        let group = vec!["e1".to_string(), "e2".to_string(), "hpack".to_string()];
+        let res = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group,
+            &owned,
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(
+            matches!(res, Ok(())),
+            "a season already covered by a persisted pack is skipped (no re-consolidation)"
+        );
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "the redundant scattered singletons are NOT deleted by consolidation (dedup's job)"
+        );
+        assert!(
+            store.get_owned("e1".into()).await.is_some()
+                && store.get_owned("e2".into()).await.is_some(),
+            "both scattered singletons persist until the duplicate-dedup pass reclaims them"
+        );
+        // No slot may resolve to a deleted/absent hash: E01 → pack (present), E02 → e2 (present).
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            "hpack",
+            "E01 stays repointed at the present pack"
+        );
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 2))
+                .await
+                .unwrap()
+                .hash,
+            "e2",
+            "E02's failed-repoint slot still points at its present scattered singleton"
         );
     }
 
