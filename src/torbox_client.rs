@@ -466,10 +466,6 @@ impl TorBoxClient {
         self.send_data_n(make, 6).await
     }
 
-    /// `send_data` with an explicit attempt budget. The synchronous on-read playback resolve
-    /// (`resolve_locator`) passes a SMALL budget (3) so a black-holing endpoint (packets dropped →
-    /// repeated 10s connect timeouts) fails over to instant repair in ~30s rather than ~60s — the
-    /// same fast-fail rationale as the RD client's 3-attempt `unrestrict_link` read path.
     /// The single TorBox request loop behind `send_data_n` and `send_ok`: send with rate-limit
     /// pacing; retry a statusless transport error, a 429, a transient 5xx, or a decode blip within
     /// `max_attempts` (surfacing the REAL 429/5xx over the synthetic 502 on the final attempt); then
@@ -601,6 +597,11 @@ impl TorBoxClient {
     /// Send a request whose success requires `success:true` AND a `data` payload, returning the
     /// decoded `data`. A `success:true` with no `data` — or a `success:false` — is a soft failure
     /// (retried/surfaced as a synthetic 502 by `send_enveloped`), never rewarded to the limiter.
+    ///
+    /// `max_attempts` is an explicit budget: the synchronous on-read playback resolve
+    /// (`resolve_locator`) passes a SMALL budget (3) so a black-holing endpoint (packets dropped →
+    /// repeated 10s connect timeouts) fails over to instant repair in ~30s rather than ~60s — the
+    /// same fast-fail rationale as the RD client's 3-attempt `unrestrict_link` read path.
     async fn send_data_n<T, F>(&self, make: F, max_attempts: u32) -> Result<T, reqwest::Error>
     where
         T: serde::de::DeserializeOwned,
