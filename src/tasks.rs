@@ -417,7 +417,11 @@ fn dedup_torrents_by_hash(
         if !torrent.id.is_empty() && !seen_ids.insert(torrent.id.as_str()) {
             continue;
         }
-        if torrent.status != "downloaded" || torrent.hash.is_empty() {
+        // Keep (never dedup) anything that isn't a valid removal candidate: a not-yet-downloaded
+        // torrent, a hashless one, OR one with an EMPTY id. An empty id can't be deleted
+        // (`delete_torrent("")` targets nothing), so a same-hash empty-id pair must both be kept
+        // rather than emitting `""` into the removal set — matching the hashless treatment.
+        if torrent.status != "downloaded" || torrent.hash.is_empty() || torrent.id.is_empty() {
             deduped.push(torrent);
             continue;
         }
@@ -2569,6 +2573,24 @@ mod tests {
         let kept_ids: Vec<&str> = kept.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(kept_ids, vec!["a", "b", "c"]);
         assert!(dups.is_empty());
+    }
+
+    #[test]
+    fn dedup_never_marks_an_empty_id_downloaded_torrent_for_deletion() {
+        // A downloaded torrent with an EMPTY id can't be acted on: `delete_torrent("")` would target
+        // nothing (or, worse, be rejected). Two empty-id downloaded entries sharing a hash must both
+        // be KEPT and NEVER pushed into the removal set as `""` — like a hashless torrent, an
+        // empty-id one is simply not a dedup candidate.
+        let torrents = vec![
+            torrent("", "H1", "downloaded"),
+            torrent("", "H1", "downloaded"), // same hash, empty id → must NOT be flagged for deletion
+        ];
+        let (kept, dups) = dedup_torrents_by_hash(&torrents);
+        assert_eq!(kept.len(), 2, "both empty-id torrents are kept");
+        assert!(
+            dups.is_empty(),
+            "an empty id must never be emitted for deletion, got {dups:?}"
+        );
     }
 
     #[test]
