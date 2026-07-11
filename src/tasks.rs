@@ -1887,7 +1887,9 @@ pub(crate) async fn dedup_owned(app: &AppState, torrents: &[crate::rd_client::To
         plans.len(),
         total,
         if removing {
-            "REMOVING"
+            // NOT "REMOVING": removal is still idle-gated below, so it may be deferred this tick. The
+            // "dedup: removed N" line at the end reports what was actually deleted.
+            "removal enabled (idle-gated)"
         } else {
             "DRY RUN (set DEDUP_REMOVE_DUPLICATES=true to remove)"
         }

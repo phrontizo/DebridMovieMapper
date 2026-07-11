@@ -3174,6 +3174,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_migrations_is_idempotent_on_reentry() {
+        // The migration ladder commits BEFORE the version stamp, so a crash between the two re-runs
+        // run_migrations on the next boot — every step MUST be idempotent. Prove a double (indeed
+        // triple, via Store::open) run from a pre-current version is a clean no-op rather than pinning
+        // that invariant only in a comment: no error, and owned rows survive intact.
+        let tmp = TempDb::new("migrate_reentry");
+        {
+            let db = Database::create(&tmp.path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let odef: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_hashes");
+                let mut ot = txn.open_table(odef).unwrap();
+                let rec = OwnedRecord {
+                    request: req("tt9", 999),
+                    provenance: Provenance::manual(),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                };
+                ot.insert("hash9", serde_json::to_vec(&rec).unwrap().as_slice())
+                    .unwrap();
+                let vdef: TableDefinition<&str, u64> = TableDefinition::new("meta");
+                txn.open_table(vdef)
+                    .unwrap()
+                    .insert("schema_version", &3u64)
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+            // Run the ladder from v3 TWICE against the same DB — the second must be a clean no-op.
+            Store::run_migrations(&db, 3).expect("first migration run");
+            Store::run_migrations(&db, 3).expect("re-run must be idempotent, not error");
+        } // drop the Database handle so Store::open can take the file lock
+        let store = Store::open(&tmp.path).unwrap();
+        assert_eq!(
+            store.get_owned("hash9".to_string()).await.unwrap().status,
+            OwnedStatus::Verified,
+            "owned rows must survive repeated migration runs"
+        );
+        assert!(
+            !std::path::Path::new(&tmp.corrupt_path()).exists(),
+            "a re-migrated valid DB must not be moved aside"
+        );
+    }
+
+    #[tokio::test]
     async fn migrates_v5_db_clears_legacy_upgrade_checks_but_keeps_owned() {
         let tmp = TempDb::new("migrate_v5_v6");
         {
