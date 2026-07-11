@@ -511,9 +511,12 @@ impl TorBoxClient {
                         text.len()
                     );
                     // A truncated/partial 200 body is transient — retry rather than discard the whole
-                    // call on a one-off hiccup (symmetry with the RD client's decode-retry; without
-                    // this a mid-body glitch fails the entire mylist tick). A persistent schema
-                    // mismatch simply exhausts the budget and returns the synthetic 502 below.
+                    // call on a one-off hiccup (like the RD client, which also retries a decode blip;
+                    // without this a mid-body glitch fails the entire mylist tick). NOTE the deliberate
+                    // difference: this retries across the FULL budget, whereas RD's `unrestrict_link`
+                    // caps decode retries at 2 because it runs on the synchronous playback resolve path
+                    // and must fast-fail to repair. A persistent schema mismatch here simply exhausts
+                    // the budget and returns the synthetic 502 below.
                     if attempt < max_attempts {
                         tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
                         continue;

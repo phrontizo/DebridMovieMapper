@@ -308,7 +308,11 @@ impl RealDebridClient {
     }
 
     pub async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
-        // Runaway guard. At 50/page this allows ~100k torrents — far beyond any realistic account —
+        // RD's /torrents default page size is 100; request it explicitly (was 50) to halve the
+        // per-scan round-trips + rate-limiter pressure on large libraries. (RD sends no rate-limit
+        // headers, so fewer requests directly means a faster scan tick.)
+        const PAGE_LIMIT: u32 = 100;
+        // Runaway guard. At 100/page this allows ~200k torrents — far beyond any realistic account —
         // so legitimate large libraries paginate to completion. Hitting it means a pathological /
         // runaway listing: we must FAIL (below), never return a truncated `Ok`, because downstream
         // treats an owned title absent from the listing as lapsed and re-acquires it (the same reason
@@ -318,7 +322,7 @@ impl RealDebridClient {
         let mut page = 1u32;
         loop {
             // Allow ONE page beyond the cap as an empty-terminator probe. An account holding EXACTLY
-            // MAX_PAGES*50 items has a FULL final page at MAX_PAGES, so `page` advances to MAX_PAGES+1
+            // MAX_PAGES*PAGE_LIMIT items has a FULL final page at MAX_PAGES, so `page` advances to MAX_PAGES+1
             // with the listing actually complete — the completion is only proven by the next page
             // coming back empty (the loop's natural break). Erroring at MAX_PAGES+1 rather than
             // MAX_PAGES treats that exact-multiple boundary as complete instead of a false truncation
@@ -334,7 +338,10 @@ impl RealDebridClient {
                 return Err(synthetic_bad_gateway(b"get_torrents exceeded MAX_PAGES"));
             }
             debug!("Fetching torrents page {}...", page);
-            let url = format!("{}/torrents?page={}&limit=50", self.base_url, page);
+            let url = format!(
+                "{}/torrents?page={}&limit={}",
+                self.base_url, page, PAGE_LIMIT
+            );
             let res: Result<Vec<Torrent>, reqwest::Error> =
                 self.fetch_with_retry(|| self.client.get(&url), &[]).await;
 
@@ -627,8 +634,13 @@ impl RealDebridClient {
                                         "Failed to decode RD response: {}. Status: {}, body {} bytes (redacted)",
                                         e, status, text.len()
                                     );
-                                    // A schema change won't fix itself on retry — bail after 2 failures
-                                    // to avoid wasting API calls on a permanently changed response format.
+                                    // Retry ONE transient decode blip, then bail — a *persistent*
+                                    // decode failure is a schema change that won't fix itself on retry.
+                                    // This cap (2 attempts) is DELIBERATELY tighter than TorBox's
+                                    // full-budget decode-retry (`send_data_n`): `unrestrict_link` runs
+                                    // on the synchronous playback resolve path with a small 3-attempt
+                                    // budget, so it must fast-fail to instant repair rather than burn
+                                    // the whole budget on a possibly-permanent format change.
                                     if deserialization_failures >= 2 {
                                         error!("Aborting after {} deserialization failures on HTTP 200 — likely a schema change", deserialization_failures);
                                         break;
