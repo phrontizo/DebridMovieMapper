@@ -2407,6 +2407,43 @@ pub(crate) fn guard_removal_on_incomplete_aired(
         .collect()
 }
 
+/// Assemble the episode-monitor's per-show action list — PURE (no I/O), so the `TitleView`
+/// assembly, `reconcile_title`, and incomplete-aired removal-guard wiring is unit-testable without a
+/// live TMDB (which `monitor_episodes` otherwise needs to fetch the aired set). `monitor_episodes`
+/// fetches the aired set, calls this, then dispatches the returned actions (acquire episodes /
+/// idle-gated removals). Behaviour is identical to the previous inline logic.
+fn plan_episode_actions(
+    tmdb_id: u64,
+    wanted: &[WantedRecord],
+    owned_group: Option<&OwnedGroup>,
+    present: &std::collections::HashSet<String>,
+    aired: &AiredEpisodes,
+) -> Vec<crate::wanted::Action> {
+    use crate::wanted::{reconcile_title, Owned, TitleView};
+    let available = owned_group
+        .map(|g| g.hashes.iter().any(|h| present.contains(h)))
+        .unwrap_or(false);
+    let view = TitleView {
+        tmdb_id,
+        media_type: MediaType::Show,
+        wanted: wanted.to_vec(),
+        owned: owned_group.map(|g| Owned {
+            hash: g.hashes.first().cloned().unwrap_or_default(),
+            provenance: g.provenance.clone(),
+            available,
+            owned_episodes: g.owned_episodes.clone(),
+        }),
+        aired_episodes: aired.pairs.clone(),
+    };
+    // Guard: a TMDB hiccup that left the aired set partial OR empty must not delete a still-wanted
+    // show (an empty `aired` makes Trigger A's "all aired watched" clause vacuously true).
+    guard_removal_on_incomplete_aired(
+        reconcile_title(&view),
+        aired.complete,
+        aired.pairs.is_empty(),
+    )
+}
+
 /// Filter aired pairs to one season's episode numbers (sorted+deduped). PURE — used by the SP3
 /// upgrade consolidation path to ask "what is the full aired set for THIS season?".
 pub(crate) fn season_aired(aired: &[(u32, u32)], season: u32) -> Vec<u32> {
@@ -2447,7 +2484,7 @@ pub async fn monitor_episodes(
     idle_window: Duration,
     remove_finished_shows: bool,
 ) {
-    use crate::wanted::{reconcile_title, Action, Owned, TitleView};
+    use crate::wanted::Action;
     use std::collections::HashSet;
 
     let today = chrono::Utc::now().date_naive();
@@ -2502,26 +2539,9 @@ pub async fn monitor_episodes(
         let aired_count = aired.pairs.len();
         let owned_eps = owned_group.map(|g| g.owned_episodes.len()).unwrap_or(0);
 
-        let view = TitleView {
-            tmdb_id,
-            media_type: MediaType::Show,
-            wanted: wanted.clone(),
-            owned: owned_group.map(|g| Owned {
-                hash: g.hashes.first().cloned().unwrap_or_default(),
-                provenance: g.provenance.clone(),
-                available,
-                owned_episodes: g.owned_episodes.clone(),
-            }),
-            aired_episodes: aired.pairs,
-        };
-
-        // Guard: a TMDB hiccup that left the aired set partial OR empty must not delete a still-wanted
-        // show (an empty `aired` makes Trigger A's "all aired watched" clause vacuously true).
-        let actions = guard_removal_on_incomplete_aired(
-            reconcile_title(&view),
-            aired_complete,
-            aired_count == 0,
-        );
+        // Assemble the TitleView, run reconcile, and apply the incomplete-aired removal guard — all
+        // in the pure `plan_episode_actions` (unit-tested without a live TMDB).
+        let actions = plan_episode_actions(tmdb_id, wanted, owned_group, &present, &aired);
         let acquires = actions
             .iter()
             .filter(|a| matches!(a, Action::AcquireEpisode { .. }))
@@ -4856,6 +4876,95 @@ mod reconcile_wanted_tests {
             status: "downloaded".to_string(),
             ..Default::default()
         }
+    }
+
+    // ── plan_episode_actions (pure: TitleView assembly + reconcile + incomplete-aired guard) ──
+
+    fn owned_group_show(
+        hashes: &[&str],
+        owned_eps: &[(u32, u32)],
+        provenance: Provenance,
+    ) -> OwnedGroup {
+        let hv: Vec<String> = hashes.iter().map(|h| h.to_string()).collect();
+        OwnedGroup {
+            engine_hashes: if provenance.entries.is_empty() {
+                vec![]
+            } else {
+                hv.clone()
+            },
+            hashes: hv,
+            provenance,
+            owned_episodes: owned_eps.to_vec(),
+            media_type: MediaType::Show,
+        }
+    }
+
+    #[test]
+    fn plan_episode_actions_acquires_unowned_aired_episode() {
+        use crate::wanted::Action;
+        // A watchlisted show owning S01E01 (present → available) with S01E01+S01E02 aired: only the
+        // unowned S01E02 is acquired, and nothing is removed (a watchlisted show is never "finished").
+        let wanted = vec![wanted_show("alice", 100, true, false)];
+        let owned = owned_group_show(&["h1"], &[(1, 1)], Provenance::watchlist("alice"));
+        let present: std::collections::HashSet<String> = ["h1".to_string()].into_iter().collect();
+        let aired = AiredEpisodes {
+            pairs: vec![(1, 1), (1, 2)],
+            complete: true,
+        };
+
+        let actions = plan_episode_actions(100, &wanted, Some(&owned), &present, &aired);
+        assert_eq!(
+            actions,
+            vec![Action::AcquireEpisode {
+                tmdb_id: 100,
+                season: 1,
+                episode: 2
+            }],
+            "only the unowned aired episode is acquired"
+        );
+    }
+
+    #[test]
+    fn plan_episode_actions_guard_suppresses_removal_on_incomplete_aired() {
+        use crate::wanted::{Action, RemoveReason};
+        // An in-progress-only, fully-watched, Ended, owned show is a Trigger-A finish removal — but
+        // only when the aired set is trustworthy. A COMPLETE aired set emits the Remove; an INCOMPLETE
+        // one (a TMDB hiccup) makes the guard drop it, so a still-wanted show is never wrongly deleted.
+        let mut w = wanted_show("alice", 100, false, true); // in-progress, not watchlisted
+        w.watched_state = WatchedState::Show {
+            watched_episodes: vec![(1, 1)],
+        };
+        w.show_status = Some(ShowStatus::Ended);
+        let wanted = vec![w];
+        let owned = owned_group_show(&["h1"], &[(1, 1)], Provenance::in_progress("alice"));
+        let present: std::collections::HashSet<String> = ["h1".to_string()].into_iter().collect();
+
+        // Complete aired → the finish removal is emitted.
+        let complete = AiredEpisodes {
+            pairs: vec![(1, 1)],
+            complete: true,
+        };
+        let actions = plan_episode_actions(100, &wanted, Some(&owned), &present, &complete);
+        assert_eq!(
+            actions,
+            vec![Action::Remove {
+                tmdb_id: 100,
+                hash: "h1".to_string(),
+                reason: RemoveReason::Finished
+            }],
+            "a fully-watched Ended in-progress show is finish-removed when the aired set is complete"
+        );
+
+        // Incomplete aired → the guard suppresses the removal.
+        let incomplete = AiredEpisodes {
+            pairs: vec![(1, 1)],
+            complete: false,
+        };
+        let actions = plan_episode_actions(100, &wanted, Some(&owned), &present, &incomplete);
+        assert!(
+            actions.is_empty(),
+            "an incomplete aired set must suppress the finish removal, got {actions:?}"
+        );
     }
 
     // ── provenance_from_wanted (pure) ─────────────────────────────────────────
