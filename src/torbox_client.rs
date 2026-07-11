@@ -1552,6 +1552,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observe_rate_headers_parks_the_limiter_from_a_response() {
+        // observe_rate_headers is the proactive-pacing entry point: it pulls
+        // x-ratelimit-remaining/-reset off a real Response and feeds observe_rate_limit. With a
+        // nearly-spent window (remaining=0) and a reset a few seconds out, it must park the shared
+        // limiter; a response carrying no rate headers must leave pacing untouched.
+        let client = TorBoxClient::new("fake".to_string()).unwrap();
+        let before = client.rate_limiter.peek_next_allowed().await;
+
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+            + 5.0;
+        let with_headers = reqwest::Response::from(
+            hyper::Response::builder()
+                .status(200)
+                .header("x-ratelimit-remaining", "0")
+                .header("x-ratelimit-reset", format!("{reset}"))
+                .body(hyper::body::Bytes::from_static(b"{}"))
+                .unwrap(),
+        );
+        client.observe_rate_headers(&with_headers).await;
+        let parked = client.rate_limiter.peek_next_allowed().await;
+        assert!(
+            parked > before,
+            "a nearly-spent window must park the shared limiter"
+        );
+
+        let no_headers = reqwest::Response::from(
+            hyper::Response::builder()
+                .status(200)
+                .body(hyper::body::Bytes::from_static(b"{}"))
+                .unwrap(),
+        );
+        client.observe_rate_headers(&no_headers).await;
+        assert_eq!(
+            client.rate_limiter.peek_next_allowed().await,
+            parked,
+            "a response without rate headers must not change pacing"
+        );
+    }
+
+    #[tokio::test]
     async fn send_ok_rejects_200_with_success_false() {
         // TorBox returns HTTP 200 with `{"success":false}` for soft failures (e.g. controltorrent
         // rejecting a delete). That must surface as an error, not a silent Ok — otherwise the

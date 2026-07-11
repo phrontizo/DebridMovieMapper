@@ -121,6 +121,14 @@ impl AdaptiveRateLimiter {
             }
         }
     }
+
+    /// Test-only: peek the current `next_allowed` instant so a cross-module test (e.g. the TorBox
+    /// client's `observe_rate_headers` glue) can assert the shared limiter was parked. `state` is
+    /// private to this module, so tests elsewhere can't reach `next_allowed` directly.
+    #[cfg(test)]
+    pub(crate) async fn peek_next_allowed(&self) -> tokio::time::Instant {
+        self.state.lock().await.next_allowed
+    }
 }
 
 #[cfg(test)]
