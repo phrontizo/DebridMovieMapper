@@ -83,9 +83,9 @@ struct TbTorrent {
 struct TbCreate {
     // Defensive decode like every other TorBox field: `#[serde(default)]` alone covers a MISSING
     // key but a present `null` or a stringized number would still fail the whole `Envelope<TbCreate>`
-    // decode. `null_to_default` tolerates both so a loosely-typed createtorrent response can't fail
-    // the add (which would otherwise self-heal via the synthetic-502 → add_magnet recovery, but at
-    // the cost of an extra round-trip).
+    // decode. `null_to_default` tolerates both, decoding an unusable id to 0; `add_magnet_raw` then
+    // treats a non-positive `torrent_id` as "no usable id" and recovers the real torrent by infohash
+    // (rather than recording an unusable "0" that would never resolve and get reaped/blacklisted).
     #[serde(default, deserialize_with = "null_to_default")]
     torrent_id: i64,
     // Returned by createtorrent but not used (we derive the canonical torrent later).
@@ -324,6 +324,9 @@ struct CachedUrl {
 pub struct TorBoxClient {
     client: reqwest::Client,
     api_key: String,
+    // API base URL. Always `TORBOX_BASE` in production; overridable only in tests (`with_base`) so
+    // the HTTP methods can be pointed at a local mock server.
+    base: String,
     rate_limiter: Arc<AdaptiveRateLimiter>,
     resolve_cache: Arc<RwLock<HashMap<(String, u32), CachedUrl>>>,
 }
@@ -353,9 +356,18 @@ impl TorBoxClient {
         Ok(Self {
             client,
             api_key,
+            base: TORBOX_BASE.to_string(),
             rate_limiter: Arc::new(AdaptiveRateLimiter::new()),
             resolve_cache: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Test-only constructor that points the HTTP methods at a mock server base URL.
+    #[cfg(test)]
+    fn with_base(api_key: String, base: String) -> Self {
+        let mut c = Self::new(api_key).unwrap();
+        c.base = base;
+        c
     }
 
     async fn cache_get(&self, loc: &FileLocator) -> Option<String> {
@@ -641,7 +653,7 @@ impl TorBoxClient {
         let (raw, hit_cap) = paginate(PAGE, MAX_PAGES, |offset| {
             let url = format!(
                 "{}/torrents/mylist?bypass_cache=true&limit={}&offset={}",
-                TORBOX_BASE, PAGE, offset
+                self.base, PAGE, offset
             );
             async move {
                 self.send_data::<Vec<TbTorrent>, _>(|| self.client.get(&url))
@@ -667,10 +679,7 @@ impl TorBoxClient {
     }
 
     pub async fn torrent_info_raw(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
-        let url = format!(
-            "{}/torrents/mylist?id={}&bypass_cache=true",
-            TORBOX_BASE, id
-        );
+        let url = format!("{}/torrents/mylist?id={}&bypass_cache=true", self.base, id);
         let raw: TbTorrent = self.send_data(|| self.client.get(&url)).await?;
         Ok(to_torrent_info(&raw))
     }
@@ -679,7 +688,7 @@ impl TorBoxClient {
         &self,
         magnet: &str,
     ) -> Result<crate::rd_client::AddMagnetResponse, reqwest::Error> {
-        let url = format!("{}/torrents/createtorrent", TORBOX_BASE);
+        let url = format!("{}/torrents/createtorrent", self.base);
         let magnet = magnet.to_string();
         let form_magnet = magnet.clone();
         match self
@@ -689,10 +698,20 @@ impl TorBoxClient {
             })
             .await
         {
-            Ok(created) => Ok(crate::rd_client::AddMagnetResponse {
+            // A usable id (> 0) is a real add. A null/missing/mistyped `torrent_id` decodes to 0
+            // (see `TbCreate`) — NOT a real id — so treat that success-with-no-id like an add error
+            // and recover by infohash, rather than recording an unusable "0" torrent that never
+            // resolves and is eventually reaped/blacklisted.
+            Ok(created) if created.torrent_id > 0 => Ok(crate::rd_client::AddMagnetResponse {
                 id: created.torrent_id.to_string(),
                 uri: magnet,
             }),
+            Ok(_) => match self.recover_existing_by_infohash(&magnet).await {
+                Some(found) => Ok(found),
+                // No usable id AND no match to recover — surface a synthetic 502 (the same signal
+                // `send_data` uses for a soft failure) so the caller treats it as a failed add.
+                None => Err(synthetic_bad_gateway()),
+            },
             Err(e) => {
                 // TorBox rejects an add for a torrent already in the account ("Download already
                 // queued"), commonly as an HTTP 400. Recover idempotently by locating the existing
@@ -705,23 +724,9 @@ impl TorBoxClient {
                 // 502*, indistinguishable from a real outage, so we don't risk blocking a soft-failure
                 // dup signal; and a statusless transport error (cheap best-effort, falls through to
                 // the original error if no match).
-                let skip_recovery = add_error_skips_recovery(e.status());
-                if !skip_recovery {
-                    if let Some(hash) = magnet_infohash(&magnet) {
-                        if let Ok(list) = self.list_torrents_raw().await {
-                            if let Some(t) =
-                                list.iter().find(|t| t.hash.eq_ignore_ascii_case(&hash))
-                            {
-                                info!(
-                                    "TorBox createtorrent rejected but torrent already present; reusing id {}",
-                                    t.id
-                                );
-                                return Ok(crate::rd_client::AddMagnetResponse {
-                                    id: t.id.clone(),
-                                    uri: magnet,
-                                });
-                            }
-                        }
+                if !add_error_skips_recovery(e.status()) {
+                    if let Some(found) = self.recover_existing_by_infohash(&magnet).await {
+                        return Ok(found);
                     }
                 }
                 Err(e)
@@ -729,8 +734,29 @@ impl TorBoxClient {
         }
     }
 
+    /// Locate a torrent already present in the account by the magnet's infohash — the shared
+    /// recovery for a createtorrent that failed (dup / soft error) or returned no usable id. Returns
+    /// the existing torrent's id, or `None` when the infohash can't be parsed, the list fetch fails,
+    /// or nothing matches (the caller then surfaces the original error / a synthetic 502).
+    async fn recover_existing_by_infohash(
+        &self,
+        magnet: &str,
+    ) -> Option<crate::rd_client::AddMagnetResponse> {
+        let hash = magnet_infohash(magnet)?;
+        let list = self.list_torrents_raw().await.ok()?;
+        let t = list.iter().find(|t| t.hash.eq_ignore_ascii_case(&hash))?;
+        info!(
+            "TorBox createtorrent rejected/idless but torrent already present; reusing id {}",
+            t.id
+        );
+        Some(crate::rd_client::AddMagnetResponse {
+            id: t.id.clone(),
+            uri: magnet.to_string(),
+        })
+    }
+
     pub async fn delete_torrent_raw(&self, id: &str) -> Result<(), reqwest::Error> {
-        let url = format!("{}/torrents/controltorrent", TORBOX_BASE);
+        let url = format!("{}/torrents/controltorrent", self.base);
         // Refuse to act on a malformed OR semantically-invalid id rather than defaulting to 0, which
         // would issue a delete against an unintended torrent and report success. `map_listed_torrents`
         // already drops id-0 entries, but enforce the `> 0` invariant locally so a future caller that
@@ -760,7 +786,7 @@ impl TorBoxClient {
         // and the error below is mapped to AppError::Unavailable without logging the URL.
         let url = format!(
             "{}/torrents/requestdl?token={}&torrent_id={}&file_id={}",
-            TORBOX_BASE, self.api_key, loc.torrent_id, loc.file_id
+            self.base, self.api_key, loc.torrent_id, loc.file_id
         );
         // Bounded budget (3): this is the synchronous on-read resolve, so a wedged/black-holing
         // endpoint must fail over to instant repair fast rather than run the full 6-attempt loop
@@ -1278,6 +1304,80 @@ mod tests {
             }
         });
         (format!("http://{}/", addr), counter)
+    }
+
+    /// Spawn a local HTTP server that replies to successive connections with the given
+    /// `(status, body)` pairs in order (JSON bodies). Serves exactly `responses.len()` connections.
+    async fn spawn_response_sequence(responses: Vec<(u16, String)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for (status, body) in responses {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 {} STATUS\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status,
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn add_magnet_null_torrent_id_recovers_existing_by_infohash() {
+        // createtorrent returns `success:true` but a null `torrent_id` (decodes to 0 — NOT a usable
+        // id). Rather than record an unusable "0" torrent, add_magnet_raw must recover the real
+        // torrent by infohash from mylist. (list_torrents_raw paginates: page 0 returns the torrent,
+        // the empty page 1 terminates.)
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let magnet = format!("magnet:?xt=urn:btih:{}", hash);
+        let base = spawn_response_sequence(vec![
+            (
+                200,
+                r#"{"success":true,"data":{"torrent_id":null}}"#.to_string(),
+            ),
+            (200, format!(r#"{{"success":true,"data":[{{"id":42,"hash":"{hash}"}}]}}"#)),
+            (200, r#"{"success":true,"data":[]}"#.to_string()),
+        ])
+        .await;
+        let client = TorBoxClient::with_base("fake".to_string(), base);
+        let r = client
+            .add_magnet_raw(&magnet)
+            .await
+            .expect("a null torrent_id must recover the existing torrent, not fail");
+        assert_eq!(r.id, "42", "must reuse the existing torrent's id, not record 0");
+    }
+
+    #[tokio::test]
+    async fn add_magnet_dup_400_recovers_existing_by_infohash() {
+        // TorBox rejects an add for an already-present torrent (commonly HTTP 400). add_magnet_raw
+        // must recover by locating it via infohash in mylist and reuse its id, not fail the acquire.
+        let hash = "89abcdef0123456789abcdef0123456789abcdef";
+        let magnet = format!("magnet:?xt=urn:btih:{}", hash);
+        let base = spawn_response_sequence(vec![
+            (
+                400,
+                r#"{"success":false,"detail":"Download already queued"}"#.to_string(),
+            ),
+            (200, format!(r#"{{"success":true,"data":[{{"id":7,"hash":"{hash}"}}]}}"#)),
+            (200, r#"{"success":true,"data":[]}"#.to_string()),
+        ])
+        .await;
+        let client = TorBoxClient::with_base("fake".to_string(), base);
+        let r = client
+            .add_magnet_raw(&magnet)
+            .await
+            .expect("a dup-400 must recover the existing torrent");
+        assert_eq!(r.id, "7", "must reuse the already-present torrent's id");
     }
 
     #[tokio::test]
