@@ -123,7 +123,9 @@ pub async fn run_upgrade_once(app: &AppState) {
 }
 
 /// The best (highest-`effective_score`) quality across ALL owned copies of a title, or `None` if ANY
-/// owned copy has unknown quality (a legacy/untagged mirror record). Used as the upgrade baseline so
+/// owned copy has unknown quality (a legacy/untagged mirror record). A hash that has been
+/// concurrently pruned (no record) is skipped rather than aborting the baseline. Used as the upgrade
+/// baseline so
 /// a swap that prunes every copy can only proceed against the BEST one it would delete — never
 /// downgrading by comparing against a worse duplicate. `None` (unknown copy present) is a
 /// conservative skip: we can't prove a candidate beats an unmeasured copy, so we don't risk
@@ -134,7 +136,12 @@ pub async fn run_upgrade_once(app: &AppState) {
 async fn best_owned_quality(app: &AppState, owned_hashes: &[String]) -> Option<QualitySummary> {
     let mut best: Option<QualitySummary> = None;
     for h in owned_hashes {
-        let rec = app.store.get_owned(h.clone()).await?;
+        // A record concurrently pruned between grouping and here is no longer part of the owned set
+        // the swap would delete, so SKIP it rather than aborting the whole baseline (which would
+        // leave the title un-upgradeable while a dangling hash lingers in the group).
+        let Some(rec) = app.store.get_owned(h.clone()).await else {
+            continue;
+        };
         let q = rec.quality?; // any unknown-quality owned copy → conservative skip (None)
         let better = best
             .as_ref()
@@ -763,7 +770,15 @@ async fn base_req_provenance(
     groups
         .get(&(media_type, tmdb_id))
         .map(|g| g.provenance.clone())
-        .unwrap_or_else(crate::store::Provenance::manual)
+        // An empty group is a race: every owned copy was concurrently pruned (dedup / a lifecycle
+        // removal) between the tick's grouping and here. Fall back to EMPTY provenance (a plain
+        // mirror), NOT manual() — manual() would permanently mislabel this engine-staged upgrade as
+        // a protected manual add (run_upgrade_once skips a manual group, and dedup never
+        // auto-removes a manual copy). This matches the show path's empty-group result
+        // (merged_provenance). NB: `Provenance::default()` == `manual()`, so we build empty here.
+        .unwrap_or_else(|| crate::store::Provenance {
+            entries: Vec::new(),
+        })
 }
 
 /// The merged sticky provenance across a group's owned records — the same value
@@ -2124,6 +2139,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn base_req_provenance_falls_back_to_empty_not_manual_for_a_vanished_group() {
+        // If every owned copy of a movie is concurrently pruned between grouping and staging, the
+        // staged upgrade must inherit EMPTY provenance (a plain mirror) — NOT manual(), which would
+        // permanently mislabel an engine-staged copy as a protected manual add (run_upgrade_once
+        // skips a manual group forever, and dedup never auto-removes a manual copy). Consistent with
+        // the show path's empty-group result (merged_provenance yields empty).
+        let store = mem_store();
+        let app = app_with(
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(MockProvider::default()),
+            store,
+        );
+        let prov = base_req_provenance(&app, MediaType::Movie, 27205).await;
+        assert!(
+            prov.entries.is_empty(),
+            "a vanished group must fall back to EMPTY provenance, got {:?}",
+            prov.entries
+        );
+        assert!(
+            !prov.has_manual_entry(),
+            "must not mislabel the staged upgrade as a protected manual add"
+        );
+    }
+
+    #[tokio::test]
     async fn idle_movie_with_cached_better_release_is_staged_swapped_and_old_pruned() {
         let store = mem_store();
         // Owned: cached WEB 1080p movie, Verified, with a movie selection pointing at it.
@@ -2209,9 +2249,14 @@ mod tests {
             sel.hash, "hnew",
             "selection swapped to the upgraded release"
         );
-        assert!(
-            store.get_owned("hnew".into()).await.is_some(),
-            "new release recorded owned+verified"
+        let new_rec = store
+            .get_owned("hnew".into())
+            .await
+            .expect("new release recorded owned+verified");
+        assert_eq!(
+            new_rec.provenance,
+            Provenance::watchlist("a"),
+            "the staged upgrade inherits the superseded copy's sticky provenance"
         );
         assert!(
             store.get_owned("hold".into()).await.is_none(),
