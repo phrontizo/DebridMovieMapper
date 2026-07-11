@@ -799,6 +799,14 @@ fn parse_mdhd_language(buf: &[u8], start: usize, end: usize) -> Option<String> {
 pub async fn probe_tracks(http: &reqwest::Client, cdn_url: &str) -> Result<Vec<Track>, ProbeError> {
     const FRONT: u64 = 4 * 1024 * 1024;
     let front = fetch_range(http, cdn_url, 0, FRONT - 1).await?;
+    // A front read shorter than the container magic (8 bytes covers both the MKV EBML signature and
+    // the MP4 `ftyp` box) can only be a truncated/empty transient read — no real media file is shorter
+    // than its container signature. Defer + retry rather than letting `detect_container` return `None`
+    // → `Unsupported`, which `acquire` maps to Accept (a wrong-language release would then be marked
+    // Verified with no language check).
+    if front.len() < 8 {
+        return Err(ProbeError::Transient);
+    }
     match detect_container(&front) {
         Some(ContainerKind::Mkv) => match parse_mkv_tracks(&front) {
             Err(ProbeError::Transient) => {
@@ -1375,6 +1383,36 @@ mod tests {
             Some(ContainerKind::Mp4)
         );
         assert_eq!(detect_container(b"RIFF\0\0\0\0AVI LIST"), None);
+    }
+
+    #[tokio::test]
+    async fn probe_tracks_defers_on_a_truncated_front_read() {
+        // A "successful" 206 whose body is shorter than the container magic (a transient origin
+        // hiccup on a still-broken/lapsed file) must DEFER (Transient), not be classified Unsupported
+        // (which acquire maps to Accept → Verified with no language check).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let body = b"\x1a\x45"; // 2 bytes — below the 8-byte container-magic minimum
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-1/1000000\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let url = format!("http://{}/", addr);
+        let result = probe_tracks(&reqwest::Client::new(), &url).await;
+        assert!(
+            matches!(result, Err(ProbeError::Transient)),
+            "a sub-magic front read must defer, not accept as Unsupported; got {result:?}"
+        );
     }
     #[test]
     fn verify_audio_original_and_subtitle_rules() {
