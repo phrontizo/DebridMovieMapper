@@ -1094,11 +1094,19 @@ impl Store {
                     Ok(t) => t,
                     Err(_) => return 0,
                 };
-                // Collect stale keys first (can't remove during the borrowing iteration).
+                // Collect stale keys first (can't remove during the borrowing iteration). Log a
+                // per-row read error rather than `.flatten()`-swallowing it, matching the `all_*`
+                // accessors' convention — a row that can't be read escapes pruning silently otherwise.
                 let stale: Vec<String> = match table.iter() {
                     Ok(iter) => iter
-                        .flatten()
-                        .filter_map(|(k, v)| {
+                        .filter_map(|entry| {
+                            let (k, v) = match entry {
+                                Ok(kv) => kv,
+                                Err(e) => {
+                                    error!("blacklist row read failed (skipped in prune): {}", e);
+                                    return None;
+                                }
+                            };
                             let at = serde_json::from_slice::<serde_json::Value>(v.value())
                                 .ok()
                                 .and_then(|j| j.get("at").and_then(|a| a.as_u64()))
@@ -1643,11 +1651,22 @@ impl Store {
                     Ok(t) => t,
                     Err(_) => return 0,
                 };
-                // Collect keys not in the owned keep-set first (can't remove during iteration).
+                // Collect keys not in the owned keep-set first (can't remove during iteration). Log a
+                // per-row read error rather than `.flatten()`-swallowing it (matching the `all_*`
+                // accessors' convention).
                 let stale: Vec<String> = match table.iter() {
                     Ok(iter) => iter
-                        .flatten()
-                        .filter_map(|(k, _)| {
+                        .filter_map(|entry| {
+                            let (k, _) = match entry {
+                                Ok(kv) => kv,
+                                Err(e) => {
+                                    error!(
+                                        "upgrade_checks row read failed (skipped in prune): {}",
+                                        e
+                                    );
+                                    return None;
+                                }
+                            };
                             let key = k.value().to_string();
                             (!keep.contains(&key)).then_some(key)
                         })
@@ -2272,6 +2291,31 @@ mod tests {
             "a row stamped exactly AT the cutoff must survive (strict <)"
         );
         assert!(store.is_blacklisted(m, 1, "after".into()).await);
+    }
+
+    #[tokio::test]
+    async fn prune_blacklist_before_treats_an_at_less_row_as_age_zero() {
+        // The prune's `.unwrap_or(0)` means a malformed / `at`-less row is treated as age 0 and
+        // pruned (rather than lingering forever). Insert a raw row lacking `at` and confirm it's
+        // removed by any cutoff.
+        let store = mem_store();
+        let key = blacklist_key(MediaKind::Movie, 1, "h");
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(BLACKLIST_TABLE).unwrap();
+                let bad = serde_json::to_vec(&serde_json::json!({"reason": "x"})).unwrap(); // no "at"
+                t.insert(key.as_str(), bad.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        assert!(
+            store.is_blacklisted(MediaKind::Movie, 1, "h".into()).await,
+            "the raw row is present before pruning"
+        );
+        let removed = store.prune_blacklist_before(1).await;
+        assert_eq!(removed, 1, "an at-less row is treated as age 0 and pruned");
+        assert!(!store.is_blacklisted(MediaKind::Movie, 1, "h".into()).await);
     }
 
     #[tokio::test]
@@ -3372,6 +3416,34 @@ mod tests {
         store.put_owned("h1".to_string(), rec).await.unwrap();
         let got = store.get_owned("h1".to_string()).await.unwrap();
         assert_eq!(got.provenance, expected_prov);
+    }
+
+    #[tokio::test]
+    async fn empty_provenance_round_trips_as_empty_not_manual() {
+        // The mirror-vs-manual distinction is load-bearing for the removal lifecycle: an
+        // account-mirror record carries an EXPLICITLY-empty provenance that must NOT read as manual.
+        // `#[serde(default)]` only fires on an ABSENT key (that path → manual, covered separately),
+        // so an explicitly-empty vec must round-trip as empty. A regression (e.g. a custom
+        // (de)serializer) could silently flip empty→manual and wrongly protect mirror content.
+        let store = mem_store();
+        let rec = OwnedRecord {
+            request: req("tt1", 27205),
+            provenance: Provenance { entries: vec![] },
+            added_at: 100,
+            status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: None,
+        };
+        store.put_owned("h1".to_string(), rec).await.unwrap();
+        let got = store.get_owned("h1".to_string()).await.unwrap();
+        assert!(
+            got.provenance.entries.is_empty(),
+            "an explicitly-empty provenance must round-trip as empty"
+        );
+        assert!(
+            !got.provenance.has_manual_entry(),
+            "empty provenance must NOT read as a protected manual add"
+        );
     }
 
     // ── SP3 Task 2 tests (OwnedRecord provides/quality, selection, upgrade_checks) ─
