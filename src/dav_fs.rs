@@ -30,6 +30,23 @@ fn parse_content_range_start(v: &str) -> Option<u64> {
         .ok()
 }
 
+/// Resolve a `SeekFrom` against the current position `pos` and the object `size` to a new absolute
+/// offset, rejecting a seek that would land before byte 0 (or overflow `i64`). Shared by
+/// `ProxiedMediaFile` and `VirtualFile`'s `DavFile::seek` so the underflow guard lives in one place.
+fn seek_within(seek: std::io::SeekFrom, pos: u64, size: u64) -> Result<u64, FsError> {
+    let resolve = |base: u64, delta: i64| -> Result<u64, FsError> {
+        Ok((base as i64)
+            .checked_add(delta)
+            .filter(|&n| n >= 0)
+            .ok_or(FsError::GeneralFailure)? as u64)
+    };
+    match seek {
+        std::io::SeekFrom::Start(p) => Ok(p),
+        std::io::SeekFrom::Current(p) => resolve(pos, p),
+        std::io::SeekFrom::End(p) => resolve(size, p),
+    }
+}
+
 #[derive(Clone)]
 pub struct DebridFileSystem {
     vfs: Arc<RwLock<DebridVfs>>,
@@ -770,25 +787,7 @@ impl DavFile for ProxiedMediaFile {
 
     fn seek(&mut self, pos: std::io::SeekFrom) -> FsFuture<'_, u64> {
         async move {
-            let new_pos = match pos {
-                std::io::SeekFrom::Start(p) => p,
-                std::io::SeekFrom::Current(p) => {
-                    let base = self.pos as i64;
-                    let result = base
-                        .checked_add(p)
-                        .filter(|&n| n >= 0)
-                        .ok_or(FsError::GeneralFailure)?;
-                    result as u64
-                }
-                std::io::SeekFrom::End(p) => {
-                    let size = self.file_size as i64;
-                    let result = size
-                        .checked_add(p)
-                        .filter(|&n| n >= 0)
-                        .ok_or(FsError::GeneralFailure)?;
-                    result as u64
-                }
-            };
+            let new_pos = seek_within(pos, self.pos, self.file_size)?;
             self.pos = new_pos;
             Ok(new_pos)
         }
@@ -1073,25 +1072,7 @@ impl DavFile for VirtualFile {
 
     fn seek(&mut self, pos: std::io::SeekFrom) -> FsFuture<'_, u64> {
         async move {
-            let new_pos = match pos {
-                std::io::SeekFrom::Start(p) => p,
-                std::io::SeekFrom::Current(p) => {
-                    let base = self.pos as i64;
-                    let result = base
-                        .checked_add(p)
-                        .filter(|&n| n >= 0)
-                        .ok_or(FsError::GeneralFailure)?;
-                    result as u64
-                }
-                std::io::SeekFrom::End(p) => {
-                    let size = self.content.len() as i64;
-                    let result = size
-                        .checked_add(p)
-                        .filter(|&n| n >= 0)
-                        .ok_or(FsError::GeneralFailure)?;
-                    result as u64
-                }
-            };
+            let new_pos = seek_within(pos, self.pos, self.content.len() as u64)?;
             self.pos = new_pos;
             Ok(new_pos)
         }
@@ -1331,6 +1312,23 @@ mod provider_abstraction_tests {
             confirmed_read: false,
             first_read_bytes: BUFFER_SIZE as u64,
         }
+    }
+
+    #[test]
+    fn seek_within_resolves_all_variants_and_rejects_underflow() {
+        use std::io::SeekFrom;
+        // Start is absolute (may exceed size — the read is clamped elsewhere).
+        assert_eq!(seek_within(SeekFrom::Start(42), 10, 100).unwrap(), 42);
+        // Current/End add to pos/size respectively.
+        assert_eq!(seek_within(SeekFrom::Current(5), 10, 100).unwrap(), 15);
+        assert_eq!(seek_within(SeekFrom::Current(-4), 10, 100).unwrap(), 6);
+        assert_eq!(seek_within(SeekFrom::End(-1), 10, 100).unwrap(), 99);
+        assert_eq!(seek_within(SeekFrom::End(0), 10, 100).unwrap(), 100);
+        // Seeking before byte 0 is rejected, not wrapped.
+        assert!(seek_within(SeekFrom::Current(-11), 10, 100).is_err());
+        assert!(seek_within(SeekFrom::End(-101), 10, 100).is_err());
+        // Overflow of the i64 add is rejected rather than panicking.
+        assert!(seek_within(SeekFrom::Current(i64::MAX), i64::MAX as u64, 100).is_err());
     }
 
     #[tokio::test]
