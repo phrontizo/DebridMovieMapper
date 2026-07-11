@@ -295,19 +295,20 @@ fn io_kind_is_corruption(kind: std::io::ErrorKind) -> bool {
 
 /// A `<path>.corrupt` backup name that doesn't already exist (falling back to `<path>.corrupt.<n>`),
 /// so moving an unusable DB aside never fails on — nor silently overwrites — a `.corrupt` from a
-/// prior recovery. Returns the plain name if the bounded search is exhausted.
-fn unique_backup_path(path: &str) -> String {
+/// prior recovery. Returns `None` if the bounded search is exhausted (every candidate exists), so
+/// the caller fails loudly rather than clobbering the oldest backup.
+fn unique_backup_path(path: &str) -> Option<String> {
     let base = format!("{path}.corrupt");
     if !std::path::Path::new(&base).exists() {
-        return base;
+        return Some(base);
     }
     for n in 1..1000 {
         let candidate = format!("{path}.corrupt.{n}");
         if !std::path::Path::new(&candidate).exists() {
-            return candidate;
+            return Some(candidate);
         }
     }
-    base
+    None
 }
 
 /// Classify a `Database::create`/open error. Only a positive *corruption* signal moves the file
@@ -529,24 +530,29 @@ impl Store {
         Ok(())
     }
 
-    /// Move an unusable database aside to `<path>.corrupt` (or `<path>.corrupt.<n>` if that already
-    /// exists) and create a fresh one. Never deletes outright unless the rename itself fails.
+    /// Move an unusable (genuinely corrupt) database aside to `<path>.corrupt` (or `<path>.corrupt.<n>`
+    /// if that already exists) and create a fresh one. NEVER deletes the file: if the rename fails,
+    /// or every backup name is taken, it fails startup with the DB left on disk for the operator to
+    /// inspect/remove — silently deleting it (the previous `remove_file` fallback) could discard data
+    /// on a misclassification.
     fn move_aside_and_create(path: &str) -> Result<Database, AppError> {
-        // Pick a backup name that doesn't already exist so the rename can't fail on (nor overwrite)
-        // a `.corrupt` from a prior recovery — on Windows rename won't overwrite an existing target,
-        // which would otherwise force the destructive `remove_file` fallback below.
-        let backup = unique_backup_path(path);
         if std::path::Path::new(path).exists() {
-            match std::fs::rename(path, &backup) {
-                Ok(()) => info!("Moved aside unusable database to {}", backup),
-                Err(e) => {
-                    error!(
-                        "Failed to move aside database {} -> {} ({}); removing it instead",
-                        path, backup, e
-                    );
-                    let _ = std::fs::remove_file(path);
-                }
-            }
+            // Pick a backup name that doesn't already exist so the rename can't overwrite a
+            // `.corrupt` from a prior recovery.
+            let backup = unique_backup_path(path).ok_or_else(|| {
+                AppError::Config(format!(
+                    "cannot move aside unusable database {path}: exhausted backup names \
+                     (.corrupt and .corrupt.1..999 all exist). Refusing to overwrite an existing \
+                     backup — archive or remove the old .corrupt file(s) and restart."
+                ))
+            })?;
+            std::fs::rename(path, &backup).map_err(|e| {
+                AppError::Config(format!(
+                    "failed to move aside unusable database {path} -> {backup} ({e}). Refusing to \
+                     delete it — the file is left on disk for you to inspect/remove manually."
+                ))
+            })?;
+            info!("Moved aside unusable database to {}", backup);
         }
         let db = Database::create(path).map_err(|e| AppError::Db(e.into()))?;
         Self::ensure_schema(&db, 0).map_err(AppError::Db)?;
@@ -1805,12 +1811,12 @@ mod tests {
         let _ = std::fs::remove_file(&corrupt);
         let _ = std::fs::remove_file(&corrupt1);
         // No existing `.corrupt` → the plain name.
-        assert_eq!(unique_backup_path(&path), corrupt);
+        assert_eq!(unique_backup_path(&path), Some(corrupt.clone()));
         // An existing `.corrupt` → a numbered variant, so the rename never fails on / clobbers it.
         std::fs::write(&corrupt, b"x").unwrap();
-        assert_eq!(unique_backup_path(&path), corrupt1);
+        assert_eq!(unique_backup_path(&path), Some(corrupt1.clone()));
         std::fs::write(&corrupt1, b"y").unwrap();
-        assert_eq!(unique_backup_path(&path), format!("{path}.corrupt.2"));
+        assert_eq!(unique_backup_path(&path), Some(format!("{path}.corrupt.2")));
         let _ = std::fs::remove_file(&corrupt);
         let _ = std::fs::remove_file(&corrupt1);
     }
