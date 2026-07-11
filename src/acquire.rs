@@ -215,6 +215,14 @@ pub struct AcquisitionEngine {
     /// A single-tick TMDB blip (incl. the first observe after a restart, when this map is empty) thus
     /// rides out; a genuine mismatch is still rejected one tick later. In-memory (best-effort).
     validate_fails: Arc<Mutex<HashMap<String, u32>>>,
+    /// torrent_id -> when `get_torrent_info` FIRST started failing consecutively for a listed Pending
+    /// torrent. Every other Pending arm in `observe` has a `dead_timeout` escape; the info-fetch arm
+    /// keys its escape off how long info has been CONSECUTIVELY unfetchable (reset on any successful
+    /// fetch) rather than the torrent's `added_at` age — so a single transient blip on a long, healthy
+    /// download can't reap a good release, while a genuinely stuck listed torrent (present but its info
+    /// endpoint persistently errors) is still reaped + re-scraped instead of stranding Pending forever.
+    /// In-memory (best-effort), pruned to live listing ids each tick like `progress`.
+    info_fail_since: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 /// The representative video for a movie request: the largest video file (the feature). Used both to
@@ -366,6 +374,7 @@ impl AcquisitionEngine {
             progress: Arc::new(Mutex::new(HashMap::new())),
             verify_attempts: Arc::new(Mutex::new(HashMap::new())),
             validate_fails: Arc::new(Mutex::new(HashMap::new())),
+            info_fail_since: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -834,12 +843,35 @@ impl AcquisitionEngine {
             }
             // Pending: fetch info to inspect files.
             let info = match self.provider.get_torrent_info(&t.id).await {
-                Ok(i) => i,
+                Ok(i) => {
+                    // Info resolved — clear any consecutive-failure timer for this id.
+                    self.info_fail_since.lock().await.remove(&t.id);
+                    i
+                }
                 Err(e) => {
-                    debug!(
-                        "observe: hash {} get_torrent_info({}) failed: {} — retry next tick",
-                        hash, t.id, e
-                    );
+                    // A listed torrent whose info endpoint keeps erroring is genuinely stuck. Reap it
+                    // once the failures have PERSISTED past the dead-timeout (anchored on the first
+                    // consecutive failure, not the record's age), so a single transient blip on a
+                    // healthy long download rides out but a stuck one doesn't strand Pending forever.
+                    let first = {
+                        let mut map = self.info_fail_since.lock().await;
+                        *map.entry(t.id.clone()).or_insert_with(Instant::now)
+                    };
+                    if !listing_empty && first.elapsed() >= self.dead_timeout {
+                        self.fail_and_reacquire(
+                            hash,
+                            &t.id,
+                            &rec.request,
+                            "InfoUnfetchable",
+                            &rec.provenance,
+                        )
+                        .await;
+                    } else {
+                        debug!(
+                            "observe: hash {} get_torrent_info({}) failed: {} — retry next tick ({}s unfetchable)",
+                            hash, t.id, e, first.elapsed().as_secs()
+                        );
+                    }
                     continue;
                 }
             };
@@ -1093,6 +1125,12 @@ impl AcquisitionEngine {
             .lock()
             .await
             .retain(|tid, _| live_ids.contains(tid.as_str()));
+        // Same id-keyed bound for the info-fetch failure timer (dropped when a torrent leaves the
+        // listing, so it can't grow unbounded as ids churn).
+        self.info_fail_since
+            .lock()
+            .await
+            .retain(|tid, _| live_ids.contains(tid.as_str()));
         let owned_hashes: std::collections::HashSet<&str> =
             owned.iter().map(|(h, _)| h.as_str()).collect();
         self.verify_attempts
@@ -1147,6 +1185,7 @@ impl AcquisitionEngine {
             torrent_id.is_empty() || self.provider.delete_torrent(torrent_id).await.is_ok();
         self.progress.lock().await.remove(torrent_id);
         self.verify_attempts.lock().await.remove(hash);
+        self.info_fail_since.lock().await.remove(torrent_id);
         if removed {
             let _ = self.store.remove_owned(hash.to_string()).await;
             let _ = self.store.remove_authoritative(hash.to_string()).await;
@@ -2660,6 +2699,98 @@ mod tests {
         assert!(
             st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
                 .await
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_reaps_pending_when_info_persistently_unfetchable() {
+        // A LISTED Pending torrent whose `get_torrent_info` keeps failing (it is present in the
+        // listing, but its per-torrent info endpoint persistently errors) must eventually be reaped +
+        // blacklisted. Every other Pending arm has a dead-timeout escape; without one here the record
+        // is stranded Pending forever (and `acquire`'s owned-AND-present idempotency short-circuits any
+        // reconciler retry). dead_timeout=0 ⇒ the very first failing tick is already past the deadline.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: 1,
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            fail_info_ids: std::collections::HashSet::from(["tid_h1".to_string()]),
+            ..Default::default()
+        });
+        let eng = engine_dead(
+            provider,
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+            0,
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloading", 50.0)])
+            .await;
+        assert!(
+            st.get_owned("h1".into()).await.is_none(),
+            "a persistently-info-unfetchable Pending torrent past the dead-timeout is reaped"
+        );
+        assert!(
+            st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await,
+            "and its hash is blacklisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_does_not_reap_pending_on_transient_info_failure() {
+        // A SINGLE transient `get_torrent_info` failure on a listed Pending torrent must NOT reap it,
+        // even when the record is ancient (a legitimately-long download). The info-fetch reap keys off
+        // how long info has been CONSECUTIVELY unfetchable, not the torrent's `added_at` age — so a
+        // one-tick blip on an otherwise-healthy download can never blacklist a good release.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: 1, // ancient — a naive `age > dead_timeout` check would wrongly reap.
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            fail_info_ids: std::collections::HashSet::from(["tid_h1".to_string()]),
+            ..Default::default()
+        });
+        // Generous dead-timeout: one failing tick's elapsed (~0s) is far under it, so no reap.
+        let eng = engine_dead(
+            provider,
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+            3600,
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloading", 50.0)])
+            .await;
+        assert!(
+            st.get_owned("h1".into()).await.is_some(),
+            "a single transient info failure must NOT reap a Pending torrent"
+        );
+        assert!(
+            !st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await,
+            "a single transient info failure must NOT blacklist a Pending torrent"
         );
     }
 
