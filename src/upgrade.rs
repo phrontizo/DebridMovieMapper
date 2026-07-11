@@ -385,7 +385,17 @@ async fn rank_changes(
         scored.push((q.score, r, imp));
     }
     scored.sort_by_key(|(score, ..)| std::cmp::Reverse(*score)); // best score first (stable for ties)
-    scored.into_iter().map(|(_, r, imp)| (r, imp)).collect()
+                                                                 // Dedup by info_hash: Torrentio can return the same infohash under multiple stream entries
+                                                                 // (different source/title strings, sometimes scored differently). Without this, a duplicate
+                                                                 // whose first entry fails and is blacklisted would still be tried again from its second entry —
+                                                                 // re-adding, re-probing and re-blacklisting the SAME torrent (stage_and_verify does NOT re-check
+                                                                 // the blacklist). Keep the best-scored entry (the first after the reverse-score sort).
+    let mut seen = std::collections::HashSet::new();
+    scored
+        .into_iter()
+        .filter(|(_, r, _)| seen.insert(r.info_hash.to_ascii_lowercase()))
+        .map(|(_, r, imp)| (r, imp))
+        .collect()
 }
 
 /// Gate a corrective downgrade on the opt-in flag. An `Upgrade` always proceeds. A `Downgrade` with
@@ -901,7 +911,14 @@ fn rank_cached_pack_candidates(
         .filter_map(|r| release::score(&r, prefs).map(|s| (r, s)))
         .collect();
     scored.sort_by_key(|(_, s)| std::cmp::Reverse(*s)); // best score first
-    scored.into_iter().map(|(r, _)| r).collect()
+                                                        // Dedup by info_hash (same rationale as rank_changes): a duplicated pack whose first entry
+                                                        // fails would otherwise be re-added/re-probed/re-blacklisted from its second entry.
+    let mut seen = std::collections::HashSet::new();
+    scored
+        .into_iter()
+        .filter(|(r, _)| seen.insert(r.info_hash.to_ascii_lowercase()))
+        .map(|(r, _)| r)
+        .collect()
 }
 
 // ── per-episode upgrade/downgrade + over-ceiling pack correction (Task 5) ─────────────────────
@@ -4603,6 +4620,33 @@ mod tests {
             vec!["hnew", "hweb"],
             "best-score (REMUX) first, WEB second; uncached + already-owned excluded"
         );
+    }
+
+    #[test]
+    fn rank_cached_pack_candidates_dedups_repeated_info_hash() {
+        use crate::config::AcquisitionConfig;
+        let prefs = AcquisitionConfig::default().prefs;
+        // The same infohash returned twice (Torrentio does this under differing source/title
+        // strings) must appear ONCE in the ranked output — otherwise a failed+blacklisted first
+        // entry would be re-added/re-probed/re-blacklisted from its duplicate.
+        let dup = |desc: &str| RawCandidate {
+            name: "Torrentio".into(),
+            description: desc.into(),
+            info_hash: "hdup".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let raws = vec![
+            dup("Show.S01.1080p.WEB-DL.x265\nRD+"),
+            dup("Show.S01.1080p.WEB.x265\n\u{26a1}"),
+        ];
+        let ranked = rank_cached_pack_candidates(&raws, &prefs, &[]);
+        assert_eq!(
+            ranked.len(),
+            1,
+            "a repeated infohash must be deduped to a single ranked entry"
+        );
+        assert_eq!(ranked[0].info_hash, "hdup");
     }
 
     #[test]
