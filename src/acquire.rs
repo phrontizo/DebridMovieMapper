@@ -417,7 +417,13 @@ impl AcquisitionEngine {
             }
             parsed.push(r);
         }
-        let ranked = release::rank(parsed, &self.prefs);
+        // Resolve `AUDIO_LANGUAGE=original` (the default) against this title's original language so a
+        // wrong-language release is down-ranked here, not just rejected later at probe time (which
+        // would burn an acquire cycle). Matches `probe::verify`'s resolution of `Original`.
+        let prefs = self
+            .prefs
+            .with_resolved_audio(req.original_language.as_deref());
+        let ranked = release::rank(parsed, &prefs);
         debug!(
             "acquire: tmdb {} — {} ranked after filters ({} blacklisted); top: [{}]",
             req.tmdb_id,

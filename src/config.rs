@@ -140,6 +140,28 @@ pub struct QualityPrefs {
     pub prefer_hdr: bool,
 }
 
+impl QualityPrefs {
+    /// Return a copy whose `audio` requirement is resolved against a title's TMDB original language,
+    /// turning the default `AudioReq::Original` into a concrete `AudioReq::Lang(...)` when the
+    /// original language is known. `release::score` only penalises a wrong-language release for an
+    /// `AudioReq::Lang` (it has no per-title context of its own), so ranking with the raw prefs would
+    /// leave `Original` un-penalised and let a wrong-language release rank #1, get optimistically
+    /// added, download, and only then be rejected at probe time — burning an acquire cycle. Resolving
+    /// here makes acquisition ranking down-rank it up front, exactly as `probe::verify` rejects it
+    /// (which resolves `Original` the same way). An unknown/empty original language, or an explicit
+    /// `Lang`, is left unchanged.
+    pub fn with_resolved_audio(&self, original_language: Option<&str>) -> QualityPrefs {
+        let mut p = self.clone();
+        if let (AudioReq::Original, Some(orig)) = (&self.audio, original_language) {
+            let orig = orig.trim();
+            if !orig.is_empty() {
+                p.audio = AudioReq::Lang(orig.to_ascii_lowercase());
+            }
+        }
+        p
+    }
+}
+
 /// Trakt sync configuration (SP2). Held by `Config` as `Option<TraktConfig>`.
 ///
 /// Present only when both `TRAKT_CLIENT_ID` and `TRAKT_CLIENT_SECRET` are set;
@@ -1074,6 +1096,44 @@ mod tests {
             AudioReq::parse(Some("en".into())),
             AudioReq::Lang("en".into())
         );
+    }
+
+    #[test]
+    fn quality_prefs_resolve_audio_maps_original_to_title_language() {
+        let base = QualityPrefs {
+            max_resolution: MaxResolution::P1080,
+            audio: AudioReq::Original,
+            subtitle: SubReq::None,
+            prefer_hevc: true,
+            prefer_hdr: false,
+        };
+        // A known original language turns the default `Original` into a concrete `Lang(...)` (lowercased),
+        // so acquisition ranking down-ranks a wrong-language release exactly as the probe rejects it.
+        assert_eq!(
+            base.with_resolved_audio(Some("JA")).audio,
+            AudioReq::Lang("ja".into())
+        );
+        // An unknown / empty / whitespace original language leaves `Original` untouched (no penalty).
+        assert_eq!(base.with_resolved_audio(None).audio, AudioReq::Original);
+        assert_eq!(base.with_resolved_audio(Some("")).audio, AudioReq::Original);
+        assert_eq!(
+            base.with_resolved_audio(Some("  ")).audio,
+            AudioReq::Original
+        );
+        // An explicit `Lang` is never overridden by the title's original language.
+        let explicit = QualityPrefs {
+            audio: AudioReq::Lang("eng".into()),
+            ..base.clone()
+        };
+        assert_eq!(
+            explicit.with_resolved_audio(Some("ja")).audio,
+            AudioReq::Lang("eng".into())
+        );
+        // Non-audio fields are preserved.
+        let r = base.with_resolved_audio(Some("de"));
+        assert_eq!(r.max_resolution, base.max_resolution);
+        assert!(r.prefer_hevc);
+        assert!(!r.prefer_hdr);
     }
 
     #[test]
