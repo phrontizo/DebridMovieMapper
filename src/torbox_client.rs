@@ -1431,6 +1431,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_magnet_raw_success_maps_torrent_id() {
+        // The plain SUCCESS path: createtorrent returns `success:true` with a positive `torrent_id`.
+        // add_magnet_raw must map that id straight into AddMagnetResponse.id (stringized) with NO
+        // list-fetch recovery fallback. `spawn_json_200` accepts EXACTLY ONE connection, so if the
+        // code wrongly took the recovery branch the fallback list-fetch would hit a refused
+        // connection and the `.expect()` below would fail — proving the single-request success path.
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        let base = spawn_json_200(r#"{"success":true,"data":{"torrent_id":42}}"#).await;
+        let client = TorBoxClient::with_base("fake".to_string(), base);
+        let r = client
+            .add_magnet_raw(magnet)
+            .await
+            .expect("a positive torrent_id must succeed via the single-request success path");
+        assert_eq!(
+            r.id, "42",
+            "the created torrent_id must map straight into the returned id"
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_locator_percent_encodes_token_and_torrent_id() {
         // A token / string torrent_id containing URL-reserved characters must be percent-encoded in
         // the requestdl query. A raw `format!` would let a `&`/`=`/`/` in the token corrupt the query
