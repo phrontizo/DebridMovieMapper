@@ -822,23 +822,32 @@ async fn sync_trakt_user(
         } else {
             r.refresh_token
         };
-        tokens = TraktTokens {
+        let new_tokens = TraktTokens {
             access: r.access_token,
             refresh,
             expires_at: r.created_at.saturating_add(r.expires_in),
             username: tokens.username.clone(),
             needs_reenrolment: false,
         };
-        // Only persist (and continue syncing) if the account still exists: if it was removed during
-        // the refresh network window (a concurrent `/remove` on the enrolment page), do NOT resurrect
-        // it by writing the refreshed token back — skip the rest of this user's sync (same lost-DELETE
-        // guard as `sync_trakt`'s failure path and `enrolment::refresh_account`).
-        if store.get_trakt_tokens(slug.to_string()).await.is_none() {
+        // Persist via the store-level compare-and-swap keyed on the refresh token we just used, so the
+        // read → compare → write is atomic (mirrors `enrolment::refresh_account`). If the account was
+        // removed during the refresh window, or a concurrent refresh (a `/refresh` POST) already
+        // rotated the single-use token, the CAS skips the write — do NOT resurrect/clobber it; skip the
+        // rest of this user's sync (the stored token is used next cycle).
+        let nt = new_tokens.clone();
+        let applied = store
+            .update_trakt_tokens_if_refresh_matches(
+                slug.to_string(),
+                tokens.refresh.clone(),
+                move |current| {
+                    *current = nt;
+                },
+            )
+            .await?;
+        if !applied {
             return Ok(());
         }
-        store
-            .put_trakt_tokens(slug.to_string(), tokens.clone())
-            .await?;
+        tokens = new_tokens;
     }
 
     // Pull reads. Any error propagates → the account is flagged by `sync_trakt`.

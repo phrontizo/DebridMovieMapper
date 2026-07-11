@@ -148,42 +148,57 @@ impl EnrolmentService {
         let Some(tokens) = self.store.get_trakt_tokens(slug.to_string()).await else {
             return Ok(()); // nothing stored under this slug — no-op
         };
+        let expected = tokens.refresh.clone();
         let outcome = self.trakt.refresh(&tokens.refresh).await;
-        // Re-read AFTER the network refresh: if the account was removed during the refresh window (a
-        // concurrent `/remove` on another connection, or the background sync), do NOT resurrect it by
-        // writing back. Rebuild from the re-read record so we also don't clobber a token a concurrent
-        // refresh/sync just wrote.
-        let Some(mut current) = self.store.get_trakt_tokens(slug.to_string()).await else {
-            return Ok(()); // account removed mid-refresh — don't resurrect it
-        };
+        // Apply the result via a store-level compare-and-swap keyed on the refresh token we tried, so
+        // the whole read → compare → write is atomic. This is NOT merely cosmetic: a plain re-read +
+        // write races a concurrent refresh (a second /refresh POST, or the background sync) — if that
+        // other refresh succeeds and rotates the single-use token AFTER our re-read but BEFORE our
+        // write, we would clobber its fresh token with our stale one plus a spurious
+        // `needs_reenrolment`, permanently breaking the account. The CAS writes only while the stored
+        // refresh still equals `expected` (nobody rotated it), so the other refresh always wins.
         match outcome {
             Ok(fresh) => {
-                current.access = fresh.access_token;
-                if !fresh.refresh_token.is_empty() {
-                    current.refresh = fresh.refresh_token;
-                }
-                current.expires_at = token_expires_at(fresh.created_at, fresh.expires_in);
-                current.needs_reenrolment = false;
+                self.store
+                    .update_trakt_tokens_if_refresh_matches(
+                        slug.to_string(),
+                        expected,
+                        move |current| {
+                            current.access = fresh.access_token;
+                            if !fresh.refresh_token.is_empty() {
+                                current.refresh = fresh.refresh_token;
+                            }
+                            current.expires_at =
+                                token_expires_at(fresh.created_at, fresh.expires_in);
+                            current.needs_reenrolment = false;
+                        },
+                    )
+                    .await?;
+                Ok(())
             }
             Err(e) => {
-                // Only flag re-enrolment if we failed against the CURRENT refresh token. If a
-                // concurrent refresh (a second /refresh POST, or the background sync) already rotated
-                // it — `current.refresh` differs from the token we tried — Trakt invalidated our token
-                // on that other success, so THIS failure is a false alarm. Leaving the good record
-                // alone (no flag, no clobber) prevents a spurious `needs_reenrolment` that would make
-                // background jobs skip a healthy account.
-                if current.refresh != tokens.refresh {
+                // Only flag re-enrolment if the stored refresh is STILL the one we failed against. If
+                // a concurrent refresh already rotated it, Trakt invalidated our token on that other
+                // success, so THIS failure is a false alarm — the CAS skips the write (returns false)
+                // and we leave the good record alone. This prevents a spurious `needs_reenrolment`
+                // that would make background jobs skip a healthy account.
+                let flagged = self
+                    .store
+                    .update_trakt_tokens_if_refresh_matches(slug.to_string(), expected, |current| {
+                        current.needs_reenrolment = true;
+                    })
+                    .await?;
+                if flagged {
+                    warn!("Trakt refresh failed for '{}': {}", slug, e);
+                } else {
                     info!(
-                        "Trakt refresh for '{}' failed on a since-rotated token (concurrent refresh) — not flagging",
+                        "Trakt refresh for '{}' failed on a since-rotated token (concurrent refresh) or a removed account — not flagging",
                         slug
                     );
-                    return Ok(());
                 }
-                warn!("Trakt refresh failed for '{}': {}", slug, e);
-                current.needs_reenrolment = true;
+                Ok(())
             }
         }
-        self.store.put_trakt_tokens(slug.to_string(), current).await
     }
 
     /// Remove (unlink) one account's stored tokens.

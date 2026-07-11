@@ -1199,6 +1199,69 @@ impl Store {
         Self::flatten_join(result)
     }
 
+    /// Atomically apply `mutate` to the stored tokens for `slug`, but ONLY if the stored `refresh`
+    /// still equals `expected_refresh`. Returns `Ok(true)` if applied, `Ok(false)` if skipped (the
+    /// record was removed, or its refresh token was rotated by a concurrent refresh since it was
+    /// read). This closes the read-modify-write race between concurrent Trakt refreshes (two
+    /// `/refresh` clicks, or a `/refresh` racing the background sync's refresh) that would otherwise
+    /// clobber a freshly-rotated single-use token with a stale one plus a spurious
+    /// `needs_reenrolment` — the whole read → compare → write happens inside one redb write txn.
+    pub async fn update_trakt_tokens_if_refresh_matches(
+        &self,
+        slug: String,
+        expected_refresh: String,
+        mutate: impl FnOnce(&mut TraktTokens) + Send + 'static,
+    ) -> Result<bool, AppError> {
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, AppError> {
+            let txn = db.begin_write().map_err(|e| AppError::Db(e.into()))?;
+            let applied = {
+                let mut table = txn
+                    .open_table(TRAKT_TOKENS_TABLE)
+                    .map_err(|e| AppError::Db(e.into()))?;
+                let existing: Option<Vec<u8>> = table
+                    .get(slug.as_str())
+                    .map_err(|e| AppError::Db(e.into()))?
+                    .map(|g| g.value().to_vec());
+                match existing {
+                    // Record removed since it was read (a concurrent /remove) — do not resurrect it.
+                    None => false,
+                    Some(raw) => {
+                        let mut current: TraktTokens =
+                            serde_json::from_slice(&raw).map_err(|e| {
+                                AppError::Task(format!("corrupt TraktTokens for {slug}: {e}"))
+                            })?;
+                        if current.refresh != expected_refresh {
+                            // A concurrent refresh rotated the single-use token — that write wins.
+                            false
+                        } else {
+                            mutate(&mut current);
+                            let bytes = serde_json::to_vec(&current).map_err(|e| {
+                                AppError::Task(format!("re-serialise TraktTokens for {slug}: {e}"))
+                            })?;
+                            table
+                                .insert(slug.as_str(), bytes.as_slice())
+                                .map_err(|e| AppError::Db(e.into()))?;
+                            true
+                        }
+                    }
+                }
+            };
+            txn.commit().map_err(|e| AppError::Db(e.into()))?;
+            Ok(applied)
+        })
+        .await;
+        match result {
+            Ok(inner) => inner,
+            Err(e) => {
+                error!("redb blocking write task did not complete: {:?}", e);
+                Err(AppError::Task(format!(
+                    "redb blocking task did not complete: {e}"
+                )))
+            }
+        }
+    }
+
     pub async fn get_trakt_tokens(&self, slug: String) -> Option<TraktTokens> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
@@ -2503,6 +2566,72 @@ mod tests {
             .unwrap();
         assert!(store.get_trakt_tokens("alice".to_string()).await.is_none());
         assert_eq!(store.all_trakt_tokens().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_trakt_tokens_cas_applies_only_on_matching_refresh() {
+        let store = mem_store();
+        store
+            .put_trakt_tokens(
+                "alice".to_string(),
+                trakt_tokens_fixture("access1", "alice"),
+            )
+            .await
+            .unwrap();
+        // Matching expected refresh → applied; the mutation lands.
+        let applied = store
+            .update_trakt_tokens_if_refresh_matches(
+                "alice".to_string(),
+                "refresh_tok".to_string(),
+                |t| {
+                    t.access = "NEW".to_string();
+                    t.refresh = "ROTATED".to_string();
+                    t.needs_reenrolment = false;
+                },
+            )
+            .await
+            .unwrap();
+        assert!(applied, "a matching refresh must apply the mutation");
+        let got = store.get_trakt_tokens("alice".to_string()).await.unwrap();
+        assert_eq!(got.access, "NEW");
+        assert_eq!(got.refresh, "ROTATED");
+
+        // A stale expected refresh (simulating a token a concurrent refresh already rotated) → skipped;
+        // the CAS must NOT clobber the fresh record with the stale flag/token.
+        let applied = store
+            .update_trakt_tokens_if_refresh_matches(
+                "alice".to_string(),
+                "refresh_tok".to_string(), // the OLD (already-rotated) token
+                |t| {
+                    t.refresh = "refresh_tok".to_string();
+                    t.needs_reenrolment = true;
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!applied, "a since-rotated refresh must be skipped");
+        let got = store.get_trakt_tokens("alice".to_string()).await.unwrap();
+        assert_eq!(got.refresh, "ROTATED", "the fresh token must be preserved");
+        assert!(
+            !got.needs_reenrolment,
+            "a stale CAS must not set a spurious needs_reenrolment"
+        );
+
+        // A removed account → skipped (never resurrected).
+        store
+            .remove_trakt_tokens("alice".to_string())
+            .await
+            .unwrap();
+        let applied = store
+            .update_trakt_tokens_if_refresh_matches(
+                "alice".to_string(),
+                "ROTATED".to_string(),
+                |t| t.needs_reenrolment = true,
+            )
+            .await
+            .unwrap();
+        assert!(!applied, "a removed account must not be resurrected");
+        assert!(store.get_trakt_tokens("alice".to_string()).await.is_none());
     }
 
     /// Old-shape token JSON (written before `needs_reenrolment` existed) must decode with the
