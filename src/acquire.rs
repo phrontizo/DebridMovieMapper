@@ -1219,10 +1219,13 @@ impl AcquisitionEngine {
     }
 
     /// After adding a NEW hash for `req`, reap a DIFFERENT owned record for this EXACT slot that has
-    /// lapsed off the provider (absent from `present`). Such a record is provenance-bearing, so
-    /// `reap_absent_mirror_owned` (empty-provenance only) never cleans it, `dedup`/`observe` ignore
-    /// an absent hash, and it lingers as a `Verified`-but-absent zombie until the daily upgrade or
-    /// Trigger-B. Store-only — the torrent is already gone, so there is no provider delete and no
+    /// lapsed off the provider (absent from `present`). The reaped record is any NON-manual record
+    /// for the exact slot — engine-provenance OR an empty-provenance account-mirror copy (the guard
+    /// below is `!has_manual_entry()`, not empty-only). `dedup`/`observe` ignore an absent hash, and
+    /// the only other absent-record reaper (`reap_absent_mirror_owned`) is empty-provenance-only and
+    /// daily — so an engine-provenance lapse would otherwise linger as a `Verified`-but-absent zombie
+    /// until the daily upgrade or Trigger-B, while a mirror lapse is merely cleaned sooner here than
+    /// on the next daily prune. Store-only — the torrent is already gone, so there is no provider delete and no
     /// stream to interrupt (hence no idle-gate). Conservative to avoid ever reaping a live record:
     /// only an EXACT slot supersede (a same-tmdb movie, or a singleton episode == the requested one)
     /// and only a NON-manual record (invariant M-1) is reaped; a pack covering other episodes, any
