@@ -854,7 +854,10 @@ impl DebridVfs {
 /// torrent basename (`file.path.split('/').next_back()`). That is intentional: Jellyfin/Plex parse
 /// episode/quality metadata out of the original scene filename, so mangling it would degrade
 /// identification. It is not a path-traversal risk — `/` is already stripped by taking the basename,
-/// the WebDAV layer XML-encodes names, and `dav_fs::walk_components` rejects any `..` component.
+/// the WebDAV layer XML-encodes names, and `dav_fs::walk_components` rejects any `..` component. (A
+/// backslash in a leaf basename is not stripped, but debrid providers / BitTorrent path lists use
+/// POSIX `/` separators so it does not occur in practice, and the leaf key is inert within the VFS —
+/// it creates no nested node — so a stray `\` is not a traversal vector either.)
 fn sanitize_filename(name: &str) -> String {
     let mut replaced = String::with_capacity(name.len());
     for c in name.chars() {
