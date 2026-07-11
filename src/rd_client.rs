@@ -25,6 +25,14 @@ fn synthetic_bad_gateway(detail: &'static [u8]) -> reqwest::Error {
     .expect_err("BAD_GATEWAY always yields an error status")
 }
 
+/// Whether an `unrestrict/link` failure is a genuinely PERMANENT client error (a bad token) that
+/// instant repair can't fix — only 401/403. Everything else (a 5xx, a transport-level failure, or a
+/// stale/expired-link 404 that a re-add-by-hash recovers) maps to `AppError::Unavailable` → repair.
+/// Mirrors TorBox's `requestdl_status_is_permanent` so the two providers behave symmetrically.
+fn unrestrict_status_is_permanent(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN
+}
+
 #[derive(Clone, Default, Deserialize)]
 pub struct Torrent {
     pub id: String,
@@ -749,16 +757,20 @@ impl crate::provider::DebridProvider for RealDebridClient {
             .ok_or(crate::error::AppError::Unavailable)?;
         match self.unrestrict_link(link).await {
             Ok(resp) => Ok(resp.download),
-            // Any server error (5xx) OR a transport-level failure (timeout/connect/no HTTP status)
-            // on unrestrict → the bytes aren't currently available; signal re-acquire/repair rather
-            // than a hard failure. unrestrict makes 5xx terminal and uses a small retry budget, so
-            // this returns promptly (instead of the full ~10×60s window) and lets `dav_fs` fast-fail
-            // to instant repair. A 4xx (e.g. 401 bad token) keeps mapping to `Http` — repairing a
-            // genuine client error would loop fruitlessly.
-            Err(e) if e.status().is_none() || e.status().is_some_and(|s| s.is_server_error()) => {
-                Err(crate::error::AppError::Unavailable)
+            Err(e) => {
+                // Map to `Unavailable` (→ instant repair) UNLESS the failure is a genuinely permanent
+                // client error (401/403 bad token) that a re-add can't fix — mirroring TorBox's
+                // `requestdl_status_is_permanent`. A 5xx or a transport-level failure (no status) is
+                // transient; a stale/expired-link 4xx such as 404 is recoverable by a re-add-by-hash,
+                // so it routes to repair too rather than failing hard. unrestrict makes 5xx terminal
+                // and uses a small retry budget, so this returns promptly (instead of the full
+                // ~10×60s window) and lets `dav_fs` fast-fail to instant repair.
+                if e.status().is_some_and(unrestrict_status_is_permanent) {
+                    Err(crate::error::AppError::Http(e))
+                } else {
+                    Err(crate::error::AppError::Unavailable)
+                }
             }
-            Err(e) => Err(crate::error::AppError::Http(e)),
         }
     }
 
@@ -1140,6 +1152,42 @@ mod tests {
         assert!(
             matches!(r, Err(crate::error::AppError::Unavailable)),
             "a transport failure on resolve must map to Unavailable, got {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_url_maps_stale_link_404_to_unavailable_but_auth_401_to_http() {
+        // A stale/expired-link 404 on unrestrict is recoverable by a re-add-by-hash → Unavailable
+        // (instant repair), matching TorBox. Only a bad token (401/403) stays a hard Http error.
+        use crate::provider::DebridProvider as _;
+        let loc = crate::provider::FileLocator {
+            hash: "h".to_string(),
+            torrent_id: "t".to_string(),
+            file_id: 0,
+            file_path: "/x.mkv".to_string(),
+            link: Some("https://real-debrid.com/d/abc".to_string()),
+        };
+        let (url, _c) = spawn_counting("HTTP/1.1 404 Not Found", "{}").await;
+        let client = RealDebridClient::new("fake".to_string())
+            .unwrap()
+            .with_base_url(url);
+        assert!(
+            matches!(
+                client.resolve_url(&loc).await,
+                Err(crate::error::AppError::Unavailable)
+            ),
+            "a 404 on unrestrict must map to Unavailable (recoverable by re-add), not a hard Http error"
+        );
+        let (url, _c) = spawn_counting("HTTP/1.1 401 Unauthorized", "{}").await;
+        let client = RealDebridClient::new("fake".to_string())
+            .unwrap()
+            .with_base_url(url);
+        assert!(
+            matches!(
+                client.resolve_url(&loc).await,
+                Err(crate::error::AppError::Http(_))
+            ),
+            "a 401 (bad token) on unrestrict must stay a hard Http error"
         );
     }
 
