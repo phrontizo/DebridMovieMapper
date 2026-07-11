@@ -1,0 +1,16 @@
+# Keep dependencies patched. The GitHub Actions in ci.yml/release.yml are referenced by floating
+# major-version tags (e.g. actions/checkout@v6); those jobs hold registry credentials
+# (packages: write, and contents: write in release.yml), so a compromised upstream tag could
+# exfiltrate them. Dependabot opens update PRs (and surfaces advisories) for the actions and the
+# Cargo tree, so drift/vulnerabilities are caught rather than silently carried.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
