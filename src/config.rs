@@ -2,19 +2,34 @@ use crate::error::AppError;
 use crate::provider::{choose_provider, ProviderKind};
 use tracing::warn;
 
+/// Default WebDAV listen port. Single source for `resolve_port` AND the `from_parts` fall-back warn
+/// so the applied value and the logged value can never drift.
+pub const DEFAULT_PORT: u16 = 8080;
+/// Defaults + floors for the acquisition/scan numeric knobs. Referenced by BOTH the applied value and
+/// the "falling back to N" warning at each parse site (in `from_parts`/`parse_dead_timeout`), so a
+/// change to a default can't leave a stale literal in the operator-facing log message.
+const DEFAULT_SCAN_INTERVAL_SECS: u64 = 60;
+const MIN_SCAN_INTERVAL_SECS: u64 = 10;
+const DEFAULT_STALL_TIMEOUT_SECS: u64 = 1800;
+const MIN_STALL_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_MAX_ACQUIRE_ATTEMPTS: u32 = 5;
+const MIN_MAX_ACQUIRE_ATTEMPTS: u32 = 1;
+const DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS: u64 = 600;
+const MIN_ACQUIRE_DEAD_TIMEOUT_SECS: u64 = 120;
+
 /// Resolve the WebDAV listen port from a raw `PORT` value, identically for the server
 /// (`Config::from_parts`) and the `--healthcheck` probe (`main`) so the probe can never target a
 /// different port than the one the server actually bound. Trims, treats blank as unset, and rejects
 /// `0` (binds a random ephemeral port → the healthcheck would connect to 127.0.0.1:0 → restart
 /// loop). Returns the resolved port plus whether a NON-EMPTY value was invalid/zero and fell back to
-/// 8080 (so the server can warn; the healthcheck ignores the flag).
+/// the default (so the server can warn; the healthcheck ignores the flag).
 pub fn resolve_port(raw: Option<&str>) -> (u16, bool) {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => match s.parse::<u16>().ok().filter(|&p| p != 0) {
             Some(p) => (p, false),
-            None => (8080, true),
+            None => (DEFAULT_PORT, true),
         },
-        None => (8080, false),
+        None => (DEFAULT_PORT, false),
     }
 }
 
@@ -369,13 +384,13 @@ impl AcquisitionConfig {
                     .parse::<u64>()
                     .unwrap_or_else(|_| {
                         warn!(
-                            "Invalid STALL_TIMEOUT_SECS value '{}', falling back to 1800",
-                            s
+                            "Invalid STALL_TIMEOUT_SECS value '{}', falling back to {}",
+                            s, DEFAULT_STALL_TIMEOUT_SECS
                         );
-                        1800
+                        DEFAULT_STALL_TIMEOUT_SECS
                     })
-                    .max(60),
-                None => 1800,
+                    .max(MIN_STALL_TIMEOUT_SECS),
+                None => DEFAULT_STALL_TIMEOUT_SECS,
             },
             max_acquire_attempts: match max_acquire_attempts
                 .map(|s| s.trim().to_string())
@@ -385,17 +400,17 @@ impl AcquisitionConfig {
                     .parse::<u32>()
                     .unwrap_or_else(|_| {
                         warn!(
-                            "Invalid MAX_ACQUIRE_ATTEMPTS value '{}', falling back to 5",
-                            s
+                            "Invalid MAX_ACQUIRE_ATTEMPTS value '{}', falling back to {}",
+                            s, DEFAULT_MAX_ACQUIRE_ATTEMPTS
                         );
-                        5
+                        DEFAULT_MAX_ACQUIRE_ATTEMPTS
                     })
-                    .max(1),
-                None => 5,
+                    .max(MIN_MAX_ACQUIRE_ATTEMPTS),
+                None => DEFAULT_MAX_ACQUIRE_ATTEMPTS,
             },
             scraper_addon_url: None,
             scraper_proxy_url: None,
-            acquire_dead_timeout_secs: 600,
+            acquire_dead_timeout_secs: DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS,
         }
     }
 
@@ -431,13 +446,13 @@ impl AcquisitionConfig {
                 .parse::<u64>()
                 .unwrap_or_else(|_| {
                     warn!(
-                        "Invalid ACQUIRE_DEAD_TIMEOUT_SECS value '{}', falling back to 600",
-                        s
+                        "Invalid ACQUIRE_DEAD_TIMEOUT_SECS value '{}', falling back to {}",
+                        s, DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS
                     );
-                    600
+                    DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS
                 })
-                .max(120),
-            None => 600,
+                .max(MIN_ACQUIRE_DEAD_TIMEOUT_SECS),
+            None => DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS,
         }
     }
 }
@@ -678,14 +693,14 @@ impl Config {
         {
             Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
                 warn!(
-                    "Invalid SCAN_INTERVAL_SECS value '{}', falling back to 60",
-                    s
+                    "Invalid SCAN_INTERVAL_SECS value '{}', falling back to {}",
+                    s, DEFAULT_SCAN_INTERVAL_SECS
                 );
-                60
+                DEFAULT_SCAN_INTERVAL_SECS
             }),
-            None => 60,
+            None => DEFAULT_SCAN_INTERVAL_SECS,
         }
-        .max(10); // Enforce minimum 10s to avoid hammering the provider API.
+        .max(MIN_SCAN_INTERVAL_SECS); // Enforce a floor to avoid hammering the provider API.
 
         // Trim + treat blank as unset (consistent with the other env knobs — a quoted/whitespace
         // `DB_PATH` from compose YAML, or an empty `DB_PATH=`, falls back to the default rather than
@@ -700,8 +715,9 @@ impl Config {
         let (port, port_fell_back) = resolve_port(port_raw.as_deref());
         if port_fell_back {
             warn!(
-                "Invalid PORT value '{}', falling back to 8080",
-                port_raw.as_deref().unwrap_or("").trim()
+                "Invalid PORT value '{}', falling back to {}",
+                port_raw.as_deref().unwrap_or("").trim(),
+                DEFAULT_PORT
             );
         }
 
@@ -1143,6 +1159,13 @@ mod tests {
         assert_eq!(parse_lookback("6mo"), Some(6 * 30 * 86_400));
         assert_eq!(parse_lookback("3MO"), Some(3 * 30 * 86_400)); // case-insensitive
         assert_eq!(parse_lookback("garbage"), None); // unparseable → all-time
+                                                     // A bare unit with no number (strip_suffix → "") is unparseable → all-time, not a panic.
+        assert_eq!(parse_lookback("d"), None);
+        assert_eq!(parse_lookback("w"), None);
+        assert_eq!(parse_lookback("mo"), None);
+        // A negative number can't parse as u64 → all-time (never a startup failure).
+        assert_eq!(parse_lookback("-5"), None);
+        assert_eq!(parse_lookback("-5d"), None);
     }
 
     #[test]
