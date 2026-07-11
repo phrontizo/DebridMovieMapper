@@ -437,8 +437,17 @@ impl AcquisitionEngine {
         // would be `add_magnet`'d (a DUPLICATE torrent) even though a lower-ranked owned+present
         // candidate exists. A transient listing failure (inner `None`) preserves the old idempotent
         // behaviour (treat an owned record as present) rather than re-adding on a listing blip.
+        //
+        // Cache each candidate's owned-ness as we read it so the add loop below need not re-issue the
+        // same `get_owned` (a spawn_blocking redb read) for every candidate — the pre-scan visits
+        // every candidate before the add loop runs unless it short-circuits on an owned+present hit
+        // first, so the cache is complete by the time the add loop consults it.
+        let mut owned_cache: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
         for cand in &top_candidates {
-            if self.store.get_owned(cand.info_hash.clone()).await.is_some() {
+            let is_owned = self.store.get_owned(cand.info_hash.clone()).await.is_some();
+            owned_cache.insert(cand.info_hash.clone(), is_owned);
+            if is_owned {
                 if present.is_none() {
                     present = Some(self.provider.get_torrents().await.ok().map(|ts| {
                         ts.iter()
@@ -461,7 +470,9 @@ impl AcquisitionEngine {
         }
 
         for cand in top_candidates.into_iter() {
-            if self.store.get_owned(cand.info_hash.clone()).await.is_some() {
+            // Reuse the pre-scan's owned lookup rather than re-reading redb (defensive `unwrap_or`:
+            // the pre-scan visited every candidate before reaching here, so this is always populated).
+            if owned_cache.get(&cand.info_hash).copied().unwrap_or(false) {
                 if present.is_none() {
                     present = Some(self.provider.get_torrents().await.ok().map(|ts| {
                         ts.iter()
