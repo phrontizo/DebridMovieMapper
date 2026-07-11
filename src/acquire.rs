@@ -426,7 +426,41 @@ impl AcquisitionEngine {
         // Option = "fetched?", inner = "fetch succeeded?". Used to distinguish "already acquired"
         // from a lapsed/externally-deleted owned record that must be RE-added.
         let mut present: Option<Option<std::collections::HashSet<String>>> = None;
-        for cand in ranked.into_iter().take(self.max_attempts as usize) {
+        let top_candidates: Vec<_> = ranked
+            .into_iter()
+            .take(self.max_attempts as usize)
+            .collect();
+
+        // Order-independent idempotency pre-scan: if ANY ranked candidate is already owned AND
+        // confirmed present on the provider, this title is already acquired — short-circuit
+        // regardless of rank order. Without this, a higher-ranked NON-owned candidate iterated first
+        // would be `add_magnet`'d (a DUPLICATE torrent) even though a lower-ranked owned+present
+        // candidate exists. A transient listing failure (inner `None`) preserves the old idempotent
+        // behaviour (treat an owned record as present) rather than re-adding on a listing blip.
+        for cand in &top_candidates {
+            if self.store.get_owned(cand.info_hash.clone()).await.is_some() {
+                if present.is_none() {
+                    present = Some(self.provider.get_torrents().await.ok().map(|ts| {
+                        ts.iter()
+                            .map(|t| t.hash.to_ascii_lowercase())
+                            .collect::<std::collections::HashSet<String>>()
+                    }));
+                }
+                let owned_present = match present.as_ref().expect("just fetched") {
+                    Some(p) => p.contains(&cand.info_hash.to_ascii_lowercase()),
+                    None => true, // listing unavailable → keep the old idempotent behaviour
+                };
+                if owned_present {
+                    debug!(
+                        "acquire: tmdb {} — {} already owned + present (idempotent, no re-add)",
+                        req.tmdb_id, cand.info_hash
+                    );
+                    return AcquireOutcome::Acquired(cand.info_hash.clone());
+                }
+            }
+        }
+
+        for cand in top_candidates.into_iter() {
             if self.store.get_owned(cand.info_hash.clone()).await.is_some() {
                 if present.is_none() {
                     present = Some(self.provider.get_torrents().await.ok().map(|ts| {
@@ -1723,6 +1757,52 @@ mod tests {
             rec.provenance.has_manual_entry(),
             "the manual provenance must be preserved"
         );
+    }
+
+    #[tokio::test]
+    async fn acquire_short_circuits_on_a_lower_ranked_owned_present_candidate() {
+        // ACQ1 regression: a higher-ranked NON-owned candidate is scraped FIRST, but a lower-ranked
+        // candidate is already owned AND present. acquire must short-circuit as Acquired(owned)
+        // regardless of rank order — NOT add_magnet the higher-ranked one as a DUPLICATE.
+        let st = store();
+        st.put_owned(
+            "h_owned".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: 1,
+                status: OwnedStatus::Verified,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        // h_new ranks higher (BluRay source tier > the default's unknown tier); the provider lists
+        // ONLY h_owned as present, not h_new.
+        let h_new = RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "Movie.2023.1080p.BluRay.x265\nRD+".into(),
+            info_hash: "h_new".into(),
+            file_idx: Some(0),
+            file_name: Some("Movie.2023.1080p.BluRay.x265.mkv".into()),
+        };
+        let eng = engine(
+            provider_returning("downloaded", "h_owned"),
+            Arc::new(MockScraper {
+                candidates: vec![h_new, cand("h_owned", true)],
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        assert_eq!(
+            eng.acquire(req(), Provenance::manual()).await,
+            AcquireOutcome::Acquired("h_owned".into()),
+            "must short-circuit on the owned+present candidate, not add the higher-ranked h_new"
+        );
+        let rec = st.get_owned("h_owned".into()).await.expect("record kept");
+        assert_eq!(rec.added_at, 1, "no spurious re-add of the owned record");
     }
 
     #[tokio::test]
