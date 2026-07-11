@@ -70,7 +70,9 @@ fn is_archive_part(path: &str) -> bool {
 }
 
 fn is_archive_file(path: &str) -> bool {
-    let lower = path.to_lowercase();
+    // ASCII lowercasing: the extensions/keywords compared are all ASCII, so full-Unicode folding
+    // is unnecessary work on this per-file hot path (`build` re-runs every scan tick).
+    let lower = path.to_ascii_lowercase();
     ARCHIVE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) || is_archive_part(&lower)
 }
 
@@ -953,7 +955,11 @@ const EXCLUDED_DIRS: &[&str] = &[
 ];
 
 pub fn is_video_file(path: &str) -> bool {
-    let lower = path.to_lowercase();
+    // ASCII lowercasing: the extensions/keywords/episode codes matched below are all ASCII, so
+    // full-Unicode folding is needless work on this per-file hot path (`build` re-runs every scan
+    // tick, calling this multiple times per file). A non-ASCII title char can't be part of any
+    // ASCII pattern either way, so the classification is unchanged.
+    let lower = path.to_ascii_lowercase();
     let filename = lower.rsplit('/').next().unwrap_or(&lower);
     // The filename stem (video extension stripped) — used by the leading-keyword/episode/promo checks.
     let stem = VIDEO_EXTENSIONS
