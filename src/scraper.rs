@@ -146,6 +146,13 @@ fn hash_idx_from_url(url: &str) -> Option<(String, Option<usize>)> {
     Some((hash, idx))
 }
 
+/// Whether a 4xx status from the addon indicates a PERMANENT config problem (misconfigured URL /
+/// revoked provider token) worth a distinct operator warning — as opposed to a transient 429
+/// rate-limit. `404` is handled earlier as "no streams" and never reaches this predicate.
+fn is_config_error_status(status: reqwest::StatusCode) -> bool {
+    status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
 /// Parse a Stremio stream response into raw candidates. Uses the explicit `infoHash` field when
 /// present (public Torrentio); otherwise recovers the hash from a debrid-resolved `url`
 /// (debrid-keyed Torrentio). Streams with neither are skipped.
@@ -234,7 +241,7 @@ impl Scraper for TorrentioScraper {
         // or a revoked provider token — not the transient 429/5xx the retry-next-tick is meant for.
         // It still surfaces as an error (so the engine doesn't silently see zero candidates), but warn
         // distinctly so the operator can tell a config problem apart from a transient upstream blip.
-        if resp.status().is_client_error() {
+        if is_config_error_status(resp.status()) {
             warn!(
                 "scrape: addon returned {} for {} — misconfigured SCRAPER_ADDON_URL or revoked provider token?",
                 resp.status(),
@@ -574,6 +581,13 @@ mod tests {
             .find("tt1", MediaKind::Movie, None, None)
             .await
             .is_err());
+        // 429 = transient rate-limit → Err (retriable), and NOT a config error (must not warn
+        // "misconfigured/revoked token").
+        let s429 = s(spawn_status_server("429 Too Many Requests", "").await);
+        assert!(s429
+            .find("tt1", MediaKind::Movie, None, None)
+            .await
+            .is_err());
         // 200 with valid stream JSON → parses the candidate.
         let s200 = s(spawn_status_server(
             "200 OK",
@@ -589,5 +603,19 @@ mod tests {
             cands[0].info_hash,
             "abcdef0123456789abcdef0123456789abcdef01"
         );
+    }
+
+    #[test]
+    fn is_config_error_status_excludes_429_and_5xx() {
+        use reqwest::StatusCode;
+        // Permanent config errors → warn-worthy.
+        assert!(is_config_error_status(StatusCode::BAD_REQUEST));
+        assert!(is_config_error_status(StatusCode::UNAUTHORIZED));
+        assert!(is_config_error_status(StatusCode::FORBIDDEN));
+        // Transient / non-config → NOT warn-worthy.
+        assert!(!is_config_error_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!is_config_error_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!is_config_error_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!is_config_error_status(StatusCode::OK));
     }
 }
