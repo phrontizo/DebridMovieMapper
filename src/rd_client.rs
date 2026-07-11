@@ -1045,6 +1045,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fetch_with_retry_surfaces_synthetic_502_after_decode_cap() {
+        // A 200 whose body never decodes into T is a schema change that won't fix itself on retry.
+        // After the 2-failure decode cap the loop clears `last_error` and must surface the synthetic
+        // 502 (not panic, not a stale prior status) — and it must stop at exactly 2 requests even when
+        // the budget is larger, so the latency-sensitive resolve path fast-fails rather than burning
+        // the whole budget on a permanent format change.
+        let (url, count) = spawn_counting("HTTP/1.1 200 OK", "not valid json").await;
+        let client = RealDebridClient::new("fake".to_string()).unwrap();
+        let r: Result<serde_json::Value, _> = client
+            .fetch_with_retry_n(|| client.client.get(&url), &[], 5)
+            .await;
+        let err = r.expect_err("a persistently-undecodable 200 must surface as an error");
+        assert_eq!(
+            err.status(),
+            Some(reqwest::StatusCode::BAD_GATEWAY),
+            "a persistent decode failure must surface as the synthetic 502"
+        );
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the 2-failure decode cap stops the loop before the 5-attempt budget"
+        );
+    }
+
     /// Loopback server that returns a non-empty torrents page for `page=1` and an empty array for
     /// every later page, optionally failing one specific page with a 500. Returns (base_url, count).
     async fn spawn_paged_torrents(
