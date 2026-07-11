@@ -45,7 +45,10 @@ static STOP_RE: LazyLock<Regex> = LazyLock::new(|| {
     // The resolution alternatives accept an optional 2-3 digit framerate suffix
     // (`1080p60`/`2160p50`) so a framerate-glued quality tag still truncates the title rather than
     // leaking into the TMDB query — mirroring the same fix on `release::RES_RE`.
-    Regex::new(r"(?i)\b(1080p(?:\d{2,3})?|720p(?:\d{2,3})?|2160p(?:\d{2,3})?|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d+x\d+|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web-dl|h264|h265|x264|x265|remux|vff|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack)\b").unwrap()
+    // NB: the `WxH` resolution alternative is bounded to `\d{3,4}x\d{3,4}` (e.g. 1920x1080, 720x480)
+    // rather than an unbounded `\d+x\d+`. An unbounded form consumed a movie literally named `10x10`
+    // as a leftmost-match truncation point, collapsing the title to its trailing year.
+    Regex::new(r"(?i)\b(1080p(?:\d{2,3})?|720p(?:\d{2,3})?|2160p(?:\d{2,3})?|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d{3,4}x\d{3,4}|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web-dl|h264|h265|x264|x265|remux|vff|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack)\b").unwrap()
 });
 
 static YEAR_RANGE_RE: LazyLock<Regex> =
@@ -54,7 +57,7 @@ static YEAR_RANGE_RE: LazyLock<Regex> =
 // Word-anchored show markers. The looser alternatives are bounded so a movie filename does not
 // trip them: `\b\d{1,2}x\d{2,3}\b` (episode form like 1x01) excludes a resolution such as
 // 1920x1080 (via the 1-2-digit first number) AND an aspect-ratio tag such as 16x9 / 4x3 / 21x9
-// (via requiring a ZERO-PADDED ≥2-digit episode number — a real NxM episode is 1x01, not 1x9),
+// (via requiring a ≥2-digit second number — a real NxM episode is 1x01, not 1x9),
 // and `\be\d{1,3}\b` (episode marker E05) excludes embedded matches like the `e7` in "Se7en". The
 // SxxExx alternative is leading-`\b`-anchored but intentionally NOT trailing-anchored, so
 // contiguous multi-episode and version markers (S01E01E02, S01E13v2) still match.
@@ -960,6 +963,18 @@ mod tests {
         assert_eq!(clean_name("Custom").0, "Custom");
         // Normal trailing-metadata stripping is unaffected.
         assert_eq!(clean_name("The Matrix 1080p").0, "The Matrix");
+    }
+
+    #[test]
+    fn clean_name_keeps_an_nxm_titled_movie() {
+        // "10x10" (2018) must survive: the resolution-form STOP_RE alternative is bounded to
+        // \d{3,4}x\d{3,4}, so an unbounded \d+x\d+ no longer consumes the title as a truncation
+        // point (which had collapsed it to just its year).
+        let (title, year) = clean_name("10x10.2018.1080p.BluRay.mkv");
+        assert_eq!(title, "10x10");
+        assert_eq!(year.as_deref(), Some("2018"));
+        // A genuine WxH resolution token is still stripped.
+        assert_eq!(clean_name("Nosferatu 1920x1080 WEB-DL").0, "Nosferatu");
     }
 
     #[test]
