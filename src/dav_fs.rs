@@ -409,20 +409,21 @@ impl ProxiedMediaFile {
                     }
                 }
             }
+            Err(reason @ crate::repair::RepairFailure::NotCached(_)) => {
+                // NotCached is the NORMAL lapsed-cache outcome: the torrent is being re-downloaded
+                // and the scan loop will surface it once ready — logging that at warn! on every
+                // cooldown-spaced read of a lapsed file is wrong-level noise. (Matched on the typed
+                // variant rather than a substring of the message, so re-wording can't reclassify it.)
+                tracing::info!(
+                    "Instant repair for {}: {} — leaving to download",
+                    self.name,
+                    reason
+                );
+                Err(FsError::GeneralFailure)
+            }
             Err(reason) => {
-                // "not cached" is the NORMAL lapsed-cache outcome: the torrent is being re-downloaded
-                // and the scan loop will surface it once ready — logging that at error! on every
-                // cooldown-spaced read of a lapsed file is wrong-level noise. Reserve warn! for an
-                // actual repair failure (rate-limited / max-attempts / info-fetch error).
-                if reason.contains("not cached") {
-                    tracing::info!(
-                        "Instant repair for {}: {} — leaving to download",
-                        self.name,
-                        reason
-                    );
-                } else {
-                    tracing::warn!("Instant repair failed for {}: {}", self.name, reason);
-                }
+                // An actual repair failure (rate-limited / max-attempts / info-fetch error).
+                tracing::warn!("Instant repair failed for {}: {}", self.name, reason);
                 Err(FsError::GeneralFailure)
             }
         }

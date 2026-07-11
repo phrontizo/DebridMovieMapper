@@ -29,6 +29,36 @@ pub struct TorrentHealth {
     pub last_repair_trigger: Option<std::time::Instant>,
 }
 
+/// Why an instant-repair attempt did not yield a usable cached replacement. Distinguishes the
+/// NORMAL lapsed-cache outcome (the re-added torrent is (re)downloading — the scan loop surfaces it
+/// once it caches) from an actual failure, so callers can pick the right log level without matching
+/// on a human-readable message.
+#[derive(Debug)]
+pub enum RepairFailure {
+    /// The re-added torrent is not cached yet — it is downloading. Not an error: `dav_fs` logs at
+    /// info level and leaves it to the scan loop.
+    NotCached(String),
+    /// An actual repair failure (rate-limited, max attempts exceeded, a provider info/listing error,
+    /// or a post-repair path mismatch). `dav_fs` logs this at warn level.
+    Failed(String),
+}
+
+impl std::fmt::Display for RepairFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RepairFailure::NotCached(m) | RepairFailure::Failed(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl From<String> for RepairFailure {
+    /// Non-not-cached error strings (from `check_and_begin_repair` / `add_and_select_files`, consumed
+    /// via `?`) are actual failures.
+    fn from(m: String) -> Self {
+        RepairFailure::Failed(m)
+    }
+}
+
 #[derive(Debug)]
 pub struct RepairManager {
     health_status: Arc<RwLock<HashMap<String, TorrentHealth>>>,
@@ -426,7 +456,7 @@ impl RepairManager {
     pub async fn try_instant_repair(
         &self,
         locator: &crate::provider::FileLocator,
-    ) -> Result<crate::provider::FileLocator, String> {
+    ) -> Result<crate::provider::FileLocator, RepairFailure> {
         let torrent_id = locator.torrent_id.as_str();
         let attempt_num = self.check_and_begin_repair(torrent_id).await?;
         info!(
@@ -452,7 +482,7 @@ impl RepairManager {
         &self,
         locator: &crate::provider::FileLocator,
         torrent_id: &str,
-    ) -> Result<crate::provider::FileLocator, String> {
+    ) -> Result<crate::provider::FileLocator, RepairFailure> {
         // Fetch old torrent info to know which files were selected (for re-selection).
         let old_info = match self.provider.get_torrent_info(torrent_id).await {
             Ok(info) => info,
@@ -462,7 +492,10 @@ impl RepairManager {
                 // back). Reset the attempt budget (a transient error is not a broken-file signal),
                 // preserving the cooldown; see `note_transient_repair_failure`.
                 self.note_transient_repair_failure(torrent_id).await;
-                return Err(format!("Failed to get torrent info: {}", e));
+                return Err(RepairFailure::Failed(format!(
+                    "Failed to get torrent info: {}",
+                    e
+                )));
             }
         };
 
@@ -492,7 +525,10 @@ impl RepairManager {
                     self.cleanup_leaked_torrent(&new_torrent_id).await;
                 }
                 self.note_transient_repair_failure(torrent_id).await;
-                return Err(format!("Failed to get final torrent info: {}", e));
+                return Err(RepairFailure::Failed(format!(
+                    "Failed to get final torrent info: {}",
+                    e
+                )));
             }
         };
 
@@ -531,10 +567,10 @@ impl RepairManager {
                         self.cleanup_leaked_torrent(&new_torrent_id).await;
                     }
                     self.note_transient_repair_failure(torrent_id).await;
-                    Err(format!(
+                    Err(RepairFailure::Failed(format!(
                         "Repaired torrent missing file path {}",
                         locator.file_path
-                    ))
+                    )))
                 }
             }
         } else {
@@ -578,10 +614,10 @@ impl RepairManager {
                 }
             }
 
-            Err(format!(
+            Err(RepairFailure::NotCached(format!(
                 "Torrent not cached (status: {}), needs download",
                 final_info.status
-            ))
+            )))
         }
     }
 
@@ -697,7 +733,7 @@ mod tests {
     /// Compile-time check: try_instant_repair exists with the correct signature.
     #[allow(dead_code)]
     async fn _assert_try_instant_repair_signature(manager: &RepairManager) {
-        let _: Result<crate::provider::FileLocator, String> =
+        let _: Result<crate::provider::FileLocator, RepairFailure> =
             manager.try_instant_repair(&FileLocator::default()).await;
     }
 
@@ -1562,7 +1598,7 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Repair rate limited");
+        assert_eq!(result.unwrap_err().to_string(), "Repair rate limited");
     }
 
     #[tokio::test]
@@ -1590,7 +1626,10 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Maximum repair attempts exceeded");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Maximum repair attempts exceeded"
+        );
 
         // Verify it was marked as Failed
         let health_map = manager.health_status.read().await;
@@ -1624,7 +1663,10 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Repair already in progress");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Repair already in progress"
+        );
     }
 
     #[tokio::test]
@@ -1753,7 +1795,10 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Torrent permanently failed");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Torrent permanently failed"
+        );
     }
 
     #[tokio::test]
