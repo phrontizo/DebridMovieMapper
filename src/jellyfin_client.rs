@@ -387,4 +387,77 @@ mod tests {
         restore("JELLYFIN_API_KEY", prev.1);
         restore("JELLYFIN_RCLONE_MOUNT_PATH", prev.2);
     }
+
+    /// Loopback that replies `fail_status` (empty body) on the first `fail_n` connections, then 200,
+    /// counting every request.
+    async fn spawn_counting_server(
+        fail_status: u16,
+        fail_n: usize,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c2 = counter.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut seen = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                c2.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let status = if seen < fail_n {
+                    seen += 1;
+                    fail_status
+                } else {
+                    200
+                };
+                let head = format!(
+                    "HTTP/1.1 {} STATUS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    status
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{}", addr), counter)
+    }
+
+    fn one_change() -> Vec<VfsChange> {
+        vec![VfsChange {
+            path: "Movies/Example (2020)".to_string(),
+            update_type: UpdateType::Created,
+        }]
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notify_changes_retries_a_transient_503_then_succeeds() {
+        // The send/retry loop is the only nontrivial runtime logic here. A transient 503 must be
+        // retried and recover on the next 200 — two requests total. `start_paused` auto-advances the
+        // NOTIFICATION_DELAY + RETRY_DELAY sleeps so the test is instant.
+        use std::sync::atomic::Ordering;
+        let (url, counter) = spawn_counting_server(503, 1).await;
+        let client = JellyfinClient::new(url, "key".to_string(), "/media".to_string()).unwrap();
+        client.notify_changes(&one_change()).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "a transient 503 then a 200 = two requests"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notify_changes_gives_up_on_a_500_without_retrying() {
+        // A 500 is GiveUp (a retry won't help): exactly one request, no retry storm.
+        use std::sync::atomic::Ordering;
+        let (url, counter) = spawn_counting_server(500, 100).await;
+        let client = JellyfinClient::new(url, "key".to_string(), "/media".to_string()).unwrap();
+        client.notify_changes(&one_change()).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "a 500 is not retried — exactly one request"
+        );
+    }
 }
