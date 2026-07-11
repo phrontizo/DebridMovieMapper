@@ -948,7 +948,15 @@ impl Store {
             out
         })
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            // Mirror `load_all_matches`: log a blocking-read JoinError rather than silently
+            // returning an empty set. These accessors read authoritative, non-regenerable tables
+            // (owned/wanted/selection/trakt_tokens/blacklist); a swallowed failure reads
+            // downstream as "empty" with zero diagnostic and can drive mass re-acquire / wrong
+            // lifecycle decisions.
+            error!("store: blocking read task failed: {e:?}");
+            Default::default()
+        })
     }
 
     // ── authoritative_ids accessors ───────────────────────────────────────────
@@ -1112,7 +1120,15 @@ impl Store {
             out
         })
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            // Mirror `load_all_matches`: log a blocking-read JoinError rather than silently
+            // returning an empty set. These accessors read authoritative, non-regenerable tables
+            // (owned/wanted/selection/trakt_tokens/blacklist); a swallowed failure reads
+            // downstream as "empty" with zero diagnostic and can drive mass re-acquire / wrong
+            // lifecycle decisions.
+            error!("store: blocking read task failed: {e:?}");
+            Default::default()
+        })
     }
 
     /// Remove blacklist entries stamped (`at`) strictly before `cutoff_at` (Unix seconds). The
@@ -1229,7 +1245,15 @@ impl Store {
             out
         })
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            // Mirror `load_all_matches`: log a blocking-read JoinError rather than silently
+            // returning an empty set. These accessors read authoritative, non-regenerable tables
+            // (owned/wanted/selection/trakt_tokens/blacklist); a swallowed failure reads
+            // downstream as "empty" with zero diagnostic and can drive mass re-acquire / wrong
+            // lifecycle decisions.
+            error!("store: blocking read task failed: {e:?}");
+            Default::default()
+        })
     }
 
     // ── trakt_tokens accessors ────────────────────────────────────────────────
@@ -1396,7 +1420,15 @@ impl Store {
             out
         })
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            // Mirror `load_all_matches`: log a blocking-read JoinError rather than silently
+            // returning an empty set. These accessors read authoritative, non-regenerable tables
+            // (owned/wanted/selection/trakt_tokens/blacklist); a swallowed failure reads
+            // downstream as "empty" with zero diagnostic and can drive mass re-acquire / wrong
+            // lifecycle decisions.
+            error!("store: blocking read task failed: {e:?}");
+            Default::default()
+        })
     }
 
     // ── wanted accessors ──────────────────────────────────────────────────────
@@ -1512,7 +1544,15 @@ impl Store {
             out
         })
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            // Mirror `load_all_matches`: log a blocking-read JoinError rather than silently
+            // returning an empty set. These accessors read authoritative, non-regenerable tables
+            // (owned/wanted/selection/trakt_tokens/blacklist); a swallowed failure reads
+            // downstream as "empty" with zero diagnostic and can drive mass re-acquire / wrong
+            // lifecycle decisions.
+            error!("store: blocking read task failed: {e:?}");
+            Default::default()
+        })
     }
 
     // ── selection accessors (SP3) ─────────────────────────────────────────────
@@ -1611,7 +1651,15 @@ impl Store {
             out
         })
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            // Mirror `load_all_matches`: log a blocking-read JoinError rather than silently
+            // returning an empty set. These accessors read authoritative, non-regenerable tables
+            // (owned/wanted/selection/trakt_tokens/blacklist); a swallowed failure reads
+            // downstream as "empty" with zero diagnostic and can drive mass re-acquire / wrong
+            // lifecycle decisions.
+            error!("store: blocking read task failed: {e:?}");
+            Default::default()
+        })
     }
 
     // ── upgrade_checks cursor (SP3) ───────────────────────────────────────────
@@ -1726,7 +1774,12 @@ impl Store {
                 keep
             })
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                // A swallowed JoinError here yields an EMPTY keep-set, which would prune every
+                // title's upgrade cursor. Log it rather than doing that silently.
+                error!("prune_upgrade_checks: owned-keep blocking read task failed: {e:?}");
+                Default::default()
+            })
         };
         tokio::task::spawn_blocking(move || -> usize {
             // As in `prune_blacklist_before`: surface a begin_write/open_table/iter/commit failure
