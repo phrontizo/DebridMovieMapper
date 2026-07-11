@@ -1480,4 +1480,20 @@ mod tests {
         assert!(!fail.success);
         assert!(fail.data.is_none());
     }
+
+    #[test]
+    fn torrent_info_raw_decodes_a_single_object_envelope_and_maps_it() {
+        // torrent_info_raw calls send_data::<TbTorrent>, i.e. it assumes `mylist?id=X` returns `data`
+        // as a SINGLE object (unlike the list endpoint's array). Pin that decode+map path so a
+        // regression (e.g. TorBox returning a one-element array here) is caught in a unit test rather
+        // than only by the live lifecycle test.
+        let env: Envelope<TbTorrent> =
+            serde_json::from_str(&format!(r#"{{"success":true,"data":{}}}"#, MYLIST_ITEM)).unwrap();
+        let t = env.data.expect("single-object data");
+        let info = to_torrent_info(&t);
+        assert_eq!(info.id, "35821241");
+        assert!(!info.hash.is_empty());
+        // A finished download normalises to "downloaded" (see tb_status).
+        assert_eq!(info.status, "downloaded");
+    }
 }

@@ -1613,6 +1613,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acquire_tries_next_candidate_when_add_magnet_fails() {
+        // The top-ranked candidate's add_magnet fails (a provider hiccup / "already queued"); acquire
+        // must fall through to the next-best candidate rather than giving up (the add-fail→continue
+        // path at the top of the candidate loop).
+        let st = store();
+        let h1 = RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "Movie.2023.1080p.REMUX.x265\nRD+".into(), // REMUX tier → ranked FIRST
+            info_hash: "h1".into(),
+            file_idx: Some(0),
+            file_name: Some("Movie.2023.1080p.REMUX.mkv".into()),
+        };
+        let h2 = RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "Movie.2023.1080p.WEB.x265\nRD+".into(),
+            info_hash: "h2".into(),
+            file_idx: Some(0),
+            file_name: Some("Movie.2023.1080p.WEB.mkv".into()),
+        };
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![h1, h2],
+        });
+        let mut info_by_id = std::collections::HashMap::new();
+        info_by_id.insert(
+            "h2".to_string(),
+            TI {
+                id: "h2".into(),
+                hash: "h2".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "Movie.2023.1080p.WEB.mkv".into(),
+                    bytes: 10,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/file".into()],
+                ..Default::default()
+            },
+        );
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            fail_add_magnet_hashes: ["h1".to_string()].into_iter().collect(),
+            torrent_info_by_id: info_by_id,
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            scraper,
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        let out = eng.acquire(req(), Provenance::watchlist("alice")).await;
+        assert_eq!(
+            out,
+            AcquireOutcome::Pending("h2".into()),
+            "falls through to the next candidate after the top candidate's add failure"
+        );
+        assert!(
+            st.get_owned("h2".into()).await.is_some(),
+            "the second candidate is recorded Pending"
+        );
+        assert!(
+            st.get_owned("h1".into()).await.is_none(),
+            "the failed candidate is not recorded owned"
+        );
+    }
+
+    #[tokio::test]
     async fn acquire_idempotent_when_already_owned_and_present() {
         // Owned AND present in the provider listing (provider_returning lists the hash) → idempotent.
         let st = store();

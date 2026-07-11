@@ -120,6 +120,9 @@ pub struct MockProvider {
     /// Torrent ids whose `get_torrent_info` returns a `reqwest::Error` (a transient failure), so a
     /// test can drive `stage_and_verify`'s `Deferred` classification for one specific staged candidate.
     pub fail_info_ids: std::collections::HashSet<String>,
+    /// Infohashes whose `add_magnet` returns a `reqwest::Error`, so a test can drive the acquisition
+    /// engine's "add failed → try the next candidate" fall-through for one specific candidate.
+    pub fail_add_magnet_hashes: std::collections::HashSet<String>,
 }
 
 #[cfg(test)]
@@ -151,10 +154,19 @@ impl DebridProvider for MockProvider {
         Ok(self.torrent_info.clone().unwrap_or_default())
     }
     async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+        let hash = magnet.rsplit("urn:btih:").next().unwrap_or("").to_string();
+        if self.fail_add_magnet_hashes.contains(&hash) {
+            // Drive an immediate URL-parse failure to produce a reqwest::Error without any I/O,
+            // so the acquisition loop takes its "add failed → try next candidate" branch.
+            return reqwest::Client::new()
+                .get("")
+                .send()
+                .await
+                .map(|_| AddMagnetResponse::default());
+        }
         if !self.torrent_info_by_id.is_empty() {
             // Per-candidate mode: id = the magnet's infohash, so each staged candidate resolves to
             // its own `torrent_info_by_id` entry.
-            let hash = magnet.rsplit("urn:btih:").next().unwrap_or("").to_string();
             return Ok(AddMagnetResponse {
                 id: hash,
                 uri: String::new(),
