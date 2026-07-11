@@ -97,6 +97,11 @@ static RES_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(\d{3,4})p(?:\d{2,3})?\b|\b(4k|uhd)\b").unwrap());
 static SIZE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)([\d.]+)\s*(gb|mb)").unwrap());
 static SEED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{1f464}\s*(\d+)").unwrap());
+// The debrid-cached marker (`RD+`/`TB+`) matched as a WORD-BOUNDED token, not a raw substring, so a
+// release name that merely CONTAINS the letters (`Standard+`, `Hard+`, `Record+`) is not mis-flagged
+// as cached — which would rank an uncached release to the top, get it optimistically added, then
+// stall-reaped by `observe`. The `⚡` (U+26A1) emoji marker is checked separately in `parse`.
+static CACHED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(?:rd|tb)\+").unwrap());
 
 // Cam / telesync / telecine / screener / R5 / workprint / pre-DVD markers (the quality floor).
 // NOTE: bare `ts` is handled by `TS_RE` (below), NOT here — `\bts\b` would match the `.ts`/`.m2ts`
@@ -167,13 +172,25 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
     let text = format!("{}\n{}", c.name, c.description);
     let lower = text.to_ascii_lowercase();
 
-    let resolution = RES_RE.captures(&text).and_then(|cap| {
-        if let Some(m) = cap.get(1) {
-            m.as_str().parse::<u16>().ok()
-        } else {
-            Some(2160)
+    // Prefer an explicit `\d{3,4}p` resolution over a bare `4k`/`uhd` tag REGARDLESS of position: a
+    // plain leftmost `captures()` would read a "4K Remastered" tag preceding an actually-`1080p`
+    // release as 2160 (then wrongly exclude it under a 1080 ceiling). Take the first digit resolution
+    // if any; otherwise fall back to a `4k`/`uhd` bareword → 2160.
+    let resolution = {
+        let mut digit_res = None;
+        let mut had_4k = false;
+        for cap in RES_RE.captures_iter(&text) {
+            if let Some(m) = cap.get(1) {
+                if let Ok(r) = m.as_str().parse::<u16>() {
+                    digit_res = Some(r);
+                    break;
+                }
+            } else {
+                had_4k = true;
+            }
         }
-    });
+        digit_res.or(if had_4k { Some(2160) } else { None })
+    };
 
     let codec = if lower.contains("x265") || lower.contains("h265") || lower.contains("hevc") {
         Codec::Hevc
@@ -188,7 +205,7 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
         || lower.contains("dovi")
         || lower.contains(" dv ");
 
-    let cached = lower.contains("rd+") || lower.contains("tb+") || text.contains('\u{26a1}');
+    let cached = CACHED_RE.is_match(&text) || text.contains('\u{26a1}');
 
     let size_bytes = SIZE_RE.captures(&text).and_then(|cap| {
         let n: f64 = cap.get(1)?.as_str().parse().ok()?;
@@ -518,6 +535,36 @@ mod tests {
         assert_eq!(r.seeders, Some(42));
         assert!(r.cached);
         assert_eq!(r.container, Container::Mkv);
+    }
+
+    #[test]
+    fn cached_marker_is_word_bounded_not_a_raw_substring() {
+        // A real RD+/TB+ token (word-bounded) is cached; the ⚡ emoji too.
+        assert!(parse(&raw("X\nRD+ 1080p", "d", "h", None)).cached);
+        assert!(parse(&raw("X\n[TB+] 1080p", "d", "h", None)).cached);
+        assert!(parse(&raw("X\n\u{26a1} 1080p", "d", "h", None)).cached);
+        // But the letters embedded in a longer word must NOT read as cached (was a raw `contains`).
+        assert!(!parse(&raw("Standard+ Edition 1080p", "d", "h", None)).cached);
+        assert!(!parse(&raw("Hard+ 1080p", "d", "h", None)).cached);
+    }
+
+    #[test]
+    fn explicit_digit_resolution_wins_over_a_leading_4k_tag() {
+        // A "4K Remastered" marketing tag preceding an actually-1080p release must NOT read as 2160
+        // (which a leftmost-match would, then wrongly exclude under a 1080 ceiling).
+        assert_eq!(
+            parse(&raw("Movie 4K Remastered 1080p BluRay", "d", "h", None)).resolution,
+            Some(1080)
+        );
+        // A bare 4k/uhd tag with no explicit digit resolution still resolves to 2160.
+        assert_eq!(
+            parse(&raw("Movie 4K UHD BluRay", "d", "h", None)).resolution,
+            Some(2160)
+        );
+        assert_eq!(
+            parse(&raw("Movie 2160p BluRay", "d", "h", None)).resolution,
+            Some(2160)
+        );
     }
 
     #[test]
