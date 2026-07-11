@@ -38,15 +38,22 @@ pub enum RepairFailure {
     /// The re-added torrent is not cached yet — it is downloading. Not an error: `dav_fs` logs at
     /// info level and leaves it to the scan loop.
     NotCached(String),
-    /// An actual repair failure (rate-limited, max attempts exceeded, a provider info/listing error,
-    /// or a post-repair path mismatch). `dav_fs` logs this at warn level.
+    /// A TRANSIENT deferral — the re-add succeeded but hasn't fully settled yet (e.g. the repaired
+    /// torrent is `downloaded` but its `files` list momentarily lacks our path, a ~500ms settle
+    /// blip). Not a genuine failure: the attempt budget was reset and a later read retries, so
+    /// `dav_fs` logs this at info level (like `NotCached`), NOT warn.
+    Deferred(String),
+    /// An actual repair failure (rate-limited, max attempts exceeded, a provider info/listing error).
+    /// `dav_fs` logs this at warn level.
     Failed(String),
 }
 
 impl std::fmt::Display for RepairFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RepairFailure::NotCached(m) | RepairFailure::Failed(m) => write!(f, "{m}"),
+            RepairFailure::NotCached(m) | RepairFailure::Deferred(m) | RepairFailure::Failed(m) => {
+                write!(f, "{m}")
+            }
         }
     }
 }
@@ -567,8 +574,10 @@ impl RepairManager {
                         self.cleanup_leaked_torrent(&new_torrent_id).await;
                     }
                     self.note_transient_repair_failure(torrent_id).await;
-                    Err(RepairFailure::Failed(format!(
-                        "Repaired torrent missing file path {}",
+                    // A settle blip, not a genuine failure (budget reset above, a later read
+                    // retries) — classify as Deferred so `dav_fs` logs it at info, not warn.
+                    Err(RepairFailure::Deferred(format!(
+                        "Repaired torrent missing file path {} (not yet settled)",
                         locator.file_path
                     )))
                 }
@@ -1325,6 +1334,10 @@ mod tests {
         };
         let r = manager.try_instant_repair(&old).await;
         assert!(r.is_err(), "a missing file returns Err for this read");
+        assert!(
+            matches!(r, Err(RepairFailure::Deferred(_))),
+            "a settle-blip path mismatch is a transient DEFERRAL (info-logged), not a hard Failed (warn)"
+        );
         assert!(
             !manager.should_hide_torrent("old_tid").await,
             "an RD new-id path-mismatch must leave the OLD torrent VISIBLE (not trapped Failed/hidden)"

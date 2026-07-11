@@ -423,11 +423,15 @@ impl ProxiedMediaFile {
                     }
                 }
             }
-            Err(reason @ crate::repair::RepairFailure::NotCached(_)) => {
-                // NotCached is the NORMAL lapsed-cache outcome: the torrent is being re-downloaded
-                // and the scan loop will surface it once ready — logging that at warn! on every
-                // cooldown-spaced read of a lapsed file is wrong-level noise. (Matched on the typed
-                // variant rather than a substring of the message, so re-wording can't reclassify it.)
+            Err(
+                reason @ (crate::repair::RepairFailure::NotCached(_)
+                | crate::repair::RepairFailure::Deferred(_)),
+            ) => {
+                // NotCached is the NORMAL lapsed-cache outcome (the torrent is being re-downloaded
+                // and the scan loop will surface it once ready); Deferred is a transient settle blip
+                // that a later read retries. Logging either at warn! on every cooldown-spaced read
+                // is wrong-level noise. (Matched on the typed variant rather than a substring of the
+                // message, so re-wording can't reclassify it.)
                 tracing::info!(
                     "Instant repair for {}: {} — leaving to download",
                     self.name,
