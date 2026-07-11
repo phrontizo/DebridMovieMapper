@@ -1286,17 +1286,26 @@ pub(crate) async fn record_mirror_owned(
                 }
             }
             if let Err(e) = store.remove_authoritative(h.clone()).await {
-                warn!("mirror: failed to remove authoritative id for {} ({})", h, e);
+                warn!(
+                    "mirror: failed to remove authoritative id for {} ({})",
+                    h, e
+                );
             }
             if let Some(slots) = slots_by_hash.get(&h.to_ascii_lowercase()) {
                 for slot in slots {
                     if let Err(e) = store.remove_selection(slot.clone()).await {
-                        warn!("mirror: failed to remove selection slot {} for {} ({})", slot, h, e);
+                        warn!(
+                            "mirror: failed to remove selection slot {} for {} ({})",
+                            slot, h, e
+                        );
                     }
                 }
             }
         }
-        info!("mirror: reaped {} blacklisted phantom owned record(s)", reaped);
+        info!(
+            "mirror: reaped {} blacklisted phantom owned record(s)",
+            reaped
+        );
     }
     let mut recorded = 0usize;
     for (info, metadata) in current_data {
@@ -1326,17 +1335,26 @@ pub(crate) async fn record_mirror_owned(
             MediaKind::Movie => Vec::new(),
         };
         // Best-effort IMDB resolution (cached per title) so the upgrade engine can re-scrape it.
-        let imdb_id = match imdb_cache.entry((media_type.clone(), tmdb_id)) {
-            std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let resolved = tmdb
-                    .external_imdb_id(tmdb_id, media_type.clone())
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                e.insert(resolved).clone()
-            }
+        // Cache only a DEFINITIVE answer (a real id, or a confirmed "no IMDB id"): a TRANSIENT TMDB
+        // failure must NOT poison the cache with "", which would degrade every remaining torrent of
+        // this title in the pass to non-upgradeable. On a transient error, use "" for this record
+        // only and leave the cache vacant so a later torrent of the same title can retry.
+        let imdb_id = match imdb_cache.get(&(media_type.clone(), tmdb_id)) {
+            Some(cached) => cached.clone(),
+            None => match tmdb.external_imdb_id(tmdb_id, media_type.clone()).await {
+                Ok(opt) => {
+                    let resolved = opt.unwrap_or_default();
+                    imdb_cache.insert((media_type.clone(), tmdb_id), resolved.clone());
+                    resolved
+                }
+                Err(e) => {
+                    debug!(
+                        "mirror: IMDB resolution for tmdb {} failed transiently ({}); not caching",
+                        tmdb_id, e
+                    );
+                    String::new()
+                }
+            },
         };
         let rec = OwnedRecord {
             request: AcquireRequest {
@@ -1832,7 +1850,12 @@ pub(crate) async fn dedup_owned(app: &AppState, torrents: &[crate::rd_client::To
             if let Some(slots) = slots_by_hash.get(&h.to_ascii_lowercase()) {
                 for slot in slots {
                     if let Err(e) = app.store.remove_selection(slot.clone()).await {
-                        warn!("dedup: remove selection slot {} for {} failed: {}", slot, short(h), e);
+                        warn!(
+                            "dedup: remove selection slot {} for {} failed: {}",
+                            slot,
+                            short(h),
+                            e
+                        );
                     }
                 }
             }
