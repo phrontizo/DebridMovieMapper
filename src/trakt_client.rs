@@ -187,10 +187,25 @@ impl TraktClientImpl {
     }
 
     /// Limiter-paced send with bounded 429 retry. Returns the raw response so callers can inspect
-    /// the status themselves (`poll_token` treats 400/410/418 as outcomes, not errors).
+    /// the status themselves (`poll_token` treats 400/410/418 as outcomes, not errors). Retries
+    /// transient 5xx/transport errors as well as 429.
     async fn send_with_retry(
         &self,
         make_request: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, AppError> {
+        self.send_with_retry_opts(make_request, true).await
+    }
+
+    /// As `send_with_retry`, but `retry_server_errors == false` retries ONLY 429 (a rate-limit is
+    /// definitely-not-processed → safe to resend), NOT a 5xx/transport error. Used by the OAuth
+    /// refresh grant: its refresh token is SINGLE-USE, so if Trakt processed the grant (rotating the
+    /// token) and THEN the response 5xx'd or the socket dropped, a resend of the now-consumed token
+    /// would return `invalid_grant` (4xx) and wrongly flag the account `needs_reenrolment`. Failing
+    /// fast on the first 5xx/transport error avoids converting that transient blip into re-enrolment.
+    async fn send_with_retry_opts(
+        &self,
+        make_request: impl Fn() -> reqwest::RequestBuilder,
+        retry_server_errors: bool,
     ) -> Result<reqwest::Response, AppError> {
         const MAX_ATTEMPTS: u32 = 5;
         let mut attempt: u32 = 0;
@@ -204,7 +219,8 @@ impl TraktClientImpl {
                     // the same backoff as the 5xx branch — so a flaky network doesn't drop a whole
                     // Trakt sync tick that RD/TorBox (which both retry transport errors) would ride
                     // out. The URL is scrubbed (it can't carry the OAuth token, but stay consistent).
-                    if attempt < MAX_ATTEMPTS {
+                    // Skipped for a non-idempotent request (the refresh grant) — see the doc above.
+                    if retry_server_errors && attempt < MAX_ATTEMPTS {
                         let backoff_ms = 200u64.saturating_mul(1u64 << (attempt - 1).min(5));
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                         continue;
@@ -220,6 +236,7 @@ impl TraktClientImpl {
                     .and_then(|h| h.to_str().ok())
                     .and_then(|s| s.trim().parse::<u64>().ok());
                 self.limiter.record_throttle(retry_after).await;
+                // A 429 is always safe to retry (the request was throttled, NOT processed).
                 if attempt < MAX_ATTEMPTS {
                     continue;
                 }
@@ -230,9 +247,9 @@ impl TraktClientImpl {
             // Retry transient server errors without signalling the rate limiter — a 5xx is not
             // a rate-limit event. Add a short exponential backoff (the limiter is NOT signalled
             // here, so otherwise the retries would fire only ~100ms apart and hammer a flapping
-            // upstream).
+            // upstream). Skipped for a non-idempotent request (the refresh grant).
             if status.is_server_error() {
-                if attempt < MAX_ATTEMPTS {
+                if retry_server_errors && attempt < MAX_ATTEMPTS {
                     let backoff_ms = 200u64.saturating_mul(1u64 << (attempt - 1).min(5));
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     continue;
@@ -298,11 +315,16 @@ impl TraktClient for TraktClientImpl {
 
     async fn refresh(&self, refresh_token: &str) -> Result<TraktTokenResponse, AppError> {
         let body = build_refresh_body(refresh_token, &self.client_id, &self.client_secret);
+        // The refresh token is single-use: do NOT retry a 5xx/transport error (Trakt may have already
+        // processed the grant and rotated the token) — only 429 is retried. See `send_with_retry_opts`.
         let resp = self
-            .send_with_retry(|| {
-                self.request(reqwest::Method::POST, "/oauth/token")
-                    .json(&body)
-            })
+            .send_with_retry_opts(
+                || {
+                    self.request(reqwest::Method::POST, "/oauth/token")
+                        .json(&body)
+                },
+                false,
+            )
             .await?;
         let resp = resp.error_for_status().map_err(AppError::Http)?;
         let v: serde_json::Value = resp.json().await.map_err(AppError::Http)?;
