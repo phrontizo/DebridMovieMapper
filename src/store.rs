@@ -603,14 +603,20 @@ impl Store {
     pub async fn get_match(&self, id: String) -> Option<(TorrentInfo, MediaMetadata)> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let read_txn = db.begin_read().ok()?;
-            let table = read_txn.open_table(MATCHES_TABLE).ok()?;
-            let entry = table.get(id.as_str()).ok()??;
-            serde_json::from_slice::<(TorrentInfo, MediaMetadata)>(entry.value()).ok()
+            let read_txn = Self::read_or_log("get_match begin_read", db.begin_read())?;
+            let table =
+                Self::read_or_log("get_match open_table", read_txn.open_table(MATCHES_TABLE))?;
+            let entry = Self::read_or_log("get_match get", table.get(id.as_str()))??;
+            Self::read_or_log(
+                "get_match deserialise",
+                serde_json::from_slice::<(TorrentInfo, MediaMetadata)>(entry.value()),
+            )
         })
         .await
-        .ok()
-        .flatten()
+        .unwrap_or_else(|e| {
+            error!("get_match: blocking read task failed: {e}");
+            None
+        })
     }
 
     /// Batch-insert identifications. Serialises with the same encoding as before; an
@@ -719,6 +725,21 @@ impl Store {
         }
     }
 
+    /// Log a read error (with `ctx`) and map it to `None`, so a point-lookup accessor distinguishes a
+    /// genuine miss (`Ok(None)`) from a transient begin_read/open_table/get/deserialise failure that a
+    /// bare `.ok()` would silently swallow — a false "absent" on an authoritative table (owned/wanted/
+    /// tokens/selection) can drive a duplicate acquire or a wrong lifecycle decision. Mirrors the
+    /// per-row logging the `all_*` scans already do.
+    fn read_or_log<T, E: std::fmt::Display>(ctx: &str, r: Result<T, E>) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                error!("{ctx}: {e}");
+                None
+            }
+        }
+    }
+
     // ── owned_hashes accessors ────────────────────────────────────────────────
 
     pub async fn put_owned(&self, hash: String, rec: OwnedRecord) -> Result<(), AppError> {
@@ -799,14 +820,19 @@ impl Store {
         let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let txn = db.begin_read().ok()?;
-            let table = txn.open_table(OWNED_TABLE).ok()?;
-            let e = table.get(hash.as_str()).ok()??;
-            serde_json::from_slice::<OwnedRecord>(e.value()).ok()
+            let txn = Self::read_or_log("get_owned begin_read", db.begin_read())?;
+            let table = Self::read_or_log("get_owned open_table", txn.open_table(OWNED_TABLE))?;
+            let e = Self::read_or_log("get_owned get", table.get(hash.as_str()))??;
+            Self::read_or_log(
+                "get_owned deserialise",
+                serde_json::from_slice::<OwnedRecord>(e.value()),
+            )
         })
         .await
-        .ok()
-        .flatten()
+        .unwrap_or_else(|e| {
+            error!("get_owned: blocking read task failed: {e}");
+            None
+        })
     }
 
     pub async fn set_owned_status(
@@ -962,14 +988,20 @@ impl Store {
     pub async fn authoritative_meta(&self, hash: String) -> Option<crate::vfs::MediaMetadata> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let txn = db.begin_read().ok()?;
-            let table = txn.open_table(AUTH_TABLE).ok()?;
-            let e = table.get(hash.as_str()).ok()??;
-            serde_json::from_slice::<crate::vfs::MediaMetadata>(e.value()).ok()
+            let txn = Self::read_or_log("authoritative_meta begin_read", db.begin_read())?;
+            let table =
+                Self::read_or_log("authoritative_meta open_table", txn.open_table(AUTH_TABLE))?;
+            let e = Self::read_or_log("authoritative_meta get", table.get(hash.as_str()))??;
+            Self::read_or_log(
+                "authoritative_meta deserialise",
+                serde_json::from_slice::<crate::vfs::MediaMetadata>(e.value()),
+            )
         })
         .await
-        .ok()
-        .flatten()
+        .unwrap_or_else(|e| {
+            error!("authoritative_meta: blocking read task failed: {e}");
+            None
+        })
     }
 
     pub async fn remove_authoritative(&self, hash: String) -> Result<(), AppError> {
@@ -1299,14 +1331,22 @@ impl Store {
     pub async fn get_trakt_tokens(&self, slug: String) -> Option<TraktTokens> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let txn = db.begin_read().ok()?;
-            let table = txn.open_table(TRAKT_TOKENS_TABLE).ok()?;
-            let e = table.get(slug.as_str()).ok()??;
-            serde_json::from_slice::<TraktTokens>(e.value()).ok()
+            let txn = Self::read_or_log("get_trakt_tokens begin_read", db.begin_read())?;
+            let table = Self::read_or_log(
+                "get_trakt_tokens open_table",
+                txn.open_table(TRAKT_TOKENS_TABLE),
+            )?;
+            let e = Self::read_or_log("get_trakt_tokens get", table.get(slug.as_str()))??;
+            Self::read_or_log(
+                "get_trakt_tokens deserialise",
+                serde_json::from_slice::<TraktTokens>(e.value()),
+            )
         })
         .await
-        .ok()
-        .flatten()
+        .unwrap_or_else(|e| {
+            error!("get_trakt_tokens: blocking read task failed: {e}");
+            None
+        })
     }
 
     pub async fn remove_trakt_tokens(&self, slug: String) -> Result<(), AppError> {
@@ -1403,14 +1443,19 @@ impl Store {
         let key = wanted_key(&user, &media_type, tmdb_id);
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let txn = db.begin_read().ok()?;
-            let table = txn.open_table(WANTED_TABLE).ok()?;
-            let e = table.get(key.as_str()).ok()??;
-            serde_json::from_slice::<WantedRecord>(e.value()).ok()
+            let txn = Self::read_or_log("get_wanted begin_read", db.begin_read())?;
+            let table = Self::read_or_log("get_wanted open_table", txn.open_table(WANTED_TABLE))?;
+            let e = Self::read_or_log("get_wanted get", table.get(key.as_str()))??;
+            Self::read_or_log(
+                "get_wanted deserialise",
+                serde_json::from_slice::<WantedRecord>(e.value()),
+            )
         })
         .await
-        .ok()
-        .flatten()
+        .unwrap_or_else(|e| {
+            error!("get_wanted: blocking read task failed: {e}");
+            None
+        })
     }
 
     pub async fn remove_wanted(
@@ -1504,14 +1549,20 @@ impl Store {
     pub async fn get_selection(&self, slot: String) -> Option<SelectionEntry> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let txn = db.begin_read().ok()?;
-            let table = txn.open_table(SELECTION_TABLE).ok()?;
-            let e = table.get(slot.as_str()).ok()??;
-            serde_json::from_slice::<SelectionEntry>(e.value()).ok()
+            let txn = Self::read_or_log("get_selection begin_read", db.begin_read())?;
+            let table =
+                Self::read_or_log("get_selection open_table", txn.open_table(SELECTION_TABLE))?;
+            let e = Self::read_or_log("get_selection get", table.get(slot.as_str()))??;
+            Self::read_or_log(
+                "get_selection deserialise",
+                serde_json::from_slice::<SelectionEntry>(e.value()),
+            )
         })
         .await
-        .ok()
-        .flatten()
+        .unwrap_or_else(|e| {
+            error!("get_selection: blocking read task failed: {e}");
+            None
+        })
     }
 
     pub async fn remove_selection(&self, slot: String) -> Result<(), AppError> {
@@ -1647,15 +1698,26 @@ impl Store {
                             for entry in iter {
                                 let v = match entry {
                                     Ok((_, v)) => v,
-                                    Err(_) => continue,
+                                    // Log a row-read error rather than silently dropping the row from
+                                    // the keep-set (matching the `all_*` convention): a corrupt-but-
+                                    // still-owned row omitted here would prune that title's upgrade
+                                    // cursor with no diagnostic.
+                                    Err(e) => {
+                                        error!("prune_upgrade_checks: owned row read failed: {e}");
+                                        continue;
+                                    }
                                 };
-                                if let Ok(view) = serde_json::from_slice::<OwnedKeyView>(v.value())
-                                {
-                                    let media_type = media_kind_to_type(view.request.kind);
-                                    keep.insert(upgrade_check_key(
-                                        &media_type,
-                                        view.request.tmdb_id,
-                                    ));
+                                match serde_json::from_slice::<OwnedKeyView>(v.value()) {
+                                    Ok(view) => {
+                                        let media_type = media_kind_to_type(view.request.kind);
+                                        keep.insert(upgrade_check_key(
+                                            &media_type,
+                                            view.request.tmdb_id,
+                                        ));
+                                    }
+                                    Err(e) => error!(
+                                        "prune_upgrade_checks: owned row deserialise failed: {e}"
+                                    ),
                                 }
                             }
                         }
