@@ -766,7 +766,7 @@ pub async fn sync_trakt(
     let mut summary = SyncSummary::default();
     for (slug, tokens) in store.all_trakt_tokens().await {
         summary.enrolled += 1;
-        if let Err(e) = sync_trakt_user(
+        let outcome = sync_trakt_user(
             trakt,
             tmdb,
             store,
@@ -780,48 +780,68 @@ pub async fn sync_trakt(
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]),
         )
-        .await
-        {
-            warn!(
-                "Trakt sync failed for {}: {}; flagging account for re-enrolment",
-                slug, e
-            );
-            // A successful refresh inside sync_trakt_user persists a fresh (single-use) token before a
-            // later read can fail; re-read so we don't clobber it with the stale pre-refresh snapshot.
-            // If the account is GONE (the operator clicked "Remove" on the enrolment page since this
-            // pass snapshotted the token list), do NOT resurrect it from the stale snapshot — skip.
-            let Some(current) = store.get_trakt_tokens(slug.clone()).await else {
-                // The account was removed since this pass snapshotted the token list — don't
-                // resurrect it from the stale snapshot.
-                continue;
-            };
-            // Flip ONLY the flag via the same refresh-keyed compare-and-swap the refresh paths use
-            // (`update_trakt_tokens_if_refresh_matches`). A blind `put_trakt_tokens` here would
-            // resurrect an account removed — or clobber a token rotated by a concurrent `/refresh` —
-            // in the get→write window; the CAS makes both a no-op. Setting the flag never rotates
-            // `refresh`, so keying on `current.refresh` is safe.
-            if let Err(pe) = store
-                .update_trakt_tokens_if_refresh_matches(
-                    slug.clone(),
-                    current.refresh.clone(),
-                    |c| {
-                        c.needs_reenrolment = true;
-                    },
-                )
-                .await
-            {
-                error!("Failed to persist re-enrolment flag for account: {}", pe);
+        .await;
+        match outcome {
+            // Only a genuine materialisation counts toward `succeeded` (→ `removals_trustworthy`).
+            Ok(UserSync::Synced) => summary.succeeded += 1,
+            // A concurrent token rotation won the refresh CAS, or the account was removed mid-cycle:
+            // nothing was materialised, so it is neither a failure (don't flag) nor a confirmation
+            // (don't count) — leaving an unconfirmed `wanted` set out of the trustworthy tally.
+            Ok(UserSync::Skipped) => {}
+            Err(e) => {
+                warn!(
+                    "Trakt sync failed for {}: {}; flagging account for re-enrolment",
+                    slug, e
+                );
+                // A successful refresh inside sync_trakt_user persists a fresh (single-use) token before a
+                // later read can fail; re-read so we don't clobber it with the stale pre-refresh snapshot.
+                // If the account is GONE (the operator clicked "Remove" on the enrolment page since this
+                // pass snapshotted the token list), do NOT resurrect it from the stale snapshot — skip.
+                let Some(current) = store.get_trakt_tokens(slug.clone()).await else {
+                    // The account was removed since this pass snapshotted the token list — don't
+                    // resurrect it from the stale snapshot.
+                    continue;
+                };
+                // Flip ONLY the flag via the same refresh-keyed compare-and-swap the refresh paths use
+                // (`update_trakt_tokens_if_refresh_matches`). A blind `put_trakt_tokens` here would
+                // resurrect an account removed — or clobber a token rotated by a concurrent `/refresh` —
+                // in the get→write window; the CAS makes both a no-op. Setting the flag never rotates
+                // `refresh`, so keying on `current.refresh` is safe.
+                if let Err(pe) = store
+                    .update_trakt_tokens_if_refresh_matches(
+                        slug.clone(),
+                        current.refresh.clone(),
+                        |c| {
+                            c.needs_reenrolment = true;
+                        },
+                    )
+                    .await
+                {
+                    error!("Failed to persist re-enrolment flag for account: {}", pe);
+                }
             }
-        } else {
-            summary.succeeded += 1;
         }
     }
     summary
 }
 
+/// Outcome of syncing one Trakt user (distinct from an `Err`, which flags the account).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserSync {
+    /// The user's `wanted` set was materialised (pruned + written) this cycle — a genuine
+    /// confirmation, so `removals_trustworthy` may rely on it.
+    Synced,
+    /// Nothing was materialised this cycle: a concurrent token rotation won the refresh CAS, or the
+    /// account was removed mid-cycle. A benign no-op — it must NOT count as a confirmed sync, or an
+    /// unconfirmed (possibly stale/empty) `wanted` set could be treated as trustworthy for removals.
+    Skipped,
+}
+
 /// Sync one user. Returns `Err` (so `sync_trakt` flags the account) on a token-refresh or
 /// Trakt-read failure; a TMDB hiccup is tolerated (it is not a de-auth). All `wanted` writes
 /// happen only after every Trakt fetch has succeeded, so an early error leaves `wanted` intact.
+/// Returns `Ok(UserSync::Synced)` when the `wanted` set was materialised, or `Ok(UserSync::Skipped)`
+/// when a concurrent token rotation / mid-cycle removal made it a no-op (not counted as a sync).
 ///
 /// NOTE: store-write errors (`put_wanted`/`remove_wanted`/`put_trakt_tokens`) also propagate as
 /// `Err` and therefore trigger `needs_reenrolment`; this is intentional and self-healing — the
@@ -837,7 +857,7 @@ async fn sync_trakt_user(
     remove_finished_shows: bool,
     owned_show_ids: &std::collections::HashSet<u64>,
     existing_wanted: &[(crate::vfs::MediaType, u64)],
-) -> Result<(), crate::error::AppError> {
+) -> Result<UserSync, crate::error::AppError> {
     use crate::store::TraktTokens;
     use crate::vfs::MediaType;
 
@@ -860,7 +880,7 @@ async fn sync_trakt_user(
                             "trakt: refresh for '{}' failed on a since-rotated token (concurrent refresh) — skipping this cycle",
                             slug
                         );
-                        return Ok(());
+                        return Ok(UserSync::Skipped);
                     }
                 }
                 return Err(e);
@@ -901,7 +921,7 @@ async fn sync_trakt_user(
             )
             .await?;
         if !applied {
-            return Ok(());
+            return Ok(UserSync::Skipped);
         }
         tokens = new_tokens;
     }
@@ -1092,7 +1112,7 @@ async fn sync_trakt_user(
             .await?;
     }
 
-    Ok(())
+    Ok(UserSync::Synced)
 }
 
 // ── reconcile_wanted (SP2 Task 8) ────────────────────────────────────────────
@@ -4286,6 +4306,88 @@ mod trakt_sync_tests {
         assert!(
             store.get_trakt_tokens("alice".to_string()).await.is_none(),
             "an account removed during refresh must not be resurrected"
+        );
+    }
+
+    #[tokio::test]
+    async fn cas_skip_on_concurrent_rotation_is_not_counted_as_a_successful_sync() {
+        // A near-expiry token triggers refresh; a concurrent /refresh rotates the stored (single-use)
+        // refresh token during the network window, so sync_trakt_user's refresh CAS — keyed on our
+        // pre-refresh token — is a no-op and it returns Skipped WITHOUT materialising `wanted`. That
+        // skip must NOT count toward `succeeded`, or `removals_trustworthy()` would treat an
+        // unconfirmed (possibly stale/empty) wanted set as safe to drive removals.
+        use crate::error::AppError;
+        use crate::trakt_client::{DeviceCode, DeviceTokenPoll, ShowProgress, TraktUser};
+        struct RotatingTrakt {
+            store: Store,
+        }
+        #[async_trait::async_trait]
+        impl TraktClient for RotatingTrakt {
+            async fn refresh(&self, _rt: &str) -> Result<TraktTokenResponse, AppError> {
+                // Concurrent refresh rotates the stored refresh token to a DIFFERENT value, so the
+                // caller's CAS (keyed on the original "ref") will find a mismatch and skip.
+                self.store
+                    .put_trakt_tokens(
+                        "alice".into(),
+                        TraktTokens {
+                            access: "OTHER".into(),
+                            refresh: "ROTATED".into(),
+                            expires_at: 9_999_999_999,
+                            username: "alice".into(),
+                            needs_reenrolment: false,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                Ok(TraktTokenResponse {
+                    access_token: "FRESH".into(),
+                    refresh_token: "NEWREF".into(),
+                    expires_in: 100,
+                    created_at: 2_000,
+                })
+            }
+            async fn device_code(&self) -> Result<DeviceCode, AppError> {
+                unreachable!()
+            }
+            async fn poll_token(&self, _d: &str) -> Result<DeviceTokenPoll, AppError> {
+                unreachable!()
+            }
+            async fn me(&self, _a: &str) -> Result<TraktUser, AppError> {
+                unreachable!()
+            }
+            // Reads must NOT run: the CAS-skip returns before pulling reads.
+            async fn watchlist(&self, _a: &str) -> Result<Vec<TraktItem>, AppError> {
+                unreachable!()
+            }
+            async fn in_progress(&self, _a: &str) -> Result<Vec<TraktItem>, AppError> {
+                unreachable!()
+            }
+            async fn watched(&self, _a: &str) -> Result<WatchedData, AppError> {
+                unreachable!()
+            }
+            async fn show_progress(&self, _a: &str, _t: u64) -> Result<ShowProgress, AppError> {
+                unreachable!()
+            }
+        }
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".into(), tokens("old", 0, false))
+            .await
+            .unwrap();
+        let trakt: Arc<dyn TraktClient> = Arc::new(RotatingTrakt {
+            store: store.clone(),
+        });
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+
+        let summary = sync_trakt(&trakt, &tmdb, &store, None, false).await;
+        assert_eq!(summary.enrolled, 1);
+        assert_eq!(
+            summary.succeeded, 0,
+            "a CAS-skip materialises nothing and must not count as a successful sync"
+        );
+        assert!(
+            !summary.removals_trustworthy(),
+            "an unconfirmed wanted set (only a CAS-skip this cycle) is not trustworthy for removals"
         );
     }
 
