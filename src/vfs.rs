@@ -857,18 +857,20 @@ fn sanitize_filename(name: &str) -> String {
         "" | "." | ".." => return "untitled".to_string(),
         _ => cleaned,
     };
-    // A bare Windows reserved DEVICE name (CON, NUL, COM1…) cannot be created verbatim on Windows/SMB.
-    // These are constructed DIRECTORY names (no extension), so an exact whole-name match is correct
-    // and avoids false-positiving a real title like "Con Air". Suffix so the key is usable there.
-    if is_windows_reserved_name(&cleaned) {
-        return format!("{cleaned}_");
+    // A Windows reserved DEVICE name (CON, NUL, COM1…) cannot be created verbatim on Windows/SMB.
+    // Windows resolves the device from the base name BEFORE the first dot, so a bare `CON` AND a
+    // dotted `Con.Air.1997` (base `Con`) both qualify — suffix the reserved BASE (not the whole
+    // name), else appending at the end wouldn't change the pre-dot base Windows still reads as a
+    // device. A dotless real title like "Con Air"/"Conan" has a non-reserved base and is untouched.
+    if let Some(base) = reserved_base(&cleaned) {
+        return format!("{}_{}", base, &cleaned[base.len()..]);
     }
     cleaned
 }
 
 /// `true` if `name` is exactly a Windows reserved device name (case-insensitive) — these cannot be
 /// used as a file/directory name on Windows/SMB.
-fn is_windows_reserved_name(name: &str) -> bool {
+fn is_reserved_device(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
         "CON"
@@ -894,6 +896,15 @@ fn is_windows_reserved_name(name: &str) -> bool {
             | "LPT8"
             | "LPT9"
     )
+}
+
+/// If `name`'s base (the part before the first dot) is a Windows reserved device name, return that
+/// base; otherwise `None`. Windows resolves `Con.Air.1997` to the CON device from its pre-dot base,
+/// so a dotted name qualifies just as a bare `CON` does. A dotless non-reserved title ("Con Air",
+/// "Conan") — whose whole name is its base — returns `None`.
+fn reserved_base(name: &str) -> Option<&str> {
+    let base = name.split('.').next().unwrap_or(name);
+    is_reserved_device(base).then_some(base)
 }
 
 /// Regex matching filenames that should be excluded from the VFS.
@@ -2425,10 +2436,18 @@ mod tests {
         assert_eq!(sanitize_filename("CON"), "CON_");
         assert_eq!(sanitize_filename("nul"), "nul_");
         assert_eq!(sanitize_filename("Com1"), "Com1_");
+        // ...as is a DOTTED name whose base (before the first dot) is a reserved device — Windows
+        // resolves `Con.Air.1997` to the CON device, so the base itself must be suffixed
+        // (appending at the very end wouldn't change the reserved pre-dot base).
+        assert_eq!(sanitize_filename("Con.Air.1997"), "Con_.Air.1997");
+        assert_eq!(sanitize_filename("Aux.Something"), "Aux_.Something");
+        assert_eq!(sanitize_filename("nul.point"), "nul_.point");
         // ...but a real title that merely contains a reserved word is untouched.
         assert_eq!(sanitize_filename("Con Air"), "Con Air");
         assert_eq!(sanitize_filename("Conan"), "Conan");
         assert_eq!(sanitize_filename("Aux Battements"), "Aux Battements");
+        // A dotted title whose base is NOT a device name is also untouched.
+        assert_eq!(sanitize_filename("G.I. Joe"), "G.I. Joe");
     }
 
     #[test]
