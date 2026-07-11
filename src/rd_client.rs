@@ -621,6 +621,10 @@ impl RealDebridClient {
                                 );
                                 if deserialization_failures >= 2 {
                                     error!("Aborting after {} empty/undecodable RD responses — likely a contract change", deserialization_failures);
+                                    // The undecodable response is the terminating cause; drop any
+                                    // earlier 429/5xx in `last_error` so the surfaced error is the
+                                    // synthetic decode-failure below, not a stale prior status.
+                                    last_error = None;
                                     break;
                                 }
                                 continue;
@@ -652,6 +656,11 @@ impl RealDebridClient {
                                     // the whole budget on a possibly-permanent format change.
                                     if deserialization_failures >= 2 {
                                         error!("Aborting after {} deserialization failures on HTTP 200 — likely a schema change", deserialization_failures);
+                                        // The decode failure is the terminating cause; drop any
+                                        // earlier 429/5xx in `last_error` so the surfaced error is the
+                                        // synthetic decode-failure below (accurate cause), not a stale
+                                        // prior status recorded on an earlier attempt.
+                                        last_error = None;
                                         break;
                                     }
                                 }
