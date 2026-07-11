@@ -2193,8 +2193,13 @@ pub async fn monitor_episodes(
     use std::collections::HashSet;
 
     let today = chrono::Utc::now().date_naive();
-    // TODO(Task 10): the scheduler could pass a shared torrents snapshot to avoid a
-    // duplicate get_torrents() when monitor_episodes and reconcile_wanted run on the same tick.
+    // TODO(Task 10): when the episode-monitor and Trakt-cycle jobs fire on overlapping ticks, this
+    // and reconcile_wanted each independently fetch get_torrents() AND rebuild the owned/wanted
+    // groupings (group_owned_by_tmdb / group_wanted_by_tmdb). They are separate `periodic` tasks at
+    // different cadences (not one shared tick), so a fix means either merging them or a short-lived
+    // shared snapshot cache — deferred, since the overlap is intermittent and the extra provider
+    // round-trip is absorbed by the rate limiter; correctness is unaffected (each re-derives from a
+    // fresh listing).
     let torrents = match provider.get_torrents().await {
         Ok(t) => t,
         Err(e) => {
