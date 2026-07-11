@@ -1630,6 +1630,14 @@ pub(crate) struct DedupPlan {
 /// episodes provided > lexicographically-smallest hash (deterministic). Only groups with at least
 /// one removal are returned. Absent (not-`present`) hashes are ignored entirely — they're already
 /// gone, never a removal target or coverage source.
+///
+/// KNOWN INTERACTION (accepted): `protected` ranks above `quality.score`, so when a title is owned as
+/// both a `quality: None` mirror copy (untagged filename → not upgrade-comparable) AND a lower-priority
+/// engine copy with a known-good quality, the mirror wins the keep slot and the engine copy is removed.
+/// Because the surviving mirror is `quality: None` the daily upgrade engine skips it conservatively, so
+/// this is a one-way quality regression rather than a temporary one. It is deliberate (keep the user's
+/// own library copy over an engine duplicate — see the sort comment below); to re-obtain the better
+/// quality, re-tag/re-add the mirror so it carries a comparable `quality`.
 pub(crate) fn plan_dedup(
     owned: &[(String, OwnedRecord)],
     present: &std::collections::HashSet<String>,
