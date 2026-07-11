@@ -48,7 +48,9 @@ static STOP_RE: LazyLock<Regex> = LazyLock::new(|| {
     // NB: the `WxH` resolution alternative is bounded to `\d{3,4}x\d{3,4}` (e.g. 1920x1080, 720x480)
     // rather than an unbounded `\d+x\d+`. An unbounded form consumed a movie literally named `10x10`
     // as a leftmost-match truncation point, collapsing the title to its trailing year.
-    Regex::new(r"(?i)\b(1080p(?:\d{2,3})?|720p(?:\d{2,3})?|2160p(?:\d{2,3})?|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d{3,4}x\d{3,4}|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web-dl|h264|h265|x264|x265|remux|vff|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack)\b").unwrap()
+    // `web[\s-]?dl` (not just `web-dl`) so the dot form `WEB.DL` — which step-2 dot→space replacement
+    // turns into `WEB DL` — also truncates, rather than leaking `WEB DL` into the TMDB query.
+    Regex::new(r"(?i)\b(1080p(?:\d{2,3})?|720p(?:\d{2,3})?|2160p(?:\d{2,3})?|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d{3,4}x\d{3,4}|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web[\s-]?dl|h264|h265|x264|x265|remux|vff|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack)\b").unwrap()
 });
 
 static YEAR_RANGE_RE: LazyLock<Regex> =
@@ -693,21 +695,35 @@ pub fn is_show_guess(files: &[rd_client::TorrentFile]) -> bool {
 }
 
 pub fn normalize_title(s: &str) -> String {
-    s.to_lowercase()
-        .replace(" and ", " & ") // Standardize 'and' to '&' for comparison
-        .chars()
-        .map(|c| match c {
-            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
-            'è' | 'é' | 'ê' | 'ë' => 'e',
-            'ì' | 'í' | 'î' | 'ï' => 'i',
-            'ò' | 'ó' | 'ô' | 'õ' | 'ö' => 'o',
-            'ù' | 'ú' | 'û' | 'ü' => 'u',
-            'ñ' => 'n',
-            'ç' => 'c',
-            _ => c,
-        })
-        .filter(|c| c.is_alphanumeric())
-        .collect()
+    let lowered = s.to_lowercase().replace(" and ", " & "); // Standardize 'and' to '&' for comparison
+    // Fold accents/ligatures to their ASCII base, then keep only alphanumerics (spaces/punctuation/
+    // the '&' connector are dropped). A manual push loop (rather than `.map().filter()`) so a single
+    // source char can expand to MULTIPLE ASCII chars — `æ`→`ae`, `œ`→`oe`, `ß`→`ss`, `þ`→`th` — which
+    // a 1:1 `char` map cannot express (e.g. `Æon Flux` → `aeonflux` now matches a filename's `aeonflux`).
+    let mut out = String::with_capacity(lowered.len());
+    for c in lowered.chars() {
+        match c {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => out.push('a'),
+            'è' | 'é' | 'ê' | 'ë' => out.push('e'),
+            'ì' | 'í' | 'î' | 'ï' => out.push('i'),
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' => out.push('o'),
+            'ù' | 'ú' | 'û' | 'ü' => out.push('u'),
+            'ý' | 'ÿ' => out.push('y'),
+            'ñ' => out.push('n'),
+            'ç' | 'č' => out.push('c'),
+            'š' => out.push('s'),
+            'ž' => out.push('z'),
+            'ł' => out.push('l'),
+            'ð' => out.push('d'),
+            'þ' => out.push_str("th"),
+            'æ' => out.push_str("ae"),
+            'œ' => out.push_str("oe"),
+            'ß' => out.push_str("ss"),
+            c if c.is_alphanumeric() => out.push(c),
+            _ => {} // drop non-alphanumeric (spaces, punctuation, the '&' connector)
+        }
+    }
+    out
 }
 
 fn is_generic_title(s: &str) -> bool {
@@ -757,6 +773,19 @@ mod tests {
             normalize_title("Tom & Jerry")
         );
         assert_eq!(normalize_title("Tom and Jerry"), "tomjerry");
+    }
+
+    #[test]
+    fn normalize_title_folds_ligatures_and_nordic_letters() {
+        // Multi-char ligatures/letters fold to their ASCII base so a title matches a filename's
+        // ASCII spelling (which a 1:1 char map couldn't do).
+        assert_eq!(normalize_title("Æon Flux"), "aeonflux");
+        assert_eq!(normalize_title("Cœur"), "coeur");
+        assert_eq!(normalize_title("Straße"), "strasse");
+        assert_eq!(normalize_title("Þór"), "thor");
+        assert_eq!(normalize_title("Øystein"), "oystein");
+        assert_eq!(normalize_title("Škoda"), "skoda");
+        assert_eq!(normalize_title("Æon Flux"), normalize_title("Aeon Flux"));
     }
 
     #[tokio::test]
@@ -963,6 +992,14 @@ mod tests {
         assert_eq!(clean_name("Custom").0, "Custom");
         // Normal trailing-metadata stripping is unaffected.
         assert_eq!(clean_name("The Matrix 1080p").0, "The Matrix");
+    }
+
+    #[test]
+    fn clean_name_truncates_at_dot_form_web_dl() {
+        // "WEB.DL" becomes "WEB DL" after dot→space replacement; STOP_RE's web[\s-]?dl truncates it
+        // (the hyphen form already did). Without this the title kept a trailing "WEB DL" fragment.
+        assert_eq!(clean_name("The.Movie.WEB.DL.mkv").0, "The Movie");
+        assert_eq!(clean_name("The.Movie.WEB-DL.mkv").0, "The Movie");
     }
 
     #[test]
