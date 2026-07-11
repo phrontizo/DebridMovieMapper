@@ -23,7 +23,10 @@ where
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TmdbSearchResult {
-    pub id: u32,
+    // `u64` to match every other TMDB id in the codebase (`find_by_imdb`/`details`/`show_status`/
+    // the store/acquire layer all key on `tmdb_id: u64`); a `u32` here was a latent narrowing
+    // footgun at the identification boundary even though real TMDB ids sit far below `u32::MAX`.
+    pub id: u64,
     // `default` so a result missing BOTH `title` and `name` decodes with an empty title (scored 0
     // and harmlessly ignored) instead of failing the whole result page (losing every other result).
     #[serde(default, alias = "name")]
