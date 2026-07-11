@@ -9,16 +9,30 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::{error, warn};
 
+/// Deserialize a possibly-null/absent/mistyped field to its `Default` (TMDB occasionally sends
+/// `popularity: null`; a plain `#[serde(default)]` covers a MISSING key but NOT a present `null`,
+/// which would otherwise fail the whole response decode).
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value::<T>(value).unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct TmdbSearchResult {
     pub id: u32,
-    #[serde(alias = "name")]
+    // `default` so a result missing BOTH `title` and `name` decodes with an empty title (scored 0
+    // and harmlessly ignored) instead of failing the whole result page (losing every other result).
+    #[serde(default, alias = "name")]
     pub title: String,
     #[serde(alias = "original_name", alias = "original_title")]
     pub original_title: Option<String>,
     #[serde(alias = "first_air_date")]
     pub release_date: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub popularity: f64,
     pub vote_average: Option<f64>,
     pub vote_count: Option<u32>,
@@ -585,6 +599,20 @@ mod tests {
         assert_eq!(resp.results.len(), 1);
         assert_eq!(resp.results[0].id, 123);
         assert_eq!(resp.results[0].title, "Test Movie");
+    }
+
+    #[test]
+    fn tmdb_response_tolerates_null_popularity_and_missing_title() {
+        // A present `popularity: null` (or a result missing title/name) must NOT fail the whole
+        // page decode — it defaults, so every other result on the page survives.
+        let json = r#"{"results": [
+            {"id": 1, "title": "Good", "popularity": null},
+            {"id": 2, "popularity": 12.5}
+        ]}"#;
+        let resp: super::TmdbResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.results.len(), 2, "no result lost to a null/missing field");
+        assert_eq!(resp.results[0].popularity, 0.0, "null popularity → default");
+        assert_eq!(resp.results[1].title, "", "missing title → empty (ignored), not a decode error");
     }
 
     #[test]
