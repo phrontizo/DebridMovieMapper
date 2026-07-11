@@ -11,7 +11,7 @@ use async_trait::async_trait;
 /// A movie or show identified by its TMDB id (a watchlist or playback entry). Also carries the
 /// IMDB id Trakt provided (`tt…`), if present, so acquisition can prefer it over re-deriving from
 /// TMDB's (sometimes-incomplete) `external_ids`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TraktItem {
     pub media_type: MediaType,
     pub tmdb_id: u64,
@@ -571,6 +571,9 @@ pub fn parse_playback(v: &serde_json::Value) -> Vec<TraktItem> {
         return Vec::new();
     };
     let mut out: Vec<TraktItem> = Vec::new();
+    // Dedup in first-seen order via a set membership check (O(n)) rather than a linear
+    // `Vec::contains` per item (O(n²)) — a show with many in-progress episodes collapses to one entry.
+    let mut seen: std::collections::HashSet<TraktItem> = std::collections::HashSet::new();
     for e in arr {
         let item = match e.get("type").and_then(|t| t.as_str()) {
             Some("movie") => e.get("movie").and_then(|m| {
@@ -590,7 +593,7 @@ pub fn parse_playback(v: &serde_json::Value) -> Vec<TraktItem> {
             _ => None,
         };
         if let Some(item) = item {
-            if !out.contains(&item) {
+            if seen.insert(item.clone()) {
                 out.push(item);
             }
         }
