@@ -31,7 +31,7 @@ bytes = "1"
 # Already in the tree transitively via tokio/hyper-util; declared explicitly for direct use.
 socket2 = "0.6"
 dotenvy = "0.15"
-rand = "0.9"
+rand = "0.10"
 redb = "3.1"
 thiserror = "2"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }

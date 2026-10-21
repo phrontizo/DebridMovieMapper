@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use crate::ratelimit::MAX_RETRY_AFTER_SECS;
-use rand::Rng;
+use rand::RngExt;
 use reqwest::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;

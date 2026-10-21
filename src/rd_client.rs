@@ -1,5 +1,5 @@
 use crate::ratelimit::{AdaptiveRateLimiter, MAX_RETRY_AFTER_SECS};
-use rand::Rng;
+use rand::RngExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
