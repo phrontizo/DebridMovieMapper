@@ -28,8 +28,9 @@ enum UpgradeSkip {
 
 /// Run one upgrade tick over `app`: re-score a budgeted batch of owned titles. For MOVIES, stage any
 /// cached meaningful upgrade and — if the library is idle — swap selection + prune the old torrent.
-/// For SHOWS, three layered passes: per-episode upgrade/downgrade, over-ceiling season-pack
-/// correction, then full-season consolidation of scattered per-episode torrents into a cached pack.
+/// For SHOWS, four layered passes: per-singleton-episode upgrade/downgrade, upgrade of episodes
+/// served from a within-ceiling multi-episode pack, over-ceiling season-pack correction, then
+/// full-season consolidation of scattered per-episode torrents into a cached pack.
 /// Each title (movie or show) is one budget unit, ordered least-recently-checked first.
 pub async fn run_upgrade_once(app: &AppState) {
     run_upgrade_once_with(app, |tmdb_id, media_type| {
@@ -434,15 +435,95 @@ struct StagedUpgrade {
     slot_files: Vec<(String, String)>,
 }
 
+/// What a swap prunes once its slot(s) are repointed — settled by [`apply_upgrade`] against the
+/// provider listing it fetches just before its final idle check, so a presence-dependent decision
+/// (phase a2's pack prune) is made on the same snapshot the prune itself runs against.
+enum PrunePlan {
+    /// Prune exactly these hashes (movie, singleton episode, over-ceiling pack correction).
+    Hashes(Vec<String>),
+    /// Phase (a2): prune the multi-episode pack only if [`pack_prunable_after_repoint`] holds when
+    /// coverage counts only OTHER records whose torrent is PRESENT ([`PackPrune::resolve`]).
+    Pack(PackPrune),
+}
+
+impl PrunePlan {
+    /// The hashes to prune, given the provider `listing` fetched for this swap.
+    fn resolve(&self, listing: &[crate::rd_client::Torrent]) -> Vec<String> {
+        match self {
+            PrunePlan::Hashes(h) => h.clone(),
+            PrunePlan::Pack(p) => p.resolve(listing),
+        }
+    }
+}
+
+/// The inputs of one phase-(a2) pack-prune decision ([`PrunePlan::Pack`]).
+struct PackPrune {
+    tmdb_id: u64,
+    hash: String,
+    provides: Vec<(u32, u32)>,
+    repointed: (u32, u32),
+    /// Each of the pack's episodes → the hash its selection slot points at.
+    served_by: std::collections::HashMap<(u32, u32), String>,
+    /// `(hash, provides)` of the show's OTHER `Verified` owned records, re-read from the store just
+    /// before the swap ([`other_owned_coverage`]).
+    others: Vec<(String, Vec<(u32, u32)>)>,
+    /// Hashes adopted earlier this tick ([`EpisodeTick::adopted`]): present even while the provider
+    /// listing lags their add.
+    adopted: Vec<String>,
+}
+
+impl PackPrune {
+    /// Prune the pack iff it is prunable once coverage counts only PRESENT other records — in the
+    /// provider `listing`, or adopted earlier this tick. A `Verified`-but-absent record (its torrent
+    /// lapsed off the provider) still names its slot, but the VFS then falls back to whichever present
+    /// torrent holds the episode — typically this pack — so counting it as coverage would delete the
+    /// only present copy of that episode, and nothing would bring it back (no file left to read, so
+    /// no on-read repair; `monitor_episodes` judges availability per title).
+    fn resolve(&self, listing: &[crate::rd_client::Torrent]) -> Vec<String> {
+        let present: std::collections::HashSet<String> = listing
+            .iter()
+            .map(|t| t.hash.to_ascii_lowercase())
+            .chain(self.adopted.iter().map(|h| h.to_ascii_lowercase()))
+            .collect();
+        let covered: Vec<(u32, u32)> = self
+            .others
+            .iter()
+            .filter(|(h, _)| present.contains(&h.to_ascii_lowercase()))
+            .flat_map(|(_, p)| p.iter().copied())
+            .collect();
+        let (s, e) = self.repointed;
+        if pack_prunable_after_repoint(
+            &self.hash,
+            &self.provides,
+            self.repointed,
+            &self.served_by,
+            &covered,
+        ) {
+            debug!(
+                "upgrade: tmdb {} pack {} fully superseded by s{}e{}'s repoint; pruning it",
+                self.tmdb_id, self.hash, s, e
+            );
+            vec![self.hash.clone()]
+        } else {
+            debug!(
+                "upgrade: tmdb {} pack {} kept after s{}e{}'s repoint (still serves an episode, or is the only present holder of one)",
+                self.tmdb_id, self.hash, s, e
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// Shared swap/prune tail used by the movie, per-episode, and pack-correction callers. Idle-gates,
 /// fetches the provider listing ONCE (before the final idle re-check, so there is no network
 /// round-trip between confirming idle and the destructive prune), repoints every slot to the staged
-/// release, then prunes the superseded hashes. Non-destructive rollback on defer: a mid-stage active
-/// read fully deletes the staged torrent + drops its records and leaves the current release intact.
+/// release, then prunes what `prune` resolves to against that listing. Non-destructive rollback on
+/// defer: a mid-stage active read fully deletes the staged torrent + drops its records and leaves
+/// the current release intact.
 async fn apply_upgrade(
     app: &AppState,
     staged: StagedUpgrade,
-    supersede_hashes: &[String],
+    prune: PrunePlan,
     idle_window: Duration,
 ) -> Result<(), UpgradeSkip> {
     // Fetch the provider listing for the prune ONCE, and BEFORE the idle re-check below, so there is
@@ -514,11 +595,11 @@ async fn apply_upgrade(
             )));
         }
     }
-    for old in supersede_hashes {
+    for old in prune.resolve(&listing) {
         if old.eq_ignore_ascii_case(&staged.hash) {
             continue;
         }
-        prune_owned_hash_in(app, old, &listing).await;
+        prune_owned_hash_in(app, &old, &listing).await;
     }
     Ok(())
 }
@@ -744,7 +825,7 @@ async fn try_upgrade_movie(
                         torrent_id: staged.1,
                         slot_files: vec![(movie_slot(tmdb_id), staged.2)],
                     },
-                    &supersede,
+                    PrunePlan::Hashes(supersede),
                     idle_window,
                 )
                 .await?;
@@ -1180,15 +1261,17 @@ async fn stage_and_await_cached(
 /// the target episode), validate the title, and probe the same audio/subtitle gate as acquisition.
 /// On success records the episode `OwnedRecord` (Verified, sticky provenance) + authoritative id and
 /// returns `(hash, torrent_id, file_path)`. On any failure the staged torrent is cleaned up and the
-/// current release is left untouched (non-destructive).
+/// current release is left untouched (non-destructive). A candidate that resolves to MORE than one
+/// distinct episode is added to `multi_episode` ([`EpisodeTick::multi_episode`]): it is rejected
+/// here for every target episode, so the caller skips it for the rest of the tick.
 async fn stage_episode_candidate(
     app: &AppState,
     tmdb_id: u64,
     base_req: &crate::store::AcquireRequest,
     cand: &release::ReleaseInfo,
-    season: u32,
-    episode: u32,
+    (season, episode): (u32, u32),
     group_prov: &crate::store::Provenance,
+    multi_episode: &mut std::collections::HashSet<String>,
 ) -> Result<(String, String, String), UpgradeSkip> {
     let hash = cand.info_hash.clone();
     let (torrent_id, fresh) = stage_and_await_cached(app, &hash).await?;
@@ -1201,6 +1284,14 @@ async fn stage_episode_candidate(
     // is exactly the season-pack churn the `provides` mechanism exists to prevent. The per-episode
     // caller falls through to the next-best candidate on this NoChange (in-tick fall-through).
     if eps.iter().any(|(s, e, _)| *s != season || *e != episode) {
+        // Two or more distinct episodes → rejected for ANY target episode, so remember it. (A
+        // single-episode torrent for a DIFFERENT episode is not remembered: it is that episode's
+        // valid singleton.)
+        let distinct: std::collections::HashSet<(u32, u32)> =
+            eps.iter().map(|(s, e, _)| (*s, *e)).collect();
+        if distinct.len() > 1 {
+            multi_episode.insert(hash.to_ascii_lowercase());
+        }
         let _ = app.provider.delete_torrent(&torrent_id).await;
         return Err(UpgradeSkip::NoChange(
             "multi-episode/season pack; not a per-episode candidate".into(),
@@ -1294,11 +1385,279 @@ async fn stage_episode_candidate(
     Ok((hash, torrent_id, file_path))
 }
 
+/// Pure: may the multi-episode pack `pack_hash` be PRUNED once the slot for `repointed` moves to a
+/// newly-staged release? `served_by` maps each of the pack's episodes to the hash its selection slot
+/// currently points at (an episode with no selection is absent); `other_provides` is the union of
+/// `provides` across the group's OTHER owned records. True only when — treating `repointed` as no
+/// longer served by the pack — the pack serves NO episode slot any more, AND every other episode it
+/// provides is held by another owned record. Otherwise the pack is kept: it still serves an episode,
+/// or deleting it would lose an episode nothing else holds. (`repointed` itself is exempt from the
+/// coverage check: the staged replacement now holds it.)
+fn pack_prunable_after_repoint(
+    pack_hash: &str,
+    pack_provides: &[(u32, u32)],
+    repointed: (u32, u32),
+    served_by: &std::collections::HashMap<(u32, u32), String>,
+    other_provides: &[(u32, u32)],
+) -> bool {
+    let still_serves = pack_provides.iter().any(|ep| {
+        *ep != repointed
+            && served_by
+                .get(ep)
+                .is_some_and(|h| h.eq_ignore_ascii_case(pack_hash))
+    });
+    if still_serves {
+        return false;
+    }
+    pack_provides
+        .iter()
+        .filter(|ep| **ep != repointed)
+        .all(|ep| other_provides.contains(ep))
+}
+
+/// `(hash, provides)` for each of the show's CURRENT owned records other than `pack_hash`, re-read
+/// from the store (so a single staged — or a singleton or overlapping pack pruned — earlier this
+/// tick is reflected, not the tick-start snapshot). Only `Verified` records count: a `Pending` record
+/// carries its target episode in `provides` from add time but may still be reaped as dead, so a pack
+/// must not be pruned on the strength of it. Filters by `MediaKind::Series` so a same-id movie never
+/// counts. Presence on the provider is checked later, against the swap's listing
+/// ([`PackPrune::resolve`]).
+async fn other_owned_coverage(
+    app: &AppState,
+    tmdb_id: u64,
+    pack_hash: &str,
+) -> Vec<(String, Vec<(u32, u32)>)> {
+    app.store
+        .all_owned()
+        .await
+        .into_iter()
+        .filter(|(h, rec)| {
+            !h.eq_ignore_ascii_case(pack_hash)
+                && rec.request.tmdb_id == tmdb_id
+                && rec.request.kind == MediaKind::Series
+                && rec.status == OwnedStatus::Verified
+        })
+        .map(|(h, rec)| (h, rec.provides))
+        .collect()
+}
+
+/// Which owned copy a per-episode swap supersedes ([`upgrade_episode_slot`]), and so what it prunes.
+enum EpisodeSupersede<'a> {
+    /// Phase (a): the episode's owned singleton — pruned outright once the slot is repointed.
+    Singleton(&'a str),
+    /// Phase (a2): the multi-episode pack currently serving the slot — pruned only when this repoint
+    /// leaves it serving nothing and every other episode it provides is held by another PRESENT
+    /// copy ([`pack_prunable_after_repoint`], [`PackPrune::resolve`]): coverage is re-read from the
+    /// store just before the swap and checked against the swap's own provider listing.
+    Pack {
+        hash: &'a str,
+        provides: &'a [(u32, u32)],
+        served_by: &'a std::collections::HashMap<(u32, u32), String>,
+    },
+}
+
+impl EpisodeSupersede<'_> {
+    /// The owned copy being upgraded away from (for the downgrade-preview log).
+    fn current_hash(&self) -> &str {
+        match self {
+            EpisodeSupersede::Singleton(h) => h,
+            EpisodeSupersede::Pack { hash, .. } => hash,
+        }
+    }
+
+    /// What to prune once `repointed`'s slot moves to the staged release. `adopted` = hashes adopted
+    /// earlier this tick (present even while the listing lags their add).
+    async fn prune_plan(
+        &self,
+        app: &AppState,
+        tmdb_id: u64,
+        repointed: (u32, u32),
+        adopted: &[String],
+    ) -> PrunePlan {
+        match self {
+            EpisodeSupersede::Singleton(h) => PrunePlan::Hashes(vec![h.to_string()]),
+            EpisodeSupersede::Pack {
+                hash,
+                provides,
+                served_by,
+            } => PrunePlan::Pack(PackPrune {
+                tmdb_id,
+                hash: hash.to_string(),
+                provides: provides.to_vec(),
+                repointed,
+                served_by: (*served_by).clone(),
+                others: other_owned_coverage(app, tmdb_id, hash).await,
+                adopted: adopted.to_vec(),
+            }),
+        }
+    }
+}
+
+/// Per-show-tick state shared by the per-episode phases (a) and (a2) ([`upgrade_episode_slot`]).
+#[derive(Default)]
+struct EpisodeTick {
+    /// Hashes adopted (staged + swapped in) earlier this tick. Each was confirmed downloaded by its
+    /// own `get_torrent_info` at staging, so it counts as PRESENT for a pack-prune decision even while
+    /// the provider listing lags the add (TorBox), and — being owned now — it is never re-staged by a
+    /// later episode's scrape (on TorBox a re-add returns the SAME torrent id, so a rejection cleanup
+    /// would delete the adopted torrent).
+    adopted: Vec<String>,
+    /// Lowercased infohashes that resolved this tick to a torrent with more than one episode file.
+    /// The per-episode path adopts only a TRUE singleton, so such a torrent is rejected for EVERY
+    /// target episode: skip it for the rest of the tick instead of re-staging it (add + cached poll +
+    /// delete) for each later episode — Torrentio commonly lists the same season pack under every
+    /// episode query.
+    multi_episode: std::collections::HashSet<String>,
+}
+
+/// One episode slot to upgrade ([`upgrade_episode_slot`]): the stage request (season/episode set),
+/// the baseline quality candidates were ranked against, and what a swap supersedes.
+struct EpisodeTarget<'a> {
+    req: &'a crate::store::AcquireRequest,
+    season: u32,
+    episode: u32,
+    baseline: &'a QualitySummary,
+    supersede: EpisodeSupersede<'a>,
+}
+
+/// Outcome of [`upgrade_episode_slot`].
+enum EpisodeUpgrade {
+    /// The slot was repointed to this newly-staged hash.
+    Swapped(String),
+    /// Nothing was adopted for this episode (candidates exhausted, a gated-off downgrade, or a
+    /// transient glitch on this episode) — move on to the next episode.
+    Unchanged,
+    /// The library went active, or a post-stage `apply_upgrade` step deferred (it already rolled the
+    /// staged copy back): stop ALL further show work this tick and signal deferral.
+    Deferred,
+}
+
+/// Try `ranked` (best-first) for ONE episode slot until one is adopted: gate a downgrade on the flag,
+/// re-check idle before each stage, stage a true singleton ([`stage_episode_candidate`]), then
+/// idle-gated swap + prune via [`apply_upgrade`]. Shared by the per-singleton phase (a) and the
+/// pack-served phase (a2), which differ only in what the swap supersedes ([`EpisodeSupersede`]).
+/// Candidates already adopted, or already found to be multi-episode packs, earlier this tick
+/// ([`EpisodeTick`]) are skipped without staging; an adoption is recorded in `tick.adopted`.
+async fn upgrade_episode_slot(
+    app: &AppState,
+    tmdb_id: u64,
+    target: EpisodeTarget<'_>,
+    ranked: Vec<(release::ReleaseInfo, release::Improvement)>,
+    group_prov: &crate::store::Provenance,
+    idle_window: Duration,
+    tick: &mut EpisodeTick,
+) -> EpisodeUpgrade {
+    let EpisodeTarget {
+        req,
+        season,
+        episode,
+        baseline,
+        supersede,
+    } = target;
+    for (cand, imp) in ranked {
+        let cand_hash = cand.info_hash.to_ascii_lowercase();
+        if tick.multi_episode.contains(&cand_hash)
+            || tick
+                .adopted
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(&cand_hash))
+        {
+            debug!(
+                "upgrade: tmdb {} s{}e{} skipping {} (already adopted, or a multi-episode pack, earlier this tick)",
+                tmdb_id, season, episode, cand.info_hash
+            );
+            continue;
+        }
+        if !downgrade_allowed_or_log(app, tmdb_id, imp, supersede.current_hash(), baseline, &cand) {
+            break; // direction-homogeneous list → all remaining are gated downgrades
+        }
+        if !app.read_activity.all_idle(idle_window).await {
+            debug!(
+                "upgrade: tmdb {} library active; deferring remaining show upgrade work",
+                tmdb_id
+            );
+            // Stop ALL further staging (remaining episodes + pack correction) this tick and
+            // signal deferral so the caller leaves the cursor unstamped (unchanged behaviour).
+            return EpisodeUpgrade::Deferred;
+        }
+        match stage_episode_candidate(
+            app,
+            tmdb_id,
+            req,
+            &cand,
+            (season, episode),
+            group_prov,
+            &mut tick.multi_episode,
+        )
+        .await
+        {
+            Ok((new_hash, tid, path)) => {
+                let prune = supersede
+                    .prune_plan(app, tmdb_id, (season, episode), &tick.adopted)
+                    .await;
+                match apply_upgrade(
+                    app,
+                    StagedUpgrade {
+                        hash: new_hash.clone(),
+                        torrent_id: tid,
+                        slot_files: vec![(
+                            crate::store::episode_slot(tmdb_id, season, episode),
+                            path,
+                        )],
+                    },
+                    prune,
+                    idle_window,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        info!(
+                            "upgrade: tmdb {} s{}e{} swapped to {}",
+                            tmdb_id, season, episode, new_hash
+                        );
+                        tick.adopted.push(new_hash.clone());
+                        return EpisodeUpgrade::Swapped(new_hash); // → the next episode
+                    }
+                    // apply_upgrade already rolled back the staged copy. A post-stage defer
+                    // (library became active, or the prune listing/selection write failed) must
+                    // propagate so the caller leaves the round-robin cursor unstamped and this
+                    // work is reconsidered next tick — NOT swallowed as a false "swapped".
+                    Err(_) => return EpisodeUpgrade::Deferred,
+                }
+            }
+            // Candidate-specific reject → try the next-best candidate for THIS episode.
+            Err(UpgradeSkip::NoChange(reason)) => {
+                debug!(
+                    "upgrade: tmdb {} s{}e{} no change: {}",
+                    tmdb_id, season, episode, reason
+                );
+                continue;
+            }
+            // Transient glitch on this episode → give up this episode this tick (move to the
+            // next episode), matching the prior per-episode fire-and-forget behaviour.
+            Err(UpgradeSkip::Deferred(reason)) => {
+                debug!(
+                    "upgrade: tmdb {} s{}e{} deferred: {}",
+                    tmdb_id, season, episode, reason
+                );
+                return EpisodeUpgrade::Unchanged;
+            }
+        }
+    }
+    EpisodeUpgrade::Unchanged
+}
+
 /// Replace an owned season pack that is now ABOVE the ceiling (e.g. acquired before the ceiling was
 /// lowered, or mirrored from a pre-existing library) with a within-ceiling cached pack that covers
 /// the SAME episodes, repointing every covered episode slot and pruning the old pack. Gated as a
 /// downgrade (`ALLOW_RESOLUTION_DOWNGRADE`). Keeps the old pack when no conforming replacement
 /// exists — a sole over-ceiling copy is never deleted with nothing to replace it.
+///
+/// `exclude_hashes` are never staged as a replacement: every hash the show owns NOW (not just in the
+/// tick-start `owned` snapshot) — a single adopted earlier this tick is listed under the season's
+/// episode-1 scrape like any stream, and on TorBox a re-add of an owned infohash returns the SAME
+/// torrent id, so the coverage-miss cleanup below would delete the adopted torrent out from under its
+/// record and selection.
 ///
 /// Returns `true` if it DEFERRED mid-tick — the library became active (a non-idle `all_idle`
 /// check) OR a post-stage `apply_upgrade` step failed (a provider-listing fetch or a `put_selection`
@@ -1308,12 +1667,12 @@ async fn correct_over_ceiling_packs(
     app: &AppState,
     tmdb_id: u64,
     owned: &[(String, OwnedRecord)],
+    exclude_hashes: &[String],
     imdb_id: &str,
     idle_window: Duration,
 ) -> bool {
     let prefs = &app.config.acquisition.prefs;
     let ceiling = prefs.max_resolution.height();
-    let owned_hashes: Vec<String> = owned.iter().map(|(h, _)| h.clone()).collect();
     // Merge the group's provenance once from the records in hand (no per-pack owned-table re-scan).
     let group_prov = merged_provenance(owned);
     // Fetch the per-title blacklist ONCE and test membership in memory (mirrors `rank_changes`),
@@ -1347,7 +1706,7 @@ async fn correct_over_ceiling_packs(
         else {
             continue;
         };
-        for cand in rank_cached_pack_candidates(&raws, prefs, &owned_hashes) {
+        for cand in rank_cached_pack_candidates(&raws, prefs, exclude_hashes) {
             if blacklist.contains(&cand.info_hash.to_ascii_lowercase()) {
                 continue;
             }
@@ -1483,7 +1842,7 @@ async fn correct_over_ceiling_packs(
                     torrent_id,
                     slot_files,
                 },
-                std::slice::from_ref(pack_hash),
+                PrunePlan::Hashes(vec![pack_hash.clone()]),
                 idle_window,
             )
             .await
@@ -1506,7 +1865,8 @@ async fn correct_over_ceiling_packs(
     false // completed the pass without a mid-tick library-active defer
 }
 
-/// The per-episode-upgrade (a) + over-ceiling-pack-correction (b) body of `try_upgrade_show`,
+/// The per-singleton-episode upgrade (a) + pack-served-episode upgrade (a2) +
+/// over-ceiling-pack-correction (b) body of `try_upgrade_show`,
 /// WITHOUT the TMDB-driven consolidation tail (c) — split out so it is unit-testable fully offline,
 /// mirroring the `try_consolidate_show` / `consolidate_show_seasons` split just below (consolidation's
 /// live TMDB aired-episode lookup is exercised by the live smoke, not unit tests; see that split's
@@ -1515,7 +1875,7 @@ async fn correct_over_ceiling_packs(
 /// logs its own outcome.
 ///
 /// Returns `true` if it DEFERRED mid-tick — the library became active (a non-idle `all_idle` check,
-/// in the per-episode loop or in `correct_over_ceiling_packs`) OR a post-stage `apply_upgrade` step
+/// in the per-episode loops or in `correct_over_ceiling_packs`) OR a post-stage `apply_upgrade` step
 /// failed (a provider-listing fetch or a `put_selection` write). The caller uses this to signal
 /// `Deferred` so the round-robin cursor is NOT stamped and the skipped work is reconsidered next
 /// tick (rather than waiting a full cursor wrap). `false` on normal completion.
@@ -1540,6 +1900,8 @@ async fn upgrade_show_episodes_and_packs(
     // Merge the group's sticky provenance ONCE from the records already fetched above, instead of
     // re-scanning the whole owned table per staged episode (see `merged_provenance`).
     let group_prov = merged_provenance(&owned);
+    // What phases (a) and (a2) adopted / found to be multi-episode packs so far this tick.
+    let mut tick = EpisodeTick::default();
 
     // (a) Per-singleton-episode upgrade/downgrade.
     let ceiling = app.config.acquisition.prefs.max_resolution.height();
@@ -1591,83 +1953,138 @@ async fn upgrade_show_episodes_and_packs(
             Err(_) => continue, // transient; other episodes/packs/consolidation still run this tick
         };
         let ranked = rank_changes(app, MediaKind::Series, tmdb_id, &raws, &q, group_hashes).await;
-        for (cand, imp) in ranked {
-            if !downgrade_allowed_or_log(app, tmdb_id, imp, hash, &q, &cand) {
-                break; // direction-homogeneous list → all remaining are gated downgrades
-            }
-            if !app.read_activity.all_idle(idle_window).await {
-                debug!(
-                    "upgrade: tmdb {} library active; deferring remaining show upgrade work",
-                    tmdb_id
-                );
-                // Stop ALL further staging (remaining episodes + pack correction) this tick and
-                // signal deferral so the caller leaves the cursor unstamped (unchanged behaviour).
-                return true;
-            }
-            match stage_episode_candidate(app, tmdb_id, &req, &cand, season, episode, &group_prov)
+        let target = EpisodeTarget {
+            req: &req,
+            season,
+            episode,
+            baseline: &q,
+            supersede: EpisodeSupersede::Singleton(hash),
+        };
+        if let EpisodeUpgrade::Deferred = upgrade_episode_slot(
+            app,
+            tmdb_id,
+            target,
+            ranked,
+            &group_prov,
+            idle_window,
+            &mut tick,
+        )
+        .await
+        {
+            return true;
+        }
+    }
+
+    // (a2) Episodes served from a WITHIN-ceiling multi-episode pack (e.g. an SD/foreign-dub pack
+    // grabbed on an air date while the season's other episodes are better singletons). Each episode
+    // whose selection slot points at the pack is re-scored against the PACK's quality and, on a
+    // better cached TRUE singleton, swapped exactly like phase (a). The pack itself is pruned only on
+    // the repoint that leaves it serving no slot AND with every episode it provides held by another
+    // owned record that is PRESENT on the provider (`PackPrune::resolve`, decided inside
+    // `apply_upgrade` against the swap's own listing); otherwise it is kept. Over-ceiling packs are
+    // phase (b)'s. Sample-first cost bound: if the pack's first served episode yields no improving
+    // candidate (or its scrape fails), the rest of that pack is skipped this visit — one scrape per
+    // unimprovable pack, not one per episode it serves. A candidate that turns out to be a
+    // multi-episode pack is staged at most once per tick (`EpisodeTick::multi_episode`), not once
+    // per served episode.
+    for (pack_hash, rec) in owned.iter().filter(|(_, r)| r.provides.len() > 1) {
+        let Some(q) = rec.quality.clone() else {
+            continue; // untagged → no baseline, skip
+        };
+        if q.resolution > ceiling {
+            continue; // over-ceiling → pack correction (b)
+        }
+        // Read the pack's slots NOW (not at tick start): phase (a) above may already have moved one.
+        let mut served_by: std::collections::HashMap<(u32, u32), String> =
+            std::collections::HashMap::new();
+        for &(s, e) in &rec.provides {
+            if let Some(sel) = app
+                .store
+                .get_selection(crate::store::episode_slot(tmdb_id, s, e))
                 .await
             {
-                Ok((new_hash, tid, path)) => {
-                    match apply_upgrade(
-                        app,
-                        StagedUpgrade {
-                            hash: new_hash.clone(),
-                            torrent_id: tid,
-                            slot_files: vec![(
-                                crate::store::episode_slot(tmdb_id, season, episode),
-                                path,
-                            )],
-                        },
-                        std::slice::from_ref(hash),
-                        idle_window,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            info!(
-                                "upgrade: tmdb {} s{}e{} swapped to {}",
-                                tmdb_id, season, episode, new_hash
-                            );
-                            break; // episode upgraded → move to the next episode
-                        }
-                        // apply_upgrade already rolled back the staged copy. A post-stage defer
-                        // (library became active, or the prune listing/selection write failed) must
-                        // propagate so the caller leaves the round-robin cursor unstamped and this
-                        // work is reconsidered next tick — NOT swallowed as a false "swapped".
-                        Err(_) => return true,
-                    }
+                served_by.insert((s, e), sel.hash);
+            }
+        }
+        let mut served: Vec<(u32, u32)> = served_by
+            .iter()
+            .filter(|(_, h)| h.eq_ignore_ascii_case(pack_hash))
+            .map(|(ep, _)| *ep)
+            .collect();
+        served.sort_unstable();
+        for (i, &(season, episode)) in served.iter().enumerate() {
+            let req = crate::store::AcquireRequest {
+                imdb_id: imdb_id.clone(),
+                season: Some(season),
+                episode: Some(episode),
+                ..rec.request.clone()
+            };
+            let ranked = match app
+                .scraper
+                .find(&imdb_id, MediaKind::Series, Some(season), Some(episode))
+                .await
+            {
+                Ok(raws) => {
+                    rank_changes(app, MediaKind::Series, tmdb_id, &raws, &q, group_hashes).await
                 }
-                // Candidate-specific reject → try the next-best candidate for THIS episode.
-                Err(UpgradeSkip::NoChange(reason)) => {
+                Err(_) => Vec::new(), // transient; treated as "nothing better" for this episode
+            };
+            if ranked.is_empty() {
+                if i == 0 {
                     debug!(
-                        "upgrade: tmdb {} s{}e{} no change: {}",
-                        tmdb_id, season, episode, reason
-                    );
-                    continue;
-                }
-                // Transient glitch on this episode → give up this episode this tick (move to the
-                // next episode), matching the prior per-episode fire-and-forget behaviour.
-                Err(UpgradeSkip::Deferred(reason)) => {
-                    debug!(
-                        "upgrade: tmdb {} s{}e{} deferred: {}",
-                        tmdb_id, season, episode, reason
+                        "upgrade: tmdb {} pack {} s{}e{} (sample) has no improving candidate; skipping the rest of the pack this visit",
+                        tmdb_id, pack_hash, season, episode
                     );
                     break;
                 }
+                continue;
+            }
+            let target = EpisodeTarget {
+                req: &req,
+                season,
+                episode,
+                baseline: &q,
+                supersede: EpisodeSupersede::Pack {
+                    hash: pack_hash,
+                    provides: &rec.provides,
+                    served_by: &served_by,
+                },
+            };
+            match upgrade_episode_slot(
+                app,
+                tmdb_id,
+                target,
+                ranked,
+                &group_prov,
+                idle_window,
+                &mut tick,
+            )
+            .await
+            {
+                EpisodeUpgrade::Deferred => return true,
+                EpisodeUpgrade::Swapped(new_hash) => {
+                    served_by.insert((season, episode), new_hash);
+                }
+                EpisodeUpgrade::Unchanged => {}
             }
         }
     }
 
     // (b) Over-ceiling pack correction (flag-gated): replace a pack above the ceiling with a
     // within-ceiling cached full-season replacement that covers the SAME episodes; keeps the pack
-    // when no conforming replacement exists (sole-copy safety). The per-episode loop above returns
-    // early on a mid-tick defer, so reaching here means it completed; propagate the pack pass's own
+    // when no conforming replacement exists (sole-copy safety). The per-episode loops above return
+    // early on a mid-tick defer, so reaching here means they completed; propagate the pack pass's own
     // defer signal (equivalent to `episode_deferred || pack_deferred` with episode_deferred=false).
-    correct_over_ceiling_packs(app, tmdb_id, &owned, &imdb_id, idle_window).await
+    // Its candidate exclusion is every hash the show owns NOW (re-read: singles adopted above, or a
+    // record added concurrently), not just the tick-start snapshot — see `correct_over_ceiling_packs`.
+    let mut exclude: Vec<String> = group_hashes.to_vec();
+    exclude.extend(current_show_hashes(app, tmdb_id).await);
+    correct_over_ceiling_packs(app, tmdb_id, &owned, &exclude, &imdb_id, idle_window).await
 }
 
-/// Show dispatch target for `run_upgrade_once`: per-episode upgrade/downgrade + over-ceiling pack
-/// correction (`upgrade_show_episodes_and_packs`), then full-season consolidation (unchanged —
+/// Show dispatch target for `run_upgrade_once`: per-episode upgrade/downgrade (singletons, then
+/// episodes served from a within-ceiling pack) + over-ceiling pack correction
+/// (`upgrade_show_episodes_and_packs`), then full-season consolidation (unchanged —
 /// `try_consolidate_show` still runs every tick exactly as before this task, so its existing
 /// behaviour/tests are preserved).
 ///
@@ -8057,5 +8474,788 @@ mod tests {
             pack_hash,
             "E01 slot unchanged after rollback"
         );
+    }
+
+    // ── pack-served episode upgrade tests (phase a2) ──────────────────────────────────────────
+
+    fn served(entries: &[(u32, &str)]) -> std::collections::HashMap<(u32, u32), String> {
+        entries
+            .iter()
+            .map(|(e, h)| ((1, *e), h.to_string()))
+            .collect()
+    }
+    const PACK_E1_E4: [(u32, u32); 4] = [(1, 1), (1, 2), (1, 3), (1, 4)];
+
+    #[test]
+    fn pack_prunable_when_last_served_episode_moves_and_rest_covered() {
+        assert!(pack_prunable_after_repoint(
+            "pack",
+            &PACK_E1_E4,
+            (1, 4),
+            &served(&[(1, "s1"), (2, "s2"), (3, "s3"), (4, "pack")]),
+            &PACK_E1_E4,
+        ));
+    }
+
+    #[test]
+    fn pack_kept_while_it_still_serves_another_episode() {
+        assert!(!pack_prunable_after_repoint(
+            "pack",
+            &PACK_E1_E4,
+            (1, 4),
+            &served(&[(1, "s1"), (2, "s2"), (3, "pack"), (4, "pack")]),
+            &PACK_E1_E4,
+        ));
+    }
+
+    #[test]
+    fn pack_kept_when_an_unserved_episode_is_not_covered_elsewhere() {
+        assert!(!pack_prunable_after_repoint(
+            "pack",
+            &PACK_E1_E4,
+            (1, 4),
+            &served(&[(1, "s1"), (3, "s3"), (4, "pack")]),
+            &[(1, 1), (1, 3), (1, 4)],
+        ));
+    }
+
+    #[test]
+    fn pack_prune_counts_only_present_or_just_adopted_coverage() {
+        let plan = |adopted: &[&str]| PackPrune {
+            tmdb_id: SHOW_TMDB,
+            hash: "pack".into(),
+            provides: PACK_E1_E4.to_vec(),
+            repointed: (1, 4),
+            served_by: served(&[(1, "s1"), (2, "s2"), (3, "s3"), (4, "pack")]),
+            others: (1..=3u32)
+                .map(|e| (format!("s{e}"), vec![(1, e)]))
+                .collect(),
+            adopted: adopted.iter().map(|h| h.to_string()).collect(),
+        };
+        let listing = |hashes: &[&str]| -> Vec<Torrent> {
+            hashes
+                .iter()
+                .map(|h| Torrent {
+                    id: format!("t{h}"),
+                    hash: h.to_string(),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        assert_eq!(
+            plan(&[]).resolve(&listing(&["s1", "S2", "s3", "pack"])),
+            vec!["pack".to_string()],
+            "every covering copy present (hash match is case-insensitive) → prune"
+        );
+        assert!(
+            plan(&[])
+                .resolve(&listing(&["s1", "s3", "pack"]))
+                .is_empty(),
+            "s2 lapsed off the provider → the pack is the only present holder of E2 → keep"
+        );
+        assert_eq!(
+            plan(&["S2"]).resolve(&listing(&["s1", "s3", "pack"])),
+            vec!["pack".to_string()],
+            "s2 adopted earlier this tick counts as present even before the listing shows it"
+        );
+        assert_eq!(
+            PrunePlan::Hashes(vec!["x".into()]).resolve(&[]),
+            vec!["x".to_string()],
+            "a fixed prune list ignores the listing"
+        );
+    }
+
+    /// Every `(season, episode)` an [`EpisodeScraper`] was asked for, in call order.
+    type ScrapeLog = Arc<std::sync::Mutex<Vec<(Option<u32>, Option<u32>)>>>;
+
+    /// A scraper scripted per requested episode that records every `(season, episode)` it is asked
+    /// for, so a test can pin exactly which scrapes a phase issued (and how many).
+    struct EpisodeScraper {
+        by_episode: std::collections::HashMap<u32, Vec<RawCandidate>>,
+        calls: ScrapeLog,
+    }
+    #[async_trait]
+    impl Scraper for EpisodeScraper {
+        async fn find(
+            &self,
+            _i: &str,
+            _k: MediaKind,
+            season: Option<u32>,
+            episode: Option<u32>,
+        ) -> Result<Vec<RawCandidate>, crate::error::AppError> {
+            self.calls.lock().unwrap().push((season, episode));
+            Ok(episode
+                .and_then(|e| self.by_episode.get(&e).cloned())
+                .unwrap_or_default())
+        }
+    }
+
+    /// YAGA's pack quality: an SD (`resolution: 0`) WEB release whose tracks could never be checked
+    /// (a `.avi`), so `unverified`.
+    fn q_sd_web_unverified() -> QualitySummary {
+        QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 0,
+            score: 1,
+            unverified: true,
+        }
+    }
+
+    /// A cached true-singleton S01E`episode` candidate tagged `tag` (e.g. `1080p.WEB-DL`).
+    fn single_candidate(episode: u32, hash: &str, res_label: &str, tag: &str) -> RawCandidate {
+        RawCandidate {
+            name: format!("Torrentio\n{res_label}"),
+            description: format!("S.S01E{episode:02}.{tag}.x265\nRD+"),
+            info_hash: hash.into(),
+            file_idx: Some(0),
+            file_name: Some(format!("S.S01E{episode:02}.{tag}.mkv")),
+        }
+    }
+
+    const PACK: &str = "ypack";
+
+    struct PackFixture {
+        app: AppState,
+        store: Store,
+        deleted: Arc<std::sync::Mutex<Vec<String>>>,
+        calls: ScrapeLog,
+        group_hashes: Vec<String>,
+    }
+
+    /// The staged `TorrentInfo` for a single-file candidate: cached, one selected file named after
+    /// the candidate's `file_name`, its torrent id == its infohash (the mock's per-candidate mode).
+    fn single_file_info(cand: &RawCandidate) -> TorrentInfo {
+        TorrentInfo {
+            id: cand.info_hash.clone(),
+            hash: cand.info_hash.clone(),
+            status: "downloaded".into(),
+            files: vec![TorrentFile {
+                id: 0,
+                path: cand.file_name.clone().unwrap(),
+                bytes: 2_000_000_000,
+                selected: 1,
+            }],
+            links: vec![format!("https://cdn/{}", cand.info_hash)],
+            ..Default::default()
+        }
+    }
+
+    /// Extra knobs for [`pack_fixture_with`] beyond the common [`pack_fixture`] shape.
+    #[derive(Default)]
+    struct PackOpts {
+        /// Make the post-stage prune listing fail (forcing `apply_upgrade` to defer).
+        fail_listing: bool,
+        /// Owned hashes left OUT of the provider listing: still owned + selected, but their torrent
+        /// has lapsed off the provider (a `Verified`-but-absent record).
+        absent: Vec<String>,
+        /// Staged `TorrentInfo` overrides keyed by their id/infohash (e.g. a candidate that resolves
+        /// to a multi-episode pack rather than the default single file).
+        infos: Vec<TorrentInfo>,
+    }
+
+    /// Seed a show group: singletons `s{e}` (Verified, quality per entry) for each of `singles`,
+    /// each serving its own slot unless the pack serves it, plus the multi-episode pack [`PACK`]
+    /// (`pack_q`) providing `pack_provides` and serving the slots in `pack_serves`. The scraper
+    /// offers each `(episode, candidate)` in `offers` for that episode only; the provider lists every
+    /// owned torrent (`t<hash>`, so a prune can delete it) and stages each offered candidate under its
+    /// own infohash as a cached single-file torrent. `fail_listing` makes the post-stage prune
+    /// listing fail (forcing `apply_upgrade` to defer).
+    async fn pack_fixture(
+        singles: &[(u32, QualitySummary)],
+        pack_provides: &[u32],
+        pack_serves: &[u32],
+        pack_q: QualitySummary,
+        offers: Vec<(u32, RawCandidate)>,
+        fail_listing: bool,
+    ) -> PackFixture {
+        pack_fixture_with(
+            singles,
+            pack_provides,
+            pack_serves,
+            pack_q,
+            offers,
+            PackOpts {
+                fail_listing,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// [`pack_fixture`] with the extra [`PackOpts`] knobs.
+    async fn pack_fixture_with(
+        singles: &[(u32, QualitySummary)],
+        pack_provides: &[u32],
+        pack_serves: &[u32],
+        pack_q: QualitySummary,
+        offers: Vec<(u32, RawCandidate)>,
+        opts: PackOpts,
+    ) -> PackFixture {
+        let store = mem_store();
+        let mut torrents = Vec::new();
+        let mut group_hashes = Vec::new();
+        for (e, q) in singles {
+            let h = format!("s{e}");
+            store
+                .put_owned(h.clone(), ep_record(1, *e, q.clone()))
+                .await
+                .unwrap();
+            if !pack_serves.contains(e) {
+                store
+                    .put_selection(
+                        crate::store::episode_slot(SHOW_TMDB, 1, *e),
+                        SelectionEntry {
+                            hash: h.clone(),
+                            file_path: format!("{h}.mkv"),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            if !opts.absent.contains(&h) {
+                torrents.push(Torrent {
+                    id: format!("t{h}"),
+                    hash: h.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                });
+            }
+            group_hashes.push(h);
+        }
+        let pack_rec = OwnedRecord {
+            provides: pack_provides.iter().map(|e| (1, *e)).collect(),
+            ..ep_record(1, pack_provides[0], pack_q)
+        };
+        store.put_owned(PACK.into(), pack_rec).await.unwrap();
+        for e in pack_serves {
+            store
+                .put_selection(
+                    crate::store::episode_slot(SHOW_TMDB, 1, *e),
+                    SelectionEntry {
+                        hash: PACK.into(),
+                        file_path: format!("Yaga.S01E01-E04/Yaga.s01e{e:02}.avi"),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        torrents.push(Torrent {
+            id: format!("t{PACK}"),
+            hash: PACK.into(),
+            status: "downloaded".into(),
+            ..Default::default()
+        });
+        group_hashes.push(PACK.into());
+
+        let mut by_episode: std::collections::HashMap<u32, Vec<RawCandidate>> =
+            std::collections::HashMap::new();
+        let mut by_id = std::collections::HashMap::new();
+        for (e, cand) in offers {
+            by_id.insert(cand.info_hash.clone(), single_file_info(&cand));
+            by_episode.entry(e).or_default().push(cand);
+        }
+        for info in opts.infos {
+            by_id.insert(info.id.clone(), info);
+        }
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let scraper = Arc::new(EpisodeScraper {
+            by_episode,
+            calls: calls.clone(),
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents,
+            torrent_info_by_id: by_id,
+            resolved_url: Some("https://cdn/staged".into()),
+            deleted: deleted.clone(),
+            fail_get_torrents: opts.fail_listing,
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+        PackFixture {
+            app,
+            store,
+            deleted,
+            calls,
+            group_hashes,
+        }
+    }
+
+    async fn slot_hash(store: &Store, episode: u32) -> String {
+        store
+            .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, episode))
+            .await
+            .unwrap()
+            .hash
+    }
+
+    #[tokio::test]
+    async fn pack_served_episode_is_upgraded_and_superseded_pack_pruned() {
+        // The YAGA shape: E1–E3 are 1080p WEB singletons serving their own slots; E4 is served by
+        // an SD `.avi` pack (unverified) that also provides E1–E4. A cached 1080p single for E4 is
+        // scrape-available → E4 is repointed to it and, since the pack then serves nothing and its
+        // other episodes are all held by the singletons, the pack is pruned.
+        let f = pack_fixture(
+            &[(1, q1080_web()), (2, q1080_web()), (3, q1080_web())],
+            &[1, 2, 3, 4],
+            &[4],
+            q_sd_web_unverified(),
+            vec![(4, single_candidate(4, "hy4", "1080p", "1080p.WEB-DL"))],
+            false,
+        )
+        .await;
+        let deferred = upgrade_show_episodes_and_packs(
+            &f.app,
+            SHOW_TMDB,
+            &f.group_hashes,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(!deferred, "a completed swap is not a deferral");
+        assert_eq!(slot_hash(&f.store, 4).await, "hy4", "E4 repointed");
+        let new_rec = f
+            .store
+            .get_owned("hy4".into())
+            .await
+            .expect("staged single recorded owned");
+        assert_eq!(new_rec.provides, vec![(1, 4)]);
+        assert!(
+            f.store.get_owned(PACK.into()).await.is_none(),
+            "fully-superseded pack's owned record removed"
+        );
+        let d = f.deleted.lock().unwrap().clone();
+        assert!(d.contains(&format!("t{PACK}")), "pack deleted: {d:?}");
+        for e in 1..=3u32 {
+            let h = format!("s{e}");
+            assert_eq!(slot_hash(&f.store, e).await, h, "E{e} slot untouched");
+            assert!(f.store.get_owned(h.clone()).await.is_some(), "{h} kept");
+            assert!(!d.contains(&format!("t{h}")), "{h} not deleted");
+        }
+    }
+
+    #[tokio::test]
+    async fn pack_served_episode_upgrade_keeps_pack_serving_other_episodes() {
+        // The pack serves E3 AND E4; only E3 (the first served episode, so the sample) has a better
+        // single. E3 is repointed, E4 is still evaluated (a later episode with nothing better is
+        // skipped, not a reason to stop), and the pack is KEPT because it still serves E4.
+        let f = pack_fixture(
+            &[(1, q1080_web()), (2, q1080_web())],
+            &[1, 2, 3, 4],
+            &[3, 4],
+            q_sd_web_unverified(),
+            vec![(3, single_candidate(3, "hy3", "1080p", "1080p.WEB-DL"))],
+            false,
+        )
+        .await;
+        let deferred = upgrade_show_episodes_and_packs(
+            &f.app,
+            SHOW_TMDB,
+            &f.group_hashes,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(!deferred);
+        assert_eq!(slot_hash(&f.store, 3).await, "hy3", "E3 repointed");
+        assert_eq!(slot_hash(&f.store, 4).await, PACK, "E4 still on the pack");
+        assert!(
+            f.store.get_owned(PACK.into()).await.is_some(),
+            "pack still serving E4 must be kept"
+        );
+        assert!(
+            !f.deleted.lock().unwrap().contains(&format!("t{PACK}")),
+            "pack torrent not deleted"
+        );
+        assert!(
+            f.calls.lock().unwrap().contains(&(Some(1), Some(4))),
+            "E4 still scraped after the sample found an upgrade"
+        );
+    }
+
+    #[tokio::test]
+    async fn pack_sample_first_skips_remaining_episodes_when_nothing_better() {
+        // A 1080p WEB pack serving E1–E3. The sample (E1) has only a non-improving 720p release, so
+        // the rest of the pack is skipped this visit — even though E2 has a better release, it is
+        // never scraped: exactly one scrape for the pack.
+        let f = pack_fixture(
+            &[],
+            &[1, 2, 3],
+            &[1, 2, 3],
+            q1080_web(),
+            vec![
+                (1, single_candidate(1, "hlow1", "720p", "720p.WEB-DL")),
+                (
+                    2,
+                    single_candidate(2, "hbig2", "1080p", "1080p.BluRay.REMUX"),
+                ),
+            ],
+            false,
+        )
+        .await;
+        let deferred = upgrade_show_episodes_and_packs(
+            &f.app,
+            SHOW_TMDB,
+            &f.group_hashes,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(!deferred);
+        assert_eq!(
+            f.calls.lock().unwrap().clone(),
+            vec![(Some(1), Some(1))],
+            "only the sample episode is scraped"
+        );
+        for e in 1..=3u32 {
+            assert_eq!(slot_hash(&f.store, e).await, PACK);
+        }
+        assert!(
+            f.deleted.lock().unwrap().is_empty(),
+            "nothing staged/deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_ceiling_pack_is_left_to_pack_correction() {
+        // A 2160p pack (above the default 1080 ceiling) serving E2 and E3: phase (a2) must not touch
+        // it — the only scrape is pack correction's own season scrape (episode 1), never a
+        // per-episode scrape for a served episode.
+        let f = pack_fixture(
+            &[],
+            &[1, 2, 3],
+            &[2, 3],
+            q2160_remux(),
+            vec![(2, single_candidate(2, "hy2", "1080p", "1080p.WEB-DL"))],
+            false,
+        )
+        .await;
+        upgrade_show_episodes_and_packs(&f.app, SHOW_TMDB, &f.group_hashes, Duration::from_secs(0))
+            .await;
+        assert_eq!(
+            f.calls.lock().unwrap().clone(),
+            vec![(Some(1), Some(1))],
+            "only pack correction's season scrape is issued"
+        );
+        assert_eq!(slot_hash(&f.store, 2).await, PACK);
+        assert!(f.store.get_owned(PACK.into()).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn pack_served_episode_swap_defer_keeps_pack() {
+        // The YAGA shape, but the post-stage prune listing fails: apply_upgrade rolls the staged
+        // single back and defers BEFORE any prune — the pack (and its E4 slot) must be intact and
+        // the deferral propagated (cursor left unstamped).
+        let f = pack_fixture(
+            &[(1, q1080_web()), (2, q1080_web()), (3, q1080_web())],
+            &[1, 2, 3, 4],
+            &[4],
+            q_sd_web_unverified(),
+            vec![(4, single_candidate(4, "hy4", "1080p", "1080p.WEB-DL"))],
+            true,
+        )
+        .await;
+        let deferred = upgrade_show_episodes_and_packs(
+            &f.app,
+            SHOW_TMDB,
+            &f.group_hashes,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(deferred, "a post-stage defer must propagate");
+        assert_eq!(slot_hash(&f.store, 4).await, PACK, "E4 still on the pack");
+        assert!(f.store.get_owned(PACK.into()).await.is_some(), "pack kept");
+        assert!(
+            f.store.get_owned("hy4".into()).await.is_none(),
+            "staged single rolled back"
+        );
+        let d = f.deleted.lock().unwrap().clone();
+        assert!(d.contains(&"hy4".to_string()), "staged torrent dropped");
+        assert!(!d.contains(&format!("t{PACK}")), "pack not deleted");
+    }
+
+    #[tokio::test]
+    async fn pack_kept_when_an_episode_is_held_only_by_a_pending_copy() {
+        // The YAGA shape, but E3's only other copy is still `Pending` (it may yet be reaped as
+        // dead). E4 is upgraded, but the pack — the only settled holder of E3 — must be kept.
+        let f = pack_fixture(
+            &[(1, q1080_web()), (2, q1080_web()), (3, q1080_web())],
+            &[1, 2, 3, 4],
+            &[4],
+            q_sd_web_unverified(),
+            vec![(4, single_candidate(4, "hy4", "1080p", "1080p.WEB-DL"))],
+            false,
+        )
+        .await;
+        let mut s3 = f.store.get_owned("s3".into()).await.unwrap();
+        s3.status = OwnedStatus::Pending;
+        f.store.put_owned("s3".into(), s3).await.unwrap();
+        upgrade_show_episodes_and_packs(&f.app, SHOW_TMDB, &f.group_hashes, Duration::from_secs(0))
+            .await;
+        assert_eq!(slot_hash(&f.store, 4).await, "hy4", "E4 repointed");
+        assert!(
+            f.store.get_owned(PACK.into()).await.is_some(),
+            "pack kept: E3 is otherwise held only by a Pending copy"
+        );
+        assert!(!f.deleted.lock().unwrap().contains(&format!("t{PACK}")));
+    }
+
+    #[tokio::test]
+    async fn pack_prune_counts_singles_upgraded_earlier_in_the_tick() {
+        // E1's 720p singleton is upgraded (and pruned) by phase (a) this same tick, so E1 is now held
+        // only by the NEW single — which the provider listing fetched by the E4 swap doesn't show
+        // (the mock listing is static, like TorBox's lagging one right after an add). A single staged
+        // earlier this tick still counts as a present holder, so the pack serving E4 is recognised as
+        // fully covered once E4 moves, and pruned. (The store RE-READ itself is pinned by
+        // `pack_prune_rereads_coverage_after_an_overlapping_pack_is_pruned`.)
+        let f = pack_fixture(
+            &[(1, q720_web()), (2, q1080_web()), (3, q1080_web())],
+            &[1, 2, 3, 4],
+            &[4],
+            q_sd_web_unverified(),
+            vec![
+                (1, single_candidate(1, "hy1", "1080p", "1080p.WEB-DL")),
+                (4, single_candidate(4, "hy4", "1080p", "1080p.WEB-DL")),
+            ],
+            false,
+        )
+        .await;
+        upgrade_show_episodes_and_packs(&f.app, SHOW_TMDB, &f.group_hashes, Duration::from_secs(0))
+            .await;
+        assert_eq!(
+            slot_hash(&f.store, 1).await,
+            "hy1",
+            "E1 upgraded by phase (a)"
+        );
+        assert!(
+            f.store.get_owned("s1".into()).await.is_none(),
+            "old E1 pruned"
+        );
+        assert_eq!(slot_hash(&f.store, 4).await, "hy4", "E4 repointed");
+        assert!(
+            f.store.get_owned(PACK.into()).await.is_none(),
+            "pack pruned: every episode it provides is held elsewhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn pack_kept_when_a_covering_copy_has_lapsed_off_the_provider() {
+        // The YAGA shape, but E2's singleton has lapsed off the provider: its owned record is still
+        // `Verified` and E2's slot still names it, yet its torrent is gone from the listing — so the
+        // VFS falls back to the pack for E2. E4 is still upgraded, but the pack (the only PRESENT
+        // holder of E2) must be kept, not pruned on the strength of an absent record.
+        let f = pack_fixture_with(
+            &[(1, q1080_web()), (2, q1080_web()), (3, q1080_web())],
+            &[1, 2, 3, 4],
+            &[4],
+            q_sd_web_unverified(),
+            vec![(4, single_candidate(4, "hy4", "1080p", "1080p.WEB-DL"))],
+            PackOpts {
+                absent: vec!["s2".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        let deferred = upgrade_show_episodes_and_packs(
+            &f.app,
+            SHOW_TMDB,
+            &f.group_hashes,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(!deferred);
+        assert_eq!(slot_hash(&f.store, 4).await, "hy4", "E4 repointed");
+        assert!(
+            f.store.get_owned(PACK.into()).await.is_some(),
+            "pack kept: it is the only present holder of E2"
+        );
+        let d = f.deleted.lock().unwrap().clone();
+        assert!(!d.contains(&format!("t{PACK}")), "pack not deleted: {d:?}");
+    }
+
+    #[tokio::test]
+    async fn pack_pruned_once_its_last_two_served_episodes_move_in_one_tick() {
+        // The pack serves E3 AND E4 and both have a better single. E3 moves first (the pack still
+        // serves E4 → kept); then E4 moves and the pack is pruned — E3 is now held by the single
+        // staged moments earlier this tick, which counts as present even though the listing fetched
+        // by the E4 swap doesn't show that just-added torrent (static mock listing).
+        let f = pack_fixture(
+            &[(1, q1080_web()), (2, q1080_web())],
+            &[1, 2, 3, 4],
+            &[3, 4],
+            q_sd_web_unverified(),
+            vec![
+                (3, single_candidate(3, "hy3", "1080p", "1080p.WEB-DL")),
+                (4, single_candidate(4, "hy4", "1080p", "1080p.WEB-DL")),
+            ],
+            false,
+        )
+        .await;
+        upgrade_show_episodes_and_packs(&f.app, SHOW_TMDB, &f.group_hashes, Duration::from_secs(0))
+            .await;
+        assert_eq!(slot_hash(&f.store, 3).await, "hy3", "E3 repointed");
+        assert_eq!(slot_hash(&f.store, 4).await, "hy4", "E4 repointed");
+        assert!(
+            f.store.get_owned(PACK.into()).await.is_none(),
+            "pack pruned once it serves nothing and every episode is held elsewhere"
+        );
+        assert!(f.deleted.lock().unwrap().contains(&format!("t{PACK}")));
+    }
+
+    #[tokio::test]
+    async fn pack_prune_rereads_coverage_after_an_overlapping_pack_is_pruned() {
+        // Two overlapping SD packs both provide E1–E4: P1 serves E1, P2 serves E2 (E3/E4 have no
+        // managed selection). Better singles exist for E1 and E2. P1 goes first: once E1 moves, P1
+        // serves nothing and P2 still holds E2–E4 → P1 is pruned. Then E2 moves off P2, and P2 must
+        // be KEPT — it is now the only holder of E3/E4. A tick-start snapshot would still count the
+        // already-pruned P1 as coverage and delete P2 too, losing E3/E4.
+        let store = mem_store();
+        for (h, e) in [("p1", 1u32), ("p2", 2)] {
+            let rec = OwnedRecord {
+                provides: PACK_E1_E4.to_vec(),
+                ..ep_record(1, 1, q_sd_web_unverified())
+            };
+            store.put_owned(h.into(), rec).await.unwrap();
+            store
+                .put_selection(
+                    crate::store::episode_slot(SHOW_TMDB, 1, e),
+                    SelectionEntry {
+                        hash: h.into(),
+                        file_path: format!("{h}/S.s01e{e:02}.avi"),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let h1 = single_candidate(1, "h1", "1080p", "1080p.WEB-DL");
+        let h2 = single_candidate(2, "h2", "1080p", "1080p.WEB-DL");
+        let by_id: std::collections::HashMap<String, TorrentInfo> = [&h1, &h2]
+            .iter()
+            .map(|c| (c.info_hash.clone(), single_file_info(c)))
+            .collect();
+        let scraper = Arc::new(EpisodeScraper {
+            by_episode: [(1, vec![h1]), (2, vec![h2])].into_iter().collect(),
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: ["p1", "p2"]
+                .iter()
+                .map(|h| Torrent {
+                    id: format!("t{h}"),
+                    hash: h.to_string(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                })
+                .collect(),
+            torrent_info_by_id: by_id,
+            resolved_url: Some("https://cdn/staged".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+        let group = vec!["p1".to_string(), "p2".to_string()];
+        upgrade_show_episodes_and_packs(&app, SHOW_TMDB, &group, Duration::from_secs(0)).await;
+        assert_eq!(slot_hash(&store, 1).await, "h1", "E1 repointed");
+        assert_eq!(slot_hash(&store, 2).await, "h2", "E2 repointed");
+        let d = deleted.lock().unwrap().clone();
+        assert!(store.get_owned("p1".into()).await.is_none(), "P1 pruned");
+        assert!(d.contains(&"tp1".to_string()), "P1 deleted: {d:?}");
+        assert!(
+            store.get_owned("p2".into()).await.is_some(),
+            "P2 kept: the only remaining holder of E3/E4"
+        );
+        assert!(!d.contains(&"tp2".to_string()), "P2 not deleted: {d:?}");
+    }
+
+    #[tokio::test]
+    async fn multi_episode_candidate_is_staged_at_most_once_per_tick() {
+        // An SD pack serves E1–E3; Torrentio lists the same BluRay season pack under every episode
+        // query (an improving candidate each time). Staging it for E1 resolves to a multi-episode
+        // pack, which the per-episode path can never adopt — so it must not be re-staged (add +
+        // cached poll + delete) for E2 and E3 this tick.
+        let season_pack = |e: u32| RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "S.S01.1080p.BluRay.x265\nRD+".into(),
+            info_hash: "hseason".into(),
+            file_idx: Some(e as usize - 1),
+            file_name: Some(format!("S.S01E{e:02}.1080p.BluRay.x265.mkv")),
+        };
+        let pack_info = TorrentInfo {
+            id: "hseason".into(),
+            hash: "hseason".into(),
+            status: "downloaded".into(),
+            files: (1..=3u32)
+                .map(|e| TorrentFile {
+                    id: e - 1,
+                    path: format!("S.S01.1080p.BluRay/S.S01E{e:02}.1080p.BluRay.x265.mkv"),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                })
+                .collect(),
+            links: (1..=3u32).map(|e| format!("https://cdn/s{e}")).collect(),
+            ..Default::default()
+        };
+        let f = pack_fixture_with(
+            &[],
+            &[1, 2, 3],
+            &[1, 2, 3],
+            q_sd_web_unverified(),
+            (1..=3u32).map(|e| (e, season_pack(e))).collect(),
+            PackOpts {
+                infos: vec![pack_info],
+                ..Default::default()
+            },
+        )
+        .await;
+        upgrade_show_episodes_and_packs(&f.app, SHOW_TMDB, &f.group_hashes, Duration::from_secs(0))
+            .await;
+        let d = f.deleted.lock().unwrap().clone();
+        assert_eq!(
+            d.iter().filter(|h| *h == "hseason").count(),
+            1,
+            "the season pack is staged (and dropped) once, not once per served episode: {d:?}"
+        );
+        for e in 1..=3u32 {
+            assert_eq!(slot_hash(&f.store, e).await, PACK, "E{e} still on the pack");
+        }
+        assert!(f.store.get_owned(PACK.into()).await.is_some(), "pack kept");
+    }
+
+    #[tokio::test]
+    async fn pack_correction_never_stages_a_single_adopted_earlier_in_the_tick() {
+        // E1 is a 720p singleton with a better 1080p single available; E2–E3 come from a 2160p pack
+        // above the ceiling (corrective downgrade ON). Phase (a) adopts the E1 single. Pack
+        // correction then scrapes episode 1 of the season, where that same single is listed: it must
+        // be recognised as already owned and never re-staged — on TorBox a re-add of an owned
+        // infohash returns the SAME torrent id (as the mock does), so the coverage-miss cleanup would
+        // delete the freshly-adopted single out from under its record and selection.
+        let mut f = pack_fixture(
+            &[(1, q720_web())],
+            &[2, 3],
+            &[2, 3],
+            q2160_remux(),
+            vec![(1, single_candidate(1, "hy1", "1080p", "1080p.WEB-DL"))],
+            false,
+        )
+        .await;
+        {
+            let mut cfg = (*f.app.config).clone();
+            cfg.allow_resolution_downgrade = true;
+            f.app.config = Arc::new(cfg);
+        }
+        upgrade_show_episodes_and_packs(&f.app, SHOW_TMDB, &f.group_hashes, Duration::from_secs(0))
+            .await;
+        assert_eq!(
+            slot_hash(&f.store, 1).await,
+            "hy1",
+            "E1 upgraded by phase (a)"
+        );
+        assert!(f.store.get_owned("hy1".into()).await.is_some());
+        let d = f.deleted.lock().unwrap().clone();
+        assert!(
+            !d.contains(&"hy1".to_string()),
+            "the adopted single is never deleted: {d:?}"
+        );
+        assert_eq!(slot_hash(&f.store, 2).await, PACK);
+        assert!(f.store.get_owned(PACK.into()).await.is_some());
     }
 }
