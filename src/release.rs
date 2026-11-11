@@ -254,25 +254,39 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
         .captures(&text)
         .and_then(|cap| cap.get(1)?.as_str().parse::<u32>().ok());
 
-    // Language words are matched as SEPARATOR-BOUNDED tokens (`\b…\b`), not raw substrings, so a
-    // longer word that merely *contains* a language name doesn't inject a spurious code (e.g.
-    // "Germany" must not tag `ger`, "Frenchman" must not tag `fre`). This mirrors the bounded
-    // `MULTI_RE`/`WEB_RE` matching and keeps the wrong-audio penalty in `score` honest.
+    // Language words (full names AND scene abbreviations like `Rus`/`ITA`/`VFF`) are matched as
+    // SEPARATOR-BOUNDED tokens (`\b…\b`), not raw substrings, so a longer word that merely *contains*
+    // a language name doesn't inject a spurious code (e.g. "Germany" must not tag `ger`, "Frenchman"
+    // must not tag `fre`, "Russell" must not tag `rus`). This mirrors the bounded `MULTI_RE`/`WEB_RE`
+    // matching and keeps the wrong-audio penalty in `score` honest.
     let mut languages: Vec<String> = Vec::new();
+    let mut push_lang = |code: &str| {
+        if !languages.iter().any(|l| l == code) {
+            languages.push(code.to_string());
+        }
+    };
     for cap in LANG_RE.captures_iter(&lower) {
         if let Some((_, code)) = LANG_WORDS.iter().find(|(w, _)| *w == &cap[1]) {
-            let code = (*code).to_string();
-            if !languages.contains(&code) {
-                languages.push(code);
-            }
+            push_lang(code);
         }
+    }
+    // Torrentio renders a release's languages as regional-indicator flag emoji (🇷🇺, 🇬🇧 / 🇮🇹).
+    // A flag can also name a SUBTITLE language (a VOSTFR release shows 🇫🇷), so this only ever feeds
+    // the soft ranking penalty in `score` — never an exclusion; the probe remains the real gate.
+    for code in flag_languages(&text) {
+        push_lang(code);
     }
     // `multi` (multi-language) is matched as a SEPARATOR-BOUNDED token, not a raw substring, because
     // its `mul` code is a WILDCARD in `score` (`|| l == "mul"` satisfies any required AUDIO_LANGUAGE).
     // A raw `contains("multi")` would mis-tag `MultiSubs`/`multichannel` as multi-language and let a
-    // wrong-audio release escape the language penalty for a non-default `AUDIO_LANGUAGE` user.
-    if MULTI_RE.is_match(&lower) {
-        languages.push("mul".to_string());
+    // wrong-audio release escape the language penalty for a non-default `AUDIO_LANGUAGE` user. For the
+    // same reason a `multi` immediately followed by `sub` (Torrentio's `Multi Subs` marker = several
+    // SUBTITLE languages) is not multi-AUDIO and doesn't tag `mul`.
+    if MULTI_RE
+        .find_iter(&lower)
+        .any(|m| !lower[m.end()..].starts_with("sub"))
+    {
+        push_lang("mul");
     }
 
     let container = c
@@ -308,9 +322,127 @@ const LANG_WORDS: &[(&str, &str)] = &[
     ("japanese", "jpn"),
     ("korean", "kor"),
     ("portuguese", "por"),
+    ("polish", "pol"),
+    ("ukrainian", "ukr"),
+    ("dutch", "dut"),
+    ("czech", "cze"),
+    ("hungarian", "hun"),
+    ("finnish", "fin"),
+    ("swedish", "swe"),
+    ("danish", "dan"),
+    ("norwegian", "nor"),
+    ("turkish", "tur"),
+    ("greek", "gre"),
+    ("hebrew", "heb"),
+    ("arabic", "ara"),
+    ("chinese", "chi"),
+    ("thai", "tha"),
+    ("vietnamese", "vie"),
+    // Scene/tracker abbreviations (3+ letters only — a 2-letter token like `it`/`de`/`es` collides
+    // with ordinary words in release names). French variants: `vff` (VF France), `vfq` (VF Québec),
+    // `vfi` (VF internationale), `truefrench`; Spanish: `castellano` (Spain), `latino` (LatAm);
+    // Portuguese: `dublado` (Brazilian dub).
+    ("eng", "eng"),
+    ("rus", "rus"),
+    ("ita", "ita"),
+    ("ger", "ger"),
+    ("deu", "ger"),
+    ("fre", "fre"),
+    ("fra", "fre"),
+    ("vff", "fre"),
+    ("vfq", "fre"),
+    ("vfi", "fre"),
+    ("truefrench", "fre"),
+    ("spa", "spa"),
+    ("esp", "spa"),
+    ("castellano", "spa"),
+    ("latino", "spa"),
+    ("por", "por"),
+    ("dublado", "por"),
+    ("pol", "pol"),
+    ("jpn", "jpn"),
+    ("kor", "kor"),
+    ("hin", "hin"),
+    ("ukr", "ukr"),
     // `multi` is intentionally NOT here — it's matched separator-bounded via `MULTI_RE` (see `parse`)
-    // because its `mul` code is a wildcard in `score`.
+    // because its `mul` code is a wildcard in `score`. Subtitle-only markers (`vostfr`, `napisy`,
+    // `subs`) are deliberately absent too: they say nothing about the AUDIO language.
 ];
+
+/// Torrentio's regional-indicator flags, keyed by the 2-letter country code they spell, mapped to
+/// the ISO 639-2/B code of that country's language (the form `score` compares against).
+const FLAG_LANGS: &[(&str, &str)] = &[
+    ("GB", "eng"),
+    ("US", "eng"),
+    ("RU", "rus"),
+    ("FR", "fre"),
+    ("IT", "ita"),
+    ("ES", "spa"),
+    ("MX", "spa"),
+    ("DE", "ger"),
+    ("PT", "por"),
+    ("BR", "por"),
+    ("PL", "pol"),
+    ("CZ", "cze"),
+    ("SK", "slo"),
+    ("NL", "dut"),
+    ("JP", "jpn"),
+    ("KR", "kor"),
+    ("CN", "chi"),
+    ("TW", "chi"),
+    ("IN", "hin"),
+    ("UA", "ukr"),
+    ("HU", "hun"),
+    ("BG", "bul"),
+    ("RS", "srp"),
+    ("HR", "hrv"),
+    ("DK", "dan"),
+    ("SE", "swe"),
+    ("NO", "nor"),
+    ("FI", "fin"),
+    ("TR", "tur"),
+    ("IL", "heb"),
+    ("GR", "gre"),
+    ("RO", "rum"),
+    ("LT", "lit"),
+    ("LV", "lav"),
+    ("EE", "est"),
+    ("SI", "slv"),
+    ("SA", "ara"),
+    ("IR", "per"),
+    ("VN", "vie"),
+    ("ID", "ind"),
+    ("MY", "may"),
+    ("TH", "tha"),
+];
+
+/// Map each regional-indicator flag emoji in `text` (a pair of chars in `U+1F1E6..=U+1F1FF`, which
+/// spell a 2-letter country code `A`–`Z`) to its language code via `FLAG_LANGS`, in order of
+/// appearance. Consecutive indicators pair up left to right (so `🇬🇧🇮🇹` is GB, IT); a lone indicator
+/// and an unknown country are ignored.
+fn flag_languages(text: &str) -> Vec<&'static str> {
+    const RI_A: u32 = 0x1F1E6;
+    let ri = |c: char| {
+        let v = c as u32;
+        (RI_A..=RI_A + 25)
+            .contains(&v)
+            .then(|| char::from(b'A' + (v - RI_A) as u8))
+    };
+    let mut out = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let Some(first) = ri(c) else { continue };
+        let Some(second) = chars.peek().copied().and_then(ri) else {
+            continue;
+        };
+        chars.next();
+        let country: String = [first, second].iter().collect();
+        if let Some((_, code)) = FLAG_LANGS.iter().find(|(cc, _)| *cc == country) {
+            out.push(*code);
+        }
+    }
+    out
+}
 
 // Word-boundary alternation of the `LANG_WORDS` names, built once from the table above so the two
 // can never drift. Matched against the lowercased text in `parse`.
@@ -824,6 +956,84 @@ mod tests {
             twice.languages.iter().filter(|l| *l == "eng").count(),
             1,
             "a repeated language word must not produce duplicate codes"
+        );
+    }
+
+    fn langs(name: &str, desc: &str) -> Vec<String> {
+        parse(&raw(name, desc, "h", Some("f.mkv"))).languages
+    }
+
+    #[test]
+    fn parse_tags_language_abbreviations() {
+        // Scene/tracker abbreviations, not just full language names (YAGA's `Rus`, Nightborn's `VFF`).
+        let yaga = langs("t", "Yaga.s01e04.WEBRip.XviD.Rus.RuDub.tv.avi");
+        assert!(yaga.contains(&"rus".to_string()), "{yaga:?}");
+        let vff = langs("t", "Nightborn.2026.MULTi.VFF.1080p.WEBRip");
+        assert!(vff.contains(&"fre".to_string()), "{vff:?}");
+        assert!(vff.contains(&"mul".to_string()), "{vff:?}");
+        let esp = langs("t", "Nightborn (2026) [Bluray 1080p][Esp]");
+        assert!(esp.contains(&"spa".to_string()), "{esp:?}");
+        let ita_eng = langs("t", "Danza.con.il.diavolo.ITA.ENG.1080p");
+        assert!(ita_eng.contains(&"ita".to_string()), "{ita_eng:?}");
+        assert!(ita_eng.contains(&"eng".to_string()), "{ita_eng:?}");
+        // Still separator-bounded: an abbreviation embedded in a longer word tags nothing.
+        let embedded = langs("t", "Engaged.Russell.Italy.Spawn.Portal.1080p");
+        assert!(embedded.is_empty(), "{embedded:?}");
+    }
+
+    #[test]
+    fn parse_maps_torrentio_flags_to_languages() {
+        // Torrentio renders a release's audio languages as regional-indicator flag emoji.
+        let ru = langs("t", "👤 9 💾 1.7 GB ⚙️ EXT\n🇷🇺");
+        assert_eq!(ru, vec!["rus".to_string()]);
+        let gb_it = langs("t", "👤 9 💾 1.7 GB ⚙️ EXT\n🇬🇧 / 🇮🇹");
+        assert!(gb_it.contains(&"eng".to_string()), "{gb_it:?}");
+        assert!(gb_it.contains(&"ita".to_string()), "{gb_it:?}");
+        // Adjacent flags pair up correctly; a flag that agrees with a word tag isn't duplicated; an
+        // unknown flag is ignored.
+        let adjacent = langs("t", "Film.English.1080p\n🇺🇸🇫🇷🇦🇶");
+        assert_eq!(adjacent, vec!["eng".to_string(), "fre".to_string()]);
+    }
+
+    #[test]
+    fn multi_subs_marker_is_not_multi_audio() {
+        // Torrentio's `Multi Subs` marks multiple SUBTITLE languages: it must not tag the `mul`
+        // multi-audio wildcard (which would let a wrong-audio release escape the penalty).
+        let subs = langs("t", "Multi Subs / 🇷🇺");
+        assert!(!subs.contains(&"mul".to_string()), "{subs:?}");
+        assert!(subs.contains(&"rus".to_string()), "{subs:?}");
+        let audio = langs("t", "Multi Audio / 🇬🇧 / 🇫🇷");
+        assert!(audio.contains(&"mul".to_string()), "{audio:?}");
+        // A separate audio MULTi token still tags `mul` even when `Multi Subs` is present too.
+        let both = langs("Film.2020.MULTi.1080p", "Multi Subs / 🇫🇷");
+        assert!(both.contains(&"mul".to_string()), "{both:?}");
+    }
+
+    #[test]
+    fn subtitle_only_markers_do_not_tag_audio() {
+        // VOSTFR = original audio with French subtitles; `Napisy` (Polish) = subtitles. Neither says
+        // anything about the AUDIO language, so neither may tag one.
+        let vostfr = langs("t", "YAGA S01E04 - Saison 1 VOSTFR HDTV 2026");
+        assert!(vostfr.is_empty(), "{vostfr:?}");
+        let napisy = langs("t", "Film.2020.1080p.WEB-DL.Napisy.PL.Subs");
+        assert!(napisy.is_empty(), "{napisy:?}");
+    }
+
+    #[test]
+    fn score_penalises_russian_tagged_release_for_english_original() {
+        let mut p = prefs();
+        p.audio = AudioReq::Lang("en".to_string());
+        let rus = parse(&raw(
+            "t",
+            "Yaga.S01E04.1080p.Rus.ColdFilm",
+            "h1",
+            Some("Yaga.mkv"),
+        ));
+        let web = parse(&raw("t", "Yaga.S01E04.1080p.WEB", "h2", Some("Yaga.mkv")));
+        let (rus_s, web_s) = (score(&rus, &p).unwrap(), score(&web, &p).unwrap());
+        assert!(
+            web_s - rus_s >= 50_000,
+            "a Rus-tagged release must take the wrong-audio penalty: rus={rus_s} web={web_s}"
         );
     }
 
