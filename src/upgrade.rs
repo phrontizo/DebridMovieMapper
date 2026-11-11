@@ -906,14 +906,10 @@ async fn stage_and_verify(
     prov: &crate::store::Provenance,
 ) -> Result<(String, String, String), UpgradeSkip> {
     let hash = cand.info_hash.clone();
-    let magnet = format!("magnet:?xt=urn:btih:{}", hash);
     // A provider add/info failure is transient → Deferred (retry next tick, keep the cursor) rather
     // than NoChange (which would skip this title — with its real upgrade candidate — for a full wrap).
-    let added = app
-        .provider
-        .add_magnet(&magnet)
-        .await
-        .map_err(|e| UpgradeSkip::Deferred(format!("add failed: {e}")))?;
+    // A candidate already in the account is never staged (NoChange → the next candidate).
+    let added = add_staging_candidate(app, &hash).await?;
     let info = match app.provider.get_torrent_info(&added.id).await {
         Ok(i) => i,
         Err(e) => {
@@ -1060,6 +1056,42 @@ async fn stage_and_verify(
         ));
     }
     Ok((hash, added.id, selected_path))
+}
+
+/// Add `hash` to stage it as an upgrade candidate — unless its torrent is ALREADY in the provider
+/// account, in which case it is never staged (`NoChange`). The ONE add path of every upgrade staging
+/// site (movie [`stage_and_verify`], per-episode + pack correction via [`stage_and_await_cached`],
+/// and consolidation), so the guard covers them all. Every site deletes the staged torrent by the id
+/// the add returned when it rejects the candidate (not cached, wrong title, probe reject or
+/// unverifiable `Accept`, …) or rolls back; on TorBox an add of an infohash already in the account
+/// returns the EXISTING torrent's id, and the rankers exclude only the title's own owned hashes — so
+/// without this a candidate present outside the group (identified under another title, or an
+/// unidentified manual add) would be deleted, or adopted over another title's owned record. Checked
+/// against a fresh listing immediately before the add (one extra `get_torrents` per staged
+/// candidate); a listing failure is `Deferred`, like an add failure — presence can't be ruled out,
+/// so nothing is added.
+async fn add_staging_candidate(
+    app: &AppState,
+    hash: &str,
+) -> Result<crate::rd_client::AddMagnetResponse, UpgradeSkip> {
+    let listing = app
+        .provider
+        .get_torrents()
+        .await
+        .map_err(|e| UpgradeSkip::Deferred(format!("listing failed before staging: {e}")))?;
+    if listing.iter().any(|t| t.hash.eq_ignore_ascii_case(hash)) {
+        debug!(
+            "upgrade: candidate {} is already in the provider account; not staging it",
+            hash
+        );
+        return Err(UpgradeSkip::NoChange(
+            "candidate already in the provider account".into(),
+        ));
+    }
+    app.provider
+        .add_magnet(&format!("magnet:?xt=urn:btih:{}", hash))
+        .await
+        .map_err(|e| UpgradeSkip::Deferred(format!("add failed: {e}")))
 }
 
 /// Delete a torrent (owned-only) and drop its owned record + authoritative id, against an
@@ -1235,12 +1267,7 @@ async fn stage_and_await_cached(
     app: &AppState,
     hash: &str,
 ) -> Result<(String, crate::rd_client::TorrentInfo), UpgradeSkip> {
-    let magnet = format!("magnet:?xt=urn:btih:{}", hash);
-    let added = app
-        .provider
-        .add_magnet(&magnet)
-        .await
-        .map_err(|e| UpgradeSkip::Deferred(format!("add failed: {e}")))?;
+    let added = add_staging_candidate(app, hash).await?;
     let info = match app.provider.get_torrent_info(&added.id).await {
         Ok(i) => i,
         Err(e) => {
@@ -2377,9 +2404,9 @@ async fn consolidate_show_seasons(
                 ));
             }
 
-            // Stage: add + resolve + SE-map files.
-            let magnet = format!("magnet:?xt=urn:btih:{}", r.info_hash);
-            let Ok(added) = app.provider.add_magnet(&magnet).await else {
+            // Stage: add + resolve + SE-map files. A pack already in the provider account is never
+            // staged (see `add_staging_candidate`); it and a failed add both move on to the next pack.
+            let Ok(added) = add_staging_candidate(app, &r.info_hash).await else {
                 continue;
             };
             let Ok(info) = app.provider.get_torrent_info(&added.id).await else {
@@ -2965,20 +2992,12 @@ mod tests {
         // Provider: both torrents listed; the new one resolves cached/downloaded with a video file.
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                Torrent {
-                    id: "told".into(),
-                    hash: "hold".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "tnew".into(),
-                    hash: "hnew".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            torrents: vec![Torrent {
+                id: "told".into(),
+                hash: "hold".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
             add_magnet: Some(AddMagnetResponse {
                 id: "tnew".into(),
                 uri: String::new(),
@@ -3105,12 +3124,6 @@ mod tests {
                 Torrent {
                     id: "t2160".into(),
                     hash: "h2160".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "tnew".into(),
-                    hash: "hnew".into(),
                     status: "downloaded".into(),
                     ..Default::default()
                 },
@@ -3345,12 +3358,6 @@ mod tests {
                     status: "downloaded".into(),
                     ..Default::default()
                 },
-                Torrent {
-                    id: "tnew".into(),
-                    hash: "hnew".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
             ],
             add_magnet: Some(AddMagnetResponse {
                 id: "tnew".into(),
@@ -3468,8 +3475,9 @@ mod tests {
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            // get_torrents is only called AFTER staging (for the prune listing) → fail it there.
-            fail_get_torrents: true,
+            // The first get_torrents is the pre-add presence check (`add_staging_candidate`); the
+            // second is the post-stage prune listing → fail it there.
+            fail_get_torrents_after: Some(1),
             add_magnet: Some(AddMagnetResponse {
                 id: "tnew".into(),
                 uri: String::new(),
@@ -3559,20 +3567,12 @@ mod tests {
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                Torrent {
-                    id: "told".into(),
-                    hash: "hold".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "tnew".into(),
-                    hash: "hnew".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            torrents: vec![Torrent {
+                id: "told".into(),
+                hash: "hold".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
             add_magnet: Some(AddMagnetResponse {
                 id: "tnew".into(),
                 uri: String::new(),
@@ -3626,20 +3626,12 @@ mod tests {
             "touchstage"
         }
         async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
-            Ok(vec![
-                Torrent {
-                    id: "told".into(),
-                    hash: "hold".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "tnew".into(),
-                    hash: "hnew".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ])
+            Ok(vec![Torrent {
+                id: "told".into(),
+                hash: "hold".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }])
         }
         async fn get_torrent_info(&self, _id: &str) -> Result<TorrentInfo, reqwest::Error> {
             // A read begins mid-stage → the 4b idle re-check must trip and force a full rollback.
@@ -3892,20 +3884,12 @@ mod tests {
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(RdLifecycleProvider {
             selected: std::sync::atomic::AtomicBool::new(false),
-            listing: vec![
-                Torrent {
-                    id: "told".into(),
-                    hash: "hold".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "tnew".into(),
-                    hash: "hnew".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            listing: vec![Torrent {
+                id: "told".into(),
+                hash: "hold".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
             deleted: deleted.clone(),
         });
         let app = app_with(scraper, provider, store.clone());
@@ -3961,20 +3945,12 @@ mod tests {
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                Torrent {
-                    id: "told".into(),
-                    hash: "hold".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "tnew".into(),
-                    hash: "hnew".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            torrents: vec![Torrent {
+                id: "told".into(),
+                hash: "hold".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
             add_magnet: Some(AddMagnetResponse {
                 id: "tnew".into(),
                 uri: String::new(),
@@ -4050,6 +4026,27 @@ mod tests {
         staged_file: &str,
         prober: Arc<dyn crate::acquire::Prober>,
     ) -> (AppState, Store, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (app, store, deleted, _) =
+            movie_swap_fixture_with(owned_q, cand, staged_file, prober, false).await;
+        (app, store, deleted)
+    }
+
+    /// [`movie_swap_fixture`], also returning the provider's add log (infohashes). With
+    /// `cand_in_account` the candidate's torrent is ALREADY in the provider account (listed as
+    /// `tnew`, outside this title's group) and the add returns that EXISTING id, as TorBox's
+    /// `createtorrent` does for a present infohash.
+    async fn movie_swap_fixture_with(
+        owned_q: QualitySummary,
+        cand: RawCandidate,
+        staged_file: &str,
+        prober: Arc<dyn crate::acquire::Prober>,
+        cand_in_account: bool,
+    ) -> (
+        AppState,
+        Store,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let store = mem_store();
         store
             .put_owned(
@@ -4077,21 +4074,23 @@ mod tests {
             .unwrap();
         let cand_hash = cand.info_hash.clone();
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut torrents = vec![Torrent {
+            id: "told".into(),
+            hash: "hold".into(),
+            status: "downloaded".into(),
+            ..Default::default()
+        }];
+        if cand_in_account {
+            torrents.push(Torrent {
+                id: "tnew".into(),
+                hash: cand_hash.clone(),
+                status: "downloaded".into(),
+                ..Default::default()
+            });
+        }
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                Torrent {
-                    id: "told".into(),
-                    hash: "hold".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "tnew".into(),
-                    hash: cand_hash.clone(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            torrents,
             add_magnet: Some(AddMagnetResponse {
                 id: "tnew".into(),
                 uri: String::new(),
@@ -4111,13 +4110,14 @@ mod tests {
             }),
             resolved_url: Some("https://cdn/new".into()),
             deleted: deleted.clone(),
+            added: added.clone(),
             ..Default::default()
         });
         let scraper = Arc::new(MockScraper {
             candidates: vec![cand],
         });
         let app = app_with_prober(scraper, provider, store.clone(), prober);
-        (app, store, deleted)
+        (app, store, deleted, added)
     }
 
     #[tokio::test]
@@ -4287,20 +4287,12 @@ mod tests {
             candidates: vec![remux_candidate()],
         });
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                Torrent {
-                    id: "told".into(),
-                    hash: "hold".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "tnew".into(),
-                    hash: "hnew".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            torrents: vec![Torrent {
+                id: "told".into(),
+                hash: "hold".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
             add_magnet: Some(AddMagnetResponse {
                 id: "tnew".into(),
                 uri: String::new(),
@@ -4707,20 +4699,12 @@ mod tests {
             candidates: vec![remux_candidate()],
         });
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                Torrent {
-                    id: "told".into(),
-                    hash: "hold".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "tnew".into(),
-                    hash: "hnew".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            torrents: vec![Torrent {
+                id: "told".into(),
+                hash: "hold".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
             add_magnet: Some(AddMagnetResponse {
                 id: "tnew".into(),
                 uri: String::new(),
@@ -5372,20 +5356,12 @@ mod tests {
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                Torrent {
-                    id: "told".into(),
-                    hash: owned_2160_hash.clone(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "tnew".into(),
-                    hash: cand_1080_hash.clone(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            torrents: vec![Torrent {
+                id: "told".into(),
+                hash: owned_2160_hash.clone(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
             add_magnet: Some(AddMagnetResponse {
                 id: "tnew".into(),
                 uri: String::new(),
@@ -5587,20 +5563,12 @@ mod tests {
 
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                Torrent {
-                    id: "own720".into(),
-                    hash: owned_hash.clone(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "hgood".into(),
-                    hash: "hgood".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            torrents: vec![Torrent {
+                id: "own720".into(),
+                hash: owned_hash.clone(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
             torrent_info_by_id: by_id,
             resolved_url: Some("https://cdn/g0".into()),
             deleted: deleted.clone(),
@@ -5721,20 +5689,12 @@ mod tests {
         }
 
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                Torrent {
-                    id: "own720".into(),
-                    hash: owned_hash.clone(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "hgood".into(),
-                    hash: "hgood".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            torrents: vec![Torrent {
+                id: "own720".into(),
+                hash: owned_hash.clone(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
             torrent_info_by_id: by_id,
             fail_info_ids,
             resolved_url: Some("https://cdn/g".into()),
@@ -6376,7 +6336,9 @@ mod tests {
             ..Default::default()
         }
     }
-    /// The torrents the provider lists during the prune: two scattered episodes + the staged pack.
+    /// The torrents the provider lists: the two scattered episodes. A candidate pack is NOT listed —
+    /// it isn't in the account before staging, and upgrade staging never stages a hash that already
+    /// is (`add_staging_candidate`).
     fn show_listing() -> Vec<Torrent> {
         vec![
             Torrent {
@@ -6388,12 +6350,6 @@ mod tests {
             Torrent {
                 id: "te2".into(),
                 hash: "e2".into(),
-                status: "downloaded".into(),
-                ..Default::default()
-            },
-            Torrent {
-                id: "tpack".into(),
-                hash: "hpack".into(),
                 status: "downloaded".into(),
                 ..Default::default()
             },
@@ -6705,12 +6661,6 @@ mod tests {
                     status: "downloaded".into(),
                     ..Default::default()
                 },
-                Torrent {
-                    id: "hgood".into(),
-                    hash: "hgood".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
             ],
             torrent_info_by_id: by_id,
             resolved_url: Some("https://cdn/g0".into()),
@@ -6772,8 +6722,9 @@ mod tests {
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            // get_torrents (the prune listing) is fetched only AFTER staging → fail it there.
-            fail_get_torrents: true,
+            // The first get_torrents is the pre-add presence check (`add_staging_candidate`); the
+            // second is the post-stage prune listing → fail it there.
+            fail_get_torrents_after: Some(1),
             add_magnet: Some(AddMagnetResponse {
                 id: "tpack".into(),
                 uri: String::new(),
@@ -7197,6 +7148,10 @@ mod tests {
         cand_1080_hash: String,
         old_2160_hash: String,
         pack_hash: String,
+        /// The provider's `delete_torrent` log (torrent ids).
+        deleted: Arc<std::sync::Mutex<Vec<String>>>,
+        /// The provider's `add_magnet` log (infohashes): every candidate that was staged.
+        added: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl ShowUpgradeHarness {
@@ -7210,6 +7165,14 @@ mod tests {
     /// Own S01E01 as a cached 720p WEB singleton; a cached 1080p WEB-DL S01E01 is scrape-available
     /// (a meaningful upgrade — same tier, higher resolution).
     async fn show_harness_singleton_720_ep() -> ShowUpgradeHarness {
+        show_harness_singleton_720_ep_with(false).await
+    }
+
+    /// [`show_harness_singleton_720_ep`]; with `cand_in_account` the candidate's torrent is ALREADY in
+    /// the provider account (listed as `tep1080`, outside the show's group — e.g. identified under
+    /// another title, or an unidentified manual add) and the add returns that EXISTING id, as TorBox's
+    /// `createtorrent` does for a present infohash.
+    async fn show_harness_singleton_720_ep_with(cand_in_account: bool) -> ShowUpgradeHarness {
         let store = mem_store();
         let old_hash = "e720".to_string();
         store
@@ -7233,21 +7196,23 @@ mod tests {
             candidates: vec![cand],
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut torrents = vec![Torrent {
+            id: "told720".into(),
+            hash: old_hash.clone(),
+            status: "downloaded".into(),
+            ..Default::default()
+        }];
+        if cand_in_account {
+            torrents.push(Torrent {
+                id: "tep1080".into(),
+                hash: cand_hash.clone(),
+                status: "downloaded".into(),
+                ..Default::default()
+            });
+        }
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                Torrent {
-                    id: "told720".into(),
-                    hash: old_hash.clone(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "tep1080".into(),
-                    hash: cand_hash.clone(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            torrents,
             add_magnet: Some(AddMagnetResponse {
                 id: "tep1080".into(),
                 uri: String::new(),
@@ -7267,6 +7232,7 @@ mod tests {
             }),
             resolved_url: Some("https://cdn/ep1080".into()),
             deleted: deleted.clone(),
+            added: added.clone(),
             ..Default::default()
         });
         let app = app_with(scraper, provider, store.clone());
@@ -7279,6 +7245,8 @@ mod tests {
             cand_1080_hash: cand_hash,
             old_2160_hash: String::new(),
             pack_hash: String::new(),
+            deleted,
+            added,
         }
     }
 
@@ -7309,21 +7277,14 @@ mod tests {
             candidates: vec![cand],
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                Torrent {
-                    id: "told2160".into(),
-                    hash: old_hash.clone(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "tep1080d".into(),
-                    hash: cand_hash.clone(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            torrents: vec![Torrent {
+                id: "told2160".into(),
+                hash: old_hash.clone(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
             add_magnet: Some(AddMagnetResponse {
                 id: "tep1080d".into(),
                 uri: String::new(),
@@ -7343,6 +7304,7 @@ mod tests {
             }),
             resolved_url: Some("https://cdn/ep1080d".into()),
             deleted: deleted.clone(),
+            added: added.clone(),
             ..Default::default()
         });
         let app = app_with(scraper, provider, store.clone());
@@ -7355,6 +7317,8 @@ mod tests {
             cand_1080_hash: cand_hash,
             old_2160_hash: old_hash,
             pack_hash: String::new(),
+            deleted,
+            added,
         }
     }
 
@@ -7415,6 +7379,7 @@ mod tests {
             candidates: vec![cand_4k],
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
             torrents: vec![Torrent {
                 id: "tpack2160".into(),
@@ -7423,6 +7388,7 @@ mod tests {
                 ..Default::default()
             }],
             deleted: deleted.clone(),
+            added: added.clone(),
             ..Default::default()
         });
         let app = app_with(scraper, provider, store.clone());
@@ -7435,6 +7401,8 @@ mod tests {
             cand_1080_hash: String::new(),
             old_2160_hash: String::new(),
             pack_hash,
+            deleted,
+            added,
         }
     }
 
@@ -7445,6 +7413,15 @@ mod tests {
     /// correction — mirrors `idle_show_with_cached_full_season_pack_consolidates_repoints_and_prunes`'s
     /// provider mock. `cand_1080_hash` carries the new within-ceiling pack's hash.
     async fn show_harness_pack_2160_with_1080_candidate() -> ShowUpgradeHarness {
+        show_harness_pack_2160_with_1080_candidate_with(false).await
+    }
+
+    /// [`show_harness_pack_2160_with_1080_candidate`]; with `cand_in_account` the replacement pack's
+    /// torrent is ALREADY in the provider account (listed as `tpack1080`, outside the show's group)
+    /// and the add returns that EXISTING id (TorBox's same-id re-add).
+    async fn show_harness_pack_2160_with_1080_candidate_with(
+        cand_in_account: bool,
+    ) -> ShowUpgradeHarness {
         let store = mem_store();
         let pack_hash = "pack2160".to_string();
         let rec = OwnedRecord {
@@ -7499,21 +7476,23 @@ mod tests {
             candidates: vec![cand],
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut torrents = vec![Torrent {
+            id: "tpack2160".into(),
+            hash: pack_hash.clone(),
+            status: "downloaded".into(),
+            ..Default::default()
+        }];
+        if cand_in_account {
+            torrents.push(Torrent {
+                id: "tpack1080".into(),
+                hash: new_pack_hash.clone(),
+                status: "downloaded".into(),
+                ..Default::default()
+            });
+        }
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                Torrent {
-                    id: "tpack2160".into(),
-                    hash: pack_hash.clone(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "tpack1080".into(),
-                    hash: new_pack_hash.clone(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            torrents,
             add_magnet: Some(AddMagnetResponse {
                 id: "tpack1080".into(),
                 uri: String::new(),
@@ -7541,6 +7520,7 @@ mod tests {
             }),
             resolved_url: Some("https://cdn/np1".into()),
             deleted: deleted.clone(),
+            added: added.clone(),
             ..Default::default()
         });
         let app = app_with(scraper, provider, store.clone());
@@ -7553,6 +7533,8 @@ mod tests {
             cand_1080_hash: new_pack_hash,
             old_2160_hash: String::new(),
             pack_hash,
+            deleted,
+            added,
         }
     }
 
@@ -7705,12 +7687,6 @@ mod tests {
                 Torrent {
                     id: "tpack2160".into(),
                     hash: pack_hash.clone(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "tep1080".into(),
-                    hash: cand_hash.clone(),
                     status: "downloaded".into(),
                     ..Default::default()
                 },
@@ -7889,6 +7865,15 @@ mod tests {
                 .is_blacklisted(MediaKind::Series, h.tmdb, h.cand_1080_hash.clone())
                 .await
         );
+        let d = h.deleted.lock().unwrap().clone();
+        assert!(
+            d.contains(&"tep1080".to_string()),
+            "the staged torrent must be deleted: {d:?}"
+        );
+        assert!(
+            !d.contains(&"told720".to_string()),
+            "the current torrent must not be pruned: {d:?}"
+        );
     }
 
     #[tokio::test]
@@ -7921,6 +7906,15 @@ mod tests {
             !app.store
                 .is_blacklisted(MediaKind::Series, h.tmdb, h.cand_1080_hash.clone())
                 .await
+        );
+        let d = h.deleted.lock().unwrap().clone();
+        assert!(
+            d.contains(&"tpack1080".to_string()),
+            "the staged replacement must be deleted: {d:?}"
+        );
+        assert!(
+            !d.contains(&"tpack2160".to_string()),
+            "the over-ceiling pack must not be pruned: {d:?}"
         );
     }
 
@@ -8178,20 +8172,12 @@ mod tests {
         );
 
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                Torrent {
-                    id: "eold720".into(),
-                    hash: old.clone(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "hgood".into(),
-                    hash: "hgood".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            torrents: vec![Torrent {
+                id: "eold720".into(),
+                hash: old.clone(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
             torrent_info_by_id: by_id,
             resolved_url: Some("https://cdn/g0".into()),
             deleted: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -8287,20 +8273,12 @@ mod tests {
 
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            torrents: vec![
-                Torrent {
-                    id: "eold720".into(),
-                    hash: old.clone(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-                Torrent {
-                    id: "hpack".into(),
-                    hash: "hpack".into(),
-                    status: "downloaded".into(),
-                    ..Default::default()
-                },
-            ],
+            torrents: vec![Torrent {
+                id: "eold720".into(),
+                hash: old.clone(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
             torrent_info_by_id: by_id,
             resolved_url: Some("https://cdn/p0".into()),
             deleted: deleted.clone(),
@@ -8371,7 +8349,9 @@ mod tests {
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            fail_get_torrents: true, // the prune listing (fetched only AFTER staging) → apply_upgrade defers
+            // Call 1 = the pre-add presence check; call 2 = the post-stage prune listing → fail it
+            // there, so apply_upgrade defers.
+            fail_get_torrents_after: Some(1),
             add_magnet: Some(AddMagnetResponse {
                 id: "tnew1080".into(),
                 uri: String::new(),
@@ -8483,7 +8463,9 @@ mod tests {
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            fail_get_torrents: true, // the prune listing (fetched only AFTER staging) → apply_upgrade defers
+            // Call 1 = the pre-add presence check; call 2 = the post-stage prune listing → fail it
+            // there, so apply_upgrade defers.
+            fail_get_torrents_after: Some(1),
             add_magnet: Some(AddMagnetResponse {
                 id: "tpack1080".into(),
                 uri: String::new(),
@@ -8849,7 +8831,8 @@ mod tests {
             resolved_url: Some("https://cdn/staged".into()),
             deleted: deleted.clone(),
             added: added.clone(),
-            fail_get_torrents: opts.fail_listing,
+            // Call 1 = the staged candidate's pre-add presence check; later = the prune listing.
+            fail_get_torrents_after: opts.fail_listing.then_some(1),
             ..Default::default()
         });
         let app = app_with(scraper, provider, store.clone());
@@ -9713,5 +9696,155 @@ mod tests {
             "the English pack is staged first (and adopted)"
         );
         assert!(store.get_owned("heng".into()).await.is_some());
+    }
+
+    // ── a candidate already in the provider account is never staged ───────────────────────────
+    //
+    // Every staging site deletes the staged torrent BY THE ID THE ADD RETURNED when it rejects the
+    // candidate (here: tracks unverifiable) or rolls back. On TorBox an add of an infohash already in
+    // the account returns the EXISTING torrent's id — and the rankers exclude only this title's own
+    // owned hashes — so a candidate present outside the group (identified under another title, or an
+    // unidentified manual add) would be deleted. Each fixture lists the candidate in the account and
+    // has the mock's add return that existing id.
+
+    #[tokio::test]
+    async fn movie_upgrade_never_stages_a_candidate_already_in_the_account() {
+        let owned = QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 1080,
+            score: 10,
+            unverified: false,
+        };
+        let (app, store, deleted, added) = movie_swap_fixture_with(
+            owned,
+            remux_candidate(),
+            "M.2020.1080p.REMUX.mkv",
+            unverifiable_prober(),
+            true,
+        )
+        .await;
+        run_upgrade_once(&app).await;
+        assert_eq!(
+            added.lock().unwrap().clone(),
+            Vec::<String>::new(),
+            "never staged"
+        );
+        let d = deleted.lock().unwrap().clone();
+        assert!(
+            !d.contains(&"tnew".to_string()),
+            "the existing torrent is never deleted: {d:?}"
+        );
+        assert!(!d.contains(&"told".to_string()), "current copy kept: {d:?}");
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hold"
+        );
+        assert!(store.get_owned("hnew".into()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn episode_upgrade_never_stages_a_candidate_already_in_the_account() {
+        let h = show_harness_singleton_720_ep_with(true).await;
+        let app = with_unverifiable_prober(&h.app);
+        upgrade_show_episodes_and_packs(&app, h.tmdb, &h.group_hashes, Duration::from_secs(0))
+            .await;
+        assert_eq!(
+            h.added.lock().unwrap().clone(),
+            Vec::<String>::new(),
+            "never staged"
+        );
+        let d = h.deleted.lock().unwrap().clone();
+        assert!(
+            !d.contains(&"tep1080".to_string()),
+            "the existing torrent is never deleted: {d:?}"
+        );
+        assert_eq!(
+            app.store
+                .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            h.old_720_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn pack_correction_never_stages_a_candidate_already_in_the_account() {
+        let mut h = show_harness_pack_2160_with_1080_candidate_with(true).await;
+        h.set_allow_downgrade(true);
+        let app = with_unverifiable_prober(&h.app);
+        upgrade_show_episodes_and_packs(&app, h.tmdb, &h.group_hashes, Duration::from_secs(0))
+            .await;
+        assert_eq!(
+            h.added.lock().unwrap().clone(),
+            Vec::<String>::new(),
+            "never staged"
+        );
+        let d = h.deleted.lock().unwrap().clone();
+        assert!(
+            !d.contains(&"tpack1080".to_string()),
+            "the existing torrent is never deleted: {d:?}"
+        );
+        assert!(!d.contains(&"tpack2160".to_string()), "pack kept: {d:?}");
+        assert!(app.store.get_owned(h.pack_hash.clone()).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn consolidation_never_stages_a_pack_already_in_the_account() {
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+        let mut torrents = show_listing();
+        torrents.push(Torrent {
+            id: "tpack".into(),
+            hash: "hpack".into(),
+            status: "downloaded".into(),
+            ..Default::default()
+        });
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents,
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(pack_info()),
+            resolved_url: Some("https://cdn/p1".into()),
+            deleted: deleted.clone(),
+            added: added.clone(),
+            ..Default::default()
+        });
+        let app = app_with_prober(
+            Arc::new(MockScraper {
+                candidates: vec![season_pack_candidate()],
+            }),
+            provider,
+            store.clone(),
+            unverifiable_prober(),
+        );
+        let res = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(
+            added.lock().unwrap().clone(),
+            Vec::<String>::new(),
+            "never staged"
+        );
+        let d = deleted.lock().unwrap().clone();
+        assert!(
+            !d.contains(&"tpack".to_string()),
+            "the existing torrent is never deleted: {d:?}"
+        );
+        for h in ["e1", "e2"] {
+            assert!(store.get_owned(h.into()).await.is_some(), "{h} kept");
+        }
     }
 }

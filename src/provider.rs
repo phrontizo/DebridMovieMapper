@@ -141,6 +141,12 @@ pub struct MockProvider {
     /// When `true`, `get_torrents` returns a `reqwest::Error` so tests can exercise the
     /// early-return guard in `reconcile_wanted` / `monitor_episodes`.
     pub fail_get_torrents: bool,
+    /// When `Some(n)`, the first `n` `get_torrents` calls succeed and every later one fails (as with
+    /// `fail_get_torrents`), so a test can fail a LATER listing — e.g. the upgrade engine's post-stage
+    /// prune listing — while an earlier one (its pre-add presence check) succeeds.
+    pub fail_get_torrents_after: Option<usize>,
+    /// Counts `get_torrents` calls (drives `fail_get_torrents_after`).
+    pub get_torrents_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// When `true`, `delete_torrent` returns a `reqwest::Error` (still recording the attempted id)
     /// so tests can exercise the keep-the-owned-record-for-retry path in `execute_remove`.
     pub fail_delete: bool,
@@ -168,7 +174,10 @@ impl DebridProvider for MockProvider {
         "mock"
     }
     async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
-        if self.fail_get_torrents {
+        let call = self
+            .get_torrents_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_get_torrents || self.fail_get_torrents_after.is_some_and(|ok| call >= ok) {
             // Drive an immediate URL-parse failure to produce a reqwest::Error without any I/O.
             return reqwest::Client::new().get("").send().await.map(|_| vec![]);
         }
