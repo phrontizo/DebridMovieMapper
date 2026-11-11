@@ -573,31 +573,35 @@ pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
             s += (sz / 1_000_000_000).min(15) as i64 * 200; // up to +3000 at ≥15 GB
         }
     }
-    // A concrete audio requirement: one language (`Lang`), or any of several (`AnyOf` — `Original`
-    // resolved against the title's TMDB original + spoken languages by `with_resolved_audio`). A raw
-    // `Original` has no per-title context here, so it never penalises.
+    if wrong_audio_language(r, prefs) {
+        s -= 50_000;
+    }
+    Some(s)
+}
+
+/// Whether `r` carries [`score`]'s wrong-`AUDIO_LANGUAGE` penalty under `prefs`: it names (or flags)
+/// audio languages and none of them — nor a `mul` multi-audio tag — satisfies a CONCRETE requirement:
+/// one language (`Lang`), or any of several (`AnyOf` — `Original` resolved against the title's TMDB
+/// original + spoken languages by `with_resolved_audio`). A raw `Original` has no per-title context,
+/// so it never applies; nor does it to an untagged release.
+pub fn wrong_audio_language(r: &ReleaseInfo, prefs: &QualityPrefs) -> bool {
     let wants: &[String] = match &prefs.audio {
         AudioReq::Lang(want) => std::slice::from_ref(want),
         AudioReq::AnyOf(wants) => wants,
         AudioReq::Original => &[],
     };
-    if !wants.is_empty() {
-        // Normalise both sides to ISO 639-2 (3-letter) before comparing — exactly as `probe::verify`
-        // does via `lang_eq`. `AudioReq::parse` only lowercases the configured value, so a 2-letter
-        // `AUDIO_LANGUAGE` (e.g. `en`) must map to `eng` to match a release tagged "English" (parsed
-        // to `eng`); a raw `l == want` would otherwise penalise the CORRECT-language release here even
-        // though the probe accepts it — an inconsistency between acquisition ranking and verification.
-        let wants: Vec<String> = wants.iter().map(|w| crate::probe::to_iso639_2(w)).collect();
-        if !r.languages.is_empty()
-            && !r
-                .languages
-                .iter()
-                .any(|l| l == "mul" || wants.contains(&crate::probe::to_iso639_2(l)))
-        {
-            s -= 50_000;
-        }
+    if wants.is_empty() || r.languages.is_empty() {
+        return false;
     }
-    Some(s)
+    // Normalise both sides to ISO 639-2 (3-letter) before comparing — exactly as `probe::verify`
+    // does via `lang_eq`. `AudioReq::parse` only lowercases the configured value, so a 2-letter
+    // `AUDIO_LANGUAGE` (e.g. `en`) must map to `eng` to match a release tagged "English" (parsed
+    // to `eng`); a raw `l == want` would otherwise penalise the CORRECT-language release here even
+    // though the probe accepts it — an inconsistency between acquisition ranking and verification.
+    let wants: Vec<String> = wants.iter().map(|w| crate::probe::to_iso639_2(w)).collect();
+    !r.languages
+        .iter()
+        .any(|l| l == "mul" || wants.contains(&crate::probe::to_iso639_2(l)))
 }
 
 pub fn rank(candidates: Vec<ReleaseInfo>, prefs: &QualityPrefs) -> Vec<ReleaseInfo> {
@@ -2624,6 +2628,48 @@ mod tests {
                 "a cam copy is unknown-lowest, never acquired over"
             );
             assert!(is_unknown_quality(&cam, 1080));
+        }
+    }
+
+    /// `wrong_audio_language` is exactly the condition `score`'s wrong-`AUDIO_LANGUAGE` penalty
+    /// applies on: a release naming (or flagging) only audio languages outside a CONCRETE
+    /// requirement. Untagged and multi-audio releases, and a raw `original` (no per-title language),
+    /// never carry it.
+    #[test]
+    fn wrong_audio_language_matches_the_score_penalty() {
+        let rel = |tag: &str, flag: &str| {
+            parse(&raw(
+                "Torrentio\n1080p",
+                &format!("M.2020.1080p.BluRay.x264.{tag}\n{flag}\nRD+"),
+                "h",
+                None,
+            ))
+        };
+        let rus = rel("Rus", "\u{1f1f7}\u{1f1fa}");
+        let eng = rel("ENG", "\u{1f1ec}\u{1f1e7}");
+        let untagged = rel("GRP", "");
+        let multi = rel("MULTi", "");
+        let english = prefs().with_resolved_audio(Some("en"), &[]);
+        assert!(wrong_audio_language(&rus, &english));
+        assert!(!wrong_audio_language(&eng, &english));
+        assert!(!wrong_audio_language(&untagged, &english));
+        assert!(!wrong_audio_language(&multi, &english));
+        assert!(
+            !wrong_audio_language(&rus, &prefs()),
+            "a raw `original` has no language to compare against"
+        );
+        let configured = QualityPrefs {
+            audio: AudioReq::Lang("en".into()),
+            ..prefs()
+        };
+        assert!(wrong_audio_language(&rus, &configured));
+        for r in [&rus, &eng, &untagged, &multi] {
+            assert_eq!(
+                score(r, &english).unwrap() < score(r, &prefs()).unwrap(),
+                wrong_audio_language(r, &english),
+                "{:?}: the penalty applies exactly when the predicate holds",
+                r.languages
+            );
         }
     }
 }

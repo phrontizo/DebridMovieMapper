@@ -81,6 +81,14 @@ impl ReadActivity {
         self.started.is_some_and(|t| t.elapsed() < window)
     }
 
+    /// How much of the start-up grace for `window` is left (zero with no grace, or once it is over).
+    /// A job that cannot do anything useful while the library is never idle — the daily upgrade pass,
+    /// whose next tick would otherwise come a full interval later — sleeps this before its first run.
+    pub fn startup_grace_remaining(&self, window: Duration) -> Duration {
+        self.started
+            .map_or(Duration::ZERO, |t| window.saturating_sub(t.elapsed()))
+    }
+
     /// Record that `path` was just read. Cheap; called on every proxy read. When the map exceeds
     /// `MAX_TRACKED`, the least-recently-read entries are batch-evicted down to a lower watermark
     /// (3/4 of the cap) so the eviction pass amortizes over many inserts rather than re-running on
@@ -187,6 +195,35 @@ mod tests {
     async fn without_startup_grace_is_idle_from_the_start() {
         let ra = ReadActivity::without_startup_grace();
         assert!(ra.all_idle(Duration::from_secs(300)).await);
+    }
+
+    /// `startup_grace_remaining` is what is left of the grace: about one window for a fresh tracker,
+    /// zero without a grace or once it has run out — and waiting it out ends the grace, so a job
+    /// that sleeps it before its first run (the upgrade job) finds the library idle.
+    #[tokio::test]
+    async fn startup_grace_remaining_counts_down_to_idle() {
+        let window = Duration::from_secs(300);
+        let left = ReadActivity::new().startup_grace_remaining(window);
+        assert!(
+            left <= window && left > window - Duration::from_secs(5),
+            "a fresh tracker has about one window of grace left, got {left:?}"
+        );
+        assert_eq!(
+            ReadActivity::without_startup_grace().startup_grace_remaining(window),
+            Duration::ZERO
+        );
+
+        let ra = ReadActivity::new();
+        let window = Duration::from_millis(50);
+        let left = ra.startup_grace_remaining(window);
+        assert!(!left.is_zero());
+        assert!(!ra.all_idle(window).await);
+        tokio::time::sleep(left).await;
+        assert!(
+            ra.all_idle(window).await,
+            "after sleeping the remaining grace the library is idle"
+        );
+        assert_eq!(ra.startup_grace_remaining(window), Duration::ZERO);
     }
 
     #[tokio::test]

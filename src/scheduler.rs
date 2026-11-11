@@ -9,7 +9,8 @@
 //! - **Episode monitor task** = `monitor_episodes`. Cadence: `TRAKT_EPISODE_CHECK_INTERVAL_SECS`.
 //! - **Upgrade task** (SP3) = `run_upgrade_once` (daily quality-upgrade + full-season consolidation).
 //!   Spawned ONLY when `config.upgrade.enabled()` (`UPGRADE_INTERVAL_SECS > 0`). Cadence:
-//!   `UPGRADE_INTERVAL_SECS`.
+//!   `UPGRADE_INTERVAL_SECS`; the first pass waits out the read-activity start-up grace
+//!   ([`upgrade_first_run_delay`]), during which it could do nothing.
 //!
 //! The Trakt cycle + monitor tasks are spawned ONLY when `trakt_jobs_enabled(&app)` — i.e. both a
 //! Trakt client and `config.trakt` are present; otherwise the service runs exactly as before.
@@ -76,6 +77,38 @@ where
             return;
         }
     }
+}
+
+/// [`periodic`], but the first run waits `first_delay` (returning early, without running the job, if
+/// `shutdown` fires meanwhile). A zero delay is exactly `periodic`.
+pub async fn periodic_after<F, Fut>(
+    first_delay: Duration,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+    job: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if !first_delay.is_zero() {
+        tokio::select! {
+            _ = tokio::time::sleep(first_delay) => {}
+            // shutdown signalled or sender dropped — stop either way.
+            _ = shutdown.changed() => return,
+        }
+    }
+    periodic(interval, shutdown, job).await
+}
+
+/// How long the upgrade job waits before its first pass: what is left of the read-activity start-up
+/// grace (`UPGRADE_IDLE_SECS` after process start, during which the library is never idle). A pass
+/// inside the grace would defer every title — its swaps and prunes are idle-gated, and so is the
+/// per-title loop — and the next pass only comes `UPGRADE_INTERVAL_SECS` later (fixed delay), so a
+/// service restarted at least that often would never upgrade anything. Zero when there is no grace
+/// left, so the first pass then runs immediately, as before the grace existed.
+pub(crate) fn upgrade_first_run_delay(app: &AppState) -> Duration {
+    app.read_activity
+        .startup_grace_remaining(Duration::from_secs(app.config.upgrade.idle_secs))
 }
 
 /// Returns `true` when both a Trakt client and Trakt configuration are present — the
@@ -233,12 +266,15 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
 
     if app.config.upgrade.enabled() {
         let secs = app.config.upgrade.interval_secs;
+        let first = upgrade_first_run_delay(&app);
         info!(
-            "Upgrade engine enabled: re-scoring owned titles every {}s",
-            secs
+            "Upgrade engine enabled: re-scoring owned titles every {}s (first pass in {}s, after the start-up idle grace)",
+            secs,
+            first.as_secs()
         );
         let upgrade_app = app.clone();
-        handles.push(tokio::spawn(periodic(
+        handles.push(tokio::spawn(periodic_after(
+            first,
             Duration::from_secs(secs),
             shutdown.clone(),
             move || {
@@ -365,6 +401,29 @@ mod trakt_gate_tests {
             trakt_jobs_enabled(&app),
             "Trakt gate must be true when both client and config are present"
         );
+    }
+
+    /// The upgrade job's first pass waits out the read-activity start-up grace: during it the
+    /// library is never idle, so a pass at start-up would defer every title and — on the daily
+    /// fixed-delay cadence — the next pass would only come one `UPGRADE_INTERVAL_SECS` later (a
+    /// service restarted at least daily would never upgrade anything). With no grace (or once it is
+    /// over) the first pass runs immediately, as before.
+    #[test]
+    fn upgrade_first_run_waits_out_the_startup_grace() {
+        let mut app = make_test_app(false);
+        assert_eq!(
+            upgrade_first_run_delay(&app),
+            Duration::ZERO,
+            "no start-up grace → the first pass runs immediately"
+        );
+        app.read_activity = std::sync::Arc::new(crate::read_activity::ReadActivity::new());
+        let idle = Duration::from_secs(app.config.upgrade.idle_secs);
+        let delay = upgrade_first_run_delay(&app);
+        assert!(
+            delay <= idle && delay > idle - Duration::from_secs(5),
+            "the first pass waits the rest of the grace (~{idle:?}), got {delay:?}"
+        );
+        assert!(delay < Duration::from_secs(app.config.upgrade.interval_secs));
     }
 
     /// `upgrade_gate_follows_config`: default `Config` has the upgrade job enabled (daily);
@@ -569,6 +628,80 @@ mod tests {
         .await;
         // With shutdown already set, the loop guard returns before running at all.
         assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// Yield a few times so a task woken by a paused-clock `advance` gets polled to its next await.
+    async fn settle() {
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// `periodic_after` runs nothing during `first_delay`, runs the job right when it ends (not one
+    /// `interval` later), then continues on the fixed-delay cadence.
+    #[tokio::test(start_paused = true)]
+    async fn periodic_after_runs_when_the_first_delay_ends_then_on_cadence() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = watch::channel(false);
+        let c = counter.clone();
+        let handle = tokio::spawn(periodic_after(
+            Duration::from_secs(300),
+            Duration::from_secs(86_400),
+            rx,
+            move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        ));
+        settle().await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "nothing during the delay"
+        );
+        tokio::time::advance(Duration::from_secs(299)).await;
+        settle().await;
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "still inside the delay");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "the first run comes as the delay ends"
+        );
+        tokio::time::advance(Duration::from_secs(86_399)).await;
+        settle().await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "then once per interval");
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// A shutdown during `periodic_after`'s first delay returns promptly without running the job.
+    #[tokio::test(start_paused = true)]
+    async fn periodic_after_stops_on_shutdown_during_the_first_delay() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = watch::channel(false);
+        let c = counter.clone();
+        let handle = tokio::spawn(periodic_after(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            rx,
+            move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        ));
+        settle().await;
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
     /// A shutdown signalled MID-tick cancels the in-flight job promptly, rather than waiting for a

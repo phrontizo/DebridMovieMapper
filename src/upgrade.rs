@@ -662,8 +662,10 @@ fn ordering_prefs(
 /// and anything failing `score()`'s hard filters (ceiling / cam / dead-seeder). Improvement is judged
 /// on the raw prefs AND, again, with the candidate scored under the title's [`ordering_prefs`]
 /// (`req`) — so a release acquisition would rank below the owned copy (a wrong-language penalty) is
-/// never a candidate; the improving candidates are then ordered by that score, so a wrong-language
-/// release is tried after a correctly-tagged one. The
+/// never a candidate; against an unknown-quality (or uncached) owned copy, whose comparison ignores
+/// scores, a release carrying that penalty ([`release::wrong_audio_language`]) is dropped outright.
+/// The improving candidates are then ordered by that score, so a wrong-language release is tried
+/// after a correctly-tagged one. The
 /// caller stages them in order until one is adopted (in-tick fall-through), so a top candidate that
 /// fails a candidate-specific gate no longer ends the tick. The list is direction-homogeneous (all
 /// `Upgrade` or all `Downgrade`) because `is_target_improvement` only rates a lower-resolution
@@ -679,6 +681,9 @@ async fn rank_changes(
 ) -> Vec<(release::ReleaseInfo, release::Improvement)> {
     let prefs = &app.config.acquisition.prefs;
     let order = ordering_prefs(app, req);
+    // The improvement verdict ignores scores for an uncached or unknown-quality owned copy.
+    let score_blind =
+        !baseline.cached || release::is_unknown_quality(baseline, prefs.max_resolution.height());
     // Fetch the per-title blacklist ONCE and test membership in memory, rather than one awaited redb
     // read per candidate (Torrentio commonly returns dozens of streams per title) — mirrors `acquire`.
     let blacklist = app.store.blacklisted_hashes_for(media, tmdb_id).await;
@@ -719,6 +724,13 @@ async fn rank_changes(
         };
         if release::is_target_improvement(baseline, &as_ranked, prefs) == release::Improvement::None
         {
+            continue;
+        }
+        // …but against an owned copy of UNKNOWN quality (or an uncached one) `is_target_improvement`
+        // ignores scores — any known cached candidate improves it — so the test above can't see the
+        // penalty. Drop a wrong-language release explicitly there: it never replaces the user's
+        // copy, which may well be in the right language.
+        if score_blind && release::wrong_audio_language(&r, &order) {
             continue;
         }
         scored.push((order_score, r, imp));
@@ -2058,6 +2070,28 @@ async fn upgrade_show_episodes_and_packs(
             );
             continue;
         }
+        // The swap repoints the episode slot, so judge candidates against what the slot SERVES too:
+        // when it points at another owned copy of this show (e.g. a better pack that also provides
+        // the episode), the baseline is the better of the two (`best_owned_quality`: known before
+        // unknown, then effective score). Otherwise a candidate that beats only this singleton — any
+        // known one, when the singleton is unknown — would move the slot off a better pack.
+        let served_other = app
+            .store
+            .get_selection(crate::store::episode_slot(tmdb_id, season, episode))
+            .await
+            .filter(|sel| !sel.hash.eq_ignore_ascii_case(hash))
+            .and_then(|sel| {
+                group_hashes
+                    .iter()
+                    .find(|h| h.eq_ignore_ascii_case(&sel.hash))
+                    .cloned()
+            });
+        let q = match served_other {
+            Some(other) => best_owned_quality(app, &[hash.clone(), other])
+                .await
+                .unwrap_or(q),
+            None => q,
+        };
         let req = crate::store::AcquireRequest {
             imdb_id: imdb_id.clone(),
             season: Some(season),
@@ -3105,9 +3139,10 @@ mod tests {
         );
     }
 
-    /// Start-up grace: on the upgrade tick that runs right after the process starts (a fresh
-    /// tracker, nothing read yet) the library is NOT idle for the first idle window, so nothing is
-    /// staged, swapped or pruned and the round-robin cursor is left unstamped.
+    /// Start-up grace: an upgrade tick run right after the process starts (a fresh tracker, nothing
+    /// read yet) finds the library NOT idle for the first idle window, so nothing is staged, swapped
+    /// or pruned and the round-robin cursor is left unstamped. (The scheduler therefore holds the
+    /// first pass back until the grace is over — `scheduler::upgrade_first_run_delay`.)
     #[tokio::test]
     async fn upgrade_tick_defers_during_the_startup_grace() {
         let store = mem_store();
@@ -6531,6 +6566,61 @@ mod tests {
         }
     }
 
+    /// For an UNKNOWN-quality owned copy every known cached candidate is an improvement whatever its
+    /// score, so the language-aware improvement test can't drop a release acquisition would
+    /// penalise for the wrong audio language. It is dropped explicitly: a release tagged only with
+    /// other languages (`Rus` + 🇷🇺 on an English-original title) never replaces the user's copy of
+    /// unknown quality — untagged audio tracks would let it pass the probe. Correctly-tagged and
+    /// untagged releases still qualify.
+    #[tokio::test]
+    async fn rank_changes_drops_wrong_language_candidates_for_an_unknown_current() {
+        let app = app_with(
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(MockProvider::default()),
+            mem_store(),
+        );
+        let cand = |hash: &str, tag: &str, flag: &str| RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: format!("M.2020.1080p.BluRay.x264.{tag}\n👤 50 💾 8 GB\n{flag}\nRD+"),
+            info_hash: hash.into(),
+            file_idx: Some(0),
+            file_name: Some(format!("M.2020.1080p.BluRay.x264.{tag}.mkv")),
+        };
+        let raws = vec![
+            cand("hrus", "Rus", "🇷🇺"),
+            cand("heng", "ENG", "🇬🇧"),
+            cand("hplain", "GRP", ""),
+        ];
+        for baseline in [
+            QualitySummary::unknown(),
+            QualitySummary {
+                cached: true,
+                source_tier: 0,
+                resolution: 1080,
+                score: 9_999_999,
+                unverified: false,
+            },
+        ] {
+            let ranked = rank_changes(
+                &app,
+                MediaKind::Movie,
+                27205,
+                &raws,
+                &baseline,
+                &[],
+                &movie_req(),
+            )
+            .await;
+            let mut hashes: Vec<_> = ranked.iter().map(|(r, _)| r.info_hash.as_str()).collect();
+            hashes.sort_unstable();
+            assert_eq!(
+                hashes,
+                vec!["heng", "hplain"],
+                "{baseline:?}: the wrong-language release is not a candidate"
+            );
+        }
+    }
+
     #[test]
     fn rank_cached_pack_candidates_skips_known_unverifiable_containers() {
         // Same rule for consolidation / pack-correction ranking: a pack whose reported file is a
@@ -8404,6 +8494,103 @@ mod tests {
                     .await
                     .is_none(),
                 "{current:?}: unknown singleton pruned"
+            );
+        }
+    }
+
+    /// Phase (a) repoints the episode slot to what it adopts, so it must judge candidates against
+    /// what the slot SERVES, not only the singleton's own quality: a singleton (unknown, or a known
+    /// but worse one) whose episode is served by a better owned pack must not move the slot from the
+    /// pack to a candidate that beats the singleton but not the pack (here 1080p WEB over a 1080p
+    /// BluRay pack — a tier drop, plus an extra torrent).
+    #[tokio::test]
+    async fn singleton_upgrade_never_repoints_a_slot_served_by_a_better_pack() {
+        for single in [None, Some(q720_web())] {
+            let mut h = show_harness_singleton_720_ep().await;
+            h.app
+                .store
+                .put_owned(
+                    h.old_720_hash.clone(),
+                    OwnedRecord {
+                        quality: single.clone(),
+                        ..ep_record(1, 1, q720_web())
+                    },
+                )
+                .await
+                .unwrap();
+            let pack = "pk".to_string();
+            h.app
+                .store
+                .put_owned(
+                    pack.clone(),
+                    OwnedRecord {
+                        provides: vec![(1, 1), (1, 2)],
+                        ..ep_record(1, 1, q1080_bluray())
+                    },
+                )
+                .await
+                .unwrap();
+            h.app
+                .store
+                .put_selection(
+                    crate::store::episode_slot(h.tmdb, 1, 1),
+                    SelectionEntry {
+                        hash: pack.clone(),
+                        file_path: "S.S01E01.1080p.BluRay.mkv".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            h.group_hashes = vec![h.old_720_hash.clone(), pack.clone()];
+            let deferred = upgrade_show_episodes_and_packs(
+                &h.app,
+                h.tmdb,
+                &h.group_hashes,
+                Duration::from_secs(0),
+            )
+            .await;
+            assert!(!deferred);
+            assert_eq!(
+                h.app
+                    .store
+                    .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+                    .await
+                    .unwrap()
+                    .hash,
+                pack,
+                "{single:?}: the slot stays on the better pack"
+            );
+            assert!(
+                h.added.lock().unwrap().is_empty(),
+                "{single:?}: nothing staged — the candidate is no better than what is served"
+            );
+
+            // Control: a candidate that beats the pack too (1080p REMUX) is still adopted.
+            let remux = ep_1080_remux_candidate();
+            let app = app_with(
+                Arc::new(MockScraper {
+                    candidates: vec![remux.clone()],
+                }),
+                h.app.provider.clone(),
+                h.app.store.clone(),
+            );
+            assert!(
+                !upgrade_show_episodes_and_packs(
+                    &app,
+                    h.tmdb,
+                    &h.group_hashes,
+                    Duration::from_secs(0)
+                )
+                .await
+            );
+            assert_eq!(
+                app.store
+                    .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+                    .await
+                    .unwrap()
+                    .hash,
+                remux.info_hash,
+                "{single:?}: a candidate better than the served pack is adopted"
             );
         }
     }

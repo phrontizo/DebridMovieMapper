@@ -1781,7 +1781,9 @@ pub(crate) struct DedupPlan {
 /// upgrade engine's job, under `ALLOW_RESOLUTION_DOWNGRADE`). A `Manual`-provenance copy is never
 /// removed (invariant M-1). Only groups with at least one removal are returned. Absent
 /// (not-`present`) hashes are ignored entirely — they're already gone, never a removal target or
-/// coverage source.
+/// coverage source — and so are unsettled (`Pending`) ones: only `Verified` copies are ranked, kept,
+/// removed or count as coverage, so a still-downloading or not-yet-checked acquisition never
+/// displaces a playable copy (and is judged once `observe` settles it).
 pub(crate) fn plan_dedup(
     owned: &[(String, OwnedRecord)],
     present: &std::collections::HashSet<String>,
@@ -1794,6 +1796,15 @@ pub(crate) fn plan_dedup(
     for (hash, rec) in owned {
         let h = hash.to_ascii_lowercase();
         if !present.contains(&h) {
+            continue;
+        }
+        // Only SETTLED copies take part. A `Pending` record is an acquisition `observe` hasn't
+        // resolved yet — still downloading (its acquire-time quality says `cached: false`), or not
+        // yet probed / title-checked — and quality ranking ignores both. Letting it win a keep slot
+        // (or cover a Verified copy's episodes) would delete a playable copy in favour of one that
+        // may yet stall, die or fail a check (observe then deletes it too: no copy left). It is not
+        // removed either: observe owns it until it settles, and dedup judges it then.
+        if rec.status != OwnedStatus::Verified {
             continue;
         }
         let mt = media_type_of(rec.request.kind);
@@ -4450,6 +4461,100 @@ mod tests {
             vec!["res0"],
             "a recorded tier beats no quality at all"
         );
+    }
+
+    /// Only SETTLED (`Verified`) copies take part in dedup. A `Pending` acquisition — still
+    /// downloading (its acquire-time quality says `cached: false`), or downloaded but not yet
+    /// probed / title-checked — must never win a keep slot over, or count as coverage for, a
+    /// Verified copy: if it later stalls, dies or fails a check, observe deletes it as well and the
+    /// title is left with no playable copy (for good, if the deleted copy was the user's own).
+    /// Nor is a Pending copy ever removed — observe owns it until it settles, and dedup judges it
+    /// then.
+    #[test]
+    fn plan_dedup_ignores_unsettled_pending_copies() {
+        use crate::release::QualitySummary;
+        use crate::scraper::MediaKind::{Movie, Series};
+        let p = || Provenance { entries: vec![] };
+        let pending = |rec: OwnedRecord| OwnedRecord {
+            status: OwnedStatus::Pending,
+            ..rec
+        };
+        let uncached_remux = QualitySummary {
+            cached: false,
+            ..qs(1080, 8_000, 5)
+        };
+
+        // Movie: a served, Verified cached 1080p WEB copy + a better but still-downloading REMUX.
+        let owned = vec![
+            (
+                "verified".to_string(),
+                qrec(Movie, 1, vec![], Some(qs(1080, 3_000, 10)), p()),
+            ),
+            (
+                "pending".to_string(),
+                pending(qrec(Movie, 1, vec![], Some(uncached_remux.clone()), p())),
+            ),
+        ];
+        let plans = plan(
+            &owned,
+            &hset(&["verified", "pending"]),
+            &hset(&["verified"]),
+        );
+        assert!(
+            removed_for(&plans, 1).is_empty(),
+            "an unsettled copy never displaces a settled one: {plans:?}"
+        );
+
+        // …and a Pending copy is never removed in favour of a better Verified one either; only the
+        // genuinely redundant settled copy goes.
+        let owned = vec![
+            (
+                "best".to_string(),
+                qrec(Movie, 2, vec![], Some(qs(1080, 8_000, 10)), p()),
+            ),
+            (
+                "worse".to_string(),
+                qrec(Movie, 2, vec![], Some(qs(720, 3_000, 10)), p()),
+            ),
+            (
+                "pending".to_string(),
+                pending(qrec(Movie, 2, vec![], Some(qs(720, 1_000, 1)), p())),
+            ),
+        ];
+        let plans = plan(&owned, &hset(&["best", "worse", "pending"]), &hset(&[]));
+        assert_eq!(removed_for(&plans, 2), vec!["worse"]);
+
+        // Show: a Pending REMUX season pack neither covers the Verified WEB singles (not removed)…
+        let owned = vec![
+            (
+                "e1".to_string(),
+                qrec(Series, 3, vec![(1, 1)], Some(qs(1080, 3_000, 10)), p()),
+            ),
+            (
+                "e2".to_string(),
+                qrec(Series, 3, vec![(1, 2)], Some(qs(1080, 3_000, 10)), p()),
+            ),
+            (
+                "pack".to_string(),
+                pending(qrec(Series, 3, eps(1, 1, 2), Some(uncached_remux), p())),
+            ),
+        ];
+        let plans = plan(&owned, &hset(&["e1", "e2", "pack"]), &hset(&["e1", "e2"]));
+        assert!(removed_for(&plans, 3).is_empty(), "{plans:?}");
+
+        // …nor is a Pending single removed while a better Verified pack covers it.
+        let owned = vec![
+            (
+                "pack".to_string(),
+                qrec(Series, 4, eps(1, 1, 2), Some(qs(1080, 8_000, 10)), p()),
+            ),
+            (
+                "e1".to_string(),
+                pending(qrec(Series, 4, vec![(1, 1)], Some(qs(720, 3_000, 1)), p())),
+            ),
+        ];
+        let plans = plan(&owned, &hset(&["pack", "e1"]), &hset(&["pack"]));
+        assert!(removed_for(&plans, 4).is_empty(), "{plans:?}");
     }
 }
 
