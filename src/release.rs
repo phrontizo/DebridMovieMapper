@@ -36,7 +36,9 @@ impl Container {
     pub fn is_verifiable(self) -> bool {
         matches!(self, Container::Mkv | Container::Mp4)
     }
-    fn from_name(name: &str) -> Container {
+    /// Classify a file by its extension. `pub` so the account mirror (`tasks::mirror_quality`), the
+    /// schema-v8 migration and the upgrade rankers can tell whether a file is one the probe can read.
+    pub fn from_name(name: &str) -> Container {
         let n = name.to_ascii_lowercase();
         if n.ends_with(".mkv") {
             Container::Mkv
@@ -617,15 +619,28 @@ pub struct QualitySummary {
     pub source_tier: i64,
     pub resolution: u16,
     pub score: i64,
+    /// The release's audio/subtitle tracks could NOT be checked: `observe` accepted it on a probe
+    /// `Accept` (an unreadable container — `.avi`, an MP4 whose `moov` couldn't be read — or no
+    /// tracks), or it is an account-mirror copy whose file isn't MKV/MP4 (the schema-v8 migration
+    /// backfills it for existing records a `selection` entry serves from such a file).
+    /// `is_target_improvement` lets an equal-quality cached release
+    /// replace such a copy, and the upgrade pass only ever adopts a probe `Pass`, so an unchecked
+    /// copy is swapped for a checked one and never the reverse. `false` (the serde default) for a
+    /// record persisted before the flag existed.
+    #[serde(default)]
+    pub unverified: bool,
 }
 
 impl QualitySummary {
+    /// Snapshot a candidate's quality. Always `unverified: false` — the caller sets the flag from
+    /// the probe verdict once the release has actually been checked (or couldn't be).
     pub fn of(r: &ReleaseInfo, prefs: &QualityPrefs) -> Self {
         QualitySummary {
             cached: r.cached,
             source_tier: r.source.tier_score(),
             resolution: r.resolution.unwrap_or(0),
             score: score(r, prefs).unwrap_or(i64::MIN),
+            unverified: false,
         }
     }
 
@@ -659,7 +674,9 @@ pub enum Improvement {
 ///
 /// A `candidate` reaching this function has already passed `score()`'s hard filter, so it is always
 /// within the ceiling; its effective score equals its raw score. Convergence: within a fixed ceiling
-/// every accepted swap strictly increases the owned effective score (bounded) => no flip-flop.
+/// every accepted swap strictly increases the owned effective score (bounded) => no flip-flop — the
+/// one equal-score case, replacing an `unverified` copy, adopts only a probe-checked release, so the
+/// new copy is verified and that rule cannot fire for it again.
 pub fn is_target_improvement(
     current: &QualitySummary,
     candidate: &QualitySummary,
@@ -673,6 +690,16 @@ pub fn is_target_improvement(
     }
     let cur = effective_score(current, prefs);
     let cand = effective_score(candidate, prefs);
+    // An owned copy whose tracks could never be checked (`unverified`) is replaced by ANY cached
+    // candidate at the same-or-better effective score and same-or-higher resolution — no category
+    // jump needed. The upgrade pass only adopts a candidate whose probe PASSES, so this trades an
+    // unchecked copy for a checked one at no quality cost; the replacement is recorded verified, so
+    // the rule can't fire again for it (converges). `resolution >=` keeps it from ever trading
+    // resolution (and, since an over-ceiling `current` can't be matched by a within-ceiling
+    // candidate, leaves the corrective-downgrade direction below untouched).
+    if current.unverified && cand >= cur && candidate.resolution >= current.resolution {
+        return Improvement::Upgrade;
+    }
     if cand <= cur {
         return Improvement::None;
     }
@@ -1516,6 +1543,7 @@ mod tests {
             source_tier: 3_000,
             resolution: 1080,
             score: 1,
+            unverified: false,
         };
         // uncached candidate is never an upgrade
         let cand_uncached = QualitySummary {
@@ -1523,6 +1551,7 @@ mod tests {
             source_tier: 8_000,
             resolution: 2160,
             score: 9,
+            unverified: false,
         };
         assert_eq!(
             is_target_improvement(&owned_web_1080_cached, &cand_uncached, &prefs()),
@@ -1534,6 +1563,7 @@ mod tests {
             source_tier: 8_000,
             resolution: 1080,
             score: 5,
+            unverified: false,
         };
         assert_eq!(
             is_target_improvement(&owned_web_1080_cached, &cand_remux, &prefs()),
@@ -1545,6 +1575,7 @@ mod tests {
             source_tier: 3_000,
             resolution: 1080,
             score: 999,
+            unverified: false,
         };
         assert_eq!(
             is_target_improvement(&owned_web_1080_cached, &cand_same, &prefs()),
@@ -1556,12 +1587,14 @@ mod tests {
             source_tier: 3_000,
             resolution: 720,
             score: 1,
+            unverified: false,
         };
         let cand_1080 = QualitySummary {
             cached: true,
             source_tier: 3_000,
             resolution: 1080,
             score: 2,
+            unverified: false,
         };
         assert_eq!(
             is_target_improvement(&owned_720, &cand_1080, &prefs()),
@@ -1573,6 +1606,7 @@ mod tests {
             source_tier: 6_000,
             resolution: 1080,
             score: 0,
+            unverified: false,
         };
         assert_eq!(
             is_target_improvement(&owned_uncached, &cand_same, &prefs()),
@@ -1596,24 +1630,28 @@ mod tests {
             source_tier: 6_000, // BluRay
             resolution: 720,
             score: 1_078_000,
+            unverified: false,
         };
         let web_1080 = QualitySummary {
             cached: true,
             source_tier: 3_000, // Web
             resolution: 1080,
             score: 1_111_000,
+            unverified: false,
         };
         let remux_1080 = QualitySummary {
             cached: true,
             source_tier: 8_000, // Remux
             resolution: 1080,
             score: 1_116_000,
+            unverified: false,
         };
         let web_2160 = QualitySummary {
             cached: true,
             source_tier: 3_000,
             resolution: 2160,
             score: 1_219_000,
+            unverified: false,
         };
 
         // Legitimate cross-axis upgrade: 720p BluRay → 1080p WEB scores higher (resolution wins),
@@ -1644,6 +1682,7 @@ mod tests {
             source_tier: 3_000,
             resolution: 1080,
             score: 1_111_500, // slightly higher than web_1080 but same tier+res
+            unverified: false,
         };
         assert_eq!(
             is_target_improvement(&web_1080, &web_1080_marginal, &prefs),
@@ -1828,12 +1867,14 @@ mod tests {
             source_tier: 3_000,
             resolution: 1080,
             score: 100,
+            unverified: false,
         };
         let cand_higher_tier = QualitySummary {
             cached: true,
             source_tier: 8_000, // a real tier jump…
             resolution: 1080,
             score: 100, // …but identical score
+            unverified: false,
         };
         assert_eq!(
             is_target_improvement(&cur_tier, &cand_higher_tier, &prefs),
@@ -1845,12 +1886,14 @@ mod tests {
             source_tier: 3_000,
             resolution: 1080,
             score: 200,
+            unverified: false,
         };
         let cand_higher_res = QualitySummary {
             cached: true,
             source_tier: 3_000,
             resolution: 2160, // a real resolution jump…
             score: 200,       // …but identical score
+            unverified: false,
         };
         assert_eq!(
             is_target_improvement(&cur_res, &cand_higher_res, &prefs),
@@ -1955,6 +1998,7 @@ mod tests {
                 source_tier: tier,
                 resolution: res,
                 score: 1_000_000 + tier + res as i64 * 100,
+                unverified: false,
             }
         }
 
@@ -2008,6 +2052,7 @@ mod tests {
                 resolution: 1080,   // exactly at the ceiling -> within
                 // 1_000_000 + 3_000 + 108_000 - 50_000 (wrong-audio penalty) = 1_061_000
                 score: 1_061_000,
+                unverified: false,
             };
             let cand = QualitySummary {
                 cached: true,
@@ -2015,6 +2060,7 @@ mod tests {
                 resolution: 720,
                 // 1_000_000 + 8_000 + 72_000 + 5_000 (hevc) = 1_085_000 (> cur)
                 score: 1_085_000,
+                unverified: false,
             };
             assert!(
                 cand.score > cur.score,
@@ -2069,6 +2115,89 @@ mod tests {
                 Improvement::Upgrade
             );
         }
+
+        #[test]
+        fn unverified_current_is_improved_by_equal_score_candidate() {
+            // An owned copy whose tracks could never be checked (an `.avi`, or an MP4 whose `moov`
+            // couldn't be read) is replaced by an EQUAL-quality cached release — no category jump
+            // needed — because the replacement will be probed (the upgrade pass only adopts a
+            // `Pass`), so the library trades an unchecked copy for a checked one at no quality cost.
+            let mut cur = cached(1080, 3_000);
+            cur.unverified = true;
+            let cand = cached(1080, 3_000);
+            assert_eq!(cand.score, cur.score, "test setup: equal score");
+            assert_eq!(
+                is_target_improvement(&cur, &cand, &prefs(MaxResolution::P1080)),
+                Improvement::Upgrade
+            );
+            // A higher-scoring same-category candidate qualifies too (`>=`, not only `==`).
+            let mut better = cached(1080, 3_000);
+            better.score += 500;
+            assert_eq!(
+                is_target_improvement(&cur, &better, &prefs(MaxResolution::P1080)),
+                Improvement::Upgrade
+            );
+            // A LOWER-scoring same-resolution candidate does not: the swap must never cost quality.
+            let mut worse = cached(1080, 3_000);
+            worse.score -= 1;
+            assert_eq!(
+                is_target_improvement(&cur, &worse, &prefs(MaxResolution::P1080)),
+                Improvement::None
+            );
+        }
+
+        #[test]
+        fn verified_current_equal_score_is_still_none() {
+            // The no-churn guard is unchanged for a checked copy: an equal (or same-category
+            // marginally better) candidate is not an upgrade.
+            let cur = cached(1080, 3_000);
+            assert!(!cur.unverified);
+            let cand = cached(1080, 3_000);
+            assert_eq!(
+                is_target_improvement(&cur, &cand, &prefs(MaxResolution::P1080)),
+                Improvement::None
+            );
+            let mut wobble = cached(1080, 3_000);
+            wobble.score += 500;
+            assert_eq!(
+                is_target_improvement(&cur, &wobble, &prefs(MaxResolution::P1080)),
+                Improvement::None
+            );
+        }
+
+        #[test]
+        fn unverified_current_never_trades_resolution() {
+            // The unverified rule needs `resolution >= current`: a within-ceiling unverified copy is
+            // never traded DOWN in resolution, even for a higher-scoring candidate.
+            let mut cur = cached(1080, 3_000);
+            cur.unverified = true;
+            let mut cand = cached(720, 8_000);
+            cand.score = cur.score + 10_000;
+            assert_eq!(
+                is_target_improvement(&cur, &cand, &prefs(MaxResolution::P1080)),
+                Improvement::None,
+                "a lower-resolution candidate must not replace a within-ceiling unverified copy"
+            );
+            // Over-ceiling corrective-downgrade semantics are unchanged by the flag.
+            let mut over = cached(2160, 8_000);
+            over.unverified = true;
+            assert_eq!(
+                is_target_improvement(&over, &cached(1080, 6_000), &prefs(MaxResolution::P1080)),
+                Improvement::Downgrade
+            );
+        }
+
+        #[test]
+        fn legacy_quality_summary_decodes_as_verified() {
+            // A `QualitySummary` persisted before the `unverified` flag existed decodes as checked
+            // (`false`), so legacy owned records keep their exact upgrade behaviour.
+            let q: QualitySummary = serde_json::from_str(
+                r#"{"cached":true,"source_tier":3000,"resolution":1080,"score":1111000}"#,
+            )
+            .expect("legacy summary must decode");
+            assert!(!q.unverified);
+            assert_eq!(q.resolution, 1080);
+        }
     }
 
     #[cfg(test)]
@@ -2093,6 +2222,7 @@ mod tests {
                 source_tier: tier,
                 resolution: res,
                 score: 1_000_000 + tier + res as i64 * 100,
+                unverified: false,
             }
         }
 
@@ -2128,6 +2258,7 @@ mod tests {
                 source_tier: 0,
                 resolution: 1080,
                 score: 1_000_000 + 1080 * 100,
+                unverified: false,
             };
             // ...must still beat a more-over-ceiling copy with the STRONGEST (max tier + bonuses).
             let more_over = QualitySummary {
@@ -2135,6 +2266,7 @@ mod tests {
                 source_tier: 8_000,
                 resolution: 2160,
                 score: 1_000_000 + 8_000 + 2160 * 100 + 15_000,
+                unverified: false,
             };
             assert!(effective_score(&more_over, &p) < effective_score(&less_over, &p));
         }

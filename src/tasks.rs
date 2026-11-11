@@ -1166,6 +1166,11 @@ fn meta_tmdb_id(metadata: &MediaMetadata) -> Option<u64> {
 /// (`is_target_improvement`) uses. Recording such a record would let a scraped candidate "upgrade"
 /// (potentially DOWNGRADE) it on the unknown axis, deleting a possibly-better original. We only
 /// record a quality we can compare safely on both axes.
+///
+/// A recorded summary is flagged `unverified` iff the representative file isn't MKV/MP4 — a
+/// container the probe can never read (e.g. `.avi`), so the upgrade pass may replace it with an
+/// equal-quality checked copy. A mirrored MKV/MP4 was never probed either, but is assumed fine:
+/// flagging every mirror copy would churn the whole library through the upgrade pass.
 fn mirror_quality(
     info: &crate::rd_client::TorrentInfo,
     prefs: &crate::config::QualityPrefs,
@@ -1191,11 +1196,13 @@ fn mirror_quality(
     r.cached = true; // present in the provider listing == available
                      // Only record a quality the engine can safely compare; a hard-filtered release has no score.
     crate::release::score(&r, prefs)?;
-    let summary = crate::release::QualitySummary::of(&r, prefs);
+    let mut summary = crate::release::QualitySummary::of(&r, prefs);
     // Both axes the upgrade comparison uses must be known, else an "upgrade" could be a downgrade.
     if summary.resolution == 0 || summary.source_tier == 0 {
         return None;
     }
+    // `r.container` is `Container::from_name` of the file name parsed above.
+    summary.unverified = !r.container.is_verifiable();
     Some(summary)
 }
 
@@ -2849,6 +2856,17 @@ mod tests {
         assert!(q.cached);
         assert_eq!(q.resolution, 1080);
         assert!(q.source_tier > 0);
+        // A mirrored MKV/MP4 was never probed but is assumed fine (flagging every mirror copy would
+        // churn the whole library through the upgrade pass) → not flagged.
+        assert!(!q.unverified, "a mirrored .mkv is not flagged unverified");
+        let mp4 = mirror_quality(&info("Movie.2020.1080p.BluRay.x264.mp4"), &prefs)
+            .expect("a fully-tagged .mp4 yields a comparable quality");
+        assert!(!mp4.unverified, "a mirrored .mp4 is not flagged unverified");
+        // A container the probe can never read (`.avi`) IS flagged, so the upgrade pass replaces it
+        // with a checked copy.
+        let avi = mirror_quality(&info("Movie.2020.1080p.BluRay.x264.avi"), &prefs)
+            .expect("a fully-tagged .avi yields a comparable quality");
+        assert!(avi.unverified, "a mirrored .avi must be flagged unverified");
         // No video file at all → None.
         let no_video = crate::rd_client::TorrentInfo {
             hash: "h".into(),
@@ -3280,6 +3298,7 @@ mod tests {
                 source_tier: 0,
                 resolution: 1080,
                 score: s,
+                unverified: false,
             }),
         }
     }
@@ -6177,6 +6196,7 @@ mod dedup_owned_tests {
                 source_tier: 0,
                 resolution: 1080,
                 score,
+                unverified: false,
             }),
         }
     }

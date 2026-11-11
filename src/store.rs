@@ -20,7 +20,11 @@ use tracing::{error, info, warn};
 /// - v6→v7: the `blacklist` key gained a media-type discriminator (`blacklist_key`) so a movie and a
 ///   show sharing a numeric TMDB id no longer cross-contaminate rejections; the migration clears the
 ///   (regenerable) blacklist.
-pub const SCHEMA_VERSION: u64 = 7;
+/// - v7→v8: `QualitySummary` gained `unverified` (serde default `false`); the migration flags
+///   `unverified = true` on every owned record whose quality is known and that some `selection` entry
+///   serves from a non-MKV/MP4 file (a container the probe can never read), so the upgrade pass
+///   replaces those releases with checked copies.
+pub const SCHEMA_VERSION: u64 = 8;
 
 /// TMDB identification cache: torrent id -> serde_json((TorrentInfo, MediaMetadata)).
 /// Same name + value encoding as the pre-Store inline table, so existing databases
@@ -470,8 +474,9 @@ impl Store {
         }
         // INVARIANT: migrations commit in their own transaction(s) BEFORE the version stamp below,
         // so a crash between the two re-runs `run_migrations` on the next boot. Every migration step
-        // MUST therefore be idempotent (all three current steps — the `3..5` `wanted` clear, the `<6`
-        // `upgrade_checks` clear, and the `<7` `blacklist` clear, each `t.retain(|_,_| false)` — are).
+        // MUST therefore be idempotent (all four current steps are: the `3..5` `wanted` clear, the `<6`
+        // `upgrade_checks` clear and the `<7` `blacklist` clear, each `t.retain(|_,_| false)`, and the
+        // `1..8` unverified-flag backfill, which only ever sets a flag).
         // A future non-idempotent migration must instead fold its work into the same write txn that
         // stamps `SCHEMA_VERSION` (below) so the two commit atomically.
         let write_txn = db.begin_write()?;
@@ -517,6 +522,12 @@ impl Store {
     /// `{tmdb_id}|{hash}` rows are unreachable by the new key, so clear the table — the blacklist is
     /// regenerable (a rejected hash is simply re-probed and re-blacklisted), so clearing it is lossless
     /// in practice. Cleared for any pre-v7 DB; a fresh DB has no rows to clear.
+    /// v7→v8: `QualitySummary.unverified` is additive (`#[serde(default)]` → `false`), but records
+    /// acquired before it existed may be SERVED from a file whose tracks could never be checked (an
+    /// `.avi` the probe can't read). Flag every owned record with a known `quality` that ANY `selection`
+    /// entry points at with a non-MKV/MP4 `file_path` (`release::Container::from_name`), in ONE write
+    /// transaction. Idempotent (it only ever sets the flag). Skipped for a fresh DB (from_version 0),
+    /// which has no rows.
     fn run_migrations(db: &Database, from_version: u64) -> Result<(), redb::Error> {
         if (3..5).contains(&from_version) {
             let write_txn = db.begin_write()?;
@@ -545,6 +556,63 @@ impl Store {
             }
             write_txn.commit()?;
         }
+        if (1..8).contains(&from_version) {
+            Self::flag_unverifiable_selected_owned(db)?;
+        }
+        Ok(())
+    }
+
+    /// The v7→v8 step (see [`Self::run_migrations`]): set `quality.unverified` on every owned record
+    /// served (by any `selection` entry) from a file the probe can't read. Undecodable rows are left
+    /// untouched — the typed accessors already skip them.
+    fn flag_unverifiable_selected_owned(db: &Database) -> Result<(), redb::Error> {
+        let write_txn = db.begin_write()?;
+        {
+            // Opening creates the tables if absent (a pre-v4 DB has no `selection` yet).
+            let sel = write_txn.open_table(SELECTION_TABLE)?;
+            let mut unverifiable: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for row in sel.iter()? {
+                let (_, v) = row?;
+                if let Ok(entry) = serde_json::from_slice::<SelectionEntry>(v.value()) {
+                    if !crate::release::Container::from_name(&entry.file_path).is_verifiable() {
+                        unverifiable.insert(entry.hash.to_ascii_lowercase());
+                    }
+                }
+            }
+            drop(sel);
+            if !unverifiable.is_empty() {
+                let mut owned = write_txn.open_table(OWNED_TABLE)?;
+                let mut updates: Vec<(String, Vec<u8>)> = Vec::new();
+                for row in owned.iter()? {
+                    let (k, v) = row?;
+                    let hash = k.value().to_string();
+                    if !unverifiable.contains(&hash.to_ascii_lowercase()) {
+                        continue;
+                    }
+                    let Ok(mut rec) = serde_json::from_slice::<OwnedRecord>(v.value()) else {
+                        continue;
+                    };
+                    match rec.quality.as_mut() {
+                        Some(q) if !q.unverified => q.unverified = true,
+                        _ => continue, // unknown quality (nothing to flag) or already flagged
+                    }
+                    if let Ok(bytes) = serde_json::to_vec(&rec) {
+                        updates.push((hash, bytes));
+                    }
+                }
+                for (hash, bytes) in &updates {
+                    owned.insert(hash.as_str(), bytes.as_slice())?;
+                }
+                if !updates.is_empty() {
+                    info!(
+                        "store: v8 migration flagged {} owned release(s) served from an unverifiable container",
+                        updates.len()
+                    );
+                }
+            }
+        }
+        write_txn.commit()?;
         Ok(())
     }
 
@@ -3598,6 +3666,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrates_v7_db_flags_unverifiable_selected_files() {
+        // v7→v8: an owned record SERVED from a file the probe can never read (any selection entry
+        // pointing at its hash has a non-MKV/MP4 extension — e.g. YAGA S01E04's Russian-dub `.avi`
+        // pack) is flagged `quality.unverified`, so the upgrade pass replaces it with a checked copy.
+        let tmp = TempDb::new("migrate_v7_v8");
+        let q = || {
+            Some(crate::release::QualitySummary {
+                cached: true,
+                source_tier: 3_000,
+                resolution: 1080,
+                score: 1_111_000,
+                unverified: false,
+            })
+        };
+        {
+            let db = Database::create(&tmp.path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let odef: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_hashes");
+                let mut ot = txn.open_table(odef).unwrap();
+                // a: served from an `.avi` → flagged. b: served from an `.mkv` → stays checked.
+                // c: `.avi` but no quality snapshot → nothing to flag. d: no selection → untouched.
+                // e: a pack serving one `.mkv` slot AND one `.avi` slot → flagged (ANY entry).
+                for (h, quality) in [("a", q()), ("b", q()), ("c", None), ("d", q()), ("e", q())] {
+                    let rec = OwnedRecord {
+                        request: req("tt7", 314360),
+                        provenance: Provenance::watchlist("u"),
+                        added_at: 1,
+                        status: OwnedStatus::Verified,
+                        provides: vec![],
+                        quality,
+                    };
+                    // Encode as a genuine v7 row: no `unverified` key in the quality snapshot.
+                    let mut v = serde_json::to_value(&rec).unwrap();
+                    if let Some(q) = v.get_mut("quality").and_then(|q| q.as_object_mut()) {
+                        q.remove("unverified");
+                    }
+                    ot.insert(h, serde_json::to_vec(&v).unwrap().as_slice())
+                        .unwrap();
+                }
+                let sdef: TableDefinition<&str, &[u8]> = TableDefinition::new("selection");
+                let mut st = txn.open_table(sdef).unwrap();
+                for (slot, hash, path) in [
+                    (
+                        "e|314360|1|4",
+                        "a",
+                        "x/Yaga.S01E01-E04.WEBRip.XviD.Rus/Yaga.s01e04.avi",
+                    ),
+                    ("m|77", "b", "y/Movie.2020.1080p.BluRay.mkv"),
+                    ("e|314360|1|5", "c", "x/Yaga.s01e05.avi"),
+                    ("e|500|1|1", "e", "z/Show.s01e01.mkv"),
+                    ("e|500|1|2", "e", "z/Show.s01e02.AVI"),
+                ] {
+                    let entry = SelectionEntry {
+                        hash: hash.into(),
+                        file_path: path.into(),
+                    };
+                    st.insert(slot, serde_json::to_vec(&entry).unwrap().as_slice())
+                        .unwrap();
+                }
+                let vdef: TableDefinition<&str, u64> = TableDefinition::new("meta");
+                let mut v = txn.open_table(vdef).unwrap();
+                v.insert("schema_version", &7u64).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = Store::open(&tmp.path).unwrap();
+        let unverified = |rec: Option<OwnedRecord>| rec.unwrap().quality.map(|q| q.unverified);
+        assert_eq!(
+            unverified(store.get_owned("a".into()).await),
+            Some(true),
+            "an owned record served from an .avi must be flagged unverified"
+        );
+        assert_eq!(
+            unverified(store.get_owned("b".into()).await),
+            Some(false),
+            "an owned record served from an .mkv stays checked"
+        );
+        assert_eq!(
+            unverified(store.get_owned("c".into()).await),
+            None,
+            "a record with no quality snapshot has nothing to flag"
+        );
+        assert_eq!(
+            unverified(store.get_owned("d".into()).await),
+            Some(false),
+            "a record no selection points at is untouched"
+        );
+        assert_eq!(
+            unverified(store.get_owned("e".into()).await),
+            Some(true),
+            "a pack serving ANY unverifiable file is flagged"
+        );
+        // Owned + selection rows are otherwise intact.
+        let a = store.get_owned("a".into()).await.unwrap();
+        assert_eq!(a.status, OwnedStatus::Verified);
+        assert_eq!(a.provenance, Provenance::watchlist("u"));
+        assert_eq!(a.quality.unwrap().score, 1_111_000);
+        assert_eq!(
+            store
+                .get_selection("e|314360|1|4".into())
+                .await
+                .unwrap()
+                .hash,
+            "a"
+        );
+        drop(store);
+        let db = Database::create(&tmp.path).unwrap();
+        assert_eq!(Store::read_version(&db).unwrap(), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 8);
+    }
+
+    #[tokio::test]
     async fn migrates_v3_db_clears_legacy_blacklist_through_the_ladder() {
         // The `< 7` blacklist clear must fire for a LOWER from_version too (not just v6→v7): a v3 DB
         // carrying an old bare-key blacklist row has it cleared through the full migration ladder,
@@ -3949,6 +4130,7 @@ mod tests {
                 source_tier: 6_000,
                 resolution: 1080,
                 score: 42,
+                unverified: false,
             }),
         };
         store

@@ -523,8 +523,17 @@ async fn apply_upgrade(
     Ok(())
 }
 
+/// Whether a candidate's addon-reported file is a container the probe can never read (a known file
+/// name that isn't MKV/MP4, e.g. `.avi`). Upgrade staging adopts only a probe `Pass`, so such a
+/// candidate could only ever be staged and rejected — skip it before the add + cached-poll + probe.
+/// A candidate with NO reported file name is kept: its container is unknown until staged.
+fn known_unverifiable(r: &release::ReleaseInfo) -> bool {
+    r.file_name.is_some() && !r.container.is_verifiable()
+}
+
 /// Rank all CACHED target-improvement candidates best-score-first, skipping owned and blacklisted
-/// hashes and anything failing `score()`'s hard filters (ceiling / cam / dead-seeder). The caller
+/// hashes, candidates whose reported file is a known-unverifiable container ([`known_unverifiable`])
+/// and anything failing `score()`'s hard filters (ceiling / cam / dead-seeder). The caller
 /// stages them in order until one is adopted (in-tick fall-through), so a top candidate that fails a
 /// candidate-specific gate no longer ends the tick. The list is direction-homogeneous (all `Upgrade`
 /// or all `Downgrade`) because `is_target_improvement` only rates a lower-resolution candidate as
@@ -551,6 +560,9 @@ async fn rank_changes(
             continue;
         }
         if blacklist.contains(&r.info_hash.to_ascii_lowercase()) {
+            continue;
+        }
+        if known_unverifiable(&r) {
             continue;
         }
         if release::score(&r, prefs).is_none() {
@@ -879,12 +891,19 @@ async fn stage_and_verify(
     // Probe gate (I-1): run the SAME audio/subtitle probe as acquisition before adopting. A
     // wrong-language/corrupt release is blacklisted + dropped; a transient probe failure is
     // dropped without blacklisting (retried next tick) so we never degrade the working release.
+    // Unlike acquisition, an upgrade adopts ONLY a `Pass`: an `Accept` (tracks couldn't be checked —
+    // unreadable container / no tracks) is dropped WITHOUT blacklisting (nothing is known to be wrong
+    // with it), so an upgrade never swaps a checked copy for an unchecked one.
     match app
         .engine
         .probe_file(&fresh, &hash, &selected_path, base_req)
         .await
     {
-        crate::acquire::VerifyResult::Pass | crate::acquire::VerifyResult::Accept => {}
+        crate::acquire::VerifyResult::Pass => {}
+        crate::acquire::VerifyResult::Accept => {
+            let _ = app.provider.delete_torrent(&added.id).await;
+            return Err(UpgradeSkip::NoChange("unverifiable release".into()));
+        }
         crate::acquire::VerifyResult::Reject(reason) => {
             let _ = app.provider.delete_torrent(&added.id).await;
             let _ = app
@@ -1064,7 +1083,8 @@ fn season_has_scatter(owned: &[(String, OwnedRecord)], season: u32) -> bool {
 }
 
 /// Rank scraped consolidation candidates: keep only the CACHED, in-ceiling (score-passing) packs not
-/// already owned, sorted best-`score`-first. So consolidation adopts the BEST pack — consistent with
+/// already owned (and not a known-unverifiable container — [`known_unverifiable`]), sorted
+/// best-`score`-first. So consolidation adopts the BEST pack — consistent with
 /// the movie upgrade path's max-by-score ranking — instead of the first acceptable one in raw scraper
 /// order (which, once adopted, the `already_pack` short-circuit would strand the season on). The
 /// async blacklist filter is applied by the caller (it can't be pure). Pure → unit-testable.
@@ -1077,6 +1097,7 @@ fn rank_cached_pack_candidates(
         .iter()
         .map(release::parse)
         .filter(|r| r.cached)
+        .filter(|r| !known_unverifiable(r))
         .filter(|r| {
             !owned_hashes
                 .iter()
@@ -1226,12 +1247,18 @@ async fn stage_episode_candidate(
         episode: Some(episode),
         ..base_req.clone()
     };
+    // Adopt only a probe `Pass` (see `stage_and_verify`): an unverifiable `Accept` is dropped
+    // without blacklisting.
     match app
         .engine
         .probe_file(&fresh, &hash, &file_path, &probe_req)
         .await
     {
-        crate::acquire::VerifyResult::Pass | crate::acquire::VerifyResult::Accept => {}
+        crate::acquire::VerifyResult::Pass => {}
+        crate::acquire::VerifyResult::Accept => {
+            let _ = app.provider.delete_torrent(&torrent_id).await;
+            return Err(UpgradeSkip::NoChange("unverifiable release".into()));
+        }
         crate::acquire::VerifyResult::Reject(reason) => {
             let _ = app.provider.delete_torrent(&torrent_id).await;
             let _ = app
@@ -1378,12 +1405,22 @@ async fn correct_over_ceiling_packs(
                 episode: Some(*re),
                 ..rec.request.clone()
             };
+            // Adopt only a probe `Pass` (see `stage_and_verify`): an unverifiable `Accept` is
+            // dropped without blacklisting and the next candidate is tried.
             match app
                 .engine
                 .probe_file(&fresh, &cand.info_hash, rpath, &probe_req)
                 .await
             {
-                crate::acquire::VerifyResult::Pass | crate::acquire::VerifyResult::Accept => {}
+                crate::acquire::VerifyResult::Pass => {}
+                crate::acquire::VerifyResult::Accept => {
+                    let _ = app.provider.delete_torrent(&torrent_id).await;
+                    debug!(
+                        "upgrade: tmdb {} s{} pack candidate {} unverifiable; not adopted",
+                        tmdb_id, season, cand.info_hash
+                    );
+                    continue;
+                }
                 crate::acquire::VerifyResult::Reject(reason) => {
                     let _ = app.provider.delete_torrent(&torrent_id).await;
                     let _ = app
@@ -1960,12 +1997,22 @@ async fn consolidate_show_seasons(
                     episode: Some(*ee),
                     ..sample.request.clone()
                 };
+                // Adopt only a probe `Pass` (see `stage_and_verify`): an unverifiable `Accept` is
+                // dropped without blacklisting and the next candidate pack is tried.
                 match app
                     .engine
                     .probe_file(&fresh, &r.info_hash, path, &probe_req)
                     .await
                 {
-                    crate::acquire::VerifyResult::Pass | crate::acquire::VerifyResult::Accept => {}
+                    crate::acquire::VerifyResult::Pass => {}
+                    crate::acquire::VerifyResult::Accept => {
+                        let _ = app.provider.delete_torrent(&added.id).await;
+                        debug!(
+                            "consolidate: tmdb {} s{} pack {} unverifiable; not adopted",
+                            tmdb_id, season, r.info_hash
+                        );
+                        continue;
+                    }
                     crate::acquire::VerifyResult::Reject(reason) => {
                         let _ = app.provider.delete_torrent(&added.id).await;
                         let _ = app
@@ -2243,16 +2290,25 @@ mod tests {
         }
     }
 
-    /// Default app: a PASSING prober (Unsupported → `VerifyResult::Accept`) so the staging probe
-    /// gate is satisfied without reaching a real CDN.
+    /// A prober whose verdict is `VerifyResult::Pass` for any language requirement: one audio track
+    /// with no language tag (inconclusive, never a positive violation) and no subtitle requirement.
+    fn passing_prober() -> Arc<dyn crate::acquire::Prober> {
+        Arc::new(CannedProber(Ok(vec![Track {
+            kind: TrackKind::Audio,
+            language: None,
+        }])))
+    }
+
+    /// Default app: a PASSING prober (`VerifyResult::Pass`) so the staging probe gate is satisfied
+    /// without reaching a real CDN. (Upgrade staging adopts only a `Pass` — an unverifiable `Accept`
+    /// is rejected — so tests that exercise that rejection use `app_with_prober` with
+    /// [`unverifiable_prober`].)
     fn app_with(
         scraper: Arc<dyn Scraper>,
         provider: Arc<dyn DebridProvider>,
         store: Store,
     ) -> AppState {
-        let prober: Arc<dyn crate::acquire::Prober> =
-            Arc::new(CannedProber(Err(ProbeError::Unsupported)));
-        app_with_prober(scraper, provider, store, prober)
+        app_with_prober(scraper, provider, store, passing_prober())
     }
 
     fn app_with_prober(
@@ -2401,6 +2457,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 10,
+                        unverified: false,
                     }),
                 },
             )
@@ -2512,6 +2569,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 10,
+                        unverified: false,
                     }),
                 },
             )
@@ -2531,6 +2589,7 @@ mod tests {
                         source_tier: 8_000,
                         resolution: 2160,
                         score: 1_008_000,
+                        unverified: false,
                     }),
                 },
             )
@@ -2650,6 +2709,7 @@ mod tests {
                             source_tier: tier,
                             resolution: res,
                             score,
+                            unverified: false,
                         }),
                     },
                 )
@@ -2738,6 +2798,7 @@ mod tests {
                 source_tier: 3_000,
                 resolution: 1080,
                 score: 10,
+                unverified: false,
             })
         };
         store
@@ -2902,6 +2963,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 10,
+                        unverified: false,
                     }),
                 },
             )
@@ -2992,6 +3054,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 10,
+                        unverified: false,
                     }),
                 },
             )
@@ -3154,6 +3217,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 10,
+                        unverified: false,
                     }),
                 },
             )
@@ -3185,8 +3249,7 @@ mod tests {
                 .unwrap();
         config.acquisition = AcquisitionConfig::default();
         let validator: Arc<dyn crate::acquire::TitleValidator> = Arc::new(PassValidator);
-        let prober: Arc<dyn crate::acquire::Prober> =
-            Arc::new(CannedProber(Err(ProbeError::Unsupported)));
+        let prober = passing_prober();
         let engine = Arc::new(crate::acquire::AcquisitionEngine::new(
             provider.clone(),
             scraper.clone(),
@@ -3322,6 +3385,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 10,
+                        unverified: false,
                     }),
                 },
             )
@@ -3390,6 +3454,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 10,
+                        unverified: false,
                     }),
                 },
             )
@@ -3486,6 +3551,213 @@ mod tests {
         );
     }
 
+    /// A prober whose tracks can't be read (`Unsupported` → `VerifyResult::Accept`): the release's
+    /// languages are unchecked.
+    fn unverifiable_prober() -> Arc<dyn crate::acquire::Prober> {
+        Arc::new(CannedProber(Err(ProbeError::Unsupported)))
+    }
+
+    /// Movie swap fixture: owned `hold` (Verified, served, quality `owned_q`, torrent `told`) and a
+    /// scraped `cand` that stages cached as torrent `tnew` with the single video `staged_file`.
+    /// Returns the app, its store and the provider's deleted-torrent log.
+    async fn movie_swap_fixture(
+        owned_q: QualitySummary,
+        cand: RawCandidate,
+        staged_file: &str,
+        prober: Arc<dyn crate::acquire::Prober>,
+    ) -> (AppState, Store, Arc<std::sync::Mutex<Vec<String>>>) {
+        let store = mem_store();
+        store
+            .put_owned(
+                "hold".into(),
+                OwnedRecord {
+                    request: movie_req(),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(owned_q),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "hold".into(),
+                    file_path: "old.avi".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let cand_hash = cand.info_hash.clone();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "told".into(),
+                    hash: "hold".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tnew".into(),
+                    hash: cand_hash.clone(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tnew".into(),
+                hash: cand_hash,
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: staged_file.into(),
+                    bytes: 30_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/new".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![cand],
+        });
+        let app = app_with_prober(scraper, provider, store.clone(), prober);
+        (app, store, deleted)
+    }
+
+    #[tokio::test]
+    async fn movie_upgrade_rejects_unverifiable_staged_candidate_without_blacklist() {
+        // A strictly better cached REMUX whose tracks can't be checked (probe `Accept`) must NOT
+        // replace the owned copy: an upgrade never swaps a checked copy for an unchecked one. The
+        // staged torrent is dropped, but the hash is NOT blacklisted (nothing is known to be wrong
+        // with it — a later probe improvement could still adopt it).
+        let owned = QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 1080,
+            score: 10,
+            unverified: false,
+        };
+        let (app, store, deleted) = movie_swap_fixture(
+            owned,
+            remux_candidate(),
+            "M.2020.1080p.REMUX.mkv",
+            unverifiable_prober(),
+        )
+        .await;
+        run_upgrade_once(&app).await;
+
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hold",
+            "an unverifiable candidate must not be swapped in"
+        );
+        assert!(
+            store.get_owned("hnew".into()).await.is_none(),
+            "an unverifiable candidate must not be recorded owned"
+        );
+        assert!(
+            store.get_owned("hold".into()).await.is_some(),
+            "the current copy is kept"
+        );
+        let d = deleted.lock().unwrap().clone();
+        assert!(
+            d.contains(&"tnew".to_string()),
+            "the staged torrent must be deleted"
+        );
+        assert!(
+            !d.contains(&"told".to_string()),
+            "the current torrent must not be pruned"
+        );
+        assert!(
+            !store
+                .is_blacklisted(MediaKind::Movie, 27205, "hnew".into())
+                .await,
+            "an unverifiable (not wrong) release must not be blacklisted"
+        );
+        assert_ne!(
+            store.get_upgrade_checked(&MediaType::Movie, 27205).await,
+            0,
+            "evaluated to completion (NoChange) → the cursor advances"
+        );
+    }
+
+    #[tokio::test]
+    async fn movie_upgrade_replaces_unverified_copy_with_equal_score_verified() {
+        // The owned copy's tracks were never checked (flagged `unverified`); a cached release of the
+        // SAME quality (same tier/resolution/score — no category jump) whose tracks PASS the probe
+        // replaces it, and the unchecked copy is pruned.
+        let prefs = AcquisitionConfig::default().prefs;
+        let mut owned = QualitySummary::of(&release::parse(&web_1080_candidate()), &prefs);
+        owned.unverified = true;
+        let (app, store, deleted) = movie_swap_fixture(
+            owned,
+            web_1080_candidate(),
+            "M.2020.1080p.WEB-DL.mkv",
+            Arc::new(CannedProber(Ok(vec![Track {
+                kind: TrackKind::Audio,
+                language: Some("eng".into()),
+            }]))),
+        )
+        .await;
+        run_upgrade_once(&app).await;
+
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hweb",
+            "the unverified copy is replaced by the checked equal-quality release"
+        );
+        let new_rec = store
+            .get_owned("hweb".into())
+            .await
+            .expect("replacement recorded owned");
+        assert!(
+            !new_rec.quality.expect("quality recorded").unverified,
+            "the adopted replacement passed the probe → not flagged"
+        );
+        assert!(
+            store.get_owned("hold".into()).await.is_none(),
+            "the unchecked copy is pruned"
+        );
+        assert!(deleted.lock().unwrap().contains(&"told".to_string()));
+    }
+
+    #[tokio::test]
+    async fn movie_upgrade_leaves_verified_copy_alone_for_equal_score_release() {
+        // Control for the test above: the same equal-quality candidate is NOT an upgrade over a
+        // CHECKED copy (the no-churn guard), so nothing is staged.
+        let prefs = AcquisitionConfig::default().prefs;
+        let owned = QualitySummary::of(&release::parse(&web_1080_candidate()), &prefs);
+        assert!(!owned.unverified);
+        let (app, store, deleted) = movie_swap_fixture(
+            owned,
+            web_1080_candidate(),
+            "M.2020.1080p.WEB-DL.mkv",
+            Arc::new(CannedProber(Ok(vec![]))),
+        )
+        .await;
+        run_upgrade_once(&app).await;
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hold"
+        );
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "nothing staged or pruned"
+        );
+    }
+
     #[tokio::test]
     async fn movie_upgrade_accepts_spoken_language_audio_under_original() {
         // Nightborn's 6 Nov upgrade pass: TMDB original_language `fi`, but English is a listed spoken
@@ -3511,6 +3783,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 10,
+                        unverified: false,
                     }),
                 },
             )
@@ -3930,6 +4203,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 10,
+                        unverified: false,
                     }),
                 },
             )
@@ -4078,6 +4352,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 10,
+                        unverified: false,
                     }),
                 },
             )
@@ -4174,6 +4449,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 10,
+                        unverified: false,
                     }),
                 },
             )
@@ -4217,6 +4493,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 10,
+                        unverified: false,
                     }),
                 },
             )
@@ -4282,6 +4559,7 @@ mod tests {
                             source_tier: 3_000,
                             resolution: 1080,
                             score: 10,
+                            unverified: false,
                         }),
                     },
                 )
@@ -4370,6 +4648,7 @@ mod tests {
                 source_tier: tier,
                 resolution: 1080,
                 score,
+                unverified: false,
             }),
         };
         // "aweb" sorts BEFORE "zremux" — the old code baselined off the first (worse) copy.
@@ -4424,6 +4703,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 10,
+                        unverified: false,
                     }),
                 },
             )
@@ -4486,6 +4766,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 10,
+                        unverified: false,
                     }),
                 },
             )
@@ -4580,6 +4861,7 @@ mod tests {
                         source_tier: 8_000,
                         resolution: 2160,
                         score: 1_008_000,
+                        unverified: false,
                     }),
                 },
             )
@@ -4841,7 +5123,7 @@ mod tests {
             ..Default::default()
         });
         let app = app_with(scraper, provider, store.clone());
-        // app_with wires an accepting prober (Unsupported → Accept), so staging the good candidate
+        // app_with wires a passing prober (`VerifyResult::Pass`), so staging the good candidate
         // verifies.
 
         let owned = vec![owned_hash.clone()];
@@ -5163,6 +5445,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 1,
+                        unverified: false,
                     },
                 ),
                 (
@@ -5172,6 +5455,7 @@ mod tests {
                         source_tier: 3_000,
                         resolution: 1080,
                         score: 1,
+                        unverified: false,
                     },
                 ),
             ],
@@ -5182,6 +5466,7 @@ mod tests {
                 source_tier: 6_000,
                 resolution: 1080,
                 score: 5,
+                unverified: false,
             },
         };
         assert!(
@@ -5423,6 +5708,69 @@ mod tests {
             "a repeated infohash must be deduped to a single ranked entry"
         );
         assert_eq!(ranked[0].info_hash, "hdup");
+    }
+
+    /// A cached REMUX 1080p candidate with the given hash and (optional) addon-reported file name.
+    fn remux_named(hash: &str, file_name: Option<&str>) -> RawCandidate {
+        RawCandidate {
+            info_hash: hash.into(),
+            file_name: file_name.map(String::from),
+            ..remux_candidate()
+        }
+    }
+
+    #[tokio::test]
+    async fn rank_changes_skips_known_unverifiable_containers() {
+        // The upgrade pass only adopts a release whose tracks PASS the probe, and the probe can never
+        // read an `.avi` — so a candidate whose addon-reported file name is a non-MKV/MP4 container
+        // is dropped up front (no wasted add + cached-poll + probe). A candidate with NO file name
+        // is kept: its container is unknown until staged, and the probe decides.
+        let app = app_with(
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(MockProvider::default()),
+            mem_store(),
+        );
+        let baseline = QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 1080,
+            score: 10,
+            unverified: false,
+        };
+        let raws = vec![
+            remux_named("havi", Some("M.2020.1080p.REMUX.avi")),
+            remux_named("hnone", None),
+            remux_named("hmkv", Some("M.2020.1080p.REMUX.mkv")),
+            remux_named("hmp4", Some("M.2020.1080p.REMUX.mp4")),
+        ];
+        let ranked = rank_changes(&app, MediaKind::Movie, 27205, &raws, &baseline, &[]).await;
+        let hashes: Vec<_> = ranked.iter().map(|(r, _)| r.info_hash.as_str()).collect();
+        assert!(
+            !hashes.contains(&"havi"),
+            "a known-unverifiable (.avi) candidate must be skipped: {hashes:?}"
+        );
+        for kept in ["hnone", "hmkv", "hmp4"] {
+            assert!(hashes.contains(&kept), "{kept} must be ranked: {hashes:?}");
+        }
+    }
+
+    #[test]
+    fn rank_cached_pack_candidates_skips_known_unverifiable_containers() {
+        // Same rule for consolidation / pack-correction ranking: a pack whose reported file is a
+        // non-MKV/MP4 container can never pass the staging probe, so it isn't staged.
+        let prefs = AcquisitionConfig::default().prefs;
+        let raws = vec![
+            remux_named("havi", Some("S.S01E01.1080p.REMUX.avi")),
+            remux_named("hnone", None),
+            remux_named("hmkv", Some("S.S01E01.1080p.REMUX.mkv")),
+        ];
+        let ranked = rank_cached_pack_candidates(&raws, &prefs, &[]);
+        let hashes: Vec<_> = ranked.iter().map(|r| r.info_hash.as_str()).collect();
+        assert!(!hashes.contains(&"havi"), "{hashes:?}");
+        assert!(
+            hashes.contains(&"hnone") && hashes.contains(&"hmkv"),
+            "{hashes:?}"
+        );
     }
 
     #[test]
@@ -6275,6 +6623,7 @@ mod tests {
             source_tier: 3_000,
             resolution: 1080,
             score: 1,
+            unverified: false,
         }
     }
     fn q1080_bluray() -> crate::release::QualitySummary {
@@ -6283,6 +6632,7 @@ mod tests {
             source_tier: 6_000,
             resolution: 1080,
             score: 2,
+            unverified: false,
         }
     }
     fn q2160_remux() -> crate::release::QualitySummary {
@@ -6291,6 +6641,7 @@ mod tests {
             source_tier: 8_000,
             resolution: 2160,
             score: 9,
+            unverified: false,
         }
     }
     fn q720_web() -> crate::release::QualitySummary {
@@ -6299,6 +6650,7 @@ mod tests {
             source_tier: 3_000,
             resolution: 720,
             score: 1,
+            unverified: false,
         }
     }
 
@@ -6998,6 +7350,142 @@ mod tests {
             new_rec.provides.contains(&(1, 1)) && new_rec.provides.contains(&(1, 2)),
             "replacement provides the full owned episode set: {:?}",
             new_rec.provides
+        );
+    }
+
+    /// Rebuild a harness's app around an UNVERIFIABLE prober (probe `Accept`), keeping its scraper,
+    /// provider, store and downgrade flag.
+    fn with_unverifiable_prober(app: &AppState) -> AppState {
+        let mut rebuilt = app_with_prober(
+            app.scraper.clone(),
+            app.provider.clone(),
+            app.store.clone(),
+            unverifiable_prober(),
+        );
+        let mut cfg = (*rebuilt.config).clone();
+        cfg.allow_resolution_downgrade = app.config.allow_resolution_downgrade;
+        rebuilt.config = Arc::new(cfg);
+        rebuilt
+    }
+
+    #[tokio::test]
+    async fn episode_upgrade_rejects_unverifiable_staged_candidate() {
+        // Per-episode staging adopts only a probe `Pass`: a better 1080p single whose tracks can't be
+        // checked leaves the 720p episode in place, unblacklisted.
+        let h = show_harness_singleton_720_ep().await;
+        let app = with_unverifiable_prober(&h.app);
+        upgrade_show_episodes_and_packs(&app, h.tmdb, &h.group_hashes, Duration::from_secs(0))
+            .await;
+        assert_eq!(
+            app.store
+                .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            h.old_720_hash,
+            "episode slot must not move to an unverifiable release"
+        );
+        assert!(app.store.get_owned(h.old_720_hash.clone()).await.is_some());
+        assert!(app
+            .store
+            .get_owned(h.cand_1080_hash.clone())
+            .await
+            .is_none());
+        assert!(
+            !app.store
+                .is_blacklisted(MediaKind::Series, h.tmdb, h.cand_1080_hash.clone())
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn over_ceiling_pack_correction_rejects_unverifiable_replacement() {
+        // Pack correction adopts only a probe `Pass`: the over-ceiling pack is kept (sole copy) when
+        // the only conforming replacement's tracks can't be checked.
+        let mut h = show_harness_pack_2160_with_1080_candidate().await;
+        h.set_allow_downgrade(true);
+        let app = with_unverifiable_prober(&h.app);
+        upgrade_show_episodes_and_packs(&app, h.tmdb, &h.group_hashes, Duration::from_secs(0))
+            .await;
+        for e in [1, 2] {
+            assert_eq!(
+                app.store
+                    .get_selection(crate::store::episode_slot(h.tmdb, 1, e))
+                    .await
+                    .unwrap()
+                    .hash,
+                h.pack_hash,
+                "E0{e} slot must stay on the over-ceiling pack"
+            );
+        }
+        assert!(app.store.get_owned(h.pack_hash.clone()).await.is_some());
+        assert!(app
+            .store
+            .get_owned(h.cand_1080_hash.clone())
+            .await
+            .is_none());
+        assert!(
+            !app.store
+                .is_blacklisted(MediaKind::Series, h.tmdb, h.cand_1080_hash.clone())
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidation_rejects_unverifiable_pack() {
+        // Consolidation adopts only a probe `Pass`: a full-season pack whose tracks can't be checked
+        // is dropped and the scattered (checked) episodes keep their selections.
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(pack_info()),
+            resolved_url: Some("https://cdn/p1".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with_prober(
+            Arc::new(MockScraper {
+                candidates: vec![season_pack_candidate()],
+            }),
+            provider,
+            store.clone(),
+            unverifiable_prober(),
+        );
+        let res = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(res.is_ok(), "evaluated to completion: {res:?}");
+        assert!(store.get_owned("hpack".into()).await.is_none());
+        for (e, h) in [(1, "e1"), (2, "e2")] {
+            assert_eq!(
+                store
+                    .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, e))
+                    .await
+                    .unwrap()
+                    .hash,
+                h
+            );
+            assert!(store.get_owned(h.into()).await.is_some(), "{h} kept");
+        }
+        let d = deleted.lock().unwrap().clone();
+        assert!(d.contains(&"tpack".to_string()), "staged pack dropped");
+        assert!(!d.contains(&"te1".to_string()) && !d.contains(&"te2".to_string()));
+        assert!(
+            !store
+                .is_blacklisted(MediaKind::Series, SHOW_TMDB, "hpack".into())
+                .await
         );
     }
 

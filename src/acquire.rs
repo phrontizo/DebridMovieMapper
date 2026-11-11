@@ -660,12 +660,16 @@ impl AcquisitionEngine {
     /// Write `provides` and the per-slot `selection` entries for a now-Verified owned torrent,
     /// and update its status. For a movie: one `movie_slot` entry for the selected file. For a
     /// show: `episode_slot` entries for every SE-mapped selected file, and `provides` is that set.
+    /// `unverified` is the probe verdict's flag (`true` for an `Accept` — the tracks couldn't be
+    /// checked — `false` for a `Pass`), stamped on the record's quality snapshot so the upgrade pass
+    /// can later replace an unchecked release with a checked one.
     async fn record_verified(
         &self,
         hash: &str,
         req: &AcquireRequest,
         info: &TorrentInfo,
         selected_path: &str,
+        unverified: bool,
     ) {
         // Compute the SE-mapped episode set for a series (this hash's `provides` — the season-pack
         // churn fix); a movie supplies none.
@@ -689,6 +693,7 @@ impl AcquisitionEngine {
                 }
                 if let Some(q) = rec.quality.as_mut() {
                     q.mark_cached();
+                    q.unverified = unverified;
                 }
                 let q = rec.quality.clone();
                 let _ = self.store.put_owned(hash.to_string(), rec).await;
@@ -1094,12 +1099,19 @@ impl AcquisitionEngine {
             }
             let locator = locator_for(&info, hash, &selected_path);
             match self.verify_file(&locator, &rec.request).await {
-                VerifyResult::Pass | VerifyResult::Accept => {
+                verdict @ (VerifyResult::Pass | VerifyResult::Accept) => {
+                    // Acquisition policy is unchanged — an unverifiable release (`Accept`: unreadable
+                    // container / no tracks) is still accepted when nothing better was found — but it
+                    // is FLAGGED so the upgrade pass replaces it with a checked copy.
+                    let unverified = matches!(verdict, VerifyResult::Accept);
                     info!(
-                        "observe: tmdb {} hash {} verified ({}) — recording selection",
-                        rec.request.tmdb_id, hash, file_name
+                        "observe: tmdb {} hash {} verified ({}{}) — recording selection",
+                        rec.request.tmdb_id,
+                        hash,
+                        file_name,
+                        if unverified { ", tracks unchecked" } else { "" }
                     );
-                    self.record_verified(hash, &rec.request, &info, &selected_path)
+                    self.record_verified(hash, &rec.request, &info, &selected_path, unverified)
                         .await;
                     self.verify_attempts.lock().await.remove(hash);
                     self.progress.lock().await.remove(&t.id);
@@ -2457,6 +2469,7 @@ mod tests {
             source_tier: 3_000,
             resolution: 1080,
             score: 111_000, // an uncached score (no CACHED_BONUS)
+            unverified: false,
         };
         st.put_owned(
             "h1".into(),
@@ -3340,6 +3353,78 @@ mod tests {
         );
     }
 
+    /// A Pending owned record carrying an acquire-time quality snapshot (so `record_verified` has a
+    /// `quality` to flag), for the unverified-flag observe tests.
+    async fn seed_pending_with_quality(st: &Store) {
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: Some(crate::release::QualitySummary {
+                    cached: true,
+                    source_tier: 3_000,
+                    resolution: 1080,
+                    score: 1_111_000,
+                    unverified: false,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn observe_flags_unverifiable_accept() {
+        // A release whose tracks can't be read (an `.avi`, an unreadable MP4 `moov`) is still
+        // accepted — acquisition policy is unchanged — but its quality is flagged `unverified` so the
+        // upgrade pass later replaces it with a checked copy.
+        let st = store();
+        seed_pending_with_quality(&st).await;
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Err(ProbeError::Unsupported))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await;
+        let rec = st.get_owned("h1".into()).await.expect("record kept");
+        assert_eq!(rec.status, OwnedStatus::Verified, "Accept still verifies");
+        assert!(
+            rec.quality.expect("quality kept").unverified,
+            "an unverifiable Accept must be flagged unverified"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_pass_is_not_flagged() {
+        let st = store();
+        seed_pending_with_quality(&st).await;
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![Track {
+                kind: crate::probe::TrackKind::Audio,
+                language: Some("eng".into()),
+            }]))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await;
+        let rec = st.get_owned("h1".into()).await.expect("record kept");
+        assert_eq!(rec.status, OwnedStatus::Verified);
+        assert!(
+            !rec.quality.expect("quality kept").unverified,
+            "a checked (Pass) release must not be flagged"
+        );
+    }
+
     #[tokio::test]
     async fn acquire_ranks_a_spoken_language_release_above_a_foreign_dub() {
         // Ranking resolves `Original` against original ∪ spoken: for a `fi`-original title that lists
@@ -3857,6 +3942,7 @@ mod tests {
                 source_tier: 8_000,
                 resolution: 1080,
                 score,
+                unverified: false,
             })
         };
         st.put_owned(
