@@ -1415,6 +1415,20 @@ fn pack_prunable_after_repoint(
         .all(|ep| other_provides.contains(ep))
 }
 
+/// Pure: may phase (a2) move a slot served by a multi-episode pack of quality `pack` to `cand`? On
+/// top of `is_target_improvement` (which `rank_changes` already applied — a strict score gain with a
+/// tier/resolution change, or Task 4's unverified rule), the candidate must be no regression vs the
+/// pack on EITHER axis: source tier AND resolution at least the pack's. That is the per-axis test
+/// [`consolidation_target`] applies, so the two passes agree on "better": a pack (a2) split can then
+/// never pass consolidation's no-regression gate against the singles that replaced it (unless they
+/// equal it on both axes, which only the unverified rule adopts — and consolidation re-adopts a pack
+/// only on a probe `Pass`, recording it verified, so (a2) cannot split it again). Without this, e.g.
+/// a BluRay x264 pack is split into higher-scoring WEB x265 singles (HEVC's bonus outweighs the
+/// BluRay-over-WEB tier gap) and consolidation folds the same pack back in the same tick, forever.
+fn pack_split_no_regression(cand: &release::ReleaseInfo, pack: &QualitySummary) -> bool {
+    cand.source.tier_score() >= pack.source_tier && cand.resolution.unwrap_or(0) >= pack.resolution
+}
+
 /// `(hash, provides)` for each of the show's CURRENT owned records other than `pack_hash`, re-read
 /// from the store (so a single staged — or a singleton or overlapping pack pruned — earlier this
 /// tick is reflected, not the tick-start snapshot). Only `Verified` records count: a `Pending` record
@@ -1978,7 +1992,9 @@ async fn upgrade_show_episodes_and_packs(
     // (a2) Episodes served from a WITHIN-ceiling multi-episode pack (e.g. an SD/foreign-dub pack
     // grabbed on an air date while the season's other episodes are better singletons). Each episode
     // whose selection slot points at the pack is re-scored against the PACK's quality and, on a
-    // better cached TRUE singleton, swapped exactly like phase (a). The pack itself is pruned only on
+    // better cached TRUE singleton at the same-or-better source tier AND resolution
+    // ([`pack_split_no_regression`] — consolidation's no-regression test, so phase (c) never folds a
+    // split pack straight back), swapped exactly like phase (a). The pack itself is pruned only on
     // the repoint that leaves it serving no slot AND with every episode it provides held by another
     // owned record that is PRESENT on the provider (`PackPrune::resolve`, decided inside
     // `apply_upgrade` against the swap's own listing); otherwise it is kept. Over-ceiling packs are
@@ -2019,7 +2035,7 @@ async fn upgrade_show_episodes_and_packs(
                 episode: Some(episode),
                 ..rec.request.clone()
             };
-            let ranked = match app
+            let mut ranked = match app
                 .scraper
                 .find(&imdb_id, MediaKind::Series, Some(season), Some(episode))
                 .await
@@ -2029,6 +2045,10 @@ async fn upgrade_show_episodes_and_packs(
                 }
                 Err(_) => Vec::new(), // transient; treated as "nothing better" for this episode
             };
+            // Only a candidate consolidation would also judge no-regression vs the pack (tier AND
+            // resolution) — filtered before the sample-first check, so a pack whose only "better"
+            // singles are lower-tier counts as unimprovable.
+            ranked.retain(|(cand, _)| pack_split_no_regression(cand, &q));
             if ranked.is_empty() {
                 if i == 0 {
                     debug!(
@@ -8619,6 +8639,8 @@ mod tests {
         app: AppState,
         store: Store,
         deleted: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Every infohash `add_magnet` was called with (i.e. every staged candidate), in order.
+        added: Arc<std::sync::Mutex<Vec<String>>>,
         calls: ScrapeLog,
         group_hashes: Vec<String>,
     }
@@ -8764,11 +8786,13 @@ mod tests {
             calls: calls.clone(),
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
             torrents,
             torrent_info_by_id: by_id,
             resolved_url: Some("https://cdn/staged".into()),
             deleted: deleted.clone(),
+            added: added.clone(),
             fail_get_torrents: opts.fail_listing,
             ..Default::default()
         });
@@ -8777,6 +8801,7 @@ mod tests {
             app,
             store,
             deleted,
+            added,
             calls,
             group_hashes,
         }
@@ -9257,5 +9282,250 @@ mod tests {
         );
         assert_eq!(slot_hash(&f.store, 2).await, PACK);
         assert!(f.store.get_owned(PACK.into()).await.is_some());
+    }
+
+    /// A cached S01 BluRay x264 1080p season pack (hash [`PACK`]) as Torrentio lists it under episode
+    /// `e`'s query (the stream points at that episode's file in the pack).
+    fn bluray_x264_pack_raw(e: u32) -> RawCandidate {
+        RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "Show.S01.1080p.BluRay.x264-GRP\n👤 20 💾 4.4 GB\nRD+".into(),
+            info_hash: PACK.into(),
+            file_idx: Some(e as usize - 1),
+            file_name: Some(format!("Show.S01E{e:02}.1080p.BluRay.x264-GRP.mkv")),
+        }
+    }
+
+    /// A cached WEB-DL x265 1080p single for S01E`e` — it OUT-SCORES the BluRay x264 pack (the +5k
+    /// HEVC bonus outweighs the 3k BluRay-over-WEB tier gap) at a LOWER source tier.
+    fn web_x265_single_raw(e: u32) -> RawCandidate {
+        RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: format!("Show.S01E{e:02}.1080p.WEB-DL.x265-GRP\n👤 20 💾 1.1 GB\nRD+"),
+            info_hash: format!("hweb{e}"),
+            file_idx: Some(0),
+            file_name: Some(format!("Show.S01E{e:02}.1080p.WEB-DL.x265-GRP.mkv")),
+        }
+    }
+
+    /// One show visit offline: phases (a)/(a2)/(b) on the CURRENT group, then consolidation on the
+    /// re-read group — exactly `try_upgrade_show`'s order, minus its live TMDB aired lookup.
+    async fn show_upgrade_visit(app: &AppState, aired: &[(u32, u32)]) {
+        let hashes = current_show_hashes(app, SHOW_TMDB).await;
+        upgrade_show_episodes_and_packs(app, SHOW_TMDB, &hashes, Duration::from_secs(0)).await;
+        let fresh = current_show_hashes(app, SHOW_TMDB).await;
+        let mut owned = Vec::new();
+        for h in &fresh {
+            if let Some(r) = app.store.get_owned(h.clone()).await {
+                owned.push((h.clone(), r));
+            }
+        }
+        let _ = consolidate_show_seasons(
+            app,
+            SHOW_TMDB,
+            &fresh,
+            &owned,
+            aired,
+            Duration::from_secs(0),
+        )
+        .await;
+    }
+
+    /// The observable show state: owned hashes (sorted) and each episode slot's hash.
+    async fn show_state(store: &Store, episodes: u32) -> (Vec<String>, Vec<String>) {
+        let mut owned: Vec<String> = store
+            .all_owned()
+            .await
+            .into_iter()
+            .filter(|(_, r)| r.request.tmdb_id == SHOW_TMDB)
+            .map(|(h, _)| h)
+            .collect();
+        owned.sort();
+        let mut slots = Vec::new();
+        for e in 1..=episodes {
+            slots.push(slot_hash(store, e).await);
+        }
+        (owned, slots)
+    }
+
+    #[tokio::test]
+    async fn pack_served_split_and_consolidation_converge() {
+        // A season held as a cached BluRay x264 1080p pack serving every slot, while cached WEB-DL
+        // x265 1080p singles exist for every episode. The singles score HIGHER (HEVC) but sit at a
+        // LOWER source tier, so consolidation — which judges "no regression" on tier + resolution —
+        // would re-adopt the pack over them. Phase (a2) must therefore not split the pack into them:
+        // otherwise every visit splits the season (N adds, pack pruned) and consolidation folds it
+        // back (pack re-added, N singles pruned), forever.
+        let prefs = crate::config::AcquisitionConfig::default().prefs;
+        let pack_q = QualitySummary::of(&release::parse(&bluray_x264_pack_raw(1)), &prefs);
+        let single_q = QualitySummary::of(&release::parse(&web_x265_single_raw(1)), &prefs);
+        assert!(
+            single_q.score > pack_q.score && single_q.source_tier < pack_q.source_tier,
+            "fixture: the single out-scores the pack at a lower tier ({single_q:?} vs {pack_q:?})"
+        );
+        assert_eq!(
+            release::is_target_improvement(&pack_q, &single_q, &prefs),
+            release::Improvement::Upgrade,
+            "fixture: the raw upgrade rule rates the single an upgrade over the pack"
+        );
+        let pack_info = TorrentInfo {
+            id: PACK.into(),
+            hash: PACK.into(),
+            status: "downloaded".into(),
+            files: (1..=3u32)
+                .map(|e| TorrentFile {
+                    id: e - 1,
+                    path: format!(
+                        "Show.S01.1080p.BluRay.x264-GRP/Show.S01E{e:02}.1080p.BluRay.x264-GRP.mkv"
+                    ),
+                    bytes: 1_500_000_000,
+                    selected: 1,
+                })
+                .collect(),
+            links: (1..=3u32).map(|e| format!("https://cdn/p{e}")).collect(),
+            ..Default::default()
+        };
+        let f = pack_fixture_with(
+            &[],
+            &[1, 2, 3],
+            &[1, 2, 3],
+            pack_q,
+            (1..=3u32)
+                .flat_map(|e| [(e, web_x265_single_raw(e)), (e, bluray_x264_pack_raw(e))])
+                .collect(),
+            PackOpts {
+                infos: vec![pack_info],
+                ..Default::default()
+            },
+        )
+        .await;
+        let aired = [(1, 1), (1, 2), (1, 3)];
+
+        show_upgrade_visit(&f.app, &aired).await;
+        let after_first = show_state(&f.store, 3).await;
+        let (adds, deletes) = (
+            f.added.lock().unwrap().len(),
+            f.deleted.lock().unwrap().len(),
+        );
+        show_upgrade_visit(&f.app, &aired).await;
+        assert_eq!(
+            show_state(&f.store, 3).await,
+            after_first,
+            "a second visit changes no owned record or slot"
+        );
+        assert_eq!(
+            f.added.lock().unwrap()[adds..].to_vec(),
+            Vec::<String>::new(),
+            "a second visit stages nothing"
+        );
+        assert_eq!(
+            f.deleted.lock().unwrap()[deletes..].to_vec(),
+            Vec::<String>::new(),
+            "a second visit deletes nothing"
+        );
+        assert_eq!(
+            after_first,
+            (vec![PACK.to_string()], vec![PACK.to_string(); 3]),
+            "the pack is never split into lower-tier singles"
+        );
+        assert_eq!(
+            f.added.lock().unwrap().clone(),
+            Vec::<String>::new(),
+            "no lower-tier single is ever staged for a pack-served slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn unverified_pack_split_into_equal_singles_is_refolded_at_most_once() {
+        // An UNVERIFIED MKV WEB-DL x265 1080p pack (its probed file's tracks couldn't be read) serving
+        // every slot, with equal-tier/resolution, slightly higher-scoring singles available. Task 4's
+        // unverified rule lets phase (a2) split it into the (checked) singles, and consolidation —
+        // whose no-regression gate the equal pack passes — may fold it back in the same visit. But
+        // consolidation adopts only a probe `Pass` and records the pack VERIFIED, so (a2) can't split
+        // it again: the second visit changes nothing (no split/re-fold cycle).
+        let pack_raw = |e: u32| RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "Show.S01.1080p.WEB-DL.x265-GRP\n👤 20 💾 4.4 GB\nRD+".into(),
+            info_hash: PACK.into(),
+            file_idx: Some(e as usize - 1),
+            file_name: Some(format!("Show.S01E{e:02}.1080p.WEB-DL.x265-GRP.mkv")),
+        };
+        let single_raw = |e: u32| RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: format!("Show.S01E{e:02}.1080p.WEB-DL.x265-OTHER\n👤 400 💾 1.1 GB\nRD+"),
+            info_hash: format!("hweb{e}"),
+            file_idx: Some(0),
+            file_name: Some(format!("Show.S01E{e:02}.1080p.WEB-DL.x265-OTHER.mkv")),
+        };
+        let prefs = crate::config::AcquisitionConfig::default().prefs;
+        let pack_q = QualitySummary {
+            unverified: true,
+            ..QualitySummary::of(&release::parse(&pack_raw(1)), &prefs)
+        };
+        let single_q = QualitySummary::of(&release::parse(&single_raw(1)), &prefs);
+        assert!(
+            single_q.score >= pack_q.score
+                && single_q.source_tier == pack_q.source_tier
+                && single_q.resolution == pack_q.resolution,
+            "fixture: equal tier/res, single scores >= pack ({single_q:?} vs {pack_q:?})"
+        );
+        let pack_info = TorrentInfo {
+            id: PACK.into(),
+            hash: PACK.into(),
+            status: "downloaded".into(),
+            files: (1..=3u32)
+                .map(|e| TorrentFile {
+                    id: e - 1,
+                    path: format!("Show.S01/Show.S01E{e:02}.1080p.WEB-DL.x265-GRP.mkv"),
+                    bytes: 1_500_000_000,
+                    selected: 1,
+                })
+                .collect(),
+            links: (1..=3u32).map(|e| format!("https://cdn/p{e}")).collect(),
+            ..Default::default()
+        };
+        let f = pack_fixture_with(
+            &[],
+            &[1, 2, 3],
+            &[1, 2, 3],
+            pack_q,
+            (1..=3u32)
+                .flat_map(|e| [(e, single_raw(e)), (e, pack_raw(e))])
+                .collect(),
+            PackOpts {
+                infos: vec![pack_info],
+                ..Default::default()
+            },
+        )
+        .await;
+        let aired = [(1, 1), (1, 2), (1, 3)];
+
+        show_upgrade_visit(&f.app, &aired).await;
+        let after_first = show_state(&f.store, 3).await;
+        let (adds, deletes) = (
+            f.added.lock().unwrap().len(),
+            f.deleted.lock().unwrap().len(),
+        );
+        show_upgrade_visit(&f.app, &aired).await;
+        assert_eq!(
+            show_state(&f.store, 3).await,
+            after_first,
+            "a second visit changes no owned record or slot"
+        );
+        assert_eq!(
+            f.added.lock().unwrap()[adds..].to_vec(),
+            Vec::<String>::new(),
+            "a second visit stages nothing"
+        );
+        assert_eq!(
+            f.deleted.lock().unwrap()[deletes..].to_vec(),
+            Vec::<String>::new(),
+            "a second visit deletes nothing"
+        );
+        // Whichever copy the first visit settled on is now a CHECKED one.
+        for h in &after_first.0 {
+            let q = f.store.get_owned(h.clone()).await.unwrap().quality.unwrap();
+            assert!(!q.unverified, "{h} settled verified");
+        }
     }
 }

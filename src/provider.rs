@@ -135,6 +135,9 @@ pub struct MockProvider {
     pub unavailable_torrent_ids: std::collections::HashSet<String>,
     /// Records every `delete_torrent` id so tests can assert that leaked torrents are cleaned up.
     pub deleted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Records the infohash of every `add_magnet` call (in call order), so tests can assert exactly
+    /// which candidates were staged — and that one was never added.
+    pub added: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// When `true`, `get_torrents` returns a `reqwest::Error` so tests can exercise the
     /// early-return guard in `reconcile_wanted` / `monitor_episodes`.
     pub fail_get_torrents: bool,
@@ -188,6 +191,7 @@ impl DebridProvider for MockProvider {
     }
     async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
         let hash = magnet.rsplit("urn:btih:").next().unwrap_or("").to_string();
+        self.added.lock().unwrap().push(hash.clone());
         if self.fail_add_magnet_hashes.contains(&hash) {
             // Drive an immediate URL-parse failure to produce a reqwest::Error without any I/O,
             // so the acquisition loop takes its "add failed → try next candidate" branch.
