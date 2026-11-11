@@ -143,6 +143,22 @@ static WEB_RE: LazyLock<Regex> =
 static MULTI_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|[ ._\n-])multi(?:[ ._\n-]|$)").unwrap());
 
+// A WHOLE subtitle-marker token: `sub`, `subs`, `subbed`, `subtitle(s)`, `hardsub(s)`, `softsub(s)`.
+// The trailing `\b` keeps a word that merely starts with `sub` (`SUBFRENCH`, `Suburbia`) out.
+const SUB_MARKER: &str = r"(?:hard|soft)?sub(?:s|bed|titles?)?\b";
+// What may sit between a language word / `multi` and an adjacent subtitle marker. Never `\n`: the
+// marker must be on the same line of the joined Torrentio name/description.
+const SUB_SEP: &str = r"[ ._\-\[\]():,/+]*";
+// A subtitle marker at the START of the text after a token (`ENG SUB`, `Eng.Subs`, `Multi Subs`).
+static SUB_AFTER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!("^{SUB_SEP}{SUB_MARKER}")).unwrap());
+// A subtitle marker at the END of the text before a token (`SUB.ITA`, `Subtitles: English`).
+static SUB_BEFORE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"\b{SUB_MARKER}{SUB_SEP}$")).unwrap());
+// Text made only of those separators (two tokens are adjacent).
+static SUB_SEP_ONLY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!("^{SUB_SEP}$")).unwrap());
+
 // A separator-bounded Dolby-Vision `dv` token — matches `Movie.2160p.DV.HEVC` (dot-separated, the
 // common Torrentio form) as well as space-separated ` dv `, without false-positiving on words that
 // merely contain "dv". Bounded like `WEB_RE`/`MULTI_RE`.
@@ -259,14 +275,41 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
     // a language name doesn't inject a spurious code (e.g. "Germany" must not tag `ger`, "Frenchman"
     // must not tag `fre`, "Russell" must not tag `rus`). This mirrors the bounded `MULTI_RE`/`WEB_RE`
     // matching and keeps the wrong-audio penalty in `score` honest.
+    //
+    // A language word ADJACENT to a subtitle marker names a SUBTITLE language, not an audio one, and
+    // is skipped — otherwise `[ENG SUB]` on a Japanese title would read as an English dub (inventing
+    // a penalty) and `KOREAN…ENG.SUB` would carry `eng` (cancelling the Korean one). Two forms:
+    // - prefix: the marker comes first (`SUB.ITA`, `Subtitles: English`), and every language word
+    //   that directly continues such a run is a subtitle too (`Sub.ITA.ENG`);
+    // - suffix: the marker follows (`ENG SUB`, `Eng.Subs`, `ENG Hardsub`) — unless that marker
+    //   directly introduces the NEXT language word, in which case it is that word's prefix and this
+    //   one stays audio (`iTA-ENG.Sub.ITA` = Italian + English audio, Italian subs).
     let mut languages: Vec<String> = Vec::new();
     let mut push_lang = |code: &str| {
         if !languages.iter().any(|l| l == code) {
             languages.push(code.to_string());
         }
     };
-    for cap in LANG_RE.captures_iter(&lower) {
-        if let Some((_, code)) = LANG_WORDS.iter().find(|(w, _)| *w == &cap[1]) {
+    let lang_hits: Vec<(usize, usize, &str)> = LANG_RE
+        .find_iter(&lower)
+        .filter_map(|m| {
+            let (_, code) = LANG_WORDS.iter().find(|(w, _)| *w == m.as_str())?;
+            Some((m.start(), m.end(), *code))
+        })
+        .collect();
+    let adjacent = |from: usize, to: usize| SUB_SEP_ONLY_RE.is_match(&lower[from..to]);
+    let mut prev_prefix_sub_end: Option<usize> = None;
+    for (i, &(start, end, code)) in lang_hits.iter().enumerate() {
+        let prefix_sub = SUB_BEFORE_RE.is_match(&lower[..start])
+            || prev_prefix_sub_end.is_some_and(|prev_end| adjacent(prev_end, start));
+        let suffix_sub = SUB_AFTER_RE.find(&lower[end..]).is_some_and(|marker| {
+            let marker_end = end + marker.end();
+            !lang_hits
+                .get(i + 1)
+                .is_some_and(|&(next_start, _, _)| adjacent(marker_end, next_start))
+        });
+        prev_prefix_sub_end = prefix_sub.then_some(end);
+        if !prefix_sub && !suffix_sub {
             push_lang(code);
         }
     }
@@ -280,11 +323,13 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
     // its `mul` code is a WILDCARD in `score` (`|| l == "mul"` satisfies any required AUDIO_LANGUAGE).
     // A raw `contains("multi")` would mis-tag `MultiSubs`/`multichannel` as multi-language and let a
     // wrong-audio release escape the language penalty for a non-default `AUDIO_LANGUAGE` user. For the
-    // same reason a `multi` immediately followed by `sub` (Torrentio's `Multi Subs` marker = several
-    // SUBTITLE languages) is not multi-AUDIO and doesn't tag `mul`.
+    // same reason a `multi` directly followed by a WHOLE subtitle-marker token (Torrentio's `Multi
+    // Subs` = several SUBTITLE languages; `Multi.Sub`, `Multi Subtitles`) is not multi-AUDIO and
+    // doesn't tag `mul` — but a word that merely starts with `sub` doesn't count, so the French scene
+    // `MULTi.SUBFRENCH` (multi-audio + French subs) still does.
     if MULTI_RE
         .find_iter(&lower)
-        .any(|m| !lower[m.end()..].starts_with("sub"))
+        .any(|m| !SUB_AFTER_RE.is_match(&lower[m.end()..]))
     {
         push_lang("mul");
     }
@@ -311,6 +356,12 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
     }
 }
 
+/// Language words tagged in a release's name/description (matched separator-bounded via `LANG_RE`).
+///
+/// Known limitation: a title that itself contains one of these words (`The Italian Job`, `My Big Fat
+/// Greek Wedding`, `The Danish Girl`) tags that language on EVERY one of its releases. That penalty
+/// is shared by all of them, so it only reorders the ones that also carry `MULTi` or the required
+/// language — accepted rather than plumbing the requested title into `parse`.
 const LANG_WORDS: &[(&str, &str)] = &[
     ("english", "eng"),
     ("french", "fre"),
@@ -1007,6 +1058,18 @@ mod tests {
         // A separate audio MULTi token still tags `mul` even when `Multi Subs` is present too.
         let both = langs("Film.2020.MULTi.1080p", "Multi Subs / 🇫🇷");
         assert!(both.contains(&"mul".to_string()), "{both:?}");
+        // Only a WHOLE subtitle token is the marker: `SUBFRENCH` (French subtitles) is a different
+        // word, so the `MULTi` before it is still multi-AUDIO (French scene `MULTi` = VF + VO).
+        let subfrench = langs("t", "Movie.2020.MULTi.SUBFRENCH.1080p.BluRay");
+        assert!(subfrench.contains(&"mul".to_string()), "{subfrench:?}");
+        // `Multi Subtitles` / `Multi.Sub` are the same subtitle marker as `Multi Subs`.
+        for name in [
+            "Movie.2020.1080p Multi Subtitles",
+            "Movie.2020.1080p.Multi.Sub",
+        ] {
+            let l = langs("t", name);
+            assert!(!l.contains(&"mul".to_string()), "{name}: {l:?}");
+        }
     }
 
     #[test]
@@ -1017,6 +1080,70 @@ mod tests {
         assert!(vostfr.is_empty(), "{vostfr:?}");
         let napisy = langs("t", "Film.2020.1080p.WEB-DL.Napisy.PL.Subs");
         assert!(napisy.is_empty(), "{napisy:?}");
+    }
+
+    #[test]
+    fn language_next_to_a_subtitle_marker_is_not_audio() {
+        // Suffix form (`[ENG SUB]`, `Eng.Subs`, `ENG Hardsub`, `English Subbed`) and prefix form
+        // (`SUB.ITA`, `Subtitles: English`) both name a SUBTITLE language, not an audio one.
+        for name in [
+            "[SubsPlease] Frieren - 01 (1080p) [ENG SUB]",
+            "Frieren.S01E01.1080p.WEB-DL.Eng.Subs",
+            "Frieren.S01E01.1080p.WEB-DL.ENG.Hardsub",
+            "Movie.2020.1080p.WEB-DL.English.Subbed",
+            "Movie.2020.1080p.WEB-DL.SUB.ITA",
+            "Movie.2020.1080p.WEB-DL [Subtitles: English]",
+        ] {
+            let l = langs("t", name);
+            assert!(l.is_empty(), "{name}: {l:?}");
+        }
+        // An audio tag elsewhere in the name is kept; only the subtitle one is dropped.
+        for name in [
+            "Movie.2020.KOREAN.1080p.WEB-DL.ENG.SUB",
+            "Movie.2020.KOREAN.1080p.WEB-DL [Eng Subs]",
+        ] {
+            assert_eq!(langs("t", name), vec!["kor".to_string()], "{name}");
+        }
+        // A `Sub` that introduces a following language belongs to THAT language, so the one before
+        // it stays audio (`iTA-ENG.Sub.ITA` = Italian + English audio, Italian subs) …
+        let dual = langs("t", "Danza.con.il.diavolo.2020.iTA-ENG.Sub.ITA.1080p");
+        assert_eq!(dual, vec!["ita".to_string(), "eng".to_string()]);
+        // … and a prefix run lists only subtitles (`ITA.Sub.ITA.ENG` = Italian audio; Italian +
+        // English subs), so the English after it isn't an audio tag either.
+        let run = langs("t", "Danza.con.il.diavolo.2020.ITA.AC3.Sub.ITA.ENG.1080p");
+        assert_eq!(run, vec!["ita".to_string()]);
+        // A word that merely starts with `sub` is not a subtitle marker.
+        let suburbia = langs("t", "Movie.2020.ENG.Suburbia.1080p");
+        assert_eq!(suburbia, vec!["eng".to_string()]);
+    }
+
+    #[test]
+    fn subtitle_language_neither_invents_nor_cancels_the_audio_penalty() {
+        let with_audio = |code: &str| {
+            let mut p = prefs();
+            p.audio = AudioReq::Lang(code.to_string());
+            p
+        };
+        let s =
+            |name: &str, p: &QualityPrefs| score(&parse(&raw("t", name, "h", Some("f.mkv"))), p);
+        // Japanese audio + English subs is what an original-audio user wants for a Japanese title:
+        // the `[ENG SUB]` marker must not make it look like an English dub.
+        let ja = with_audio("ja");
+        assert_eq!(
+            s("[SubsPlease] Frieren - 01 (1080p) [ENG SUB]", &ja),
+            s("[SubsPlease] Frieren - 01 (1080p)", &ja)
+        );
+        // English audio + Italian subs, for an English title: no wrong-audio penalty.
+        let en = with_audio("en");
+        assert_eq!(
+            s("Movie.2020.1080p.WEB-DL.SUB.ITA", &en),
+            s("Movie.2020.1080p.WEB-DL", &en)
+        );
+        // Korean audio + English subs, for an English title: still penalised — the `ENG` subtitle
+        // tag must not cancel the Korean audio tag's penalty.
+        let kor = s("Movie.2020.KOREAN.1080p.WEB-DL.ENG.SUB", &en).unwrap();
+        let plain = s("Movie.2020.1080p.WEB-DL", &en).unwrap();
+        assert!(plain - kor >= 50_000, "kor={kor} plain={plain}");
     }
 
     #[test]
