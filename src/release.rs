@@ -673,7 +673,9 @@ pub enum Improvement {
 /// within-ceiling cached `candidate` now scores higher even at a lower raw resolution).
 ///
 /// A `candidate` reaching this function has already passed `score()`'s hard filter, so it is always
-/// within the ceiling; its effective score equals its raw score. Convergence: within a fixed ceiling
+/// within the ceiling; its effective score equals its raw score. An `Upgrade` is a strict score gain
+/// plus a category jump: a higher resolution (any tier — resolution dominates), or a higher source
+/// tier at the same resolution (never a tier drop for a bonus). Convergence: within a fixed ceiling
 /// every accepted swap strictly increases the owned effective score (bounded) => no flip-flop — the
 /// one equal-score case, replacing an `unverified` copy, adopts only a probe-checked release, so the
 /// new copy is verified and that rule cannot fire for it again.
@@ -703,9 +705,16 @@ pub fn is_target_improvement(
     if cand <= cur {
         return Improvement::None;
     }
-    // Require a category change (tier or resolution differs) so a marginal same-tier/same-res
-    // bitrate/HEVC/HDR/seeder wobble never triggers a swap.
-    if candidate.source_tier == current.source_tier && candidate.resolution == current.resolution {
+    // At the SAME resolution, require a HIGHER source tier: a marginal same-tier bitrate/HEVC/HDR/
+    // seeder wobble never triggers a swap, and neither does a LOWER tier that out-scores the owned
+    // copy on those additive bonuses (e.g. WEB x265 over BluRay x264: HEVC's +5k beats the 3k tier
+    // gap). Trading the tier for a bonus would also disagree with full-season consolidation, which
+    // judges "no regression" on tier + resolution alone: a show's singles swapped down a tier could
+    // be folded back into the lower-tier pack phase (a2) had split them from, and split again, every
+    // visit. With this rule every upgrade of a verified copy (the unverified rule above aside — and
+    // the upgrade pass only adopts verified copies) raises the resolution, or the tier at the same
+    // resolution: a move no show pass reverses.
+    if candidate.resolution == current.resolution && candidate.source_tier <= current.source_tier {
         return Improvement::None;
     }
     if candidate.resolution < current.resolution {
@@ -1688,6 +1697,41 @@ mod tests {
             is_target_improvement(&web_1080, &web_1080_marginal, &prefs),
             Improvement::None,
             "marginal same-tier-same-resolution score wobble is not an upgrade"
+        );
+    }
+
+    #[test]
+    fn same_resolution_lower_tier_is_never_an_upgrade_even_when_it_scores_higher() {
+        use super::{is_target_improvement, Improvement, QualitySummary};
+        // At the same resolution only a HIGHER source tier is a category jump. A lower-tier release
+        // can out-score the owned copy on the additive bonuses (HEVC's +5k beats BluRay's +3k tier
+        // gap over WEB), but swapping to it would trade the source tier for a bonus: full-season
+        // consolidation (tier + resolution only) could then fold the singles back into a lower-tier
+        // pack that phase (a2) splits again — a cycle through all three show passes.
+        let q = |name: &str| {
+            QualitySummary::of(
+                &parse(&raw("Torrentio\n1080p", &format!("{name}\nRD+"), "h", None)),
+                &prefs(),
+            )
+        };
+        let bluray_x264 = q("Show.S01E01.1080p.BluRay.x264-BD\n👤 20 💾 2 GB");
+        let web_x265 = q("Show.S01E01.1080p.WEB-DL.x265-HV\n👤 20 💾 1.1 GB");
+        assert!(
+            web_x265.score > bluray_x264.score && web_x265.source_tier < bluray_x264.source_tier,
+            "fixture: the WEB x265 out-scores the BluRay x264 at a lower tier ({web_x265:?} vs {bluray_x264:?})"
+        );
+        assert_eq!(
+            is_target_improvement(&bluray_x264, &web_x265, &prefs()),
+            Improvement::None,
+            "a same-resolution tier drop is not an upgrade, whatever the score"
+        );
+        // The higher-tier direction is still an upgrade when it scores higher.
+        let web_x264 = q("Show.S01.1080p.WEB-DL.x264-GRP\n👤 20 💾 12 GB");
+        assert!(bluray_x264.score > web_x264.score, "fixture");
+        assert_eq!(
+            is_target_improvement(&web_x264, &bluray_x264, &prefs()),
+            Improvement::Upgrade,
+            "WEB -> BluRay at the same resolution is a category jump"
         );
     }
 
