@@ -9,7 +9,9 @@ use crate::now_unix_secs as now_secs;
 use crate::release::{self, QualitySummary};
 use crate::scraper::MediaKind;
 use crate::store::{movie_slot, OwnedRecord, OwnedStatus};
+use crate::tmdb_client::TitleDetails;
 use crate::vfs::MediaType;
+use std::future::Future;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -30,6 +32,19 @@ enum UpgradeSkip {
 /// correction, then full-season consolidation of scattered per-episode torrents into a cached pack.
 /// Each title (movie or show) is one budget unit, ordered least-recently-checked first.
 pub async fn run_upgrade_once(app: &AppState) {
+    run_upgrade_once_with(app, |tmdb_id, media_type| {
+        app.tmdb_client.details(tmdb_id, media_type)
+    })
+    .await
+}
+
+/// [`run_upgrade_once`] with the TMDB `details` fetch (used only by the per-title language backfill,
+/// [`LanguageBackfill`]) injected, so tests can drive the backfill without the network.
+async fn run_upgrade_once_with<F, Fut>(app: &AppState, fetch_details: F)
+where
+    F: Fn(u64, MediaType) -> Fut,
+    Fut: Future<Output = Result<TitleDetails, reqwest::Error>>,
+{
     let budget = app.config.upgrade.budget_per_tick as usize;
     let idle_window = Duration::from_secs(app.config.upgrade.idle_secs);
 
@@ -74,7 +89,8 @@ pub async fn run_upgrade_once(app: &AppState) {
     ordered.sort_by_key(|(last, ..)| *last);
     ordered.truncate(budget);
 
-    for (_, tmdb_id, media_type, hashes, rec) in ordered {
+    let mut backfill = LanguageBackfill::new(fetch_details);
+    for (_, tmdb_id, media_type, hashes, mut rec) in ordered {
         // Library-wide idle gate BEFORE stamping the cursor. The actual swap/prune is idle-gated
         // inside each handler, but stamping `upgrade_checked` for a title we then defer (library
         // active) would advance the round-robin cursor past it — so on a frequently-streamed library
@@ -89,9 +105,21 @@ pub async fn run_upgrade_once(app: &AppState) {
             );
             break;
         }
-        let outcome = match media_type {
-            MediaType::Movie => try_upgrade_movie(app, tmdb_id, &hashes, &rec, idle_window).await,
-            MediaType::Show => try_upgrade_show(app, tmdb_id, &hashes, idle_window).await,
+        // Legacy/mirror records predate `spoken_languages`: fetch the title's TMDB languages once
+        // (before dispatch) so this visit's staging probes already accept its spoken languages under
+        // AUDIO_LANGUAGE=original. A transient TMDB failure defers the title instead of probing it
+        // with the original-only rule.
+        let backfilled = backfill
+            .run(app, tmdb_id, &media_type, &hashes, &mut rec)
+            .await;
+        let outcome = match backfilled {
+            Err(skip) => Err(skip),
+            Ok(()) => match media_type {
+                MediaType::Movie => {
+                    try_upgrade_movie(app, tmdb_id, &hashes, &rec, idle_window).await
+                }
+                MediaType::Show => try_upgrade_show(app, tmdb_id, &hashes, idle_window).await,
+            },
         };
         match outcome {
             // Evaluated to completion (success or a genuine no-upgrade): advance the cursor.
@@ -118,6 +146,158 @@ pub async fn run_upgrade_once(app: &AppState) {
                     tmdb_id, reason
                 );
             }
+        }
+    }
+}
+
+/// One-time backfill of a title's TMDB languages for owned records that predate
+/// `AcquireRequest.spoken_languages` (or account-mirror records, which also lack an
+/// `original_language`). Such a record carries `spoken_languages: None` ("never fetched"), so
+/// `AUDIO_LANGUAGE=original` would still accept only the original language when this pass probes an
+/// upgrade candidate for it — e.g. blacklisting every English release of a `fi`-original,
+/// mostly-English film as BadAudio.
+///
+/// The decision is GROUP-wide, not representative-only: the show paths stage and probe with each
+/// episode/pack record's OWN request, so the fetch fires when ANY record of the group is `None` (a
+/// legacy episode whose group's representative was acquired after the field existed, or a mirror
+/// record that joined later). One fetch then fills every record, so it is never repeated for that
+/// group. Holds a per-tick memory of a transient TMDB failure so an outage costs one (slow, retrying)
+/// fetch per tick rather than one per title.
+struct LanguageBackfill<F> {
+    fetch: F,
+    /// Set once a transient TMDB failure is seen this tick: later titles that need a backfill are
+    /// deferred without another fetch.
+    tmdb_unavailable: bool,
+}
+
+impl<F, Fut> LanguageBackfill<F>
+where
+    F: Fn(u64, MediaType) -> Fut,
+    Fut: Future<Output = Result<TitleDetails, reqwest::Error>>,
+{
+    fn new(fetch: F) -> Self {
+        Self {
+            fetch,
+            tmdb_unavailable: false,
+        }
+    }
+
+    /// Backfill the group's TMDB languages if any of its records has never had them fetched, before
+    /// the title is dispatched. `Ok(())` = proceed (nothing to do, filled, or a permanent TMDB
+    /// refusal — see [`tmdb_error_is_permanent`]). `Err(Deferred)` = a transient TMDB failure (now or
+    /// earlier this tick): nothing is written and the title is NOT dispatched, so no staging probe
+    /// runs with the original-only rule (which could blacklist correct spoken-language releases for
+    /// the blacklist TTL); its cursor stays unstamped and it is retried next tick.
+    async fn run(
+        &mut self,
+        app: &AppState,
+        tmdb_id: u64,
+        media_type: &MediaType,
+        hashes: &[String],
+        rec: &mut OwnedRecord,
+    ) -> Result<(), UpgradeSkip> {
+        if !group_needs_language_backfill(app, hashes, rec).await {
+            return Ok(());
+        }
+        if self.tmdb_unavailable {
+            return Err(UpgradeSkip::Deferred(
+                "TMDB language backfill pending (TMDB unavailable earlier this tick)".into(),
+            ));
+        }
+        match (self.fetch)(tmdb_id, media_type.clone()).await {
+            Ok(details) => {
+                debug!(
+                    "upgrade: tmdb {} backfilled languages (original {:?}, spoken {:?})",
+                    tmdb_id, details.original_language, details.spoken_languages
+                );
+                persist_title_languages(
+                    app,
+                    hashes,
+                    rec,
+                    details.original_language,
+                    details.spoken_languages,
+                )
+                .await;
+                Ok(())
+            }
+            // Waiting won't fix it, and deferring would park the title at the head of the
+            // round-robin forever: proceed with the recorded languages (the pre-backfill rule).
+            Err(e) if tmdb_error_is_permanent(&e) => {
+                debug!(
+                    "upgrade: tmdb {} language backfill refused ({}); proceeding with the recorded languages",
+                    tmdb_id, e
+                );
+                Ok(())
+            }
+            Err(e) => {
+                self.tmdb_unavailable = true;
+                Err(UpgradeSkip::Deferred(format!(
+                    "TMDB language backfill failed ({e}); retrying next tick"
+                )))
+            }
+        }
+    }
+}
+
+/// A TMDB failure that will not fix itself by waiting: a 4xx other than 429 (bad API key, unknown
+/// id). A 429, a 5xx, or a failure with no HTTP status (transport/decode) is transient.
+fn tmdb_error_is_permanent(e: &reqwest::Error) -> bool {
+    e.status()
+        .is_some_and(|s| s.is_client_error() && s != reqwest::StatusCode::TOO_MANY_REQUESTS)
+}
+
+/// True when the in-hand representative `rec` or ANY owned record in `hashes` has never had its
+/// TMDB spoken languages fetched (`None`). A hash with no record (pruned concurrently) is skipped.
+async fn group_needs_language_backfill(
+    app: &AppState,
+    hashes: &[String],
+    rec: &OwnedRecord,
+) -> bool {
+    if rec.request.spoken_languages.is_none() {
+        return true;
+    }
+    for h in hashes {
+        if let Some(r) = app.store.get_owned(h.clone()).await {
+            if r.request.spoken_languages.is_none() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Fill the fetched TMDB languages into every unset field of the in-hand representative `rec` and of
+/// every owned record in `hashes`: `spoken_languages` where it is `None`, and `original_language`
+/// where it is `None` (an account-mirror record), so the staging probe checks `original ∪ spoken`
+/// like an engine-acquired title. Each record is updated with the store's atomic
+/// `backfill_title_languages_if_unset` (one transaction, only those fields change), so a concurrent
+/// `observe` write to a Pending record of the group can't be clobbered by a stale copy. A hash with
+/// no record (pruned concurrently) is skipped, never resurrected; an already-fetched list or a
+/// recorded original language is kept. A failed write only delays that record (it keeps `None` and
+/// triggers another fetch on a later visit).
+async fn persist_title_languages(
+    app: &AppState,
+    hashes: &[String],
+    rec: &mut OwnedRecord,
+    original_language: Option<String>,
+    spoken: Vec<String>,
+) {
+    if rec.request.spoken_languages.is_none() {
+        rec.request.spoken_languages = Some(spoken.clone());
+    }
+    if rec.request.original_language.is_none() {
+        rec.request.original_language = original_language.clone();
+    }
+    for h in hashes {
+        if let Err(e) = app
+            .store
+            .backfill_title_languages_if_unset(h.clone(), original_language.clone(), spoken.clone())
+            .await
+        {
+            debug!(
+                "upgrade: persisting TMDB languages for {} failed ({}); retrying next visit",
+                h, e
+            );
         }
     }
 }
@@ -1955,6 +2135,7 @@ mod tests {
     use crate::tmdb_client::TmdbClient;
     use crate::vfs::{DebridVfs, MediaMetadata, MediaType};
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -1983,6 +2164,7 @@ mod tests {
             season: None,
             episode: None,
             original_language: Some("eng".into()),
+            spoken_languages: Some(vec![]),
             metadata: movie_meta(),
         }
     }
@@ -2125,6 +2307,7 @@ mod tests {
             season: Some(1),
             episode: Some(1),
             original_language: Some("eng".into()),
+            spoken_languages: Some(vec![]),
             metadata: movie_meta(),
         };
         let rec = |req: AcquireRequest| OwnedRecord {
@@ -3300,6 +3483,581 @@ mod tests {
         assert!(
             deleted.lock().unwrap().contains(&"tnew".to_string()),
             "staged torrent must be cleaned up after probe reject"
+        );
+    }
+
+    #[tokio::test]
+    async fn movie_upgrade_accepts_spoken_language_audio_under_original() {
+        // Nightborn's 6 Nov upgrade pass: TMDB original_language `fi`, but English is a listed spoken
+        // language. Under the default AUDIO_LANGUAGE=original an `eng`-audio upgrade candidate must
+        // PASS the staging probe (and be adopted), not be blacklisted BadAudio.
+        let store = mem_store();
+        let nightborn = AcquireRequest {
+            original_language: Some("fi".into()),
+            spoken_languages: Some(vec!["en".into(), "fi".into(), "es".into()]),
+            ..movie_req()
+        };
+        store
+            .put_owned(
+                "hold".into(),
+                OwnedRecord {
+                    request: nightborn,
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(QualitySummary {
+                        cached: true,
+                        source_tier: 3_000,
+                        resolution: 1080,
+                        score: 10,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "hold".into(),
+                    file_path: "old.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![remux_candidate()],
+        });
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "told".into(),
+                    hash: "hold".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tnew".into(),
+                    hash: "hnew".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tnew".into(),
+                hash: "hnew".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "M.2020.1080p.REMUX.mkv".into(),
+                    bytes: 30_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/new".into()),
+            ..Default::default()
+        });
+        let prober: Arc<dyn crate::acquire::Prober> = Arc::new(CannedProber(Ok(vec![Track {
+            kind: TrackKind::Audio,
+            language: Some("eng".into()),
+        }])));
+        let app = app_with_prober(scraper, provider, store.clone(), prober);
+
+        run_upgrade_once(&app).await;
+
+        assert!(
+            !store
+                .is_blacklisted(MediaKind::Movie, 27205, "hnew".into())
+                .await,
+            "an English (spoken-language) release must not be blacklisted BadAudio"
+        );
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hnew",
+            "the spoken-language upgrade must be adopted"
+        );
+        // The staged record inherits the title's spoken languages.
+        assert_eq!(
+            store
+                .get_owned("hnew".into())
+                .await
+                .unwrap()
+                .request
+                .spoken_languages,
+            Some(vec!["en".into(), "fi".into(), "es".into()])
+        );
+    }
+
+    /// A `reqwest::Error` carrying HTTP `status`, as TMDB's `fetch_with_retry` surfaces one.
+    fn http_status_error(status: u16) -> reqwest::Error {
+        reqwest::Response::from(
+            hyper::Response::builder()
+                .status(status)
+                .body(hyper::body::Bytes::new())
+                .unwrap(),
+        )
+        .error_for_status()
+        .unwrap_err()
+    }
+
+    /// A canned TMDB `details` fetcher for the language backfill that counts its calls (so a test
+    /// can pin "no fetch" / "one fetch per group" without ever reaching the network).
+    fn canned_details<R>(
+        calls: Arc<AtomicUsize>,
+        result: R,
+    ) -> impl Fn(u64, MediaType) -> std::future::Ready<Result<TitleDetails, reqwest::Error>>
+    where
+        R: Fn() -> Result<TitleDetails, reqwest::Error>,
+    {
+        move |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(result())
+        }
+    }
+
+    /// TMDB's view of Nightborn: `fi` original, mostly English.
+    fn nightborn_details() -> TitleDetails {
+        TitleDetails {
+            title: "Nightborn".into(),
+            year: Some("2026".into()),
+            original_language: Some("fi".into()),
+            spoken_languages: vec!["en".into(), "fi".into(), "es".into()],
+        }
+    }
+
+    /// A show episode record whose TMDB languages were never fetched (`spoken_languages: None`).
+    fn legacy_episode(season: u32, episode: u32) -> OwnedRecord {
+        OwnedRecord {
+            request: AcquireRequest {
+                kind: MediaKind::Series,
+                season: Some(season),
+                episode: Some(episode),
+                spoken_languages: None,
+                ..movie_req()
+            },
+            provenance: Provenance::watchlist("a"),
+            added_at: 7,
+            status: OwnedStatus::Verified,
+            provides: vec![(season, episode)],
+            quality: None,
+        }
+    }
+
+    fn empty_app(store: Store) -> AppState {
+        app_with(
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(MockProvider::default()),
+            store,
+        )
+    }
+
+    #[tokio::test]
+    async fn language_backfill_covers_the_whole_group_even_when_the_representative_is_fetched() {
+        // The decision is group-wide, not representative-only: here the representative (`ha`, the
+        // lexicographically-first hash) was acquired after the field existed (`Some`), but the
+        // group's legacy episode `hb` and account-mirror record `hc` are `None`. The show paths probe
+        // with each record's OWN request, so all of them must be backfilled — with ONE fetch. A mirror
+        // record (no `original_language` either) also gains TMDB's original language, so its staging
+        // probe checks `original ∪ spoken`, not the spoken list alone.
+        let store = mem_store();
+        let mut fresh = legacy_episode(1, 1);
+        fresh.request.spoken_languages = Some(vec!["en".into()]);
+        store.put_owned("ha".into(), fresh).await.unwrap();
+        store
+            .put_owned("hb".into(), legacy_episode(1, 2))
+            .await
+            .unwrap();
+        let mut mirror = legacy_episode(1, 3);
+        mirror.request.original_language = None;
+        mirror.provenance = Provenance { entries: vec![] };
+        store.put_owned("hc".into(), mirror).await.unwrap();
+        let app = empty_app(store.clone());
+        let mut rec = store.get_owned("ha".into()).await.unwrap();
+        // A hash pruned concurrently (no record) is skipped, never resurrected.
+        let hashes: Vec<String> = ["ha", "hb", "hc", "hgone"].map(String::from).to_vec();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut backfill =
+            LanguageBackfill::new(canned_details(calls.clone(), || Ok(nightborn_details())));
+
+        let out = backfill
+            .run(&app, 314360, &MediaType::Show, &hashes, &mut rec)
+            .await;
+
+        assert!(out.is_ok(), "{out:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one TMDB call per group");
+        let want = Some(vec!["en".to_string(), "fi".to_string(), "es".to_string()]);
+        let hb = store.get_owned("hb".into()).await.unwrap();
+        assert_eq!(
+            hb.request.spoken_languages, want,
+            "legacy episode backfilled"
+        );
+        assert_eq!(
+            hb.request.original_language.as_deref(),
+            Some("eng"),
+            "a recorded original language is kept"
+        );
+        assert_eq!(hb.request.episode, Some(2), "other fields intact");
+        assert_eq!(hb.provides, vec![(1, 2)]);
+        assert_eq!(hb.added_at, 7);
+        let hc = store.get_owned("hc".into()).await.unwrap();
+        assert_eq!(
+            hc.request.spoken_languages, want,
+            "mirror record backfilled"
+        );
+        assert_eq!(hc.request.original_language.as_deref(), Some("fi"));
+        // The already-fetched representative keeps its own list, in hand and in the store.
+        assert_eq!(rec.request.spoken_languages, Some(vec!["en".to_string()]));
+        assert_eq!(
+            store
+                .get_owned("ha".into())
+                .await
+                .unwrap()
+                .request
+                .spoken_languages,
+            Some(vec!["en".to_string()])
+        );
+        assert!(store.get_owned("hgone".into()).await.is_none());
+
+        // Converged: every record is now `Some`, so the next visit fetches nothing.
+        let out = backfill
+            .run(&app, 314360, &MediaType::Show, &hashes, &mut rec)
+            .await;
+        assert!(out.is_ok(), "{out:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "never re-fetched");
+    }
+
+    #[tokio::test]
+    async fn language_backfill_fills_the_in_hand_representative() {
+        // The movie path stages with the in-hand representative `rec`, so a fetch must update it too
+        // (spoken list, and the original language when it was unknown).
+        let store = mem_store();
+        let mut legacy = legacy_episode(1, 1);
+        legacy.request = AcquireRequest {
+            original_language: None,
+            spoken_languages: None,
+            ..movie_req()
+        };
+        legacy.provides = vec![];
+        store.put_owned("hold".into(), legacy).await.unwrap();
+        let app = empty_app(store.clone());
+        let mut rec = store.get_owned("hold".into()).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut backfill =
+            LanguageBackfill::new(canned_details(calls.clone(), || Ok(nightborn_details())));
+        let out = backfill
+            .run(&app, 27205, &MediaType::Movie, &["hold".into()], &mut rec)
+            .await;
+        assert!(out.is_ok(), "{out:?}");
+        assert_eq!(
+            rec.request.spoken_languages,
+            Some(vec!["en".to_string(), "fi".to_string(), "es".to_string()])
+        );
+        assert_eq!(rec.request.original_language.as_deref(), Some("fi"));
+        let stored = store.get_owned("hold".into()).await.unwrap().request;
+        assert_eq!(stored.spoken_languages, rec.request.spoken_languages);
+        assert_eq!(stored.original_language, rec.request.original_language);
+    }
+
+    #[tokio::test]
+    async fn language_backfill_skips_the_fetch_when_every_record_is_fetched() {
+        // `Some(..)` (even empty) on every record means TMDB was already consulted: no fetch at all.
+        let store = mem_store();
+        let mut a = legacy_episode(1, 1);
+        a.request.spoken_languages = Some(vec![]);
+        let mut b = legacy_episode(1, 2);
+        b.request.spoken_languages = Some(vec!["en".into()]);
+        store.put_owned("ha".into(), a).await.unwrap();
+        store.put_owned("hb".into(), b).await.unwrap();
+        let app = empty_app(store.clone());
+        let mut rec = store.get_owned("ha".into()).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut backfill =
+            LanguageBackfill::new(canned_details(calls.clone(), || Ok(nightborn_details())));
+        let out = backfill
+            .run(
+                &app,
+                314360,
+                &MediaType::Show,
+                &["ha".into(), "hb".into()],
+                &mut rec,
+            )
+            .await;
+        assert!(out.is_ok(), "{out:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no TMDB fetch");
+        assert_eq!(rec.request.spoken_languages, Some(vec![]));
+    }
+
+    #[tokio::test]
+    async fn language_backfill_transient_failure_defers_without_writing() {
+        // A transient TMDB failure must NOT let this visit probe with the original-only rule (that
+        // would blacklist correct spoken-language candidates for the blacklist TTL): the title is
+        // Deferred (cursor unchanged → retried next tick), nothing is written, and later titles
+        // that also need a backfill are deferred this tick WITHOUT another (slow, retrying) fetch.
+        // A title that needs no backfill is unaffected.
+        let store = mem_store();
+        store
+            .put_owned("hb".into(), legacy_episode(1, 2))
+            .await
+            .unwrap();
+        let mut done = legacy_episode(1, 1);
+        done.request.spoken_languages = Some(vec![]);
+        store.put_owned("hdone".into(), done).await.unwrap();
+        let app = empty_app(store.clone());
+        let mut rec = store.get_owned("hb".into()).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut backfill = LanguageBackfill::new(canned_details(calls.clone(), || {
+            Err(http_status_error(502))
+        }));
+
+        let out = backfill
+            .run(&app, 314360, &MediaType::Show, &["hb".into()], &mut rec)
+            .await;
+        assert!(matches!(out, Err(UpgradeSkip::Deferred(_))), "{out:?}");
+        assert_eq!(rec.request.spoken_languages, None);
+        assert_eq!(
+            store
+                .get_owned("hb".into())
+                .await
+                .unwrap()
+                .request
+                .spoken_languages,
+            None
+        );
+        // A second title needing a backfill this tick: deferred without fetching again.
+        let out = backfill
+            .run(&app, 999, &MediaType::Show, &["hb".into()], &mut rec)
+            .await;
+        assert!(matches!(out, Err(UpgradeSkip::Deferred(_))), "{out:?}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "TMDB outage: one fetch per tick"
+        );
+        // A fully-fetched title still proceeds.
+        let mut done = store.get_owned("hdone".into()).await.unwrap();
+        let out = backfill
+            .run(&app, 1000, &MediaType::Show, &["hdone".into()], &mut done)
+            .await;
+        assert!(out.is_ok(), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn language_backfill_permanent_failure_proceeds_without_writing() {
+        // A non-429 4xx (bad key, unknown id) won't fix itself by waiting: deferring would park the
+        // title at the head of the round-robin forever, blocking all its upgrades. Proceed with the
+        // recorded languages (the pre-backfill rule), write nothing, and keep TMDB usable for the
+        // rest of the tick.
+        let store = mem_store();
+        store
+            .put_owned("hb".into(), legacy_episode(1, 2))
+            .await
+            .unwrap();
+        let app = empty_app(store.clone());
+        let mut rec = store.get_owned("hb".into()).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut backfill = LanguageBackfill::new(canned_details(calls.clone(), || {
+            Err(http_status_error(404))
+        }));
+        for id in [314360, 999] {
+            let out = backfill
+                .run(&app, id, &MediaType::Show, &["hb".into()], &mut rec)
+                .await;
+            assert!(out.is_ok(), "{out:?}");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a 4xx doesn't mark TMDB down"
+        );
+        assert_eq!(rec.request.spoken_languages, None);
+        assert_eq!(
+            store
+                .get_owned("hb".into())
+                .await
+                .unwrap()
+                .request
+                .spoken_languages,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn tmdb_error_permanence_classification() {
+        assert!(tmdb_error_is_permanent(&http_status_error(404)));
+        assert!(tmdb_error_is_permanent(&http_status_error(401)));
+        assert!(!tmdb_error_is_permanent(&http_status_error(429)));
+        assert!(!tmdb_error_is_permanent(&http_status_error(502)));
+        assert!(!tmdb_error_is_permanent(&http_status_error(500)));
+        // No HTTP status (transport / decode failure) → transient.
+        let decode = reqwest::Response::from(
+            hyper::Response::builder()
+                .status(200)
+                .body(hyper::body::Bytes::from_static(b"not json"))
+                .unwrap(),
+        )
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_err();
+        assert!(decode.status().is_none());
+        assert!(!tmdb_error_is_permanent(&decode));
+    }
+
+    /// A Nightborn-shaped legacy movie (`fi` original, spoken languages never fetched) owned as a
+    /// cached 1080p WEB copy, plus a provider/scraper offering a cached `eng`-audio REMUX upgrade.
+    async fn legacy_nightborn_app(store: &Store) -> AppState {
+        store
+            .put_owned(
+                "hold".into(),
+                OwnedRecord {
+                    request: AcquireRequest {
+                        original_language: Some("fi".into()),
+                        spoken_languages: None,
+                        ..movie_req()
+                    },
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(QualitySummary {
+                        cached: true,
+                        source_tier: 3_000,
+                        resolution: 1080,
+                        score: 10,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "hold".into(),
+                    file_path: "old.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![remux_candidate()],
+        });
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "told".into(),
+                    hash: "hold".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tnew".into(),
+                    hash: "hnew".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tnew".into(),
+                hash: "hnew".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "M.2020.1080p.REMUX.mkv".into(),
+                    bytes: 30_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/new".into()),
+            ..Default::default()
+        });
+        let prober: Arc<dyn crate::acquire::Prober> = Arc::new(CannedProber(Ok(vec![Track {
+            kind: TrackKind::Audio,
+            language: Some("eng".into()),
+        }])));
+        app_with_prober(scraper, provider, store.clone(), prober)
+    }
+
+    #[tokio::test]
+    async fn upgrade_tick_backfills_a_legacy_title_before_its_staging_probe() {
+        // Wiring: `run_upgrade_once` must backfill a legacy title BEFORE dispatch. Without it, the
+        // staging probe checks `fi` alone and blacklists the English upgrade as BadAudio.
+        let store = mem_store();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = legacy_nightborn_app(&store).await;
+
+        run_upgrade_once_with(
+            &app,
+            canned_details(calls.clone(), || Ok(nightborn_details())),
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !store
+                .is_blacklisted(MediaKind::Movie, 27205, "hnew".into())
+                .await,
+            "the English upgrade must not be blacklisted BadAudio"
+        );
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hnew",
+            "the spoken-language upgrade must be adopted"
+        );
+        assert_eq!(
+            store
+                .get_owned("hnew".into())
+                .await
+                .unwrap()
+                .request
+                .spoken_languages,
+            Some(vec!["en".into(), "fi".into(), "es".into()]),
+            "the staged record inherits the backfilled languages"
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_tick_defers_a_legacy_title_when_tmdb_is_unavailable() {
+        // A transient TMDB failure during the backfill defers the title: nothing is staged or probed
+        // (so nothing is blacklisted under the original-only rule) and its cursor stays unstamped.
+        let store = mem_store();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = legacy_nightborn_app(&store).await;
+
+        run_upgrade_once_with(
+            &app,
+            canned_details(calls.clone(), || Err(http_status_error(503))),
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !store
+                .is_blacklisted(MediaKind::Movie, 27205, "hnew".into())
+                .await
+        );
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hold",
+            "nothing staged or swapped"
+        );
+        assert!(store.get_owned("hnew".into()).await.is_none());
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Movie, 27205).await,
+            0,
+            "deferred: cursor unchanged"
         );
     }
 
@@ -4733,6 +5491,7 @@ mod tests {
                 season: Some(season),
                 episode: Some(episode),
                 original_language: Some("eng".into()),
+                spoken_languages: Some(vec![]),
                 metadata: show_meta(),
             },
             provenance: Provenance::watchlist("a"),
@@ -5768,6 +6527,7 @@ mod tests {
                 season: Some(1),
                 episode: Some(1),
                 original_language: Some("eng".into()),
+                spoken_languages: Some(vec![]),
                 metadata: show_meta(),
             },
             provenance: Provenance::watchlist("a"),
@@ -5850,6 +6610,7 @@ mod tests {
                 season: Some(1),
                 episode: Some(1),
                 original_language: Some("eng".into()),
+                spoken_languages: Some(vec![]),
                 metadata: show_meta(),
             },
             provenance: Provenance::watchlist("a"),
@@ -6050,6 +6811,7 @@ mod tests {
                 season: Some(1),
                 episode: Some(1),
                 original_language: Some("eng".into()),
+                spoken_languages: Some(vec![]),
                 metadata: show_meta(),
             },
             provenance: Provenance::watchlist("a"),
@@ -6702,6 +7464,7 @@ mod tests {
                 season: Some(1),
                 episode: Some(1),
                 original_language: Some("eng".into()),
+                spoken_languages: Some(vec![]),
                 metadata: show_meta(),
             },
             provenance: Provenance::watchlist("a"),

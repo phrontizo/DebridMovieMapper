@@ -72,6 +72,10 @@ impl MaxResolution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioReq {
     Lang(String),
+    /// Any one of these languages is acceptable. Never produced by [`AudioReq::parse`] (the env var
+    /// names one language) — only by [`QualityPrefs::with_resolved_audio`] resolving `Original`
+    /// against a title whose TMDB original + spoken languages span more than one language.
+    AnyOf(Vec<String>),
     Original,
 }
 
@@ -140,23 +144,56 @@ pub struct QualityPrefs {
     pub prefer_hdr: bool,
 }
 
+/// The audio languages `AUDIO_LANGUAGE=original` accepts for a title: its TMDB original language
+/// followed by its TMDB spoken languages — trimmed, lowercased, empties dropped, de-duplicated (two
+/// codes naming the same language, e.g. `de`/`ger`, count once; the first spelling is kept), original
+/// first. Empty when neither is known (no audio requirement). Shared by acquisition ranking
+/// ([`QualityPrefs::with_resolved_audio`]) and the probe (`probe::verify`) so the two can't disagree
+/// about which releases are the right language.
+pub fn original_audio_languages(original: Option<&str>, spoken: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for code in original
+        .into_iter()
+        .chain(spoken.iter().map(String::as_str))
+    {
+        let code = code.trim().to_ascii_lowercase();
+        if code.is_empty() {
+            continue;
+        }
+        let canon = crate::probe::to_iso639_2(&code);
+        if !out.iter().any(|c| crate::probe::to_iso639_2(c) == canon) {
+            out.push(code);
+        }
+    }
+    out
+}
+
 impl QualityPrefs {
-    /// Return a copy whose `audio` requirement is resolved against a title's TMDB original language,
-    /// turning the default `AudioReq::Original` into a concrete `AudioReq::Lang(...)` when the
-    /// original language is known. `release::score` only penalises a wrong-language release for an
-    /// `AudioReq::Lang` (it has no per-title context of its own), so ranking with the raw prefs would
-    /// leave `Original` un-penalised and let a wrong-language release rank #1, get optimistically
-    /// added, download, and only then be rejected at probe time — burning an acquire cycle. Resolving
-    /// here makes acquisition ranking down-rank it up front, exactly as `probe::verify` rejects it
-    /// (which resolves `Original` the same way). An unknown/empty original language, or an explicit
-    /// `Lang`, is left unchanged.
-    pub fn with_resolved_audio(&self, original_language: Option<&str>) -> QualityPrefs {
+    /// Return a copy whose `audio` requirement is resolved against a title's TMDB original + spoken
+    /// languages ([`original_audio_languages`]), turning the default `AudioReq::Original` into a
+    /// concrete `AudioReq::Lang(..)` (one language) or `AudioReq::AnyOf(..)` (several, original
+    /// first). `release::score` only penalises a wrong-language release for a concrete requirement (it
+    /// has no per-title context of its own), so ranking with the raw prefs would leave `Original`
+    /// un-penalised and let a wrong-language release rank #1, get optimistically added, download, and
+    /// only then be rejected at probe time — burning an acquire cycle. Resolving here makes
+    /// acquisition ranking down-rank it up front, exactly as `probe::verify` rejects it (which
+    /// resolves `Original` the same way). Accepting the spoken languages too means a title whose TMDB
+    /// original language isn't its main audio (Nightborn: `fi` original, mostly English) doesn't
+    /// down-rank every correctly-tagged release. No known language, or an explicit `Lang`, is left
+    /// unchanged.
+    pub fn with_resolved_audio(
+        &self,
+        original_language: Option<&str>,
+        spoken_languages: &[String],
+    ) -> QualityPrefs {
         let mut p = self.clone();
-        if let (AudioReq::Original, Some(orig)) = (&self.audio, original_language) {
-            let orig = orig.trim();
-            if !orig.is_empty() {
-                p.audio = AudioReq::Lang(orig.to_ascii_lowercase());
-            }
+        if self.audio == AudioReq::Original {
+            let mut langs = original_audio_languages(original_language, spoken_languages);
+            p.audio = match langs.len() {
+                0 => AudioReq::Original,
+                1 => AudioReq::Lang(langs.remove(0)),
+                _ => AudioReq::AnyOf(langs),
+            };
         }
         p
     }
@@ -1110,14 +1147,20 @@ mod tests {
         // A known original language turns the default `Original` into a concrete `Lang(...)` (lowercased),
         // so acquisition ranking down-ranks a wrong-language release exactly as the probe rejects it.
         assert_eq!(
-            base.with_resolved_audio(Some("JA")).audio,
+            base.with_resolved_audio(Some("JA"), &[]).audio,
             AudioReq::Lang("ja".into())
         );
         // An unknown / empty / whitespace original language leaves `Original` untouched (no penalty).
-        assert_eq!(base.with_resolved_audio(None).audio, AudioReq::Original);
-        assert_eq!(base.with_resolved_audio(Some("")).audio, AudioReq::Original);
         assert_eq!(
-            base.with_resolved_audio(Some("  ")).audio,
+            base.with_resolved_audio(None, &[]).audio,
+            AudioReq::Original
+        );
+        assert_eq!(
+            base.with_resolved_audio(Some(""), &[]).audio,
+            AudioReq::Original
+        );
+        assert_eq!(
+            base.with_resolved_audio(Some("  "), &[]).audio,
             AudioReq::Original
         );
         // An explicit `Lang` is never overridden by the title's original language.
@@ -1126,14 +1169,64 @@ mod tests {
             ..base.clone()
         };
         assert_eq!(
-            explicit.with_resolved_audio(Some("ja")).audio,
+            explicit.with_resolved_audio(Some("ja"), &[]).audio,
             AudioReq::Lang("eng".into())
         );
         // Non-audio fields are preserved.
-        let r = base.with_resolved_audio(Some("de"));
+        let r = base.with_resolved_audio(Some("de"), &[]);
         assert_eq!(r.max_resolution, base.max_resolution);
         assert!(r.prefer_hevc);
         assert!(!r.prefer_hdr);
+    }
+
+    #[test]
+    fn with_resolved_audio_unions_original_and_spoken() {
+        let base = QualityPrefs {
+            max_resolution: MaxResolution::P1080,
+            audio: AudioReq::Original,
+            subtitle: SubReq::None,
+            prefer_hevc: true,
+            prefer_hdr: false,
+        };
+        let spoken = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Nightborn: original `fi`, spoken [en, fi, es] → any of them, original first, de-duplicated.
+        assert_eq!(
+            base.with_resolved_audio(Some("fi"), &spoken(&["en", "fi", "es"]))
+                .audio,
+            AudioReq::AnyOf(vec!["fi".into(), "en".into(), "es".into()])
+        );
+        // Spoken list that adds nothing beyond the original collapses to a single `Lang`.
+        assert_eq!(
+            base.with_resolved_audio(Some("FI"), &spoken(&["fi"])).audio,
+            AudioReq::Lang("fi".into())
+        );
+        // No original but spoken languages known → those (lowercased, empties dropped).
+        assert_eq!(
+            base.with_resolved_audio(None, &spoken(&["EN", " ", "en"]))
+                .audio,
+            AudioReq::Lang("en".into())
+        );
+        assert_eq!(
+            base.with_resolved_audio(Some(""), &spoken(&["en", "de"]))
+                .audio,
+            AudioReq::AnyOf(vec!["en".into(), "de".into()])
+        );
+        // An explicit language ignores the title's spoken languages entirely.
+        let explicit = QualityPrefs {
+            audio: AudioReq::Lang("de".into()),
+            ..base.clone()
+        };
+        assert_eq!(
+            explicit
+                .with_resolved_audio(Some("fi"), &spoken(&["en", "fi"]))
+                .audio,
+            AudioReq::Lang("de".into())
+        );
+        // `AnyOf` is never produced by parsing the env var.
+        assert!(!matches!(
+            AudioReq::parse(Some("fi,en".into())),
+            AudioReq::AnyOf(_)
+        ));
     }
 
     #[test]

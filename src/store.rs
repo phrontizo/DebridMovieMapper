@@ -108,6 +108,13 @@ pub struct AcquireRequest {
     pub season: Option<u32>,
     pub episode: Option<u32>,
     pub original_language: Option<String>,
+    /// TMDB's `spoken_languages` (ISO 639-1) for the title. Under `AUDIO_LANGUAGE=original` an audio
+    /// track in any of these — or in `original_language` — is acceptable (ranking + probe). `None` =
+    /// never fetched (a record persisted before this field existed, or an account-mirror record): the
+    /// upgrade pass backfills it once from TMDB; until then only `original_language` counts. `Some`
+    /// (even empty) = fetched, never re-fetched.
+    #[serde(default)]
+    pub spoken_languages: Option<Vec<String>>,
     pub metadata: crate::vfs::MediaMetadata,
 }
 
@@ -904,6 +911,71 @@ impl Store {
             }
             txn.commit().map_err(|e| AppError::Db(e.into()))?;
             Ok(())
+        })
+        .await;
+        Self::flatten_join_app(result)
+    }
+
+    /// Fill the TMDB language fields of the owned record for `hash` that are still unset, as one
+    /// read-modify-write transaction that touches no other field: `request.spoken_languages =
+    /// Some(spoken)` only if it is `None` (never fetched), and `request.original_language =
+    /// original_language` only if it is `None` (an account-mirror record never had one). So the upgrade
+    /// pass's one-time TMDB backfill can't clobber a concurrent `observe`/acquire update to the same
+    /// record, overwrite a list that was already fetched, or replace a recorded original language.
+    /// Returns `true` if it wrote; `false` when nothing was unset (or nothing to fill) or the record
+    /// is missing (never resurrected).
+    pub async fn backfill_title_languages_if_unset(
+        &self,
+        hash: String,
+        original_language: Option<String>,
+        spoken: Vec<String>,
+    ) -> Result<bool, AppError> {
+        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, AppError> {
+            let txn = db.begin_write().map_err(|e| AppError::Db(e.into()))?;
+            let wrote = {
+                let mut table = txn
+                    .open_table(OWNED_TABLE)
+                    .map_err(|e| AppError::Db(e.into()))?;
+                // Copy the bytes out so the read borrow ends before the `&mut` insert.
+                let existing: Option<Vec<u8>> = table
+                    .get(hash.as_str())
+                    .map_err(|e| AppError::Db(e.into()))?
+                    .map(|guard| guard.value().to_vec());
+                match existing {
+                    Some(raw) => {
+                        let mut rec = serde_json::from_slice::<OwnedRecord>(&raw).map_err(|e| {
+                            AppError::Task(format!(
+                                "backfill_title_languages_if_unset: corrupt owned record for {hash}: {e}"
+                            ))
+                        })?;
+                        let mut changed = false;
+                        if rec.request.spoken_languages.is_none() {
+                            rec.request.spoken_languages = Some(spoken);
+                            changed = true;
+                        }
+                        if rec.request.original_language.is_none() && original_language.is_some() {
+                            rec.request.original_language = original_language;
+                            changed = true;
+                        }
+                        if changed {
+                            let bytes = serde_json::to_vec(&rec).map_err(|e| {
+                                AppError::Task(format!(
+                                    "backfill_title_languages_if_unset: re-serialise failed for {hash}: {e}"
+                                ))
+                            })?;
+                            table
+                                .insert(hash.as_str(), bytes.as_slice())
+                                .map_err(|e| AppError::Db(e.into()))?;
+                        }
+                        changed
+                    }
+                    None => false,
+                }
+            };
+            txn.commit().map_err(|e| AppError::Db(e.into()))?;
+            Ok(wrote)
         })
         .await;
         Self::flatten_join_app(result)
@@ -2339,6 +2411,7 @@ mod tests {
             season: None,
             episode: None,
             original_language: Some("eng".to_string()),
+            spoken_languages: Some(vec![]),
             metadata: movie("Title"),
         }
     }
@@ -3696,6 +3769,114 @@ mod tests {
         });
         let decoded2: OwnedRecord = serde_json::from_value(old_arbitrary).unwrap();
         assert_eq!(decoded2.provenance, Provenance::manual());
+    }
+
+    /// A record persisted before `AcquireRequest.spoken_languages` existed must still decode, with the
+    /// field `None` ("never fetched") so the upgrade pass knows to backfill it from TMDB.
+    #[test]
+    fn acquire_request_without_spoken_languages_decodes_as_none() {
+        let rec = OwnedRecord {
+            request: req("tt1", 27205),
+            provenance: Provenance::watchlist("alice"),
+            added_at: 100,
+            status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: None,
+        };
+        let mut val = serde_json::to_value(&rec).unwrap();
+        val["request"]
+            .as_object_mut()
+            .unwrap()
+            .remove("spoken_languages");
+        assert!(val["request"].get("spoken_languages").is_none());
+        let back: OwnedRecord = serde_json::from_value(val).expect("legacy record must decode");
+        assert_eq!(back.request.spoken_languages, None);
+        assert_eq!(back.request.original_language.as_deref(), Some("eng"));
+        assert_eq!(back.request.tmdb_id, 27205);
+        // A fetched (even empty) list round-trips as `Some` — never collapsed back to "unfetched".
+        let mut fetched = rec.clone();
+        fetched.request.spoken_languages = Some(vec![]);
+        let rt: OwnedRecord =
+            serde_json::from_value(serde_json::to_value(&fetched).unwrap()).unwrap();
+        assert_eq!(rt.request.spoken_languages, Some(vec![]));
+    }
+
+    /// The upgrade pass's TMDB language backfill fills ONLY the unset (`None`) language fields of a
+    /// record, in one write transaction, touching nothing else — so it can't clobber a concurrent
+    /// `observe` update, overwrite a list that was already fetched, or replace a recorded original
+    /// language. An account-mirror record (both `None`) gains both.
+    #[tokio::test]
+    async fn backfill_title_languages_if_unset_fills_only_unset_fields() {
+        let store = mem_store();
+        let mut legacy = OwnedRecord {
+            request: req("tt1", 27205),
+            provenance: Provenance::watchlist("alice"),
+            added_at: 100,
+            status: OwnedStatus::Pending,
+            provides: vec![(1, 2)],
+            quality: None,
+        };
+        legacy.request.spoken_languages = None;
+        store
+            .put_owned("hleg".into(), legacy.clone())
+            .await
+            .unwrap();
+        let mut fetched = legacy.clone();
+        fetched.request.spoken_languages = Some(vec!["de".into()]);
+        store.put_owned("hnew".into(), fetched).await.unwrap();
+        let mut mirror = legacy.clone();
+        mirror.request.original_language = None;
+        store.put_owned("hmir".into(), mirror).await.unwrap();
+
+        let langs = vec!["en".to_string(), "fi".to_string()];
+        let fi = Some("fi".to_string());
+        assert!(store
+            .backfill_title_languages_if_unset("HLEG".into(), fi.clone(), langs.clone())
+            .await
+            .unwrap());
+        let got = store.get_owned("hleg".into()).await.unwrap();
+        assert_eq!(got.request.spoken_languages, Some(langs.clone()));
+        assert_eq!(
+            got.request.original_language.as_deref(),
+            Some("eng"),
+            "a recorded original language is kept"
+        );
+        assert_eq!(got.status, OwnedStatus::Pending, "other fields intact");
+        assert_eq!(got.provides, vec![(1, 2)]);
+        assert_eq!(got.provenance, Provenance::watchlist("alice"));
+        // Account-mirror record: both fields were never fetched → both filled.
+        assert!(store
+            .backfill_title_languages_if_unset("hmir".into(), fi.clone(), langs.clone())
+            .await
+            .unwrap());
+        let got = store.get_owned("hmir".into()).await.unwrap();
+        assert_eq!(got.request.spoken_languages, Some(langs.clone()));
+        assert_eq!(got.request.original_language, fi);
+        // Already fetched, original already known → untouched.
+        assert!(!store
+            .backfill_title_languages_if_unset("hnew".into(), fi.clone(), langs.clone())
+            .await
+            .unwrap());
+        let got = store.get_owned("hnew".into()).await.unwrap();
+        assert_eq!(got.request.spoken_languages, Some(vec!["de".to_string()]));
+        assert_eq!(got.request.original_language.as_deref(), Some("eng"));
+        // TMDB knows no original language → only the spoken list is filled.
+        let mut blank = legacy.clone();
+        blank.request.original_language = None;
+        store.put_owned("hblank".into(), blank).await.unwrap();
+        assert!(store
+            .backfill_title_languages_if_unset("hblank".into(), None, vec![])
+            .await
+            .unwrap());
+        let got = store.get_owned("hblank".into()).await.unwrap();
+        assert_eq!(got.request.spoken_languages, Some(vec![]));
+        assert_eq!(got.request.original_language, None);
+        // Missing record → no-op, never resurrected.
+        assert!(!store
+            .backfill_title_languages_if_unset("hgone".into(), fi, langs)
+            .await
+            .unwrap());
+        assert!(store.get_owned("hgone".into()).await.is_none());
     }
 
     /// A new-format record with multi-user provenance must survive a put→get round-trip

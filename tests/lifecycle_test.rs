@@ -246,7 +246,7 @@ async fn lifecycle_acquire_sintel_by_imdb() {
             return;
         }
     };
-    let (title, year, original_language) = tmdb
+    let details = tmdb
         .details(tmdb_id, mtype.clone())
         .await
         .unwrap_or_default();
@@ -256,10 +256,11 @@ async fn lifecycle_acquire_sintel_by_imdb() {
         kind: debridmoviemapper::scraper::MediaKind::Movie,
         season: None,
         episode: None,
-        original_language,
+        original_language: details.original_language,
+        spoken_languages: Some(details.spoken_languages),
         metadata: debridmoviemapper::vfs::MediaMetadata {
-            title,
-            year,
+            title: details.title,
+            year: details.year,
             media_type: mtype,
             external_id: Some(format!("tmdb:{}", tmdb_id)),
         },

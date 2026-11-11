@@ -41,12 +41,15 @@ pub enum ProbeError {
     TracksNotFound,
 }
 
-/// The resolved language requirement (from `QualityPrefs` + the title's TMDB original language).
+/// The resolved language requirement (from `QualityPrefs` + the title's TMDB original and spoken
+/// languages).
 #[derive(Debug, Clone)]
 pub struct LangReq {
     pub audio: AudioReq,
     pub subtitle: SubReq,
     pub original_language: Option<String>,
+    /// The title's TMDB spoken languages (empty when unknown / never fetched).
+    pub spoken_languages: Vec<String>,
 }
 
 /// Normalise a language code to ISO 639-2/B (bibliographic). Maps the COMPLETE ISO 639-1 (2-letter)
@@ -290,17 +293,17 @@ enum LangCheck {
     Inconclusive,
 }
 
-/// Does the requirement for language `want` hold for tracks of `kind`?
-/// - `Pass`: a track is tagged with `want`.
-/// - `Inconclusive`: a track of that kind carries no determinable language (it *could* be `want`);
+/// Does the requirement "any of the languages in `wants`" hold for tracks of `kind`?
+/// - `Pass`: a track is tagged with one of `wants`.
+/// - `Inconclusive`: a track of that kind carries no determinable language (it *could* be wanted);
 ///   we only have positive evidence when a language is actually tagged, so don't reject.
-/// - `Fail`: every track of that kind is tagged with a *different* language, or there are none —
-///   i.e. the wanted language is positively absent.
-fn check_lang(tracks: &[Track], kind: TrackKind, want: &str) -> LangCheck {
+/// - `Fail`: every track of that kind is tagged with a language outside `wants`, or there are none —
+///   i.e. every wanted language is positively absent.
+fn check_lang(tracks: &[Track], kind: TrackKind, wants: &[String]) -> LangCheck {
     let mut has_untagged = false;
     for t in tracks.iter().filter(|t| t.kind == kind) {
         match &t.language {
-            Some(l) if lang_eq(l, want) => return LangCheck::Pass,
+            Some(l) if wants.iter().any(|w| lang_eq(l, w)) => return LangCheck::Pass,
             Some(_) => {}
             None => has_untagged = true,
         }
@@ -324,17 +327,25 @@ pub fn verify(tracks: &[Track], req: &LangReq) -> Verify {
     if tracks.is_empty() {
         return Verify::Inconclusive;
     }
-    let want_audio: Option<String> = match &req.audio {
-        AudioReq::Lang(l) => Some(l.clone()),
-        AudioReq::Original => req.original_language.clone(),
+    // The acceptable audio languages: an explicit one, an explicit set, or — for the default
+    // `Original` — the title's TMDB original language plus its spoken languages (the same set
+    // `QualityPrefs::with_resolved_audio` ranks with). Empty = nothing known → no audio requirement.
+    let want_audio: Vec<String> = match &req.audio {
+        AudioReq::Lang(l) => vec![l.clone()],
+        AudioReq::AnyOf(v) => v.clone(),
+        AudioReq::Original => crate::config::original_audio_languages(
+            req.original_language.as_deref(),
+            &req.spoken_languages,
+        ),
     };
-    if let Some(want) = want_audio {
-        if let LangCheck::Fail = check_lang(tracks, TrackKind::Audio, &want) {
+    if !want_audio.is_empty() {
+        if let LangCheck::Fail = check_lang(tracks, TrackKind::Audio, &want_audio) {
             return Verify::FailAudio;
         }
     }
     if let SubReq::Lang(want) = &req.subtitle {
-        if let LangCheck::Fail = check_lang(tracks, TrackKind::Subtitle, want) {
+        if let LangCheck::Fail = check_lang(tracks, TrackKind::Subtitle, std::slice::from_ref(want))
+        {
             return Verify::FailSubtitle;
         }
     }
@@ -1896,18 +1907,21 @@ mod tests {
             audio: AudioReq::Original,
             subtitle: SubReq::Lang("eng".into()),
             original_language: Some("jpn".into()),
+            spoken_languages: vec![],
         };
         assert_eq!(verify(&tracks, &req), Verify::Pass);
         let req2 = LangReq {
             audio: AudioReq::Lang("eng".into()),
             subtitle: SubReq::None,
             original_language: None,
+            spoken_languages: vec![],
         };
         assert_eq!(verify(&tracks, &req2), Verify::FailAudio);
         let req3 = LangReq {
             audio: AudioReq::Original,
             subtitle: SubReq::Lang("ger".into()),
             original_language: Some("jpn".into()),
+            spoken_languages: vec![],
         };
         assert_eq!(verify(&tracks, &req3), Verify::FailSubtitle);
         assert_eq!(verify(&[], &req), Verify::Inconclusive);
@@ -1931,6 +1945,7 @@ mod tests {
             audio: AudioReq::Original,
             subtitle: SubReq::None,
             original_language: Some("eng".into()),
+            spoken_languages: vec![],
         };
         assert_eq!(verify(&tracks, &req), Verify::Pass);
     }
@@ -1964,6 +1979,7 @@ mod tests {
             audio: AudioReq::Lang("eng".into()),
             subtitle: SubReq::None,
             original_language: None,
+            spoken_languages: vec![],
         };
         assert_ne!(
             verify(&tracks, &req),
@@ -2006,6 +2022,7 @@ mod tests {
             audio: AudioReq::Lang("eng".into()),
             subtitle: SubReq::None,
             original_language: None,
+            spoken_languages: vec![],
         };
         assert_eq!(verify(&tracks, &req), Verify::FailAudio);
     }
@@ -2029,6 +2046,7 @@ mod tests {
             audio: AudioReq::Lang("eng".into()),
             subtitle: SubReq::None,
             original_language: None,
+            spoken_languages: vec![],
         };
         assert_eq!(verify(&tracks, &req), Verify::Pass);
     }
@@ -2039,6 +2057,7 @@ mod tests {
             audio: AudioReq::Lang("eng".into()),
             subtitle: SubReq::Lang("eng".into()),
             original_language: None,
+            spoken_languages: vec![],
         };
         // Untagged subtitle present → could be the wanted one → inconclusive (accept).
         let untagged_sub = vec![
@@ -2160,7 +2179,72 @@ mod tests {
             audio: AudioReq::Original,
             subtitle: SubReq::None,
             original_language: Some("de".into()),
+            spoken_languages: vec![],
         };
         assert_eq!(verify(&tracks, &req), Verify::Pass);
+    }
+
+    fn eng_audio() -> Vec<Track> {
+        vec![Track {
+            kind: TrackKind::Audio,
+            language: Some("eng".into()),
+        }]
+    }
+
+    #[test]
+    fn verify_original_accepts_a_spoken_language() {
+        // Nightborn: TMDB original_language `fi`, spoken [en, fi, es]; the release's audio is `eng`.
+        // Under AUDIO_LANGUAGE=original the acceptable set is original ∪ spoken → Pass, not BadAudio.
+        let req = LangReq {
+            audio: AudioReq::Original,
+            subtitle: SubReq::None,
+            original_language: Some("fi".into()),
+            spoken_languages: vec!["en".into(), "fi".into(), "es".into()],
+        };
+        assert_eq!(verify(&eng_audio(), &req), Verify::Pass);
+        // A language outside the set is still rejected.
+        let ger = vec![Track {
+            kind: TrackKind::Audio,
+            language: Some("ger".into()),
+        }];
+        assert_eq!(verify(&ger, &req), Verify::FailAudio);
+    }
+
+    #[test]
+    fn verify_original_without_spoken_still_requires_original() {
+        let req = LangReq {
+            audio: AudioReq::Original,
+            subtitle: SubReq::None,
+            original_language: Some("fi".into()),
+            spoken_languages: vec![],
+        };
+        assert_eq!(verify(&eng_audio(), &req), Verify::FailAudio);
+    }
+
+    #[test]
+    fn verify_explicit_audio_ignores_spoken() {
+        let req = LangReq {
+            audio: AudioReq::Lang("de".into()),
+            subtitle: SubReq::None,
+            original_language: Some("en".into()),
+            spoken_languages: vec!["en".into()],
+        };
+        assert_eq!(verify(&eng_audio(), &req), Verify::FailAudio);
+    }
+
+    #[test]
+    fn verify_any_of_passes_on_any_listed_language() {
+        let req = LangReq {
+            audio: AudioReq::AnyOf(vec!["fi".into(), "en".into()]),
+            subtitle: SubReq::None,
+            original_language: None,
+            spoken_languages: vec![],
+        };
+        assert_eq!(verify(&eng_audio(), &req), Verify::Pass);
+        let ger = vec![Track {
+            kind: TrackKind::Audio,
+            language: Some("deu".into()),
+        }];
+        assert_eq!(verify(&ger, &req), Verify::FailAudio);
     }
 }

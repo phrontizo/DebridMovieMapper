@@ -571,18 +571,26 @@ pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
             s += (sz / 1_000_000_000).min(15) as i64 * 200; // up to +3000 at ≥15 GB
         }
     }
-    if let AudioReq::Lang(want) = &prefs.audio {
+    // A concrete audio requirement: one language (`Lang`), or any of several (`AnyOf` — `Original`
+    // resolved against the title's TMDB original + spoken languages by `with_resolved_audio`). A raw
+    // `Original` has no per-title context here, so it never penalises.
+    let wants: &[String] = match &prefs.audio {
+        AudioReq::Lang(want) => std::slice::from_ref(want),
+        AudioReq::AnyOf(wants) => wants,
+        AudioReq::Original => &[],
+    };
+    if !wants.is_empty() {
         // Normalise both sides to ISO 639-2 (3-letter) before comparing — exactly as `probe::verify`
         // does via `lang_eq`. `AudioReq::parse` only lowercases the configured value, so a 2-letter
         // `AUDIO_LANGUAGE` (e.g. `en`) must map to `eng` to match a release tagged "English" (parsed
         // to `eng`); a raw `l == want` would otherwise penalise the CORRECT-language release here even
         // though the probe accepts it — an inconsistency between acquisition ranking and verification.
-        let want = crate::probe::to_iso639_2(want);
+        let wants: Vec<String> = wants.iter().map(|w| crate::probe::to_iso639_2(w)).collect();
         if !r.languages.is_empty()
             && !r
                 .languages
                 .iter()
-                .any(|l| crate::probe::to_iso639_2(l) == want || l == "mul")
+                .any(|l| l == "mul" || wants.contains(&crate::probe::to_iso639_2(l)))
         {
             s -= 50_000;
         }
@@ -1198,6 +1206,28 @@ mod tests {
         // And a genuinely wrong language is still penalised under the 2-letter setting.
         let german = parse(&raw("t", "Film.1080p.x265 German", "h3", Some("Film.mkv"))); // languages=["ger"]
         assert!(score(&german, &p).unwrap() < score(&untagged, &p).unwrap());
+    }
+
+    #[test]
+    fn score_any_of_does_not_penalise_a_spoken_language() {
+        // `AUDIO_LANGUAGE=original` resolved against a title whose TMDB original is `fi` but which
+        // lists English as a spoken language → AnyOf([fi, en]): an English-tagged release is NOT
+        // penalised, a German-tagged one still is.
+        let mut p = prefs();
+        p.audio = AudioReq::AnyOf(vec!["fi".to_string(), "en".to_string()]);
+        let english = parse(&raw("t", "Film.1080p.x265 English", "h1", Some("Film.mkv")));
+        let untagged = parse(&raw("t", "Film.1080p.x265", "h2", Some("Film.mkv")));
+        let german = parse(&raw("t", "Film.1080p.x265 German", "h3", Some("Film.mkv")));
+        let (en_s, un_s, de_s) = (
+            score(&english, &p).unwrap(),
+            score(&untagged, &p).unwrap(),
+            score(&german, &p).unwrap(),
+        );
+        assert_eq!(
+            en_s, un_s,
+            "a spoken-language release must not be penalised"
+        );
+        assert!(un_s - de_s >= 50_000, "de={de_s} untagged={un_s}");
     }
 
     #[test]

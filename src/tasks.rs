@@ -1446,7 +1446,10 @@ pub(crate) async fn record_mirror_owned(
                 kind,
                 season: None,
                 episode: None,
+                // Neither TMDB language is fetched here: the upgrade pass backfills both (only-if-unset)
+                // from one TMDB `details` call on the title's next visit.
                 original_language: None,
+                spoken_languages: None,
                 metadata: metadata.clone(),
             },
             // Empty provenance: owned + upgradeable, NOT a protected manual class. No Trakt wanter
@@ -1547,7 +1550,7 @@ fn choose_imdb(trakt_hint: Option<String>, tmdb_external: Option<String>) -> Opt
 }
 
 /// Build the `AcquireRequest` for `tmdb_id`: resolve the IMDB id (preferring Trakt's `imdb_hint`
-/// over TMDB's `external_ids`) and (title, year, original_language) from TMDB. Returns `Ok(None)`
+/// over TMDB's `external_ids`) and (title, year, original + spoken languages) from TMDB. Returns `Ok(None)`
 /// when no IMDB id exists anywhere — the title can't be scraped (Torrentio is IMDB-keyed) and is
 /// skipped quietly. Any TMDB failure → `Err` (the caller logs and skips). TMDB-dependent, so the
 /// happy path is exercised by the live smoke rather than unit tests.
@@ -1573,17 +1576,20 @@ async fn build_acquire_request(
     let Some(imdb_id) = choose_imdb(imdb_hint, tmdb_external) else {
         return Ok(None);
     };
-    let (title, year, original_language) = tmdb.details(tmdb_id, media_type.clone()).await?;
+    let details = tmdb.details(tmdb_id, media_type.clone()).await?;
     Ok(Some(AcquireRequest {
         imdb_id,
         tmdb_id,
         kind,
         season,
         episode,
-        original_language,
+        original_language: details.original_language,
+        // Fetched (so `Some`, even when TMDB lists none): `AUDIO_LANGUAGE=original` accepts any of
+        // these as well as the original language.
+        spoken_languages: Some(details.spoken_languages),
         metadata: MediaMetadata {
-            title,
-            year,
+            title: details.title,
+            year: details.year,
             media_type,
             external_id: Some(format!("tmdb:{}", tmdb_id)),
         },
@@ -2786,6 +2792,7 @@ mod tests {
             season: Some(1),
             episode: Some(1),
             original_language: None,
+            spoken_languages: Some(vec![]),
             metadata: MediaMetadata {
                 title: "S".into(),
                 year: None,
@@ -2900,6 +2907,7 @@ mod tests {
                         season: None,
                         episode: None,
                         original_language: None,
+                        spoken_languages: Some(vec![]),
                         metadata: MediaMetadata {
                             title: "Inception".into(),
                             year: Some("2010".into()),
@@ -3071,6 +3079,7 @@ mod tests {
                 season: None,
                 episode: None,
                 original_language: None,
+                spoken_languages: Some(vec![]),
                 metadata: MediaMetadata {
                     title: "Movie".into(),
                     year: None,
@@ -3141,6 +3150,7 @@ mod tests {
                 season: None,
                 episode: None,
                 original_language: None,
+                spoken_languages: Some(vec![]),
                 metadata: MediaMetadata {
                     title: "Movie".into(),
                     year: None,
@@ -3253,6 +3263,7 @@ mod tests {
                 season: None,
                 episode: None,
                 original_language: None,
+                spoken_languages: Some(vec![]),
                 metadata: MediaMetadata {
                     title: "T".into(),
                     year: None,
@@ -4854,6 +4865,7 @@ mod reconcile_wanted_tests {
                 season: None,
                 episode: None,
                 original_language: None,
+                spoken_languages: Some(vec![]),
                 metadata: MediaMetadata {
                     title: String::new(),
                     year: None,
@@ -5536,6 +5548,7 @@ mod reconcile_wanted_tests {
             season: None,
             episode: None,
             original_language: None,
+            spoken_languages: Some(vec![]),
             metadata: MediaMetadata {
                 title: "M".into(),
                 year: None,
@@ -6147,6 +6160,7 @@ mod dedup_owned_tests {
                 season: None,
                 episode: None,
                 original_language: None,
+                spoken_languages: Some(vec![]),
                 metadata: MediaMetadata {
                     title: "M".into(),
                     year: None,

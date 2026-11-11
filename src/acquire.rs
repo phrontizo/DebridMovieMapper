@@ -417,12 +417,13 @@ impl AcquisitionEngine {
             }
             parsed.push(r);
         }
-        // Resolve `AUDIO_LANGUAGE=original` (the default) against this title's original language so a
-        // wrong-language release is down-ranked here, not just rejected later at probe time (which
-        // would burn an acquire cycle). Matches `probe::verify`'s resolution of `Original`.
-        let prefs = self
-            .prefs
-            .with_resolved_audio(req.original_language.as_deref());
+        // Resolve `AUDIO_LANGUAGE=original` (the default) against this title's original + spoken
+        // languages so a wrong-language release is down-ranked here, not just rejected later at probe
+        // time (which would burn an acquire cycle). Matches `probe::verify`'s resolution of `Original`.
+        let prefs = self.prefs.with_resolved_audio(
+            req.original_language.as_deref(),
+            req.spoken_languages.as_deref().unwrap_or_default(),
+        );
         let ranked = release::rank(parsed, &prefs);
         debug!(
             "acquire: tmdb {} — {} ranked after filters ({} blacklisted); top: [{}]",
@@ -635,6 +636,7 @@ impl AcquisitionEngine {
             audio: self.prefs.audio.clone(),
             subtitle: self.prefs.subtitle.clone(),
             original_language: req.original_language.clone(),
+            spoken_languages: req.spoken_languages.clone().unwrap_or_default(),
         };
         match self.prober.probe(&url).await {
             Ok(tracks) => match probe::verify(&tracks, &langreq) {
@@ -1581,6 +1583,7 @@ mod tests {
             season: None,
             episode: None,
             original_language: Some("eng".into()),
+            spoken_languages: Some(vec![]),
             metadata: meta(),
         }
     }
@@ -2094,6 +2097,7 @@ mod tests {
             season: Some(1),
             episode: Some(1),
             original_language: Some("eng".into()),
+            spoken_languages: Some(vec![]),
             metadata: MediaMetadata {
                 title: "Show".into(),
                 year: Some("2023".into()),
@@ -3290,6 +3294,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observe_verifies_spoken_language_audio_under_original() {
+        // Nightborn: TMDB original_language `fi`, spoken [en, fi]; the release's audio is `eng`.
+        // Under the default `AUDIO_LANGUAGE=original` an English track is acceptable (it is one of
+        // the title's spoken languages) → Verified, NOT reaped/blacklisted as BadAudio.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: AcquireRequest {
+                    original_language: Some("fi".into()),
+                    spoken_languages: Some(vec!["en".into(), "fi".into()]),
+                    ..req()
+                },
+                provenance: Provenance::manual(),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![Track {
+                kind: crate::probe::TrackKind::Audio,
+                language: Some("eng".into()),
+            }]))),
+            st.clone(),
+        );
+        assert_eq!(eng.prefs.audio, AudioReq::Original);
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await;
+        assert_eq!(
+            st.get_owned("h1".into()).await.map(|r| r.status),
+            Some(OwnedStatus::Verified),
+            "a spoken-language audio track must verify under AUDIO_LANGUAGE=original"
+        );
+        assert!(
+            !st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_ranks_a_spoken_language_release_above_a_foreign_dub() {
+        // Ranking resolves `Original` against original ∪ spoken: for a `fi`-original title that lists
+        // English as spoken, an English-tagged release must not take the wrong-language penalty, so
+        // it outranks an otherwise-better (HEVC) French dub. Before, the English release took the
+        // same wrong-language penalty as the dub, so the dub's HEVC bonus won.
+        let mk = |hash: &str, desc: &str| RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: format!("{desc}\nRD+"),
+            info_hash: hash.into(),
+            file_idx: Some(0),
+            file_name: Some(format!("{desc}.mkv")),
+        };
+        let st = store();
+        let eng = engine(
+            provider_returning("downloaded", "heng"),
+            Arc::new(MockScraper {
+                candidates: vec![
+                    mk("hfre", "Nightborn.2026.1080p.WEB.x265.French"),
+                    mk("heng", "Nightborn.2026.1080p.WEB.x264.English"),
+                ],
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        let request = AcquireRequest {
+            original_language: Some("fi".into()),
+            spoken_languages: Some(vec!["en".into(), "fi".into()]),
+            ..req()
+        };
+        let out = eng.acquire(request, Provenance::manual()).await;
+        let hash = match out {
+            AcquireOutcome::Pending(h) | AcquireOutcome::Acquired(h) => h,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(
+            hash, "heng",
+            "the spoken-language (English) release must win"
+        );
+    }
+
+    #[tokio::test]
     async fn acquire_skips_a_blacklisted_candidate_and_picks_the_next() {
         // `acquire` must filter a known-bad hash from the candidate set and add the next-best instead,
         // not re-add the blacklisted hash on every reconcile tick.
@@ -3424,6 +3517,7 @@ mod tests {
             season: Some(1),
             episode: Some(1),
             original_language: Some("eng".into()),
+            spoken_languages: Some(vec![]),
             metadata: MediaMetadata {
                 title: "Show".into(),
                 year: Some("2023".into()),
@@ -3501,6 +3595,7 @@ mod tests {
             season: Some(1),
             episode: Some(1),
             original_language: Some("eng".into()),
+            spoken_languages: Some(vec![]),
             metadata: MediaMetadata {
                 title: "Show".into(),
                 year: Some("2023".into()),
@@ -3646,6 +3741,7 @@ mod tests {
             season: Some(1),
             episode: Some(1),
             original_language: Some("eng".into()),
+            spoken_languages: Some(vec![]),
             metadata: MediaMetadata {
                 title: "Show".into(),
                 year: Some("2023".into()),
@@ -3747,6 +3843,7 @@ mod tests {
             season: Some(1),
             episode: Some(2),
             original_language: Some("eng".into()),
+            spoken_languages: Some(vec![]),
             metadata: MediaMetadata {
                 title: "Show".into(),
                 year: Some("2023".into()),

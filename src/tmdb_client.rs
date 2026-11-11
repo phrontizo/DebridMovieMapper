@@ -187,12 +187,12 @@ impl TmdbClient {
         Ok(parse_find_response(&v))
     }
 
-    /// Fetch (title, year, original_language) for a TMDB id.
+    /// Fetch a title's [`TitleDetails`] (title, year, original + spoken languages) for a TMDB id.
     pub async fn details(
         &self,
         tmdb_id: u64,
         kind: crate::vfs::MediaType,
-    ) -> Result<(String, Option<String>, Option<String>), reqwest::Error> {
+    ) -> Result<TitleDetails, reqwest::Error> {
         let path = match kind {
             crate::vfs::MediaType::Movie => "movie",
             crate::vfs::MediaType::Show => "tv",
@@ -402,11 +402,21 @@ impl TmdbClient {
     }
 }
 
-/// Parse a TMDB movie/tv details object into (title, year, original_language).
-pub(crate) fn parse_details(
-    v: &serde_json::Value,
-    kind: crate::vfs::MediaType,
-) -> (String, Option<String>, Option<String>) {
+/// The parts of a TMDB movie/tv details object the acquisition path needs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TitleDetails {
+    pub title: String,
+    /// The 4-digit release / first-air year, when TMDB has a full date.
+    pub year: Option<String>,
+    /// TMDB's `original_language` (ISO 639-1, as TMDB sends it).
+    pub original_language: Option<String>,
+    /// TMDB's `spoken_languages[].iso_639_1`, lowercased, empties dropped, in TMDB's order. Empty when
+    /// TMDB lists none (or omits the key).
+    pub spoken_languages: Vec<String>,
+}
+
+/// Parse a TMDB movie/tv details object into [`TitleDetails`].
+pub(crate) fn parse_details(v: &serde_json::Value, kind: crate::vfs::MediaType) -> TitleDetails {
     let title = match kind {
         crate::vfs::MediaType::Movie => v.get("title"),
         crate::vfs::MediaType::Show => v.get("name"),
@@ -429,7 +439,24 @@ pub(crate) fn parse_details(
         .get("original_language")
         .and_then(|l| l.as_str())
         .map(String::from);
-    (title, year, original_language)
+    let spoken_languages = v
+        .get("spoken_languages")
+        .and_then(|a| a.as_array())
+        .map(|langs| {
+            langs
+                .iter()
+                .filter_map(|l| l.get("iso_639_1").and_then(|c| c.as_str()))
+                .map(|c| c.trim().to_ascii_lowercase())
+                .filter(|c| !c.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    TitleDetails {
+        title,
+        year,
+        original_language,
+        spoken_languages,
+    }
 }
 
 /// Parse TMDB `/find/{imdb_id}?external_source=imdb_id` into (tmdb_id, kind). Movie wins over TV.
@@ -815,16 +842,55 @@ mod tests {
         let m = serde_json::json!({"title": "Inception", "release_date": "2010-07-16", "original_language": "en"});
         assert_eq!(
             super::parse_details(&m, crate::vfs::MediaType::Movie),
-            ("Inception".into(), Some("2010".into()), Some("en".into()))
+            super::TitleDetails {
+                title: "Inception".into(),
+                year: Some("2010".into()),
+                original_language: Some("en".into()),
+                spoken_languages: vec![],
+            }
         );
         let s = serde_json::json!({"name": "Breaking Bad", "first_air_date": "2008-01-20", "original_language": "en"});
         assert_eq!(
             super::parse_details(&s, crate::vfs::MediaType::Show),
-            (
-                "Breaking Bad".into(),
-                Some("2008".into()),
-                Some("en".into())
-            )
+            super::TitleDetails {
+                title: "Breaking Bad".into(),
+                year: Some("2008".into()),
+                original_language: Some("en".into()),
+                spoken_languages: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_details_captures_spoken_languages() {
+        // Nightborn: TMDB's original_language is `fi` but the film is mostly English — the spoken
+        // languages list carries that, so `AUDIO_LANGUAGE=original` can accept an English release.
+        let v = serde_json::json!({
+            "title": "Nightborn",
+            "release_date": "2026-07-01",
+            "original_language": "fi",
+            "spoken_languages": [
+                {"english_name": "English", "iso_639_1": "en", "name": "English"},
+                {"iso_639_1": "FI"},
+                {"iso_639_1": "es"}
+            ]
+        });
+        let d = super::parse_details(&v, crate::vfs::MediaType::Movie);
+        assert_eq!(d.original_language.as_deref(), Some("fi"));
+        assert_eq!(d.spoken_languages, vec!["en", "fi", "es"]);
+        // Missing key → empty (behaves exactly as before: original language only).
+        let none = serde_json::json!({"title": "X", "original_language": "fi"});
+        assert!(super::parse_details(&none, crate::vfs::MediaType::Movie)
+            .spoken_languages
+            .is_empty());
+        // Empty / missing / non-string iso codes are dropped rather than becoming a bogus "" want.
+        let junk = serde_json::json!({
+            "name": "Y",
+            "spoken_languages": [{"iso_639_1": ""}, {"iso_639_1": null}, {"name": "?"}, {"iso_639_1": " it "}]
+        });
+        assert_eq!(
+            super::parse_details(&junk, crate::vfs::MediaType::Show).spoken_languages,
+            vec!["it"]
         );
     }
 
