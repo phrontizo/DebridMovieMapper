@@ -926,10 +926,11 @@ pub async fn probe_tracks(http: &reqwest::Client, cdn_url: &str) -> Result<Vec<T
     }
 }
 
-/// Cap on a single probe fetch. We only ever request `FRONT` (4 MB) windows, so allow a little
-/// slack above that and refuse anything larger. This is the hard memory guarantee: a CDN that
-/// ignores `Range` (replying `200` with the whole multi-GB file) or lies about a `206` length must
-/// never drive an unbounded allocation in the probe path.
+/// Cap on a single probe fetch. Callers request at most this much: the 4 MB (`FRONT`) front and
+/// suffix reads, plus the up-to-8 MB recovery reads (the larger MKV `Tracks` / front-`moov` re-fetch
+/// and the trailing-`moov` read at its exact offset); anything larger is refused. This is the hard
+/// memory guarantee: a CDN that ignores `Range` (replying `200` with the whole multi-GB file) or
+/// lies about a `206` length must never drive an unbounded allocation in the probe path.
 const MAX_PROBE_FETCH: usize = 8 * 1024 * 1024;
 
 /// Whether a probe fetch's response status is usable. `206 Partial Content` always is. A `200 OK`
@@ -947,9 +948,10 @@ fn probe_status_ok(status: reqwest::StatusCode, accept_200_from_start: bool) -> 
 /// streaming the whole multi-GB object) we stop and drop the connection as soon as we have `want`
 /// bytes, so we never download more than a window. A status mismatch or a read error → `Transient`
 /// (defer + retry; we never blacklist a release merely because a probe window couldn't be fetched).
-/// The `MAX_PROBE_FETCH` cap is a defensive backstop on total allocation: with the current callers
-/// `want` (4 MB) is below it so the `>= want` early-return fires first, but it bounds the buffer
-/// should a future caller request a window larger than the cap.
+/// The `MAX_PROBE_FETCH` cap is a defensive backstop on total allocation: every current caller
+/// requests `want <= MAX_PROBE_FETCH` (4 MB front/suffix reads, up-to-8 MB recovery and
+/// trailing-`moov` reads) so the `>= want` early-return fires first, but it bounds the buffer should
+/// a future caller request a window larger than the cap.
 async fn read_body(
     resp: reqwest::Response,
     want: usize,
@@ -1001,8 +1003,9 @@ async fn fetch_range(
             );
             ProbeError::Transient
         })?;
-    // Saturating: all current callers pass start <= end (start = 0), but harden against a future
-    // caller so an inverted range can never underflow-panic (debug) / wrap (release).
+    // Saturating: all current callers pass start <= end (start = 0, or the trailing-moov read's
+    // `off..=off + MAX_PROBE_FETCH - 1`, itself saturating), but harden against a future caller so
+    // an inverted range can never underflow-panic (debug) / wrap (release).
     let want = end.saturating_sub(start).saturating_add(1) as usize;
     // Offset-0 (front) read: a Range-ignoring 200 streams from byte 0, which is exactly our window.
     read_body(resp, want, start == 0).await
