@@ -700,6 +700,30 @@ fn front_moov_extent(buf: &[u8]) -> Option<u64> {
     None
 }
 
+/// For a non-faststart MP4 (no `moov` in the front window): walk the front's top-level boxes and
+/// return the declared absolute end of the FIRST box that overruns the fetched buffer — normally the
+/// `mdat`, whose end is exactly where the next top-level box (the trailing `moov`) starts. Lets
+/// `probe_tracks` read the `moov` at its exact offset instead of hoping the 4 MB suffix happens to
+/// start on a box boundary. `None` if nothing overruns, a header is split/malformed, a box is size 0
+/// ("to EOF" — no next box), or the box is `moov` (the large-front-moov case is `front_moov_extent`).
+fn front_mp4_next_box_offset(buf: &[u8]) -> Option<u64> {
+    let mut pos = 0;
+    while pos + 8 <= buf.len() {
+        if buf[pos..pos + 4] == [0, 0, 0, 0] {
+            return None; // size 0: the box extends to EOF, so there is no next top-level box
+        }
+        let (typ, _p_start, b_end) = read_box_header(buf, pos).ok()?;
+        if &typ == b"moov" || b_end <= pos {
+            return None;
+        }
+        if b_end > buf.len() {
+            return Some(b_end as u64);
+        }
+        pos = b_end;
+    }
+    None
+}
+
 fn parse_mp4_moov(buf: &[u8], start: usize, end: usize) -> Result<Vec<Track>, ProbeError> {
     let mut out = Vec::new();
     let mut pos = start;
@@ -848,14 +872,34 @@ pub async fn probe_tracks(http: &reqwest::Client, cdn_url: &str) -> Result<Vec<T
         },
         Some(ContainerKind::Mp4) => match parse_mp4_tracks(&front) {
             Err(ProbeError::TracksNotFound) => {
-                // moov is likely at the tail (non-faststart MP4). The suffix rarely starts on a
-                // box boundary, so this only parses when it happens to; otherwise the probe
-                // accepts with a warning. A misaligned tail can make `parse_mp4_tracks` read a
-                // bogus box size and return `Corrupt` — that is NOT evidence the release is
-                // broken, so map any speculative-parse error down to `TracksNotFound` (accept)
-                // rather than blacklisting a valid non-faststart MP4. (A transient *fetch* failure
-                // still propagates via `?` so it defers/retries.)
-                // TODO(SP1+): scan the tail for the `moov` box signature for reliable handling.
+                // No moov in the front: a non-faststart MP4 (`ftyp`, `free`, a huge `mdat`, then the
+                // `moov` at EOF). The first front box that overruns the window (the `mdat`) declares
+                // exactly where the next top-level box starts, so read `[off, off + MAX_PROBE_FETCH)`
+                // there and parse it (a 206 shorter than requested is fine — the moov runs to EOF).
+                // Any failure of that targeted read or parse (a moov larger than the cap → Transient,
+                // a 416 because the mdat's size lies, garbage → Corrupt) falls through to the suffix
+                // attempt below UNCHANGED, so this step can never introduce a defer-forever loop.
+                if let Some(off) = front_mp4_next_box_offset(&front) {
+                    let end = off.saturating_add(MAX_PROBE_FETCH as u64 - 1);
+                    match fetch_range(http, cdn_url, off, end).await {
+                        Ok(buf) => match parse_mp4_tracks(&buf) {
+                            Ok(tracks) => return Ok(tracks),
+                            Err(e) => debug!(
+                                "probe: trailing moov at offset {off} unparseable ({e:?}); trying the suffix"
+                            ),
+                        },
+                        Err(e) => debug!(
+                            "probe: trailing moov read at offset {off} failed ({e:?}); trying the suffix"
+                        ),
+                    }
+                }
+                // Fallback: the moov is likely in the tail. The suffix rarely starts on a box
+                // boundary, so this only parses when it happens to; otherwise the probe accepts with
+                // a warning. A misaligned tail can make `parse_mp4_tracks` read a bogus box size and
+                // return `Corrupt` — that is NOT evidence the release is broken, so map any
+                // speculative-parse error down to `TracksNotFound` (accept) rather than blacklisting a
+                // valid non-faststart MP4. (A transient *fetch* failure still propagates via `?` so it
+                // defers/retries.)
                 let tail = fetch_suffix(http, cdn_url, FRONT).await?;
                 parse_mp4_tracks(&tail).or(Err(ProbeError::TracksNotFound))
             }
@@ -1305,6 +1349,59 @@ mod tests {
         ftyp_partial.truncate(ftyp_partial.len() - 2);
         assert_eq!(front_moov_extent(&ftyp_partial), None);
     }
+    /// A 32-byte `ftyp` + an 8-byte `free`: the top-level boxes before a non-faststart MP4's `mdat`
+    /// (so the `mdat` header sits at absolute offset 40).
+    fn ftyp32_free8() -> Vec<u8> {
+        let mut out = mp4_box(b"ftyp", b"isom\0\0\x02\0isomiso2avc1mp41");
+        assert_eq!(out.len(), 32);
+        out.extend(mp4_box(b"free", &[]));
+        assert_eq!(out.len(), 40);
+        out
+    }
+    #[test]
+    fn front_mp4_next_box_offset_reports_end_of_an_overrunning_mdat() {
+        // Non-faststart MP4: the `mdat` declares an extent far past the 4 MB front window, and the
+        // `moov` follows it. The declared end of that first overrunning box is exactly where the next
+        // top-level box (the trailing `moov`) starts.
+        let mut buf = ftyp32_free8();
+        buf.extend_from_slice(&1_000_000u32.to_be_bytes());
+        buf.extend_from_slice(b"mdat");
+        buf.extend_from_slice(&[0u8; 16]);
+        assert_eq!(front_mp4_next_box_offset(&buf), Some(40 + 1_000_000));
+    }
+    #[test]
+    fn front_mp4_next_box_offset_handles_64bit_largesize_mdat() {
+        // A >4 GiB `mdat` uses size field 1 + a 64-bit largesize (which includes the 16-byte header).
+        let mut buf = ftyp32_free8();
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(b"mdat");
+        buf.extend_from_slice(&5_000_000_000u64.to_be_bytes());
+        buf.extend_from_slice(&[0u8; 16]);
+        assert_eq!(front_mp4_next_box_offset(&buf), Some(40 + 5_000_000_000));
+    }
+    #[test]
+    fn front_mp4_next_box_offset_none_for_size_zero_or_no_overrun() {
+        // A size-0 box runs "to EOF": there is no next top-level box to target.
+        let mut size0 = ftyp32_free8();
+        size0.extend_from_slice(&0u32.to_be_bytes());
+        size0.extend_from_slice(b"mdat");
+        size0.extend_from_slice(&[0u8; 16]);
+        assert_eq!(front_mp4_next_box_offset(&size0), None);
+        // Complete boxes only (nothing overruns the buffer) → None.
+        let mut complete = ftyp32_free8();
+        complete.extend(mp4_box(b"mdat", &[0u8; 16]));
+        assert_eq!(front_mp4_next_box_offset(&complete), None);
+        // An overrunning FRONT `moov` is the large-front-moov case (`front_moov_extent`) → None.
+        let mut big_moov = ftyp32_free8();
+        big_moov.extend_from_slice(&1_000_000u32.to_be_bytes());
+        big_moov.extend_from_slice(b"moov");
+        big_moov.extend_from_slice(&[0u8; 16]);
+        assert_eq!(front_mp4_next_box_offset(&big_moov), None);
+        // A box header split by the buffer boundary carries no usable extent → None.
+        let mut split = ftyp32_free8();
+        split.extend_from_slice(&[0, 0, 0]);
+        assert_eq!(front_mp4_next_box_offset(&split), None);
+    }
     #[test]
     fn overrun_classifies_under_fetch_vs_malformed() {
         assert_eq!(overrun_error(120, 100), ProbeError::Transient); // past the fetched buffer
@@ -1615,6 +1712,168 @@ mod tests {
                 .any(|t| matches!(t.kind, TrackKind::Subtitle)
                     && t.language.as_deref() == Some("ger")),
             "the recovered probe must report the ger subtitle track, got {tracks:?}"
+        );
+    }
+
+    /// Serve `file` over HTTP honouring `Range` like a real CDN: `bytes=a-b` / `bytes=a-` /
+    /// `bytes=-n` → `206` with `Content-Range` + exact `Content-Length`; a start at/past EOF → `416`.
+    /// Returns the base URL plus a log of every `Range` header received (in arrival order).
+    async fn serve_ranges_logged(
+        file: Vec<u8>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let file = std::sync::Arc::new(file);
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_log = log.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let file = file.clone();
+                let log = server_log.clone();
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&req).to_string();
+                    let range = req
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("range")
+                                .then(|| v.trim().to_string())
+                        })
+                        .unwrap_or_default();
+                    log.lock().unwrap().push(range.clone());
+                    let len = file.len() as u64;
+                    let spec = range.strip_prefix("bytes=").unwrap_or("");
+                    let (a, b) = spec.split_once('-').unwrap_or(("", ""));
+                    let (start, end) = if a.is_empty() {
+                        let n: u64 = b.parse().unwrap_or(0);
+                        (len.saturating_sub(n), len.saturating_sub(1))
+                    } else {
+                        let start: u64 = a.parse().unwrap_or(0);
+                        let end = b
+                            .parse::<u64>()
+                            .unwrap_or(u64::MAX)
+                            .min(len.saturating_sub(1));
+                        (start, end)
+                    };
+                    if start >= len {
+                        let head = format!(
+                            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{len}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.flush().await;
+                        return;
+                    }
+                    let body = &file[start as usize..=end as usize];
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{len}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (format!("http://{}/", addr), log)
+    }
+    async fn serve_ranges(file: Vec<u8>) -> String {
+        serve_ranges_logged(file).await.0
+    }
+    /// A non-faststart MP4: `ftyp` + `free` + an `mdat` whose header DECLARES `mdat_declared` bytes
+    /// (header included) but carries `payload` zero bytes, followed by `trailer` (the `moov`, or
+    /// nothing). The front 4 MB lands entirely inside the `mdat`.
+    fn non_faststart_mp4(mdat_declared: u32, payload: usize, trailer: &[u8]) -> Vec<u8> {
+        let mut file = ftyp32_free8();
+        file.extend_from_slice(&mdat_declared.to_be_bytes());
+        file.extend_from_slice(b"mdat");
+        file.resize(file.len() + payload, 0);
+        file.extend_from_slice(trailer);
+        file
+    }
+
+    #[tokio::test]
+    async fn probe_tracks_mp4_reads_trailing_moov_at_exact_offset() {
+        // Nightborn shape: ftyp, free, a 5 MiB mdat, then the moov at EOF. The 4 MB front read sees
+        // no moov, and the 4 MB SUFFIX starts mid-mdat (not on a box boundary), so before the fix the
+        // probe accepted as TracksNotFound without ever checking the language. The mdat's declared
+        // end is the exact offset of the trailing moov → ONE targeted read there must yield tracks.
+        let with_ftyp = mp4_with(&[(b"soun", packed("eng")), (b"subt", packed("ger"))]);
+        let ftyp_len = u32::from_be_bytes(with_ftyp[0..4].try_into().unwrap()) as usize;
+        let moov = with_ftyp[ftyp_len..].to_vec();
+        assert_eq!(&moov[4..8], b"moov");
+        let payload = 5 * 1024 * 1024;
+        let file = non_faststart_mp4((8 + payload) as u32, payload, &moov);
+        let url = serve_ranges(file).await;
+        let tracks = probe_tracks(&reqwest::Client::new(), &url)
+            .await
+            .expect("a trailing moov at the mdat's declared end must be probed");
+        assert!(
+            tracks
+                .iter()
+                .any(|t| t.kind == TrackKind::Audio && t.language.as_deref() == Some("eng")),
+            "the trailing-moov probe must report the eng audio track, got {tracks:?}"
+        );
+        assert!(
+            tracks
+                .iter()
+                .any(|t| t.kind == TrackKind::Subtitle && t.language.as_deref() == Some("ger")),
+            "the trailing-moov probe must report the ger subtitle track, got {tracks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_tracks_mp4_trailing_moov_failure_falls_back_to_accept() {
+        // The mdat declares a size running PAST EOF, so the targeted read at its declared end gets a
+        // 416. That must fall back to the existing suffix attempt (zero tail → TracksNotFound = accept),
+        // NEVER surface as Transient (which would defer and re-probe the same layout forever).
+        let payload = 5 * 1024 * 1024;
+        let declared = 64 * 1024 * 1024u32;
+        let file = non_faststart_mp4(declared, payload, &[]);
+        let (url, log) = serve_ranges_logged(file).await;
+        let result = probe_tracks(&reqwest::Client::new(), &url).await;
+        assert!(
+            matches!(result, Err(ProbeError::TracksNotFound)),
+            "a failed targeted trailing-moov read must fall back to accept, got {result:?}"
+        );
+        let target = format!("bytes={}-", 40 + declared as u64);
+        let ranges = log.lock().unwrap().clone();
+        assert!(
+            ranges.iter().any(|r| r.starts_with(&target)),
+            "the targeted read at the mdat's declared end must have been attempted: {ranges:?}"
+        );
+        assert!(
+            ranges
+                .iter()
+                .any(|r| r == &format!("bytes=-{}", 4 * 1024 * 1024)),
+            "the suffix fallback must still run after the targeted read fails: {ranges:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_tracks_mp4_trailing_moov_over_cap_falls_back_to_accept() {
+        // A trailing moov LARGER than the MAX_PROBE_FETCH window: the targeted read parses as a
+        // truncated moov (Transient). That must fall back to the suffix path (accept), not defer — a
+        // re-probe would read the same window and defer forever.
+        let payload = 5 * 1024 * 1024;
+        let mut huge_moov = (9 * 1024 * 1024u32).to_be_bytes().to_vec();
+        huge_moov.extend_from_slice(b"moov");
+        huge_moov.extend_from_slice(&[0u8; 64]);
+        let file = non_faststart_mp4((8 + payload) as u32, payload, &huge_moov);
+        let url = serve_ranges(file).await;
+        let result = probe_tracks(&reqwest::Client::new(), &url).await;
+        assert!(
+            matches!(result, Err(ProbeError::TracksNotFound)),
+            "an over-cap trailing moov must fall back to accept, got {result:?}"
         );
     }
 
