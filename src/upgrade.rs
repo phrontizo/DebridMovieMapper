@@ -612,13 +612,33 @@ fn known_unverifiable(r: &release::ReleaseInfo) -> bool {
     r.file_name.is_some() && !r.container.is_verifiable()
 }
 
-/// Rank all CACHED target-improvement candidates best-score-first, skipping owned and blacklisted
+/// The prefs upgrade candidates are ORDERED by: the configured prefs with `AUDIO_LANGUAGE=original`
+/// resolved against the title's TMDB original + spoken languages (`req`), exactly as acquisition
+/// ranks them. On the raw prefs `score()` has no per-title language to penalise, so a release tagged
+/// with the wrong language (`Rus`, 🇷🇺) would be staged before a correctly-tagged one — and, if its
+/// audio tracks are untagged, pass the probe. Ordering ONLY: `is_target_improvement` and every stored
+/// `QualitySummary` stay on the raw prefs, so a stored and a fresh score always compare like-for-like
+/// (no flip-flop). `score()`'s hard filters don't depend on audio, so these prefs filter exactly what
+/// the raw ones do.
+fn ordering_prefs(
+    app: &AppState,
+    req: &crate::store::AcquireRequest,
+) -> crate::config::QualityPrefs {
+    app.config.acquisition.prefs.with_resolved_audio(
+        req.original_language.as_deref(),
+        req.spoken_languages.as_deref().unwrap_or_default(),
+    )
+}
+
+/// Rank all CACHED target-improvement candidates best-first, skipping owned and blacklisted
 /// hashes, candidates whose reported file is a known-unverifiable container ([`known_unverifiable`])
-/// and anything failing `score()`'s hard filters (ceiling / cam / dead-seeder). The caller
-/// stages them in order until one is adopted (in-tick fall-through), so a top candidate that fails a
-/// candidate-specific gate no longer ends the tick. The list is direction-homogeneous (all `Upgrade`
-/// or all `Downgrade`) because `is_target_improvement` only rates a lower-resolution candidate as
-/// improving when the owned copy is over the ceiling.
+/// and anything failing `score()`'s hard filters (ceiling / cam / dead-seeder). Improvement is judged
+/// on the raw prefs; the improving candidates are then ordered by their score under the title's
+/// [`ordering_prefs`] (`req`), so a wrong-language release is tried after a correctly-tagged one. The
+/// caller stages them in order until one is adopted (in-tick fall-through), so a top candidate that
+/// fails a candidate-specific gate no longer ends the tick. The list is direction-homogeneous (all
+/// `Upgrade` or all `Downgrade`) because `is_target_improvement` only rates a lower-resolution
+/// candidate as improving when the owned copy is over the ceiling.
 async fn rank_changes(
     app: &AppState,
     media: MediaKind,
@@ -626,8 +646,10 @@ async fn rank_changes(
     raws: &[release::RawCandidate],
     baseline: &QualitySummary,
     owned_hashes: &[String],
+    req: &crate::store::AcquireRequest,
 ) -> Vec<(release::ReleaseInfo, release::Improvement)> {
     let prefs = &app.config.acquisition.prefs;
+    let order = ordering_prefs(app, req);
     // Fetch the per-title blacklist ONCE and test membership in memory, rather than one awaited redb
     // read per candidate (Torrentio commonly returns dozens of streams per title) — mirrors `acquire`.
     let blacklist = app.store.blacklisted_hashes_for(media, tmdb_id).await;
@@ -654,9 +676,10 @@ async fn rank_changes(
         if imp == release::Improvement::None {
             continue;
         }
-        scored.push((q.score, r, imp));
+        let order_score = release::score(&r, &order).unwrap_or(q.score);
+        scored.push((order_score, r, imp));
     }
-    scored.sort_by_key(|(score, ..)| std::cmp::Reverse(*score)); // best score first (stable for ties)
+    scored.sort_by_key(|(score, ..)| std::cmp::Reverse(*score)); // best first (stable for ties)
                                                                  // Dedup by info_hash: Torrentio can return the same infohash under multiple stream entries
                                                                  // (different source/title strings, sometimes scored differently). Without this, a duplicate
                                                                  // whose first entry fails and is blacklisted would still be tried again from its second entry —
@@ -778,6 +801,7 @@ async fn try_upgrade_movie(
         &raws,
         &current,
         owned_hashes,
+        &req,
     )
     .await;
     if ranked.is_empty() {
@@ -1165,7 +1189,10 @@ fn season_has_scatter(owned: &[(String, OwnedRecord)], season: u32) -> bool {
 
 /// Rank scraped consolidation candidates: keep only the CACHED, in-ceiling (score-passing) packs not
 /// already owned (and not a known-unverifiable container — [`known_unverifiable`]), sorted
-/// best-`score`-first. So consolidation adopts the BEST pack — consistent with
+/// best-`score`-first under `prefs` — which callers pass as the title's [`ordering_prefs`], so a
+/// wrong-language pack is tried after a correctly-tagged one (the hard filters don't depend on
+/// audio; callers still judge each pack's quality on the raw prefs). So consolidation adopts the
+/// BEST pack — consistent with
 /// the movie upgrade path's max-by-score ranking — instead of the first acceptable one in raw scraper
 /// order (which, once adopted, the `already_pack` short-circuit would strand the season on). The
 /// async blacklist filter is applied by the caller (it can't be pure). Pure → unit-testable.
@@ -1720,7 +1747,8 @@ async fn correct_over_ceiling_packs(
         else {
             continue;
         };
-        for cand in rank_cached_pack_candidates(&raws, prefs, exclude_hashes) {
+        let order = ordering_prefs(app, &rec.request);
+        for cand in rank_cached_pack_candidates(&raws, &order, exclude_hashes) {
             if blacklist.contains(&cand.info_hash.to_ascii_lowercase()) {
                 continue;
             }
@@ -1966,7 +1994,16 @@ async fn upgrade_show_episodes_and_packs(
             Ok(r) => r,
             Err(_) => continue, // transient; other episodes/packs/consolidation still run this tick
         };
-        let ranked = rank_changes(app, MediaKind::Series, tmdb_id, &raws, &q, group_hashes).await;
+        let ranked = rank_changes(
+            app,
+            MediaKind::Series,
+            tmdb_id,
+            &raws,
+            &q,
+            group_hashes,
+            &req,
+        )
+        .await;
         let target = EpisodeTarget {
             req: &req,
             season,
@@ -2041,7 +2078,16 @@ async fn upgrade_show_episodes_and_packs(
                 .await
             {
                 Ok(raws) => {
-                    rank_changes(app, MediaKind::Series, tmdb_id, &raws, &q, group_hashes).await
+                    rank_changes(
+                        app,
+                        MediaKind::Series,
+                        tmdb_id,
+                        &raws,
+                        &q,
+                        group_hashes,
+                        &req,
+                    )
+                    .await
                 }
                 Err(_) => Vec::new(), // transient; treated as "nothing better" for this episode
             };
@@ -2315,7 +2361,8 @@ async fn consolidate_show_seasons(
         // Try the CACHED, in-ceiling, not-owned candidate packs BEST-SCORE-FIRST (the hard filters —
         // resolution ceiling, cam/telesync, dead seeders — are applied by `score()` inside the helper:
         // a pack above the ceiling would pass the no-regression check yet violate it, so it's excluded).
-        for r in rank_cached_pack_candidates(&raws, &app.config.acquisition.prefs, group_hashes) {
+        let order = ordering_prefs(app, &sample.request);
+        for r in rank_cached_pack_candidates(&raws, &order, group_hashes) {
             if blacklist.contains(&r.info_hash.to_ascii_lowercase()) {
                 continue;
             }
@@ -6180,7 +6227,16 @@ mod tests {
             remux_named("hmkv", Some("M.2020.1080p.REMUX.mkv")),
             remux_named("hmp4", Some("M.2020.1080p.REMUX.mp4")),
         ];
-        let ranked = rank_changes(&app, MediaKind::Movie, 27205, &raws, &baseline, &[]).await;
+        let ranked = rank_changes(
+            &app,
+            MediaKind::Movie,
+            27205,
+            &raws,
+            &baseline,
+            &[],
+            &movie_req(),
+        )
+        .await;
         let hashes: Vec<_> = ranked.iter().map(|(r, _)| r.info_hash.as_str()).collect();
         assert!(
             !hashes.contains(&"havi"),
@@ -9527,5 +9583,135 @@ mod tests {
             let q = f.store.get_owned(h.clone()).await.unwrap().quality.unwrap();
             assert!(!q.unverified, "{h} settled verified");
         }
+    }
+
+    /// A cached 1080p WEB-DL x265 single for S01E04 tagged Russian by name AND Torrentio flag — it
+    /// out-scores [`eng_x264_e4_raw`] on raw prefs (HEVC), where `AUDIO_LANGUAGE=original` has no
+    /// per-title language to penalise it with.
+    fn rus_x265_e4_raw() -> RawCandidate {
+        RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "Yaga.S01E04.1080p.WEB-DL.x265.Rus\n👤 50 💾 2.1 GB\n🇷🇺\nRD+".into(),
+            info_hash: "hrus4".into(),
+            file_idx: Some(0),
+            file_name: Some("Yaga.S01E04.1080p.WEB-DL.x265.Rus.mkv".into()),
+        }
+    }
+    fn eng_x264_e4_raw() -> RawCandidate {
+        RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "Yaga.S01E04.1080p.WEB-DL.x264.ENG\n👤 5 💾 1.1 GB\n🇬🇧\nRD+".into(),
+            info_hash: "heng4".into(),
+            file_idx: Some(0),
+            file_name: Some("Yaga.S01E04.1080p.WEB-DL.x264.ENG.mkv".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn pack_served_episode_stages_the_original_language_release_first() {
+        // YAGA S01E04: an English-original show whose E4 is served by an SD pack. A Russian-tagged
+        // single (name + 🇷🇺) and an English one both improve it; the Russian one scores higher on
+        // the raw prefs (HEVC). Candidates are ORDERED with the title's resolved audio (as
+        // acquisition ranks), so the English release is staged first — and, passing the probe, is
+        // the one adopted; the Russian release is never staged.
+        let prefs = crate::config::AcquisitionConfig::default().prefs;
+        let raw = |c: &RawCandidate| QualitySummary::of(&release::parse(c), &prefs).score;
+        assert!(
+            raw(&rus_x265_e4_raw()) > raw(&eng_x264_e4_raw()),
+            "fixture: the Russian release out-scores the English one on raw prefs"
+        );
+        let f = pack_fixture(
+            &[(1, q1080_web()), (2, q1080_web()), (3, q1080_web())],
+            &[1, 2, 3, 4],
+            &[4],
+            q_sd_web_unverified(),
+            vec![(4, rus_x265_e4_raw()), (4, eng_x264_e4_raw())],
+            false,
+        )
+        .await;
+        upgrade_show_episodes_and_packs(&f.app, SHOW_TMDB, &f.group_hashes, Duration::from_secs(0))
+            .await;
+        assert_eq!(
+            f.added.lock().unwrap().clone(),
+            vec!["heng4".to_string()],
+            "the English release is staged first (and the Russian one never)"
+        );
+        assert_eq!(slot_hash(&f.store, 4).await, "heng4", "E4 moved to English");
+        let stored = f.store.get_owned("heng4".into()).await.unwrap();
+        assert_eq!(
+            stored.quality.unwrap().score,
+            raw(&eng_x264_e4_raw()),
+            "the stored score stays on the raw prefs (consistent with every other stored score)"
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidation_stages_the_original_language_pack_first() {
+        // The pack ranker orders by the title's resolved audio too: of two cached BluRay 1080p
+        // full-season packs that both pass the no-regression gate, the English one is staged before
+        // a Russian-tagged one that scores higher on the raw prefs (HEVC).
+        let rus = RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "S.2019.S01.1080p.BluRay.x265.Rus\n🇷🇺\nRD+".into(),
+            info_hash: "hrus".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let eng = RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "S.2019.S01.1080p.BluRay.x264.ENG\n🇬🇧\nRD+".into(),
+            info_hash: "heng".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let prefs = crate::config::AcquisitionConfig::default().prefs;
+        let raw = |c: &RawCandidate| QualitySummary::of(&release::parse(c), &prefs).score;
+        assert!(
+            raw(&rus) > raw(&eng),
+            "fixture: raw order puts Russian first"
+        );
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+        let pack = |h: &str| TorrentInfo {
+            id: h.into(),
+            hash: h.into(),
+            ..pack_info()
+        };
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            torrent_info_by_id: [
+                ("hrus".to_string(), pack("hrus")),
+                ("heng".into(), pack("heng")),
+            ]
+            .into_iter()
+            .collect(),
+            resolved_url: Some("https://cdn/p1".into()),
+            added: added.clone(),
+            ..Default::default()
+        });
+        let app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![rus, eng],
+            }),
+            provider,
+            store.clone(),
+        );
+        consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            added.lock().unwrap().clone(),
+            vec!["heng".to_string()],
+            "the English pack is staged first (and adopted)"
+        );
+        assert!(store.get_owned("heng".into()).await.is_some());
     }
 }
