@@ -743,15 +743,21 @@ impl AcquisitionEngine {
                             // this present pack, which supplies the episode.
                             None => true,
                             // A different, still-owned release holds this episode: overwrite only
-                            // when this pack is NOT a downgrade. Unknown quality on either side is a
-                            // conservative keep (can't prove it isn't a regression).
-                            Some(old) => match (
-                                new_quality.as_ref().map(|q| q.score),
-                                old.quality.as_ref().map(|q| q.score),
-                            ) {
-                                (Some(n), Some(x)) => n >= x,
-                                _ => false,
-                            },
+                            // when this pack is NOT a downgrade. Unknown quality (none recorded, or
+                            // an untagged axis) is the LOWEST: known beats unknown outright; on the
+                            // same side the scores decide; and with no quality on either side
+                            // nothing is provable → keep.
+                            Some(old) => {
+                                let ceiling = self.prefs.max_resolution.height();
+                                let key = |q: Option<&crate::release::QualitySummary>| {
+                                    (
+                                        crate::release::quality_rank(q, ceiling).known,
+                                        q.map(|q| q.score).unwrap_or(i64::MIN),
+                                    )
+                                };
+                                (new_quality.is_some() || old.quality.is_some())
+                                    && key(new_quality.as_ref()) >= key(old.quality.as_ref())
+                            }
                         },
                     };
                     if overwrite {
@@ -3920,6 +3926,23 @@ mod tests {
     // Shared setup for the pack-selection-gate tests: an E01 single ("hsingle") at `single_score`
     // and a pending pack ("hpack", E01+E02) at `pack_score`. Runs observe and returns the store.
     async fn run_pack_gate(single_score: i64, pack_score: i64) -> Store {
+        let q = |score: i64| {
+            Some(crate::release::QualitySummary {
+                cached: true,
+                source_tier: 8_000,
+                resolution: 1080,
+                score,
+                unverified: false,
+            })
+        };
+        run_pack_gate_q(q(single_score), q(pack_score)).await
+    }
+
+    /// [`run_pack_gate`] with explicit (possibly unknown) qualities for the single and the pack.
+    async fn run_pack_gate_q(
+        single_q: Option<crate::release::QualitySummary>,
+        pack_q: Option<crate::release::QualitySummary>,
+    ) -> Store {
         let st = store();
         let base = AcquireRequest {
             imdb_id: "tt1".into(),
@@ -3936,15 +3959,6 @@ mod tests {
                 external_id: Some("tmdb:27205".into()),
             },
         };
-        let q = |score: i64| {
-            Some(crate::release::QualitySummary {
-                cached: true,
-                source_tier: 8_000,
-                resolution: 1080,
-                score,
-                unverified: false,
-            })
-        };
         st.put_owned(
             "hsingle".into(),
             OwnedRecord {
@@ -3956,7 +3970,7 @@ mod tests {
                 added_at: now_secs(),
                 status: OwnedStatus::Verified,
                 provides: vec![(1, 1)],
-                quality: q(single_score),
+                quality: single_q,
             },
         )
         .await
@@ -3969,7 +3983,7 @@ mod tests {
                 added_at: now_secs(),
                 status: OwnedStatus::Pending,
                 provides: vec![(1, 2)],
-                quality: q(pack_score),
+                quality: pack_q,
             },
         )
         .await
@@ -4070,5 +4084,43 @@ mod tests {
             "hpack",
             "a better-or-equal pack repoints E01"
         );
+    }
+
+    /// Unknown quality is the lowest: a KNOWN pack takes a sibling slot held by an unknown-quality
+    /// single (no recorded quality, or an untagged axis — whatever its score), while an unknown pack
+    /// never steals a slot from a known single.
+    #[tokio::test]
+    async fn observe_pack_slot_gate_ranks_unknown_quality_lowest() {
+        let q = |res: u16, tier: i64, score: i64| {
+            Some(crate::release::QualitySummary {
+                cached: true,
+                source_tier: tier,
+                resolution: res,
+                score,
+                unverified: false,
+            })
+        };
+        let slot = |st: Store| async move {
+            st.get_selection(crate::store::episode_slot(27205, 1, 1))
+                .await
+                .unwrap()
+                .hash
+        };
+        for single in [None, q(1080, 0, 9_000_000), q(0, 8_000, 9_000_000)] {
+            let st = run_pack_gate_q(single.clone(), q(720, 3_000, 1_075_000)).await;
+            assert_eq!(
+                slot(st).await,
+                "hpack",
+                "{single:?}: the known pack takes the slot"
+            );
+        }
+        for pack in [None, q(1080, 0, 9_000_000)] {
+            let st = run_pack_gate_q(q(720, 3_000, 1_075_000), pack.clone()).await;
+            assert_eq!(
+                slot(st).await,
+                "hsingle",
+                "{pack:?}: an unknown pack never steals it"
+            );
+        }
     }
 }

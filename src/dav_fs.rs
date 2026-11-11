@@ -824,7 +824,7 @@ mod tests {
             cdn_url: None,
             buffer: Bytes::new(),
             buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
@@ -1099,7 +1099,7 @@ mod provider_abstraction_tests {
         let vfs = Arc::new(RwLock::new(DebridVfs::new()));
         let repair = Arc::new(RepairManager::new(provider.clone()));
         let http = reqwest::Client::new();
-        let ra = Arc::new(crate::read_activity::ReadActivity::new());
+        let ra = Arc::new(crate::read_activity::ReadActivity::without_startup_grace());
         let _fs = DebridFileSystem::new(provider, vfs, repair, http, ra);
     }
 
@@ -1139,7 +1139,7 @@ mod provider_abstraction_tests {
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
         let repair = Arc::new(RepairManager::new(provider.clone()));
-        let ra = Arc::new(crate::read_activity::ReadActivity::new());
+        let ra = Arc::new(crate::read_activity::ReadActivity::without_startup_grace());
         let fs = DebridFileSystem::new(
             provider,
             Arc::new(RwLock::new(vfs)),
@@ -1198,7 +1198,7 @@ mod provider_abstraction_tests {
             cdn_url: None,
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
@@ -1248,7 +1248,7 @@ mod provider_abstraction_tests {
             cdn_url: Some(url),
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
@@ -1306,7 +1306,7 @@ mod provider_abstraction_tests {
             cdn_url: Some(url),
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
@@ -1483,7 +1483,7 @@ mod provider_abstraction_tests {
             cdn_url: Some(url),
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
@@ -1763,7 +1763,7 @@ mod provider_abstraction_tests {
             cdn_url: None,
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
             vfs_path: String::new(),
             modified_time: ts,
             confirmed_read: false,
@@ -1781,7 +1781,7 @@ mod provider_abstraction_tests {
     #[tokio::test]
     async fn read_bytes_stamps_read_activity() {
         use crate::read_activity::ReadActivity;
-        let ra = Arc::new(ReadActivity::new());
+        let ra = Arc::new(ReadActivity::without_startup_grace());
         let provider: Arc<dyn DebridProvider> = Arc::new(crate::provider::MockProvider {
             resolved_url: Some("http://127.0.0.1:0/none".into()),
             ..Default::default()
@@ -1866,7 +1866,7 @@ mod provider_abstraction_tests {
             cdn_url: None,
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
@@ -1936,7 +1936,7 @@ mod provider_abstraction_tests {
             cdn_url: Some(url),
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
@@ -2006,7 +2006,7 @@ mod provider_abstraction_tests {
             cdn_url: Some(url_500),
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
@@ -2097,7 +2097,7 @@ mod provider_abstraction_tests {
             cdn_url: None,
             buffer: bytes::Bytes::from_static(b"ABCDEFGHIJ"), // [100, 110)
             buffer_start: 100,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
             vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
@@ -2125,7 +2125,7 @@ mod provider_abstraction_tests {
         // A Broken/hidden torrent must short-circuit read_bytes BEFORE any I/O — so it can never
         // re-trigger repair (which would trap it until restart) and never even stamps read-activity.
         use crate::read_activity::ReadActivity;
-        let ra = Arc::new(ReadActivity::new());
+        let ra = Arc::new(ReadActivity::without_startup_grace());
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
             resolved_url: Some("http://127.0.0.1:0/none".into()),

@@ -644,6 +644,40 @@ impl QualitySummary {
         }
     }
 
+    /// The baseline for an owned copy with NO recorded quality (`quality: None`): unknown on both
+    /// axes, so [`is_unknown_quality`] holds and it ranks below every known quality (see
+    /// [`quality_rank`]). `cached: true` — an owned copy is in the account — so only a KNOWN-quality
+    /// cached candidate improves on it ([`is_target_improvement`]), never another unknown one.
+    pub fn unknown() -> Self {
+        QualitySummary {
+            cached: true,
+            source_tier: 0,
+            resolution: 0,
+            score: i64::MIN,
+            unverified: false,
+        }
+    }
+
+    /// Snapshot an OWNED file's quality for comparison, bypassing the acquisition hard filters that
+    /// make [`score`] return `None`: a file ABOVE the resolution ceiling keeps its real resolution
+    /// (scored as if the ceiling were the maximum, 2160p) instead of being dropped — so an
+    /// over-ceiling copy is never mistaken for unknown-lowest and stays under the corrective-downgrade
+    /// rules; a cam source keeps tier 0 (unknown-lowest); an untagged axis stays 0 (unknown). Equal to
+    /// [`QualitySummary::of`] for any release `score` accepts. Used for account-mirror copies, whose
+    /// quality is derived from the file name rather than a scraped release.
+    pub fn of_owned(r: &ReleaseInfo, prefs: &QualityPrefs) -> Self {
+        let uncapped = QualityPrefs {
+            max_resolution: crate::config::MaxResolution::P2160,
+            ..prefs.clone()
+        };
+        QualitySummary {
+            score: score(r, prefs)
+                .or_else(|| score(r, &uncapped))
+                .unwrap_or(i64::MIN),
+            ..QualitySummary::of(r, prefs)
+        }
+    }
+
     /// Mark this owned release as now present/cached on the provider — used when an UNCACHED torrent
     /// finishes downloading (so its acquire-time snapshot recorded `cached: false`). Flips `cached`
     /// AND adds [`CACHED_BONUS`] to `score` so the stored summary matches what `score()` would yield
@@ -656,6 +690,44 @@ impl QualitySummary {
             self.cached = true;
             self.score = self.score.saturating_add(CACHED_BONUS);
         }
+    }
+}
+
+/// Whether `q` is UNKNOWN quality — ranked LOW, below every known quality, wherever qualities are
+/// compared (dedup keep-priority, upgrade baselines, consolidation): its resolution or source tier
+/// is 0 (that axis untagged). A copy with NO recorded quality is unknown too
+/// ([`QualitySummary::unknown`]). The one exception is a copy whose resolution is ABOVE `ceiling`
+/// (`MAX_RESOLUTION`): its resolution is known and higher than anything acquisition would fetch, so
+/// it is never unknown-lowest — replacing it is a corrective downgrade, gated by
+/// `ALLOW_RESOLUTION_DOWNGRADE`, whatever its source tier.
+pub fn is_unknown_quality(q: &QualitySummary, ceiling: u16) -> bool {
+    q.resolution <= ceiling && (q.resolution == 0 || q.source_tier == 0)
+}
+
+/// A copy's quality rank: known before unknown ([`is_unknown_quality`]), then resolution, then
+/// source tier — the derived `Ord` compares the fields in that order. Score is deliberately NOT part
+/// of it: two copies with the same rank are the same quality. The ceiling only decides
+/// unknown-ness; it never ranks a copy down for being above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct QualityRank {
+    pub known: bool,
+    pub resolution: u16,
+    pub source_tier: i64,
+}
+
+/// The [`QualityRank`] of an owned copy's recorded quality (`None` = nothing recorded = the lowest).
+pub fn quality_rank(q: Option<&QualitySummary>, ceiling: u16) -> QualityRank {
+    match q {
+        Some(q) => QualityRank {
+            known: !is_unknown_quality(q, ceiling),
+            resolution: q.resolution,
+            source_tier: q.source_tier,
+        },
+        None => QualityRank {
+            known: false,
+            resolution: 0,
+            source_tier: 0,
+        },
     }
 }
 
@@ -679,6 +751,11 @@ pub enum Improvement {
 /// every accepted swap strictly increases the owned effective score (bounded) => no flip-flop — the
 /// one equal-score case, replacing an `unverified` copy, adopts only a probe-checked release, so the
 /// new copy is verified and that rule cannot fire for it again.
+///
+/// UNKNOWN quality ([`is_unknown_quality`]) is the lowest: within the ceiling an unknown current is
+/// improved by any known cached candidate (scores ignored) and a known current is never improved by
+/// an unknown candidate. Replacing an unknown copy records a known one, so that rule fires at most
+/// once per slot (converges); an unknown candidate is never adopted over anything cached.
 pub fn is_target_improvement(
     current: &QualitySummary,
     candidate: &QualitySummary,
@@ -689,6 +766,28 @@ pub fn is_target_improvement(
     }
     if !current.cached {
         return Improvement::Upgrade;
+    }
+    // Unknown quality ranks below every known quality ([`is_unknown_quality`]). For a WITHIN-ceiling
+    // current that decides the comparison outright, scores ignored: an unknown current is improved by
+    // ANY known-quality cached within-ceiling candidate (the upgrade pass adopts it only on a probe
+    // `Pass`), and never by an unknown one; a known current is never "improved" by an unknown
+    // candidate. The swap records the adopted release's known quality, so the next visit compares two
+    // known copies under the rules below — it converges. An over-ceiling current is never unknown
+    // (its known resolution is above the ceiling) and falls through to the corrective-downgrade rules.
+    let ceiling = prefs.max_resolution.height();
+    if current.resolution <= ceiling {
+        let candidate_known =
+            !is_unknown_quality(candidate, ceiling) && candidate.resolution <= ceiling;
+        if is_unknown_quality(current, ceiling) {
+            return if candidate_known {
+                Improvement::Upgrade
+            } else {
+                Improvement::None
+            };
+        }
+        if !candidate_known {
+            return Improvement::None;
+        }
     }
     let cur = effective_score(current, prefs);
     let cand = effective_score(candidate, prefs);
@@ -2313,6 +2412,218 @@ mod tests {
                 unverified: false,
             };
             assert!(effective_score(&more_over, &p) < effective_score(&less_over, &p));
+        }
+    }
+
+    /// Unknown quality is LOW quality: a `None` summary, or one whose resolution or source tier is 0
+    /// (that axis untagged), ranks below every known quality — EXCEPT a copy whose recorded resolution
+    /// is above `MAX_RESOLUTION`, which is never unknown-lowest (it stays under the corrective-downgrade
+    /// rules and `ALLOW_RESOLUTION_DOWNGRADE`).
+    #[cfg(test)]
+    mod unknown_quality_tests {
+        use super::{
+            is_target_improvement, is_unknown_quality, parse, quality_rank, Improvement,
+            QualitySummary, RawCandidate,
+        };
+        use crate::config::{AudioReq, MaxResolution, QualityPrefs, SubReq};
+
+        fn prefs(ceiling: MaxResolution) -> QualityPrefs {
+            QualityPrefs {
+                max_resolution: ceiling,
+                audio: AudioReq::Original,
+                subtitle: SubReq::None,
+                prefer_hevc: true,
+                prefer_hdr: false,
+            }
+        }
+        fn q(res: u16, tier: i64, score: i64) -> QualitySummary {
+            QualitySummary {
+                cached: true,
+                source_tier: tier,
+                resolution: res,
+                score,
+                unverified: false,
+            }
+        }
+
+        #[test]
+        fn unknown_is_none_or_an_untagged_axis_but_never_an_over_ceiling_resolution() {
+            assert!(is_unknown_quality(&QualitySummary::unknown(), 1080));
+            assert!(
+                is_unknown_quality(&q(0, 3_000, 9), 1080),
+                "resolution untagged"
+            );
+            assert!(
+                is_unknown_quality(&q(1080, 0, 9), 1080),
+                "source tier untagged"
+            );
+            assert!(
+                !is_unknown_quality(&q(720, 3_000, 9), 1080),
+                "both axes known"
+            );
+            assert!(
+                !is_unknown_quality(&q(2160, 0, 9), 1080),
+                "a resolution above the ceiling is never unknown-lowest, whatever its tier"
+            );
+            assert!(
+                is_unknown_quality(&q(2160, 0, 9), 2160),
+                "at a 2160 ceiling the same copy is within the ceiling, so its untagged tier is unknown"
+            );
+        }
+
+        #[test]
+        fn quality_rank_is_known_first_then_resolution_then_tier() {
+            let c = 1080;
+            let web720 = quality_rank(Some(&q(720, 3_000, 1)), c);
+            let untagged_source_1080 = quality_rank(Some(&q(1080, 0, 999_999)), c);
+            let untagged_res_remux = quality_rank(Some(&q(0, 8_000, 999_999)), c);
+            let none = quality_rank(None, c);
+            assert!(
+                web720 > untagged_source_1080,
+                "any known quality beats unknown, even at a higher resolution or score"
+            );
+            assert!(web720 > untagged_res_remux);
+            assert!(
+                untagged_source_1080 > untagged_res_remux,
+                "unknowns: resolution next"
+            );
+            assert!(
+                untagged_res_remux > none,
+                "a recorded tier beats nothing at all"
+            );
+            assert!(
+                quality_rank(Some(&q(1080, 8_000, 1)), c)
+                    > quality_rank(Some(&q(1080, 6_000, 9)), c),
+                "known: same resolution → higher tier wins (score is not part of the rank)"
+            );
+            assert!(
+                quality_rank(Some(&q(2160, 3_000, 1)), c) > quality_rank(Some(&q(1080, 8_000, 9)), c),
+                "known: resolution dominates tier, and the ceiling never lowers an over-ceiling copy"
+            );
+            assert!(
+                quality_rank(Some(&q(2160, 0, 1)), c) > quality_rank(Some(&q(1080, 8_000, 9)), c),
+                "an over-ceiling copy with an untagged tier is not unknown-lowest"
+            );
+            assert_eq!(
+                quality_rank(Some(&q(1080, 6_000, 1)), c),
+                quality_rank(Some(&q(1080, 6_000, 9)), c),
+                "same resolution + tier = same quality (score ignored)"
+            );
+        }
+
+        #[test]
+        fn any_known_within_ceiling_candidate_improves_an_unknown_current() {
+            let p = prefs(MaxResolution::P1080);
+            let known = q(720, 3_000, 1_000_100);
+            for current in [
+                QualitySummary::unknown(),
+                q(0, 3_000, 9_000_000), // resolution untagged, even with a higher score
+                q(1080, 0, 9_000_000),  // source untagged, even at a higher resolution
+                q(0, 0, 1),
+            ] {
+                assert_eq!(
+                    is_target_improvement(&current, &known, &p),
+                    Improvement::Upgrade,
+                    "{current:?} is unknown → any known cached within-ceiling candidate improves it"
+                );
+                assert_eq!(
+                    is_target_improvement(&current, &q(1080, 0, 9_999_999), &p),
+                    Improvement::None,
+                    "an UNKNOWN candidate never improves an unknown current (no unknown→unknown churn)"
+                );
+                let mut uncached = known.clone();
+                uncached.cached = false;
+                assert_eq!(
+                    is_target_improvement(&current, &uncached, &p),
+                    Improvement::None,
+                    "an uncached candidate is never an improvement"
+                );
+            }
+        }
+
+        #[test]
+        fn an_unknown_candidate_never_improves_a_known_within_ceiling_current() {
+            let p = prefs(MaxResolution::P2160);
+            let current = q(720, 3_000, 1_075_000);
+            // Higher resolution AND higher score, but its source tier is untagged → unknown → lower.
+            let cand = q(1080, 0, 1_110_000);
+            assert_eq!(
+                is_target_improvement(&current, &cand, &p),
+                Improvement::None,
+                "unknown quality ranks below every known quality"
+            );
+        }
+
+        #[test]
+        fn an_over_ceiling_untagged_tier_copy_stays_under_the_corrective_downgrade_rules() {
+            let p = prefs(MaxResolution::P1080);
+            let over = q(2160, 0, 1_216_000);
+            assert_eq!(
+                is_target_improvement(&over, &q(1080, 6_000, 1_114_000), &p),
+                Improvement::Downgrade,
+                "an over-ceiling copy is replaced only as a gated corrective downgrade, never as unknown"
+            );
+        }
+
+        #[test]
+        fn replacing_an_unknown_copy_converges() {
+            let p = prefs(MaxResolution::P1080);
+            let adopted = q(1080, 3_000, 1_113_000);
+            assert_eq!(
+                is_target_improvement(&QualitySummary::unknown(), &adopted, &p),
+                Improvement::Upgrade
+            );
+            // Once adopted the copy is known: the same release, an equal one, or any unknown one is
+            // no improvement on the next visit.
+            for again in [
+                adopted.clone(),
+                q(1080, 3_000, 1_113_500),
+                q(0, 8_000, 9_999_999),
+            ] {
+                assert_eq!(
+                    is_target_improvement(&adopted, &again, &p),
+                    Improvement::None
+                );
+            }
+        }
+
+        #[test]
+        fn of_owned_records_an_over_ceiling_file_instead_of_dropping_it() {
+            let p = prefs(MaxResolution::P1080);
+            let r = |name: &str| {
+                let mut r = parse(&RawCandidate {
+                    name: name.into(),
+                    description: String::new(),
+                    info_hash: "h".into(),
+                    file_idx: None,
+                    file_name: Some(name.into()),
+                });
+                r.cached = true;
+                r
+            };
+            let over = QualitySummary::of_owned(&r("Show.S04E05.2160p.WEB.h265-GRP.mkv"), &p);
+            assert_eq!((over.resolution, over.source_tier), (2160, 3_000));
+            assert!(over.cached);
+            assert!(
+                over.score > 1_000_000,
+                "scored as if uncapped (not the hard-filter sentinel), got {}",
+                over.score
+            );
+            assert!(!is_unknown_quality(&over, 1080));
+            let within = QualitySummary::of_owned(&r("Movie.2020.1080p.BluRay.x264.mkv"), &p);
+            assert_eq!(
+                within,
+                QualitySummary::of(&r("Movie.2020.1080p.BluRay.x264.mkv"), &p)
+            );
+            let untagged = QualitySummary::of_owned(&r("The Matrix (1999).mkv"), &p);
+            assert_eq!((untagged.resolution, untagged.source_tier), (0, 0));
+            assert!(is_unknown_quality(&untagged, 1080));
+            let cam = QualitySummary::of_owned(&r("Movie.2024.1080p.CAM.x264.mkv"), &p);
+            assert_eq!(
+                cam.source_tier, 0,
+                "a cam copy is unknown-lowest, never acquired over"
+            );
+            assert!(is_unknown_quality(&cam, 1080));
         }
     }
 }

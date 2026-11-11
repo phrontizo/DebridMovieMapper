@@ -1049,6 +1049,61 @@ impl Store {
         Self::flatten_join_app(result)
     }
 
+    /// Set the `quality` of the owned record for `hash` ONLY if it has none (`None`), as one
+    /// read-modify-write transaction that touches no other field — so the quality backfill (which
+    /// re-derives a missing quality from the torrent's file name) can never overwrite a recorded
+    /// quality or clobber a concurrent `observe`/upgrade write to another field. Returns `true` if it
+    /// wrote; `false` when a quality was already recorded or the record is missing (never resurrected).
+    pub async fn set_quality_if_unset(
+        &self,
+        hash: String,
+        quality: crate::release::QualitySummary,
+    ) -> Result<bool, AppError> {
+        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, AppError> {
+            let txn = db.begin_write().map_err(|e| AppError::Db(e.into()))?;
+            let wrote = {
+                let mut table = txn
+                    .open_table(OWNED_TABLE)
+                    .map_err(|e| AppError::Db(e.into()))?;
+                // Copy the bytes out so the read borrow ends before the `&mut` insert.
+                let existing: Option<Vec<u8>> = table
+                    .get(hash.as_str())
+                    .map_err(|e| AppError::Db(e.into()))?
+                    .map(|guard| guard.value().to_vec());
+                match existing {
+                    Some(raw) => {
+                        let mut rec = serde_json::from_slice::<OwnedRecord>(&raw).map_err(|e| {
+                            AppError::Task(format!(
+                                "set_quality_if_unset: corrupt owned record for {hash}: {e}"
+                            ))
+                        })?;
+                        if rec.quality.is_none() {
+                            rec.quality = Some(quality);
+                            let bytes = serde_json::to_vec(&rec).map_err(|e| {
+                                AppError::Task(format!(
+                                    "set_quality_if_unset: re-serialise failed for {hash}: {e}"
+                                ))
+                            })?;
+                            table
+                                .insert(hash.as_str(), bytes.as_slice())
+                                .map_err(|e| AppError::Db(e.into()))?;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    None => false,
+                }
+            };
+            txn.commit().map_err(|e| AppError::Db(e.into()))?;
+            Ok(wrote)
+        })
+        .await;
+        Self::flatten_join_app(result)
+    }
+
     pub async fn remove_owned(&self, hash: String) -> Result<(), AppError> {
         let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
         let db = self.db.clone();
@@ -4055,6 +4110,70 @@ mod tests {
         // Missing record → no-op, never resurrected.
         assert!(!store
             .backfill_title_languages_if_unset("hgone".into(), fi, langs)
+            .await
+            .unwrap());
+        assert!(store.get_owned("hgone".into()).await.is_none());
+    }
+
+    /// The quality backfill (re-deriving a `quality: None` record's quality from its file name) sets
+    /// `quality` ONLY where it is still `None`, in one write transaction touching nothing else — a
+    /// recorded quality is never overwritten and a missing record is never resurrected.
+    #[tokio::test]
+    async fn set_quality_if_unset_fills_only_a_missing_quality() {
+        let store = mem_store();
+        let rec = OwnedRecord {
+            request: req("tt1", 27205),
+            provenance: Provenance { entries: vec![] },
+            added_at: 100,
+            status: OwnedStatus::Verified,
+            provides: vec![(1, 2)],
+            quality: None,
+        };
+        store.put_owned("hnone".into(), rec.clone()).await.unwrap();
+        let recorded = crate::release::QualitySummary {
+            cached: true,
+            source_tier: 3_000,
+            resolution: 720,
+            score: 7,
+            unverified: false,
+        };
+        store
+            .put_owned(
+                "hsome".into(),
+                OwnedRecord {
+                    quality: Some(recorded.clone()),
+                    ..rec.clone()
+                },
+            )
+            .await
+            .unwrap();
+        let derived = crate::release::QualitySummary {
+            cached: true,
+            source_tier: 8_000,
+            resolution: 2160,
+            score: 9,
+            unverified: false,
+        };
+        assert!(store
+            .set_quality_if_unset("HNONE".into(), derived.clone())
+            .await
+            .unwrap());
+        let got = store.get_owned("hnone".into()).await.unwrap();
+        assert_eq!(got.quality, Some(derived.clone()));
+        assert_eq!(got.provides, vec![(1, 2)], "other fields intact");
+        assert_eq!(got.added_at, 100);
+        assert!(got.provenance.entries.is_empty());
+        assert!(!store
+            .set_quality_if_unset("hsome".into(), derived.clone())
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get_owned("hsome".into()).await.unwrap().quality,
+            Some(recorded),
+            "a recorded quality is never overwritten"
+        );
+        assert!(!store
+            .set_quality_if_unset("hgone".into(), derived)
             .await
             .unwrap());
         assert!(store.get_owned("hgone".into()).await.is_none());

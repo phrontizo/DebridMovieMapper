@@ -1154,23 +1154,21 @@ fn meta_tmdb_id(metadata: &MediaMetadata) -> Option<u64> {
         .and_then(|s| s.parse::<u64>().ok())
 }
 
-/// Derive a `QualitySummary` for a mirror record from the torrent's representative (largest) video
-/// file. The torrent is present in the provider listing, so it is treated as `cached` (available).
-/// Returns `None` (→ the upgrade path skips it conservatively) when ANY of:
-/// - there is no video file;
-/// - the file fails the hard quality filters (e.g. resolution above the configured ceiling);
-/// - the filename does not tag BOTH the resolution AND the source tier.
-///
-/// The last case is the important one: a partially/un-tagged name (e.g. `The Matrix (1999).mkv`)
-/// parses to `resolution: 0` and/or `source_tier: 0` — UNKNOWN on an axis the upgrade comparison
-/// (`is_target_improvement`) uses. Recording such a record would let a scraped candidate "upgrade"
-/// (potentially DOWNGRADE) it on the unknown axis, deleting a possibly-better original. We only
-/// record a quality we can compare safely on both axes.
+/// The quality of an owned torrent, derived from its representative (largest) video file's name —
+/// for an account-mirror copy, which has no scraped release to snapshot, and for the backfill of
+/// older records that have none ([`backfill_owned_quality`]). `None` only when there is no video
+/// file. Every axis the name doesn't tag is recorded as 0 — UNKNOWN, which ranks below every known
+/// quality (see [`crate::release::is_unknown_quality`]), so any known cached release may replace it.
+/// A file ABOVE the resolution ceiling keeps its real resolution ([`QualitySummary::of_owned`]):
+/// recording it as `None` would make it read as unknown-lowest, whereas it must stay under the
+/// corrective-downgrade rules (`ALLOW_RESOLUTION_DOWNGRADE`).
 ///
 /// A recorded summary is flagged `unverified` iff the representative file isn't MKV/MP4 — a
 /// container the probe can never read (e.g. `.avi`), so the upgrade pass may replace it with an
 /// equal-quality checked copy. A mirrored MKV/MP4 was never probed either, but is assumed fine:
 /// flagging every mirror copy would churn the whole library through the upgrade pass.
+///
+/// [`QualitySummary::of_owned`]: crate::release::QualitySummary::of_owned
 fn mirror_quality(
     info: &crate::rd_client::TorrentInfo,
     prefs: &crate::config::QualityPrefs,
@@ -1194,16 +1192,58 @@ fn mirror_quality(
         file_name: Some(name),
     });
     r.cached = true; // present in the provider listing == available
-                     // Only record a quality the engine can safely compare; a hard-filtered release has no score.
-    crate::release::score(&r, prefs)?;
-    let mut summary = crate::release::QualitySummary::of(&r, prefs);
-    // Both axes the upgrade comparison uses must be known, else an "upgrade" could be a downgrade.
-    if summary.resolution == 0 || summary.source_tier == 0 {
-        return None;
-    }
+    let mut summary = crate::release::QualitySummary::of_owned(&r, prefs);
     // `r.container` is `Container::from_name` of the file name parsed above.
     summary.unverified = !r.container.is_verifiable();
     Some(summary)
+}
+
+/// Re-derive the quality of owned records that have NONE (`quality: None` — account-mirror copies
+/// recorded before their quality was captured, or recorded `None` for sitting above the ceiling)
+/// from their torrent's representative file ([`mirror_quality`]), for every record whose torrent is
+/// in `infos`. Without it such a copy reads as unknown-lowest — and an over-ceiling one would be
+/// treated as unknown instead of staying under the corrective-downgrade rules. Only `Verified`
+/// records are touched (a `Pending` one gets its quality from `observe`), and only where the store
+/// still has no quality ([`Store::set_quality_if_unset`] — atomic, never overwrites). Run by the scan
+/// loop's account-mirror pass (so the dedup pass right after it sees the result) and at the start of
+/// every upgrade tick (from the persisted identification cache). Returns how many were filled.
+pub(crate) async fn backfill_owned_quality(
+    store: &Store,
+    prefs: &crate::config::QualityPrefs,
+    owned: &[(String, OwnedRecord)],
+    infos: &[&crate::rd_client::TorrentInfo],
+) -> usize {
+    let missing: std::collections::HashSet<String> = owned
+        .iter()
+        .filter(|(_, r)| r.quality.is_none() && r.status == OwnedStatus::Verified)
+        .map(|(h, _)| h.to_ascii_lowercase())
+        .collect();
+    if missing.is_empty() {
+        return 0;
+    }
+    let mut filled = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for info in infos {
+        let hash = info.hash.to_ascii_lowercase();
+        if !missing.contains(&hash) || !seen.insert(hash.clone()) {
+            continue;
+        }
+        let Some(q) = mirror_quality(info, prefs) else {
+            continue; // no video file → nothing to derive
+        };
+        match store.set_quality_if_unset(hash.clone(), q).await {
+            Ok(true) => filled += 1,
+            Ok(false) => {}
+            Err(e) => warn!("quality backfill for {} failed: {}", hash, e),
+        }
+    }
+    if filled > 0 {
+        info!(
+            "quality: derived the quality of {} owned record(s) from their file names",
+            filled
+        );
+    }
+    filled
 }
 
 /// Owned-record hashes safe to reap because their torrent has left the provider: a `Verified`,
@@ -1314,10 +1354,10 @@ fn index_selection_slots_by_hash(
 ///
 /// Idempotent and non-destructive: a hash the engine already owns (or a previously-recorded mirror
 /// hash) is left untouched, so an in-flight `Pending` acquisition or an engine record's
-/// provenance/quality/`provides` is never clobbered. `provides` for a show is the SE-parsed set of
-/// its selected video files (a movie's is empty); `quality` is derived from the representative
-/// (largest) video file via [`mirror_quality`] (or `None` when there is no video / it is above the
-/// resolution ceiling, in which case the upgrade path skips it conservatively).
+/// provenance/`provides` is never clobbered — the one exception being a record with NO quality,
+/// which gets it filled from its file names ([`backfill_owned_quality`]). `provides` for a show is
+/// the SE-parsed set of its selected video files (a movie's is empty); `quality` is derived from the
+/// representative (largest) video file via [`mirror_quality`] (`None` only when there is no video).
 pub(crate) async fn record_mirror_owned(
     store: &Store,
     tmdb: &TmdbClient,
@@ -1397,6 +1437,11 @@ pub(crate) async fn record_mirror_owned(
             reaped
         );
     }
+    // Records already owned with NO quality (mirrored before quality capture existed, or recorded
+    // `None` for being above the ceiling) get it re-derived from their file names, so the dedup pass
+    // that follows this one in the scan tick ranks them by what they really are.
+    let infos: Vec<&crate::rd_client::TorrentInfo> = current_data.iter().map(|(i, _)| i).collect();
+    backfill_owned_quality(store, prefs, &all_owned, &infos).await;
     let mut recorded = 0usize;
     for (info, metadata) in current_data {
         let Some(tmdb_id) = meta_tmdb_id(metadata) else {
@@ -1467,8 +1512,9 @@ pub(crate) async fn record_mirror_owned(
             status: OwnedStatus::Verified,
             provides,
             // Derived from the representative (largest) video file so the record is comparable on
-            // the upgrade/consolidation path. `None` when there is no video file or the file is
-            // above the resolution ceiling (the upgrade path then skips it conservatively).
+            // the dedup/upgrade/consolidation paths: an untagged axis is recorded as unknown (the
+            // lowest quality), an over-ceiling file keeps its real resolution. `None` only when there
+            // is no video file.
             quality: mirror_quality(info, prefs),
         };
         // Write ONLY if no record exists, ATOMICALLY: the per-title TMDB lookup above is an await
@@ -1712,33 +1758,37 @@ pub(crate) struct DedupPlan {
 }
 
 /// PURE duplicate planner. Within each `(media_type, tmdb_id)` group of **present** owned hashes,
-/// choose a minimal keep-set that still covers all owned content and mark fully-redundant
-/// duplicates for removal:
+/// choose a minimal keep-set that still covers all owned content and mark redundant duplicates for
+/// removal — a copy is only ever removed in favour of copies of the SAME OR BETTER quality:
 /// - **Movie**: every hash is the same film → keep the single top-priority hash, remove the rest.
-/// - **Show**: a greedy set-cover over the episodes each hash `provides` — keep a hash only if it
-///   adds an episode not already covered by a higher-priority kept hash; a hash whose every episode
-///   is already covered is redundant → remove. Complementary packs/episodes are therefore all kept.
-///   A show hash with **empty `provides`** (unknown coverage) is **always kept** — never removed on
-///   a guess.
+/// - **Show**: a greedy set-cover over the episodes each hash `provides`, best first — a hash whose
+///   every episode is already provided by a kept hash of same-or-better quality is redundant →
+///   remove; otherwise keep it. Complementary packs/episodes are therefore all kept. A show hash with
+///   **empty `provides`** (unknown coverage) is **always kept** — never removed on a guess.
 ///
-/// Keep-priority (highest kept first): protected (empty-provenance mirror OR manual add) >
-/// currently-served (`selected`) > higher `quality.score` (an absent summary ranks lowest) > more
-/// episodes provided > lexicographically-smallest hash (deterministic). Only groups with at least
-/// one removal are returned. Absent (not-`present`) hashes are ignored entirely — they're already
-/// gone, never a removal target or coverage source.
-///
-/// KNOWN INTERACTION (accepted): `protected` ranks above `quality.score`, so when a title is owned as
-/// both a `quality: None` mirror copy (untagged filename → not upgrade-comparable) AND a lower-priority
-/// engine copy with a known-good quality, the mirror wins the keep slot and the engine copy is removed.
-/// Because the surviving mirror is `quality: None` the daily upgrade engine skips it conservatively, so
-/// this is a one-way quality regression rather than a temporary one. It is deliberate (keep the user's
-/// own library copy over an engine duplicate — see the sort comment below); to re-obtain the better
-/// quality, re-tag/re-add the mirror so it carries a comparable `quality`.
+/// Keep-priority (highest kept first): QUALITY first — [`crate::release::quality_rank`]: known
+/// before unknown (a `None` quality, or an untagged resolution / source tier, is unknown and ranks
+/// below every known quality), then resolution, then source tier — then `quality.score`, then
+/// currently-served (`selected`), then more episodes provided, then lexicographically-smallest hash
+/// (deterministic). Provenance is NOT a keep axis: a pre-existing account-mirror copy (empty
+/// provenance) competes on quality like any engine copy ("the whole point is to upgrade
+/// everything"). Consequence (accepted): when a mirror copy loses to a better ENGINE copy, the
+/// title's survival then rests on that engine copy, which the Trakt lifecycle (Trigger A/B,
+/// [`removal_hashes`]) may later remove — the lifecycle's own mirror protection is unchanged and
+/// applies only to copies that are still mirror records. `ceiling` (`MAX_RESOLUTION`) only decides
+/// unknown-ness — a copy whose resolution is above it is never unknown-lowest — and never ranks a copy
+/// down for being above it: dedup never trades resolution down (a corrective downgrade is the
+/// upgrade engine's job, under `ALLOW_RESOLUTION_DOWNGRADE`). A `Manual`-provenance copy is never
+/// removed (invariant M-1). Only groups with at least one removal are returned. Absent
+/// (not-`present`) hashes are ignored entirely — they're already gone, never a removal target or
+/// coverage source.
 pub(crate) fn plan_dedup(
     owned: &[(String, OwnedRecord)],
     present: &std::collections::HashSet<String>,
     selected: &std::collections::HashSet<String>,
+    ceiling: u16,
 ) -> Vec<DedupPlan> {
+    use crate::release::{quality_rank, QualityRank};
     use std::collections::{BTreeMap, HashMap, HashSet};
     let mut groups: BTreeMap<(MediaType, u64), Vec<(String, &OwnedRecord)>> = BTreeMap::new();
     for (hash, rec) in owned {
@@ -1752,6 +1802,7 @@ pub(crate) fn plan_dedup(
             .or_default()
             .push((h, rec));
     }
+    let rank_of = |r: &OwnedRecord| quality_rank(r.quality.as_ref(), ceiling);
 
     let mut plans = Vec::new();
     for ((media_type, tmdb_id), mut hashes) in groups {
@@ -1759,19 +1810,12 @@ pub(crate) fn plan_dedup(
             continue; // no possible duplicate
         }
         // Sort by keep-priority DESC; deterministic tie-break on hash ASC.
-        // `protected` (empty-provenance mirror or manual add) ranks FIRST so dedup never drops the
-        // user's own library copy in favour of an engine-acquired duplicate — otherwise a later
-        // Trigger-B abandonment of the surviving engine copy would net-remove content that
-        // `removal_hashes`' mirror/manual protection is meant to keep. (When provenance is uniform —
-        // e.g. all engine, or all mirror — this axis is constant and the prior selected>quality>
-        // episodes order is unchanged.)
         hashes.sort_by(|(ha, ra), (hb, rb)| {
             let key = |h: &str, r: &OwnedRecord| {
-                let protected = r.provenance.entries.is_empty() || r.provenance.has_manual_entry();
                 (
-                    protected,
-                    selected.contains(h),
+                    rank_of(r),
                     r.quality.as_ref().map(|q| q.score).unwrap_or(i64::MIN),
+                    selected.contains(h),
                     r.provides.len(),
                 )
             };
@@ -1785,11 +1829,9 @@ pub(crate) fn plan_dedup(
                 keep.push(hashes[0].0.clone());
                 for (h, r) in &hashes[1..] {
                     // A Manual-provenance copy is a protected never-auto-remove class (invariant
-                    // M-1): never dedup-remove it, even when a higher-keep-priority mirror/engine
-                    // duplicate won the keep slot. Both Manual and empty-provenance mirror rank as
-                    // `protected` on the sort axis, so without this a `selected`/higher-score mirror
-                    // could take hashes[0] and the Manual copy would be marked redundant — silently
-                    // dropping its never-auto-remove designation from the surviving group.
+                    // M-1): never dedup-remove it, even when a higher-keep-priority duplicate won the
+                    // keep slot — that would silently drop its never-auto-remove designation from the
+                    // surviving group.
                     if r.provenance.has_manual_entry() {
                         keep.push(h.clone());
                     } else {
@@ -1798,59 +1840,59 @@ pub(crate) fn plan_dedup(
                 }
             }
             MediaType::Show => {
-                let mut covered: HashSet<(u32, u32)> = HashSet::new();
+                // Per-hash episode SETS (a complete-series pack provides hundreds of episodes), so
+                // the coverage checks below are O(1) per episode.
+                let provides_of: HashMap<&str, HashSet<(u32, u32)>> = hashes
+                    .iter()
+                    .map(|(h, r)| (h.as_str(), r.provides.iter().copied().collect()))
+                    .collect();
+                let rank_by_hash: HashMap<&str, QualityRank> = hashes
+                    .iter()
+                    .map(|(h, r)| (h.as_str(), rank_of(r)))
+                    .collect();
+                // Manual (M-1) and unknown-coverage (empty `provides`) hashes are never removed.
+                let unremovable =
+                    |r: &OwnedRecord| r.provenance.has_manual_entry() || r.provides.is_empty();
+                // Every episode `h` provides is also provided by a hash in `by` (other than `h`)
+                // whose quality rank is at least `h`'s — the only coverage that may make `h`
+                // redundant (score ignored: same rank = same quality).
+                let covered_by_same_or_better = |h: &str, by: &[String]| {
+                    let mine = rank_by_hash[h];
+                    provides_of[h].iter().all(|ep| {
+                        by.iter().any(|k| {
+                            k.as_str() != h
+                                && rank_by_hash[k.as_str()] >= mine
+                                && provides_of[k.as_str()].contains(ep)
+                        })
+                    })
+                };
+                // Greedy pass, best first: every hash kept so far ranks at least as high, so this
+                // keeps a hash exactly when it adds an episode no kept hash provides yet.
                 for (h, r) in &hashes {
-                    if r.provides.is_empty() {
-                        keep.push(h.clone()); // unknown coverage → never remove on a guess
-                        continue;
-                    }
-                    // Keep this hash if it either adds episode coverage OR is a Manual copy (invariant
-                    // M-1: a Manual copy is never dedup-removed, even when fully covered — see the
-                    // Movie branch); otherwise it is a redundant duplicate → remove.
-                    if r.provenance.has_manual_entry()
-                        || r.provides.iter().any(|e| !covered.contains(e))
-                    {
-                        keep.push(h.clone());
-                        covered.extend(r.provides.iter().copied());
-                    } else {
+                    if !unremovable(r) && covered_by_same_or_better(h, &keep) {
                         remove.push(h.clone());
+                    } else {
+                        keep.push(h.clone());
                     }
                 }
-                // Second sweep — reclaim a fully-redundant kept hash that the greedy pass missed
-                // because it sorted BEFORE its covering superset (e.g. a higher-score/served singleton
-                // kept ahead of the lower-priority pack that also covers it). Remove any kept
-                // non-Manual, known-coverage hash whose EVERY episode is provided by the union of the
-                // OTHER still-kept hashes. Processed lowest-keep-priority first (keep is priority-DESC,
-                // so iterate in reverse) and re-checked against the CURRENT kept set after each removal
-                // — so a mutually-covering cycle (A⊆B∪C, B⊆A∪C, C⊆A∪B) drops only the redundant ones
-                // and never breaks total coverage.
-                let provides_of: HashMap<&str, &Vec<(u32, u32)>> = hashes
+                // Second sweep — reclaim a kept hash the greedy pass missed because it sorted BEFORE
+                // the copy that also covers it (e.g. a higher-score/served singleton kept ahead of an
+                // equal-quality pack covering it). Remove a kept, removable hash only when EVERY
+                // episode it provides is provided by ANOTHER still-kept hash of the same or better
+                // quality rank: a better copy is never removed because a worse one covers it.
+                // Processed lowest-keep-priority first (keep is priority-DESC, so iterate in reverse)
+                // and re-checked against the CURRENT kept set after each removal — so a
+                // mutually-covering cycle (A⊆B∪C, B⊆A∪C, C⊆A∪B) drops only the redundant ones and
+                // never breaks total coverage.
+                let removable: HashMap<&str, bool> = hashes
                     .iter()
-                    .map(|(h, r)| (h.as_str(), &r.provides))
-                    .collect();
-                let protected_from_removal: HashSet<&str> = hashes
-                    .iter()
-                    .filter(|(_, r)| r.provenance.has_manual_entry() || r.provides.is_empty())
-                    .map(|(h, _)| h.as_str())
+                    .map(|(h, r)| (h.as_str(), !unremovable(r)))
                     .collect();
                 let mut i = keep.len();
                 while i > 0 {
                     i -= 1;
                     let h = keep[i].clone();
-                    if protected_from_removal.contains(h.as_str()) {
-                        continue; // Manual / unknown-coverage: never removed
-                    }
-                    let my_provides = match provides_of.get(h.as_str()) {
-                        Some(p) => *p,
-                        None => continue,
-                    };
-                    let others_cover: HashSet<(u32, u32)> = keep
-                        .iter()
-                        .filter(|k| k.as_str() != h.as_str())
-                        .filter_map(|k| provides_of.get(k.as_str()))
-                        .flat_map(|p| p.iter().copied())
-                        .collect();
-                    if my_provides.iter().all(|e| others_cover.contains(e)) {
+                    if removable[h.as_str()] && covered_by_same_or_better(&h, &keep) {
                         keep.remove(i);
                         remove.push(h);
                     }
@@ -1913,7 +1955,8 @@ pub(crate) async fn dedup_owned(app: &AppState, torrents: &[crate::rd_client::To
     // Index slots by hash ONCE so per-removed-hash selection cleanup is O(1), not O(removed × table).
     let slots_by_hash = index_selection_slots_by_hash(&selection);
 
-    let mut plans = plan_dedup(&owned, &present, &selected);
+    let ceiling = app.config.acquisition.prefs.max_resolution.height();
+    let mut plans = plan_dedup(&owned, &present, &selected, ceiling);
     // Don't dedup a title with a FRESHLY-staged copy. The upgrade engine adds a new (better) hash and
     // records it owned BEFORE it repoints the selection + prunes the old hash; a concurrent dedup tick
     // (separate task) that saw both copies would keep the still-selected OLD hash and delete the
@@ -2834,8 +2877,8 @@ mod tests {
     }
 
     #[test]
-    fn mirror_quality_requires_known_resolution_and_source() {
-        let prefs = crate::config::AcquisitionConfig::default().prefs;
+    fn mirror_quality_records_every_video_file_including_unknown_and_over_ceiling() {
+        let prefs = crate::config::AcquisitionConfig::default().prefs; // 1080p ceiling
         let info = |path: &str| crate::rd_client::TorrentInfo {
             hash: "h".into(),
             files: vec![crate::rd_client::TorrentFile {
@@ -2846,16 +2889,35 @@ mod tests {
             }],
             ..Default::default()
         };
-        // Untagged filename → unknown on both axes → None (so the upgrade path won't risk a swap).
-        assert!(mirror_quality(&info("The Matrix (1999).mkv"), &prefs).is_none());
-        // Resolution tagged but no source → still unknown on an axis → None.
-        assert!(mirror_quality(&info("Movie.1080p.mkv"), &prefs).is_none());
-        // Both resolution and source tagged → Some, cached, with known axes.
+        let res_tier = |q: &crate::release::QualitySummary| (q.resolution, q.source_tier);
+        // Untagged filename → recorded, unknown on both axes (unknown = lowest quality, so any known
+        // cached release may replace it).
+        let untagged = mirror_quality(&info("The Matrix (1999).mkv"), &prefs).expect("recorded");
+        assert_eq!(res_tier(&untagged), (0, 0));
+        assert!(crate::release::is_unknown_quality(&untagged, 1080));
+        // Resolution tagged but no source → recorded with the known axis, still unknown.
+        let partial = mirror_quality(&info("Movie.1080p.mkv"), &prefs).expect("recorded");
+        assert_eq!(res_tier(&partial), (1080, 0));
+        assert!(crate::release::is_unknown_quality(&partial, 1080));
+        // Both resolution and source tagged → known.
         let q = mirror_quality(&info("Movie.2020.1080p.BluRay.x264.mkv"), &prefs)
             .expect("a fully-tagged file yields a comparable quality");
         assert!(q.cached);
         assert_eq!(q.resolution, 1080);
         assert!(q.source_tier > 0);
+        assert!(!crate::release::is_unknown_quality(&q, 1080));
+        // ABOVE the ceiling → its real resolution is recorded (it used to be dropped to `None`, which
+        // would now read as unknown-lowest): never unknown, so only a gated corrective downgrade can
+        // replace it — whatever its source tier.
+        let over =
+            mirror_quality(&info("Movie.2020.2160p.WEB-DL.x265.mkv"), &prefs).expect("recorded");
+        assert_eq!(res_tier(&over), (2160, 3_000));
+        let over_untagged =
+            mirror_quality(&info("Some.Show.S04E08.2160p.WEBMux.HDR.HEVC.mkv"), &prefs)
+                .expect("recorded");
+        assert_eq!(over_untagged.resolution, 2160);
+        assert!(!crate::release::is_unknown_quality(&over, 1080));
+        assert!(!crate::release::is_unknown_quality(&over_untagged, 1080));
         // A mirrored MKV/MP4 was never probed but is assumed fine (flagging every mirror copy would
         // churn the whole library through the upgrade pass) → not flagged.
         assert!(!q.unverified, "a mirrored .mkv is not flagged unverified");
@@ -2867,7 +2929,7 @@ mod tests {
         let avi = mirror_quality(&info("Movie.2020.1080p.BluRay.x264.avi"), &prefs)
             .expect("a fully-tagged .avi yields a comparable quality");
         assert!(avi.unverified, "a mirrored .avi must be flagged unverified");
-        // No video file at all → None.
+        // No video file at all → None (nothing to serve, nothing to compare).
         let no_video = crate::rd_client::TorrentInfo {
             hash: "h".into(),
             files: vec![crate::rd_client::TorrentFile {
@@ -2879,6 +2941,131 @@ mod tests {
             ..Default::default()
         };
         assert!(mirror_quality(&no_video, &prefs).is_none());
+    }
+
+    /// Existing `quality: None` records (account-mirror copies recorded before their quality was
+    /// derived, or recorded `None` for being above the ceiling) get their quality re-derived from
+    /// their torrent's representative file — so an over-ceiling copy is recognised as such instead
+    /// of reading as unknown-lowest. Only `Verified` records with no quality are touched.
+    #[tokio::test]
+    async fn backfill_owned_quality_re_derives_missing_qualities_from_file_names() {
+        use crate::scraper::MediaKind;
+        let store = Store::from_database(std::sync::Arc::new(
+            redb::Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        ))
+        .unwrap();
+        let base = dedup_rec(MediaKind::Movie, 1, vec![], None);
+        let known = qs(720, 3_000, 5);
+        for (h, quality, status) in [
+            ("uhd", None, OwnedStatus::Verified),
+            ("web", None, OwnedStatus::Verified),
+            ("kept", Some(known.clone()), OwnedStatus::Verified),
+            ("pending", None, OwnedStatus::Pending),
+            ("nofile", None, OwnedStatus::Verified),
+        ] {
+            store
+                .put_owned(
+                    h.into(),
+                    OwnedRecord {
+                        quality,
+                        status,
+                        ..base.clone()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let info = |hash: &str, path: &str| crate::rd_client::TorrentInfo {
+            hash: hash.to_ascii_uppercase(),
+            files: vec![crate::rd_client::TorrentFile {
+                id: 0,
+                path: path.into(),
+                bytes: 2_000_000_000,
+                selected: 1,
+            }],
+            ..Default::default()
+        };
+        let infos = [
+            info("uhd", "Movie.2160p.BluRay.REMUX.mkv"),
+            info("web", "Movie.1080p.WEB-DL.mkv"),
+            info("kept", "Movie.2160p.BluRay.REMUX.mkv"),
+            info("pending", "Movie.1080p.WEB-DL.mkv"),
+            // "nofile" has no listing entry → nothing known about it → left None.
+        ];
+        let prefs = crate::config::AcquisitionConfig::default().prefs;
+        let owned = store.all_owned().await;
+        let infos: Vec<&crate::rd_client::TorrentInfo> = infos.iter().collect();
+        let n = backfill_owned_quality(&store, &prefs, &owned, &infos).await;
+        assert_eq!(n, 2);
+        let q = |h: &str| {
+            let store = store.clone();
+            let h = h.to_string();
+            async move { store.get_owned(h).await.unwrap().quality }
+        };
+        let uhd = q("uhd").await.expect("derived");
+        assert_eq!((uhd.resolution, uhd.source_tier), (2160, 8_000));
+        let web = q("web").await.expect("derived");
+        assert_eq!((web.resolution, web.source_tier), (1080, 3_000));
+        assert_eq!(
+            q("kept").await,
+            Some(known),
+            "a recorded quality is never replaced"
+        );
+        assert_eq!(
+            q("pending").await,
+            None,
+            "a Pending record gets its quality from observe"
+        );
+        assert_eq!(q("nofile").await, None);
+    }
+
+    /// The scan loop's account-mirror pass runs the backfill over the identified torrents, so an
+    /// already-mirrored `quality: None` record gets its quality (and the dedup pass that follows in
+    /// the same tick sees it).
+    #[tokio::test]
+    async fn record_mirror_owned_backfills_an_existing_mirror_record_without_quality() {
+        use crate::scraper::MediaKind;
+        let store = Store::from_database(std::sync::Arc::new(
+            redb::Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        ))
+        .unwrap();
+        store
+            .put_owned("mir".into(), dedup_rec(MediaKind::Movie, 603, vec![], None))
+            .await
+            .unwrap();
+        let data = vec![(
+            crate::rd_client::TorrentInfo {
+                hash: "MIR".into(),
+                files: vec![crate::rd_client::TorrentFile {
+                    id: 0,
+                    path: "The.Matrix.1999.2160p.UHD.BluRay.REMUX.mkv".into(),
+                    bytes: 60_000_000_000,
+                    selected: 1,
+                }],
+                ..Default::default()
+            },
+            MediaMetadata {
+                title: "The Matrix".into(),
+                year: Some("1999".into()),
+                media_type: MediaType::Movie,
+                external_id: Some("tmdb:603".into()),
+            },
+        )];
+        let tmdb = TmdbClient::new("k".into()).unwrap(); // never called: the hash is already owned
+        let prefs = crate::config::AcquisitionConfig::default().prefs;
+        record_mirror_owned(&store, &tmdb, &prefs, &data).await;
+        let q = store
+            .get_owned("mir".into())
+            .await
+            .unwrap()
+            .quality
+            .expect("backfilled");
+        assert_eq!(q.resolution, 2160);
+        assert!(!crate::release::is_unknown_quality(&q, 1080));
     }
 
     #[test]
@@ -3293,18 +3480,65 @@ mod tests {
             added_at: 0,
             status: OwnedStatus::Verified,
             provides,
-            quality: score.map(|s| crate::release::QualitySummary {
-                cached: true,
-                source_tier: 0,
-                resolution: 1080,
-                score: s,
-                unverified: false,
-            }),
+            // A KNOWN quality (1080p WEB) differing only in score, so these tests exercise the
+            // score / selected / episode-count / hash axes; `None` is unknown (the lowest).
+            quality: score.map(|s| qs(1080, 3_000, s)),
         }
     }
 
     fn hset(items: &[&str]) -> std::collections::HashSet<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A cached quality snapshot with the given resolution / source tier / score.
+    fn qs(resolution: u16, source_tier: i64, score: i64) -> crate::release::QualitySummary {
+        crate::release::QualitySummary {
+            cached: true,
+            source_tier,
+            resolution,
+            score,
+            unverified: false,
+        }
+    }
+
+    /// `plan_dedup` under the default 1080p `MAX_RESOLUTION` ceiling.
+    fn plan(
+        owned: &[(String, OwnedRecord)],
+        present: &std::collections::HashSet<String>,
+        selected: &std::collections::HashSet<String>,
+    ) -> Vec<DedupPlan> {
+        plan_dedup(owned, present, selected, 1080)
+    }
+
+    /// A dedup fixture record with an explicit quality and provenance.
+    fn qrec(
+        kind: crate::scraper::MediaKind,
+        tmdb: u64,
+        provides: Vec<(u32, u32)>,
+        quality: Option<crate::release::QualitySummary>,
+        provenance: Provenance,
+    ) -> OwnedRecord {
+        OwnedRecord {
+            quality,
+            provenance,
+            ..dedup_rec(kind, tmdb, provides, None)
+        }
+    }
+
+    /// Every episode of `season` from `first` to `last` inclusive.
+    fn eps(season: u32, first: u32, last: u32) -> Vec<(u32, u32)> {
+        (first..=last).map(|e| (season, e)).collect()
+    }
+
+    /// The removal set of the plan for `tmdb` (empty when the planner proposes nothing for it).
+    fn removed_for(plans: &[DedupPlan], tmdb: u64) -> Vec<String> {
+        let mut rm: Vec<String> = plans
+            .iter()
+            .filter(|p| p.tmdb_id == tmdb)
+            .flat_map(|p| p.remove.clone())
+            .collect();
+        rm.sort();
+        rm
     }
 
     #[test]
@@ -3324,7 +3558,7 @@ mod tests {
                 dedup_rec(MediaKind::Movie, 1, vec![], Some(50)),
             ),
         ];
-        let plans = plan_dedup(&owned, &hset(&["a", "b", "c"]), &hset(&[]));
+        let plans = plan(&owned, &hset(&["a", "b", "c"]), &hset(&[]));
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].keep, vec!["a"], "the highest-score hash is kept");
         let mut rm = plans[0].remove.clone();
@@ -3333,9 +3567,10 @@ mod tests {
     }
 
     #[test]
-    fn plan_dedup_movie_prefers_currently_served() {
+    fn plan_dedup_movie_prefers_currently_served_only_among_equal_quality() {
         use crate::scraper::MediaKind;
-        // `selected` outranks quality: keep the served (lower-score) hash to avoid disrupting playback.
+        // Quality outranks `selected`: a better copy (higher score at the same resolution + tier) is
+        // kept over the served one…
         let owned = vec![
             (
                 "served".to_string(),
@@ -3346,10 +3581,25 @@ mod tests {
                 dedup_rec(MediaKind::Movie, 1, vec![], Some(99)),
             ),
         ];
-        let plans = plan_dedup(&owned, &hset(&["served", "better"]), &hset(&["served"]));
+        let plans = plan(&owned, &hset(&["served", "better"]), &hset(&["served"]));
         assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].keep, vec!["served"]);
-        assert_eq!(plans[0].remove, vec!["better"]);
+        assert_eq!(plans[0].keep, vec!["better"], "quality first");
+        assert_eq!(plans[0].remove, vec!["served"]);
+        // …while between EQUAL-quality copies the served one is kept (no needless playback churn),
+        // even though the other sorts first by hash.
+        let owned = vec![
+            (
+                "aother".to_string(),
+                dedup_rec(MediaKind::Movie, 1, vec![], Some(10)),
+            ),
+            (
+                "zserved".to_string(),
+                dedup_rec(MediaKind::Movie, 1, vec![], Some(10)),
+            ),
+        ];
+        let plans = plan(&owned, &hset(&["aother", "zserved"]), &hset(&["zserved"]));
+        assert_eq!(plans[0].keep, vec!["zserved"]);
+        assert_eq!(plans[0].remove, vec!["aother"]);
     }
 
     #[test]
@@ -3371,7 +3621,7 @@ mod tests {
                 dedup_rec(MediaKind::Movie, 1, vec![], Some(1)),
             ),
         ];
-        let plans = plan_dedup(&owned, &hset(&["man", "mir1", "mir2"]), &hset(&["mir1"]));
+        let plans = plan(&owned, &hset(&["man", "mir1", "mir2"]), &hset(&["mir1"]));
         assert_eq!(plans.len(), 1);
         assert!(
             !plans[0].remove.contains(&"man".to_string()),
@@ -3405,7 +3655,7 @@ mod tests {
             ("dup".to_string(), dup),
         ];
         // `pack` is `selected` so it wins the keep slot; `man` and `dup` are both fully covered by it.
-        let plans = plan_dedup(&owned, &hset(&["pack", "man", "dup"]), &hset(&["pack"]));
+        let plans = plan(&owned, &hset(&["pack", "man", "dup"]), &hset(&["pack"]));
         assert_eq!(plans.len(), 1);
         assert!(
             !plans[0].remove.contains(&"man".to_string()),
@@ -3433,7 +3683,7 @@ mod tests {
                 dedup_rec(MediaKind::Series, 2, vec![(1, 1)], Some(5)),
             ),
         ];
-        let plans = plan_dedup(&owned, &hset(&["pack", "single"]), &hset(&[]));
+        let plans = plan(&owned, &hset(&["pack", "single"]), &hset(&[]));
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].keep, vec!["pack"]);
         assert_eq!(
@@ -3459,7 +3709,7 @@ mod tests {
                 dedup_rec(MediaKind::Series, 7, vec![(1, 1), (1, 2)], Some(50)),
             ),
         ];
-        let plans = plan_dedup(&owned, &hset(&["single", "pack"]), &hset(&[]));
+        let plans = plan(&owned, &hset(&["single", "pack"]), &hset(&[]));
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].keep, vec!["pack"], "the covering pack is kept");
         assert_eq!(
@@ -3488,7 +3738,7 @@ mod tests {
                 dedup_rec(MediaKind::Series, 8, vec![(1, 1), (1, 3)], Some(10)),
             ),
         ];
-        let plans = plan_dedup(&owned, &hset(&["a", "b", "c"]), &hset(&[]));
+        let plans = plan(&owned, &hset(&["a", "b", "c"]), &hset(&[]));
         // Coverage of the KEPT set must remain {(1,1),(1,2),(1,3)} — never lose an episode.
         let kept: std::collections::HashSet<&str> = plans
             .first()
@@ -3524,7 +3774,7 @@ mod tests {
                 dedup_rec(MediaKind::Series, 3, vec![], None),
             ),
         ];
-        let plans = plan_dedup(&owned, &hset(&["a", "b", "unknown"]), &hset(&[]));
+        let plans = plan(&owned, &hset(&["a", "b", "unknown"]), &hset(&[]));
         assert!(
             plans.is_empty(),
             "complementary packs + an unknown-coverage hash yield no removals"
@@ -3553,52 +3803,103 @@ mod tests {
     }
 
     #[test]
-    fn plan_dedup_movie_keeps_mirror_over_higher_quality_engine_copy() {
+    fn plan_dedup_keeps_the_better_copy_whether_mirror_or_engine() {
         use crate::scraper::MediaKind;
-        // A movie owned as BOTH a mirror copy (empty provenance) and a higher-quality engine copy
-        // (watchlist provenance) must KEEP the mirror — otherwise a later Trigger-B abandonment of the
-        // engine copy net-removes the user's own library content that mirror-protection guards.
-        let mirror = dedup_rec(MediaKind::Movie, 1, vec![], Some(10)); // empty provenance, lower score
-        let mut engine = dedup_rec(MediaKind::Movie, 1, vec![], Some(99)); // higher score
-        engine.provenance = Provenance::watchlist("alice");
+        // Pre-existing account-mirror copies (empty provenance) get NO dedup protection: the better
+        // copy is kept whichever side it is on.
+        let mirror = |q| {
+            qrec(
+                MediaKind::Movie,
+                1,
+                vec![],
+                q,
+                Provenance { entries: vec![] },
+            )
+        };
+        let engine = |q| {
+            qrec(
+                MediaKind::Movie,
+                1,
+                vec![],
+                q,
+                Provenance::watchlist("alice"),
+            )
+        };
+        let both = hset(&["mirror", "engine"]);
+        // A pre-existing WEB copy loses to a better engine REMUX…
         let owned = vec![
-            ("mirror".to_string(), mirror),
-            ("engine".to_string(), engine),
+            (
+                "mirror".to_string(),
+                mirror(Some(qs(1080, 3_000, 1_113_000))),
+            ),
+            (
+                "engine".to_string(),
+                engine(Some(qs(1080, 8_000, 1_118_000))),
+            ),
         ];
-        let plans = plan_dedup(&owned, &hset(&["mirror", "engine"]), &hset(&[]));
-        assert_eq!(plans.len(), 1);
-        assert_eq!(
-            plans[0].keep,
-            vec!["mirror"],
-            "the protected (empty-provenance) mirror copy must be kept"
-        );
+        let plans = plan(&owned, &both, &hset(&["mirror"]));
+        assert_eq!(plans[0].keep, vec!["engine"]);
+        assert_eq!(plans[0].remove, vec!["mirror"]);
+        // …and a pre-existing REMUX beats a worse engine WEB copy.
+        let owned = vec![
+            (
+                "mirror".to_string(),
+                mirror(Some(qs(1080, 8_000, 1_118_000))),
+            ),
+            (
+                "engine".to_string(),
+                engine(Some(qs(1080, 3_000, 1_113_000))),
+            ),
+        ];
+        let plans = plan(&owned, &both, &hset(&["engine"]));
+        assert_eq!(plans[0].keep, vec!["mirror"]);
         assert_eq!(plans[0].remove, vec!["engine"]);
+        // A pre-existing copy with NO recorded quality is unknown — below any known quality, even a
+        // lower resolution.
+        let owned = vec![
+            ("mirror".to_string(), mirror(None)),
+            (
+                "engine".to_string(),
+                engine(Some(qs(720, 3_000, 1_075_000))),
+            ),
+        ];
+        let plans = plan(&owned, &both, &hset(&["mirror"]));
+        assert_eq!(plans[0].keep, vec!["engine"], "known before unknown");
+        assert_eq!(plans[0].remove, vec!["mirror"]);
     }
 
     #[test]
-    fn plan_dedup_show_prefers_currently_served_over_higher_quality() {
+    fn plan_dedup_show_quality_outranks_currently_served() {
         use crate::scraper::MediaKind;
-        // Show set-cover keep-priority: `selected` outranks quality, exactly like the movie path. Two
-        // packs with IDENTICAL coverage — the actively-served (lower-score) one must be KEPT and the
-        // higher-score one removed, so dedup never tears down the pack a player is reading.
+        // Two packs with IDENTICAL coverage: the higher-tier one is kept even though the other is
+        // the one being served (removal is idle-gated and the slots re-derive from the kept pack).
+        let pack = |q| {
+            qrec(
+                MediaKind::Series,
+                2,
+                eps(1, 1, 2),
+                q,
+                Provenance::watchlist("a"),
+            )
+        };
         let owned = vec![
+            ("served".to_string(), pack(Some(qs(1080, 3_000, 1_113_000)))),
+            ("better".to_string(), pack(Some(qs(1080, 6_000, 1_116_000)))),
+        ];
+        let plans = plan(&owned, &hset(&["served", "better"]), &hset(&["served"]));
+        assert_eq!(plans[0].keep, vec!["better"]);
+        assert_eq!(plans[0].remove, vec!["served"]);
+        // Equal quality (same rank AND score): the served pack is kept.
+        let owned = vec![
+            ("aother".to_string(), pack(Some(qs(1080, 6_000, 1_116_000)))),
             (
-                "served".to_string(),
-                dedup_rec(MediaKind::Series, 2, vec![(1, 1), (1, 2)], Some(10)),
-            ),
-            (
-                "better".to_string(),
-                dedup_rec(MediaKind::Series, 2, vec![(1, 1), (1, 2)], Some(99)),
+                "zserved".to_string(),
+                pack(Some(qs(1080, 6_000, 1_116_000))),
             ),
         ];
-        let plans = plan_dedup(
-            &owned,
-            &hset(&["served", "better"]),
-            /*selected*/ &hset(&["served"]),
-        );
-        assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].keep, vec!["served"], "the served pack is kept");
-        assert_eq!(plans[0].remove, vec!["better"]);
+        let plans = plan(&owned, &hset(&["aother", "zserved"]), &hset(&["zserved"]));
+        assert_eq!(plans[0].keep, vec!["zserved"]);
+        assert_eq!(plans[0].remove, vec!["aother"]);
     }
 
     #[test]
@@ -3624,7 +3925,7 @@ mod tests {
                 dedup_rec(MediaKind::Series, 7, vec![(1, 1), (1, 2)], Some(10)),
             ),
         ];
-        let plans = plan_dedup(&owned, &hset(&["asmall", "zbig"]), &hset(&[]));
+        let plans = plan(&owned, &hset(&["asmall", "zbig"]), &hset(&[]));
         assert_eq!(plans.len(), 1);
         assert_eq!(
             plans[0].keep,
@@ -3652,8 +3953,503 @@ mod tests {
             ),
         ];
         // Only `a` is present → no duplicate to act on (`b` is already gone from the provider).
-        let plans = plan_dedup(&owned, &hset(&["a"]), &hset(&[]));
+        let plans = plan(&owned, &hset(&["a"]), &hset(&[]));
         assert!(plans.is_empty());
+    }
+
+    /// Replay of the 2026-11-11 incident: five titles where the old planner's second sweep deleted a
+    /// BETTER copy because a worse one covered its episodes (the per-title data — provenance,
+    /// `provides`, recorded quality, served slots — is the live library's at the time, but the
+    /// titles, TMDB ids and 8-char hash prefixes are made up, in the same relative order). Under
+    /// the quality-first keep-priority and the same-or-better second sweep none of those removals
+    /// happens.
+    #[test]
+    fn plan_dedup_incident_replay_keeps_every_better_copy() {
+        use crate::scraper::MediaKind::Series;
+        let w = || Provenance::watchlist("u");
+        let i = || Provenance::in_progress("u");
+        let mirror = || Provenance { entries: vec![] };
+        let q = |res: u16, tier: i64, score: i64, unverified: bool| {
+            Some(crate::release::QualitySummary {
+                unverified,
+                ..qs(res, tier, score)
+            })
+        };
+        let mut wi = w();
+        wi.merge(&i());
+        let show_b_pack: Vec<(u32, u32)> = (1..=4)
+            .flat_map(|s| eps(s, 1, 10))
+            .chain(eps(5, 1, 10))
+            .chain(eps(6, 1, 13))
+            .collect();
+        let mut show_c_s1_web = eps(1, 1, 17);
+        show_c_s1_web.extend(eps(1, 19, 22));
+        let owned: Vec<(String, OwnedRecord)> = vec![
+            // Show A (tmdb 900500): English 1080p WEB singles E01–E03 + the Russian SD .avi pack E01–E04.
+            (
+                "0c000000",
+                qrec(
+                    Series,
+                    900500,
+                    eps(1, 1, 4),
+                    q(0, 3_000, 1_003_002, true),
+                    wi,
+                ),
+            ),
+            (
+                "c0000000",
+                qrec(
+                    Series,
+                    900500,
+                    vec![(1, 3)],
+                    q(1080, 3_000, 1_118_222, false),
+                    w(),
+                ),
+            ),
+            (
+                "30000000",
+                qrec(
+                    Series,
+                    900500,
+                    vec![(1, 2)],
+                    q(1080, 3_000, 1_118_302, false),
+                    w(),
+                ),
+            ),
+            (
+                "b4000000",
+                qrec(
+                    Series,
+                    900500,
+                    vec![(1, 1)],
+                    q(1080, 3_000, 1_118_328, false),
+                    w(),
+                ),
+            ),
+            // A mirror copy of E01 that had already left the account (absent → ignored).
+            (
+                "6c000000",
+                qrec(
+                    Series,
+                    900500,
+                    vec![(1, 1)],
+                    q(1080, 3_000, 1_113_000, false),
+                    mirror(),
+                ),
+            ),
+            // Show B (tmdb 900200): S06 1080p REMUX + the S01–S06 1080p BluRay pack.
+            (
+                "60000000",
+                qrec(
+                    Series,
+                    900200,
+                    show_b_pack,
+                    q(1080, 6_000, 1_122_052, false),
+                    i(),
+                ),
+            ),
+            (
+                "cc000000",
+                qrec(
+                    Series,
+                    900200,
+                    eps(6, 1, 13),
+                    q(1080, 8_000, 1_123_016, false),
+                    i(),
+                ),
+            ),
+            // Show C (tmdb 900100): a WEB copy (resolution untagged) + an untagged .avi pack.
+            ("78000000", {
+                let mut all = eps(1, 1, 22);
+                all.extend(eps(2, 1, 13));
+                qrec(Series, 900100, all, q(0, 0, 1_000_022, true), w())
+            }),
+            (
+                "e4000000",
+                qrec(
+                    Series,
+                    900100,
+                    show_c_s1_web,
+                    q(0, 3_000, 1_005_022, false),
+                    w(),
+                ),
+            ),
+            // Show D (tmdb 900400): S03E01–07 1080p WEB + unknown-quality copies.
+            (
+                "54000000",
+                qrec(Series, 900400, eps(2, 1, 5), None, mirror()),
+            ),
+            (
+                "d8000000",
+                qrec(
+                    Series,
+                    900400,
+                    eps(1, 1, 5),
+                    q(1080, 0, 1_115_200, false),
+                    i(),
+                ),
+            ),
+            (
+                "84000000",
+                qrec(
+                    Series,
+                    900400,
+                    vec![(2, 7)],
+                    q(1080, 3_000, 1_113_434, false),
+                    i(),
+                ),
+            ),
+            (
+                "24000000",
+                qrec(
+                    Series,
+                    900400,
+                    vec![(2, 6)],
+                    q(1080, 3_000, 1_113_220, false),
+                    i(),
+                ),
+            ),
+            (
+                "18000000",
+                qrec(
+                    Series,
+                    900400,
+                    eps(3, 1, 8),
+                    q(720, 0, 1_079_004, false),
+                    i(),
+                ),
+            ),
+            (
+                "48000000",
+                qrec(
+                    Series,
+                    900400,
+                    eps(3, 1, 7),
+                    q(1080, 3_000, 1_118_022, false),
+                    i(),
+                ),
+            ),
+            ("90000000", qrec(Series, 900400, vec![], None, mirror())), // absent
+            // Show E (tmdb 900300): pre-existing S01 + S03 1080p REMUX + the S01–S03 BluRay pack.
+            ("3c000000", {
+                let all: Vec<(u32, u32)> = (1..=3).flat_map(|s| eps(s, 1, 10)).collect();
+                qrec(Series, 900300, all, q(1080, 6_000, 1_121_274, false), i())
+            }),
+            (
+                "a8000000",
+                qrec(
+                    Series,
+                    900300,
+                    eps(1, 1, 10),
+                    q(1080, 8_000, 1_118_000, false),
+                    mirror(),
+                ),
+            ),
+            (
+                "9c000000",
+                qrec(
+                    Series,
+                    900300,
+                    eps(3, 1, 10),
+                    q(1080, 8_000, 1_118_000, false),
+                    mirror(),
+                ),
+            ),
+        ]
+        .into_iter()
+        .map(|(h, r)| (h.to_string(), r))
+        .collect();
+        let present: std::collections::HashSet<String> = owned
+            .iter()
+            .map(|(h, _)| h.clone())
+            .filter(|h| h != "6c000000" && h != "90000000")
+            .collect();
+        // Every engine copy served at least one slot; the mirror copies served none.
+        let selected: std::collections::HashSet<String> = owned
+            .iter()
+            .filter(|(_, r)| !r.provenance.entries.is_empty())
+            .map(|(h, _)| h.clone())
+            .collect();
+        let plans = plan(&owned, &present, &selected);
+        // What the old planner deleted, per title.
+        for (title, tmdb, deleted) in [
+            ("Show A", 900500, &["c0000000", "30000000", "b4000000"][..]),
+            ("Show B", 900200, &["cc000000"][..]),
+            ("Show C", 900100, &["e4000000"][..]),
+            ("Show D", 900400, &["48000000"][..]),
+            ("Show E", 900300, &["a8000000", "9c000000"][..]),
+        ] {
+            let rm = removed_for(&plans, tmdb);
+            for h in deleted {
+                assert!(
+                    !rm.contains(&h.to_string()),
+                    "{title}: {h} must be kept, plan removes {rm:?}"
+                );
+            }
+            assert!(
+                rm.is_empty(),
+                "{title}: nothing is redundant at same-or-better quality, got {rm:?}"
+            );
+        }
+    }
+
+    /// A South-Park-style library: a complete-series pack plus season packs inside it. A season pack
+    /// at the SAME quality is a genuine duplicate (removed, mirror copies included); so is a worse
+    /// one; a season pack of BETTER quality than the complete pack is kept, and so is an episode only
+    /// one copy provides.
+    #[test]
+    fn plan_dedup_removes_equal_or_worse_season_packs_inside_a_complete_pack() {
+        use crate::scraper::MediaKind::Series;
+        let complete: Vec<(u32, u32)> = (1..=3).flat_map(|s| eps(s, 1, 10)).collect();
+        let engine = || Provenance::in_progress("u");
+        let mirror = || Provenance { entries: vec![] };
+        let owned: Vec<(String, OwnedRecord)> = vec![
+            (
+                "complete",
+                qrec(
+                    Series,
+                    2190,
+                    complete,
+                    Some(qs(1080, 6_000, 1_200_000)),
+                    engine(),
+                ),
+            ),
+            (
+                "s1pack",
+                qrec(
+                    Series,
+                    2190,
+                    eps(1, 1, 10),
+                    Some(qs(1080, 6_000, 1_190_000)),
+                    engine(),
+                ),
+            ),
+            (
+                "s2pack",
+                qrec(
+                    Series,
+                    2190,
+                    eps(2, 1, 10),
+                    Some(qs(1080, 6_000, 1_250_000)),
+                    mirror(),
+                ),
+            ),
+            (
+                "s3web",
+                qrec(
+                    Series,
+                    2190,
+                    eps(3, 1, 10),
+                    Some(qs(1080, 3_000, 1_113_000)),
+                    engine(),
+                ),
+            ),
+            (
+                "s2remux",
+                qrec(
+                    Series,
+                    2190,
+                    eps(2, 1, 10),
+                    Some(qs(1080, 8_000, 1_118_000)),
+                    engine(),
+                ),
+            ),
+            ("s4single", qrec(Series, 2190, vec![(4, 1)], None, mirror())),
+        ]
+        .into_iter()
+        .map(|(h, r)| (h.to_string(), r))
+        .collect();
+        let all: std::collections::HashSet<String> = owned.iter().map(|(h, _)| h.clone()).collect();
+        // The season packs are the ones being served.
+        let plans = plan(&owned, &all, &hset(&["s1pack", "s2pack", "s3web"]));
+        assert_eq!(removed_for(&plans, 2190), vec!["s1pack", "s2pack", "s3web"]);
+        let mut keep = plans[0].keep.clone();
+        keep.sort();
+        assert_eq!(keep, vec!["complete", "s2remux", "s4single"]);
+    }
+
+    /// The second sweep removes a kept copy only when EVERY one of its episodes is provided by another
+    /// kept copy of the same-or-better quality (rank: known, resolution, tier — score ignored).
+    #[test]
+    fn plan_dedup_second_sweep_needs_same_or_better_coverage() {
+        use crate::scraper::MediaKind::Series;
+        let p = || Provenance::watchlist("a");
+        let all = hset(&["single", "pack"]);
+        // A higher-tier single covered only by a lower-tier pack is kept…
+        let owned = vec![
+            (
+                "single".to_string(),
+                qrec(Series, 9, vec![(1, 1)], Some(qs(1080, 8_000, 1)), p()),
+            ),
+            (
+                "pack".to_string(),
+                qrec(Series, 9, eps(1, 1, 2), Some(qs(1080, 6_000, 2)), p()),
+            ),
+        ];
+        assert!(
+            plan(&owned, &all, &hset(&[])).is_empty(),
+            "a worse cover never removes it"
+        );
+        // …and so is a known single covered only by an unknown-quality pack, whatever its score…
+        let owned = vec![
+            (
+                "single".to_string(),
+                qrec(Series, 9, vec![(1, 1)], Some(qs(720, 1_000, 1)), p()),
+            ),
+            (
+                "pack".to_string(),
+                qrec(Series, 9, eps(1, 1, 2), Some(qs(0, 8_000, 9_999_999)), p()),
+            ),
+        ];
+        assert!(
+            plan(&owned, &all, &hset(&[])).is_empty(),
+            "unknown is below any known quality"
+        );
+        // …while an equal-rank pack reclaims it even with a LOWER score (score is ignored).
+        let owned = vec![
+            (
+                "single".to_string(),
+                qrec(Series, 9, vec![(1, 1)], Some(qs(1080, 6_000, 9)), p()),
+            ),
+            (
+                "pack".to_string(),
+                qrec(Series, 9, eps(1, 1, 2), Some(qs(1080, 6_000, 1)), p()),
+            ),
+        ];
+        let plans = plan(&owned, &all, &hset(&["single"]));
+        assert_eq!(removed_for(&plans, 9), vec!["single"]);
+        // Coverage split across two kept copies: each episode needs a same-or-better provider.
+        // E1 is covered by an equal pack, E2 only by a worse one → the single is kept.
+        let owned = vec![
+            (
+                "single".to_string(),
+                qrec(Series, 9, eps(1, 1, 2), Some(qs(1080, 6_000, 9)), p()),
+            ),
+            (
+                "eq".to_string(),
+                qrec(
+                    Series,
+                    9,
+                    vec![(1, 1), (1, 3)],
+                    Some(qs(1080, 6_000, 1)),
+                    p(),
+                ),
+            ),
+            (
+                "worse".to_string(),
+                qrec(
+                    Series,
+                    9,
+                    vec![(1, 2), (1, 4)],
+                    Some(qs(1080, 3_000, 1)),
+                    p(),
+                ),
+            ),
+        ];
+        let plans = plan(&owned, &hset(&["single", "eq", "worse"]), &hset(&[]));
+        assert!(
+            removed_for(&plans, 9).is_empty(),
+            "E2's only other provider is worse"
+        );
+    }
+
+    /// Dedup never ranks by `MAX_RESOLUTION`: a copy above the ceiling is not ranked down for it (the
+    /// corrective downgrade is the upgrade engine's job under `ALLOW_RESOLUTION_DOWNGRADE`), and one
+    /// whose tier is untagged is not unknown-lowest either.
+    #[test]
+    fn plan_dedup_never_trades_an_over_ceiling_copy_down() {
+        use crate::scraper::MediaKind::{Movie, Series};
+        let p = || Provenance { entries: vec![] };
+        for over in [qs(2160, 3_000, 1_216_000), qs(2160, 0, 1_216_000)] {
+            let owned = vec![
+                (
+                    "uhd".to_string(),
+                    qrec(Movie, 5, vec![], Some(over.clone()), p()),
+                ),
+                (
+                    "remux".to_string(),
+                    qrec(Movie, 5, vec![], Some(qs(1080, 8_000, 1_118_000)), p()),
+                ),
+            ];
+            let plans = plan(&owned, &hset(&["uhd", "remux"]), &hset(&["remux"]));
+            assert_eq!(
+                plans[0].keep,
+                vec!["uhd"],
+                "{over:?} outranks a 1080p REMUX"
+            );
+            // A show pack above the ceiling, covered by within-ceiling REMUX packs, is kept too.
+            let owned = vec![
+                (
+                    "uhd".to_string(),
+                    qrec(Series, 6, eps(1, 1, 4), Some(over.clone()), p()),
+                ),
+                (
+                    "r1".to_string(),
+                    qrec(Series, 6, eps(1, 1, 2), Some(qs(1080, 8_000, 1)), p()),
+                ),
+                (
+                    "r2".to_string(),
+                    qrec(Series, 6, eps(1, 3, 4), Some(qs(1080, 8_000, 1)), p()),
+                ),
+            ];
+            let plans = plan(&owned, &hset(&["uhd", "r1", "r2"]), &hset(&[]));
+            assert!(
+                !removed_for(&plans, 6).contains(&"uhd".to_string()),
+                "{over:?} pack must not be removed in favour of 1080p packs"
+            );
+        }
+    }
+
+    /// Keep-priority among unknown copies (both below every known one): resolution, then source tier,
+    /// then score; a copy with no recorded quality at all is the lowest.
+    #[test]
+    fn plan_dedup_orders_unknown_copies_below_known_ones() {
+        use crate::scraper::MediaKind::Movie;
+        let p = || Provenance { entries: vec![] };
+        let owned = vec![
+            ("none".to_string(), qrec(Movie, 7, vec![], None, p())),
+            (
+                "res0".to_string(),
+                qrec(Movie, 7, vec![], Some(qs(0, 8_000, 9_999_999)), p()),
+            ),
+            (
+                "tier0".to_string(),
+                qrec(Movie, 7, vec![], Some(qs(1080, 0, 9_999_999)), p()),
+            ),
+            (
+                "known".to_string(),
+                qrec(Movie, 7, vec![], Some(qs(720, 1_000, 1)), p()),
+            ),
+        ];
+        let all = hset(&["none", "res0", "tier0", "known"]);
+        let plans = plan(&owned, &all, &hset(&["none", "res0", "tier0"]));
+        assert_eq!(
+            plans[0].keep,
+            vec!["known"],
+            "any known quality beats every unknown one"
+        );
+        let without_known: Vec<_> = owned
+            .iter()
+            .filter(|(h, _)| h != "known")
+            .cloned()
+            .collect();
+        let plans = plan(&without_known, &all, &hset(&[]));
+        assert_eq!(
+            plans[0].keep,
+            vec!["tier0"],
+            "among unknowns, resolution first"
+        );
+        let only: Vec<_> = owned
+            .iter()
+            .filter(|(h, _)| h == "none" || h == "res0")
+            .cloned()
+            .collect();
+        let plans = plan(&only, &all, &hset(&["none"]));
+        assert_eq!(
+            plans[0].keep,
+            vec!["res0"],
+            "a recorded tier beats no quality at all"
+        );
     }
 }
 
@@ -3727,7 +4523,7 @@ mod provider_abstraction_tests {
             scraper,
             engine,
             trakt_client: None,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
         };
         let _config = ScanConfig { app };
     }
@@ -5610,7 +6406,7 @@ mod reconcile_wanted_tests {
             ..Default::default()
         });
         let torrents = provider.get_torrents().await.unwrap();
-        let idle = Arc::new(crate::read_activity::ReadActivity::new());
+        let idle = Arc::new(crate::read_activity::ReadActivity::without_startup_grace());
         execute_remove(
             &provider,
             &torrents,
@@ -5663,7 +6459,7 @@ mod reconcile_wanted_tests {
             ..Default::default()
         });
         let torrents = provider.get_torrents().await.unwrap();
-        let activity = Arc::new(crate::read_activity::ReadActivity::new());
+        let activity = Arc::new(crate::read_activity::ReadActivity::without_startup_grace());
         activity.touch("Movies/M/m.mkv").await; // an active read
         execute_remove(
             &provider,
@@ -5689,6 +6485,51 @@ mod reconcile_wanted_tests {
         );
     }
 
+    /// Start-up grace: a Trigger-A/B removal right after the process starts (fresh tracker, no read
+    /// history yet) defers for the first idle window, exactly like an active library.
+    #[tokio::test]
+    async fn execute_remove_defers_during_the_startup_grace() {
+        let store = mem_store();
+        store
+            .put_owned(
+                "h1".into(),
+                owned_record(27205, MediaKind::Movie, Provenance::watchlist("alice")),
+            )
+            .await
+            .unwrap();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent {
+                id: "tid".into(),
+                hash: "h1".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let torrents = provider.get_torrents().await.unwrap();
+        let fresh = Arc::new(crate::read_activity::ReadActivity::new());
+        execute_remove(
+            &provider,
+            &torrents,
+            &store,
+            &fresh,
+            Duration::from_secs(300),
+            27205,
+            &["h1".to_string()],
+        )
+        .await;
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "no delete during the grace"
+        );
+        assert!(
+            store.get_owned("h1".into()).await.is_some(),
+            "kept for a later tick"
+        );
+    }
+
     #[tokio::test]
     async fn execute_remove_deletes_torrent_and_owned_record() {
         let store = mem_store();
@@ -5705,7 +6546,7 @@ mod reconcile_wanted_tests {
             ..Default::default()
         });
         let torrents = vec![torrent("t1", "H1")]; // hash case differs from stored "h1"
-        let idle = Arc::new(crate::read_activity::ReadActivity::new());
+        let idle = Arc::new(crate::read_activity::ReadActivity::without_startup_grace());
         execute_remove(
             &provider,
             &torrents,
@@ -5756,7 +6597,7 @@ mod reconcile_wanted_tests {
             ..Default::default()
         });
         let torrents = vec![torrent("t1", "h1")];
-        let idle = Arc::new(crate::read_activity::ReadActivity::new());
+        let idle = Arc::new(crate::read_activity::ReadActivity::without_startup_grace());
         execute_remove(
             &provider,
             &torrents,
@@ -5829,7 +6670,7 @@ mod reconcile_wanted_tests {
         );
         let tmdb = crate::tmdb_client::TmdbClient::new("k".into()).unwrap();
 
-        let idle = Arc::new(crate::read_activity::ReadActivity::new());
+        let idle = Arc::new(crate::read_activity::ReadActivity::without_startup_grace());
         reconcile_wanted(
             &engine,
             &provider,
@@ -5928,7 +6769,7 @@ mod reconcile_wanted_tests {
             std::time::Duration::from_secs(600),
         );
         let tmdb = crate::tmdb_client::TmdbClient::new("k".into()).unwrap();
-        let idle = Arc::new(crate::read_activity::ReadActivity::new());
+        let idle = Arc::new(crate::read_activity::ReadActivity::without_startup_grace());
 
         // Untrustworthy (no sync confirmed the set): removal suppressed.
         reconcile_wanted(
@@ -6166,7 +7007,7 @@ mod dedup_owned_tests {
             scraper,
             engine,
             trakt_client: None,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
         }
     }
 
@@ -6283,6 +7124,22 @@ mod dedup_owned_tests {
             store.get_owned("worse".into()).await.is_some(),
             "deferred → the owned record is kept for a later idle pass"
         );
+    }
+
+    /// Start-up grace: right after the process starts (a fresh tracker, nothing read yet) the
+    /// library is NOT idle for the first idle window, so enabled dedup removals defer instead of
+    /// firing on the first tick (the 2026-11-11 redeploy deleted 81 torrents 34 s after start-up).
+    #[tokio::test]
+    async fn defers_removals_during_the_startup_grace() {
+        let (store, deleted, torrents, provider) = fixture().await;
+        let mut app = build_app(store.clone(), provider, true);
+        app.read_activity = Arc::new(crate::read_activity::ReadActivity::new());
+        dedup_owned(&app, &torrents).await;
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "no dedup deletion within the first idle window after start-up"
+        );
+        assert!(store.get_owned("worse".into()).await.is_some());
     }
 
     #[tokio::test]

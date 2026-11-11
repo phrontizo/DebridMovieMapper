@@ -49,6 +49,29 @@ where
     let budget = app.config.upgrade.budget_per_tick as usize;
     let idle_window = Duration::from_secs(app.config.upgrade.idle_secs);
 
+    // Re-derive the quality of owned records that have NONE from their file names (the persisted
+    // identifications) BEFORE ranking anything. A record without a quality is unknown — the lowest —
+    // and is upgraded as such; but a copy whose file name shows a resolution above the ceiling must
+    // never be mistaken for unknown (it stays under the corrective-downgrade rules), so its quality
+    // has to be known first. The scan loop's account-mirror pass does the same each scan; this covers
+    // an upgrade tick that runs before it (e.g. at start-up). Only a record whose file name is
+    // unknown anywhere stays `None` (and is then unknown-lowest).
+    {
+        let owned = app.store.all_owned().await;
+        if owned.iter().any(|(_, r)| r.quality.is_none()) {
+            let matches = app.store.load_all_matches().await;
+            let infos: Vec<&crate::rd_client::TorrentInfo> =
+                matches.values().map(|(i, _)| i).collect();
+            crate::tasks::backfill_owned_quality(
+                &app.store,
+                &app.config.acquisition.prefs,
+                &owned,
+                &infos,
+            )
+            .await;
+        }
+    }
+
     // Group owned by tmdb_id (reuse the tasks helper) and pick the least-recently-checked titles.
     let groups = crate::tasks::group_owned_by_tmdb(&app.store).await;
     let mut candidates: Vec<(u64, MediaType, Vec<String>, OwnedRecord)> = Vec::new();
@@ -303,18 +326,28 @@ async fn persist_title_languages(
     }
 }
 
-/// The best (highest-`effective_score`) quality across ALL owned copies of a title, or `None` if ANY
-/// owned copy has unknown quality (a legacy/untagged mirror record). A hash that has been
-/// concurrently pruned (no record) is skipped rather than aborting the baseline. Used as the upgrade
-/// baseline so
-/// a swap that prunes every copy can only proceed against the BEST one it would delete — never
-/// downgrading by comparing against a worse duplicate. `None` (unknown copy present) is a
-/// conservative skip: we can't prove a candidate beats an unmeasured copy, so we don't risk
-/// deleting it. Ranking by `effective_score` (rather than raw `score`) is ceiling-aware: an
-/// over-ceiling copy no longer masquerades as "best" and block its own corrective downgrade — e.g.
-/// owning only a 2160p copy under a 1080p ceiling must baseline off its (heavily penalised)
-/// effective score so a within-ceiling cached candidate can be recognised as an improvement.
+/// The best quality across ALL owned copies of a title — the upgrade baseline — or `None` when no
+/// owned record is left (all pruned concurrently; a dangling hash is skipped, not fatal). Known
+/// quality beats unknown ([`release::is_unknown_quality`]: no recorded quality, or an untagged
+/// resolution / source tier — the LOWEST quality); among copies on the same side, the highest
+/// `effective_score` wins. A copy with no recorded quality baselines as
+/// [`QualitySummary::unknown`]. Used as the upgrade baseline so a swap that prunes every copy can only
+/// proceed against the BEST one it would delete — never downgrading by comparing against a worse
+/// duplicate — while a title owned only as unknown copies baselines as unknown, so any known cached
+/// within-ceiling candidate (adopted only on a probe `Pass`) improves on it. Ranking by
+/// `effective_score` (rather than raw `score`) is ceiling-aware: an over-ceiling copy (never unknown)
+/// no longer masquerades as "best" and block its own corrective downgrade — e.g. owning only a 2160p
+/// copy under a 1080p ceiling must baseline off its (heavily penalised) effective score so a
+/// within-ceiling cached candidate can be recognised as an improvement.
 async fn best_owned_quality(app: &AppState, owned_hashes: &[String]) -> Option<QualitySummary> {
+    let prefs = &app.config.acquisition.prefs;
+    let ceiling = prefs.max_resolution.height();
+    let key = |q: &QualitySummary| {
+        (
+            !release::is_unknown_quality(q, ceiling),
+            release::effective_score(q, prefs),
+        )
+    };
     let mut best: Option<QualitySummary> = None;
     for h in owned_hashes {
         // A record concurrently pruned between grouping and here is no longer part of the owned set
@@ -323,15 +356,8 @@ async fn best_owned_quality(app: &AppState, owned_hashes: &[String]) -> Option<Q
         let Some(rec) = app.store.get_owned(h.clone()).await else {
             continue;
         };
-        let q = rec.quality?; // any unknown-quality owned copy → conservative skip (None)
-        let better = best
-            .as_ref()
-            .map(|b| {
-                release::effective_score(&q, &app.config.acquisition.prefs)
-                    > release::effective_score(b, &app.config.acquisition.prefs)
-            })
-            .unwrap_or(true);
-        if better {
+        let q = rec.quality.unwrap_or_else(QualitySummary::unknown);
+        if best.as_ref().is_none_or(|b| key(&q) > key(b)) {
             best = Some(q);
         }
     }
@@ -749,24 +775,20 @@ async fn try_upgrade_movie(
     idle_window: Duration,
 ) -> Result<(), UpgradeSkip> {
     // 1. Baseline = the BEST quality across ALL owned copies of this title — NOT an arbitrary one.
-    //    The swap below prunes EVERY owned hash, so if a title has multiple present copies (the
-    //    default state: account-mirror records them all and dedup is dry-run by default), comparing
-    //    against only the representative (lexicographically-first) copy could "upgrade" past the
-    //    worse copy yet DELETE a better one — e.g. own {WEB 1080p, REMUX 1080p}, baseline off WEB,
-    //    adopt a BluRay 1080p, prune the REMUX → a downgrade + loss. `best_owned_quality` returns
-    //    `None` (→ skip) if ANY owned copy has `quality: None` — a legacy/untagged mirror record,
-    //    INCLUDING a mirror copy recorded above the ceiling (an over-ceiling file is never given a
-    //    quality snapshot). An over-ceiling ENGINE copy carries a KNOWN quality and is NOT skipped:
-    //    it is deliberately baselined via the ceiling-penalised `effective_score` (see the
-    //    corrective-downgrade path), so only a `quality: None` copy forces the skip. Comparing against
-    //    a default (uncached/tier-0) would treat any cached candidate as an upgrade and could delete a
-    //    possibly-better unknown copy. Checked BEFORE the
-    //    scrape so unupgradeable titles don't waste a scrape every tick. (`owned_rec` is still used
-    //    below for the request's imdb_id/metadata — only the quality BASELINE is widened here.)
+    //    The swap below prunes EVERY owned hash, so if a title has multiple present copies,
+    //    comparing against only the representative (lexicographically-first) copy could "upgrade"
+    //    past the worse copy yet DELETE a better one — e.g. own {WEB 1080p, REMUX 1080p}, baseline off
+    //    WEB, adopt a BluRay 1080p, prune the REMUX → a downgrade + loss. Known quality beats unknown
+    //    (`best_owned_quality`): an unknown-quality copy (no recorded quality, or an untagged axis) is
+    //    the LOWEST quality, so it never sets the bar while a known copy exists, and a title owned only
+    //    as unknown copies is upgraded by any known cached within-ceiling candidate that passes the
+    //    probe. An over-ceiling copy is never unknown (the tick-start backfill re-derives a missing
+    //    quality from its file name first): it is deliberately baselined via the ceiling-penalised
+    //    `effective_score` (see the corrective-downgrade path). Checked BEFORE the scrape so a title
+    //    with no owned record left doesn't waste a scrape. (`owned_rec` is still used below for the
+    //    request's imdb_id/metadata — only the quality BASELINE is widened here.)
     let Some(current) = best_owned_quality(app, owned_hashes).await else {
-        return Err(UpgradeSkip::NoChange(
-            "current quality unknown/mixed; not upgrading (avoids regression)".into(),
-        ));
+        return Err(UpgradeSkip::NoChange("no owned copy left".into()));
     };
     // Corrective-downgrade guard: if the baseline is a WITHIN-ceiling copy (so any adopted candidate
     // is rated `Improvement::Upgrade`, bypassing the downgrade gate) yet the SERVED slot points at a
@@ -1186,8 +1208,10 @@ pub fn consolidation_target(i: &ConsolidationInput) -> bool {
 }
 
 /// Pure: consolidation's no-regression gate — `pack` is at least every owned episode's source tier
-/// AND resolution. Depends only on the candidate's scraped quality, so consolidation also applies it
-/// before staging (a candidate failing it would only be added, polled and deleted again).
+/// AND resolution. An UNKNOWN axis (0) is the lowest value on either side: an owned episode's unknown
+/// axis never blocks a pack, and a pack's unknown axis is a regression against any known episode
+/// axis. Depends only on the candidate's scraped quality, so consolidation also applies it before
+/// staging (a candidate failing it would only be added, polled and deleted again).
 fn pack_no_regression(
     pack: &QualitySummary,
     owned_episode_quality: &[(u32, QualitySummary)],
@@ -1200,14 +1224,14 @@ fn pack_no_regression(
 /// Per-episode owned quality for one season, gathered from EVERY owned record that supplies an
 /// episode of it — scattered singletons AND multi-episode/partial packs alike. The consolidation
 /// prune below supersedes *any* in-season-covered record (not just singletons), so the
-/// no-regression gate must see all of them, expanded per-episode. Returns `None` if any
-/// contributing record has unknown quality (`quality == None`, e.g. a legacy mirror pack): we then
-/// cannot prove the candidate pack isn't a regression, so the caller must skip the season rather
-/// than risk downgrading a held higher-quality pack.
+/// no-regression gate must see all of them, expanded per-episode. A contributing record with no
+/// recorded quality counts as [`QualitySummary::unknown`] — both axes unknown, the lowest — so it
+/// never blocks a pack (an over-ceiling copy is never unknown: its quality is re-derived from its
+/// file name at tick start, and its known resolution then blocks every within-ceiling pack).
 fn season_owned_quality(
     owned: &[(String, OwnedRecord)],
     season: u32,
-) -> Option<Vec<(u32, QualitySummary)>> {
+) -> Vec<(u32, QualitySummary)> {
     let mut out = Vec::new();
     for (_, rec) in owned {
         let in_season: Vec<u32> = rec
@@ -1219,12 +1243,12 @@ fn season_owned_quality(
         if in_season.is_empty() {
             continue;
         }
-        let q = rec.quality.as_ref()?; // unknown quality → cannot prove no-regression
+        let q = rec.quality.clone().unwrap_or_else(QualitySummary::unknown);
         for e in in_season {
             out.push((e, q.clone()));
         }
     }
-    Some(out)
+    out
 }
 
 /// Pure: is `season` worth consolidating? Only when ≥2 owned records supply episodes of it (genuine
@@ -1507,6 +1531,9 @@ fn pack_prunable_after_repoint(
 /// the split pack against them. Singles EQUAL to the pack on both axes come only
 /// from the unverified rule, and consolidation re-adopts a pack only on a probe `Pass`, recording it
 /// verified, so such a pack is split and folded back at most once.
+///
+/// An UNKNOWN pack axis (0: untagged, or no recorded quality at all — [`QualitySummary::unknown`]) is
+/// the lowest value, so any known candidate passes it; a known pack axis is still compared.
 fn pack_split_no_regression(cand: &release::ReleaseInfo, pack: &QualitySummary) -> bool {
     cand.source.tier_score() >= pack.source_tier && cand.resolution.unwrap_or(0) >= pack.resolution
 }
@@ -1779,7 +1806,9 @@ async fn correct_over_ceiling_packs(
         .await;
     for (pack_hash, rec) in owned.iter().filter(|(_, r)| r.provides.len() > 1) {
         let Some(pack_q) = rec.quality.clone() else {
-            continue; // untagged → no baseline, skip
+            // No recorded quality (its file name is unknown even after the tick-start backfill) →
+            // not known to be over the ceiling: unknown-lowest, handled by phase (a2), not here.
+            continue;
         };
         if pack_q.resolution <= ceiling {
             continue; // within ceiling → not a correction target
@@ -2003,9 +2032,8 @@ async fn upgrade_show_episodes_and_packs(
     // (a) Per-singleton-episode upgrade/downgrade.
     let ceiling = app.config.acquisition.prefs.max_resolution.height();
     for (hash, rec) in owned.iter().filter(|(_, r)| r.provides.len() == 1) {
-        let Some(q) = rec.quality.clone() else {
-            continue; // untagged → no baseline, skip
-        };
+        // No recorded quality → unknown, the lowest: any known cached candidate improves on it.
+        let q = rec.quality.clone().unwrap_or_else(QualitySummary::unknown);
         let (season, episode) = rec.provides[0];
         // Corrective-downgrade guard, mirroring the movie path's `served_slot_is_retained_over_ceiling`:
         // this per-episode upgrade baselines on the SINGLETON's own quality, not on what the episode
@@ -2097,9 +2125,8 @@ async fn upgrade_show_episodes_and_packs(
     // multi-episode pack is staged at most once per tick (`EpisodeTick::multi_episode`), not once
     // per served episode.
     for (pack_hash, rec) in owned.iter().filter(|(_, r)| r.provides.len() > 1) {
-        let Some(q) = rec.quality.clone() else {
-            continue; // untagged → no baseline, skip
-        };
+        // No recorded quality → unknown on both axes, the lowest (see `pack_split_no_regression`).
+        let q = rec.quality.clone().unwrap_or_else(QualitySummary::unknown);
         if q.resolution > ceiling {
             continue; // over-ceiling → pack correction (b)
         }
@@ -2383,15 +2410,8 @@ async fn consolidate_show_seasons(
         }
 
         // Per-episode owned quality across ALL records that supply an episode of this season (the
-        // prune below supersedes any of them). Unknown quality on any contributor → skip the season
-        // (can't prove the candidate pack isn't a regression).
-        let Some(season_owned_q) = season_owned_quality(owned, season) else {
-            debug!(
-                "consolidate: tmdb {} s{} skipped (an owned record has unknown quality)",
-                tmdb_id, season
-            );
-            continue;
-        };
+        // prune below supersedes any of them); an unknown-quality contributor is the lowest.
+        let season_owned_q = season_owned_quality(owned, season);
 
         // Scrape the season (episode 1 query returns season packs too).
         let raws = match app
@@ -2894,7 +2914,7 @@ mod tests {
             scraper,
             engine,
             trakt_client: None,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::new()),
+            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
         }
     }
 
@@ -3082,6 +3102,45 @@ mod tests {
         assert!(
             deleted.lock().unwrap().contains(&"told".to_string()),
             "old torrent deleted from provider"
+        );
+    }
+
+    /// Start-up grace: on the upgrade tick that runs right after the process starts (a fresh
+    /// tracker, nothing read yet) the library is NOT idle for the first idle window, so nothing is
+    /// staged, swapped or pruned and the round-robin cursor is left unstamped.
+    #[tokio::test]
+    async fn upgrade_tick_defers_during_the_startup_grace() {
+        let store = mem_store();
+        store
+            .put_owned(
+                "hold".into(),
+                OwnedRecord {
+                    request: movie_req(),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (mut app, added, deleted) = unknown_movie_app(&store, vec![remux_candidate()]);
+        app.read_activity = Arc::new(crate::read_activity::ReadActivity::new());
+        run_upgrade_once(&app).await;
+        assert!(
+            added.lock().unwrap().is_empty(),
+            "nothing staged during the grace"
+        );
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "nothing pruned during the grace"
+        );
+        assert!(store.get_owned("hold".into()).await.is_some());
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Movie, 27205).await,
+            0,
+            "deferred → cursor unstamped"
         );
     }
 
@@ -3750,7 +3809,7 @@ mod tests {
             candidates: vec![remux_candidate()],
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let ra = Arc::new(crate::read_activity::ReadActivity::new());
+        let ra = Arc::new(crate::read_activity::ReadActivity::without_startup_grace());
         let provider: Arc<dyn DebridProvider> = Arc::new(TouchDuringStageProvider {
             ra: ra.clone(),
             deleted: deleted.clone(),
@@ -5140,7 +5199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn best_owned_quality_picks_best_copy_and_skips_unknown() {
+    async fn best_owned_quality_picks_best_copy_known_before_unknown() {
         let store = mem_store();
         let rec = |tier: i64, score: i64| OwnedRecord {
             request: movie_req(),
@@ -5178,16 +5237,54 @@ mod tests {
             "baseline must be the BEST owned copy (REMUX), not the lexicographically-first (WEB)"
         );
 
-        // Any unknown-quality owned copy → None (conservative skip — can't prove a candidate beats it).
+        // An unknown-quality copy (no recorded quality) is the LOWEST quality: it never becomes the
+        // baseline while a known copy exists…
         let mut unknown = rec(3_000, 1_003_000);
         unknown.quality = None;
-        store.put_owned("bunknown".into(), unknown).await.unwrap();
-        assert!(
-            best_owned_quality(&app, &["aweb".into(), "bunknown".into(), "zremux".into()])
-                .await
-                .is_none(),
-            "an unknown-quality copy forces a conservative skip"
+        store
+            .put_owned("bunknown".into(), unknown.clone())
+            .await
+            .unwrap();
+        let mut partial = rec(0, 9_999_999); // source untagged → unknown, even with a higher score
+        partial.quality.as_mut().unwrap().source_tier = 0;
+        store.put_owned("cpartial".into(), partial).await.unwrap();
+        let best = best_owned_quality(
+            &app,
+            &[
+                "aweb".into(),
+                "bunknown".into(),
+                "cpartial".into(),
+                "zremux".into(),
+            ],
+        )
+        .await
+        .expect("a baseline exists");
+        assert_eq!(
+            best.source_tier, 8_000,
+            "known before unknown: REMUX is the baseline"
         );
+        // …and a title owned ONLY as unknown copies baselines as unknown, so any known cached
+        // within-ceiling candidate is an improvement.
+        let best = best_owned_quality(&app, &["bunknown".into()])
+            .await
+            .expect("unknown baseline");
+        assert!(release::is_unknown_quality(&best, 1080));
+        assert_eq!(
+            release::is_target_improvement(
+                &best,
+                &QualitySummary {
+                    cached: true,
+                    source_tier: 3_000,
+                    resolution: 720,
+                    score: 1,
+                    unverified: false,
+                },
+                &app.config.acquisition.prefs
+            ),
+            release::Improvement::Upgrade
+        );
+        // No owned record at all → no baseline.
+        assert!(best_owned_quality(&app, &["gone".into()]).await.is_none());
     }
 
     #[tokio::test]
@@ -6017,67 +6114,206 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn mirror_movie_with_unknown_quality_is_not_upgraded() {
-        let store = mem_store();
-        // A mirror-style record: Verified, empty provenance, but quality UNKNOWN (None) — e.g. a
-        // legacy record written before quality capture. The upgrade engine must NOT swap/prune it:
-        // an unknown current quality compared against a cached candidate would otherwise treat ANY
-        // cached release as an upgrade and could delete a better existing copy (regression).
-        store
-            .put_owned(
-                "hold".into(),
-                OwnedRecord {
-                    request: movie_req(),
-                    provenance: Provenance { entries: vec![] },
-                    added_at: 1,
-                    status: OwnedStatus::Verified,
-                    provides: vec![],
-                    quality: None,
-                },
-            )
-            .await
-            .unwrap();
-        store
-            .put_selection(
-                movie_slot(27205),
-                SelectionEntry {
-                    hash: "hold".into(),
-                    file_path: "old.mkv".into(),
-                },
-            )
-            .await
-            .unwrap();
-        // A cached REMUX candidate that WOULD be a meaningful upgrade if the current quality were known.
-        let scraper = Arc::new(MockScraper {
-            candidates: vec![remux_candidate()],
-        });
+    /// A provider call log (`add_magnet` infohashes / `delete_torrent` ids).
+    type CallLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A movie app whose account lists the owned "hold" copy (`told`) and whose staging add resolves
+    /// to the cached REMUX candidate (`hnew`/`tnew`). Returns the app plus the add / delete logs.
+    fn unknown_movie_app(
+        store: &Store,
+        candidates: Vec<RawCandidate>,
+    ) -> (AppState, CallLog, CallLog) {
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent {
+                id: "told".into(),
+                hash: "hold".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tnew".into(),
+                hash: "hnew".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "M.2020.1080p.REMUX.mkv".into(),
+                    bytes: 30_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/new".into()),
+            added: added.clone(),
             deleted: deleted.clone(),
             ..Default::default()
         });
-        let app = app_with(scraper, provider, store.clone());
+        let app = app_with(
+            Arc::new(MockScraper { candidates }),
+            provider,
+            store.clone(),
+        );
+        (app, added, deleted)
+    }
 
-        run_upgrade_once(&app).await;
+    /// An owned movie copy whose quality is UNKNOWN — no recorded quality (a mirror copy whose file
+    /// name was never seen), or an untagged axis (even with a higher score than the candidate) — is
+    /// the lowest quality: a known cached candidate that passes the probe replaces it, and the next
+    /// visit changes nothing (convergence).
+    #[tokio::test]
+    async fn movie_with_unknown_quality_is_upgraded_and_converges() {
+        for current in [
+            None,
+            Some(QualitySummary {
+                cached: true,
+                source_tier: 0, // untagged source
+                resolution: 1080,
+                score: 9_999_999,
+                unverified: false,
+            }),
+        ] {
+            let store = mem_store();
+            store
+                .put_owned(
+                    "hold".into(),
+                    OwnedRecord {
+                        request: movie_req(),
+                        provenance: Provenance { entries: vec![] }, // pre-existing mirror copy
+                        added_at: 1,
+                        status: OwnedStatus::Verified,
+                        provides: vec![],
+                        quality: current.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .put_selection(
+                    movie_slot(27205),
+                    SelectionEntry {
+                        hash: "hold".into(),
+                        file_path: "old.mkv".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let (app, added, deleted) =
+                unknown_movie_app(&store, vec![remux_candidate(), web_1080_candidate()]);
 
-        assert!(
-            deleted.lock().unwrap().is_empty(),
-            "must not prune a record whose current quality is unknown"
-        );
-        assert!(
-            store.get_owned("hnew".into()).await.is_none(),
-            "must not stage an upgrade over an unknown current quality"
-        );
-        assert_eq!(
-            store.get_selection(movie_slot(27205)).await.unwrap().hash,
-            "hold",
-            "selection unchanged"
-        );
+            run_upgrade_once(&app).await;
+
+            assert_eq!(
+                store.get_selection(movie_slot(27205)).await.unwrap().hash,
+                "hnew",
+                "{current:?}: swapped to the known REMUX"
+            );
+            let adopted = store.get_owned("hnew".into()).await.expect("adopted");
+            let q = adopted.quality.expect("a known quality is recorded");
+            assert!(!release::is_unknown_quality(&q, 1080));
+            assert!(
+                store.get_owned("hold".into()).await.is_none(),
+                "unknown copy pruned"
+            );
+            assert!(deleted.lock().unwrap().contains(&"told".to_string()));
+            assert_eq!(*added.lock().unwrap(), vec!["hnew".to_string()]);
+
+            // Second visit: the adopted copy is known; the WEB release is no improvement on it and the
+            // REMUX is owned → nothing is staged, nothing changes.
+            run_upgrade_once(&app).await;
+            assert_eq!(
+                *added.lock().unwrap(),
+                vec!["hnew".to_string()],
+                "{current:?}: converged — nothing staged on the second visit"
+            );
+            assert_eq!(
+                store.get_selection(movie_slot(27205)).await.unwrap().hash,
+                "hnew"
+            );
+            assert!(store.get_owned("hnew".into()).await.is_some());
+        }
+    }
+
+    /// The hard constraint: a copy whose FILE NAME shows a resolution above `MAX_RESOLUTION` is never
+    /// treated as unknown-lowest, even when its record carries no quality (account-mirror records
+    /// above the ceiling used to be stored `quality: None`). The upgrade tick re-derives the quality
+    /// from the persisted identification first, so the copy stays under the corrective-downgrade
+    /// rules: kept with `ALLOW_RESOLUTION_DOWNGRADE` off, corrected with it on.
+    #[tokio::test]
+    async fn over_ceiling_movie_without_quality_stays_under_corrective_downgrade_rules() {
+        for allow_downgrade in [false, true] {
+            let store = mem_store();
+            store
+                .put_owned(
+                    "hold".into(),
+                    OwnedRecord {
+                        request: movie_req(),
+                        provenance: Provenance { entries: vec![] },
+                        added_at: 1,
+                        status: OwnedStatus::Verified,
+                        provides: vec![],
+                        quality: None,
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .put_matches(vec![(
+                    "told".into(),
+                    TorrentInfo {
+                        id: "told".into(),
+                        hash: "HOLD".into(),
+                        status: "downloaded".into(),
+                        files: vec![TorrentFile {
+                            id: 0,
+                            path: "M (2020)/M.2020.2160p.UHD.BluRay.REMUX.mkv".into(),
+                            bytes: 60_000_000_000,
+                            selected: 1,
+                        }],
+                        ..Default::default()
+                    },
+                    movie_meta(),
+                )])
+                .await
+                .unwrap();
+            let (mut app, added, deleted) = unknown_movie_app(&store, vec![remux_candidate()]);
+            let mut cfg = (*app.config).clone();
+            cfg.allow_resolution_downgrade = allow_downgrade;
+            app.config = Arc::new(cfg);
+
+            run_upgrade_once(&app).await;
+
+            if allow_downgrade {
+                assert!(
+                    store.get_owned("hnew".into()).await.is_some(),
+                    "flag on: corrected to the within-ceiling REMUX"
+                );
+                assert!(store.get_owned("hold".into()).await.is_none());
+            } else {
+                assert!(added.lock().unwrap().is_empty(), "flag off: nothing staged");
+                assert!(
+                    deleted.lock().unwrap().is_empty(),
+                    "flag off: nothing deleted"
+                );
+                let q = store
+                    .get_owned("hold".into())
+                    .await
+                    .expect("the over-ceiling copy is kept")
+                    .quality
+                    .expect("its quality was re-derived from the file name");
+                assert_eq!(q.resolution, 2160);
+                assert!(!release::is_unknown_quality(&q, 1080));
+            }
+        }
     }
 
     #[test]
-    fn season_owned_quality_includes_packs_and_flags_unknown() {
+    fn season_owned_quality_includes_packs_and_ranks_unknown_lowest() {
         let rec = |provides: Vec<(u32, u32)>, quality: Option<QualitySummary>| OwnedRecord {
             request: movie_req(),
             provenance: Provenance { entries: vec![] },
@@ -6095,7 +6331,7 @@ mod tests {
             ("h9".to_string(), rec(vec![(1, 9)], Some(q1080_web()))),
             ("h10".to_string(), rec(vec![(1, 10)], Some(q1080_web()))),
         ];
-        let q = season_owned_quality(&owned, 1).expect("all qualities known");
+        let q = season_owned_quality(&owned, 1);
         assert_eq!(
             q.len(),
             10,
@@ -6121,12 +6357,63 @@ mod tests {
             "a WEB pack must not supersede a held higher-quality REMUX pack"
         );
 
-        // Unknown quality on any contributor → None (caller must skip the season conservatively).
+        // A contributor with no recorded quality is UNKNOWN on both axes — the lowest — so it never
+        // makes a known pack a regression…
         let mut owned2 = owned;
+        owned2.retain(|(h, _)| h != "hp");
         owned2.push(("hx".to_string(), rec(vec![(1, 11)], None)));
+        let q2 = season_owned_quality(&owned2, 1);
+        assert_eq!(
+            q2.len(),
+            3,
+            "the unknown contributor is represented, not a skip"
+        );
+        let pack = |q: QualitySummary| ConsolidationInput {
+            season: 1,
+            aired_episodes: vec![9, 10, 11],
+            owned_episode_quality: q2.clone(),
+            pack_cached: true,
+            pack_episodes: vec![9, 10, 11],
+            pack_quality: q,
+        };
         assert!(
-            season_owned_quality(&owned2, 1).is_none(),
-            "an unknown-quality contributor forces a conservative skip"
+            consolidation_target(&pack(q1080_web())),
+            "a known pack replaces it"
+        );
+        // …while an untagged pack axis is the lowest too: a pack with unknown resolution is a
+        // regression against a known 1080p episode.
+        let mut untagged_res = q1080_bluray();
+        untagged_res.resolution = 0;
+        assert!(!consolidation_target(&pack(untagged_res)));
+    }
+
+    /// Phase (a2)'s per-axis filter treats an unknown pack axis as the lowest: ANY known candidate
+    /// passes it, while a known pack axis is still compared.
+    #[test]
+    fn pack_split_filter_accepts_any_known_candidate_over_an_unknown_pack_axis() {
+        let cand = |desc: &str| {
+            release::parse(&RawCandidate {
+                name: "Torrentio".into(),
+                description: format!("{desc}\nRD+"),
+                info_hash: "h".into(),
+                file_idx: Some(0),
+                file_name: Some(format!("{desc}.mkv")),
+            })
+        };
+        let hdtv_720 = cand("S.S01E01.720p.HDTV.x264");
+        assert!(pack_split_no_regression(
+            &hdtv_720,
+            &QualitySummary::unknown()
+        ));
+        let mut untagged_res_bluray = q1080_bluray();
+        untagged_res_bluray.resolution = 0;
+        assert!(
+            pack_split_no_regression(&cand("S.S01E01.720p.BluRay.x264"), &untagged_res_bluray),
+            "the unknown resolution axis accepts any known resolution"
+        );
+        assert!(
+            !pack_split_no_regression(&hdtv_720, &untagged_res_bluray),
+            "the known tier axis is still compared"
         );
     }
 
@@ -8067,69 +8354,96 @@ mod tests {
         );
     }
 
+    /// Symmetric to the movie path's `movie_with_unknown_quality_is_upgraded_and_converges`: an owned
+    /// singleton episode of UNKNOWN quality — none recorded, or an untagged axis (even with a higher
+    /// score than the candidate) — is the lowest quality, so a known cached candidate replaces it.
     #[tokio::test]
-    async fn untagged_singleton_episode_is_not_upgraded() {
-        // FIX 4: symmetric to the movie path's `mirror_movie_with_unknown_quality_is_not_upgraded`.
-        // An owned singleton episode with `quality: None` (untagged/legacy mirror) has no baseline,
-        // so the per-episode upgrade must SKIP it (no scrape/stage) even when a "better" candidate
-        // exists — comparing against a default would treat any cached release as an upgrade and
-        // could delete a possibly-better untagged copy.
-        let store = mem_store();
-        let old_hash = "euntagged".to_string();
-        let mut rec = ep_record(1, 1, q720_web());
-        rec.quality = None; // untagged
-        store.put_owned(old_hash.clone(), rec).await.unwrap();
-        store
-            .put_selection(
-                crate::store::episode_slot(SHOW_TMDB, 1, 1),
-                SelectionEntry {
-                    hash: old_hash.clone(),
-                    file_path: "old.mkv".into(),
+    async fn unknown_quality_singleton_episode_is_upgraded() {
+        for current in [
+            None,
+            Some(QualitySummary {
+                cached: true,
+                source_tier: 0,
+                resolution: 1080,
+                score: 9_999_999,
+                unverified: false,
+            }),
+        ] {
+            let h = show_harness_singleton_720_ep().await;
+            let rec = OwnedRecord {
+                quality: current.clone(),
+                ..ep_record(1, 1, q720_web())
+            };
+            h.app
+                .store
+                .put_owned(h.old_720_hash.clone(), rec)
+                .await
+                .unwrap();
+            let deferred = upgrade_show_episodes_and_packs(
+                &h.app,
+                h.tmdb,
+                &h.group_hashes,
+                Duration::from_secs(0),
+            )
+            .await;
+            assert!(!deferred);
+            assert_eq!(
+                h.app
+                    .store
+                    .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+                    .await
+                    .unwrap()
+                    .hash,
+                h.cand_1080_hash,
+                "{current:?}: slot repointed to the known release"
+            );
+            assert!(
+                h.app
+                    .store
+                    .get_owned(h.old_720_hash.clone())
+                    .await
+                    .is_none(),
+                "{current:?}: unknown singleton pruned"
+            );
+        }
+    }
+
+    /// A pack with NO recorded quality serving an episode is the lowest quality too: phase (a2)
+    /// splits the served episode off to a known cached single.
+    #[tokio::test]
+    async fn pack_served_episode_of_an_unknown_quality_pack_is_upgraded() {
+        let f = pack_fixture(
+            &[(1, q1080_web()), (2, q1080_web()), (3, q1080_web())],
+            &[1, 2, 3, 4],
+            &[4],
+            q_sd_web_unverified(),
+            vec![(4, single_candidate(4, "hy4", "720p", "720p.HDTV"))],
+            false,
+        )
+        .await;
+        let pack = f.store.get_owned(PACK.into()).await.unwrap();
+        f.store
+            .put_owned(
+                PACK.into(),
+                OwnedRecord {
+                    quality: None,
+                    ..pack
                 },
             )
             .await
             .unwrap();
-
-        // A candidate that WOULD be a meaningful upgrade if the current quality were known.
-        let scraper = Arc::new(MockScraper {
-            candidates: vec![ep_1080_web_candidate()],
-        });
-        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            deleted: deleted.clone(),
-            ..Default::default()
-        });
-        let app = app_with(scraper, provider, store.clone());
-
         let deferred = upgrade_show_episodes_and_packs(
-            &app,
+            &f.app,
             SHOW_TMDB,
-            std::slice::from_ref(&old_hash),
+            &f.group_hashes,
             Duration::from_secs(0),
         )
         .await;
-
-        assert!(!deferred, "an untagged skip is not a deferral");
-        assert!(
-            deleted.lock().unwrap().is_empty(),
-            "no staging/delete attempted for an untagged episode"
-        );
+        assert!(!deferred);
         assert_eq!(
-            store
-                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
-                .await
-                .unwrap()
-                .hash,
-            old_hash,
-            "selection unchanged"
-        );
-        assert!(
-            store.get_owned(old_hash.clone()).await.is_some(),
-            "untagged owned record untouched"
-        );
-        assert!(
-            store.get_owned("hep1080".into()).await.is_none(),
-            "candidate not recorded owned"
+            slot_hash(&f.store, 4).await,
+            "hy4",
+            "E4 repointed to the known single"
         );
     }
 
