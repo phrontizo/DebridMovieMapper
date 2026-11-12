@@ -63,9 +63,21 @@ pub trait Scraper: Send + Sync {
     ) -> Result<Vec<RawCandidate>, AppError>;
 }
 
+/// Default spacing between scrapes (`SCRAPER_MIN_INTERVAL_MS`). Torrentio sends no rate-limit
+/// headers, and in production it answered 429 once ~80–100 requests arrived within a minute (the hourly
+/// episode check scrapes 100–200 episodes back to back); one request a second stays under that.
+pub const DEFAULT_SCRAPER_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(1_000);
+
+/// Requests per scrape when the addon keeps answering 429: the first try plus two retries, each
+/// after the limiter's back-off (and any `Retry-After`).
+pub const MAX_SCRAPE_ATTEMPTS: u32 = 3;
+
 pub struct TorrentioScraper {
     base_url: String,
     http: reqwest::Client,
+    /// Paces every request (all callers share one scraper) and backs off on a 429.
+    limiter: crate::ratelimit::AdaptiveRateLimiter,
 }
 
 impl TorrentioScraper {
@@ -78,7 +90,17 @@ impl TorrentioScraper {
         Self {
             base_url: Self::build_base_url(override_url, provider, token),
             http,
+            limiter: crate::ratelimit::AdaptiveRateLimiter::with_min_interval(
+                DEFAULT_SCRAPER_MIN_INTERVAL,
+            ),
         }
+    }
+
+    /// Space requests by `min_interval` instead of [`DEFAULT_SCRAPER_MIN_INTERVAL`]
+    /// (`SCRAPER_MIN_INTERVAL_MS`).
+    pub fn with_min_interval(mut self, min_interval: std::time::Duration) -> Self {
+        self.limiter = crate::ratelimit::AdaptiveRateLimiter::with_min_interval(min_interval);
+        self
     }
 
     /// Override (trimmed) wins; else template Torrentio from provider + token.
@@ -237,15 +259,39 @@ impl Scraper for TorrentioScraper {
         episode: Option<u32>,
     ) -> Result<Vec<RawCandidate>, AppError> {
         let url = Self::stream_url(&self.base_url, imdb_id, kind, season, episode);
-        // The base URL embeds the provider token in its path, so any reqwest error here would
-        // carry it (reqwest only redacts userinfo, not the path). Strip the URL from every error
-        // before it can reach a log line — mirrors tmdb_client/torbox_client.
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| AppError::Http(e.without_url()))?;
+        // Paced through the shared limiter; a 429 backs it off (honouring `Retry-After`) and the
+        // request is retried, up to MAX_SCRAPE_ATTEMPTS, before surfacing as the retriable error.
+        let mut attempt = 0;
+        let resp = loop {
+            attempt += 1;
+            self.limiter.wait_for_token().await;
+            // The base URL embeds the provider token in its path, so any reqwest error here would
+            // carry it (reqwest only redacts userinfo, not the path). Strip the URL from every error
+            // before it can reach a log line — mirrors tmdb_client/torbox_client.
+            let resp = self
+                .http
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| AppError::Http(e.without_url()))?;
+            if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                self.limiter.record_success().await;
+                break resp;
+            }
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            self.limiter.record_throttle(retry_after).await;
+            if attempt >= MAX_SCRAPE_ATTEMPTS {
+                break resp; // still throttled: surface the 429 below
+            }
+            debug!(
+                "scrape: {} {:?} s={:?} e={:?} → 429, backing off (retry-after {:?}) and retrying",
+                imdb_id, kind, season, episode, retry_after
+            );
+        };
         // 404 = unknown id (genuinely no streams). Any other non-success (429/5xx) is a
         // retriable addon error — surface it so the engine treats it as TemporarilyUnavailable
         // rather than silently seeing zero candidates.
@@ -627,7 +673,113 @@ mod tests {
         format!("http://{}", addr)
     }
 
-    #[tokio::test]
+    /// A loopback server that answers request N with `replies[N]` (the last one repeating) and counts
+    /// the requests. Each reply is `(status line, extra header lines, body)`; connections are closed
+    /// after every reply so each request arrives on a fresh one.
+    async fn spawn_sequence_server(
+        replies: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let (status, headers, body) = replies[n.min(replies.len() - 1)];
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{}", addr), hits)
+    }
+
+    const ONE_STREAM: &str = r#"{"streams":[{"name":"x","title":"y","infoHash":"abcdef0123456789abcdef0123456789abcdef01"}]}"#;
+
+    fn scraper_at(url: String) -> TorrentioScraper {
+        TorrentioScraper::new(
+            Some(url),
+            ProviderKind::TorBox,
+            "tok",
+            reqwest::Client::new(),
+        )
+    }
+
+    /// Torrentio answers a burst with 429. A throttled scrape backs off — honouring `Retry-After` —
+    /// and is retried, so the acquisition that asked for it isn't failed until the next cycle.
+    #[tokio::test(start_paused = true)]
+    async fn a_throttled_scrape_backs_off_and_is_retried() {
+        let (url, hits) = spawn_sequence_server(vec![
+            ("429 Too Many Requests", "Retry-After: 7\r\n", ""),
+            ("200 OK", "", ONE_STREAM),
+        ])
+        .await;
+        let t0 = tokio::time::Instant::now();
+        let cands = scraper_at(url)
+            .find("tt1", MediaKind::Movie, None, None)
+            .await
+            .expect("the retry succeeds");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_secs(7),
+            "Retry-After is honoured, waited {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// A scrape that stays throttled gives up after `MAX_SCRAPE_ATTEMPTS` requests and returns the
+    /// retriable error, as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_scrape_that_stays_throttled_gives_up_after_a_bounded_number_of_attempts() {
+        let (url, hits) = spawn_sequence_server(vec![("429 Too Many Requests", "", "")]).await;
+        assert!(scraper_at(url)
+            .find("tt1", MediaKind::Movie, None, None)
+            .await
+            .is_err());
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_SCRAPE_ATTEMPTS as usize
+        );
+    }
+
+    /// Scrapes are paced: consecutive requests are at least the configured interval apart, so a
+    /// reconcile's burst stays under the addon's limit instead of tripping it.
+    #[tokio::test(start_paused = true)]
+    async fn consecutive_scrapes_are_spaced_by_the_min_interval() {
+        let (url, hits) = spawn_sequence_server(vec![("200 OK", "", ONE_STREAM)]).await;
+        let scraper = scraper_at(url).with_min_interval(std::time::Duration::from_millis(500));
+        let t0 = tokio::time::Instant::now();
+        for _ in 0..3 {
+            scraper
+                .find("tt1", MediaKind::Movie, None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(1_000),
+            "three scrapes span two intervals, took {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(
+            DEFAULT_SCRAPER_MIN_INTERVAL,
+            std::time::Duration::from_millis(1_000)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn find_maps_404_to_empty_5xx_to_err_and_parses_200() {
         // The 404-vs-other status classification in `find` is load-bearing (404 → "no streams",
         // anything else retriable → Err so the engine retries rather than seeing silent zero

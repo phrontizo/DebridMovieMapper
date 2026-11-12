@@ -16,6 +16,9 @@ const DEFAULT_MAX_ACQUIRE_ATTEMPTS: u32 = 5;
 const MIN_MAX_ACQUIRE_ATTEMPTS: u32 = 1;
 const DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS: u64 = 600;
 const MIN_ACQUIRE_DEAD_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_SCRAPER_MIN_INTERVAL_MS: u64 = 1_000;
+const MIN_SCRAPER_MIN_INTERVAL_MS: u64 = 100;
+const MAX_SCRAPER_MIN_INTERVAL_MS: u64 = 60_000;
 
 /// Resolve the WebDAV listen port from a raw `PORT` value, identically for the server
 /// (`Config::from_parts`) and the `--healthcheck` probe (`main`) so the probe can never target a
@@ -356,6 +359,9 @@ pub struct AcquisitionConfig {
     /// Seconds an optimistically-added torrent may stay Pending without resolving/seeding
     /// before `observe` reaps it as dead (SP3). Default 600.
     pub acquire_dead_timeout_secs: u64,
+    /// Minimum spacing between scraper requests, in ms (`SCRAPER_MIN_INTERVAL_MS`, default 1000,
+    /// clamped 100–60000); a 429 backs off from it. Set by `from_env`, not `from_parts`.
+    pub scraper_min_interval_ms: u64,
 }
 
 // Manual Debug redacts `scraper_addon_url` and `scraper_proxy_url` — both can embed credentials
@@ -376,6 +382,7 @@ impl std::fmt::Debug for AcquisitionConfig {
                 &self.scraper_proxy_url.as_ref().map(|_| "<redacted>"),
             )
             .field("acquire_dead_timeout_secs", &self.acquire_dead_timeout_secs)
+            .field("scraper_min_interval_ms", &self.scraper_min_interval_ms)
             .finish()
     }
 }
@@ -468,6 +475,7 @@ impl AcquisitionConfig {
             scraper_addon_url: None,
             scraper_proxy_url: None,
             acquire_dead_timeout_secs: DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS,
+            scraper_min_interval_ms: DEFAULT_SCRAPER_MIN_INTERVAL_MS,
         }
     }
 
@@ -491,7 +499,26 @@ impl AcquisitionConfig {
             .filter(|s| !s.is_empty());
         a.acquire_dead_timeout_secs =
             Self::parse_dead_timeout(std::env::var("ACQUIRE_DEAD_TIMEOUT_SECS").ok());
+        a.scraper_min_interval_ms =
+            Self::parse_scraper_min_interval(std::env::var("SCRAPER_MIN_INTERVAL_MS").ok());
         a
+    }
+
+    /// Parse `SCRAPER_MIN_INTERVAL_MS`: unset/blank → 1000, an unparseable value warns + falls back to
+    /// 1000, and any value is clamped to 100–60000 (the limiter needs a non-zero interval to back off
+    /// from, and over a minute per scrape would stall acquisition). Pure for unit-testability.
+    fn parse_scraper_min_interval(raw: Option<String>) -> u64 {
+        match raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
+                warn!(
+                    "Invalid SCRAPER_MIN_INTERVAL_MS value '{}', falling back to {}",
+                    s, DEFAULT_SCRAPER_MIN_INTERVAL_MS
+                );
+                DEFAULT_SCRAPER_MIN_INTERVAL_MS
+            }),
+            None => DEFAULT_SCRAPER_MIN_INTERVAL_MS,
+        }
+        .clamp(MIN_SCRAPER_MIN_INTERVAL_MS, MAX_SCRAPER_MIN_INTERVAL_MS)
     }
 
     /// Parse `ACQUIRE_DEAD_TIMEOUT_SECS`: unset/blank → 600, an unparseable value warns + falls back
@@ -1027,6 +1054,22 @@ mod tests {
         assert!(a.prefs.prefer_hdr);
         assert_eq!(a.stall_timeout_secs, 600);
         assert_eq!(a.max_acquire_attempts, 3);
+    }
+
+    #[test]
+    fn scraper_min_interval_defaults_warns_and_clamps() {
+        let p = AcquisitionConfig::parse_scraper_min_interval;
+        assert_eq!(p(None), 1_000);
+        assert_eq!(p(Some("  ".into())), 1_000);
+        assert_eq!(p(Some("2500".into())), 2_500);
+        assert_eq!(p(Some("1s".into())), 1_000, "unparseable → default");
+        assert_eq!(
+            p(Some("0".into())),
+            100,
+            "the limiter needs an interval to back off from"
+        );
+        assert_eq!(p(Some("600000".into())), 60_000);
+        assert_eq!(AcquisitionConfig::default().scraper_min_interval_ms, 1_000);
     }
 
     #[test]

@@ -16,6 +16,10 @@ struct RateLimiterState {
 /// Bucket capacity is 1 (no bursting).
 pub struct AdaptiveRateLimiter {
     state: tokio::sync::Mutex<RateLimiterState>,
+    /// The baseline interval: the pace with no throttling, and the floor `record_success` recovers to.
+    min_interval_ms: u64,
+    /// The back-off ceiling: `MAX_INTERVAL_MS`, or the baseline when that is higher.
+    max_interval_ms: u64,
 }
 
 impl std::fmt::Debug for AdaptiveRateLimiter {
@@ -31,12 +35,24 @@ impl Default for AdaptiveRateLimiter {
 }
 
 impl AdaptiveRateLimiter {
+    /// The providers' limiter: a 100 ms baseline (10 req/s).
     pub fn new() -> Self {
+        Self::with_min_interval(Duration::from_millis(MIN_INTERVAL_MS))
+    }
+
+    /// A limiter whose baseline is `min_interval` (at least 1 ms): requests are spaced by it when
+    /// nothing is throttled, a 429 backs off from it, and recovery never goes below it. The scraper
+    /// uses this — Torrentio sends no rate-limit headers, so steady pacing is what keeps a burst of
+    /// scrapes under its limit.
+    pub fn with_min_interval(min_interval: Duration) -> Self {
+        let min_interval_ms = (min_interval.as_millis() as u64).max(1);
         Self {
             state: tokio::sync::Mutex::new(RateLimiterState {
-                interval_ms: MIN_INTERVAL_MS,
+                interval_ms: min_interval_ms,
                 next_allowed: tokio::time::Instant::now(),
             }),
+            min_interval_ms,
+            max_interval_ms: MAX_INTERVAL_MS.max(min_interval_ms),
         }
     }
 
@@ -60,7 +76,7 @@ impl AdaptiveRateLimiter {
     /// bulk throttle burst doesn't leave later requests crawling at the raised ceiling.
     pub async fn record_success(&self) {
         let mut state = self.state.lock().await;
-        state.interval_ms = (state.interval_ms / 2).max(MIN_INTERVAL_MS);
+        state.interval_ms = (state.interval_ms / 2).max(self.min_interval_ms);
     }
 
     /// Record a 429 throttle — double the interval and optionally respect Retry-After.
@@ -71,7 +87,10 @@ impl AdaptiveRateLimiter {
     /// and `record_success` walks it back), so it's accepted rather than de-duplicated per window.
     pub async fn record_throttle(&self, retry_after: Option<u64>) {
         let mut state = self.state.lock().await;
-        state.interval_ms = state.interval_ms.saturating_mul(2).min(MAX_INTERVAL_MS);
+        state.interval_ms = state
+            .interval_ms
+            .saturating_mul(2)
+            .min(self.max_interval_ms);
         if let Some(seconds) = retry_after {
             let capped_seconds = seconds.min(MAX_RETRY_AFTER_SECS);
             let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(capped_seconds);
@@ -134,6 +153,47 @@ impl AdaptiveRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn interval(rl: &AdaptiveRateLimiter) -> u64 {
+        rl.state.lock().await.interval_ms
+    }
+
+    /// A limiter built with a custom baseline (the scraper's) spaces requests by it, backs off from
+    /// it on a 429, and never recovers BELOW it — while `new()` keeps the providers' 100 ms baseline.
+    #[tokio::test(start_paused = true)]
+    async fn a_custom_baseline_paces_requests_and_bounds_recovery() {
+        let rl = AdaptiveRateLimiter::with_min_interval(Duration::from_millis(1_000));
+        let t0 = tokio::time::Instant::now();
+        for _ in 0..3 {
+            rl.wait_for_token().await;
+        }
+        let spent = t0.elapsed();
+        assert!(
+            spent >= Duration::from_millis(2_000) && spent < Duration::from_millis(2_100),
+            "three tokens take two baseline intervals, got {spent:?}"
+        );
+        rl.record_success().await;
+        assert_eq!(
+            interval(&rl).await,
+            1_000,
+            "success never goes below the baseline"
+        );
+        rl.record_throttle(None).await;
+        assert_eq!(
+            interval(&rl).await,
+            2_000,
+            "a 429 doubles from the baseline"
+        );
+        rl.record_success().await;
+        rl.record_success().await;
+        assert_eq!(interval(&rl).await, 1_000);
+        assert_eq!(interval(&AdaptiveRateLimiter::new()).await, MIN_INTERVAL_MS);
+
+        // A baseline above the usual 30 s ceiling is still a floor under back-off.
+        let slow = AdaptiveRateLimiter::with_min_interval(Duration::from_secs(60));
+        slow.record_throttle(None).await;
+        assert_eq!(interval(&slow).await, 60_000);
+    }
 
     #[tokio::test]
     async fn adaptive_limiter_starts_at_baseline() {

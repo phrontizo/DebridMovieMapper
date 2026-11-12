@@ -25,6 +25,7 @@ pub mod release;
 pub mod repair;
 pub mod scheduler;
 pub mod scraper;
+pub mod selection;
 pub mod store;
 pub mod tasks;
 pub mod tmdb_client;

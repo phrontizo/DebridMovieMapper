@@ -343,6 +343,19 @@ pub async fn run_scan_loop(
                 // DEDUP_REMOVE_DUPLICATES is set.
                 dedup_owned(&app, &torrents).await;
 
+                // Serve the best copy present: a slot whose copy is beaten by another present,
+                // settled copy of strictly better quality (e.g. a pre-existing or re-added REMUX
+                // behind an engine-acquired BluRay pack — such a copy never gets a slot of its own)
+                // is repointed to it. Idle-gated; the VFS shows the change on the next tick.
+                crate::selection::repoint_to_better_copies(
+                    &store,
+                    &app.read_activity,
+                    Duration::from_secs(config.upgrade.idle_secs),
+                    &repair_manager.hidden_torrent_ids().await,
+                    &current_data,
+                )
+                .await;
+
                 // Daily: reap dangling account-mirror owned records whose hash has left the provider
                 // listing entirely. Without this, a `Verified` empty-provenance mirror record for a
                 // deleted/lapsed torrent is never cleaned (dedup/observe/Trigger-A/B all ignore an

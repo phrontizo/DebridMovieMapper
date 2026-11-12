@@ -40,6 +40,32 @@ fn parse_se(name: &str) -> Option<(u32, u32)> {
     (season >= 1 && episode >= 1).then_some((season, episode))
 }
 
+/// The selected video files of `t` the VFS can actually EMIT: a selected video file is emittable
+/// only when `links` is empty (TorBox) or has a link at its position among the SELECTED files
+/// (Real-Debrid pairs links positionally, and its `selected != links` anomaly can leave a file with
+/// none). The build's episode-slot check (`present_files`) and `selection::plan_selection_repoints`
+/// both use this, so a slot is only ever pointed at a file the build will emit.
+pub(crate) fn emittable_video_files(t: &TorrentInfo) -> Vec<&crate::rd_client::TorrentFile> {
+    let links_empty = t.links.is_empty();
+    let mut link_idx = 0usize;
+    let mut out = Vec::new();
+    for f in &t.files {
+        if f.selected == 1 {
+            if is_video_file(&f.path) && (links_empty || t.links.get(link_idx).is_some()) {
+                out.push(f);
+            }
+            link_idx += 1;
+        }
+    }
+    out
+}
+
+/// The `(season, episode)` slot a file is shown under: the first episode code in its basename,
+/// exactly as the build keys episode selections.
+pub(crate) fn episode_of_file(path: &str) -> Option<(u32, u32)> {
+    parse_se(path.rsplit('/').next().unwrap_or(path))
+}
+
 /// Extract the numeric tmdb id from a `MediaMetadata.external_id` like `"tmdb:1396"`.
 pub(crate) fn tmdb_id_of(metadata: &MediaMetadata) -> Option<u64> {
     metadata
@@ -482,20 +508,9 @@ impl DebridVfs {
                                 .iter()
                                 .flat_map(|t| {
                                     let h = t.hash.to_ascii_lowercase();
-                                    let links_empty = t.links.is_empty();
-                                    let mut link_idx = 0usize;
-                                    let mut out: Vec<(String, String)> = Vec::new();
-                                    for f in &t.files {
-                                        if f.selected == 1 {
-                                            if is_video_file(&f.path)
-                                                && (links_empty || t.links.get(link_idx).is_some())
-                                            {
-                                                out.push((h.clone(), f.path.clone()));
-                                            }
-                                            link_idx += 1;
-                                        }
-                                    }
-                                    out
+                                    emittable_video_files(t)
+                                        .into_iter()
+                                        .map(move |f| (h.clone(), f.path.clone()))
                                 })
                                 .collect()
                         } else {

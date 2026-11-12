@@ -1816,6 +1816,45 @@ impl Store {
         })
     }
 
+    /// Atomically repoint `slot` to `new` only while it still holds `expected` (compare-and-set, one
+    /// write transaction). Returns whether it wrote. Used by `selection::repoint_to_better_copies`,
+    /// which plans from a snapshot: a slot the upgrade engine swapped, or dedup cleared, in the
+    /// meantime is left alone rather than overwritten or re-created.
+    pub async fn repoint_selection_if(
+        &self,
+        slot: String,
+        expected: SelectionEntry,
+        new: SelectionEntry,
+    ) -> Result<bool, AppError> {
+        let bytes = serde_json::to_vec(&new)
+            .map_err(|e| AppError::Task(format!("serialise SelectionEntry for {slot}: {e}")))?;
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, AppError> {
+            let txn = db.begin_write().map_err(|e| AppError::Db(e.into()))?;
+            let wrote = {
+                let mut table = txn
+                    .open_table(SELECTION_TABLE)
+                    .map_err(|e| AppError::Db(e.into()))?;
+                let current: Option<SelectionEntry> = table
+                    .get(slot.as_str())
+                    .map_err(|e| AppError::Db(e.into()))?
+                    .and_then(|v| serde_json::from_slice(v.value()).ok());
+                if current.as_ref() == Some(&expected) {
+                    table
+                        .insert(slot.as_str(), bytes.as_slice())
+                        .map_err(|e| AppError::Db(e.into()))?;
+                    true
+                } else {
+                    false
+                }
+            };
+            txn.commit().map_err(|e| AppError::Db(e.into()))?;
+            Ok(wrote)
+        })
+        .await;
+        Self::flatten_join_app(result)
+    }
+
     pub async fn remove_selection(&self, slot: String) -> Result<(), AppError> {
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
@@ -4118,6 +4157,46 @@ mod tests {
     /// The quality backfill (re-deriving a `quality: None` record's quality from its file name) sets
     /// `quality` ONLY where it is still `None`, in one write transaction touching nothing else — a
     /// recorded quality is never overwritten and a missing record is never resurrected.
+    /// The repoint is a compare-and-set: it writes only while the slot still holds the entry the
+    /// caller planned from, so it can never clobber a swap the upgrade engine made in between.
+    #[tokio::test]
+    async fn repoint_selection_if_writes_only_over_the_expected_entry() {
+        let store = mem_store();
+        let entry = |h: &str, p: &str| SelectionEntry {
+            hash: h.into(),
+            file_path: p.into(),
+        };
+        let slot = episode_slot(7, 1, 1);
+        store
+            .put_selection(slot.clone(), entry("old", "a.mkv"))
+            .await
+            .unwrap();
+        assert!(store
+            .repoint_selection_if(slot.clone(), entry("old", "a.mkv"), entry("new", "b.mkv"))
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get_selection(slot.clone()).await,
+            Some(entry("new", "b.mkv"))
+        );
+        // The slot moved on since the plan → no write.
+        assert!(!store
+            .repoint_selection_if(slot.clone(), entry("old", "a.mkv"), entry("other", "c.mkv"))
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get_selection(slot.clone()).await,
+            Some(entry("new", "b.mkv"))
+        );
+        // A slot cleared since the plan is not re-created.
+        let gone = episode_slot(7, 1, 2);
+        assert!(!store
+            .repoint_selection_if(gone.clone(), entry("old", "a.mkv"), entry("new", "b.mkv"))
+            .await
+            .unwrap());
+        assert_eq!(store.get_selection(gone).await, None);
+    }
+
     #[tokio::test]
     async fn set_quality_if_unset_fills_only_a_missing_quality() {
         let store = mem_store();

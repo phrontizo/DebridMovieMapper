@@ -225,13 +225,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Don't log the URL — it may contain proxy credentials.
         info!("Scraper requests routed through the configured HTTP proxy");
     }
-    let scraper: Arc<dyn debridmoviemapper::scraper::Scraper> =
-        Arc::new(debridmoviemapper::scraper::TorrentioScraper::new(
+    let scraper: Arc<dyn debridmoviemapper::scraper::Scraper> = Arc::new(
+        debridmoviemapper::scraper::TorrentioScraper::new(
             config.acquisition.scraper_addon_url.clone(),
             config.provider_kind,
             &config.provider_token,
             scraper_http,
-        ));
+        )
+        .with_min_interval(std::time::Duration::from_millis(
+            config.acquisition.scraper_min_interval_ms,
+        )),
+    );
     let validator: Arc<dyn debridmoviemapper::acquire::TitleValidator> =
         Arc::new(debridmoviemapper::acquire::TmdbTitleValidator {
             tmdb: tmdb_client.clone(),
