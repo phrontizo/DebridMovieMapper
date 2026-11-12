@@ -697,9 +697,11 @@ impl QualitySummary {
     }
 }
 
-/// Whether `q` is UNKNOWN quality — ranked LOW, below every known quality, wherever qualities are
-/// compared (dedup keep-priority, upgrade baselines, consolidation): its resolution or source tier
-/// is 0 (that axis untagged). A copy with NO recorded quality is unknown too
+/// Whether `q` is UNKNOWN quality — ranked LOW wherever qualities are compared (dedup
+/// keep-priority, upgrade baselines, consolidation): its resolution or source tier is 0 (that axis
+/// untagged). A known RESOLUTION still stays a floor: an unknown copy is below every known quality
+/// at its resolution, never below a lower-resolution one ([`quality_rank`]), and the upgrade pass
+/// only replaces it with a known release at or above that resolution ([`is_target_improvement`]). A copy with NO recorded quality is unknown too
 /// ([`QualitySummary::unknown`]). The one exception is a copy whose resolution is ABOVE `ceiling`
 /// (`MAX_RESOLUTION`): its resolution is known and higher than anything acquisition would fetch, so
 /// it is never unknown-lowest — replacing it is a corrective downgrade, gated by
@@ -708,29 +710,34 @@ pub fn is_unknown_quality(q: &QualitySummary, ceiling: u16) -> bool {
     q.resolution <= ceiling && (q.resolution == 0 || q.source_tier == 0)
 }
 
-/// A copy's quality rank: known before unknown ([`is_unknown_quality`]), then resolution, then
-/// source tier — the derived `Ord` compares the fields in that order. Score is deliberately NOT part
-/// of it: two copies with the same rank are the same quality. The ceiling only decides
-/// unknown-ness; it never ranks a copy down for being above it.
+/// A copy's quality rank, compared field by field (the derived `Ord`): resolution, then source
+/// tier, then checked before unchecked (`unverified` — tracks that could not be read). An untagged
+/// axis is 0, so UNKNOWN quality ([`is_unknown_quality`]) is the lowest at its resolution — a known
+/// source beats an untagged one — but a KNOWN resolution stays a floor: a 1080p copy with an
+/// untagged source outranks a 720p WEB copy, so dedup never trades a known resolution down. An
+/// untagged resolution (0) is the lowest of all, and no recorded quality is below everything.
+/// Score is deliberately NOT part of it: two copies with the same rank are the same quality. The
+/// ceiling plays no part — a copy above `MAX_RESOLUTION` is never ranked down for it (the
+/// corrective downgrade is the upgrade engine's job, under `ALLOW_RESOLUTION_DOWNGRADE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct QualityRank {
-    pub known: bool,
     pub resolution: u16,
     pub source_tier: i64,
+    pub checked: bool,
 }
 
 /// The [`QualityRank`] of an owned copy's recorded quality (`None` = nothing recorded = the lowest).
-pub fn quality_rank(q: Option<&QualitySummary>, ceiling: u16) -> QualityRank {
+pub fn quality_rank(q: Option<&QualitySummary>) -> QualityRank {
     match q {
         Some(q) => QualityRank {
-            known: !is_unknown_quality(q, ceiling),
             resolution: q.resolution,
             source_tier: q.source_tier,
+            checked: !q.unverified,
         },
         None => QualityRank {
-            known: false,
             resolution: 0,
             source_tier: 0,
+            checked: false,
         },
     }
 }
@@ -757,9 +764,11 @@ pub enum Improvement {
 /// new copy is verified and that rule cannot fire for it again.
 ///
 /// UNKNOWN quality ([`is_unknown_quality`]) is the lowest: within the ceiling an unknown current is
-/// improved by any known cached candidate (scores ignored) and a known current is never improved by
-/// an unknown candidate. Replacing an unknown copy records a known one, so that rule fires at most
-/// once per slot (converges); an unknown candidate is never adopted over anything cached.
+/// improved by any known cached candidate at or above its resolution when that is tagged (scores
+/// ignored — a known resolution stays a floor, so a 1080p copy with an untagged source is never
+/// traded for 720p), and a known current is never improved by an unknown candidate. Replacing an
+/// unknown copy records a known one, so that rule fires at most once per slot (converges); an
+/// unknown candidate is never adopted over anything cached.
 pub fn is_target_improvement(
     current: &QualitySummary,
     candidate: &QualitySummary,
@@ -774,8 +783,9 @@ pub fn is_target_improvement(
     // Unknown quality ranks below every known quality ([`is_unknown_quality`]). For a WITHIN-ceiling
     // current that decides the comparison outright, scores ignored: an unknown current is improved by
     // ANY known-quality cached within-ceiling candidate (the upgrade pass adopts it only on a probe
-    // `Pass`), and never by an unknown one; a known current is never "improved" by an unknown
-    // candidate. The swap records the adopted release's known quality, so the next visit compares two
+    // `Pass`) that keeps its resolution when that is tagged — a known resolution stays a floor, so
+    // this ungated path never trades resolution down — and never by an unknown one; a known current
+    // is never "improved" by an unknown candidate. The swap records the adopted release's known quality, so the next visit compares two
     // known copies under the rules below — it converges. An over-ceiling current is never unknown
     // (its known resolution is above the ceiling) and falls through to the corrective-downgrade rules.
     let ceiling = prefs.max_resolution.height();
@@ -783,7 +793,9 @@ pub fn is_target_improvement(
         let candidate_known =
             !is_unknown_quality(candidate, ceiling) && candidate.resolution <= ceiling;
         if is_unknown_quality(current, ceiling) {
-            return if candidate_known {
+            let keeps_resolution =
+                current.resolution == 0 || candidate.resolution >= current.resolution;
+            return if candidate_known && keeps_resolution {
                 Improvement::Upgrade
             } else {
                 Improvement::None
@@ -2476,42 +2488,53 @@ mod tests {
         }
 
         #[test]
-        fn quality_rank_is_known_first_then_resolution_then_tier() {
-            let c = 1080;
-            let web720 = quality_rank(Some(&q(720, 3_000, 1)), c);
-            let untagged_source_1080 = quality_rank(Some(&q(1080, 0, 999_999)), c);
-            let untagged_res_remux = quality_rank(Some(&q(0, 8_000, 999_999)), c);
-            let none = quality_rank(None, c);
+        fn quality_rank_is_resolution_then_tier_then_checked() {
+            let web720 = quality_rank(Some(&q(720, 3_000, 1)));
+            let untagged_source_1080 = quality_rank(Some(&q(1080, 0, 1)));
+            let untagged_res_remux = quality_rank(Some(&q(0, 8_000, 999_999)));
+            let none = quality_rank(None);
             assert!(
-                web720 > untagged_source_1080,
-                "any known quality beats unknown, even at a higher resolution or score"
+                untagged_source_1080 > web720,
+                "a known resolution stays a floor: 1080p with an untagged source outranks 720p WEB"
             );
-            assert!(web720 > untagged_res_remux);
             assert!(
-                untagged_source_1080 > untagged_res_remux,
-                "unknowns: resolution next"
+                quality_rank(Some(&q(1080, 1_000, 1))) > untagged_source_1080,
+                "at the same resolution a known source tier beats an untagged one"
+            );
+            assert!(
+                web720 > untagged_res_remux,
+                "an untagged resolution is the lowest, whatever its tier or score"
             );
             assert!(
                 untagged_res_remux > none,
                 "a recorded tier beats nothing at all"
             );
             assert!(
-                quality_rank(Some(&q(1080, 8_000, 1)), c)
-                    > quality_rank(Some(&q(1080, 6_000, 9)), c),
-                "known: same resolution → higher tier wins (score is not part of the rank)"
+                quality_rank(Some(&q(1080, 8_000, 1))) > quality_rank(Some(&q(1080, 6_000, 9))),
+                "same resolution → higher tier wins (score is not part of the rank)"
             );
             assert!(
-                quality_rank(Some(&q(2160, 3_000, 1)), c) > quality_rank(Some(&q(1080, 8_000, 9)), c),
-                "known: resolution dominates tier, and the ceiling never lowers an over-ceiling copy"
+                quality_rank(Some(&q(2160, 3_000, 1))) > quality_rank(Some(&q(1080, 8_000, 9))),
+                "resolution dominates tier, and an over-ceiling copy is never ranked down"
             );
             assert!(
-                quality_rank(Some(&q(2160, 0, 1)), c) > quality_rank(Some(&q(1080, 8_000, 9)), c),
+                quality_rank(Some(&q(2160, 0, 1))) > quality_rank(Some(&q(1080, 8_000, 9))),
                 "an over-ceiling copy with an untagged tier is not unknown-lowest"
             );
             assert_eq!(
-                quality_rank(Some(&q(1080, 6_000, 1)), c),
-                quality_rank(Some(&q(1080, 6_000, 9)), c),
+                quality_rank(Some(&q(1080, 6_000, 1))),
+                quality_rank(Some(&q(1080, 6_000, 9))),
                 "same resolution + tier = same quality (score ignored)"
+            );
+            let mut unchecked = q(1080, 6_000, 9);
+            unchecked.unverified = true;
+            assert!(
+                quality_rank(Some(&q(1080, 6_000, 1))) > quality_rank(Some(&unchecked)),
+                "at the same resolution and tier a checked copy beats an unchecked one"
+            );
+            assert!(
+                quality_rank(Some(&unchecked)) > quality_rank(Some(&q(1080, 3_000, 9))),
+                "but `unverified` never outweighs a better tier"
             );
         }
 
@@ -2522,7 +2545,7 @@ mod tests {
             for current in [
                 QualitySummary::unknown(),
                 q(0, 3_000, 9_000_000), // resolution untagged, even with a higher score
-                q(1080, 0, 9_000_000),  // source untagged, even at a higher resolution
+                q(720, 0, 9_000_000),   // source untagged, at the same resolution
                 q(0, 0, 1),
             ] {
                 assert_eq!(
@@ -2543,6 +2566,36 @@ mod tests {
                     "an uncached candidate is never an improvement"
                 );
             }
+        }
+
+        /// An unknown copy whose RESOLUTION is known keeps it as a floor: only a known candidate at
+        /// that resolution or higher improves it, so a 1080p copy with an untagged source is never
+        /// replaced by a 720p release on the ungated upgrade path (only a corrective downgrade, under
+        /// `ALLOW_RESOLUTION_DOWNGRADE`, ever trades resolution down).
+        #[test]
+        fn an_unknown_current_keeps_its_known_resolution_as_a_floor() {
+            let p = prefs(MaxResolution::P1080);
+            let untagged_source_1080 = q(1080, 0, 9_000_000);
+            assert_eq!(
+                is_target_improvement(&untagged_source_1080, &q(720, 6_000, 1_000_100), &p),
+                Improvement::None,
+                "a known 720p BluRay never replaces a 1080p copy with an untagged source"
+            );
+            assert_eq!(
+                is_target_improvement(&untagged_source_1080, &q(1080, 1_000, 1), &p),
+                Improvement::Upgrade,
+                "a known 1080p release does, whatever its score"
+            );
+            assert_eq!(
+                is_target_improvement(&q(720, 0, 9_000_000), &q(1080, 3_000, 1), &p),
+                Improvement::Upgrade,
+                "and so does a higher resolution"
+            );
+            assert_eq!(
+                is_target_improvement(&q(0, 8_000, 9_000_000), &q(720, 3_000, 1), &p),
+                Improvement::Upgrade,
+                "an untagged resolution sets no floor"
+            );
         }
 
         #[test]

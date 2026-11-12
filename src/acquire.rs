@@ -743,15 +743,16 @@ impl AcquisitionEngine {
                             // this present pack, which supplies the episode.
                             None => true,
                             // A different, still-owned release holds this episode: overwrite only
-                            // when this pack is NOT a downgrade. Unknown quality (none recorded, or
-                            // an untagged axis) is the LOWEST: known beats unknown outright; on the
-                            // same side the scores decide; and with no quality on either side
-                            // nothing is provable → keep.
+                            // when this pack is NOT a downgrade. Resolution first (a known
+                            // resolution stays a floor; untagged = 0 = the lowest), then a known
+                            // source beats an untagged one, then the scores decide; and with no
+                            // quality on either side nothing is provable → keep.
                             Some(old) => {
-                                let ceiling = self.prefs.max_resolution.height();
                                 let key = |q: Option<&crate::release::QualitySummary>| {
+                                    let rank = crate::release::quality_rank(q);
                                     (
-                                        crate::release::quality_rank(q, ceiling).known,
+                                        rank.resolution,
+                                        rank.source_tier > 0,
                                         q.map(|q| q.score).unwrap_or(i64::MIN),
                                     )
                                 };
@@ -4106,7 +4107,7 @@ mod tests {
                 .unwrap()
                 .hash
         };
-        for single in [None, q(1080, 0, 9_000_000), q(0, 8_000, 9_000_000)] {
+        for single in [None, q(720, 0, 9_000_000), q(0, 8_000, 9_000_000)] {
             let st = run_pack_gate_q(single.clone(), q(720, 3_000, 1_075_000)).await;
             assert_eq!(
                 slot(st).await,
@@ -4114,13 +4115,21 @@ mod tests {
                 "{single:?}: the known pack takes the slot"
             );
         }
-        for pack in [None, q(1080, 0, 9_000_000)] {
+        // A known resolution stays a floor: a 720p pack never takes the slot of a 1080p single
+        // whose source is untagged.
+        let st = run_pack_gate_q(q(1080, 0, 1), q(720, 3_000, 1_075_000)).await;
+        assert_eq!(slot(st).await, "hsingle");
+        for pack in [None, q(720, 0, 9_000_000), q(0, 8_000, 9_000_000)] {
             let st = run_pack_gate_q(q(720, 3_000, 1_075_000), pack.clone()).await;
             assert_eq!(
                 slot(st).await,
                 "hsingle",
-                "{pack:?}: an unknown pack never steals it"
+                "{pack:?}: an unknown pack never steals it at the same or a lower resolution"
             );
         }
+        // Resolution comes first, as dedup ranks copies: a 1080p pack whose source is untagged
+        // outranks a 720p single.
+        let st = run_pack_gate_q(q(720, 3_000, 1_075_000), q(1080, 0, 1)).await;
+        assert_eq!(slot(st).await, "hpack");
     }
 }

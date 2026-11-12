@@ -334,7 +334,9 @@ async fn persist_title_languages(
 /// [`QualitySummary::unknown`]. Used as the upgrade baseline so a swap that prunes every copy can only
 /// proceed against the BEST one it would delete — never downgrading by comparing against a worse
 /// duplicate — while a title owned only as unknown copies baselines as unknown, so any known cached
-/// within-ceiling candidate (adopted only on a probe `Pass`) improves on it. Ranking by
+/// within-ceiling candidate at or above its resolution (adopted only on a probe `Pass`) improves on
+/// it. A known resolution stays a floor: an unknown within-ceiling copy at a higher resolution than
+/// the best known one is the baseline instead, so the swap never trades it down. Ranking by
 /// `effective_score` (rather than raw `score`) is ceiling-aware: an over-ceiling copy (never unknown)
 /// no longer masquerades as "best" and block its own corrective downgrade — e.g. owning only a 2160p
 /// copy under a 1080p ceiling must baseline off its (heavily penalised) effective score so a
@@ -349,6 +351,8 @@ async fn best_owned_quality(app: &AppState, owned_hashes: &[String]) -> Option<Q
         )
     };
     let mut best: Option<QualitySummary> = None;
+    // The highest-resolution unknown within-ceiling copy (see the floor below).
+    let mut floor: Option<QualitySummary> = None;
     for h in owned_hashes {
         // A record concurrently pruned between grouping and here is no longer part of the owned set
         // the swap would delete, so SKIP it rather than aborting the whole baseline (which would
@@ -357,8 +361,25 @@ async fn best_owned_quality(app: &AppState, owned_hashes: &[String]) -> Option<Q
             continue;
         };
         let q = rec.quality.unwrap_or_else(QualitySummary::unknown);
+        if release::is_unknown_quality(&q, ceiling)
+            && floor
+                .as_ref()
+                .is_none_or(|f| (q.resolution, key(&q)) > (f.resolution, key(f)))
+        {
+            floor = Some(q.clone());
+        }
         if best.as_ref().is_none_or(|b| key(&q) > key(b)) {
             best = Some(q);
+        }
+    }
+    // A known resolution stays a floor: an unknown within-ceiling copy at a HIGHER resolution than
+    // the best within-ceiling copy (known, or another unknown that out-scored it) becomes the
+    // baseline, so an improvement on it (a known release at or above that resolution) also improves
+    // every other copy the swap would prune and never trades its resolution down. An over-ceiling
+    // best is left alone: it already baselines the gated corrective-downgrade path.
+    if let (Some(b), Some(f)) = (&best, floor) {
+        if b.resolution <= ceiling && f.resolution > b.resolution {
+            best = Some(f);
         }
     }
     best
@@ -5231,6 +5252,74 @@ mod tests {
             3_000,
             "the freshest title must be left for a later tick (over budget)"
         );
+    }
+
+    /// A known resolution stays a floor in the baseline too: owning a 1080p copy with an untagged
+    /// source and a 720p WEB copy, the baseline is the 1080p one, so a 720p candidate — which
+    /// would "improve" the 720p WEB copy — is never adopted and the swap never prunes the 1080p
+    /// copy (only the gated corrective downgrade ever trades resolution down).
+    #[tokio::test]
+    async fn best_owned_quality_keeps_an_unknown_copys_resolution_as_a_floor() {
+        let store = mem_store();
+        let rec = |resolution: u16, tier: i64, score: i64| OwnedRecord {
+            request: movie_req(),
+            provenance: Provenance::watchlist("a"),
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: Some(QualitySummary {
+                cached: true,
+                source_tier: tier,
+                resolution,
+                score,
+                unverified: false,
+            }),
+        };
+        store
+            .put_owned("a720web".into(), rec(720, 3_000, 1_000_000))
+            .await
+            .unwrap();
+        store
+            .put_owned("b1080".into(), rec(1080, 0, 1))
+            .await
+            .unwrap();
+        let app = app_with(
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(MockProvider::default()),
+            store.clone(),
+        );
+        let best = best_owned_quality(&app, &["a720web".into(), "b1080".into()])
+            .await
+            .expect("a baseline exists");
+        assert_eq!((best.resolution, best.source_tier), (1080, 0));
+        let prefs = &app.config.acquisition.prefs;
+        let cand = |resolution: u16, tier: i64| QualitySummary {
+            cached: true,
+            source_tier: tier,
+            resolution,
+            score: 2_000_000,
+            unverified: false,
+        };
+        assert_eq!(
+            release::is_target_improvement(&best, &cand(720, 6_000), prefs),
+            release::Improvement::None,
+            "a 720p BluRay must not prune the 1080p copy"
+        );
+        assert_eq!(
+            release::is_target_improvement(&best, &cand(1080, 3_000), prefs),
+            release::Improvement::Upgrade,
+            "a known 1080p release improves on both copies"
+        );
+        // Among unknown copies too: a higher-scoring copy with an untagged resolution doesn't make
+        // the 1080p one prunable by a 720p release.
+        store
+            .put_owned("cremux".into(), rec(0, 8_000, 9_000_000))
+            .await
+            .unwrap();
+        let best = best_owned_quality(&app, &["b1080".into(), "cremux".into()])
+            .await
+            .expect("a baseline exists");
+        assert_eq!(best.resolution, 1080);
     }
 
     #[tokio::test]
