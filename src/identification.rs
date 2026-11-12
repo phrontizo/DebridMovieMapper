@@ -820,11 +820,7 @@ fn is_generic_title(s: &str) -> bool {
     }
 
     // Generic terms that might have survived cleaning
-    if GENERIC_RE.is_match(&lower) {
-        return true;
-    }
-
-    false
+    GENERIC_RE.is_match(&lower)
 }
 
 #[cfg(test)]
