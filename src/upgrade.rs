@@ -31,7 +31,10 @@ enum UpgradeSkip {
 /// For SHOWS, four layered passes: per-singleton-episode upgrade/downgrade, upgrade of episodes
 /// served from a within-ceiling multi-episode pack, over-ceiling season-pack correction, then
 /// full-season consolidation of scattered per-episode torrents into a cached pack.
-/// Each title (movie or show) is one budget unit, ordered least-recently-checked first.
+/// Each title (movie or show) is one budget unit. Titles holding a copy that needs attention (see
+/// [`needs_attention`]) go first, then the rest, each least-recently-checked first; by default
+/// (`UPGRADE_BUDGET_PER_TICK` unset) every title is visited, and a budget caps the pass as
+/// [`upgrade_batch`] describes.
 pub async fn run_upgrade_once(app: &AppState) {
     run_upgrade_once_with(app, |tmdb_id, media_type| {
         app.tmdb_client.details(tmdb_id, media_type)
@@ -46,7 +49,7 @@ where
     F: Fn(u64, MediaType) -> Fut,
     Fut: Future<Output = Result<TitleDetails, reqwest::Error>>,
 {
-    let budget = app.config.upgrade.budget_per_tick as usize;
+    let budget = app.config.upgrade.budget_per_tick.map(|b| b as usize);
     let idle_window = Duration::from_secs(app.config.upgrade.idle_secs);
 
     // Re-derive the quality of owned records that have NONE from their file names (the persisted
@@ -72,7 +75,8 @@ where
         }
     }
 
-    // Group owned by tmdb_id (reuse the tasks helper) and pick the least-recently-checked titles.
+    // Group owned by tmdb_id (reuse the tasks helper); titles needing attention go first, then the
+    // least-recently-checked.
     let groups = crate::tasks::group_owned_by_tmdb(&app.store).await;
     let mut candidates: Vec<(u64, MediaType, Vec<String>, OwnedRecord)> = Vec::new();
     for ((_mt, tmdb_id), g) in &groups {
@@ -104,17 +108,38 @@ where
         }
         candidates.push((*tmdb_id, g.media_type.clone(), g.hashes.clone(), rec));
     }
-    // Least-recently-checked first.
-    let mut ordered: Vec<_> = Vec::new();
+    // Read after the quality backfill above, so a record it just filled is judged on that quality.
+    let records: std::collections::HashMap<String, OwnedRecord> = app
+        .store
+        .all_owned()
+        .await
+        .into_iter()
+        .map(|(h, r)| (h.to_ascii_lowercase(), r))
+        .collect();
+    let ceiling = app.config.acquisition.prefs.max_resolution.height();
+    let mut queue = Vec::with_capacity(candidates.len());
     for (id, media_type, hashes, rec) in candidates {
         let last = app.store.get_upgrade_checked(&media_type, id).await;
-        ordered.push((last, id, media_type, hashes, rec));
+        let attention = needs_attention(
+            hashes
+                .iter()
+                .filter_map(|h| records.get(&h.to_ascii_lowercase())),
+            ceiling,
+        );
+        queue.push((last, attention, (id, media_type, hashes, rec)));
     }
-    ordered.sort_by_key(|(last, ..)| *last);
-    ordered.truncate(budget);
+    let queued = queue.len();
+    let attention = queue.iter().filter(|(_, a, _)| *a).count();
+    let batch = upgrade_batch(queue, budget);
+    info!(
+        "upgrade: visiting {} of {} title(s), first the {} holding a copy of unknown or unchecked quality",
+        batch.len(),
+        queued,
+        attention
+    );
 
     let mut backfill = LanguageBackfill::new(fetch_details);
-    for (_, tmdb_id, media_type, hashes, mut rec) in ordered {
+    for (tmdb_id, media_type, hashes, mut rec) in batch {
         // Library-wide idle gate BEFORE stamping the cursor. The actual swap/prune is idle-gated
         // inside each handler, but stamping `upgrade_checked` for a title we then defer (library
         // active) would advance the round-robin cursor past it — so on a frequently-streamed library
@@ -172,6 +197,49 @@ where
             }
         }
     }
+}
+
+/// Whether a title holds a settled (`Verified`) copy the upgrade pass should look at first: one with
+/// no recorded quality, an unknown quality ([`release::is_unknown_quality`]: an untagged resolution
+/// or source tier within the ceiling), or tracks that could not be checked (`unverified`). These are
+/// the copies the pass replaces with any known, checked release, so waiting a full rotation of the
+/// library for them leaves a bad copy in place for no reason. A `Pending` copy is `observe`'s.
+fn needs_attention<'a>(records: impl IntoIterator<Item = &'a OwnedRecord>, ceiling: u16) -> bool {
+    records
+        .into_iter()
+        .filter(|r| r.status == OwnedStatus::Verified)
+        .any(|r| match &r.quality {
+            None => true,
+            Some(q) => q.unverified || release::is_unknown_quality(q, ceiling),
+        })
+}
+
+/// This pass's titles, in visiting order, from `queue` = `(last_checked, needs_attention, title)`.
+/// Each group is ordered least-recently-checked first (ties keep the queue's order). With no budget,
+/// or one covering the queue, every title is visited, attention titles first. A smaller budget gives
+/// half of itself (rounded down) to the attention titles checked least recently and the rest to the
+/// remaining titles checked least recently, attention or not — so attention titles that never find
+/// a better copy can't crowd the others out of a capped pass.
+fn upgrade_batch<T>(mut queue: Vec<(u64, bool, T)>, budget: Option<usize>) -> Vec<T> {
+    queue.sort_by_key(|(last, ..)| *last); // stable
+    let budget = budget.unwrap_or(usize::MAX);
+    if budget >= queue.len() {
+        let (first, rest): (Vec<_>, Vec<_>) = queue.into_iter().partition(|(_, a, _)| *a);
+        return first.into_iter().chain(rest).map(|(.., t)| t).collect();
+    }
+    let reserved = budget / 2;
+    let mut picked = Vec::with_capacity(budget);
+    let mut rest = Vec::with_capacity(queue.len());
+    for entry in queue {
+        if entry.1 && picked.len() < reserved {
+            picked.push(entry);
+        } else {
+            rest.push(entry);
+        }
+    }
+    let fill = budget - picked.len();
+    picked.extend(rest.into_iter().take(fill));
+    picked.into_iter().map(|(.., t)| t).collect()
 }
 
 /// One-time backfill of a title's TMDB languages for owned records that predate
@@ -5232,7 +5300,7 @@ mod tests {
         Arc::get_mut(&mut app.config)
             .unwrap()
             .upgrade
-            .budget_per_tick = 1;
+            .budget_per_tick = Some(1);
 
         run_upgrade_once(&app).await;
 
@@ -5252,6 +5320,193 @@ mod tests {
             3_000,
             "the freshest title must be left for a later tick (over budget)"
         );
+    }
+
+    #[tokio::test]
+    async fn a_title_holding_an_unknown_copy_is_visited_ahead_of_its_turn() {
+        // Three owned movies; 303 holds a copy of unknown quality (untagged resolution) but was checked
+        // MOST recently. With a budget of 2, half of it (1) goes to titles needing attention, so 303 is
+        // visited this tick, and the other slot goes to the stalest remaining title (101). The scrape
+        // finds nothing, so each visited title is evaluated to completion and its cursor advances.
+        let store = mem_store();
+        for (id, resolution) in [(101u64, 1080u16), (202, 1080), (303, 0)] {
+            let mut req = movie_req();
+            req.tmdb_id = id;
+            req.metadata.external_id = Some(format!("tmdb:{id}"));
+            store
+                .put_owned(
+                    format!("h{id}"),
+                    OwnedRecord {
+                        request: req,
+                        provenance: Provenance::watchlist("a"),
+                        added_at: 1,
+                        status: OwnedStatus::Verified,
+                        provides: vec![],
+                        quality: Some(QualitySummary {
+                            cached: true,
+                            source_tier: 3_000,
+                            resolution,
+                            score: 10,
+                            unverified: false,
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        for (id, last) in [(101u64, 1_000u64), (202, 2_000), (303, 3_000)] {
+            store
+                .set_upgrade_checked(&MediaType::Movie, id, last)
+                .await
+                .unwrap();
+        }
+        let scraper = Arc::new(MockScraper { candidates: vec![] });
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
+        let mut app = app_with(scraper, provider, store.clone());
+        Arc::get_mut(&mut app.config)
+            .unwrap()
+            .upgrade
+            .budget_per_tick = Some(2);
+
+        run_upgrade_once(&app).await;
+
+        assert!(
+            store.get_upgrade_checked(&MediaType::Movie, 303).await > 3_000,
+            "the title holding an unknown copy is visited despite its recent check"
+        );
+        assert!(
+            store.get_upgrade_checked(&MediaType::Movie, 101).await > 3_000,
+            "the rest of the budget still goes to the stalest title"
+        );
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Movie, 202).await,
+            2_000,
+            "over budget this tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_no_budget_every_title_is_visited() {
+        let store = mem_store();
+        for id in [101u64, 202, 303] {
+            let mut req = movie_req();
+            req.tmdb_id = id;
+            req.metadata.external_id = Some(format!("tmdb:{id}"));
+            store
+                .put_owned(
+                    format!("h{id}"),
+                    OwnedRecord {
+                        request: req,
+                        provenance: Provenance::watchlist("a"),
+                        added_at: 1,
+                        status: OwnedStatus::Verified,
+                        provides: vec![],
+                        quality: Some(q1080_web()),
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .set_upgrade_checked(&MediaType::Movie, id, id)
+                .await
+                .unwrap();
+        }
+        let scraper = Arc::new(MockScraper { candidates: vec![] });
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
+        let mut app = app_with(scraper, provider, store.clone());
+        Arc::get_mut(&mut app.config)
+            .unwrap()
+            .upgrade
+            .budget_per_tick = None;
+
+        run_upgrade_once(&app).await;
+
+        for id in [101u64, 202, 303] {
+            assert!(
+                store.get_upgrade_checked(&MediaType::Movie, id).await > 1_000,
+                "tmdb {id} is visited: with no budget a pass covers the whole library"
+            );
+        }
+    }
+
+    #[test]
+    fn upgrade_batch_puts_titles_needing_attention_first_and_never_starves_the_rest() {
+        // (last_checked, needs_attention, title)
+        let queue = || {
+            vec![
+                (5, true, "a1"),
+                (1, false, "r1"),
+                (7, true, "a3"),
+                (2, false, "r2"),
+                (6, true, "a2"),
+                (3, false, "r3"),
+            ]
+        };
+        // No budget: every title, attention first, each group least recently checked first.
+        assert_eq!(
+            upgrade_batch(queue(), None),
+            vec!["a1", "a2", "a3", "r1", "r2", "r3"]
+        );
+        // A budget covering the queue behaves the same.
+        assert_eq!(upgrade_batch(queue(), Some(6)).len(), 6);
+        // A smaller budget: half (rounded down) for the attention titles, the rest to whichever
+        // remaining titles were checked least recently.
+        assert_eq!(
+            upgrade_batch(queue(), Some(4)),
+            vec!["a1", "a2", "r1", "r2"]
+        );
+        assert_eq!(
+            upgrade_batch(queue(), Some(5)),
+            vec!["a1", "a2", "r1", "r2", "r3"]
+        );
+        // A budget of 1 has no attention share: plain least-recently-checked rotation.
+        assert_eq!(upgrade_batch(queue(), Some(1)), vec!["r1"]);
+        // When every other title has had its turn, attention titles fill the remaining budget.
+        let few = vec![
+            (9, false, "r1"),
+            (5, true, "a1"),
+            (6, true, "a2"),
+            (7, true, "a3"),
+        ];
+        assert_eq!(upgrade_batch(few, Some(3)), vec!["a1", "a2", "a3"]);
+        // Equal cursors keep the queue's own order.
+        let tied = vec![(0, false, "x"), (0, false, "y"), (0, true, "z")];
+        assert_eq!(upgrade_batch(tied, None), vec!["z", "x", "y"]);
+    }
+
+    #[test]
+    fn needs_attention_flags_settled_copies_of_unknown_or_unchecked_quality() {
+        let rec = |status: OwnedStatus, quality: Option<QualitySummary>| OwnedRecord {
+            request: movie_req(),
+            provenance: Provenance { entries: vec![] },
+            added_at: 1,
+            status,
+            provides: vec![],
+            quality,
+        };
+        let q = |resolution: u16, source_tier: i64, unverified: bool| QualitySummary {
+            cached: true,
+            source_tier,
+            resolution,
+            score: 10,
+            unverified,
+        };
+        let good = rec(OwnedStatus::Verified, Some(q(1080, 3_000, false)));
+        assert!(!needs_attention([&good], 1080));
+        for odd in [
+            rec(OwnedStatus::Verified, None),
+            rec(OwnedStatus::Verified, Some(q(0, 3_000, false))),
+            rec(OwnedStatus::Verified, Some(q(1080, 0, false))),
+            rec(OwnedStatus::Verified, Some(q(1080, 3_000, true))),
+        ] {
+            assert!(needs_attention([&good, &odd], 1080), "{:?}", odd.quality);
+        }
+        // An over-ceiling copy is never unknown, whatever its source tier.
+        let over = rec(OwnedStatus::Verified, Some(q(2160, 0, false)));
+        assert!(!needs_attention([&over], 1080));
+        // An unsettled (Pending) copy is left to `observe`.
+        let pending = rec(OwnedStatus::Pending, None);
+        assert!(!needs_attention([&pending], 1080));
     }
 
     /// A known resolution stays a floor in the baseline too: owning a 1080p copy with an untagged

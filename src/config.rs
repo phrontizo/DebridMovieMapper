@@ -545,7 +545,9 @@ impl AcquisitionConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradeConfig {
     pub interval_secs: u64,
-    pub budget_per_tick: u32,
+    /// Maximum titles visited per pass (`UPGRADE_BUDGET_PER_TICK`); `None` (the default) = every
+    /// owned title, every pass.
+    pub budget_per_tick: Option<u32>,
     pub idle_secs: u64,
     pub stage_max_secs: u64,
 }
@@ -590,8 +592,7 @@ impl UpgradeConfig {
         }
         UpgradeConfig {
             interval_secs: num(interval_secs, 86_400, 600, true, "UPGRADE_INTERVAL_SECS"),
-            budget_per_tick: num(budget_per_tick, 20, 1, false, "UPGRADE_BUDGET_PER_TICK")
-                .min(u32::MAX as u64) as u32,
+            budget_per_tick: parse_upgrade_budget(budget_per_tick),
             idle_secs: num(idle_secs, 300, 30, false, "UPGRADE_IDLE_SECS"),
             stage_max_secs: num(
                 stage_max_secs,
@@ -612,6 +613,23 @@ impl UpgradeConfig {
             std::env::var("UPGRADE_IDLE_SECS").ok(),
             std::env::var("UPGRADE_STAGE_MAX_SECS").ok(),
         )
+    }
+}
+
+/// `UPGRADE_BUDGET_PER_TICK`: unset or blank = no budget (every pass visits the whole library); a
+/// number caps the titles visited per pass (minimum 1); anything else warns and falls back to no
+/// budget.
+fn parse_upgrade_budget(v: Option<String>) -> Option<u32> {
+    let s = v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+    match s.parse::<u64>() {
+        Ok(n) => Some(n.clamp(1, u32::MAX as u64) as u32),
+        Err(_) => {
+            warn!(
+                "Invalid UPGRADE_BUDGET_PER_TICK value '{}', falling back to no budget (the whole library each pass)",
+                s
+            );
+            None
+        }
     }
 }
 
@@ -1528,7 +1546,10 @@ mod tests {
         // Absent → daily default, all sub-defaults applied.
         let u = UpgradeConfig::from_parts(None, None, None, None);
         assert_eq!(u.interval_secs, 86_400);
-        assert_eq!(u.budget_per_tick, 20);
+        assert_eq!(
+            u.budget_per_tick, None,
+            "no budget by default: every pass covers the library"
+        );
         assert_eq!(u.idle_secs, 300);
         assert_eq!(u.stage_max_secs, 604_800);
         assert!(u.enabled(), "default (daily) is enabled");
@@ -1546,14 +1567,20 @@ mod tests {
             Some("10".into()),
         );
         assert_eq!(clamped.interval_secs, 600);
-        assert_eq!(clamped.budget_per_tick, 1);
+        assert_eq!(clamped.budget_per_tick, Some(1));
         assert_eq!(clamped.idle_secs, 30);
         assert_eq!(clamped.stage_max_secs, 3600);
 
         // Invalid → defaults.
         let bad = UpgradeConfig::from_parts(Some("x".into()), Some("y".into()), None, None);
         assert_eq!(bad.interval_secs, 86_400);
-        assert_eq!(bad.budget_per_tick, 20);
+        assert_eq!(bad.budget_per_tick, None);
+
+        // An explicit budget caps each pass; blank is unset.
+        let capped = UpgradeConfig::from_parts(None, Some(" 400 ".into()), None, None);
+        assert_eq!(capped.budget_per_tick, Some(400));
+        let blank = UpgradeConfig::from_parts(None, Some("  ".into()), None, None);
+        assert_eq!(blank.budget_per_tick, None);
     }
 
     #[test]
