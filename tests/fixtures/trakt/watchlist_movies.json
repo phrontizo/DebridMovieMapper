@@ -1,0 +1,68 @@
+[
+  {
+    "type": "movie",
+    "movie": {
+      "ids": {
+        "imdb": "tt9901000",
+        "plex": {
+          "guid": "00000000000000000000000f",
+          "slug": "example-22"
+        },
+        "slug": "example-22",
+        "tmdb": 911700,
+        "trakt": 811700
+      },
+      "year": 2026,
+      "title": "Example Film Six"
+    },
+    "rank": 3,
+    "id": 5000020,
+    "listed_at": "2025-05-05T08:14:24.000Z",
+    "notes": null,
+    "my_rating": null
+  },
+  {
+    "type": "movie",
+    "movie": {
+      "ids": {
+        "imdb": "tt9901300",
+        "plex": {
+          "guid": "000000000000000000000004",
+          "slug": "example-15"
+        },
+        "slug": "example-16",
+        "tmdb": 911300,
+        "trakt": 811100
+      },
+      "year": 2016,
+      "title": "Example Film Seven"
+    },
+    "rank": 4,
+    "id": 5000030,
+    "listed_at": "2025-05-05T08:14:37.000Z",
+    "notes": null,
+    "my_rating": null
+  },
+  {
+    "type": "movie",
+    "movie": {
+      "ids": {
+        "imdb": "tt9901400",
+        "plex": {
+          "guid": "000000000000000000000005",
+          "slug": "example-17"
+        },
+        "slug": "example-18",
+        "tmdb": 911400,
+        "trakt": 811200
+      },
+      "year": 2018,
+      "title": "Example Film Eight"
+    },
+    "rank": 5,
+    "id": 5000040,
+    "listed_at": "2025-05-05T08:14:41.000Z",
+    "notes": null,
+    "my_rating": null
+  }
+]

@@ -22,6 +22,12 @@ pub enum AppError {
 
     #[error("Upstream API rate limit exceeded")]
     RateLimited,
+
+    /// An upstream API answered successfully but incoherently (e.g. a Trakt list read whose
+    /// pagination headers changed between pages, or a page body that is not a JSON array). Surfaced
+    /// as an error so a caller never acts on a silently truncated/partial read.
+    #[error("Unexpected upstream response: {0}")]
+    Upstream(String),
 }
 
 #[cfg(test)]
@@ -57,6 +63,10 @@ mod tests {
         assert_eq!(
             AppError::Task("scheduler panicked".into()).to_string(),
             "Background task failed: scheduler panicked"
+        );
+        assert_eq!(
+            AppError::Upstream("page count changed".into()).to_string(),
+            "Unexpected upstream response: page count changed"
         );
     }
 

@@ -1,0 +1,50 @@
+[
+  {
+    "type": "show",
+    "show": {
+      "ids": {
+        "imdb": "tt9901500",
+        "plex": {
+          "guid": "000000000000000000000012",
+          "slug": "example-4"
+        },
+        "slug": "example-4",
+        "tmdb": 911200,
+        "tvdb": 710900,
+        "trakt": 811400
+      },
+      "year": 2026,
+      "title": "Example Docudrama",
+      "aired_episodes": 2
+    },
+    "rank": 1,
+    "id": 5000010,
+    "listed_at": "2025-05-05T08:13:11.000Z",
+    "notes": null,
+    "my_rating": null
+  },
+  {
+    "type": "show",
+    "show": {
+      "ids": {
+        "imdb": "tt9900100",
+        "plex": {
+          "guid": "000000000000000000000007",
+          "slug": "example-25"
+        },
+        "slug": "example-24",
+        "tmdb": 910100,
+        "tvdb": 710100,
+        "trakt": 810100
+      },
+      "year": 1967,
+      "title": "Example Classic",
+      "aired_episodes": 17
+    },
+    "rank": 19,
+    "id": 5000050,
+    "listed_at": "2025-05-07T08:10:27.000Z",
+    "notes": null,
+    "my_rating": null
+  }
+]

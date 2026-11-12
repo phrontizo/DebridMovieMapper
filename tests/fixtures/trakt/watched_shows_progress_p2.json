@@ -1,0 +1,95 @@
+[
+  {
+    "plays": 6,
+    "last_watched_at": "2022-09-20T18:48:04.000Z",
+    "last_updated_at": "2022-09-20T18:48:04.000Z",
+    "reset_at": null,
+    "show": {
+      "ids": {
+        "imdb": "tt9900600",
+        "plex": {
+          "guid": "00000000000000000000000d",
+          "slug": "example-7"
+        },
+        "slug": "example-7",
+        "tmdb": 910900,
+        "tvdb": 710600,
+        "trakt": 810900
+      },
+      "year": 2022,
+      "title": "Example Thriller",
+      "aired_episodes": 6
+    },
+    "seasons": [
+      {
+        "number": 1,
+        "episodes": [
+          {
+            "number": 1,
+            "plays": 1,
+            "last_watched_at": "2022-09-16T20:05:00.000Z"
+          },
+          {
+            "number": 2,
+            "plays": 2,
+            "last_watched_at": "2022-09-20T18:32:00.000Z"
+          },
+          {
+            "number": 3,
+            "plays": 1,
+            "last_watched_at": "2022-09-20T18:48:00.000Z"
+          },
+          {
+            "number": 4,
+            "plays": 1,
+            "last_watched_at": "2022-09-17T18:43:00.000Z"
+          },
+          {
+            "number": 5,
+            "plays": 1,
+            "last_watched_at": "2022-09-17T19:13:00.000Z"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "plays": 2,
+    "last_watched_at": "2022-09-16T19:25:21.000Z",
+    "last_updated_at": "2022-09-16T19:25:21.000Z",
+    "reset_at": null,
+    "show": {
+      "ids": {
+        "imdb": null,
+        "plex": {
+          "guid": "00000000000000000000000b",
+          "slug": "example-12"
+        },
+        "slug": "example-12",
+        "tmdb": 910700,
+        "tvdb": 710500,
+        "trakt": 810700
+      },
+      "year": 2019,
+      "title": "Example Travelogue",
+      "aired_episodes": 2
+    },
+    "seasons": [
+      {
+        "number": 1,
+        "episodes": [
+          {
+            "number": 1,
+            "plays": 1,
+            "last_watched_at": "2022-09-16T19:25:00.000Z"
+          },
+          {
+            "number": 2,
+            "plays": 1,
+            "last_watched_at": "2022-09-16T19:25:00.000Z"
+          }
+        ]
+      }
+    ]
+  }
+]

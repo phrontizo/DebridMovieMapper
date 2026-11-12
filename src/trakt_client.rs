@@ -7,6 +7,7 @@ use crate::error::AppError;
 use crate::ratelimit::AdaptiveRateLimiter;
 use crate::vfs::MediaType;
 use async_trait::async_trait;
+use tracing::{debug, warn};
 
 /// A movie or show identified by its TMDB id (a watchlist or playback entry). Also carries the
 /// IMDB id Trakt provided (`tt…`), if present, so acquisition can prefer it over re-deriving from
@@ -132,11 +133,13 @@ pub trait TraktClient: Send + Sync {
     async fn refresh(&self, refresh_token: &str) -> Result<TraktTokenResponse, AppError>;
     /// GET /users/me — the authenticated user's slug + username (keys the per-user tokens).
     async fn me(&self, access_token: &str) -> Result<TraktUser, AppError>;
-    /// GET /sync/watchlist/movies + /sync/watchlist/shows — the user's watchlisted movies+shows.
+    /// GET /sync/watchlist/movies + /sync/watchlist/shows — the user's watchlisted movies+shows,
+    /// EVERY page (see `TraktClientImpl::authed_get_list`); any page failing is an `Err`.
     async fn watchlist(&self, access_token: &str) -> Result<Vec<TraktItem>, AppError>;
     /// GET /sync/playback — movies + (show via episodes) the user is mid-watch, deduped by show tmdb.
     async fn in_progress(&self, access_token: &str) -> Result<Vec<TraktItem>, AppError>;
-    /// GET /sync/watched/movies + /sync/watched/shows — watched movies + per-show watched episodes.
+    /// GET /sync/watched/movies + /sync/watched/shows?extended=progress — watched movies + per-show
+    /// watched episodes, EVERY page; any page failing is an `Err`.
     async fn watched(&self, access_token: &str) -> Result<WatchedData, AppError>;
     /// GET /shows/{trakt_id}/progress/watched — whether the user has unwatched *aired* episodes
     /// (the precise catch-up gate). `trakt_id` is the show's Trakt numeric id, not its TMDB id.
@@ -148,6 +151,71 @@ pub trait TraktClient: Send + Sync {
 }
 
 const DEFAULT_BASE_URL: &str = "https://api.trakt.tv";
+
+/// Page size requested on every paginated Trakt list read. Since Trakt's 2026 API changes the
+/// watchlist (2026-04-15, trakt-api discussion #681) and watched (2026-07-03, #775) endpoints
+/// paginate BY DEFAULT and return only page 1 unless asked for more, so every page is followed.
+/// 100 is the largest page `/sync/watched/shows?extended=progress` accepts (plain watched allows
+/// 250; one uniform size keeps the reads simple — a few extra requests per sync are absorbed by the
+/// rate limiter).
+const PAGE_LIMIT: u32 = 100;
+
+/// Defensive cap on how many pages ONE list read follows (`PAGE_LIMIT` × this = 20,000 items): a
+/// garbled or hostile `X-Pagination-Page-Count` must not drive an unbounded request loop. A list
+/// claiming more pages is an `Err` — never a silently truncated read.
+const MAX_PAGES: u32 = 200;
+
+/// Trakt's pagination headers (`X-Pagination-Page`, `-Page-Count`, `-Item-Count`), as far as they
+/// are present and parse. A missing or garbled value is `None` — never guessed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Pagination {
+    pub page: Option<u32>,
+    pub page_count: Option<u32>,
+    pub item_count: Option<u64>,
+}
+
+/// Read the pagination headers off a Trakt response. PURE + total: a missing, non-UTF-8 or
+/// non-numeric header yields `None` for that field (the caller then treats the read as a single
+/// page, exactly like an unpaginated endpoint such as `/sync/playback`).
+pub(crate) fn parse_pagination(headers: &reqwest::header::HeaderMap) -> Pagination {
+    fn num<T: std::str::FromStr>(headers: &reqwest::header::HeaderMap, name: &str) -> Option<T> {
+        headers.get(name)?.to_str().ok()?.trim().parse().ok()
+    }
+    Pagination {
+        page: num(headers, "x-pagination-page"),
+        page_count: num(headers, "x-pagination-page-count"),
+        item_count: num(headers, "x-pagination-item-count"),
+    }
+}
+
+/// Check that page `requested` (≥ 2) of a list read is coherent with page 1. The list changing
+/// between page fetches (an item added/removed mid-read) shifts items across page boundaries, so a
+/// title could be missed on BOTH pages — for the watchlist that would read as "un-watchlisted" and
+/// could drive a Trigger-B removal. Detected via the headers changing (page/item count), or the
+/// server answering a different page than asked for; the read then fails and is retried next sync.
+/// A header absent on either side is not compared. PURE.
+pub(crate) fn check_page_consistency(
+    requested: u32,
+    first: &Pagination,
+    this: &Pagination,
+) -> Result<(), String> {
+    if let Some(p) = this.page {
+        if p != requested {
+            return Err(format!("asked for page {requested}, got page {p}"));
+        }
+    }
+    if let (Some(a), Some(b)) = (first.page_count, this.page_count) {
+        if a != b {
+            return Err(format!("page count changed mid-read ({a} → {b})"));
+        }
+    }
+    if let (Some(a), Some(b)) = (first.item_count, this.item_count) {
+        if a != b {
+            return Err(format!("item count changed mid-read ({a} → {b})"));
+        }
+    }
+    Ok(())
+}
 
 pub struct TraktClientImpl {
     base_url: String,
@@ -286,6 +354,102 @@ impl TraktClientImpl {
             .await
             .map_err(AppError::Http)
     }
+
+    /// Authed GET of a Trakt LIST endpoint, following EVERY page, returning the concatenated items
+    /// as one JSON array (so the per-endpoint parsers stay page-agnostic).
+    ///
+    /// - `limit = Some(n)`: every page is requested as `page=N&limit=n`.
+    /// - `limit = None`: page 1 is requested exactly as given (no `page`/`limit` — for an endpoint
+    ///   that does not paginate today, e.g. `/sync/playback`); should the response nevertheless
+    ///   carry a page count > 1, the rest is fetched as `page=N` at the server's default size.
+    ///
+    /// The page count comes from page 1's `X-Pagination-Page-Count`; a missing/garbled/zero value
+    /// reads as a single page. SAFETY: any failure is an `Err` for the WHOLE read — a page's
+    /// request/status/body failing, a non-array body, a page count above `MAX_PAGES`, or the list
+    /// changing mid-read (`check_page_consistency`) — so the caller keeps its previous state
+    /// rather than acting on a silently truncated list.
+    async fn authed_get_list(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+        access_token: &str,
+        limit: Option<u32>,
+    ) -> Result<serde_json::Value, AppError> {
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut first = Pagination::default();
+        let mut total_pages: u32 = 1;
+        let mut page: u32 = 1;
+        loop {
+            let mut query: Vec<(String, String)> = params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            if limit.is_some() || page > 1 {
+                query.push(("page".to_string(), page.to_string()));
+            }
+            if let Some(l) = limit {
+                query.push(("limit".to_string(), l.to_string()));
+            }
+            let resp = self
+                .send_with_retry(|| {
+                    self.request(reqwest::Method::GET, path)
+                        .query(&query)
+                        .bearer_auth(access_token)
+                })
+                .await?;
+            let resp = resp.error_for_status().map_err(AppError::Http)?;
+            let info = parse_pagination(resp.headers());
+            let body = resp
+                .json::<serde_json::Value>()
+                .await
+                .map_err(AppError::Http)?;
+            let serde_json::Value::Array(page_items) = body else {
+                return Err(AppError::Upstream(format!(
+                    "Trakt {path} page {page}: expected a JSON array"
+                )));
+            };
+            let page_len = page_items.len();
+            items.extend(page_items);
+            if page == 1 {
+                first = info;
+                total_pages = match info.page_count {
+                    Some(c) if c > MAX_PAGES => {
+                        return Err(AppError::Upstream(format!(
+                            "Trakt {path}: {c} pages exceeds the {MAX_PAGES}-page cap"
+                        )));
+                    }
+                    Some(c) => c.max(1),
+                    None => {
+                        // Read as one page (as specified for absent/garbled headers). A FULL page
+                        // with no usable count is the one hint the list may be longer — say so.
+                        if limit.is_some_and(|l| page_len >= l as usize) {
+                            warn!(
+                                "trakt: {} returned a full page ({} items) without a usable \
+                                 X-Pagination-Page-Count; reading it as a single page",
+                                path, page_len
+                            );
+                        }
+                        1
+                    }
+                };
+            } else {
+                check_page_consistency(page, &first, &info).map_err(|why| {
+                    AppError::Upstream(format!("Trakt {path} page {page}: {why}"))
+                })?;
+            }
+            if page >= total_pages {
+                break;
+            }
+            page += 1;
+        }
+        debug!(
+            "trakt: {} — {} item(s) over {} page(s)",
+            path,
+            items.len(),
+            total_pages
+        );
+        Ok(serde_json::Value::Array(items))
+    }
 }
 
 #[async_trait]
@@ -364,11 +528,18 @@ impl TraktClient for TraktClientImpl {
     }
 
     async fn watchlist(&self, access_token: &str) -> Result<Vec<TraktItem>, AppError> {
+        // Paginated by default since 2026-04-15: only page 1 came back before, so a title beyond
+        // it was never acquired and read as un-watchlisted (a Trigger-B removal risk).
         let movies = self
-            .authed_get_json("/sync/watchlist/movies", access_token)
+            .authed_get_list(
+                "/sync/watchlist/movies",
+                &[],
+                access_token,
+                Some(PAGE_LIMIT),
+            )
             .await?;
         let shows = self
-            .authed_get_json("/sync/watchlist/shows", access_token)
+            .authed_get_list("/sync/watchlist/shows", &[], access_token, Some(PAGE_LIMIT))
             .await?;
         let mut out = parse_watchlist(&movies, MediaType::Movie);
         out.extend(parse_watchlist(&shows, MediaType::Show));
@@ -376,16 +547,32 @@ impl TraktClient for TraktClientImpl {
     }
 
     async fn in_progress(&self, access_token: &str) -> Result<Vec<TraktItem>, AppError> {
-        let v = self.authed_get_json("/sync/playback", access_token).await?;
+        // `/sync/playback` does not paginate (the live response carries no pagination headers), so
+        // it is requested exactly as before; `authed_get_list` still follows pages should Trakt
+        // start paginating it.
+        let v = self
+            .authed_get_list("/sync/playback", &[], access_token, None)
+            .await?;
         Ok(parse_playback(&v))
     }
 
     async fn watched(&self, access_token: &str) -> Result<WatchedData, AppError> {
+        // Both paginated by default since 2026-07-03 (100 per page). Watched SHOWS also lost their
+        // `seasons`/`episodes` unless `extended=progress` is passed (`noseasons` is now a no-op), so
+        // without it every show parsed to an EMPTY watched-episode set. The `extended=progress`
+        // shape is the old one plus `seasons[].episodes[]` (`show.ids` still carries tmdb/trakt/imdb
+        // and `last_watched_at` is unchanged), so `parse_watched_shows` reads it as-is; it caps at
+        // 100 items per page (= `PAGE_LIMIT`). Specials (season 0) are omitted by Trakt.
         let movies = self
-            .authed_get_json("/sync/watched/movies", access_token)
+            .authed_get_list("/sync/watched/movies", &[], access_token, Some(PAGE_LIMIT))
             .await?;
         let shows = self
-            .authed_get_json("/sync/watched/shows", access_token)
+            .authed_get_list(
+                "/sync/watched/shows",
+                &[("extended", "progress")],
+                access_token,
+                Some(PAGE_LIMIT),
+            )
             .await?;
         Ok(WatchedData {
             movies: parse_watched_movies(&movies),
@@ -611,8 +798,21 @@ pub fn parse_watched_movies(v: &serde_json::Value) -> Vec<u64> {
         .collect()
 }
 
-/// Parse a `/sync/watched/shows` array into per-show watched-episode `(season, episode)` sets.
-/// Shows without a numeric tmdb, and seasons/episodes without a numeric `number`, are skipped.
+/// An RFC 3339 timestamp field (e.g. `last_watched_at`) as Unix seconds; missing/null/malformed →
+/// `None`.
+fn timestamp_field(v: &serde_json::Value, key: &str) -> Option<i64> {
+    v.get(key)
+        .and_then(|t| t.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp())
+}
+
+/// Parse a `/sync/watched/shows?extended=progress` array into per-show watched-episode
+/// `(season, episode)` sets (the `seasons[].episodes[]` that only `extended=progress` returns since
+/// 2026-07-03 — without it the sets are empty). Shows without a numeric tmdb, and seasons/episodes
+/// without a numeric `number`, are skipped. When the user has reset the show's progress
+/// (`reset_at` set — a re-watch), an episode whose `last_watched_at` predates the reset (or is
+/// missing) is unwatched for progress, matching Trakt's own per-show progress.
 pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
     let Some(arr) = v.as_array() else {
         return Vec::new();
@@ -622,6 +822,7 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
             let tmdb_id = e.get("show").and_then(tmdb_id_of)?;
             let trakt_id = e.get("show").and_then(trakt_id_of);
             let imdb_id = e.get("show").and_then(imdb_id_of);
+            let reset_at = timestamp_field(e, "reset_at");
             let mut watched_episodes = Vec::new();
             if let Some(seasons) = e.get("seasons").and_then(|s| s.as_array()) {
                 for season in seasons {
@@ -636,6 +837,11 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
                         continue;
                     };
                     for ep in episodes {
+                        if let Some(reset) = reset_at {
+                            if timestamp_field(ep, "last_watched_at").is_none_or(|t| t < reset) {
+                                continue; // watched before the progress reset → unwatched now
+                            }
+                        }
                         if let Some(episode_number) = ep
                             .get("number")
                             .and_then(|n| n.as_u64())
@@ -646,11 +852,7 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
                     }
                 }
             }
-            let last_watched_at = e
-                .get("last_watched_at")
-                .and_then(|t| t.as_str())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.timestamp());
+            let last_watched_at = timestamp_field(e, "last_watched_at");
             Some(WatchedShow {
                 tmdb_id,
                 trakt_id,
@@ -1518,5 +1720,614 @@ mod tests {
         // device_code / poll_token are unaffected by the flags.
         assert!(mock.device_code().await.is_ok());
         assert!(mock.poll_token("dc").await.is_ok());
+    }
+}
+
+/// Minimal loopback HTTP/1.1 router for exercising `TraktClientImpl` end-to-end (pagination, page
+/// failures) without the network. Each route matches a request PATH plus its query parameters
+/// (order-insensitive) and may be hit any number of times; an unmatched request gets a `404` so a
+/// test that issues an unexpected request fails loudly. Every request target is logged in arrival
+/// order. `pub(crate)` so the `tasks` sync tests can drive `sync_trakt` through a real client.
+#[cfg(test)]
+pub(crate) mod test_http {
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct Reply {
+        pub status: u16,
+        pub headers: Vec<(String, String)>,
+        pub body: String,
+    }
+
+    impl Reply {
+        /// A `200` JSON body with no pagination headers (like `/sync/playback`, captured live).
+        pub(crate) fn json(body: &str) -> Self {
+            Self {
+                status: 200,
+                headers: Vec::new(),
+                body: body.to_string(),
+            }
+        }
+
+        /// A `200` JSON page carrying Trakt's pagination headers, exactly as captured live
+        /// (`x-pagination-page`, `-limit`, `-page-count`, `-item-count`).
+        pub(crate) fn page(
+            body: &str,
+            page: u32,
+            page_count: u32,
+            item_count: u64,
+            limit: u32,
+        ) -> Self {
+            Self::json(body)
+                .header("x-pagination-page", &page.to_string())
+                .header("x-pagination-limit", &limit.to_string())
+                .header("x-pagination-page-count", &page_count.to_string())
+                .header("x-pagination-item-count", &item_count.to_string())
+        }
+
+        /// A bare status (empty body), e.g. a `503` page failure.
+        pub(crate) fn status(status: u16) -> Self {
+            Self {
+                status,
+                headers: Vec::new(),
+                body: String::new(),
+            }
+        }
+
+        pub(crate) fn header(mut self, name: &str, value: &str) -> Self {
+            self.headers.push((name.to_string(), value.to_string()));
+            self
+        }
+    }
+
+    struct Route {
+        path: String,
+        query: Vec<(String, String)>,
+        reply: Reply,
+    }
+
+    /// Split a request target into its path and its (sorted) query pairs.
+    fn split_target(target: &str) -> (String, Vec<(String, String)>) {
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let mut pairs: Vec<(String, String)> = query
+            .split('&')
+            .filter(|kv| !kv.is_empty())
+            .map(|kv| {
+                let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+                (k.to_string(), v.to_string())
+            })
+            .collect();
+        pairs.sort();
+        (path.to_string(), pairs)
+    }
+
+    pub(crate) struct Server {
+        pub base_url: String,
+        pub requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Server {
+        /// Every request target received so far, in arrival order.
+        pub(crate) fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        /// How many requests hit `path` (any query).
+        pub(crate) fn hits(&self, path: &str) -> usize {
+            self.requests()
+                .iter()
+                .filter(|t| t.split('?').next() == Some(path))
+                .count()
+        }
+    }
+
+    /// Spawn the router. `routes` = `(request target incl. query, reply)`.
+    pub(crate) async fn spawn(routes: Vec<(&str, Reply)>) -> Server {
+        let routes: Arc<Vec<Route>> = Arc::new(
+            routes
+                .into_iter()
+                .map(|(target, reply)| {
+                    let (path, query) = split_target(target);
+                    Route { path, query, reply }
+                })
+                .collect(),
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let log = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let routes = routes.clone();
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let target = head
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_string();
+                    log.lock().unwrap().push(target.clone());
+                    let (path, query) = split_target(&target);
+                    let reply = routes
+                        .iter()
+                        .find(|r| r.path == path && r.query == query)
+                        .map(|r| r.reply.clone())
+                        .unwrap_or_else(|| Reply::status(404));
+                    let mut out = format!(
+                        "HTTP/1.1 {} STATUS\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                        reply.status,
+                        reply.body.len()
+                    );
+                    for (k, v) in &reply.headers {
+                        out.push_str(&format!("{k}: {v}\r\n"));
+                    }
+                    out.push_str("\r\n");
+                    out.push_str(&reply.body);
+                    let _ = sock.write_all(out.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        Server {
+            base_url: format!("http://{addr}"),
+            requests,
+        }
+    }
+}
+
+/// Real-response fixtures + pagination behaviour. The fixtures under `tests/fixtures/trakt/` are
+/// TRIMMED, ANONYMISED copies of live responses captured in Nov 2026 (after Trakt's
+/// pagination/`extended=progress` changes — trakt-api discussions #681 and #775): the response
+/// shapes are exactly as Trakt sent them, but every title, id, slug, Plex GUID and list-item id is
+/// fictional and every date is shifted (ids keep their relative order; times of day are unchanged):
+///   - `watched_shows_progress_p{1,2}.json` — `GET /sync/watched/shows?extended=progress&page=N&limit=100`
+///     (live headers: item-count 129, limit 100, page-count 2);
+///   - `watched_shows_no_extended.json` — `GET /sync/watched/shows` (no `extended`): no `seasons`;
+///   - `watched_movies_p{1,2}.json` — `GET /sync/watched/movies?page=N&limit=100` (item-count 206,
+///     page-count 3);
+///   - `watchlist_{movies,shows}.json` — `GET /sync/watchlist/{movies,shows}?page=1&limit=100`;
+///   - `playback.json` — `GET /sync/playback` (no pagination headers at all).
+#[cfg(test)]
+mod pagination_tests {
+    use super::test_http::{spawn, Reply};
+    use super::*;
+
+    const WATCHED_SHOWS_P1: &str =
+        include_str!("../tests/fixtures/trakt/watched_shows_progress_p1.json");
+    const WATCHED_SHOWS_P2: &str =
+        include_str!("../tests/fixtures/trakt/watched_shows_progress_p2.json");
+    const WATCHED_SHOWS_NO_EXTENDED: &str =
+        include_str!("../tests/fixtures/trakt/watched_shows_no_extended.json");
+    const WATCHED_MOVIES_P1: &str = include_str!("../tests/fixtures/trakt/watched_movies_p1.json");
+    const WATCHED_MOVIES_P2: &str = include_str!("../tests/fixtures/trakt/watched_movies_p2.json");
+    const WATCHLIST_MOVIES: &str = include_str!("../tests/fixtures/trakt/watchlist_movies.json");
+    const WATCHLIST_SHOWS: &str = include_str!("../tests/fixtures/trakt/watchlist_shows.json");
+    const PLAYBACK: &str = include_str!("../tests/fixtures/trakt/playback.json");
+
+    fn json(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).expect("fixture is valid JSON")
+    }
+
+    fn client(base_url: &str) -> TraktClientImpl {
+        TraktClientImpl::new("cid".into(), "secret".into(), reqwest::Client::new())
+            .with_base_url(base_url.to_string())
+    }
+
+    fn eps(season: u32, range: std::ops::RangeInclusive<u32>) -> Vec<(u32, u32)> {
+        range.map(|e| (season, e)).collect()
+    }
+
+    // ── parsers on the real samples ──────────────────────────────────────────
+
+    #[test]
+    fn parse_watched_shows_reads_the_real_extended_progress_shape() {
+        let p1 = parse_watched_shows(&json(WATCHED_SHOWS_P1));
+        let mut drama_eps = eps(1, 1..=8);
+        drama_eps.extend(eps(2, 1..=7));
+        assert_eq!(
+            p1,
+            vec![
+                WatchedShow {
+                    tmdb_id: 911000,
+                    trakt_id: Some(811000),
+                    imdb_id: Some("tt9900900".into()),
+                    watched_episodes: drama_eps,
+                    last_watched_at: Some(1_759_873_440), // 2025-10-07T21:44:00.000Z
+                },
+                WatchedShow {
+                    tmdb_id: 911100,
+                    trakt_id: Some(811300),
+                    imdb_id: Some("tt9901100".into()),
+                    watched_episodes: eps(1, 1..=4),
+                    last_watched_at: Some(1_737_450_120), // 2025-01-21T09:02:00.000Z
+                },
+            ],
+            "extended=progress keeps every id the sync needs (tmdb/trakt/imdb) + last_watched_at, \
+             and carries the per-episode watched set"
+        );
+        let p2 = parse_watched_shows(&json(WATCHED_SHOWS_P2));
+        assert_eq!(
+            p2,
+            vec![
+                WatchedShow {
+                    tmdb_id: 910900,
+                    trakt_id: Some(810900),
+                    imdb_id: Some("tt9900600".into()),
+                    watched_episodes: eps(1, 1..=5),
+                    last_watched_at: Some(1_663_699_684), // 2022-09-20T18:48:04.000Z
+                },
+                WatchedShow {
+                    // Trakt sends `"imdb": null` for this show → None (not an empty string).
+                    tmdb_id: 910700,
+                    trakt_id: Some(810700),
+                    imdb_id: None,
+                    watched_episodes: eps(1, 1..=2),
+                    last_watched_at: Some(1_663_356_321), // 2022-09-16T19:25:21.000Z
+                },
+            ]
+        );
+        // The live samples carry no season 0: Trakt's watched history omits Specials, matching the
+        // TMDB aired set (`parse_season_numbers` drops season 0) — see `wanted::SPECIALS_SEASON`.
+        assert!(p1
+            .iter()
+            .chain(p2.iter())
+            .flat_map(|s| s.watched_episodes.iter())
+            .all(|(season, _)| *season != 0));
+    }
+
+    #[test]
+    fn parse_watched_shows_drops_episodes_watched_before_a_progress_reset() {
+        // Trakt's `reset_at`: the user reset the show's progress (a re-watch); an episode whose
+        // `last_watched_at` predates it is unwatched for progress — Trakt's own per-show progress
+        // (the catch-up gate) already reads it that way. Counting it would make a re-watched Ended
+        // show look finished and get it finish-removed mid-re-watch. The Example Drama sample with a reset
+        // injected between its plays: S1E1-8 + S2E1-5 (2025-05-01T19:37) predate the reset, S2E6
+        // (20:40 that day) and S2E7 (2025-10-07) come after it.
+        let mut v = json(WATCHED_SHOWS_P1);
+        v[0]["reset_at"] = serde_json::json!("2025-05-01T20:00:00.000Z");
+        let shows = parse_watched_shows(&v);
+        assert_eq!(shows[0].tmdb_id, 911000);
+        assert_eq!(shows[0].watched_episodes, vec![(2, 6), (2, 7)]);
+        // `reset_at: null` (every live sample) changes nothing.
+        assert_eq!(shows[1].watched_episodes, eps(1, 1..=4));
+    }
+
+    #[test]
+    fn watched_shows_without_extended_carry_no_episodes() {
+        // The regression's root cause, pinned on the real sample: since 2026-07-03 the plain
+        // `/sync/watched/shows` returns NO `seasons`, so every show parsed to an EMPTY watched set
+        // (Trigger A could never fire; catch-up re-acquired already-watched episodes). The ids and
+        // `last_watched_at` are still there — only the episodes are missing.
+        let shows = parse_watched_shows(&json(WATCHED_SHOWS_NO_EXTENDED));
+        assert_eq!(
+            shows.iter().map(|s| s.tmdb_id).collect::<Vec<_>>(),
+            vec![911000, 911100]
+        );
+        assert!(shows.iter().all(|s| s.watched_episodes.is_empty()));
+        assert!(shows
+            .iter()
+            .all(|s| s.trakt_id.is_some() && s.last_watched_at.is_some()));
+    }
+
+    #[test]
+    fn parse_real_watchlist_watched_movies_and_playback_samples() {
+        let movie = |tmdb_id: u64, imdb: &str| TraktItem {
+            media_type: MediaType::Movie,
+            tmdb_id,
+            imdb_id: Some(imdb.into()),
+        };
+        let show = |tmdb_id: u64, imdb: &str| TraktItem {
+            media_type: MediaType::Show,
+            tmdb_id,
+            imdb_id: Some(imdb.into()),
+        };
+        assert_eq!(
+            parse_watchlist(&json(WATCHLIST_MOVIES), MediaType::Movie),
+            vec![
+                movie(911700, "tt9901000"),
+                movie(911300, "tt9901300"),
+                movie(911400, "tt9901400"),
+            ]
+        );
+        assert_eq!(
+            parse_watchlist(&json(WATCHLIST_SHOWS), MediaType::Show),
+            vec![show(911200, "tt9901500"), show(910100, "tt9900100")]
+        );
+        assert_eq!(
+            parse_watched_movies(&json(WATCHED_MOVIES_P1)),
+            vec![911600, 910500, 911500]
+        );
+        assert_eq!(
+            parse_playback(&json(PLAYBACK)),
+            vec![show(910200, "tt9900400"), show(910600, "tt9901700")],
+            "in-progress episodes map to their show"
+        );
+    }
+
+    #[test]
+    fn parse_pagination_reads_trakt_headers_and_tolerates_garbage() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        // Exactly the live `/sync/watched/movies?page=2&limit=100` headers.
+        h.insert("x-pagination-item-count", HeaderValue::from_static("206"));
+        h.insert("x-pagination-limit", HeaderValue::from_static("100"));
+        h.insert("x-pagination-page", HeaderValue::from_static("2"));
+        h.insert("x-pagination-page-count", HeaderValue::from_static("3"));
+        assert_eq!(
+            parse_pagination(&h),
+            Pagination {
+                page: Some(2),
+                page_count: Some(3),
+                item_count: Some(206),
+            }
+        );
+        // No headers at all (e.g. `/sync/playback`) → nothing known.
+        assert_eq!(parse_pagination(&HeaderMap::new()), Pagination::default());
+        // Garbled values are ignored, never guessed.
+        let mut g = HeaderMap::new();
+        g.insert("x-pagination-page", HeaderValue::from_static("one"));
+        g.insert("x-pagination-page-count", HeaderValue::from_static("-1"));
+        g.insert("x-pagination-item-count", HeaderValue::from_static(""));
+        assert_eq!(parse_pagination(&g), Pagination::default());
+    }
+
+    // ── pagination over HTTP ─────────────────────────────────────────────────
+
+    /// The routes for a full, healthy, two-page `watched()` read built from the real samples.
+    fn watched_routes() -> Vec<(&'static str, Reply)> {
+        vec![
+            (
+                "/sync/watched/movies?page=1&limit=100",
+                Reply::page(WATCHED_MOVIES_P1, 1, 2, 5, 100),
+            ),
+            (
+                "/sync/watched/movies?page=2&limit=100",
+                Reply::page(WATCHED_MOVIES_P2, 2, 2, 5, 100),
+            ),
+            (
+                "/sync/watched/shows?extended=progress&page=1&limit=100",
+                Reply::page(WATCHED_SHOWS_P1, 1, 2, 4, 100),
+            ),
+            (
+                "/sync/watched/shows?extended=progress&page=2&limit=100",
+                Reply::page(WATCHED_SHOWS_P2, 2, 2, 4, 100),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn watched_follows_every_page_and_requests_extended_progress() {
+        let server = spawn(watched_routes()).await;
+        let w = client(&server.base_url)
+            .watched("at")
+            .await
+            .expect("watched");
+        assert_eq!(
+            w.movies,
+            vec![911600, 910500, 911500, 910400, 910300],
+            "page 2's movies must not be dropped"
+        );
+        assert_eq!(
+            w.shows.iter().map(|s| s.tmdb_id).collect::<Vec<_>>(),
+            vec![911000, 911100, 910900, 910700],
+            "page 2's shows must not be dropped"
+        );
+        assert!(
+            w.shows.iter().all(|s| !s.watched_episodes.is_empty()),
+            "extended=progress must yield the per-episode watched sets"
+        );
+        assert_eq!(server.hits("/sync/watched/movies"), 2);
+        assert_eq!(server.hits("/sync/watched/shows"), 2);
+        assert!(
+            server
+                .requests()
+                .iter()
+                .filter(|t| t.starts_with("/sync/watched/shows"))
+                .all(|t| t.contains("extended=progress")),
+            "every watched-shows page must request extended=progress: {:?}",
+            server.requests()
+        );
+    }
+
+    #[tokio::test]
+    async fn watchlist_follows_pagination_for_movies_and_shows() {
+        // A title on page 2 of the watchlist must be read — otherwise it is never acquired and, worse,
+        // looks un-watchlisted to Trigger B (abandoned) and could be deleted.
+        let page2 = r#"[{"type":"movie","movie":{"ids":{"tmdb":11,"imdb":"tt0076759","trakt":1},"title":"Star Wars"}}]"#;
+        let server = spawn(vec![
+            (
+                "/sync/watchlist/movies?page=1&limit=100",
+                Reply::page(WATCHLIST_MOVIES, 1, 2, 4, 100),
+            ),
+            (
+                "/sync/watchlist/movies?page=2&limit=100",
+                Reply::page(page2, 2, 2, 4, 100),
+            ),
+            (
+                "/sync/watchlist/shows?page=1&limit=100",
+                Reply::page(WATCHLIST_SHOWS, 1, 1, 2, 100),
+            ),
+        ])
+        .await;
+        let items = client(&server.base_url)
+            .watchlist("at")
+            .await
+            .expect("watchlist");
+        assert_eq!(
+            items.iter().map(|i| i.tmdb_id).collect::<Vec<_>>(),
+            vec![911700, 911300, 911400, 11, 911200, 910100]
+        );
+        assert_eq!(server.hits("/sync/watchlist/movies"), 2);
+        assert_eq!(server.hits("/sync/watchlist/shows"), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_later_page_is_an_err_never_a_truncated_ok() {
+        // Page 1 succeeds and says there are 2 pages; page 2 fails persistently (retried, then
+        // surfaced). The whole read must be Err so sync keeps the previous wanted set — returning
+        // page 1 alone would be a silently truncated list.
+        for failing in [
+            "/sync/watched/movies?page=2&limit=100",
+            "/sync/watched/shows?extended=progress&page=2&limit=100",
+        ] {
+            let routes: Vec<(&str, Reply)> = watched_routes()
+                .into_iter()
+                .map(|(t, r)| {
+                    if t == failing {
+                        (t, Reply::status(503))
+                    } else {
+                        (t, r)
+                    }
+                })
+                .collect();
+            let server = spawn(routes).await;
+            assert!(
+                client(&server.base_url).watched("at").await.is_err(),
+                "a failure of {failing} must fail the watched() read"
+            );
+        }
+        let server = spawn(vec![
+            (
+                "/sync/watchlist/movies?page=1&limit=100",
+                Reply::page(WATCHLIST_MOVIES, 1, 1, 3, 100),
+            ),
+            (
+                "/sync/watchlist/shows?page=1&limit=100",
+                Reply::page(WATCHLIST_SHOWS, 1, 2, 4, 100),
+            ),
+            ("/sync/watchlist/shows?page=2&limit=100", Reply::status(500)),
+        ])
+        .await;
+        assert!(client(&server.base_url).watchlist("at").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_or_garbled_pagination_headers_read_as_a_single_page() {
+        for reply in [
+            Reply::json(WATCHED_MOVIES_P1),
+            Reply::json(WATCHED_MOVIES_P1).header("x-pagination-page-count", "lots"),
+            Reply::json(WATCHED_MOVIES_P1).header("x-pagination-page-count", "0"),
+        ] {
+            let server = spawn(vec![
+                ("/sync/watched/movies?page=1&limit=100", reply),
+                (
+                    "/sync/watched/shows?extended=progress&page=1&limit=100",
+                    Reply::json("[]"),
+                ),
+            ])
+            .await;
+            let w = client(&server.base_url)
+                .watched("at")
+                .await
+                .expect("watched");
+            assert_eq!(w.movies, vec![911600, 910500, 911500]);
+            assert_eq!(
+                server.hits("/sync/watched/movies"),
+                1,
+                "no page-2 request without a usable page count"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_count_beyond_the_cap_is_an_err_not_a_runaway_loop() {
+        let server = spawn(vec![(
+            "/sync/watchlist/movies?page=1&limit=100",
+            Reply::page(WATCHLIST_MOVIES, 1, MAX_PAGES + 1, 1_000_000, 100),
+        )])
+        .await;
+        assert!(client(&server.base_url).watchlist("at").await.is_err());
+        assert_eq!(
+            server.hits("/sync/watchlist/movies"),
+            1,
+            "an over-cap page count is rejected up front"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_list_that_changes_mid_read_is_an_err() {
+        // Items shifting between pages (an add/remove mid-read) could drop a title from BOTH pages —
+        // for the watchlist that would read as "un-watchlisted". Detected by the pagination headers
+        // changing between pages; the read is retried next sync instead.
+        let changed = [
+            Reply::page(WATCHED_MOVIES_P2, 2, 2, 4, 100), // item count 5 → 4
+            Reply::page(WATCHED_MOVIES_P2, 2, 3, 5, 100), // page count 2 → 3
+            Reply::page(WATCHED_MOVIES_P2, 1, 2, 5, 100), // asked for page 2, got page 1
+        ];
+        for page2 in changed {
+            let server = spawn(vec![
+                (
+                    "/sync/watched/movies?page=1&limit=100",
+                    Reply::page(WATCHED_MOVIES_P1, 1, 2, 5, 100),
+                ),
+                ("/sync/watched/movies?page=2&limit=100", page2),
+                (
+                    "/sync/watched/shows?extended=progress&page=1&limit=100",
+                    Reply::json("[]"),
+                ),
+            ])
+            .await;
+            assert!(client(&server.base_url).watched("at").await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_array_page_body_is_an_err() {
+        let server = spawn(vec![
+            (
+                "/sync/watchlist/movies?page=1&limit=100",
+                Reply::json(r#"{"error":"nope"}"#),
+            ),
+            (
+                "/sync/watchlist/shows?page=1&limit=100",
+                Reply::json(WATCHLIST_SHOWS),
+            ),
+        ])
+        .await;
+        assert!(client(&server.base_url).watchlist("at").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn playback_is_read_unpaginated_but_follows_pages_if_trakt_starts_paginating() {
+        // Live `/sync/playback` carries NO pagination headers, so it is requested exactly as before
+        // (no page/limit) and read as one page.
+        let server = spawn(vec![("/sync/playback", Reply::json(PLAYBACK))]).await;
+        let items = client(&server.base_url)
+            .in_progress("at")
+            .await
+            .expect("playback");
+        assert_eq!(
+            items.iter().map(|i| i.tmdb_id).collect::<Vec<_>>(),
+            vec![910200, 910600]
+        );
+        assert_eq!(server.requests(), vec!["/sync/playback".to_string()]);
+
+        // Should Trakt start paginating it (headers appear), the remaining pages are followed at the
+        // server's own default page size.
+        let page2 = r#"[{"type":"movie","movie":{"ids":{"tmdb":77,"trakt":7}}}]"#;
+        let server = spawn(vec![
+            ("/sync/playback", Reply::page(PLAYBACK, 1, 2, 3, 2)),
+            ("/sync/playback?page=2", Reply::page(page2, 2, 2, 3, 2)),
+        ])
+        .await;
+        let items = client(&server.base_url)
+            .in_progress("at")
+            .await
+            .expect("playback");
+        assert_eq!(
+            items.iter().map(|i| i.tmdb_id).collect::<Vec<_>>(),
+            vec![910200, 910600, 77]
+        );
     }
 }

@@ -2503,11 +2503,13 @@ fn plan_episode_actions(
         aired_episodes: aired.pairs.clone(),
     };
     // Guard: a TMDB hiccup that left the aired set partial OR empty must not delete a still-wanted
-    // show (an empty `aired` makes Trigger A's "all aired watched" clause vacuously true).
+    // show (an empty `aired` makes Trigger A's "all aired watched" clause vacuously true). "Empty"
+    // means no REGULAR episode: Specials never count toward the finish test (`SPECIALS_SEASON`), so
+    // a specials-only set is just as vacuous.
     guard_removal_on_incomplete_aired(
         reconcile_title(&view),
         aired.complete,
-        aired.pairs.is_empty(),
+        !aired.pairs.iter().any(crate::wanted::is_regular_episode),
     )
 }
 
@@ -5719,6 +5721,230 @@ mod trakt_sync_tests {
             "a stale-token refresh failure must NOT flag a healthy account"
         );
     }
+
+    // ── real Trakt samples, end-to-end (HTTP → client → build_wanted → plan) ──
+
+    const WATCHED_SHOWS_P1: &str =
+        include_str!("../tests/fixtures/trakt/watched_shows_progress_p1.json");
+    const WATCHED_SHOWS_P2: &str =
+        include_str!("../tests/fixtures/trakt/watched_shows_progress_p2.json");
+    const WATCHED_SHOWS_NO_EXTENDED: &str =
+        include_str!("../tests/fixtures/trakt/watched_shows_no_extended.json");
+    const WATCHED_MOVIES_P1: &str = include_str!("../tests/fixtures/trakt/watched_movies_p1.json");
+    const WATCHED_MOVIES_P2: &str = include_str!("../tests/fixtures/trakt/watched_movies_p2.json");
+    const WATCHLIST_MOVIES: &str = include_str!("../tests/fixtures/trakt/watchlist_movies.json");
+
+    fn real_client(base_url: &str) -> Arc<dyn TraktClient> {
+        Arc::new(
+            crate::trakt_client::TraktClientImpl::new(
+                "cid".into(),
+                "secret".into(),
+                reqwest::Client::new(),
+            )
+            .with_base_url(base_url.to_string()),
+        )
+    }
+
+    /// The real samples, end-to-end: `watched()` is fetched through the REAL client from a loopback
+    /// server serving both captured pages (`extended=progress`), then the wanted-set is built exactly
+    /// as `sync_trakt_user` builds it and planned by the episode monitor. Before the fix (plain
+    /// `/sync/watched/shows`, page 1 only) every watched-episode set was empty, so the fully-watched
+    /// Ended show was never finish-removed and catch-up re-acquired episodes already watched.
+    #[tokio::test]
+    async fn real_samples_finish_remove_a_watched_ended_show_and_catch_up_only_unwatched() {
+        use crate::trakt_client::test_http::{spawn, Reply};
+        use crate::wanted::{Action, RemoveReason};
+        use std::collections::HashSet;
+        const MINISERIES: u64 = 911100; // sample: S1E1-4 watched, all 4 aired → caught up
+        const DRAMA: u64 = 911000; // sample: S1E1-8 + S2E1-7 watched, 17 aired → behind
+        const THRILLER: u64 = 910900; // only on page 2 of the sample
+
+        let server = spawn(vec![
+            (
+                "/sync/watched/movies?page=1&limit=100",
+                Reply::page(WATCHED_MOVIES_P1, 1, 2, 5, 100),
+            ),
+            (
+                "/sync/watched/movies?page=2&limit=100",
+                Reply::page(WATCHED_MOVIES_P2, 2, 2, 5, 100),
+            ),
+            (
+                "/sync/watched/shows?extended=progress&page=1&limit=100",
+                Reply::page(WATCHED_SHOWS_P1, 1, 2, 4, 100),
+            ),
+            (
+                "/sync/watched/shows?extended=progress&page=2&limit=100",
+                Reply::page(WATCHED_SHOWS_P2, 2, 2, 4, 100),
+            ),
+        ])
+        .await;
+        let watched = real_client(&server.base_url)
+            .watched("at")
+            .await
+            .expect("watched");
+        assert!(
+            watched.shows.iter().any(|s| s.tmdb_id == THRILLER),
+            "page 2 of the watched shows is read"
+        );
+
+        // As `sync_trakt_user` derives them from Trakt's per-show progress: Example Drama is behind
+        // (catch-up), Example Miniseries is caught up + owned + Ended (a finish-cleanup candidate, folded
+        // because REMOVE_FINISHED_SHOWS is on).
+        let statuses: HashMap<u64, ShowStatus> = [
+            (MINISERIES, ShowStatus::Ended),
+            (DRAMA, ShowStatus::Returning),
+        ]
+        .into_iter()
+        .collect();
+        let behind: HashSet<u64> = [DRAMA].into_iter().collect();
+        let caught_up_owned: HashSet<u64> = [MINISERIES].into_iter().collect();
+        let finished_ended = finished_ended_candidates(&caught_up_owned, &statuses);
+        let fold = shows_to_fold(&behind, &finished_ended, true);
+        let plan = |watched: &WatchedData, tmdb_id: u64, owned: Option<&OwnedGroup>| {
+            let wanted: Vec<WantedRecord> =
+                build_wanted("alice", &[], &[], watched, &statuses, None, Some(&fold))
+                    .into_iter()
+                    .filter(|r| r.media_type == MediaType::Show && r.tmdb_id == tmdb_id)
+                    .collect();
+            assert_eq!(wanted.len(), 1, "tmdb {tmdb_id} is wanted (folded)");
+            assert!(wanted[0].sources.in_progress && !wanted[0].sources.watchlist);
+            // TMDB's aired set (season 0 excluded, as `aired_episodes` returns it).
+            let aired = AiredEpisodes {
+                pairs: match tmdb_id {
+                    MINISERIES => (1..=4).map(|e| (1, e)).collect(),
+                    _ => (1..=8)
+                        .map(|e| (1, e))
+                        .chain((1..=9).map(|e| (2, e)))
+                        .collect(),
+                },
+                complete: true,
+            };
+            let present: HashSet<String> = ["adol".to_string()].into_iter().collect();
+            plan_episode_actions(tmdb_id, &wanted, owned, &present, &aired)
+        };
+
+        // Example Miniseries: a pre-existing (account-mirror, EMPTY provenance) copy, present.
+        let miniseries = OwnedGroup {
+            hashes: vec!["adol".to_string()],
+            engine_hashes: vec![],
+            provenance: Provenance { entries: vec![] },
+            owned_episodes: (1..=4).map(|e| (1, e)).collect(),
+            media_type: MediaType::Show,
+        };
+        assert_eq!(
+            plan(&watched, MINISERIES, Some(&miniseries)),
+            vec![Action::Remove {
+                tmdb_id: MINISERIES,
+                hash: "adol".to_string(),
+                reason: RemoveReason::Finished
+            }],
+            "a fully-watched Ended in-progress show is now a Trigger-A finish removal"
+        );
+        assert_eq!(
+            removal_hashes(&miniseries, RemoveReason::Finished, true),
+            vec!["adol".to_string()],
+            "REMOVE_FINISHED_SHOWS reclaims the library copy"
+        );
+        // Example Drama (not owned): catch-up acquires ONLY the two unwatched aired episodes.
+        assert_eq!(
+            plan(&watched, DRAMA, None),
+            vec![
+                Action::AcquireEpisode {
+                    tmdb_id: DRAMA,
+                    season: 2,
+                    episode: 8
+                },
+                Action::AcquireEpisode {
+                    tmdb_id: DRAMA,
+                    season: 2,
+                    episode: 9
+                },
+            ],
+            "catch-up must skip the 15 episodes already watched"
+        );
+
+        // Contrast — the pre-fix read (no `extended`): empty watched sets, so no finish removal and
+        // all 17 Example Drama episodes re-acquired.
+        let old = WatchedData {
+            movies: vec![],
+            shows: crate::trakt_client::parse_watched_shows(
+                &serde_json::from_str(WATCHED_SHOWS_NO_EXTENDED).unwrap(),
+            ),
+        };
+        assert!(plan(&old, MINISERIES, Some(&miniseries)).is_empty());
+        assert_eq!(plan(&old, DRAMA, None).len(), 17);
+    }
+
+    /// Safety: a failure on ANY page fails the whole read, so `sync_trakt` keeps the user's previous
+    /// `wanted` set (exactly as for any other read failure) instead of materialising a truncated one
+    /// — which for the watchlist would read titles beyond page 1 as un-watchlisted (Trigger B).
+    #[tokio::test(start_paused = true)]
+    async fn sync_trakt_a_failed_page_keeps_the_prior_wanted_set() {
+        use crate::trakt_client::test_http::{spawn, Reply};
+        let page2 = r#"[{"type":"movie","movie":{"ids":{"tmdb":11,"imdb":"tt0076759","trakt":1},"title":"Star Wars"}}]"#;
+        let routes = |page2_reply: Reply| {
+            vec![
+                (
+                    "/sync/watchlist/movies?page=1&limit=100",
+                    Reply::page(WATCHLIST_MOVIES, 1, 2, 4, 100),
+                ),
+                ("/sync/watchlist/movies?page=2&limit=100", page2_reply),
+                (
+                    "/sync/watchlist/shows?page=1&limit=100",
+                    Reply::page("[]", 1, 1, 0, 100),
+                ),
+                ("/sync/playback", Reply::json("[]")),
+                (
+                    "/sync/watched/movies?page=1&limit=100",
+                    Reply::page("[]", 1, 1, 0, 100),
+                ),
+                (
+                    "/sync/watched/shows?extended=progress&page=1&limit=100",
+                    Reply::page("[]", 1, 1, 0, 100),
+                ),
+            ]
+        };
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".to_string(), tokens("acc", 9_999_999_999, false))
+            .await
+            .unwrap();
+        let preexisting = movie_wanted_row("alice", 999);
+        store.put_wanted(preexisting.clone()).await.unwrap();
+        let tmdb = TmdbClient::new("k".into()).unwrap();
+
+        // Page 2 of the watchlist fails persistently (retried, then surfaced).
+        let server = spawn(routes(Reply::status(503))).await;
+        let summary = sync_trakt(&real_client(&server.base_url), &tmdb, &store, None, false).await;
+        assert_eq!(summary.succeeded, 0, "a failed page is a failed sync");
+        assert_eq!(
+            store.all_wanted().await,
+            vec![preexisting],
+            "the prior wanted set must be left untouched — no truncated page-1-only set"
+        );
+        assert!(
+            store
+                .get_trakt_tokens("alice".to_string())
+                .await
+                .unwrap()
+                .needs_reenrolment,
+            "flagged like any other read failure (cleared by the next good sync)"
+        );
+
+        // Positive control: once page 2 answers, every page is read and adopted — the page-2 title
+        // is wanted and the stale row is pruned.
+        let server = spawn(routes(Reply::page(page2, 2, 2, 4, 100))).await;
+        let summary = sync_trakt(&real_client(&server.base_url), &tmdb, &store, None, false).await;
+        assert_eq!(summary.succeeded, 1);
+        let mut ids: Vec<u64> = store
+            .all_wanted()
+            .await
+            .into_iter()
+            .map(|r| r.tmdb_id)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![11, 911300, 911400, 911700]);
+    }
 }
 
 #[cfg(test)]
@@ -5896,6 +6122,46 @@ mod reconcile_wanted_tests {
         assert!(
             actions.is_empty(),
             "an incomplete aired set must suppress the finish removal, got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn plan_episode_actions_specials_do_not_block_or_fake_a_finish() {
+        use crate::wanted::{Action, RemoveReason};
+        // Specials (season 0) are outside the regular run on both sides of the finish comparison:
+        // TMDB's aired set drops season 0 and Trakt's watched history omits it. So an aired set that
+        // happens to carry an unwatched special must not block the finish removal…
+        let mut w = wanted_show("alice", 100, false, true);
+        w.watched_state = WatchedState::Show {
+            watched_episodes: vec![(1, 1), (1, 2)],
+        };
+        w.show_status = Some(ShowStatus::Ended);
+        let wanted = vec![w];
+        let owned = owned_group_show(&["h1"], &[(1, 1), (1, 2)], Provenance::in_progress("alice"));
+        let present: std::collections::HashSet<String> = ["h1".to_string()].into_iter().collect();
+        let with_special = AiredEpisodes {
+            pairs: vec![(0, 1), (1, 1), (1, 2)],
+            complete: true,
+        };
+        assert_eq!(
+            plan_episode_actions(100, &wanted, Some(&owned), &present, &with_special),
+            vec![Action::Remove {
+                tmdb_id: 100,
+                hash: "h1".to_string(),
+                reason: RemoveReason::Finished
+            }],
+            "an unwatched special must not block a fully-watched Ended show's finish removal"
+        );
+        // …and an aired set holding ONLY specials is as untrustworthy as an empty one: the "every
+        // regular aired episode watched" test would be vacuously true, so the guard drops it.
+        let only_specials = AiredEpisodes {
+            pairs: vec![(0, 1)],
+            complete: true,
+        };
+        let actions = plan_episode_actions(100, &wanted, Some(&owned), &present, &only_specials);
+        assert!(
+            actions.is_empty(),
+            "a specials-only aired set must never finish-remove, got {actions:?}"
         );
     }
 

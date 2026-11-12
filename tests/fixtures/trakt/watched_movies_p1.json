@@ -1,0 +1,62 @@
+[
+  {
+    "last_updated_at": "2025-10-06T20:37:55.000Z",
+    "last_watched_at": "2025-10-06T20:37:00.000Z",
+    "movie": {
+      "ids": {
+        "imdb": "tt9900700",
+        "plex": {
+          "guid": "00000000000000000000000c",
+          "slug": "example-19"
+        },
+        "slug": "example-19",
+        "tmdb": 911600,
+        "trakt": 811600
+      },
+      "year": 2026,
+      "title": "Example Film One"
+    },
+    "plays": 1,
+    "total_count": 206
+  },
+  {
+    "last_updated_at": "2025-10-06T20:37:55.000Z",
+    "last_watched_at": "2025-10-06T20:37:00.000Z",
+    "movie": {
+      "ids": {
+        "imdb": "tt9900800",
+        "plex": {
+          "guid": "000000000000000000000003",
+          "slug": "example-21"
+        },
+        "slug": "example-20",
+        "tmdb": 910500,
+        "trakt": 810500
+      },
+      "year": 2010,
+      "title": "Example Film Two"
+    },
+    "plays": 1,
+    "total_count": 206
+  },
+  {
+    "last_updated_at": "2025-09-30T20:01:38.000Z",
+    "last_watched_at": "2025-09-30T20:01:00.000Z",
+    "movie": {
+      "ids": {
+        "imdb": "tt9901600",
+        "plex": {
+          "guid": "000000000000000000000006",
+          "slug": "example-5"
+        },
+        "slug": "example-6",
+        "tmdb": 911500,
+        "trakt": 811500
+      },
+      "year": 2022,
+      "title": "Example Film Three"
+    },
+    "plays": 3,
+    "total_count": 206
+  }
+]

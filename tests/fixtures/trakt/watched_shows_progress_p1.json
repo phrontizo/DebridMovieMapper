@@ -1,0 +1,160 @@
+[
+  {
+    "plays": 21,
+    "last_watched_at": "2025-10-07T21:44:00.000Z",
+    "last_updated_at": "2025-10-07T21:44:00.000Z",
+    "reset_at": null,
+    "show": {
+      "ids": {
+        "imdb": "tt9900900",
+        "plex": {
+          "guid": "00000000000000000000000e",
+          "slug": "example-13"
+        },
+        "slug": "example-14",
+        "tmdb": 911000,
+        "tvdb": 710700,
+        "trakt": 811000
+      },
+      "year": 2024,
+      "title": "Example Drama",
+      "aired_episodes": 17
+    },
+    "seasons": [
+      {
+        "number": 1,
+        "episodes": [
+          {
+            "number": 1,
+            "plays": 2,
+            "last_watched_at": "2025-05-01T19:37:00.000Z"
+          },
+          {
+            "number": 2,
+            "plays": 2,
+            "last_watched_at": "2025-05-01T19:37:00.000Z"
+          },
+          {
+            "number": 3,
+            "plays": 2,
+            "last_watched_at": "2025-05-01T19:37:00.000Z"
+          },
+          {
+            "number": 4,
+            "plays": 2,
+            "last_watched_at": "2025-05-01T19:37:00.000Z"
+          },
+          {
+            "number": 5,
+            "plays": 2,
+            "last_watched_at": "2025-05-01T19:37:00.000Z"
+          },
+          {
+            "number": 6,
+            "plays": 2,
+            "last_watched_at": "2025-05-01T19:37:00.000Z"
+          },
+          {
+            "number": 7,
+            "plays": 1,
+            "last_watched_at": "2025-05-01T19:37:00.000Z"
+          },
+          {
+            "number": 8,
+            "plays": 1,
+            "last_watched_at": "2025-05-01T19:37:00.000Z"
+          }
+        ]
+      },
+      {
+        "number": 2,
+        "episodes": [
+          {
+            "number": 1,
+            "plays": 1,
+            "last_watched_at": "2025-05-01T19:37:00.000Z"
+          },
+          {
+            "number": 2,
+            "plays": 1,
+            "last_watched_at": "2025-05-01T19:37:00.000Z"
+          },
+          {
+            "number": 3,
+            "plays": 1,
+            "last_watched_at": "2025-05-01T19:37:00.000Z"
+          },
+          {
+            "number": 4,
+            "plays": 1,
+            "last_watched_at": "2025-05-01T19:37:00.000Z"
+          },
+          {
+            "number": 5,
+            "plays": 1,
+            "last_watched_at": "2025-05-01T19:37:00.000Z"
+          },
+          {
+            "number": 6,
+            "plays": 1,
+            "last_watched_at": "2025-05-01T20:40:00.000Z"
+          },
+          {
+            "number": 7,
+            "plays": 1,
+            "last_watched_at": "2025-10-07T21:44:00.000Z"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "plays": 4,
+    "last_watched_at": "2025-01-21T09:02:00.000Z",
+    "last_updated_at": "2025-01-21T09:02:00.000Z",
+    "reset_at": null,
+    "show": {
+      "ids": {
+        "imdb": "tt9901100",
+        "plex": {
+          "guid": "000000000000000000000010",
+          "slug": "example-3"
+        },
+        "slug": "example-3",
+        "tmdb": 911100,
+        "tvdb": 710800,
+        "trakt": 811300
+      },
+      "year": 2025,
+      "title": "Example Miniseries",
+      "aired_episodes": 4
+    },
+    "seasons": [
+      {
+        "number": 1,
+        "episodes": [
+          {
+            "number": 1,
+            "plays": 1,
+            "last_watched_at": "2025-01-21T09:02:00.000Z"
+          },
+          {
+            "number": 2,
+            "plays": 1,
+            "last_watched_at": "2025-01-21T09:02:00.000Z"
+          },
+          {
+            "number": 3,
+            "plays": 1,
+            "last_watched_at": "2025-01-21T09:02:00.000Z"
+          },
+          {
+            "number": 4,
+            "plays": 1,
+            "last_watched_at": "2025-01-21T09:02:00.000Z"
+          }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,74 @@
+[
+  {
+    "progress": 18.2853,
+    "paused_at": "2025-09-04T20:54:51.000Z",
+    "id": 5000070,
+    "type": "episode",
+    "episode": {
+      "ids": {
+        "imdb": "tt9900500",
+        "plex": {
+          "guid": "00000000000000000000000a"
+        },
+        "tmdb": 910800,
+        "tvdb": 710300,
+        "trakt": 810800
+      },
+      "title": "Example Episode One",
+      "number": 1,
+      "season": 1
+    },
+    "show": {
+      "ids": {
+        "imdb": "tt9900400",
+        "plex": {
+          "guid": "000000000000000000000008",
+          "slug": "example-2"
+        },
+        "slug": "example-1",
+        "tmdb": 910200,
+        "tvdb": 710200,
+        "trakt": 810200
+      },
+      "year": 2002,
+      "title": "Example Food Show",
+      "aired_episodes": 35
+    }
+  },
+  {
+    "progress": 15.2514,
+    "paused_at": "2025-06-29T16:51:47.000Z",
+    "id": 5000060,
+    "type": "episode",
+    "episode": {
+      "ids": {
+        "imdb": "tt9901200",
+        "plex": {
+          "guid": "000000000000000000000011"
+        },
+        "tmdb": 911800,
+        "tvdb": 711000,
+        "trakt": 811800
+      },
+      "title": "Example Episode Two",
+      "number": 5,
+      "season": 4
+    },
+    "show": {
+      "ids": {
+        "imdb": "tt9901700",
+        "plex": {
+          "guid": "000000000000000000000009",
+          "slug": "example-23"
+        },
+        "slug": "example-23",
+        "tmdb": 910600,
+        "tvdb": 710400,
+        "trakt": 810600
+      },
+      "year": 2019,
+      "title": "Example Newsroom",
+      "aired_episodes": 40
+    }
+  }
+]

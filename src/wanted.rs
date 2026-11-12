@@ -90,6 +90,22 @@ pub enum Action {
     },
 }
 
+/// TMDB's "Specials" season number. Specials are NOT part of a show's regular run here: they never
+/// count toward "every aired episode watched" (Trigger A / the acquire-side finish guard) and the
+/// catch-up/watchlist acquire set never chases one. That keeps the comparison consistent across the
+/// two sources it joins: TMDB's aired set already excludes season 0 (`tasks::aired_episodes` →
+/// `tmdb_client::parse_season_numbers`), while Trakt's watched history
+/// (`/sync/watched/shows?extended=progress`) omits season 0 and its per-show progress is requested
+/// with `specials=false`. Requiring a special Trakt never reports would leave a fully-watched show
+/// forever unfinished (never finish-removed, and re-acquired every catch-up cycle); a special Trakt
+/// DOES report watched is merely an extra element of the watched set, never required.
+pub const SPECIALS_SEASON: u32 = 0;
+
+/// True iff `(season, episode)` belongs to a show's regular run (not a Specials episode).
+pub fn is_regular_episode(e: &(u32, u32)) -> bool {
+    e.0 != SPECIALS_SEASON
+}
+
 /// True iff a user currently wants this title via either Trakt source.
 pub fn wants(r: &WantedRecord) -> bool {
     r.sources.watchlist || r.sources.in_progress
@@ -98,8 +114,10 @@ pub fn wants(r: &WantedRecord) -> bool {
 /// Has THIS user finished the title?
 /// - Movie: the `watched` flag.
 /// - Show: only an **ended** series counts as finishable, and then only when every aired
-///   episode is in the user's watched set (100% of aired). An empty `aired` makes the
-///   "all aired watched" clause vacuously true, so an ended show with nothing aired is finished.
+///   **regular** episode is in the user's watched set (100% of aired; Specials — season 0 — are
+///   ignored, see [`SPECIALS_SEASON`]). An `aired` set with no regular episodes makes the
+///   "all aired watched" clause vacuously true, so an ended show with nothing aired is finished
+///   (the episode monitor's `guard_removal_on_incomplete_aired` refuses removal on such a set).
 ///
 /// `aired` is the TMDB-sourced aired-episode list for shows and is IGNORED for movies;
 /// callers pass `&[]` for movies.
@@ -108,7 +126,10 @@ pub fn user_finished(r: &WantedRecord, aired: &[(u32, u32)]) -> bool {
         WatchedState::Movie { watched } => *watched,
         WatchedState::Show { watched_episodes } => {
             r.show_status == Some(ShowStatus::Ended)
-                && aired.iter().all(|e| watched_episodes.contains(e)) // O(|watched_episodes| × |aired|); fine for realistic episode counts.
+                && aired
+                    .iter()
+                    .filter(|e| is_regular_episode(e))
+                    .all(|e| watched_episodes.contains(e)) // O(|watched_episodes| × |aired|); fine for realistic episode counts.
         }
     }
 }
@@ -296,9 +317,12 @@ pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
                 .as_ref()
                 .map(|o| o.owned_episodes.iter().copied().collect())
                 .unwrap_or_default();
+            // Specials are not part of the regular run (`SPECIALS_SEASON`): never acquired here,
+            // exactly as they never count toward `user_finished`.
             title
                 .aired_episodes
                 .iter()
+                .filter(|e| is_regular_episode(e))
                 .filter(|e| !episode_covered(title, e))
                 .filter(|e| !watched.contains(e) || (manual && owned_eps.contains(e)))
                 .map(|&(season, episode)| Action::AcquireEpisode {
@@ -1406,6 +1430,94 @@ mod tests {
             reconcile_title(&t),
             vec![],
             "kept + owned + available → no acquire, no remove (no flip-flop)"
+        );
+    }
+
+    // ── Specials (season 0) ───────────────────────────────────────────────────
+
+    #[test]
+    fn user_finished_ignores_specials_trakt_never_reports() {
+        // TMDB lists Specials as season 0; Trakt's watched history omits season 0 and its progress
+        // excludes specials. A fully-watched Ended show must read as finished even when the aired set
+        // carries specials the user has (per Trakt) never watched.
+        let aired = vec![(0, 1), (0, 2), (1, 1), (1, 2)];
+        assert!(user_finished(
+            &show_record("a", 1, false, true, vec![(1, 1), (1, 2)], ShowStatus::Ended),
+            &aired
+        ));
+        // A regular episode still unwatched keeps it unfinished.
+        assert!(!user_finished(
+            &show_record("a", 1, false, true, vec![(1, 1)], ShowStatus::Ended),
+            &aired
+        ));
+        // A watched special Trakt DOES report is simply extra — never required, never harmful.
+        assert!(user_finished(
+            &show_record(
+                "a",
+                1,
+                false,
+                true,
+                vec![(0, 1), (1, 1), (1, 2)],
+                ShowStatus::Ended
+            ),
+            &aired
+        ));
+    }
+
+    #[test]
+    fn trigger_a_removes_fully_watched_ended_show_despite_unwatched_specials() {
+        let t = show_title(
+            7,
+            vec![show_record(
+                "alice",
+                7,
+                /*watchlisted*/ false,
+                /*in_progress*/ true,
+                vec![(1, 1), (1, 2)],
+                ShowStatus::Ended,
+            )],
+            Some(owned(
+                "h",
+                Provenance::in_progress("alice"),
+                true,
+                vec![(1, 1), (1, 2)],
+            )),
+            vec![(0, 1), (1, 1), (1, 2)],
+        );
+        assert_eq!(
+            reconcile_title(&t),
+            vec![Action::Remove {
+                tmdb_id: 7,
+                hash: "h".into(),
+                reason: RemoveReason::Finished
+            }]
+        );
+    }
+
+    #[test]
+    fn catchup_never_acquires_specials() {
+        // Consistent with the finish test: a special is not part of the regular run, so catch-up
+        // never chases one (Trakt would never report it watched → re-acquired forever).
+        let t = show_title(
+            8,
+            vec![show_record(
+                "alice",
+                8,
+                false,
+                true,
+                vec![(1, 1)],
+                ShowStatus::Returning,
+            )],
+            None,
+            vec![(0, 1), (1, 1), (1, 2)],
+        );
+        assert_eq!(
+            reconcile_title(&t),
+            vec![Action::AcquireEpisode {
+                tmdb_id: 8,
+                season: 1,
+                episode: 2
+            }]
         );
     }
 }

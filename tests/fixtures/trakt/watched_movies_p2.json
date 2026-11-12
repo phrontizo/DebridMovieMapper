@@ -1,0 +1,42 @@
+[
+  {
+    "last_updated_at": "2024-12-29T21:09:06.000Z",
+    "last_watched_at": "2024-12-29T21:08:00.000Z",
+    "movie": {
+      "ids": {
+        "imdb": "tt9900200",
+        "plex": {
+          "guid": "000000000000000000000002",
+          "slug": "example-8"
+        },
+        "slug": "example-9",
+        "tmdb": 910400,
+        "trakt": 810400
+      },
+      "year": 1979,
+      "title": "Example Film Four"
+    },
+    "plays": 1,
+    "total_count": 206
+  },
+  {
+    "last_updated_at": "2024-12-29T21:09:06.000Z",
+    "last_watched_at": "2024-12-29T21:08:00.000Z",
+    "movie": {
+      "ids": {
+        "imdb": "tt9900300",
+        "plex": {
+          "guid": "000000000000000000000001",
+          "slug": "example-10"
+        },
+        "slug": "example-11",
+        "tmdb": 910300,
+        "trakt": 810300
+      },
+      "year": 1985,
+      "title": "Example Film Five"
+    },
+    "plays": 2,
+    "total_count": 206
+  }
+]

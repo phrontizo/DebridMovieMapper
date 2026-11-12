@@ -87,6 +87,27 @@ async fn trakt_live_device_flow_and_sync() {
         me.username
     );
 
+    // Since Trakt's 2026-07-03 API change, watched SHOWS carry their episodes only when requested
+    // with `extended=progress` (and every list read paginates). A watched history that has shows
+    // but no watched episode anywhere means that request regressed — every finish-removal and
+    // catch-up decision would then be wrong (Trigger A never fires; watched episodes re-acquired).
+    if !watched.shows.is_empty() {
+        let with_eps = watched
+            .shows
+            .iter()
+            .filter(|s| !s.watched_episodes.is_empty())
+            .count();
+        eprintln!(
+            "watched shows with per-episode data: {}/{}",
+            with_eps,
+            watched.shows.len()
+        );
+        assert!(
+            with_eps > 0,
+            "watched shows must carry their watched episodes (extended=progress)"
+        );
+    }
+
     sync_trakt(&trakt, &tmdb, &store, None, false).await;
     let wanted = store.all_wanted().await;
     eprintln!("sync_trakt wrote {} wanted row(s)", wanted.len());
