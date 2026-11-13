@@ -14,10 +14,11 @@ async fn test_short_title_identification() {
     println!("TESTING SHORT TITLE IDENTIFICATION");
     println!("========================================\n");
 
-    // Test cases: the 4 unidentified films. NB: TMDB re-assigns numeric ids over time, so a
-    // hardcoded expected id can silently point at a DIFFERENT film later — verify against the live
-    // API (title + year) when updating, not just the number. (Prior stale ids: Us was 458156, which
-    // now resolves to "John Wick: Chapter 3"; Amy was 318034, which no longer exists.)
+    // Test cases: short (≤3-letter) titles that need the short-title identification path.
+    // NB: TMDB re-assigns numeric ids over time, so a hardcoded expected id can silently point at
+    // a DIFFERENT film later — verify against the live API (title + year) when updating, not just
+    // the number. (Prior stale ids: Us was 458156, which now resolves to "John Wick: Chapter 3";
+    // Amy was 318034, which no longer exists.)
     let test_cases = vec![
         ("Us", 2019, 458723), // Us (2019) by Jordan Peele (verified live: tmdb:458723, 2019-03-14)
         ("Don", 2022, 895033), // Don (2022) - Tamil film (TMDB 895033); previous ID 940721 was Godzilla Minus One

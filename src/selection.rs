@@ -15,6 +15,17 @@ use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+/// The upgrade engine's resolution rules, which the planner must not undo: with
+/// `allow_resolution_downgrade` the engine moves slots off copies above `max_resolution` (the
+/// ceiling), so the planner never moves a slot onto one. Without it the ceiling plays no part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepointRules {
+    /// `MAX_RESOLUTION` as a height (720/1080/2160).
+    pub max_resolution: u16,
+    /// `ALLOW_RESOLUTION_DOWNGRADE`.
+    pub allow_resolution_downgrade: bool,
+}
+
 /// One planned slot change: `slot` moves from `from` (what it serves now) to `to`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotRepoint {
@@ -32,11 +43,15 @@ pub struct SlotRepoint {
 /// better copies the highest rank wins, then score, then the smallest hash. A slot whose served copy
 /// is absent, unsettled or unowned is left alone (the VFS already falls back for a stale slot), and
 /// a slot is never created. `present` is the provider listing's identified torrents with their files.
+/// Two exceptions keep the planner from undoing the upgrade engine (`rules`): a slot serving a
+/// checked copy moves onto an unchecked one only for a strictly higher resolution, and with
+/// `ALLOW_RESOLUTION_DOWNGRADE` no slot moves onto a copy above `MAX_RESOLUTION`.
 /// Every repoint moves a slot strictly up in rank, so repeated passes converge.
 pub fn plan_selection_repoints(
     owned: &[(String, OwnedRecord)],
     selection: &[(String, SelectionEntry)],
     present: &[&TorrentInfo],
+    rules: RepointRules,
 ) -> Vec<SlotRepoint> {
     use crate::release::quality_rank;
     use crate::scraper::MediaKind;
@@ -92,13 +107,23 @@ pub fn plan_selection_repoints(
             continue;
         }
         let cur_rank = quality_rank(cur.quality.as_ref());
+        // Never undo what the upgrade engine adopts. Its unverified rule swaps an unchecked copy for
+        // a checked one of a possibly LOWER tier at the same resolution, so a checked slot moves onto
+        // an unchecked copy only for a strictly higher resolution. With downgrades allowed it moves
+        // slots off copies above the ceiling, so no slot moves onto one.
+        let allowed = |rank: crate::release::QualityRank| {
+            (rank.checked || !cur_rank.checked || rank.resolution > cur_rank.resolution)
+                && !(rules.allow_resolution_downgrade && rank.resolution > rules.max_resolution)
+        };
         let best = by_title
             .get(&(is_movie, tmdb))
             .into_iter()
             .flatten()
             .filter(|(h, r)| {
+                let rank = quality_rank(r.quality.as_ref());
                 *h != current
-                    && quality_rank(r.quality.as_ref()) > cur_rank
+                    && rank > cur_rank
+                    && allowed(rank)
                     && episode.is_none_or(|ep| r.provides.contains(&ep))
             })
             .filter_map(|(h, r)| file_for(h, episode).map(|path| (*h, *r, path)))
@@ -171,6 +196,7 @@ pub async fn repoint_to_better_copies(
     idle_window: Duration,
     hidden_ids: &HashSet<String>,
     current: &[(TorrentInfo, MediaMetadata)],
+    rules: RepointRules,
 ) -> usize {
     let present: Vec<&TorrentInfo> = current
         .iter()
@@ -182,7 +208,7 @@ pub async fn repoint_to_better_copies(
     }
     let owned = store.all_owned().await;
     let selection = store.all_selection().await;
-    let plan = plan_selection_repoints(&owned, &selection, &present);
+    let plan = plan_selection_repoints(&owned, &selection, &present, rules);
     if plan.is_empty() {
         return 0;
     }
@@ -225,6 +251,12 @@ mod tests {
     use crate::scraper::MediaKind;
     use crate::store::{episode_slot, movie_slot, AcquireRequest, Provenance};
     use crate::vfs::{MediaMetadata, MediaType};
+
+    /// The default rules: `ALLOW_RESOLUTION_DOWNGRADE` off, so the ceiling plays no part.
+    const OFF: RepointRules = RepointRules {
+        max_resolution: 1080,
+        allow_resolution_downgrade: false,
+    };
 
     fn q(resolution: u16, source_tier: i64, score: i64) -> Option<QualitySummary> {
         Some(QualitySummary {
@@ -346,7 +378,7 @@ mod tests {
                 sel("pack", "P/Show.S02E01.1080p.BluRay.mkv"),
             ),
         ];
-        let plan = plan_selection_repoints(&owned, &selection, &[&pack, &remux]);
+        let plan = plan_selection_repoints(&owned, &selection, &[&pack, &remux], OFF);
         assert_eq!(
             plan,
             vec![
@@ -372,7 +404,7 @@ mod tests {
                     .unwrap_or_else(|| (slot.clone(), e.clone()))
             })
             .collect();
-        assert!(plan_selection_repoints(&owned, &after, &[&pack, &remux]).is_empty());
+        assert!(plan_selection_repoints(&owned, &after, &[&pack, &remux], OFF).is_empty());
     }
 
     /// Only a STRICTLY better rank moves a slot: an equal-quality copy (even one with a higher
@@ -399,7 +431,7 @@ mod tests {
             let alt = info("other", &[("Show.S01E01.other.mkv", 9)]);
             let selection = vec![(episode_slot(7, 1, 1), sel("cur", "Show.S01E01.mkv"))];
             assert!(
-                plan_selection_repoints(&owned, &selection, &[&cur, &alt]).is_empty(),
+                plan_selection_repoints(&owned, &selection, &[&cur, &alt], OFF).is_empty(),
                 "{other:?} must not take the slot"
             );
         }
@@ -423,7 +455,7 @@ mod tests {
         let avi = info("avi", &[("Show.S01E01.avi", 1)]);
         let mkv = info("mkv", &[("Show.S01E01.mkv", 1)]);
         let selection = vec![(episode_slot(7, 1, 1), sel("avi", "Show.S01E01.avi"))];
-        let plan = plan_selection_repoints(&owned, &selection, &[&avi, &mkv]);
+        let plan = plan_selection_repoints(&owned, &selection, &[&avi, &mkv], OFF);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].to, sel("mkv", "Show.S01E01.mkv"));
     }
@@ -455,7 +487,7 @@ mod tests {
             .collect();
         let refs: Vec<&TorrentInfo> = infos.iter().collect();
         let selection = vec![(episode_slot(7, 1, 1), sel("cur", "cur/Show.S01E01.mkv"))];
-        let plan = plan_selection_repoints(&owned, &selection, &refs);
+        let plan = plan_selection_repoints(&owned, &selection, &refs, OFF);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].to, sel("aremux", "aremux/Show.S01E01.mkv"));
     }
@@ -483,48 +515,52 @@ mod tests {
         );
         let selection = vec![(episode_slot(7, 1, 1), sel("cur", "Show.S01E01.mkv"))];
         assert_eq!(
-            plan_selection_repoints(&base(), &selection, &[&cur, &better]).len(),
+            plan_selection_repoints(&base(), &selection, &[&cur, &better], OFF).len(),
             1,
             "control: the better copy takes the slot"
         );
 
         let mut pending = base();
         pending[1].1.status = OwnedStatus::Pending;
-        assert!(plan_selection_repoints(&pending, &selection, &[&cur, &better]).is_empty());
+        assert!(plan_selection_repoints(&pending, &selection, &[&cur, &better], OFF).is_empty());
 
         assert!(
-            plan_selection_repoints(&base(), &selection, &[&cur]).is_empty(),
+            plan_selection_repoints(&base(), &selection, &[&cur], OFF).is_empty(),
             "an absent copy can't serve"
         );
 
         let mut other_title = base();
         other_title[1].1.request.tmdb_id = 8;
-        assert!(plan_selection_repoints(&other_title, &selection, &[&cur, &better]).is_empty());
+        assert!(
+            plan_selection_repoints(&other_title, &selection, &[&cur, &better], OFF).is_empty()
+        );
 
         let no_file = info("better", &[("B/Show.S01E02.mkv", 5)]);
         assert!(
-            plan_selection_repoints(&base(), &selection, &[&cur, &no_file]).is_empty(),
+            plan_selection_repoints(&base(), &selection, &[&cur, &no_file], OFF).is_empty(),
             "provides lists E01 but no file is E01"
         );
         let mut unselected = better.clone();
         unselected.files[0].selected = 0;
         assert!(
-            plan_selection_repoints(&base(), &selection, &[&cur, &unselected]).is_empty(),
+            plan_selection_repoints(&base(), &selection, &[&cur, &unselected], OFF).is_empty(),
             "a file the VFS wouldn't emit can't serve"
         );
 
         let mut not_provided = base();
         not_provided[1].1.provides = vec![(1, 2)];
-        assert!(plan_selection_repoints(&not_provided, &selection, &[&cur, &better]).is_empty());
+        assert!(
+            plan_selection_repoints(&not_provided, &selection, &[&cur, &better], OFF).is_empty()
+        );
 
         let mut cur_pending = base();
         cur_pending[0].1.status = OwnedStatus::Pending;
         assert!(
-            plan_selection_repoints(&cur_pending, &selection, &[&cur, &better]).is_empty(),
+            plan_selection_repoints(&cur_pending, &selection, &[&cur, &better], OFF).is_empty(),
             "a slot serving an unsettled copy is left to observe"
         );
         assert!(
-            plan_selection_repoints(&base(), &selection, &[&better]).is_empty(),
+            plan_selection_repoints(&base(), &selection, &[&better], OFF).is_empty(),
             "a slot serving an absent copy is left alone (the VFS already falls back)"
         );
     }
@@ -575,6 +611,7 @@ mod tests {
             Duration::from_secs(300),
             &HashSet::new(),
             &current,
+            OFF,
         )
         .await;
         assert_eq!(moved, 1);
@@ -590,20 +627,20 @@ mod tests {
     async fn the_executor_waits_for_an_idle_library_and_skips_hidden_torrents() {
         let (store, current) = better_copy_fixture().await;
         let busy = ReadActivity::without_startup_grace();
-        busy.touch("Shows/T/Season 01/Show.S01E01.BluRay.mkv").await;
+        busy.touch("pack").await;
         let window = Duration::from_secs(300);
         assert_eq!(
-            repoint_to_better_copies(&store, &busy, window, &HashSet::new(), &current).await,
+            repoint_to_better_copies(&store, &busy, window, &HashSet::new(), &current, OFF).await,
             0
         );
         let idle = ReadActivity::without_startup_grace();
         let hidden: HashSet<String> = ["id-remux".to_string()].into_iter().collect();
         assert_eq!(
-            repoint_to_better_copies(&store, &idle, window, &hidden, &current).await,
+            repoint_to_better_copies(&store, &idle, window, &hidden, &current, OFF).await,
             0
         );
         assert_eq!(
-            repoint_to_better_copies(&store, &idle, window, &HashSet::new(), &[]).await,
+            repoint_to_better_copies(&store, &idle, window, &HashSet::new(), &[], OFF).await,
             0,
             "an empty listing plans nothing"
         );
@@ -633,7 +670,7 @@ mod tests {
             &[("Film/sample.mkv", 1), ("Film/Film.1080p.BluRay.mkv", 8)],
         );
         let selection = vec![(movie_slot(5), sel("web", "Film.1080p.WEB.mkv"))];
-        let plan = plan_selection_repoints(&owned, &selection, &[&web, &bluray]);
+        let plan = plan_selection_repoints(&owned, &selection, &[&web, &bluray], OFF);
         assert_eq!(
             plan,
             vec![SlotRepoint {
@@ -641,6 +678,92 @@ mod tests {
                 from: sel("web", "Film.1080p.WEB.mkv"),
                 to: sel("bluray", "Film/Film.1080p.BluRay.mkv"),
             }]
+        );
+    }
+
+    /// A slot never moves from a checked copy onto an unchecked one at the same resolution, even of
+    /// a higher tier: the upgrade engine's unverified rule deliberately swaps an unchecked copy for a
+    /// checked one of a lower tier (e.g. an unverified BluRay `.avi` pack -> a checked WEB x265 MKV),
+    /// and the planner must not move the slot straight back. A strictly higher resolution still wins.
+    #[test]
+    fn a_checked_slot_is_not_moved_onto_an_unchecked_copy_at_the_same_resolution() {
+        let unchecked_pack = |resolution: u16| {
+            let mut quality = q(resolution, 6_000, 9);
+            quality.as_mut().unwrap().unverified = true;
+            rec(MediaKind::Series, 7, eps(1, 2), quality)
+        };
+        let single = rec(MediaKind::Series, 7, eps(1, 1), q(1080, 3_000, 9));
+        let pack = info(
+            "pack",
+            &[("P/Show.S01E01.avi", 5), ("P/Show.S01E02.avi", 5)],
+        );
+        let web = info("web", &[("Show.S01E01.WEB.x265.mkv", 2)]);
+        let selection = vec![(
+            episode_slot(7, 1, 1),
+            sel("web", "Show.S01E01.WEB.x265.mkv"),
+        )];
+
+        let owned = vec![
+            ("pack".to_string(), unchecked_pack(1080)),
+            ("web".to_string(), single.clone()),
+        ];
+        assert!(
+            plan_selection_repoints(&owned, &selection, &[&pack, &web], OFF).is_empty(),
+            "a checked 1080p copy keeps its slot against an unchecked 1080p pack of a higher tier"
+        );
+
+        let owned = vec![
+            ("pack".to_string(), unchecked_pack(2160)),
+            ("web".to_string(), single),
+        ];
+        let plan = plan_selection_repoints(&owned, &selection, &[&pack, &web], OFF);
+        assert_eq!(plan.len(), 1, "a higher resolution still takes the slot");
+        assert_eq!(plan[0].to, sel("pack", "P/Show.S01E01.avi"));
+    }
+
+    /// With `ALLOW_RESOLUTION_DOWNGRADE` on, the upgrade engine moves slots off copies above the
+    /// ceiling, so the planner never moves a slot onto one. With the flag off the ceiling plays no
+    /// part (the documented behaviour: a better copy is served whatever its resolution).
+    #[test]
+    fn an_over_ceiling_copy_takes_no_slot_when_downgrades_are_allowed() {
+        let owned = vec![
+            (
+                "uhd".to_string(),
+                rec(MediaKind::Series, 7, eps(1, 2), q(2160, 6_000, 9)),
+            ),
+            (
+                "hd".to_string(),
+                rec(MediaKind::Series, 7, eps(1, 1), q(1080, 6_000, 9)),
+            ),
+        ];
+        let uhd = info(
+            "uhd",
+            &[
+                ("U/Show.S01E01.2160p.mkv", 9),
+                ("U/Show.S01E02.2160p.mkv", 9),
+            ],
+        );
+        let hd = info("hd", &[("Show.S01E01.1080p.mkv", 4)]);
+        let selection = vec![(episode_slot(7, 1, 1), sel("hd", "Show.S01E01.1080p.mkv"))];
+        let on = RepointRules {
+            max_resolution: 1080,
+            allow_resolution_downgrade: true,
+        };
+        assert!(
+            plan_selection_repoints(&owned, &selection, &[&uhd, &hd], on).is_empty(),
+            "the 2160p pack must not take a slot from the 1080p copy above a 1080p ceiling"
+        );
+        let plan = plan_selection_repoints(&owned, &selection, &[&uhd, &hd], OFF);
+        assert_eq!(plan.len(), 1, "with the flag off the ceiling plays no part");
+        assert_eq!(plan[0].to, sel("uhd", "U/Show.S01E01.2160p.mkv"));
+        let raised = RepointRules {
+            max_resolution: 2160,
+            allow_resolution_downgrade: true,
+        };
+        assert_eq!(
+            plan_selection_repoints(&owned, &selection, &[&uhd, &hd], raised).len(),
+            1,
+            "within the ceiling the better copy takes the slot"
         );
     }
 }

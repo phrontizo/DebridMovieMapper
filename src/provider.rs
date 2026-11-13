@@ -16,6 +16,74 @@ pub(crate) fn synthetic_bad_gateway(detail: &'static [u8]) -> reqwest::Error {
     .expect_err("BAD_GATEWAY always yields an error status")
 }
 
+/// Per-request timeout for the synchronous on-read resolve calls (RD `unrestrict/link`, TorBox
+/// `requestdl`), overriding the clients' 60 s default. Both answer with a small JSON body in well
+/// under a second, so this only bites an endpoint that accepts the connection and then hangs — which
+/// would otherwise hold the WebDAV read for 3 attempts × 60 s.
+pub(crate) const READ_PATH_REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// How many times a paginated provider listing is attempted while concurrent deletes keep shifting
+/// its pages (see [`DeleteTracker`]) before it fails as an `Err` (callers skip the tick).
+pub(crate) const MAX_LISTING_ATTEMPTS: u32 = 3;
+
+/// Counts this process's torrent deletes so a multi-page provider listing can tell whether one may
+/// have landed while it was paging. Both providers page by position (RD `page`, TorBox `offset`), so
+/// deleting an item on an already-fetched page shifts every later item back by one and the first
+/// item of the next page is never returned — an `Ok` listing silently missing a live torrent, which
+/// downstream reads as lapsed (re-acquire), absent (a staging presence check) or gone (a mirror
+/// reap). The upgrade, reconcile and repair paths delete while other jobs list, so the clients
+/// re-list when this reports a possible overlap. Deletes made outside this process (the provider's
+/// web UI) can't be seen; this only covers our own.
+#[derive(Debug, Default)]
+pub(crate) struct DeleteTracker {
+    started: std::sync::atomic::AtomicU64,
+    in_flight: std::sync::atomic::AtomicUsize,
+}
+
+/// Marks one delete request as in flight; dropping it (on completion or cancellation) clears that.
+pub(crate) struct DeleteInFlight<'a>(&'a DeleteTracker);
+
+impl Drop for DeleteInFlight<'_> {
+    fn drop(&mut self) {
+        self.0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The tracker's state when a listing started; see [`DeleteTracker::changed_since`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeleteSnapshot {
+    started: u64,
+    in_flight: bool,
+}
+
+impl DeleteTracker {
+    /// Call before sending a delete and hold the guard until the request is done.
+    pub(crate) fn begin(&self) -> DeleteInFlight<'_> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.in_flight.fetch_add(1, SeqCst);
+        self.started.fetch_add(1, SeqCst);
+        DeleteInFlight(self)
+    }
+
+    /// Take before fetching the first page.
+    pub(crate) fn snapshot(&self) -> DeleteSnapshot {
+        use std::sync::atomic::Ordering::SeqCst;
+        DeleteSnapshot {
+            started: self.started.load(SeqCst),
+            in_flight: self.in_flight.load(SeqCst) > 0,
+        }
+    }
+
+    /// Whether a delete may have taken effect since `since`: one started after it, or one was
+    /// already in flight then (and so may have landed mid-listing).
+    pub(crate) fn changed_since(&self, since: DeleteSnapshot) -> bool {
+        since.in_flight || self.started.load(std::sync::atomic::Ordering::SeqCst) != since.started
+    }
+}
+
 /// The set of transient 5xx statuses worth retrying — 500/502/503/504. The DETERMINISTIC 5xx (501
 /// Not Implemented / 505 HTTP Version Not Supported) are excluded, since a retry can't fix them.
 /// Shared by both provider clients so the retryable set can't silently diverge between them.
@@ -79,9 +147,10 @@ pub trait DebridProvider: Send + Sync + std::fmt::Debug {
     async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error>;
 
     /// Resolve a file to a streamable CDN URL. Returns `AppError::Unavailable` when the
-    /// file's bytes are not currently available (RD: any 5xx, a transport-level failure, OR a
-    /// stale/expired-link 4xx such as 404 — all recoverable by a re-add-by-hash; only a permanent
-    /// auth 4xx like 401/403 stays a hard error) so callers can trigger re-acquire/repair.
+    /// file's bytes are not currently available (any 5xx, a transport-level failure, OR a
+    /// stale/expired-link 4xx such as 404 — all recoverable by a re-add-by-hash) so callers can
+    /// trigger re-acquire/repair. A permanent auth 4xx (401/403) and throttling (429) stay a hard
+    /// `AppError::Http`: neither is fixed by a re-add, so the read fails without repair.
     async fn resolve_url(&self, loc: &FileLocator) -> Result<String, crate::error::AppError>;
 
     /// Drop any cached resolution for `loc` (RD: the unrestrict-cache entry for its link).
@@ -254,6 +323,30 @@ mod tests {
     use super::*;
     use crate::rd_client::RealDebridClient;
     use std::sync::Arc;
+
+    #[test]
+    fn delete_tracker_flags_deletes_that_overlap_a_listing() {
+        let t = DeleteTracker::default();
+        // Nothing happened: an unchanged tracker lets the listing stand.
+        let quiet = t.snapshot();
+        assert!(!t.changed_since(quiet));
+
+        // A delete that starts (and even finishes) after the snapshot is flagged.
+        let before = t.snapshot();
+        drop(t.begin());
+        assert!(t.changed_since(before));
+
+        // A delete already in flight when the listing starts may land mid-listing, so it is flagged
+        // even though no new delete starts afterwards.
+        let in_flight = t.begin();
+        let during = t.snapshot();
+        assert!(t.changed_since(during));
+        drop(in_flight);
+
+        // Once it has finished, a fresh snapshot is clean again.
+        let after = t.snapshot();
+        assert!(!t.changed_since(after));
+    }
 
     #[test]
     fn real_debrid_client_is_a_debrid_provider() {

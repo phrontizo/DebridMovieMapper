@@ -26,8 +26,9 @@ pub struct AppState {
     pub scraper: Arc<dyn Scraper>,
     pub engine: Arc<AcquisitionEngine>,
     /// The Trakt client, present only when Trakt sync is configured. The scheduler
-    /// gates the Trakt cycle + episode-monitor jobs on `is_some()`; the wanted/token
-    /// store handles are reachable via `store`.
+    /// gates the Trakt cycle + episode-monitor jobs on `scheduler::trakt_jobs_enabled`
+    /// (this client AND `config.trakt`); the wanted/token store handles are reachable
+    /// via `store`.
     pub trakt_client: Option<Arc<dyn crate::trakt_client::TraktClient>>,
     /// Proxy read-activity tracker (SP3) — stamped by `dav_fs` reads, read by the upgrade engine.
     pub read_activity: Arc<crate::read_activity::ReadActivity>,

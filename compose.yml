@@ -49,7 +49,7 @@ services:
       - SCRAPER_PROXY_URL=${SCRAPER_PROXY_URL:-}
       # Hard resolution ceiling: 720 | 1080 | 2160/4k (default 1080).
       - MAX_RESOLUTION=${MAX_RESOLUTION:-}
-      # Required audio language: 2- or 3-letter ISO code, or "original" = the title's original language (default original).
+      # Required audio language: 2- or 3-letter ISO code, or "original" = the title's original or spoken languages (default original).
       - AUDIO_LANGUAGE=${AUDIO_LANGUAGE:-}
       # Required subtitle language: 2- or 3-letter ISO code, or "none" = skip the subtitle check (default none).
       - SUBTITLE_LANGUAGE=${SUBTITLE_LANGUAGE:-}
@@ -58,14 +58,17 @@ services:
       - PREFER_HDR=${PREFER_HDR:-}
       # Numeric knobs (uncomment to override the defaults shown):
       # - STALL_TIMEOUT_SECS=1800        # no-progress timeout before a Pending acquire is retried
-      # - MAX_ACQUIRE_ATTEMPTS=5         # candidates tried before giving up on a title
+      # - MAX_ACQUIRE_ATTEMPTS=5         # top-ranked candidates one pass tries to add (the next only when an add fails)
       # - ACQUIRE_DEAD_TIMEOUT_SECS=600  # secs an optimistic add may stay unresolved before reaped (min 120)
+      # - SCRAPER_MIN_INTERVAL_MS=1000   # min spacing between scraper requests (clamped 100–60000; backs off on 429)
       # - DEDUP_REMOVE_DUPLICATES=false  # true = actually delete redundant duplicate torrents (default: dry-run/log only)
       # - REMOVE_FINISHED_SHOWS=false    # true = auto-remove fully-watched ended non-watchlisted shows (default: preview/log only)
 
       # ── Trakt sync (SP2) ──────────────────────────────────────────────────────
       # Set BOTH id + secret (from a Trakt API app) to drive the library from users'
-      # watchlists/history; absent → Trakt disabled (account-mirror + repair only).
+      # watchlists/history. Absent, nothing is acquired, but the account mirror, dedup and the
+      # upgrade engine still work on what is already in the account (UPGRADE_INTERVAL_SECS=0
+      # stops the upgrade engine replacing and deleting existing copies).
       # Then link accounts at the /trakt/accounts page on the published port.
       - TRAKT_CLIENT_ID=${TRAKT_CLIENT_ID:-}
       - TRAKT_CLIENT_SECRET=${TRAKT_CLIENT_SECRET:-}
@@ -74,14 +77,18 @@ services:
       # Catch-up: auto-acquire episodes aired since you last watched a show. Lookback window —
       # 90d / 12w / 6mo (or a bare number = days); unset/0 = all-time (default).
       - TRAKT_CATCHUP_LOOKBACK=${TRAKT_CATCHUP_LOOKBACK:-}
+      # Extra host names (comma-separated, no scheme or port) the /trakt pages answer for, e.g. a
+      # reverse proxy's FQDN. IP addresses, localhost, single-label names (debridmoviemapper) and
+      # .local/.lan/.internal/.home.arpa names always work; any other Host is refused (guards
+      # against DNS rebinding).
+      - TRAKT_ENROL_ALLOWED_HOSTS=${TRAKT_ENROL_ALLOWED_HOSTS:-}
 
       # ── Upgrade engine (SP3) ──────────────────────────────────────────────────
       # Daily quality-upgrade + full-season consolidation. On by default; set
       # UPGRADE_INTERVAL_SECS=0 to disable. Uncomment to override the defaults shown:
       # - UPGRADE_INTERVAL_SECS=86400    # 0 disables; min 600 when non-zero
-      # - UPGRADE_BUDGET_PER_TICK=20     # owned titles re-scored per tick (min 1)
+      # - UPGRADE_BUDGET_PER_TICK=       # cap on titles re-scored per pass (default: unset = whole library; min 1)
       # - UPGRADE_IDLE_SECS=300          # read-inactivity before a swap/prune (min 30)
-      # - UPGRADE_STAGE_MAX_SECS=604800  # reserved (min 3600)
       # - ALLOW_RESOLUTION_DOWNGRADE=false # true = correct an above-ceiling owned copy to a within-ceiling cached release (default: preview/log only)
     volumes:
       - metadata:/data

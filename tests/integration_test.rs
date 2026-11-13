@@ -1,52 +1,54 @@
+//! Live Real-Debrid identification and VFS tests (`#[ignore]`). They need `RD_API_TOKEN` and
+//! `TMDB_API_KEY`, skip when `RD_API_TOKEN` is unset or blank, and only read the account.
+//!
+//! Identifications are cached between runs in a `Store` under Cargo's scratch directory for
+//! integration tests (`CARGO_TARGET_TMPDIR`), never in the service's own `metadata.db`.
+
+mod common;
+
 use debridmoviemapper::identification::identify_torrent;
 use debridmoviemapper::rd_client::{RealDebridClient, TorrentInfo};
+use debridmoviemapper::store::Store;
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::vfs::{is_video_file, DebridVfs, MediaMetadata, VfsNode};
 use futures_util::StreamExt;
-use redb::{Database, ReadableDatabase, TableDefinition};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use tokio::sync::{OnceCell, RwLock};
 
-const MATCHES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("matches");
+/// Shared identified data, fetched and identified once and reused by every test. `None` when
+/// `RD_API_TOKEN` is unset or blank, and the tests then skip.
+static IDENTIFIED_DATA: OnceCell<Option<Vec<(TorrentInfo, MediaMetadata)>>> = OnceCell::const_new();
 
-/// Shared redb Database instance — redb only allows one open handle per path.
-static DB: LazyLock<Database> =
-    LazyLock::new(|| Database::create("metadata.db").expect("Failed to open database"));
+/// The identification cache's path.
+fn cache_path() -> String {
+    format!(
+        "{}/integration_test_cache.redb",
+        env!("CARGO_TARGET_TMPDIR")
+    )
+}
 
-/// Shared identified data — fetched and identified exactly once, reused by all tests.
-#[allow(clippy::type_complexity)]
-static IDENTIFIED_DATA: OnceCell<(Arc<RealDebridClient>, Vec<(TorrentInfo, MediaMetadata)>)> =
-    OnceCell::const_new();
-
-async fn get_shared_data() -> &'static (Arc<RealDebridClient>, Vec<(TorrentInfo, MediaMetadata)>) {
+async fn get_shared_data() -> Option<&'static Vec<(TorrentInfo, MediaMetadata)>> {
     IDENTIFIED_DATA
         .get_or_init(|| async {
             tracing_subscriber::fmt::try_init().ok();
-            dotenvy::dotenv().ok();
-
-            let api_token = std::env::var("RD_API_TOKEN")
-                .expect("RD_API_TOKEN must be set")
-                .trim()
-                .to_string();
-            let tmdb_api_key = std::env::var("TMDB_API_KEY")
-                .expect("TMDB_API_KEY must be set")
-                .trim()
-                .to_string();
+            let api_token = common::token("RD_API_TOKEN")?;
+            let tmdb_client = common::tmdb_client();
             let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-            let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key).unwrap());
+            let store = Store::open(&cache_path())
+                .expect("Failed to open the integration-test identification cache");
 
-            let data = fetch_and_identify(&rd_client, &tmdb_client, &DB).await;
-            (rd_client, data)
+            Some(fetch_and_identify(&rd_client, &tmdb_client, &store).await)
         })
         .await
+        .as_ref()
 }
 
-/// Fetch downloaded torrents and identify them via TMDB, using redb cache.
+/// Fetch downloaded torrents and identify them via TMDB, using the store's identification cache.
 /// Respects INTEGRATION_TEST_LIMIT env var to limit the number of torrents processed.
 async fn fetch_and_identify(
     rd_client: &Arc<RealDebridClient>,
     tmdb_client: &Arc<TmdbClient>,
-    db: &Database,
+    store: &Store,
 ) -> Vec<(TorrentInfo, MediaMetadata)> {
     println!("Fetching torrents...");
     let torrents = rd_client
@@ -77,15 +79,7 @@ async fn fetch_and_identify(
     let mut to_identify = Vec::new();
 
     for torrent in &to_process {
-        let cached = {
-            let read_txn = db.begin_read().ok();
-            read_txn.and_then(|txn| {
-                let table = txn.open_table(MATCHES_TABLE).ok()?;
-                let entry = table.get(torrent.id.as_str()).ok()??;
-                serde_json::from_slice::<(TorrentInfo, MediaMetadata)>(entry.value()).ok()
-            })
-        };
-        if let Some(data) = cached {
+        if let Some(data) = store.get_match(torrent.id.clone()).await {
             println!("Cached: {} (ID: {:?})", data.0.filename, data.1.external_id);
             current_data.push(data);
         } else {
@@ -119,13 +113,11 @@ async fn fetch_and_identify(
                 "Identified: {} as {:?} (ID: {:?})",
                 info.filename, metadata.media_type, metadata.external_id
             );
-            if let Ok(data_bytes) = serde_json::to_vec(&(info.clone(), metadata.clone())) {
-                if let Ok(write_txn) = db.begin_write() {
-                    if let Ok(mut table) = write_txn.open_table(MATCHES_TABLE) {
-                        let _ = table.insert(id.as_str(), data_bytes.as_slice());
-                    }
-                    let _ = write_txn.commit();
-                }
+            if let Err(e) = store
+                .put_matches(vec![(id, info.clone(), metadata.clone())])
+                .await
+            {
+                println!("WARNING: failed to cache identification: {e}");
             }
             current_data.push((info, metadata));
         }
@@ -137,11 +129,14 @@ async fn fetch_and_identify(
 }
 
 /// Test 1: Torrent fetching and TMDB identification only. No VFS, no unrestrict.
-/// Uses redb cache so repeat runs are fast.
+/// Uses the identification cache so repeat runs are fast.
 #[tokio::test]
 #[ignore]
 async fn test_identification() {
-    let (_, data) = get_shared_data().await;
+    let Some(data) = get_shared_data().await else {
+        println!("skipping test_identification: RD_API_TOKEN not set");
+        return;
+    };
 
     let identified = data.iter().filter(|(_, m)| m.external_id.is_some()).count();
     let unidentified = data.len() - identified;
@@ -165,11 +160,15 @@ async fn test_identification() {
     assert!(identified > 0, "Should identify at least one torrent");
 }
 
-/// Test 2: Given identified data (from redb cache), builds VFS and checks directory structure.
+/// Test 2: Given identified data (from the identification cache), builds VFS and checks directory
+/// structure.
 #[tokio::test]
 #[ignore]
 async fn test_vfs_structure() {
-    let (_, data) = get_shared_data().await;
+    let Some(data) = get_shared_data().await else {
+        println!("skipping test_vfs_structure: RD_API_TOKEN not set");
+        return;
+    };
     assert!(
         !data.is_empty(),
         "Need identified torrents to test VFS structure"
@@ -240,7 +239,10 @@ async fn test_vfs_structure() {
 #[tokio::test]
 #[ignore]
 async fn test_vfs_completeness() {
-    let (_, data) = get_shared_data().await;
+    let Some(data) = get_shared_data().await else {
+        println!("skipping test_vfs_completeness: RD_API_TOKEN not set");
+        return;
+    };
     assert!(
         !data.is_empty(),
         "Need identified torrents to test VFS completeness"
@@ -323,7 +325,10 @@ async fn test_vfs_completeness() {
 #[tokio::test]
 #[ignore]
 async fn test_vfs_timestamps_stable() {
-    let (_, data) = get_shared_data().await;
+    let Some(data) = get_shared_data().await else {
+        println!("skipping test_vfs_timestamps_stable: RD_API_TOKEN not set");
+        return;
+    };
     assert!(
         !data.is_empty(),
         "Need identified torrents to test timestamps"

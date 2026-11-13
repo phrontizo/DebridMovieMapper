@@ -92,19 +92,51 @@ impl SearchOutcome {
     }
 }
 
+tokio::task_local! {
+    /// Set by [`TmdbClient::search`] when a search FAILED, inside a [`track_search_failures`] scope.
+    static SEARCH_FAILED: std::cell::Cell<bool>;
+}
+
+/// Run `fut`, also reporting whether any TMDB search inside it FAILED (the request itself: a
+/// transport error, a 5xx after the retry budget, or a 4xx), as opposed to a genuine empty result.
+/// `identification::identify_name` returns `None` for both, so this is how the scan loop tells "TMDB
+/// has no such title" (cache it) from "TMDB could not be reached" (identify it again later). Scoped
+/// to `fut`'s own polls, so a search failing in another job never counts.
+pub async fn track_search_failures<F: std::future::Future>(fut: F) -> (F::Output, bool) {
+    SEARCH_FAILED
+        .scope(std::cell::Cell::new(false), async move {
+            let out = fut.await;
+            (out, SEARCH_FAILED.with(|failed| failed.get()))
+        })
+        .await
+}
+
 /// A well-formed IMDB id: `tt` followed by ≥1 ASCII digit (e.g. `tt0111161`). Guards `find_by_imdb`
-/// so a malformed/hostile value can't be interpolated into the request path (unlike the numeric
-/// `tmdb_id` paths, which can't carry a URL-reserved char).
-fn is_well_formed_imdb_id(id: &str) -> bool {
+/// and the scraper's addon URL so a malformed/hostile value can't be interpolated into a request
+/// path (unlike the numeric `tmdb_id` paths, which can't carry a URL-reserved char).
+pub(crate) fn is_well_formed_imdb_id(id: &str) -> bool {
     matches!(id.strip_prefix("tt"), Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether a TMDB request error is PERMANENT for that request (a 4xx other than 429: a bad key, an
+/// unknown id), as opposed to transient (a 429, a 5xx after the retry budget, a transport error)
+/// and so worth retrying later.
+pub(crate) fn error_is_permanent(e: &reqwest::Error) -> bool {
+    e.status()
+        .is_some_and(|s| s.is_client_error() && s != reqwest::StatusCode::TOO_MANY_REQUESTS)
 }
 
 /// Minimum interval between TMDB requests (TMDB allows ~40 req/s; 100ms is conservative).
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 
+/// The TMDB v3 API root every request is built on.
+const TMDB_API_BASE: &str = "https://api.themoviedb.org/3";
+
 pub struct TmdbClient {
     client: Client,
     api_key: String,
+    /// The API root (no trailing `/`): [`TMDB_API_BASE`], or a loopback server in tests.
+    base_url: String,
     last_request: Mutex<Instant>,
 }
 
@@ -119,31 +151,49 @@ impl TmdbClient {
         Ok(Self {
             client,
             api_key,
+            base_url: TMDB_API_BASE.to_string(),
             // Start in the past so the first request fires immediately.
             last_request: Mutex::new(Instant::now() - MIN_REQUEST_INTERVAL),
         })
     }
 
+    /// A client whose requests go to `base_url` (e.g. a loopback test server) instead of TMDB, so
+    /// unit tests never reach the real API.
+    #[cfg(test)]
+    pub(crate) fn with_base_url(api_key: String, base_url: String) -> Result<Self, AppError> {
+        let mut client = Self::new(api_key)?;
+        client.base_url = base_url.trim_end_matches('/').to_string();
+        Ok(client)
+    }
+
+    /// A client for unit tests that must never reach TMDB: every request goes to a loopback server
+    /// that answers `404` at once (a client error, so nothing is retried or slept on).
+    #[cfg(test)]
+    pub(crate) async fn offline() -> Self {
+        let server = crate::trakt_client::test_http::spawn(Vec::new()).await;
+        Self::with_base_url("k".into(), server.base_url).unwrap()
+    }
+
     pub async fn search_movie(&self, query: &str, year: Option<&str>) -> SearchOutcome {
-        let url = "https://api.themoviedb.org/3/search/movie";
+        let url = format!("{}/search/movie", self.base_url);
         let mut params = vec![("api_key", self.api_key.as_str()), ("query", query)];
         let year_string;
         if let Some(y) = year {
             year_string = y.to_string();
             params.push(("primary_release_year", &year_string));
         }
-        self.search(url, params).await
+        self.search(&url, params).await
     }
 
     pub async fn search_tv(&self, query: &str, year: Option<&str>) -> SearchOutcome {
-        let url = "https://api.themoviedb.org/3/search/tv";
+        let url = format!("{}/search/tv", self.base_url);
         let mut params = vec![("api_key", self.api_key.as_str()), ("query", query)];
         let year_string;
         if let Some(y) = year {
             year_string = y.to_string();
             params.push(("first_air_date_year", &year_string));
         }
-        self.search(url, params).await
+        self.search(&url, params).await
     }
 
     async fn search(&self, url: &str, params: Vec<(&str, &str)>) -> SearchOutcome {
@@ -154,8 +204,10 @@ impl TmdbClient {
             Ok(resp) => SearchOutcome::Results(resp.results),
             Err(e) => {
                 // A failed request is NOT "no match" — surface it as `Unavailable` so `identify_name`
-                // stops issuing further doomed fallback searches during a TMDB outage.
+                // stops issuing further doomed fallback searches during a TMDB outage, and flag it to
+                // a `track_search_failures` caller (outside one, there is nothing to flag).
                 error!("TMDB search failed: {}", e.without_url());
+                let _ = SEARCH_FAILED.try_with(|failed| failed.set(true));
                 SearchOutcome::Unavailable
             }
         }
@@ -175,7 +227,7 @@ impl TmdbClient {
             );
             return Ok(None);
         }
-        let url = format!("https://api.themoviedb.org/3/find/{}", imdb_id);
+        let url = format!("{}/find/{}", self.base_url, imdb_id);
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
                 self.client.get(&url).query(&[
@@ -197,7 +249,7 @@ impl TmdbClient {
             crate::vfs::MediaType::Movie => "movie",
             crate::vfs::MediaType::Show => "tv",
         };
-        let url = format!("https://api.themoviedb.org/3/{}/{}", path, tmdb_id);
+        let url = format!("{}/{}/{}", self.base_url, path, tmdb_id);
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
                 self.client
@@ -218,10 +270,7 @@ impl TmdbClient {
             crate::vfs::MediaType::Movie => "movie",
             crate::vfs::MediaType::Show => "tv",
         };
-        let url = format!(
-            "https://api.themoviedb.org/3/{}/{}/external_ids",
-            path, tmdb_id
-        );
+        let url = format!("{}/{}/{}/external_ids", self.base_url, path, tmdb_id);
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
                 self.client
@@ -235,7 +284,7 @@ impl TmdbClient {
     /// Fetch a series' production status from TMDB `/tv/{id}` (the `status` field).
     /// Network/HTTP failure → Err; an unrecognised or missing status → Ok(ShowStatus::Other).
     pub async fn show_status(&self, tmdb_id: u64) -> Result<ShowStatus, reqwest::Error> {
-        let url = format!("https://api.themoviedb.org/3/tv/{}", tmdb_id);
+        let url = format!("{}/tv/{}", self.base_url, tmdb_id);
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
                 self.client
@@ -252,10 +301,7 @@ impl TmdbClient {
         tmdb_id: u64,
         season: u32,
     ) -> Result<Vec<EpisodeAirDate>, reqwest::Error> {
-        let url = format!(
-            "https://api.themoviedb.org/3/tv/{}/season/{}",
-            tmdb_id, season
-        );
+        let url = format!("{}/tv/{}/season/{}", self.base_url, tmdb_id, season);
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
                 self.client
@@ -268,7 +314,7 @@ impl TmdbClient {
 
     /// Enumerate a series' (non-Specials) season numbers from TMDB `/tv/{id}` details.
     pub async fn show_season_numbers(&self, tmdb_id: u64) -> Result<Vec<u32>, reqwest::Error> {
-        let url = format!("https://api.themoviedb.org/3/tv/{}", tmdb_id);
+        let url = format!("{}/tv/{}", self.base_url, tmdb_id);
         let v = self
             .fetch_with_retry::<serde_json::Value>(|| {
                 self.client
@@ -587,6 +633,33 @@ pub(crate) fn parse_season_numbers(v: &serde_json::Value) -> Vec<u32> {
 mod tests {
     use super::*;
 
+    /// `track_search_failures` tells a failed search (here a `404`) from a genuine empty result, and
+    /// a search outside its scope (or in another task) is not counted.
+    #[tokio::test]
+    async fn track_search_failures_reports_a_failed_search_but_not_an_empty_result() {
+        use crate::trakt_client::test_http::{spawn, Reply};
+        let ok = spawn(vec![(
+            "/search/movie?api_key=k&query=Zzqx",
+            Reply::json(r#"{"results":[]}"#),
+        )])
+        .await;
+        let tmdb = TmdbClient::with_base_url("k".into(), ok.base_url.clone()).unwrap();
+        let (out, failed) = track_search_failures(tmdb.search_movie("Zzqx", None)).await;
+        assert!(matches!(out, SearchOutcome::Results(ref v) if v.is_empty()));
+        assert!(!failed, "an empty result is a genuine no-match");
+
+        let (out, failed) = track_search_failures(tmdb.search_tv("Zzqx", None)).await;
+        assert!(matches!(out, SearchOutcome::Unavailable));
+        assert!(failed, "an unanswered search is a failure");
+
+        // Outside a scope a failure is simply not tracked (and must not panic).
+        assert!(matches!(
+            tmdb.search_tv("Zzqx", None).await,
+            SearchOutcome::Unavailable
+        ));
+        assert_eq!(ok.hits("/search/movie"), 1);
+    }
+
     #[test]
     fn tmdb_response_drops_a_malformed_row_but_keeps_valid_results() {
         // One bad element (missing `id`, or a `vote_count` that isn't a non-negative int) must NOT
@@ -863,10 +936,10 @@ mod tests {
 
     #[test]
     fn parse_details_captures_spoken_languages() {
-        // Nightborn: TMDB's original_language is `fi` but the film is mostly English — the spoken
+        // A film whose TMDB original_language is `fi` but whose dialogue is mostly English — the spoken
         // languages list carries that, so `AUDIO_LANGUAGE=original` can accept an English release.
         let v = serde_json::json!({
-            "title": "Nightborn",
+            "title": "Film",
             "release_date": "2026-07-01",
             "original_language": "fi",
             "spoken_languages": [

@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 /// file list never resolving within `max_wait` — the leaked torrent is deleted before returning
 /// `Err` (so nothing leaks). The caller decides cached-vs-not by re-fetching final info.
 ///
+/// The instant-repair path, its only caller, passes `settle == max_wait`: a single poll, since the
+/// re-added hash is known-good and its metadata should already be there. The multi-poll loop is
+/// kept (and tested) for a caller adding a hash whose metadata may still be resolving.
+///
 /// `protect_id`: a torrent id that must NEVER be deleted by the failure cleanup. This guards the
 /// same-hash re-add on providers (TorBox) whose `add_magnet` recovers the EXISTING torrent by
 /// infohash and returns its **same** id — there the "added" torrent IS the real torrent under

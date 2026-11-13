@@ -476,6 +476,14 @@ impl TraktClient for TraktClientImpl {
             })
             .await?;
         let status = resp.status();
+        if status.is_server_error() {
+            // send_with_retry already retried the 5xx for its short (~3s) budget. A longer Trakt
+            // outage is still transient, not an expired code: return Err so `poll_to_completion`
+            // retries it on the poll cadence under its consecutive-error cap.
+            return Err(AppError::Upstream(format!(
+                "Trakt device-token poll returned {status}"
+            )));
+        }
         if status == reqwest::StatusCode::OK {
             // A 200 is the authorized response and MUST carry a token body. If the body fails to
             // read (a transient mid-stream blip), bubble the error so `poll_to_completion` retries
@@ -512,8 +520,10 @@ impl TraktClient for TraktClientImpl {
         // A persistent 429 (rate-limit) exhausted the retry budget and is returned raw here. It is a
         // throttle, NOT an auth failure — the grant was never processed, so the single-use refresh
         // token is untouched. Map it to `RateLimited` so `refresh_account` treats it as transient and
-        // does NOT flag `needs_reenrolment` (which would make background jobs skip a healthy account
-        // and never self-heal). A genuine `invalid_grant` still arrives as a 4xx via error_for_status.
+        // does NOT flag `needs_reenrolment`. That flag is only an accounts-page marker (background
+        // sync keeps syncing a flagged account and clears it on the next success), but a spurious one
+        // tells the operator to re-enrol an account that is fine. A genuine `invalid_grant` still
+        // arrives as a 4xx via error_for_status.
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(AppError::RateLimited);
         }
@@ -713,6 +723,8 @@ pub(crate) fn parse_user(v: &serde_json::Value) -> TraktUser {
 ///   429 Too Many Req  -> polling too fast; normally absorbed by the retry helper, mapped to
 ///                        Pending defensively so a stray 429 doesn't abort enrolment.
 /// Any other status is treated as terminal (Expired) so the caller's poll loop can't spin forever.
+/// A 5xx never reaches this from `TraktClientImpl::poll_token`, which returns it as a retryable
+/// `Err` instead.
 pub fn interpret_device_token(
     status: reqwest::StatusCode,
     body: &serde_json::Value,
@@ -1227,7 +1239,9 @@ mod tests {
             interpret_device_token(StatusCode::TOO_MANY_REQUESTS, &empty),
             DeviceTokenPoll::Pending
         );
-        // 500 → Expired: a 5xx surfacing here after exhausted retries is treated as terminal
+        // 500 → Expired: any unlisted status is terminal here. In practice `poll_token` returns a
+        // 5xx as a retryable Err before calling this (see
+        // poll_token_surfaces_a_persistent_5xx_as_an_error_not_expired).
         assert_eq!(
             interpret_device_token(StatusCode::INTERNAL_SERVER_ERROR, &empty),
             DeviceTokenPoll::Expired
@@ -1615,6 +1629,27 @@ mod tests {
             counter.load(std::sync::atomic::Ordering::SeqCst),
             5,
             "a persistent 5xx is retried for the full MAX_ATTEMPTS budget"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_token_surfaces_a_persistent_5xx_as_an_error_not_expired() {
+        // A Trakt 5xx outage that outlasts send_with_retry's ~3s budget during the device-flow poll
+        // must come back as Err, so poll_to_completion's bounded consecutive-error path retries it on
+        // the poll cadence. Mapping it to Expired would end the enrolment with a misleading
+        // "device code expired" while the code is still valid.
+        let (url, counter) = spawn_status_repeating(503).await;
+        let client = TraktClientImpl::new("cid".into(), "secret".into(), reqwest::Client::new())
+            .with_base_url(url);
+        let got = client.poll_token("dc").await;
+        assert!(
+            matches!(got, Err(AppError::Upstream(_))),
+            "a persistent 5xx on the device poll must be a retryable error, got {got:?}"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "the poll is idempotent, so the 5xx is first retried for the full MAX_ATTEMPTS budget"
         );
     }
 

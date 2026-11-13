@@ -1,9 +1,10 @@
 //! SP3 upgrade engine. A slow periodic job (gated on `UPGRADE_INTERVAL_SECS`, default daily) that
 //! re-scores owned titles and stages meaningfully-better CACHED releases — and full-season cached
-//! packs (Task 10) — swapping the persisted `selection` and pruning the superseded torrent only
-//! once the slot is idle (proxy read-activity). Upgrades are non-destructive: a failed stage never
-//! degrades the working release.
+//! packs — swapping the persisted `selection` and pruning the superseded torrent only while no
+//! player is reading a copy the swap changes (proxy read-activity, [`being_read`]). Upgrades are
+//! non-destructive: a failed stage never degrades the working release.
 
+use crate::acquire::TitleCheck;
 use crate::app_state::AppState;
 use crate::now_unix_secs as now_secs;
 use crate::release::{self, QualitySummary};
@@ -16,10 +17,11 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// Why an upgrade/consolidation attempt made no change. The distinction matters for the round-robin
-/// cursor: a `Deferred` title was NOT actually evaluated (the library went active mid-stage, or the
-/// provider/scraper was momentarily unavailable) and must be reconsidered next tick — its cursor is
-/// left UNSTAMPED. A `NoChange` title WAS evaluated to completion (no meaningful upgrade exists, or
-/// the chosen candidate didn't pan out) and its cursor is stamped so the budget rotates onward.
+/// cursor: a `Deferred` title was NOT actually evaluated (a player was reading a copy it would
+/// change, or the provider/scraper/TMDB was momentarily unavailable) and must be reconsidered next
+/// tick — its cursor is left UNSTAMPED. A `NoChange` title WAS evaluated to completion (no
+/// meaningful upgrade exists, or the chosen candidate didn't pan out) and its cursor is stamped so
+/// the budget rotates onward.
 #[derive(Debug)]
 enum UpgradeSkip {
     Deferred(String),
@@ -27,7 +29,8 @@ enum UpgradeSkip {
 }
 
 /// Run one upgrade tick over `app`: re-score a budgeted batch of owned titles. For MOVIES, stage any
-/// cached meaningful upgrade and — if the library is idle — swap selection + prune the old torrent.
+/// cached meaningful upgrade and — unless a player is reading a copy the swap changes — swap
+/// selection + prune the old torrent.
 /// For SHOWS, four layered passes: per-singleton-episode upgrade/downgrade, upgrade of episodes
 /// served from a within-ceiling multi-episode pack, over-ceiling season-pack correction, then
 /// full-season consolidation of scattered per-episode torrents into a cached pack.
@@ -866,11 +869,12 @@ fn ordering_prefs(
 /// on the raw prefs AND, again, with the candidate scored under the title's [`ordering_prefs`]
 /// (`req`) — so a release acquisition would rank below the owned copy (a wrong-language penalty) is
 /// never a candidate; against an unknown-quality (or uncached) owned copy, whose comparison ignores
-/// scores, a release carrying that penalty ([`release::wrong_audio_language`]) is dropped outright.
-/// The improving candidates are then ordered by that score, so a wrong-language release is tried
-/// after a correctly-tagged one. The
-/// caller stages them in order until one is adopted (in-tick fall-through), so a top candidate that
-/// fails a candidate-specific gate no longer ends the tick. The list is direction-homogeneous (all
+/// scores, and for a corrective downgrade, whose ceiling penalty swamps the language one, a release
+/// carrying that penalty ([`release::wrong_audio_language`]) is dropped outright. The improving
+/// candidates are then ordered by that score, so a wrong-language release is tried after a
+/// correctly-tagged one. The caller stages them in order until one is adopted (in-tick
+/// fall-through), so a top candidate that fails a candidate-specific gate no longer ends the tick.
+/// The list is direction-homogeneous (all
 /// `Upgrade` or all `Downgrade`) because `is_target_improvement` only rates a lower-resolution
 /// candidate as improving when the owned copy is over the ceiling.
 async fn rank_changes(
@@ -931,19 +935,24 @@ async fn rank_changes(
         }
         // …but against an owned copy of UNKNOWN quality (or an uncached one) `is_target_improvement`
         // ignores scores — any known cached candidate improves it — so the test above can't see the
-        // penalty. Drop a wrong-language release explicitly there: it never replaces the user's
-        // copy, which may well be in the right language.
-        if score_blind && release::wrong_audio_language(&r, &order) {
+        // penalty. Nor can it for a corrective downgrade: the ceiling penalty on the over-ceiling
+        // owned copy (`effective_score`) dwarfs the language penalty. Drop a wrong-language release
+        // explicitly in both cases: it never replaces the user's copy, which may well be in the
+        // right language.
+        if (score_blind || imp == release::Improvement::Downgrade)
+            && release::wrong_audio_language(&r, &order)
+        {
             continue;
         }
         scored.push((order_score, r, imp));
     }
-    scored.sort_by_key(|(score, ..)| std::cmp::Reverse(*score)); // best first (stable for ties)
-                                                                 // Dedup by info_hash: Torrentio can return the same infohash under multiple stream entries
-                                                                 // (different source/title strings, sometimes scored differently). Without this, a duplicate
-                                                                 // whose first entry fails and is blacklisted would still be tried again from its second entry —
-                                                                 // re-adding, re-probing and re-blacklisting the SAME torrent (stage_and_verify does NOT re-check
-                                                                 // the blacklist). Keep the best-scored entry (the first after the reverse-score sort).
+    // Best first (stable for ties).
+    scored.sort_by_key(|(score, ..)| std::cmp::Reverse(*score));
+    // Dedup by info_hash: Torrentio can return the same infohash under multiple stream entries
+    // (different source/title strings, sometimes scored differently). Without this, a duplicate
+    // whose first entry fails and is blacklisted would still be tried again from its second entry —
+    // re-adding, re-probing and re-blacklisting the SAME torrent (stage_and_verify does NOT re-check
+    // the blacklist). Keep the best-scored entry (the first after the reverse-score sort).
     let mut seen = std::collections::HashSet::new();
     scored
         .into_iter()
@@ -1251,7 +1260,7 @@ async fn stage_and_verify(
         .next()
         .unwrap_or(&selected_path)
         .to_string();
-    // Movie-pack guard (I-2): a candidate that materialises into more than one feature-sized
+    // Movie-pack guard: a candidate that materialises into more than one feature-sized
     // video is a multi-movie pack (providers like TorBox auto-select all files) — never adopt it.
     // Run BEFORE title-validation to save a TMDB lookup on a pack that would be rejected anyway.
     if crate::acquire::count_feature_videos(&fresh) > 1 {
@@ -1268,26 +1277,36 @@ async fn stage_and_verify(
             .await;
         return Err(UpgradeSkip::NoChange("multi-feature pack".into()));
     }
-    // Title validation (the engine exposes `validate_title` — see below).
-    if !app
+    // Title validation: a mismatch is blacklisted; no verdict (TMDB unreachable) is not held
+    // against the release — the title is retried on a later tick.
+    match app
         .engine
         .validate_title(&file_name, tmdb_id, MediaKind::Movie, None, None)
         .await
     {
-        let _ = app.provider.delete_torrent(&added.id).await;
-        let _ = app
-            .store
-            .blacklist_add(
-                MediaKind::Movie,
-                tmdb_id,
-                hash.clone(),
-                "WrongTitle",
-                now_secs(),
-            )
-            .await;
-        return Err(UpgradeSkip::NoChange("title mismatch".into()));
+        TitleCheck::Match => {}
+        TitleCheck::Mismatch => {
+            let _ = app.provider.delete_torrent(&added.id).await;
+            let _ = app
+                .store
+                .blacklist_add(
+                    MediaKind::Movie,
+                    tmdb_id,
+                    hash.clone(),
+                    "WrongTitle",
+                    now_secs(),
+                )
+                .await;
+            return Err(UpgradeSkip::NoChange("title mismatch".into()));
+        }
+        TitleCheck::Unavailable => {
+            let _ = app.provider.delete_torrent(&added.id).await;
+            return Err(UpgradeSkip::Deferred(
+                "title check unavailable (TMDB unreachable)".into(),
+            ));
+        }
     }
-    // Probe gate (I-1): run the SAME audio/subtitle probe as acquisition before adopting. A
+    // Probe gate: run the SAME audio/subtitle probe as acquisition before adopting. A
     // wrong-language/corrupt release is blacklisted + dropped; a transient probe failure is
     // dropped without blacklisting (retried next tick) so we never degrade the working release.
     // Unlike acquisition, an upgrade adopts ONLY a `Pass`: an `Accept` (tracks couldn't be checked —
@@ -1316,50 +1335,70 @@ async fn stage_and_verify(
             return Err(UpgradeSkip::Deferred("probe deferred".into()));
         }
     }
-    // Record Verified with sticky provenance from the owned record we are upgrading. DEFER (don't
-    // return Ok) if either record write fails: the caller repoints the selection + prunes the
-    // superseded copy on Ok, so returning Ok with an unrecorded staged copy would prune against a
-    // replacement that has no owned record (stranding it as an empty-provenance mirror). The staged
-    // torrent is left for the account-mirror/dedup pass to reclaim; a later tick re-stages.
-    // Sticky provenance = the merge across the title's current owned copies, computed ONCE by the
-    // caller from records already in hand (no full owned-table re-scan) — see `merged_provenance`.
-    if app
-        .store
-        .put_owned(
-            hash.clone(),
-            OwnedRecord {
-                request: base_req.clone(),
-                provenance: prov.clone(),
-                added_at: now_secs(),
-                status: OwnedStatus::Verified,
-                provides: vec![],
-                quality: Some(QualitySummary::of(cand, &app.config.acquisition.prefs)),
-            },
-        )
-        .await
-        .is_err()
-    {
-        return Err(UpgradeSkip::Deferred(
-            "staged owned-record write failed; deferring swap+prune".into(),
-        ));
-    }
-    if app
-        .store
-        .put_authoritative(hash.clone(), base_req.metadata.clone())
-        .await
-        .is_err()
-    {
-        return Err(UpgradeSkip::Deferred(
-            "staged authoritative write failed; deferring swap+prune".into(),
-        ));
-    }
+    // Record Verified with sticky provenance from the owned record we are upgrading; on a failed
+    // write the candidate is rolled back and the title deferred ([`record_staged`]). Sticky
+    // provenance = the merge across the title's current owned copies, computed ONCE by the caller
+    // from records already in hand (no full owned-table re-scan) — see `merged_provenance`.
+    record_staged(
+        app,
+        &hash,
+        &added.id,
+        OwnedRecord {
+            request: base_req.clone(),
+            provenance: prov.clone(),
+            added_at: now_secs(),
+            status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: Some(QualitySummary::of(cand, &app.config.acquisition.prefs)),
+        },
+    )
+    .await
+    .map_err(UpgradeSkip::Deferred)?;
     Ok((hash, added.id, selected_path))
+}
+
+/// Record a staged, verified candidate (`hash`, added as `torrent_id`) as owned + authoritative — the
+/// last step of every staging site before its swap. If either write fails, the candidate is rolled
+/// back (its owned record dropped, best effort, and its torrent deleted by the id the add returned)
+/// and the caller defers: pruning against a replacement with no owned record would strand it as an
+/// empty-provenance mirror copy, and a staged torrent left in the account could never be staged
+/// again ([`add_staging_candidate`] refuses a hash already there), so it is deleted for a later tick
+/// to stage afresh.
+async fn record_staged(
+    app: &AppState,
+    hash: &str,
+    torrent_id: &str,
+    rec: OwnedRecord,
+) -> Result<(), String> {
+    let metadata = rec.request.metadata.clone();
+    let failed = if app.store.put_owned(hash.to_string(), rec).await.is_err() {
+        Some("owned-record")
+    } else if app
+        .store
+        .put_authoritative(hash.to_string(), metadata)
+        .await
+        .is_err()
+    {
+        let _ = app.store.remove_owned(hash.to_string()).await;
+        Some("authoritative")
+    } else {
+        None
+    };
+    match failed {
+        None => Ok(()),
+        Some(what) => {
+            let _ = app.provider.delete_torrent(torrent_id).await;
+            Err(format!(
+                "staged {what} write failed; dropped the staged candidate"
+            ))
+        }
+    }
 }
 
 /// Add `hash` to stage it as an upgrade candidate — unless its torrent is ALREADY in the provider
 /// account, in which case it is never staged (`NoChange`). The ONE add path of every upgrade staging
-/// site (movie [`stage_and_verify`], per-episode + pack correction via [`stage_and_await_cached`],
-/// and consolidation), so the guard covers them all. Every site deletes the staged torrent by the id
+/// site (movie [`stage_and_verify`]; per-episode, pack correction and consolidation via
+/// [`stage_and_await_cached`]), so the guard covers them all. Every site deletes the staged torrent by the id
 /// the add returned when it rejects the candidate (not cached, wrong title, probe reject or
 /// unverifiable `Accept`, …) or rolls back; on TorBox an add of an infohash already in the account
 /// returns the EXISTING torrent's id, and the rankers exclude only the title's own owned hashes — so
@@ -1524,15 +1563,16 @@ fn season_has_scatter(owned: &[(String, OwnedRecord)], season: u32) -> bool {
         >= 2
 }
 
-/// Rank scraped consolidation candidates: keep only the CACHED, in-ceiling (score-passing) packs not
-/// already owned (and not a known-unverifiable container — [`known_unverifiable`]), sorted
-/// best-`score`-first under `prefs` — which callers pass as the title's [`ordering_prefs`], so a
-/// wrong-language pack is tried after a correctly-tagged one (the hard filters don't depend on
-/// audio; callers still judge each pack's quality on the raw prefs). So consolidation adopts the
-/// BEST pack — consistent with
-/// the movie upgrade path's max-by-score ranking — instead of the first acceptable one in raw scraper
-/// order (which, once adopted, the `already_pack` short-circuit would strand the season on). The
-/// async blacklist filter is applied by the caller (it can't be pure). Pure → unit-testable.
+/// Rank scraped consolidation / pack-correction candidates: keep only the CACHED, in-ceiling
+/// (score-passing) packs not already owned (and not a known-unverifiable container —
+/// [`known_unverifiable`]), sorted best-`score`-first under `prefs` — which callers pass as the
+/// title's [`ordering_prefs`]. A pack carrying the wrong-language penalty under those prefs
+/// ([`release::wrong_audio_language`]) is dropped: both callers judge a pack on tier and resolution
+/// only (raw prefs), so it could replace correct-language copies, and untagged audio tracks would
+/// let it pass the probe. So consolidation adopts the BEST pack — consistent with the movie upgrade
+/// path's max-by-score ranking — instead of the first acceptable one in raw scraper order (which,
+/// once adopted, the `already_pack` short-circuit would strand the season on). The async blacklist
+/// filter is applied by the caller (it can't be pure). Pure → unit-testable.
 fn rank_cached_pack_candidates(
     raws: &[crate::release::RawCandidate],
     prefs: &crate::config::QualityPrefs,
@@ -1543,6 +1583,7 @@ fn rank_cached_pack_candidates(
         .map(release::parse)
         .filter(|r| r.cached)
         .filter(|r| !known_unverifiable(r))
+        .filter(|r| !release::wrong_audio_language(r, prefs))
         .filter(|r| {
             !owned_hashes
                 .iter()
@@ -1550,9 +1591,10 @@ fn rank_cached_pack_candidates(
         })
         .filter_map(|r| release::score(&r, prefs).map(|s| (r, s)))
         .collect();
-    scored.sort_by_key(|(_, s)| std::cmp::Reverse(*s)); // best score first
-                                                        // Dedup by info_hash (same rationale as rank_changes): a duplicated pack whose first entry
-                                                        // fails would otherwise be re-added/re-probed/re-blacklisted from its second entry.
+    // Best score first.
+    scored.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+    // Dedup by info_hash (same rationale as rank_changes): a duplicated pack whose first entry
+    // fails would otherwise be re-added/re-probed/re-blacklisted from its second entry.
     let mut seen = std::collections::HashSet::new();
     scored
         .into_iter()
@@ -1561,13 +1603,13 @@ fn rank_cached_pack_candidates(
         .collect()
 }
 
-// ── per-episode upgrade/downgrade + over-ceiling pack correction (Task 5) ─────────────────────
+// ── per-episode upgrade/downgrade + over-ceiling pack correction ──────────────────────────────
 
-/// Add `hash`, select its video files, and poll for the cached verdict. Shared staging tail for
-/// `stage_episode_candidate` and `correct_over_ceiling_packs` (episode vs pack staging differ only
-/// in what they do with the resolved `TorrentInfo` afterwards — this covers exactly the add/select/
-/// poll/cached-gate steps common to both). On any failure the staged torrent is deleted so nothing
-/// leaks; returns the torrent id + the post-selection `TorrentInfo` on success.
+/// Add `hash`, select its video files, and poll for the cached verdict. Shared staging head for
+/// `stage_episode_candidate`, `correct_over_ceiling_packs` and consolidation (they differ only in
+/// what they do with the resolved `TorrentInfo` afterwards — this covers exactly the add/select/
+/// poll/cached-gate steps common to all three). On any failure the staged torrent is deleted so
+/// nothing leaks; returns the torrent id + the post-selection `TorrentInfo` on success.
 async fn stage_and_await_cached(
     app: &AppState,
     hash: &str,
@@ -1668,7 +1710,7 @@ async fn stage_episode_candidate(
         .next()
         .unwrap_or(&file_path)
         .to_string();
-    if !app
+    match app
         .engine
         .validate_title(
             &fname,
@@ -1679,18 +1721,28 @@ async fn stage_episode_candidate(
         )
         .await
     {
-        let _ = app.provider.delete_torrent(&torrent_id).await;
-        let _ = app
-            .store
-            .blacklist_add(
-                MediaKind::Series,
-                tmdb_id,
-                hash.clone(),
-                "WrongTitle",
-                now_secs(),
-            )
-            .await;
-        return Err(UpgradeSkip::NoChange("title mismatch".into()));
+        TitleCheck::Match => {}
+        TitleCheck::Mismatch => {
+            let _ = app.provider.delete_torrent(&torrent_id).await;
+            let _ = app
+                .store
+                .blacklist_add(
+                    MediaKind::Series,
+                    tmdb_id,
+                    hash.clone(),
+                    "WrongTitle",
+                    now_secs(),
+                )
+                .await;
+            return Err(UpgradeSkip::NoChange("title mismatch".into()));
+        }
+        // No verdict (TMDB unreachable): not blacklisted; the episode is retried on a later visit.
+        TitleCheck::Unavailable => {
+            let _ = app.provider.delete_torrent(&torrent_id).await;
+            return Err(UpgradeSkip::Deferred(
+                "title check unavailable (TMDB unreachable)".into(),
+            ));
+        }
     }
     let probe_req = crate::store::AcquireRequest {
         season: Some(season),
@@ -1722,25 +1774,21 @@ async fn stage_episode_candidate(
             return Err(UpgradeSkip::Deferred("probe deferred".into()));
         }
     }
-    let prov = group_prov.clone();
-    let _ = app
-        .store
-        .put_owned(
-            hash.clone(),
-            OwnedRecord {
-                request: base_req.clone(),
-                provenance: prov,
-                added_at: now_secs(),
-                status: OwnedStatus::Verified,
-                provides: vec![(season, episode)],
-                quality: Some(QualitySummary::of(cand, &app.config.acquisition.prefs)),
-            },
-        )
-        .await;
-    let _ = app
-        .store
-        .put_authoritative(hash.clone(), base_req.metadata.clone())
-        .await;
+    record_staged(
+        app,
+        &hash,
+        &torrent_id,
+        OwnedRecord {
+            request: base_req.clone(),
+            provenance: group_prov.clone(),
+            added_at: now_secs(),
+            status: OwnedStatus::Verified,
+            provides: vec![(season, episode)],
+            quality: Some(QualitySummary::of(cand, &app.config.acquisition.prefs)),
+        },
+    )
+    .await
+    .map_err(UpgradeSkip::Deferred)?;
     Ok((hash, torrent_id, file_path))
 }
 
@@ -1776,7 +1824,7 @@ fn pack_prunable_after_repoint(
 
 /// Pure: may phase (a2) move a slot served by a multi-episode pack of quality `pack` to `cand`? On
 /// top of `is_target_improvement` (which `rank_changes` already applied — a strict score gain with a
-/// higher resolution, or a higher tier at the same resolution, or Task 4's unverified rule), the
+/// higher resolution, or a higher tier at the same resolution, or the unverified-copy rule), the
 /// candidate must be no regression vs the pack on EITHER axis: source tier AND resolution at least
 /// the pack's — the per-axis test [`consolidation_target`] applies. So (a2) never splits a pack into
 /// singles below it on either axis (e.g. a 720p BluRay pack is not split into 1080p WEB singles).
@@ -1908,8 +1956,9 @@ enum EpisodeUpgrade {
     /// Nothing was adopted for this episode (candidates exhausted, a gated-off downgrade, or a
     /// transient glitch on this episode) — move on to the next episode.
     Unchanged,
-    /// The library went active, or a post-stage `apply_upgrade` step deferred (it already rolled the
-    /// staged copy back): stop ALL further show work this tick and signal deferral.
+    /// A player is reading a copy the swap changes, or a post-stage `apply_upgrade` step deferred
+    /// (it already rolled the staged copy back): stop ALL further show work this tick and signal
+    /// deferral.
     Deferred,
 }
 
@@ -1928,6 +1977,9 @@ async fn upgrade_episode_slot(
     idle_window: Duration,
     tick: &mut EpisodeTick,
 ) -> EpisodeUpgrade {
+    if ranked.is_empty() {
+        return EpisodeUpgrade::Unchanged;
+    }
     let EpisodeTarget {
         req,
         season,
@@ -2031,9 +2083,11 @@ async fn upgrade_episode_slot(
 
 /// Replace an owned season pack that is now ABOVE the ceiling (e.g. acquired before the ceiling was
 /// lowered, or mirrored from a pre-existing library) with a within-ceiling cached pack that covers
-/// the SAME episodes, repointing every covered episode slot and pruning the old pack. Gated as a
-/// downgrade (`ALLOW_RESOLUTION_DOWNGRADE`). Keeps the old pack when no conforming replacement
-/// exists — a sole over-ceiling copy is never deleted with nothing to replace it.
+/// the SAME episodes, repointing the episode slots the old pack served (a slot serving another
+/// copy keeps it) and pruning the old pack. Gated as a downgrade (`ALLOW_RESOLUTION_DOWNGRADE`).
+/// Keeps the old pack when no conforming replacement exists — a sole over-ceiling copy is never
+/// deleted with nothing to replace it — and never adopts a replacement carrying the title's
+/// wrong-language penalty ([`rank_cached_pack_candidates`]).
 ///
 /// `exclude_hashes` are never staged as a replacement: every hash the show owns NOW (not just in the
 /// tick-start `owned` snapshot) — a single adopted earlier this tick is listed under the season's
@@ -2041,10 +2095,11 @@ async fn upgrade_episode_slot(
 /// torrent id, so the coverage-miss cleanup below would delete the adopted torrent out from under its
 /// record and selection.
 ///
-/// Returns `true` if it DEFERRED mid-tick — a player is reading the pack ([`being_read`]) OR a
-/// post-stage `apply_upgrade` step failed (a provider-listing fetch or a `put_selection`
-/// write) — so the caller can leave the round-robin cursor unstamped and reconsider next tick;
-/// `false` on normal completion (whether or not a correction was applied).
+/// Returns `true` if it DEFERRED mid-tick — a player is reading the pack ([`being_read`]), the
+/// replacement's title check had no verdict (TMDB unreachable) or its record write failed, OR a
+/// post-stage `apply_upgrade` step failed (a provider-listing fetch or a `put_selection` write) —
+/// so the caller can leave the round-robin cursor unstamped and reconsider next tick; `false` on
+/// normal completion (whether or not a correction was applied).
 async fn correct_over_ceiling_packs(
     app: &AppState,
     tmdb_id: u64,
@@ -2076,11 +2131,9 @@ async fn correct_over_ceiling_packs(
         if rec.provides.iter().any(|(s, _)| *s != season) {
             continue; // single-season packs only
         }
+        // The exact episode set the OLD over-ceiling pack supplied: the replacement must cover all of
+        // these, and only their slots are candidates for a repoint (see `slot_files` below).
         let need: Vec<u32> = rec.provides.iter().map(|(_, e)| *e).collect();
-        // The exact episode set the OLD over-ceiling pack supplied. The replacement must cover all of
-        // these, but we only repoint/claim THESE — never the extra episodes a bigger replacement pack
-        // happens to also contain (an extra episode may have a better within-ceiling singleton whose
-        // slot must not be dragged down to this pack; see the `provides`/`slot_files` filters below).
         let need_set: std::collections::HashSet<u32> = need.iter().copied().collect();
         let copies = copies_serving(app, MediaKind::Series, tmdb_id, Some(&rec.provides)).await;
 
@@ -2126,23 +2179,31 @@ async fn correct_over_ceiling_packs(
                 continue;
             };
             let fname = rpath.rsplit('/').next().unwrap_or(rpath).to_string();
-            if !app
+            match app
                 .engine
                 .validate_title(&fname, tmdb_id, MediaKind::Series, Some(*rs), Some(*re))
                 .await
             {
-                let _ = app.provider.delete_torrent(&torrent_id).await;
-                let _ = app
-                    .store
-                    .blacklist_add(
-                        MediaKind::Series,
-                        tmdb_id,
-                        cand.info_hash.clone(),
-                        "WrongTitle",
-                        now_secs(),
-                    )
-                    .await;
-                continue;
+                TitleCheck::Match => {}
+                TitleCheck::Mismatch => {
+                    let _ = app.provider.delete_torrent(&torrent_id).await;
+                    let _ = app
+                        .store
+                        .blacklist_add(
+                            MediaKind::Series,
+                            tmdb_id,
+                            cand.info_hash.clone(),
+                            "WrongTitle",
+                            now_secs(),
+                        )
+                        .await;
+                    continue;
+                }
+                // No verdict (TMDB unreachable): not blacklisted; defer the pack to a later tick.
+                TitleCheck::Unavailable => {
+                    let _ = app.provider.delete_torrent(&torrent_id).await;
+                    return true;
+                }
             }
             let probe_req = crate::store::AcquireRequest {
                 imdb_id: imdb_id.to_string(),
@@ -2185,42 +2246,49 @@ async fn correct_over_ceiling_packs(
                     continue;
                 }
             }
-            let prov = group_prov.clone();
             let base_req = crate::store::AcquireRequest {
                 imdb_id: imdb_id.to_string(),
                 ..rec.request.clone()
             };
-            // Claim/repoint ONLY the old pack's episodes (`need_set`), not every episode this
-            // replacement pack contains — so an extra episode with a better within-ceiling singleton
-            // keeps its own (better) selection and isn't silently downgraded onto this pack.
-            let provides: Vec<(u32, u32)> = eps
-                .iter()
-                .filter(|(s, e, _)| *s == season && need_set.contains(e))
-                .map(|(s, e, _)| (*s, *e))
-                .collect();
-            let _ = app
-                .store
-                .put_owned(
-                    cand.info_hash.clone(),
-                    OwnedRecord {
-                        request: base_req.clone(),
-                        provenance: prov,
-                        added_at: now_secs(),
-                        status: OwnedStatus::Verified,
-                        provides,
-                        quality: Some(cand_q.clone()),
-                    },
-                )
-                .await;
-            let _ = app
-                .store
-                .put_authoritative(cand.info_hash.clone(), base_req.metadata.clone())
-                .await;
-            let slot_files: Vec<(String, String)> = eps
-                .iter()
-                .filter(|(s, e, _)| *s == season && need_set.contains(e))
-                .map(|(s, e, p)| (crate::store::episode_slot(tmdb_id, *s, *e), p.clone()))
-                .collect();
+            // `provides` is every episode the replacement holds (it is single-season, checked
+            // above), extras included: `provides` never moves a slot, and leaving an extra out would
+            // make `monitor_episodes` treat it as unowned and acquire a duplicate single.
+            let mut provides: Vec<(u32, u32)> = eps.iter().map(|(s, e, _)| (*s, *e)).collect();
+            provides.sort_unstable();
+            provides.dedup();
+            if record_staged(
+                app,
+                &cand.info_hash,
+                &torrent_id,
+                OwnedRecord {
+                    request: base_req,
+                    provenance: group_prov.clone(),
+                    added_at: now_secs(),
+                    status: OwnedStatus::Verified,
+                    provides,
+                    quality: Some(cand_q.clone()),
+                },
+            )
+            .await
+            .is_err()
+            {
+                return true; // rolled back; reconsider the pack next tick
+            }
+            // Repoint only the old pack's episodes whose slot it serves (or that have none) — a slot
+            // already serving another owned copy (e.g. a better single adopted by phase (a)) keeps
+            // it; the old pack's prune doesn't touch that copy.
+            let mut slot_files: Vec<(String, String)> = Vec::new();
+            for (s, e, p) in eps.iter().filter(|(_, e, _)| need_set.contains(e)) {
+                let slot = crate::store::episode_slot(tmdb_id, *s, *e);
+                let served_elsewhere = app
+                    .store
+                    .get_selection(slot.clone())
+                    .await
+                    .is_some_and(|sel| !sel.hash.eq_ignore_ascii_case(pack_hash));
+                if !served_elsewhere {
+                    slot_files.push((slot, p.clone()));
+                }
+            }
             match apply_upgrade(
                 app,
                 StagedUpgrade {
@@ -2252,19 +2320,18 @@ async fn correct_over_ceiling_packs(
 }
 
 /// The per-singleton-episode upgrade (a) + pack-served-episode upgrade (a2) +
-/// over-ceiling-pack-correction (b) body of `try_upgrade_show`,
-/// WITHOUT the TMDB-driven consolidation tail (c) — split out so it is unit-testable fully offline,
-/// mirroring the `try_consolidate_show` / `consolidate_show_seasons` split just below (consolidation's
-/// live TMDB aired-episode lookup is exercised by the live smoke, not unit tests; see that split's
-/// doc comment). Fire-and-forget per item: one episode/pack's per-candidate outcome
-/// (Deferred/NoChange/staged) never aborts the rest of the group — every branch already classifies +
-/// logs its own outcome.
+/// over-ceiling-pack-correction (b) body of `try_upgrade_show`, WITHOUT the TMDB-driven
+/// consolidation tail (c) — split out so it is unit-testable fully offline, mirroring the
+/// `try_consolidate_show` / `consolidate_show_seasons` split below. A per-candidate `NoChange`
+/// falls through to the next candidate, and a transient failure on one episode (a scrape, an add,
+/// a deferred probe) moves on to the next episode; but a DEFERRAL — a player reading a copy one of
+/// its swaps would change ([`being_read`], in the per-episode loops or in
+/// `correct_over_ceiling_packs`), or a post-stage `apply_upgrade` step failing (a provider-listing
+/// fetch or a `put_selection` write) — stops all further show work this tick.
 ///
-/// Returns `true` if it DEFERRED mid-tick — a player is reading a copy one of its swaps would change
-/// ([`being_read`], in the per-episode loops or in `correct_over_ceiling_packs`) OR a post-stage
-/// `apply_upgrade` step failed (a provider-listing fetch or a `put_selection` write). The caller uses this to signal
-/// `Deferred` so the round-robin cursor is NOT stamped and the skipped work is reconsidered next
-/// tick (rather than waiting a full cursor wrap). `false` on normal completion.
+/// Returns `true` on such a deferral. The caller then signals `Deferred` so the round-robin cursor is
+/// NOT stamped and the skipped work is reconsidered next tick (rather than waiting a full cursor
+/// wrap). `false` on normal completion.
 async fn upgrade_show_episodes_and_packs(
     app: &AppState,
     tmdb_id: u64,
@@ -2320,9 +2387,10 @@ async fn upgrade_show_episodes_and_packs(
         }
         // The swap repoints the episode slot, so judge candidates against what the slot SERVES too:
         // when it points at another owned copy of this show (e.g. a better pack that also provides
-        // the episode), the baseline is the better of the two (`best_owned_quality`: known before
-        // unknown, then effective score). Otherwise a candidate that beats only this singleton — any
-        // known one, when the singleton is unknown — would move the slot off a better pack.
+        // the episode, or a copy adopted for it earlier this tick from a duplicate singleton), the
+        // baseline is the better of the two (`best_owned_quality`: known before unknown, then
+        // effective score). Otherwise a candidate that beats only this singleton — any known one,
+        // when the singleton is unknown — would move the slot off a better copy.
         let served_other = app
             .store
             .get_selection(crate::store::episode_slot(tmdb_id, season, episode))
@@ -2331,6 +2399,7 @@ async fn upgrade_show_episodes_and_packs(
             .and_then(|sel| {
                 group_hashes
                     .iter()
+                    .chain(tick.adopted.iter())
                     .find(|h| h.eq_ignore_ascii_case(&sel.hash))
                     .cloned()
             });
@@ -2515,18 +2584,16 @@ async fn upgrade_show_episodes_and_packs(
 
 /// Show dispatch target for `run_upgrade_once`: per-episode upgrade/downgrade (singletons, then
 /// episodes served from a within-ceiling pack) + over-ceiling pack correction
-/// (`upgrade_show_episodes_and_packs`), then full-season consolidation (unchanged —
-/// `try_consolidate_show` still runs every tick exactly as before this task, so its existing
-/// behaviour/tests are preserved).
+/// (`upgrade_show_episodes_and_packs`), then full-season consolidation (`try_consolidate_show`).
 ///
-/// If the per-episode/pack phase deferred mid-tick (library became active), return `Deferred`
-/// REGARDLESS of consolidation's own result, so `run_upgrade_once` leaves the round-robin cursor
-/// unstamped and the skipped episodes/pack-correction are reconsidered next tick rather than
-/// waiting a full cursor wrap (a `NoChange`/`Ok` from a scatter-free consolidation would otherwise
-/// stamp it). When the phase did NOT defer, propagate consolidation's own `Result`. Consolidation is
-/// SKIPPED (its live TMDB + per-season scrapes would be wasted) when the phase deferred AND the
-/// library is still active — since consolidation's own idle gate would discard the work anyway; a
-/// defer with an idle library (e.g. a transient listing failure) still lets consolidation run.
+/// If the per-episode/pack phase deferred mid-tick, return `Deferred` REGARDLESS of consolidation's
+/// own result, so `run_upgrade_once` leaves the round-robin cursor unstamped and the skipped
+/// episodes/pack-correction are reconsidered next tick rather than waiting a full cursor wrap (a
+/// `NoChange`/`Ok` from a scatter-free consolidation would otherwise stamp it). When the phase did
+/// NOT defer, propagate consolidation's own `Result`. Consolidation is SKIPPED (its TMDB +
+/// per-season scrapes would be wasted) when the phase deferred AND a copy of the show is still being
+/// read — consolidation's own read check would discard the work anyway; a defer for another reason
+/// (e.g. a transient listing failure) still lets consolidation run.
 async fn try_upgrade_show(
     app: &AppState,
     tmdb_id: u64,
@@ -2611,6 +2678,16 @@ async fn try_consolidate_show(
             "no imdb id; cannot scrape for consolidation".into(),
         ));
     }
+    // Only a season held as scattered single-episode records (≥2 records) can be consolidated
+    // (`consolidate_show_seasons` checks the same), so a show held as packs alone — most of them —
+    // skips the aired-episode lookup (one TMDB request per season) altogether.
+    let scattered = owned
+        .iter()
+        .filter(|(_, r)| r.provides.len() == 1)
+        .any(|(_, r)| season_has_scatter(&owned, r.provides[0].0));
+    if !scattered {
+        return Ok(());
+    }
     let today = chrono::Utc::now().date_naive();
     // Per-season completeness is enough here: a season only ever proceeds below when its
     // `season_aired` is non-empty, which means that season's air-date lookup succeeded — so
@@ -2659,8 +2736,8 @@ async fn consolidate_show_seasons(
         ));
     }
 
-    // Fix B: hoist provenance merge outside the per-season loop. Merged from the `owned` records
-    // already in hand (no `owned`-table re-scan) — see `merged_provenance`.
+    // The group's sticky provenance, merged ONCE from the `owned` records already in hand (no
+    // `owned`-table re-scan) — see `merged_provenance`.
     let prov = merged_provenance(owned);
     // Fetch the per-title blacklist ONCE and test membership in memory (mirrors `rank_changes`),
     // rather than one awaited redb read per ranked candidate across every season.
@@ -2762,57 +2839,20 @@ async fn consolidate_show_seasons(
                 ));
             }
 
-            // Stage: add + resolve + SE-map files. A pack already in the provider account is never
-            // staged (see `add_staging_candidate`); it and a failed add both move on to the next pack.
-            let Ok(added) = add_staging_candidate(app, &r.info_hash).await else {
+            // Stage: add + select all videos + poll for the cached verdict (never adopt an uncached
+            // pack: we never speculatively download a consolidation). A pack already in the provider
+            // account is never staged (see `add_staging_candidate`); it, a failed add and an
+            // uncached pack all move on to the next pack (the helper deletes what it added).
+            let Ok((torrent_id, fresh)) = stage_and_await_cached(app, &r.info_hash).await else {
                 continue;
             };
-            let Ok(info) = staged_torrent_info(app.provider.as_ref(), &added.id).await else {
-                let _ = app.provider.delete_torrent(&added.id).await;
-                continue;
-            };
-            // Select all videos so the pack is fully available. RD reports a cached torrent as
-            // `downloaded` only AFTER selection, so the cached gate must come after select + poll
-            // (gating on `info.status` here would reject every cached pack on RD).
-            let ids: Vec<u32> = info
-                .files
-                .iter()
-                .filter(|f| crate::vfs::is_video_file(&f.path))
-                .map(|f| f.id)
-                .collect();
-            if !ids.is_empty() {
-                if let Err(e) = app
-                    .provider
-                    .select_files(
-                        &added.id,
-                        &ids.iter()
-                            .map(|i| i.to_string())
-                            .collect::<Vec<_>>()
-                            .join(","),
-                    )
-                    .await
-                {
-                    warn!(
-                        "consolidate: select_files for staged pack {} failed: {}",
-                        r.info_hash, e
-                    );
-                }
-            }
-            // Poll for the cached verdict (RD lags select→downloaded by a moment), then gate: never
-            // adopt an uncached pack (we never speculatively download a consolidation).
-            let fresh = await_downloaded(app.provider.as_ref(), &added.id)
-                .await
-                .unwrap_or(info);
-            if fresh.status != "downloaded" {
-                let _ = app.provider.delete_torrent(&added.id).await;
-                continue;
-            }
-            let eps = crate::acquire::episode_files(&fresh); // (s,e,path) — pub(crate) from Task 6
-                                                             // Fix A: consolidation adopts a single-season pack only. A multi-season ("complete series") pack
-                                                             // would leave its other seasons recorded-as-owned but un-repointed/un-pruned — reject it so
-                                                             // provides/selection/prune stay consistent for the target season.
+            // (season, episode, path) of each selected video.
+            let eps = crate::acquire::episode_files(&fresh);
+            // Consolidation adopts a single-season pack only. A multi-season ("complete series") pack
+            // would leave its other seasons recorded-as-owned but un-repointed/un-pruned — reject it
+            // so provides/selection/prune stay consistent for the target season.
             if eps.iter().any(|(s, _, _)| *s != season) {
-                let _ = app.provider.delete_torrent(&added.id).await;
+                let _ = app.provider.delete_torrent(&torrent_id).await;
                 continue;
             }
             let pack_episodes: Vec<u32> = eps
@@ -2835,30 +2875,40 @@ async fn consolidate_show_seasons(
                 pack_quality,
             };
             if !consolidation_target(&input) {
-                let _ = app.provider.delete_torrent(&added.id).await; // non-destructive: drop the staged pack
+                let _ = app.provider.delete_torrent(&torrent_id).await; // non-destructive: drop the staged pack
                 continue;
             }
             // Validate the show identity on a representative episode file, then apply the SAME
-            // probe gate as acquisition (I-1) on that representative episode before adopting.
+            // probe gate as acquisition on that representative episode before adopting.
             if let Some((es, ee, path)) = eps.iter().find(|(s, _, _)| *s == season) {
                 let fname = path.rsplit('/').next().unwrap_or(path).to_string();
-                if !app
+                match app
                     .engine
                     .validate_title(&fname, tmdb_id, MediaKind::Series, Some(*es), Some(*ee))
                     .await
                 {
-                    let _ = app.provider.delete_torrent(&added.id).await;
-                    let _ = app
-                        .store
-                        .blacklist_add(
-                            MediaKind::Series,
-                            tmdb_id,
-                            r.info_hash.clone(),
-                            "WrongTitle",
-                            now_secs(),
-                        )
-                        .await;
-                    continue;
+                    TitleCheck::Match => {}
+                    TitleCheck::Mismatch => {
+                        let _ = app.provider.delete_torrent(&torrent_id).await;
+                        let _ = app
+                            .store
+                            .blacklist_add(
+                                MediaKind::Series,
+                                tmdb_id,
+                                r.info_hash.clone(),
+                                "WrongTitle",
+                                now_secs(),
+                            )
+                            .await;
+                        continue;
+                    }
+                    // No verdict (TMDB unreachable): not blacklisted; retry the season next tick.
+                    TitleCheck::Unavailable => {
+                        let _ = app.provider.delete_torrent(&torrent_id).await;
+                        return Err(UpgradeSkip::Deferred(format!(
+                            "s{season} title check unavailable (TMDB unreachable)"
+                        )));
+                    }
                 }
                 // Per-episode request so the probe's language check uses the right original_language.
                 let probe_req = crate::store::AcquireRequest {
@@ -2875,7 +2925,7 @@ async fn consolidate_show_seasons(
                 {
                     crate::acquire::VerifyResult::Pass => {}
                     crate::acquire::VerifyResult::Accept => {
-                        let _ = app.provider.delete_torrent(&added.id).await;
+                        let _ = app.provider.delete_torrent(&torrent_id).await;
                         debug!(
                             "consolidate: tmdb {} s{} pack {} unverifiable; not adopted",
                             tmdb_id, season, r.info_hash
@@ -2883,7 +2933,7 @@ async fn consolidate_show_seasons(
                         continue;
                     }
                     crate::acquire::VerifyResult::Reject(reason) => {
-                        let _ = app.provider.delete_torrent(&added.id).await;
+                        let _ = app.provider.delete_torrent(&torrent_id).await;
                         let _ = app
                             .store
                             .blacklist_add(
@@ -2898,7 +2948,7 @@ async fn consolidate_show_seasons(
                     }
                     crate::acquire::VerifyResult::Defer => {
                         // Transient probe failure: drop the staged pack and retry next tick (no blacklist).
-                        let _ = app.provider.delete_torrent(&added.id).await;
+                        let _ = app.provider.delete_torrent(&torrent_id).await;
                         continue;
                     }
                 }
@@ -2914,7 +2964,7 @@ async fn consolidate_show_seasons(
             let listing = match app.provider.get_torrents().await {
                 Ok(l) => l,
                 Err(_) => {
-                    let _ = app.provider.delete_torrent(&added.id).await;
+                    let _ = app.provider.delete_torrent(&torrent_id).await;
                     return Err(UpgradeSkip::Deferred(format!(
                         "s{season} provider listing unavailable; dropped staged pack"
                     )));
@@ -2924,52 +2974,35 @@ async fn consolidate_show_seasons(
             // dangling stage) and retry on a later tick; consolidation re-stages cheaply (the pack
             // is cached).
             if being_read(app, &season_copies, idle_window).await {
-                let _ = app.provider.delete_torrent(&added.id).await;
+                let _ = app.provider.delete_torrent(&torrent_id).await;
                 return Err(UpgradeSkip::Deferred(format!(
                     "s{season} copy being read; dropped staged pack"
                 )));
             }
-            // Record the pack owned+verified with full-season provides + sticky provenance.
+            // Record the pack owned+verified with full-season provides + sticky provenance, BEFORE
+            // the repoint+prune: on a failed write the pack is rolled back and the season deferred
+            // ([`record_staged`]), so the scattered episodes are never pruned against an unrecorded
+            // pack, and the next tick stages it afresh.
             let provides: Vec<(u32, u32)> = eps.iter().map(|(s, e, _)| (*s, *e)).collect();
-            // Record the pack's owned + authoritative rows FIRST, and DEFER the repoint+prune if
-            // either write fails: pruning the scattered episodes against an unrecorded pack would
-            // strand the pack as an empty-provenance mirror (losing its sticky provenance) while the
-            // originals are gone. The pack torrent is already added, so a deferred tick re-runs the
-            // idempotent consolidation; nothing is lost.
-            if app
-                .store
-                .put_owned(
-                    r.info_hash.clone(),
-                    OwnedRecord {
-                        request: crate::store::AcquireRequest {
-                            season: Some(season),
-                            episode: Some(1),
-                            ..sample.request.clone()
-                        }, // episode: Some(1) is a sentinel — the authoritative full-season set is in `provides`.
-                        provenance: prov.clone(),
-                        added_at: now_secs(),
-                        status: OwnedStatus::Verified,
-                        provides: provides.clone(),
-                        quality: Some(QualitySummary::of(&r, &app.config.acquisition.prefs)),
-                    },
-                )
-                .await
-                .is_err()
-            {
-                return Err(UpgradeSkip::Deferred(format!(
-                    "s{season} pack owned-record write failed; deferring repoint+prune"
-                )));
-            }
-            if app
-                .store
-                .put_authoritative(r.info_hash.clone(), sample.request.metadata.clone())
-                .await
-                .is_err()
-            {
-                return Err(UpgradeSkip::Deferred(format!(
-                    "s{season} pack authoritative write failed; deferring repoint+prune"
-                )));
-            }
+            record_staged(
+                app,
+                &r.info_hash,
+                &torrent_id,
+                OwnedRecord {
+                    request: crate::store::AcquireRequest {
+                        season: Some(season),
+                        episode: Some(1),
+                        ..sample.request.clone()
+                    }, // episode: Some(1) is a sentinel — the authoritative full-season set is in `provides`.
+                    provenance: prov.clone(),
+                    added_at: now_secs(),
+                    status: OwnedStatus::Verified,
+                    provides: provides.clone(),
+                    quality: Some(QualitySummary::of(&r, &app.config.acquisition.prefs)),
+                },
+            )
+            .await
+            .map_err(|e| UpgradeSkip::Deferred(format!("s{season} {e}")))?;
             // Repoint every episode slot of this season to the pack. If any repoint fails to
             // persist, DEFER the prune below: deleting a scattered episode whose slot still points at
             // the old (about-to-be-deleted) hash would break that episode's playback. Nothing is lost
@@ -3129,8 +3162,24 @@ mod tests {
             _k: MediaKind,
             _s: Option<u32>,
             _e: Option<u32>,
-        ) -> bool {
-            true
+        ) -> TitleCheck {
+            TitleCheck::Match
+        }
+    }
+
+    /// A title validator with a fixed verdict (e.g. `Unavailable`: TMDB unreachable).
+    struct FixedValidator(TitleCheck);
+    #[async_trait]
+    impl crate::acquire::TitleValidator for FixedValidator {
+        async fn validate(
+            &self,
+            _f: &str,
+            _t: u64,
+            _k: MediaKind,
+            _s: Option<u32>,
+            _e: Option<u32>,
+        ) -> TitleCheck {
+            self.0
         }
     }
 
@@ -3187,12 +3236,21 @@ mod tests {
         store: Store,
         prober: Arc<dyn crate::acquire::Prober>,
     ) -> AppState {
+        app_with_validator(scraper, provider, store, prober, Arc::new(PassValidator))
+    }
+
+    fn app_with_validator(
+        scraper: Arc<dyn Scraper>,
+        provider: Arc<dyn DebridProvider>,
+        store: Store,
+        prober: Arc<dyn crate::acquire::Prober>,
+        validator: Arc<dyn crate::acquire::TitleValidator>,
+    ) -> AppState {
         let mut config =
             Config::from_parts(None, Some("tb".into()), Some("k".into()), None, None, None)
                 .unwrap();
         config.acquisition = AcquisitionConfig::default();
         let tmdb = Arc::new(TmdbClient::new("k".into()).unwrap());
-        let validator: Arc<dyn crate::acquire::TitleValidator> = Arc::new(PassValidator);
         let engine = Arc::new(crate::acquire::AcquisitionEngine::new(
             provider.clone(),
             scraper.clone(),
@@ -3222,7 +3280,7 @@ mod tests {
 
     #[tokio::test]
     async fn current_show_hashes_reflects_store_and_excludes_same_id_movie() {
-        // Guards the F1 fix: consolidation must see the CURRENT show membership, not a stale
+        // Consolidation must see the CURRENT show membership, not a stale
         // tick-start snapshot. The helper reflects live store state and excludes a movie sharing
         // the numeric tmdb id.
         let store = mem_store();
@@ -3307,6 +3365,105 @@ mod tests {
             !prov.has_manual_entry(),
             "must not mislabel the staged upgrade as a protected manual add"
         );
+    }
+
+    #[tokio::test]
+    async fn movie_upgrade_defers_without_blacklisting_when_tmdb_is_unreachable() {
+        // The staged REMUX can't be title-checked (TMDB outage / rejected key): it must be deleted
+        // like any rejected stage but NOT blacklisted, and the title deferred (cursor unchanged), so a
+        // TMDB blip during the daily pass doesn't block a good upgrade for the blacklist TTL.
+        let store = mem_store();
+        let hold = OwnedRecord {
+            request: movie_req(),
+            provenance: Provenance::watchlist("a"),
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: Some(QualitySummary {
+                cached: true,
+                source_tier: 3_000,
+                resolution: 1080,
+                score: 10,
+                unverified: false,
+            }),
+        };
+        store.put_owned("hold".into(), hold.clone()).await.unwrap();
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "hold".into(),
+                    file_path: "old.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent {
+                id: "told".into(),
+                hash: "hold".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tnew".into(),
+                hash: "hnew".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "M.2020.1080p.REMUX.mkv".into(),
+                    bytes: 30_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/new".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with_validator(
+            Arc::new(MockScraper {
+                candidates: vec![remux_candidate()],
+            }),
+            provider,
+            store.clone(),
+            passing_prober(),
+            Arc::new(FixedValidator(TitleCheck::Unavailable)),
+        );
+        let res = try_upgrade_movie(
+            &app,
+            27205,
+            &["hold".to_string()],
+            &hold,
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(UpgradeSkip::Deferred(_))),
+            "an unavailable title check defers the title, got {res:?}"
+        );
+        assert!(
+            !store
+                .is_blacklisted(MediaKind::Movie, 27205, "hnew".into())
+                .await,
+            "an unavailable title check must not blacklist the candidate"
+        );
+        assert_eq!(
+            *deleted.lock().unwrap(),
+            vec!["tnew".to_string()],
+            "the staged candidate is deleted; the owned copy is untouched"
+        );
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hold"
+        );
+        assert!(store.get_owned("hnew".into()).await.is_none());
     }
 
     #[tokio::test]
@@ -4013,7 +4170,8 @@ mod tests {
     }
 
     /// Provider that touches read-activity inside `get_torrent_info` — simulating a playback read that
-    /// begins DURING staging (after the outer idle gate passed). Used to trip the 4b idle re-check.
+    /// begins DURING staging (after the outer idle gate passed). Used to trip `apply_upgrade`'s final
+    /// read re-check.
     #[derive(Debug)]
     struct TouchDuringStageProvider {
         ra: Arc<crate::read_activity::ReadActivity>,
@@ -4033,7 +4191,7 @@ mod tests {
             }])
         }
         async fn get_torrent_info(&self, _id: &str) -> Result<TorrentInfo, reqwest::Error> {
-            // A read of the copy the swap would delete begins mid-stage → the 4b idle re-check must
+            // A read of the copy the swap would delete begins mid-stage → the final read re-check must
             // trip and force a full rollback.
             self.ra.touch("hold").await;
             Ok(TorrentInfo {
@@ -4074,10 +4232,11 @@ mod tests {
 
     #[tokio::test]
     async fn movie_upgrade_rolls_back_when_library_goes_active_during_staging() {
-        // The 4b idle re-check: the outer/inner idle gates pass, the candidate is fully staged, then a
-        // read begins mid-stage. The engine must ROLL BACK the staged candidate (delete + drop
-        // records) and DEFER — never prune the old torrent out from under the new read. (Distinct from
-        // the outer-gate `active_movie_is_not_pruned` test, where nothing is ever staged.)
+        // `apply_upgrade`'s final read re-check: the outer/inner idle gates pass, the candidate is
+        // fully staged, then a read begins mid-stage. The engine must ROLL BACK the staged candidate
+        // (delete + drop records) and DEFER — never prune the old torrent out from under the new
+        // read. (Distinct from the outer-gate `active_movie_is_not_pruned` test, where nothing is
+        // ever staged.)
         let store = mem_store();
         store
             .put_owned(
@@ -4155,7 +4314,7 @@ mod tests {
 
         assert!(
             deleted.lock().unwrap().contains(&"tnew".to_string()),
-            "the staged candidate must be deleted on the 4b rollback"
+            "the staged candidate must be deleted on the read-check rollback"
         );
         assert!(
             store.get_owned("hnew".into()).await.is_none(),
@@ -4644,11 +4803,11 @@ mod tests {
 
     #[tokio::test]
     async fn movie_upgrade_accepts_spoken_language_audio_under_original() {
-        // Nightborn's 6 Nov upgrade pass: TMDB original_language `fi`, but English is a listed spoken
-        // language. Under the default AUDIO_LANGUAGE=original an `eng`-audio upgrade candidate must
+        // A `fi`-original film whose dialogue is mostly English: TMDB original_language `fi`, but
+        // English is a listed spoken language. Under the default AUDIO_LANGUAGE=original an `eng`-audio upgrade candidate must
         // PASS the staging probe (and be adopted), not be blacklisted BadAudio.
         let store = mem_store();
-        let nightborn = AcquireRequest {
+        let fi_film = AcquireRequest {
             original_language: Some("fi".into()),
             spoken_languages: Some(vec!["en".into(), "fi".into(), "es".into()]),
             ..movie_req()
@@ -4657,7 +4816,7 @@ mod tests {
             .put_owned(
                 "hold".into(),
                 OwnedRecord {
-                    request: nightborn,
+                    request: fi_film,
                     provenance: Provenance::watchlist("a"),
                     added_at: 1,
                     status: OwnedStatus::Verified,
@@ -4771,10 +4930,10 @@ mod tests {
         }
     }
 
-    /// TMDB's view of Nightborn: `fi` original, mostly English.
-    fn nightborn_details() -> TitleDetails {
+    /// TMDB's view of a `fi`-original film whose dialogue is mostly English.
+    fn fi_film_details() -> TitleDetails {
         TitleDetails {
-            title: "Nightborn".into(),
+            title: "Film".into(),
             year: Some("2026".into()),
             original_language: Some("fi".into()),
             spoken_languages: vec!["en".into(), "fi".into(), "es".into()],
@@ -4833,10 +4992,10 @@ mod tests {
         let hashes: Vec<String> = ["ha", "hb", "hc", "hgone"].map(String::from).to_vec();
         let calls = Arc::new(AtomicUsize::new(0));
         let mut backfill =
-            LanguageBackfill::new(canned_details(calls.clone(), || Ok(nightborn_details())));
+            LanguageBackfill::new(canned_details(calls.clone(), || Ok(fi_film_details())));
 
         let out = backfill
-            .run(&app, 314360, &MediaType::Show, &hashes, &mut rec)
+            .run(&app, 900001, &MediaType::Show, &hashes, &mut rec)
             .await;
 
         assert!(out.is_ok(), "{out:?}");
@@ -4876,7 +5035,7 @@ mod tests {
 
         // Converged: every record is now `Some`, so the next visit fetches nothing.
         let out = backfill
-            .run(&app, 314360, &MediaType::Show, &hashes, &mut rec)
+            .run(&app, 900001, &MediaType::Show, &hashes, &mut rec)
             .await;
         assert!(out.is_ok(), "{out:?}");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "never re-fetched");
@@ -4899,7 +5058,7 @@ mod tests {
         let mut rec = store.get_owned("hold".into()).await.unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let mut backfill =
-            LanguageBackfill::new(canned_details(calls.clone(), || Ok(nightborn_details())));
+            LanguageBackfill::new(canned_details(calls.clone(), || Ok(fi_film_details())));
         let out = backfill
             .run(&app, 27205, &MediaType::Movie, &["hold".into()], &mut rec)
             .await;
@@ -4928,11 +5087,11 @@ mod tests {
         let mut rec = store.get_owned("ha".into()).await.unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let mut backfill =
-            LanguageBackfill::new(canned_details(calls.clone(), || Ok(nightborn_details())));
+            LanguageBackfill::new(canned_details(calls.clone(), || Ok(fi_film_details())));
         let out = backfill
             .run(
                 &app,
-                314360,
+                900001,
                 &MediaType::Show,
                 &["ha".into(), "hb".into()],
                 &mut rec,
@@ -4966,7 +5125,7 @@ mod tests {
         }));
 
         let out = backfill
-            .run(&app, 314360, &MediaType::Show, &["hb".into()], &mut rec)
+            .run(&app, 900001, &MediaType::Show, &["hb".into()], &mut rec)
             .await;
         assert!(matches!(out, Err(UpgradeSkip::Deferred(_))), "{out:?}");
         assert_eq!(rec.request.spoken_languages, None);
@@ -5014,7 +5173,7 @@ mod tests {
         let mut backfill = LanguageBackfill::new(canned_details(calls.clone(), || {
             Err(http_status_error(404))
         }));
-        for id in [314360, 999] {
+        for id in [900001, 999] {
             let out = backfill
                 .run(&app, id, &MediaType::Show, &["hb".into()], &mut rec)
                 .await;
@@ -5058,9 +5217,9 @@ mod tests {
         assert!(!tmdb_error_is_permanent(&decode));
     }
 
-    /// A Nightborn-shaped legacy movie (`fi` original, spoken languages never fetched) owned as a
+    /// A legacy `fi`-original movie (mostly English; spoken languages never fetched) owned as a
     /// cached 1080p WEB copy, plus a provider/scraper offering a cached `eng`-audio REMUX upgrade.
-    async fn legacy_nightborn_app(store: &Store) -> AppState {
+    async fn legacy_fi_film_app(store: &Store) -> AppState {
         store
             .put_owned(
                 "hold".into(),
@@ -5138,11 +5297,11 @@ mod tests {
         // staging probe checks `fi` alone and blacklists the English upgrade as BadAudio.
         let store = mem_store();
         let calls = Arc::new(AtomicUsize::new(0));
-        let app = legacy_nightborn_app(&store).await;
+        let app = legacy_fi_film_app(&store).await;
 
         run_upgrade_once_with(
             &app,
-            canned_details(calls.clone(), || Ok(nightborn_details())),
+            canned_details(calls.clone(), || Ok(fi_film_details())),
         )
         .await;
 
@@ -5176,7 +5335,7 @@ mod tests {
         // (so nothing is blacklisted under the original-only rule) and its cursor stays unstamped.
         let store = mem_store();
         let calls = Arc::new(AtomicUsize::new(0));
-        let app = legacy_nightborn_app(&store).await;
+        let app = legacy_fi_film_app(&store).await;
 
         run_upgrade_once_with(
             &app,
@@ -6114,7 +6273,7 @@ mod tests {
         );
     }
 
-    // ── corrective-downgrade tests (Task 4) ───────────────────────────────────
+    // ── corrective-downgrade tests ────────────────────────────────────────────
 
     /// Harness for the movie corrective-downgrade tests: a single owned copy ABOVE the P1080
     /// ceiling (2160p REMUX — as if acquired before the ceiling was lowered, or mirrored from a
@@ -6140,6 +6299,12 @@ mod tests {
     }
 
     async fn harness_with_owned_movie_2160_and_1080_candidate() -> DowngradeHarness {
+        harness_with_owned_movie_2160_and(remux_candidate(), "M.2020.1080p.REMUX.mkv").await
+    }
+
+    /// [`harness_with_owned_movie_2160_and_1080_candidate`] with `cand` (resolving to `file`) as the
+    /// within-ceiling replacement.
+    async fn harness_with_owned_movie_2160_and(cand: RawCandidate, file: &str) -> DowngradeHarness {
         let store = mem_store();
         let owned_2160_hash = "h2160".to_string();
         store
@@ -6173,10 +6338,6 @@ mod tests {
             .await
             .unwrap();
 
-        // A cached, within-ceiling 1080p REMUX candidate — `remux_candidate()` is already used
-        // (and proven) elsewhere as a meaningful cached upgrade; reused here as the corrective
-        // within-ceiling replacement.
-        let cand = remux_candidate();
         let cand_1080_hash = cand.info_hash.clone();
         let scraper = Arc::new(MockScraper {
             candidates: vec![cand],
@@ -6199,7 +6360,7 @@ mod tests {
                 status: "downloaded".into(),
                 files: vec![TorrentFile {
                     id: 0,
-                    path: "M.2020.1080p.REMUX.mkv".into(),
+                    path: file.into(),
                     bytes: 20_000_000_000,
                     selected: 1,
                 }],
@@ -6287,6 +6448,71 @@ mod tests {
                 .unwrap()
                 .hash,
             h.cand_1080_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn movie_corrective_downgrade_never_adopts_a_wrong_language_release() {
+        // The ceiling penalty on the over-ceiling owned copy dwarfs the wrong-language penalty, so the
+        // as-ranked improvement test can't see it: a Russian-tagged (name + 🇷🇺) 1080p replacement
+        // for an English-original 2160p copy must be dropped outright. Untagged audio tracks would
+        // let it pass the probe. The same release tagged English is adopted (control).
+        let rus = RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "M.2020.1080p.BluRay.REMUX.x265.Rus\n🇷🇺\nRD+".into(),
+            info_hash: "hrus".into(),
+            file_idx: Some(0),
+            file_name: Some("M.2020.1080p.REMUX.Rus.mkv".into()),
+        };
+        let mut h = harness_with_owned_movie_2160_and(rus, "M.2020.1080p.REMUX.Rus.mkv").await;
+        h.set_allow_downgrade(true);
+        let r = try_upgrade_movie(
+            &h.app,
+            h.tmdb,
+            &h.owned_hashes,
+            &h.rec,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(matches!(r, Err(UpgradeSkip::NoChange(_))), "{r:?}");
+        assert!(h.app.store.get_owned("hrus".into()).await.is_none());
+        assert_eq!(
+            h.app
+                .store
+                .get_selection(movie_slot(h.tmdb))
+                .await
+                .unwrap()
+                .hash,
+            h.owned_2160_hash,
+            "the English copy keeps its slot"
+        );
+
+        let eng = RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "M.2020.1080p.BluRay.REMUX.x265.ENG\n🇬🇧\nRD+".into(),
+            info_hash: "heng".into(),
+            file_idx: Some(0),
+            file_name: Some("M.2020.1080p.REMUX.ENG.mkv".into()),
+        };
+        let mut h = harness_with_owned_movie_2160_and(eng, "M.2020.1080p.REMUX.ENG.mkv").await;
+        h.set_allow_downgrade(true);
+        let r = try_upgrade_movie(
+            &h.app,
+            h.tmdb,
+            &h.owned_hashes,
+            &h.rec,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(r.is_ok(), "control: {r:?}");
+        assert_eq!(
+            h.app
+                .store
+                .get_selection(movie_slot(h.tmdb))
+                .await
+                .unwrap()
+                .hash,
+            "heng"
         );
     }
 
@@ -6700,7 +6926,7 @@ mod tests {
         );
     }
 
-    // ── pure consolidation-decision tests (Task 10) ───────────────────────────
+    // ── pure consolidation-decision tests ─────────────────────────────────────
 
     #[test]
     fn full_cached_season_pack_no_regression_consolidates() {
@@ -7334,7 +7560,7 @@ mod tests {
         );
     }
 
-    // ── show-consolidation orchestration tests (Task 10) ───────────────────────
+    // ── show-consolidation orchestration tests ─────────────────────────────────
     //
     // These exercise `try_consolidate_show`'s destructive multi-step body (stage cached full-season
     // pack → record owned with full-season `provides` → repoint episode `selection` slots → prune the
@@ -7957,15 +8183,16 @@ mod tests {
         );
     }
 
-    /// A redb backend wrapping `InMemoryBackend` that fails every `write`/`set_len` once ARMED, so a
-    /// test can make a later store commit (here: the selection repoint) return `Err` deterministically.
-    /// Seed the store BEFORE arming. redb is copy-on-write — a failed page write aborts the commit
-    /// without flipping the committed root — so prior committed state stays readable (reads never call
-    /// `write`).
+    /// A redb backend wrapping `InMemoryBackend` that fails every `write`/`set_len` once ARMED
+    /// ([`WriteFailSwitch`]), so a test can make a store commit return `Err` deterministically. Seed
+    /// the store BEFORE arming. redb is copy-on-write — a failed page write aborts the commit without
+    /// flipping the committed root — so prior committed state stays readable (reads never call
+    /// `write`). Every commit ends in `sync_data`, which this counts so a switch can let a given
+    /// number of commits through first.
     #[derive(Debug)]
     struct ArmableFailBackend {
         inner: redb::backends::InMemoryBackend,
-        fail_writes: Arc<std::sync::atomic::AtomicBool>,
+        switch: WriteFailSwitch,
     }
     impl redb::StorageBackend for ArmableFailBackend {
         fn len(&self) -> Result<u64, std::io::Error> {
@@ -7975,41 +8202,85 @@ mod tests {
             self.inner.read(offset, out)
         }
         fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
-            if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.switch.failing() {
                 return Err(std::io::Error::other("set_len blocked (armed)"));
             }
             self.inner.set_len(len)
         }
         fn sync_data(&self) -> Result<(), std::io::Error> {
+            self.switch.syncs.fetch_add(1, Ordering::SeqCst);
             self.inner.sync_data()
         }
         fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
-            if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.switch.failing() {
                 return Err(std::io::Error::other("write blocked (armed)"));
             }
             self.inner.write(offset, data)
         }
     }
-    fn fail_after_arm_store() -> (Store, Arc<std::sync::atomic::AtomicBool>) {
-        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    /// Arms an [`ArmableFailBackend`]: writes fail once `syncs` reaches `fail_from`.
+    #[derive(Debug, Clone)]
+    struct WriteFailSwitch {
+        syncs: Arc<AtomicUsize>,
+        fail_from: Arc<AtomicUsize>,
+    }
+    impl WriteFailSwitch {
+        fn failing(&self) -> bool {
+            self.syncs.load(Ordering::SeqCst) >= self.fail_from.load(Ordering::SeqCst)
+        }
+        /// Fail every write from now on.
+        fn arm(&self) {
+            self.fail_from.store(0, Ordering::SeqCst);
+        }
+        /// Let the next `commits` commits (of `syncs_per_commit` syncs each) through, then fail every
+        /// write.
+        fn arm_after(&self, commits: usize, syncs_per_commit: usize) {
+            self.fail_from.store(
+                self.syncs.load(Ordering::SeqCst) + commits * syncs_per_commit,
+                Ordering::SeqCst,
+            );
+        }
+        fn disarm(&self) {
+            self.fail_from.store(usize::MAX, Ordering::SeqCst);
+        }
+    }
+    fn fail_after_arm_store() -> (Store, WriteFailSwitch) {
+        let switch = WriteFailSwitch {
+            syncs: Arc::new(AtomicUsize::new(0)),
+            fail_from: Arc::new(AtomicUsize::new(usize::MAX)),
+        };
         let backend = ArmableFailBackend {
             inner: redb::backends::InMemoryBackend::new(),
-            fail_writes: fail.clone(),
+            switch: switch.clone(),
         };
         let db = redb::Database::builder()
             .create_with_backend(backend)
             .unwrap();
-        (Store::from_database(Arc::new(db)).unwrap(), fail)
+        (Store::from_database(Arc::new(db)).unwrap(), switch)
+    }
+    /// How many `sync_data` calls one store commit makes on `store`'s backend (measured with a
+    /// harmless write), for [`WriteFailSwitch::arm_after`].
+    async fn syncs_per_commit(store: &Store, switch: &WriteFailSwitch) -> usize {
+        let before = switch.syncs.load(Ordering::SeqCst);
+        store
+            .set_upgrade_checked(&MediaType::Movie, 424_242, 1)
+            .await
+            .unwrap();
+        let n = switch.syncs.load(Ordering::SeqCst) - before;
+        assert!(n > 0, "a commit syncs");
+        n
     }
 
     #[tokio::test]
     async fn show_consolidation_repoint_failure_defers_prune() {
         // If a `put_selection` repoint fails partway, the prune MUST be deferred — a scattered episode
         // whose slot still points at the about-to-be-deleted hash must never be orphaned. Nothing may
-        // be deleted on the provider. (We arm the store to fail ALL writes, so the pack record also
-        // doesn't persist; the asserted contract — defer + delete nothing — is what matters here.)
-        let (store, fail) = fail_after_arm_store();
+        // be deleted on the provider: the pack's own records have committed, so the staged pack is
+        // left for the duplicate-dedup pass. The store lets the pack's two record commits (owned +
+        // authoritative) through and fails from the first repoint on.
+        let (store, switch) = fail_after_arm_store();
         seed_two_scattered_episodes(&store).await;
+        let per_commit = syncs_per_commit(&store, &switch).await;
 
         let scraper = Arc::new(MockScraper {
             candidates: vec![season_pack_candidate()],
@@ -8028,8 +8299,8 @@ mod tests {
         });
         let app = app_with(scraper, provider, store.clone());
 
-        // Arm AFTER seeding so the selection repoint (a redb commit) fails.
-        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Arm AFTER seeding: the pack's records commit, the selection repoint fails.
+        switch.arm_after(2, per_commit);
         let res = consolidate_show_seasons(
             &app,
             SHOW_TMDB,
@@ -8053,7 +8324,11 @@ mod tests {
         );
 
         // Disarm so verification reads are pristine, then confirm the per-episode content survives.
-        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        switch.disarm();
+        assert!(
+            store.get_owned("hpack".into()).await.is_some(),
+            "the pack's record committed: the failure was the repoint's"
+        );
         assert!(
             store.get_owned("e1".into()).await.is_some()
                 && store.get_owned("e2".into()).await.is_some(),
@@ -8077,6 +8352,199 @@ mod tests {
             "e2",
             "E02 slot still points at its scattered episode"
         );
+    }
+
+    #[tokio::test]
+    async fn show_consolidation_record_write_failure_drops_the_staged_pack() {
+        // The pack's owned-record write fails: the staged pack is deleted (by the id the add
+        // returned) so a later tick can stage it afresh — left in the account, it could never be
+        // staged again — and the season is deferred with the scattered episodes untouched.
+        let (store, switch) = fail_after_arm_store();
+        seed_two_scattered_episodes(&store).await;
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(pack_info()),
+            resolved_url: Some("https://cdn/p1".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![season_pack_candidate()],
+            }),
+            provider,
+            store.clone(),
+        );
+        switch.arm();
+        let res = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(matches!(res, Err(UpgradeSkip::Deferred(_))), "{res:?}");
+        assert_eq!(*deleted.lock().unwrap(), vec!["tpack".to_string()]);
+        switch.disarm();
+        for (e, h) in [(1, "e1"), (2, "e2")] {
+            assert!(store.get_owned(h.into()).await.is_some());
+            assert_eq!(
+                store
+                    .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, e))
+                    .await
+                    .unwrap()
+                    .hash,
+                h
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn movie_upgrade_record_write_failure_drops_the_staged_copy() {
+        // Same rule on the movie path: the staged REMUX is deleted when its record can't be written,
+        // and the title is deferred with its current copy untouched.
+        let (store, switch) = fail_after_arm_store();
+        let hold = OwnedRecord {
+            request: movie_req(),
+            provenance: Provenance::watchlist("a"),
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: Some(QualitySummary {
+                cached: true,
+                source_tier: 3_000,
+                resolution: 1080,
+                score: 10,
+                unverified: false,
+            }),
+        };
+        store.put_owned("hold".into(), hold.clone()).await.unwrap();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent {
+                id: "told".into(),
+                hash: "hold".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tnew".into(),
+                hash: "hnew".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "M.2020.1080p.REMUX.mkv".into(),
+                    bytes: 30_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/new".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![remux_candidate()],
+            }),
+            provider,
+            store.clone(),
+        );
+        switch.arm();
+        let res = try_upgrade_movie(
+            &app,
+            27205,
+            &["hold".to_string()],
+            &hold,
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(matches!(res, Err(UpgradeSkip::Deferred(_))), "{res:?}");
+        assert_eq!(*deleted.lock().unwrap(), vec!["tnew".to_string()]);
+        switch.disarm();
+        assert!(store.get_owned("hold".into()).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn episode_upgrade_record_write_failure_never_swaps_or_prunes() {
+        // The per-episode stage's record write fails: no swap and no prune follow — the staged
+        // torrent is deleted, and the old singleton keeps its record and slot.
+        let (store, switch) = fail_after_arm_store();
+        let h = show_harness_singleton_720_ep_in(store.clone(), false).await;
+        switch.arm();
+        let res = stage_episode_candidate(
+            &h.app,
+            h.tmdb,
+            &ep_record(1, 1, q720_web()).request,
+            &release::parse(&ep_1080_web_candidate()),
+            (1, 1),
+            &Provenance::watchlist("a"),
+            &mut std::collections::HashSet::new(),
+        )
+        .await;
+        assert!(matches!(res, Err(UpgradeSkip::Deferred(_))), "{res:?}");
+        assert_eq!(*h.deleted.lock().unwrap(), vec!["tep1080".to_string()]);
+        switch.disarm();
+        assert!(store.get_owned(h.old_720_hash.clone()).await.is_some());
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            h.old_720_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn pack_correction_record_write_failure_keeps_the_old_pack() {
+        // The replacement pack's record write fails: nothing is repointed or pruned, the staged pack
+        // is deleted, and the pass reports a deferral.
+        let (store, switch) = fail_after_arm_store();
+        let mut h =
+            show_harness_pack_2160_in(store.clone(), false, "S.2019.S01.1080p.BluRay.x265\nRD+")
+                .await;
+        h.set_allow_downgrade(true);
+        let owned = vec![(
+            h.pack_hash.clone(),
+            store.get_owned(h.pack_hash.clone()).await.unwrap(),
+        )];
+        switch.arm();
+        let deferred = correct_over_ceiling_packs(
+            &h.app,
+            h.tmdb,
+            &owned,
+            &h.group_hashes,
+            "tt9",
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(deferred, "a failed record write defers the pack");
+        assert_eq!(*h.deleted.lock().unwrap(), vec!["tpack1080".to_string()]);
+        switch.disarm();
+        assert!(store.get_owned(h.pack_hash.clone()).await.is_some());
+        for e in [1, 2] {
+            assert_eq!(
+                store
+                    .get_selection(crate::store::episode_slot(h.tmdb, 1, e))
+                    .await
+                    .unwrap()
+                    .hash,
+                h.pack_hash
+            );
+        }
     }
 
     #[tokio::test]
@@ -8212,7 +8680,7 @@ mod tests {
         }
     }
 
-    // ── per-episode upgrade/downgrade + over-ceiling pack correction tests (Task 5) ──────────
+    // ── per-episode upgrade/downgrade + over-ceiling pack correction tests ───────────────────
     //
     // These call `upgrade_show_episodes_and_packs` directly rather than the public dispatch
     // target `try_upgrade_show`. `try_upgrade_show` always additionally invokes the TMDB-driven
@@ -8250,9 +8718,10 @@ mod tests {
         }
     }
 
-    /// Harness for the Task 5 show tests: an owned singleton episode or full-season pack, a
-    /// scraped candidate (or none), and `set_allow_downgrade` to flip the corrective-downgrade
-    /// flag — mirrors `DowngradeHarness` above but for the per-episode/pack-correction path.
+    /// Harness for the per-episode / pack-correction tests: an owned singleton episode or
+    /// full-season pack, a scraped candidate (or none), and `set_allow_downgrade` to flip the
+    /// corrective-downgrade flag — mirrors `DowngradeHarness` above but for the
+    /// per-episode/pack-correction path.
     /// Only the fields relevant to a given scenario are populated; the rest are left empty.
     struct ShowUpgradeHarness {
         app: AppState,
@@ -8287,7 +8756,14 @@ mod tests {
     /// another title, or an unidentified manual add) and the add returns that EXISTING id, as TorBox's
     /// `createtorrent` does for a present infohash.
     async fn show_harness_singleton_720_ep_with(cand_in_account: bool) -> ShowUpgradeHarness {
-        let store = mem_store();
+        show_harness_singleton_720_ep_in(mem_store(), cand_in_account).await
+    }
+
+    /// [`show_harness_singleton_720_ep_with`] on `store`.
+    async fn show_harness_singleton_720_ep_in(
+        store: Store,
+        cand_in_account: bool,
+    ) -> ShowUpgradeHarness {
         let old_hash = "e720".to_string();
         store
             .put_owned(old_hash.clone(), ep_record(1, 1, q720_web()))
@@ -8536,7 +9012,24 @@ mod tests {
     async fn show_harness_pack_2160_with_1080_candidate_with(
         cand_in_account: bool,
     ) -> ShowUpgradeHarness {
-        let store = mem_store();
+        show_harness_pack_2160_with(cand_in_account, "S.2019.S01.1080p.BluRay.x265\nRD+").await
+    }
+
+    /// [`show_harness_pack_2160_with_1080_candidate_with`] with the replacement pack's stream
+    /// `description` (its release name, flags and cached marker).
+    async fn show_harness_pack_2160_with(
+        cand_in_account: bool,
+        description: &str,
+    ) -> ShowUpgradeHarness {
+        show_harness_pack_2160_in(mem_store(), cand_in_account, description).await
+    }
+
+    /// [`show_harness_pack_2160_with`] on `store`.
+    async fn show_harness_pack_2160_in(
+        store: Store,
+        cand_in_account: bool,
+        description: &str,
+    ) -> ShowUpgradeHarness {
         let pack_hash = "pack2160".to_string();
         let rec = OwnedRecord {
             request: AcquireRequest {
@@ -8581,7 +9074,7 @@ mod tests {
         let new_pack_hash = "hpack1080".to_string();
         let cand = RawCandidate {
             name: "Torrentio\n1080p".into(),
-            description: "S.2019.S01.1080p.BluRay.x265\nRD+".into(),
+            description: description.into(),
             info_hash: new_pack_hash.clone(),
             file_idx: None,
             file_name: None,
@@ -8650,6 +9143,334 @@ mod tests {
             deleted,
             added,
         }
+    }
+
+    #[tokio::test]
+    async fn pack_correction_keeps_better_slots_and_records_every_episode_of_the_replacement() {
+        // The over-ceiling pack provides E1–E3, but E2's slot serves a within-ceiling REMUX single.
+        // The replacement pack holds E1–E4. Only the slots the old pack served move (E1, E3); E2
+        // keeps its better single; and the replacement's `provides` lists E4 too, so
+        // `monitor_episodes` never acquires a duplicate of it.
+        let store = mem_store();
+        let pack = OwnedRecord {
+            provides: vec![(1, 1), (1, 2), (1, 3)],
+            ..ep_record(1, 1, q2160_remux())
+        };
+        let q1080_remux = QualitySummary {
+            source_tier: 8_000,
+            ..q1080_web()
+        };
+        let single = ep_record(1, 2, q1080_remux);
+        store
+            .put_owned("pack2160".into(), pack.clone())
+            .await
+            .unwrap();
+        store
+            .put_owned("e2remux".into(), single.clone())
+            .await
+            .unwrap();
+        for (e, h) in [(1, "pack2160"), (2, "e2remux"), (3, "pack2160")] {
+            store
+                .put_selection(
+                    crate::store::episode_slot(SHOW_TMDB, 1, e),
+                    SelectionEntry {
+                        hash: h.into(),
+                        file_path: format!("{h}.e{e}.mkv"),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let files = (1..=4u32)
+            .map(|e| TorrentFile {
+                id: e,
+                path: format!("S.S01E{e:02}.1080p.BluRay.mkv"),
+                bytes: 2_000_000_000,
+                selected: 1,
+            })
+            .collect();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "tpack2160".into(),
+                    hash: "pack2160".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "te2remux".into(),
+                    hash: "e2remux".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack1080".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tpack1080".into(),
+                hash: "hpack1080".into(),
+                status: "downloaded".into(),
+                files,
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/np".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let mut app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![RawCandidate {
+                    name: "Torrentio\n1080p".into(),
+                    description: "S.2019.S01.1080p.BluRay.x265\nRD+".into(),
+                    info_hash: "hpack1080".into(),
+                    file_idx: None,
+                    file_name: None,
+                }],
+            }),
+            provider,
+            store.clone(),
+        );
+        let mut cfg = (*app.config).clone();
+        cfg.allow_resolution_downgrade = true;
+        app.config = Arc::new(cfg);
+        let owned = vec![
+            ("pack2160".to_string(), pack),
+            ("e2remux".to_string(), single),
+        ];
+        let group: Vec<String> = owned.iter().map(|(h, _)| h.clone()).collect();
+        let deferred = correct_over_ceiling_packs(
+            &app,
+            SHOW_TMDB,
+            &owned,
+            &group,
+            "tt9",
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(!deferred);
+        let slot = |e: u32| {
+            let store = store.clone();
+            async move {
+                store
+                    .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, e))
+                    .await
+                    .unwrap()
+                    .hash
+            }
+        };
+        assert_eq!(slot(1).await, "hpack1080");
+        assert_eq!(slot(2).await, "e2remux", "E2 keeps its better single");
+        assert_eq!(slot(3).await, "hpack1080");
+        assert_eq!(
+            store.get_owned("hpack1080".into()).await.unwrap().provides,
+            vec![(1, 1), (1, 2), (1, 3), (1, 4)]
+        );
+        assert!(
+            store.get_owned("pack2160".into()).await.is_none(),
+            "the over-ceiling pack is pruned"
+        );
+        assert!(store.get_owned("e2remux".into()).await.is_some());
+        assert_eq!(*deleted.lock().unwrap(), vec!["tpack2160".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn pack_correction_never_adopts_a_wrong_language_pack() {
+        // An English-original show's 2160p pack, downgrade allowed, and the only within-ceiling
+        // cached pack is tagged Russian (name + 🇷🇺): the over-ceiling English pack is kept and
+        // nothing is staged.
+        let mut h =
+            show_harness_pack_2160_with(false, "S.2019.S01.1080p.BluRay.x265.Rus\n🇷🇺\nRD+").await;
+        h.set_allow_downgrade(true);
+        let deferred = upgrade_show_episodes_and_packs(
+            &h.app,
+            h.tmdb,
+            &h.group_hashes,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(!deferred);
+        assert_eq!(
+            h.added.lock().unwrap().clone(),
+            Vec::<String>::new(),
+            "the wrong-language pack is never staged"
+        );
+        assert!(h.deleted.lock().unwrap().is_empty());
+        assert!(h.app.store.get_owned(h.pack_hash.clone()).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn consolidation_never_adopts_a_wrong_language_pack() {
+        // English 1080p WEB singles; the only cached full-season pack is a 1080p BluRay tagged
+        // Russian (name + 🇷🇺). It passes the tier/resolution gate and, with untagged audio, the
+        // probe — but adopting it would delete the English singles, and (a2) would never split it
+        // back (the singles are a lower tier). Nothing is staged.
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(pack_info()),
+            resolved_url: Some("https://cdn/p1".into()),
+            deleted: deleted.clone(),
+            added: added.clone(),
+            ..Default::default()
+        });
+        let app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![RawCandidate {
+                    name: "Torrentio\n1080p".into(),
+                    description: "S.2019.S01.1080p.BluRay.x265.Rus\n🇷🇺\nRD+".into(),
+                    info_hash: "hpack".into(),
+                    file_idx: None,
+                    file_name: None,
+                }],
+            }),
+            provider,
+            store.clone(),
+        );
+        let res = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(added.lock().unwrap().clone(), Vec::<String>::new());
+        assert!(deleted.lock().unwrap().is_empty());
+        for (e, h) in [(1, "e1"), (2, "e2")] {
+            assert_eq!(
+                store
+                    .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, e))
+                    .await
+                    .unwrap()
+                    .hash,
+                h
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_singletons_never_move_a_slot_off_a_copy_adopted_this_tick() {
+        // Two owned singletons for S01E01: `a1080` (1080p WEB) and `b720` (720p, holding the slot).
+        // `a1080`'s visit adopts the best candidate B (1080p BluRay x265) and repoints the slot to
+        // it. `b720`'s visit must then baseline on B — what the slot now serves — so C (1080p BluRay
+        // x264: same rank as B, lower score), which beats only `b720`, is never staged and the slot
+        // stays on B.
+        let store = mem_store();
+        store
+            .put_owned("a1080".into(), ep_record(1, 1, q1080_web()))
+            .await
+            .unwrap();
+        store
+            .put_owned("b720".into(), ep_record(1, 1, q720_web()))
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 1),
+                SelectionEntry {
+                    hash: "b720".into(),
+                    file_path: "b720.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let single = |hash: &str, tag: &str| {
+            (
+                RawCandidate {
+                    name: "Torrentio\n1080p".into(),
+                    description: format!("S.S01E01.1080p.BluRay.{tag}\nRD+"),
+                    info_hash: hash.into(),
+                    file_idx: Some(0),
+                    file_name: Some(format!("S.S01E01.1080p.BluRay.{tag}.mkv")),
+                },
+                TorrentInfo {
+                    id: hash.into(),
+                    hash: hash.into(),
+                    status: "downloaded".into(),
+                    files: vec![TorrentFile {
+                        id: 0,
+                        path: format!("S.S01E01.1080p.BluRay.{tag}.mkv"),
+                        bytes: 2_000_000_000,
+                        selected: 1,
+                    }],
+                    links: vec!["https://cdn/e1".into()],
+                    ..Default::default()
+                },
+            )
+        };
+        let (b, b_info) = single("hbx265", "x265");
+        let (c, c_info) = single("hbx264", "x264");
+        let prefs = crate::config::AcquisitionConfig::default().prefs;
+        let qb = QualitySummary::of(&release::parse(&b), &prefs);
+        let qc = QualitySummary::of(&release::parse(&c), &prefs);
+        assert!(
+            qb.score > qc.score
+                && release::quality_rank(Some(&qb)) == release::quality_rank(Some(&qc)),
+            "fixture: B and C share a rank, B scores higher"
+        );
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![
+                Torrent {
+                    id: "ta1080".into(),
+                    hash: "a1080".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                Torrent {
+                    id: "tb720".into(),
+                    hash: "b720".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+            ],
+            torrent_info_by_id: [("hbx265".to_string(), b_info), ("hbx264".into(), c_info)]
+                .into_iter()
+                .collect(),
+            resolved_url: Some("https://cdn/e1".into()),
+            added: added.clone(),
+            ..Default::default()
+        });
+        let app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![b, c],
+            }),
+            provider,
+            store.clone(),
+        );
+        upgrade_show_episodes_and_packs(
+            &app,
+            SHOW_TMDB,
+            &["a1080".to_string(), "b720".to_string()],
+            Duration::from_secs(0),
+        )
+        .await;
+        assert_eq!(
+            added.lock().unwrap().clone(),
+            vec!["hbx265".to_string()],
+            "only B is staged; C never is"
+        );
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            "hbx265",
+            "the slot stays on the best copy"
+        );
     }
 
     #[tokio::test]
@@ -9118,7 +9939,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_idle_library_defers_show_upgrade_leaving_state_unchanged() {
-        // FIX 1: a singleton episode WITH a valid better cached candidate, but the library is
+        // A singleton episode WITH a valid better cached candidate, but the library is
         // NON-idle. The per-episode idle guard must bail and SIGNAL deferral (`true`) so
         // `try_upgrade_show` returns `Deferred` and `run_upgrade_once` leaves the round-robin cursor
         // unstamped — nothing swapped/pruned. Asserted on the offline core
@@ -9580,7 +10401,7 @@ mod tests {
 
     #[tokio::test]
     async fn per_episode_upgrade_propagates_apply_upgrade_defer() {
-        // F7: the per-episode loop discarded apply_upgrade's result. If the prune listing is
+        // The per-episode loop once discarded apply_upgrade's result. If the prune listing is
         // unavailable (or the library became active) AFTER staging, apply_upgrade rolls back and
         // returns Deferred — the loop must PROPAGATE that (return true → round-robin cursor left
         // unstamped, reconsidered next tick), not swallow it and log a false "swapped". Force the
@@ -9677,7 +10498,7 @@ mod tests {
 
     #[tokio::test]
     async fn over_ceiling_pack_correction_propagates_apply_upgrade_defer() {
-        // F7: correct_over_ceiling_packs discarded apply_upgrade's result the same way. On a
+        // correct_over_ceiling_packs once discarded apply_upgrade's result the same way. On a
         // post-staging Deferred it must return true (propagate the defer, leave the cursor unstamped
         // and the over-ceiling pack intact for a retry) rather than log a false "pack corrected".
         let store = mem_store();
@@ -9913,7 +10734,7 @@ mod tests {
         }
     }
 
-    /// YAGA's pack quality: an SD (`resolution: 0`) WEB release whose tracks could never be checked
+    /// The SD pack's quality: an SD (`resolution: 0`) WEB release whose tracks could never be checked
     /// (a `.avi`), so `unverified`.
     fn q_sd_web_unverified() -> QualitySummary {
         QualitySummary {
@@ -10118,7 +10939,7 @@ mod tests {
                     crate::store::episode_slot(SHOW_TMDB, 1, *e),
                     SelectionEntry {
                         hash: PACK.into(),
-                        file_path: format!("Yaga.S01E01-E04/Yaga.s01e{e:02}.avi"),
+                        file_path: format!("Show.S01E01-E04/Show.s01e{e:02}.avi"),
                     },
                 )
                 .await
@@ -10188,7 +11009,7 @@ mod tests {
 
     #[tokio::test]
     async fn pack_served_episode_is_upgraded_and_superseded_pack_pruned() {
-        // The YAGA shape: E1–E3 are 1080p WEB singletons serving their own slots; E4 is served by
+        // The SD-pack shape: E1–E3 are 1080p WEB singletons serving their own slots; E4 is served by
         // an SD `.avi` pack (unverified) that also provides E1–E4. A cached 1080p single for E4 is
         // scrape-available → E4 is repointed to it and, since the pack then serves nothing and its
         // other episodes are all held by the singletons, the pack is pruned.
@@ -10366,7 +11187,7 @@ mod tests {
 
     #[tokio::test]
     async fn pack_served_episode_swap_defer_keeps_pack() {
-        // The YAGA shape, but the post-stage prune listing fails: apply_upgrade rolls the staged
+        // The SD-pack shape, but the post-stage prune listing fails: apply_upgrade rolls the staged
         // single back and defers BEFORE any prune — the pack (and its E4 slot) must be intact and
         // the deferral propagated (cursor left unstamped).
         let f = pack_fixture(
@@ -10399,7 +11220,7 @@ mod tests {
 
     #[tokio::test]
     async fn pack_kept_when_an_episode_is_held_only_by_a_pending_copy() {
-        // The YAGA shape, but E3's only other copy is still `Pending` (it may yet be reaped as
+        // The SD-pack shape, but E3's only other copy is still `Pending` (it may yet be reaped as
         // dead). E4 is upgraded, but the pack — the only settled holder of E3 — must be kept.
         let f = pack_fixture(
             &[(1, q1080_web()), (2, q1080_web()), (3, q1080_web())],
@@ -10463,7 +11284,7 @@ mod tests {
 
     #[tokio::test]
     async fn pack_kept_when_a_covering_copy_has_lapsed_off_the_provider() {
-        // The YAGA shape, but E2's singleton has lapsed off the provider: its owned record is still
+        // The SD-pack shape, but E2's singleton has lapsed off the provider: its owned record is still
         // `Verified` and E2's slot still names it, yet its torrent is gone from the listing — so the
         // VFS falls back to the pack for E2. E4 is still upgraded, but the pack (the only PRESENT
         // holder of E2) must be kept, not pruned on the strength of an absent record.
@@ -10840,7 +11661,7 @@ mod tests {
     #[tokio::test]
     async fn unverified_pack_split_into_equal_singles_is_refolded_at_most_once() {
         // An UNVERIFIED MKV WEB-DL x265 1080p pack (its probed file's tracks couldn't be read) serving
-        // every slot, with equal-tier/resolution, slightly higher-scoring singles available. Task 4's
+        // every slot, with equal-tier/resolution, slightly higher-scoring singles available. The
         // unverified rule lets phase (a2) split it into the (checked) singles, and consolidation —
         // whose no-regression gate the equal pack passes — folds it back in the same visit (the
         // listing reflects adds and deletes, so the pruned pack can be re-staged). But consolidation
@@ -11146,25 +11967,25 @@ mod tests {
     fn rus_x265_e4_raw() -> RawCandidate {
         RawCandidate {
             name: "Torrentio\n1080p".into(),
-            description: "Yaga.S01E04.1080p.WEB-DL.x265.Rus\n👤 50 💾 2.1 GB\n🇷🇺\nRD+".into(),
+            description: "Show.S01E04.1080p.WEB-DL.x265.Rus\n👤 50 💾 2.1 GB\n🇷🇺\nRD+".into(),
             info_hash: "hrus4".into(),
             file_idx: Some(0),
-            file_name: Some("Yaga.S01E04.1080p.WEB-DL.x265.Rus.mkv".into()),
+            file_name: Some("Show.S01E04.1080p.WEB-DL.x265.Rus.mkv".into()),
         }
     }
     fn eng_x264_e4_raw() -> RawCandidate {
         RawCandidate {
             name: "Torrentio\n1080p".into(),
-            description: "Yaga.S01E04.1080p.WEB-DL.x264.ENG\n👤 5 💾 1.1 GB\n🇬🇧\nRD+".into(),
+            description: "Show.S01E04.1080p.WEB-DL.x264.ENG\n👤 5 💾 1.1 GB\n🇬🇧\nRD+".into(),
             info_hash: "heng4".into(),
             file_idx: Some(0),
-            file_name: Some("Yaga.S01E04.1080p.WEB-DL.x264.ENG.mkv".into()),
+            file_name: Some("Show.S01E04.1080p.WEB-DL.x264.ENG.mkv".into()),
         }
     }
 
     #[tokio::test]
     async fn pack_served_episode_stages_the_original_language_release_first() {
-        // YAGA S01E04: an English-original show whose E4 is served by an SD pack. A Russian-tagged
+        // An English-original show whose E4 is served by an SD pack. A Russian-tagged
         // single (name + 🇷🇺) and an English one both improve it; the Russian one scores higher on
         // the raw prefs (HEVC). Candidates are ORDERED with the title's resolved audio (as
         // acquisition ranks), so the English release is staged first — and, passing the probe, is

@@ -12,6 +12,11 @@ const REPAIR_COOLDOWN_SECS: u64 = 30;
 /// Maximum consecutive failed repairs before a torrent is marked permanently `Failed`. Counts only
 /// *consecutive* failures — a confirmed good read (`note_read_success`) resets the budget.
 const MAX_REPAIR_ATTEMPTS: u32 = 3;
+/// Upper bound on one instant repair. It runs inline in a WebDAV read, but the provider calls inside
+/// it use the background retry budgets (RD: 10 attempts with up to 30 s backoff on a 5xx; either
+/// client: a 60 s per-request timeout), so during a provider outage it could otherwise hold the read
+/// — and a connection permit — for minutes. A normal repair takes a few seconds.
+const INSTANT_REPAIR_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepairState {
@@ -315,7 +320,9 @@ impl RepairManager {
 
     /// Add magnet, wait for the provider to process, get new torrent info, match files by path, select them.
     /// Returns (new_torrent_id, new_torrent_info) on success.
-    /// On failure, cleans up the leaked torrent and marks the old torrent as failed.
+    /// On failure, `reacquire::materialise` deletes a leaked NEW-id torrent (never `old_torrent_id`,
+    /// passed as `protect_id`), and the old torrent is kept visible (`Healthy`) with its attempt
+    /// budget reset (`note_transient_repair_failure`).
     async fn add_and_select_files(
         &self,
         old_torrent_id: &str,
@@ -478,7 +485,29 @@ impl RepairManager {
         // `Repairing` torrent on drop; a normal completion disarms it (see `RepairInProgressGuard`).
         let mut guard =
             RepairInProgressGuard::armed(Arc::clone(&self.health_status), torrent_id.to_string());
-        let result = self.instant_repair_inner(locator, torrent_id).await;
+        // Bound the whole repair: the read that triggered it is waiting (see
+        // `INSTANT_REPAIR_TIMEOUT`). On timeout the inner future is dropped at an await, which is
+        // the same cancellation the guard covers, but the guard only resets the STATE — so also
+        // reset the attempt budget here (keeping the cooldown), or repeated timeouts during an
+        // outage would climb to `MAX_REPAIR_ATTEMPTS` and trap the torrent `Failed`/hidden. A
+        // timeout after RD's `add_magnet` can leave the new-id torrent behind; it carries the same
+        // hash, so once it is downloaded the scan loop's same-hash duplicate deletion collapses the
+        // pair back to one torrent (the same path as any other leaked repair add).
+        let result = match tokio::time::timeout(
+            INSTANT_REPAIR_TIMEOUT,
+            self.instant_repair_inner(locator, torrent_id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.note_transient_repair_failure(torrent_id).await;
+                Err(RepairFailure::Deferred(format!(
+                    "instant repair timed out after {}s",
+                    INSTANT_REPAIR_TIMEOUT.as_secs()
+                )))
+            }
+        };
         guard.disarm();
         result
     }
@@ -754,13 +783,6 @@ mod tests {
         let _manager = RepairManager::new(provider);
     }
 
-    /// Compile-time check: try_instant_repair exists with the correct signature.
-    #[allow(dead_code)]
-    async fn _assert_try_instant_repair_signature(manager: &RepairManager) {
-        let _: Result<crate::provider::FileLocator, RepairFailure> =
-            manager.try_instant_repair(&FileLocator::default()).await;
-    }
-
     #[tokio::test]
     async fn should_hide_torrent_for_each_state() {
         let manager = make_test_manager();
@@ -844,10 +866,10 @@ mod tests {
         );
     }
 
+    /// A manager over an in-memory provider: a unit test must never reach a live API (a real client
+    /// here sent `complete_repair`'s DELETE to api.real-debrid.com).
     fn make_test_manager() -> RepairManager {
-        let rd_client =
-            Arc::new(crate::rd_client::RealDebridClient::new("fake-token".to_string()).unwrap());
-        RepairManager::new(rd_client)
+        RepairManager::new(Arc::new(crate::provider::MockProvider::default()))
     }
 
     /// `locator_for_file` advances `link_idx` ONLY for `selected == 1` files, pairing RD's
@@ -914,7 +936,9 @@ mod tests {
         use crate::rd_client::{AddMagnetResponse, TorrentFile, TorrentInfo};
 
         // MockProvider returns a "downloaded" torrent containing the target file with a link.
+        let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mock = crate::provider::MockProvider {
+            deleted: deleted.clone(),
             add_magnet: Some(AddMagnetResponse {
                 id: "new_tid".to_string(),
                 uri: String::new(),
@@ -952,6 +976,23 @@ mod tests {
         assert_eq!(new.file_path, "/Movie.mkv");
         assert_eq!(new.link.as_deref(), Some("https://rd/newlink"));
         assert_eq!(new.hash, "H");
+        // The destructive half of the RD new-id success path: only the superseded OLD torrent is
+        // deleted (never the replacement now serving the file), and new→old is recorded so the scan
+        // loop reuses the old identification for the replacement.
+        assert_eq!(
+            *deleted.lock().unwrap(),
+            vec!["old_tid".to_string()],
+            "only the superseded old torrent is deleted"
+        );
+        assert_eq!(
+            manager
+                .take_repair_replacements()
+                .await
+                .get("new_tid")
+                .map(String::as_str),
+            Some("old_tid"),
+            "a cached new-id repair records new→old for the scan loop"
+        );
     }
 
     /// R1 regression: `try_instant_repair` is awaited inside the WebDAV read future. If that future
@@ -1027,6 +1068,96 @@ mod tests {
         assert!(
             recovered,
             "a cancelled repair must not leave the torrent stranded Repairing/hidden"
+        );
+    }
+
+    /// A provider whose `get_torrent_info` never returns: stands in for an API that accepts the
+    /// connection and then hangs, or one deep in its (slow, background-sized) retry backoff.
+    #[derive(Debug)]
+    struct HangingInfoProvider;
+
+    #[async_trait::async_trait]
+    impl DebridProvider for HangingInfoProvider {
+        fn name(&self) -> &'static str {
+            "hanging"
+        }
+        async fn get_torrents(&self) -> Result<Vec<crate::rd_client::Torrent>, reqwest::Error> {
+            Ok(vec![])
+        }
+        async fn get_torrent_info(&self, _id: &str) -> Result<TorrentInfo, reqwest::Error> {
+            std::future::pending().await
+        }
+        async fn add_magnet(
+            &self,
+            _magnet: &str,
+        ) -> Result<crate::rd_client::AddMagnetResponse, reqwest::Error> {
+            std::future::pending().await
+        }
+        async fn select_files(&self, _t: &str, _f: &str) -> Result<(), reqwest::Error> {
+            Ok(())
+        }
+        async fn delete_torrent(&self, _t: &str) -> Result<(), reqwest::Error> {
+            Ok(())
+        }
+        async fn resolve_url(&self, _l: &FileLocator) -> Result<String, crate::error::AppError> {
+            Err(crate::error::AppError::Unavailable)
+        }
+        async fn invalidate(&self, _l: &FileLocator) {}
+    }
+
+    /// The repair runs inline in a WebDAV read, so it must give up within `INSTANT_REPAIR_TIMEOUT`
+    /// even when the provider hangs, rather than holding the read (and a connection permit) for the
+    /// minutes its background retry budgets allow. A timed-out repair produced no replacement, so the
+    /// torrent stays visible with its attempt budget reset and its cooldown kept, exactly like the
+    /// other transient arms.
+    #[tokio::test(start_paused = true)]
+    async fn try_instant_repair_gives_up_when_the_provider_hangs() {
+        let manager = RepairManager::new(Arc::new(HangingInfoProvider));
+        {
+            let mut hm = manager.health_status.write().await;
+            hm.insert(
+                "tid".to_string(),
+                TorrentHealth {
+                    torrent_id: "tid".to_string(),
+                    state: RepairState::Healthy,
+                    repair_attempts: 2,
+                    last_repair_trigger: Some(std::time::Instant::now() - Duration::from_secs(31)),
+                },
+            );
+        }
+        let loc = FileLocator {
+            hash: "H".to_string(),
+            torrent_id: "tid".to_string(),
+            file_path: "/Movie.mkv".to_string(),
+            ..Default::default()
+        };
+        let started = tokio::time::Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(600), manager.try_instant_repair(&loc))
+            .await
+            .expect("the inline repair must bound itself, not hang the read");
+        assert!(
+            matches!(r, Err(RepairFailure::Deferred(_))),
+            "a timed-out repair is a transient deferral, got {r:?}"
+        );
+        assert!(
+            started.elapsed() <= INSTANT_REPAIR_TIMEOUT + Duration::from_secs(1),
+            "gave up after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !manager.should_hide_torrent("tid").await,
+            "a timed-out repair must leave the torrent visible"
+        );
+        let hm = manager.health_status.read().await;
+        let h = hm.get("tid").expect("health entry present");
+        assert_eq!(h.state, RepairState::Healthy);
+        assert_eq!(
+            h.repair_attempts, 0,
+            "a timeout is not a broken-file signal, so it must not climb toward Failed"
+        );
+        assert!(
+            h.last_repair_trigger.is_some(),
+            "the cooldown is kept so the next read doesn't re-run the hanging repair at once"
         );
     }
 
@@ -1150,6 +1281,10 @@ mod tests {
             deleted.lock().unwrap().is_empty(),
             "the repaired-in-place torrent (same id) must NOT be deleted, got: {:?}",
             deleted.lock().unwrap()
+        );
+        assert!(
+            manager.take_repair_replacements().await.is_empty(),
+            "a same-id repair has no replacement to record"
         );
     }
 

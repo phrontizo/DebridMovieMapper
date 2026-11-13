@@ -1,6 +1,7 @@
 target/
-metadata.db
-metadata.db/
+# The redb database (file or directory) and its `.corrupt[.N]` backups hold Trakt tokens: keep
+# them out of the build context.
+metadata.db*
 .env
 .git/
 .idea/

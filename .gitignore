@@ -1,5 +1,7 @@
 /target
-metadata.db
+# The redb database plus the `<db>.corrupt[.N]` backups Store::open moves a damaged one to: both
+# hold Trakt OAuth tokens and the library, so neither may be committed.
+metadata.db*
 .env
 
 # macOS

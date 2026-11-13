@@ -5,6 +5,10 @@
 //! operator link a Trakt account via OAuth device-flow, list linked accounts, and refresh or
 //! remove them. Tokens are keyed by the user's Trakt *slug* (stable per-user key).
 //!
+//! Two browser-side guards back that model up: a `Host` allowlist (only local-network names,
+//! plus `TRAKT_ENROL_ALLOWED_HOSTS`) refuses DNS-rebinding pages, and a same-origin check refuses
+//! cross-origin form POSTs.
+//!
 //! Responses are built as `dav_server::body::Body` (via `Body::from(String)`) so `main`'s
 //! per-connection service can return either these or `DavHandler::handle`'s response uniformly.
 
@@ -28,6 +32,9 @@ pub struct EnrolmentService {
     /// 429-ing while an earlier code is still pending approval, while still keeping the exposure
     /// tightly bounded.
     inflight: Arc<tokio::sync::Semaphore>,
+    /// Extra hostnames (lowercase, no port) accepted in the `Host` header on top of the built-in
+    /// local-network names — from `TRAKT_ENROL_ALLOWED_HOSTS`, e.g. a reverse proxy's FQDN.
+    allowed_hosts: Vec<String>,
 }
 
 /// Max simultaneous pending device-flow enrolments (each holds a slot for the ~600s poll window).
@@ -39,7 +46,15 @@ impl EnrolmentService {
             trakt,
             store,
             inflight: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ENROLMENTS)),
+            allowed_hosts: Vec::new(),
         }
+    }
+
+    /// Also accept these hostnames (lowercase, no port; see `config::parse_allowed_hosts`) in the
+    /// `Host` header, on top of the built-in local-network names.
+    pub fn with_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.allowed_hosts = hosts;
+        self
     }
 
     /// Route a `/trakt*` request by method + path. Unknown `/trakt` paths return 404.
@@ -50,6 +65,30 @@ impl EnrolmentService {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+        // DNS-rebinding guard, for every method (the GET page lists the account slugs). A page on
+        // an attacker's domain whose name is rebound to this server's IP is same-origin as far as
+        // the browser knows: its Origin matches its Host, so the CSRF guard below passes it. Its
+        // Host still names the attacker's domain, though, so answer only for local-network names
+        // the attacker can't point at us. A request with no Host header isn't from a browser.
+        if let Some(host) = req.headers().get(hyper::header::HOST) {
+            let allowed = host
+                .to_str()
+                .is_ok_and(|h| host_is_allowed(h, &self.allowed_hosts));
+            if !allowed {
+                warn!(
+                    "Rejecting {} {} for Host {:?}: not a local-network name \
+                     (add it to TRAKT_ENROL_ALLOWED_HOSTS to allow it)",
+                    method, path, host
+                );
+                return html(
+                    StatusCode::MISDIRECTED_REQUEST,
+                    "<h1>421 Misdirected Request</h1><p>This host name is not accepted. \
+                     Add it to TRAKT_ENROL_ALLOWED_HOSTS to use it.</p>"
+                        .to_string(),
+                );
+            }
+        }
 
         // CSRF guard: the state-changing POST routes are unauthenticated, so the trusted-LAN
         // model alone does not stop a drive-by cross-origin form POST from a page a LAN browser
@@ -182,8 +221,10 @@ impl EnrolmentService {
             Err(AppError::RateLimited) => {
                 // A rate-limit (persistent 429) is transient, NOT an auth failure: the grant was
                 // never processed, so the single-use refresh token is untouched and next cycle will
-                // retry. Flagging `needs_reenrolment` here would make background jobs skip a healthy
-                // account until a manual re-enrolment, which never self-heals. Leave the record intact.
+                // retry. Don't flag `needs_reenrolment`: it is an accounts-page marker (background
+                // sync keeps syncing a flagged account and clears it on the next success), and a
+                // spurious one sends the operator off to re-enrol a healthy account. Leave the
+                // record intact.
                 info!(
                     "Trakt refresh for '{}' was rate-limited (429) — not flagging, will retry next cycle",
                     slug
@@ -195,7 +236,7 @@ impl EnrolmentService {
                 // a concurrent refresh already rotated it, Trakt invalidated our token on that other
                 // success, so THIS failure is a false alarm — the CAS skips the write (returns false)
                 // and we leave the good record alone. This prevents a spurious `needs_reenrolment`
-                // that would make background jobs skip a healthy account.
+                // marker telling the operator to re-enrol a healthy account.
                 let flagged = self
                     .store
                     .update_trakt_tokens_if_refresh_matches(slug.to_string(), expected, |current| {
@@ -222,19 +263,10 @@ impl EnrolmentService {
     /// tokens, so a removed slug's rows are never revisited. Left behind, they keep the reconciler
     /// acquiring the title under the removed user's (now frozen) provenance and perpetually satisfy
     /// `wants()`, so Trigger-B cleanup can never fire. Prune them here as part of the unlink.
+    /// The store drops the token row and the wanted rows in one write transaction, so a failure
+    /// part-way can't leave orphaned rows behind.
     pub(crate) async fn remove_account(&self, slug: &str) -> Result<(), AppError> {
-        self.store.remove_trakt_tokens(slug.to_string()).await?;
-        // Intentional full `wanted` scan: account removal is rare and operator-initiated, and the
-        // store exposes no user-prefixed range delete, so the O(all-users × all-titles) scan here is
-        // acceptable (and simpler than adding a prefix index for a cold path).
-        for rec in self.store.all_wanted().await {
-            if rec.user == slug {
-                self.store
-                    .remove_wanted(rec.user, rec.media_type, rec.tmdb_id)
-                    .await?;
-            }
-        }
-        Ok(())
+        self.store.remove_trakt_account(slug.to_string()).await
     }
 }
 
@@ -395,6 +427,64 @@ fn is_cross_origin<B>(req: &hyper::Request<B>) -> bool {
         }
     }
     false
+}
+
+/// Whether the enrolment routes answer for a request whose `Host` header is `host`: an IP literal,
+/// `localhost` or a `*.localhost` name, a single-label name (`mediabox`, a docker service name), a name
+/// under a suffix that public DNS never delegates (`.local`, `.lan`, `.internal`, `.home.arpa`), or
+/// one of `extra` (lowercase, no port). A DNS-rebinding attack needs a name the attacker controls in
+/// public DNS, which none of these are. Anything malformed (bad port, unclosed bracket, characters a
+/// hostname can't contain) is refused.
+fn host_is_allowed(host: &str, extra: &[String]) -> bool {
+    let Some((name, is_ip_literal)) = hostname_of(host) else {
+        return false;
+    };
+    if is_ip_literal || name.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && l.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    if !name.split('.').all(label_ok) {
+        return false;
+    }
+    if extra.contains(&name) || !name.contains('.') {
+        return true;
+    }
+    const LOCAL_SUFFIXES: [&str; 5] = ["localhost", "local", "lan", "internal", "home.arpa"];
+    LOCAL_SUFFIXES.iter().any(|suffix| {
+        name.strip_suffix(suffix)
+            .is_some_and(|rest| rest.is_empty() || rest.ends_with('.'))
+    })
+}
+
+/// Split a `Host` header value into its lowercase hostname (port, IPv6 brackets, an IPv6 zone id
+/// and a trailing root dot removed) and whether it was a bracketed IPv6 literal. `None` when it is
+/// malformed: empty, an unclosed bracket, or a port that isn't all digits.
+fn hostname_of(host: &str) -> Option<(String, bool)> {
+    let host = host.trim();
+    let port_ok = |port: &str| port.bytes().all(|b| b.is_ascii_digit());
+    if let Some(rest) = host.strip_prefix('[') {
+        let (addr, after) = rest.split_once(']')?;
+        if !(after.is_empty() || after.strip_prefix(':').is_some_and(port_ok)) {
+            return None;
+        }
+        // `[fe80::1%25eth0]`: the zone id is not part of the address.
+        let addr = addr.split('%').next().unwrap_or(addr);
+        return addr
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok()
+            .then(|| (addr.to_string(), true));
+    }
+    let name = match host.split_once(':') {
+        Some((name, port)) if port_ok(port) => name,
+        Some(_) => return None,
+        None => host,
+    };
+    let name = name.strip_suffix('.').unwrap_or(name);
+    (!name.is_empty()).then(|| (name.to_ascii_lowercase(), false))
 }
 
 /// Strip the DEFAULT port for `scheme` (`:80` for http, `:443` for https) from a `host[:port]`, so a
@@ -972,8 +1062,8 @@ mod tests {
 
     #[test]
     fn encode_path_segment_passes_real_slugs_and_encodes_path_specials() {
-        // Real Trakt slugs are unreserved characters → unchanged (the route still matches).
-        assert_eq!(encode_path_segment("kiril-p"), "kiril-p");
+        // Typical Trakt slugs use only unreserved characters → unchanged (the route still matches).
+        assert_eq!(encode_path_segment("jane-doe"), "jane-doe");
         assert_eq!(encode_path_segment("user_123.x~y"), "user_123.x~y");
         // A path-significant character can't break out of the /trakt/accounts/<slug>/… route.
         assert_eq!(encode_path_segment("a/b"), "a%2Fb");
@@ -999,7 +1089,7 @@ mod tests {
         // Every slug the router might receive must round-trip back to its stored key, otherwise
         // the refresh/remove buttons silently no-op for a fallback slug (see the space case).
         for slug in [
-            "kiril-p",
+            "jane-doe",
             "user_123.x~y",
             "Bob Smith",
             "a/b",
@@ -1210,6 +1300,134 @@ mod tests {
         );
     }
 
+    // ── security: Host allowlist (DNS-rebinding guard) ────────────────────────
+
+    /// A request whose Host AND Origin both name `host` — what a browser sends from a page served by
+    /// that host, including a DNS-rebinding page whose name now resolves to this server.
+    fn req_for_host(method: Method, path: &str, host: &str) -> hyper::Request<()> {
+        hyper::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", host)
+            .header("origin", format!("http://{host}"))
+            .body(())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rebinding_host_is_rejected_on_every_route() {
+        // DNS rebinding: an attacker page on rebind.attacker.example:8080, its name rebound to this
+        // server's IP, sends Host and Origin that match, so the CSRF guard passes. The Host
+        // allowlist must refuse it before any route runs, reads or writes included.
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
+            .await
+            .unwrap();
+        let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), store.clone());
+        let host = "rebind.attacker.example:8080";
+        for (method, path) in [
+            (Method::GET, "/trakt/accounts"),
+            (Method::GET, "/trakt"),
+            (Method::POST, "/trakt/accounts/alice/remove"),
+            (Method::POST, "/trakt/accounts/alice/refresh"),
+            (Method::POST, "/trakt/enrol"),
+        ] {
+            let r = svc.handle(req_for_host(method.clone(), path, host)).await;
+            assert_eq!(
+                r.status(),
+                StatusCode::MISDIRECTED_REQUEST,
+                "{method} {path} for a rebinding Host must be refused"
+            );
+        }
+        assert!(
+            store.get_trakt_tokens("alice".into()).await.is_some(),
+            "a refused remove must not unlink the account"
+        );
+        assert_eq!(
+            svc.inflight.available_permits(),
+            MAX_CONCURRENT_ENROLMENTS,
+            "a refused enrol must not start a device-flow poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_network_hosts_are_accepted() {
+        let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), mem_store());
+        for host in [
+            "192.168.1.10:8080",
+            "127.0.0.1",
+            "[::1]:8080",
+            "[fe80::1%25eth0]:8080",
+            "localhost:8080",
+            "LOCALHOST",
+            "app.localhost",
+            "mediabox:8080",
+            "debridmoviemapper:8080",
+            "host.local",
+            "nas.lan",
+            "box.home.arpa",
+            "svc.internal:8080",
+            "host.local.",
+        ] {
+            let r = svc
+                .handle(req_for_host(Method::GET, "/trakt/accounts", host))
+                .await;
+            assert_eq!(r.status(), StatusCode::OK, "Host {host} must be accepted");
+        }
+        // No Host header at all (a non-browser client): accepted, like the CSRF guard's
+        // header-less case.
+        let r = svc
+            .handle(
+                hyper::Request::builder()
+                    .method(Method::GET)
+                    .uri("/trakt/accounts")
+                    .body(())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn configured_extra_host_is_accepted_case_insensitively() {
+        let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), mem_store())
+            .with_allowed_hosts(vec!["media.example.com".to_string()]);
+        for host in ["media.example.com", "Media.Example.COM:443"] {
+            let r = svc
+                .handle(req_for_host(Method::GET, "/trakt/accounts", host))
+                .await;
+            assert_eq!(r.status(), StatusCode::OK, "allowlisted Host {host}");
+        }
+        // Another public name is still refused.
+        let r = svc
+            .handle(req_for_host(
+                Method::GET,
+                "/trakt/accounts",
+                "other.example.com",
+            ))
+            .await;
+        assert_eq!(r.status(), StatusCode::MISDIRECTED_REQUEST);
+    }
+
+    #[test]
+    fn host_allowlist_rejects_lookalikes_and_malformed_hosts() {
+        for host in [
+            "rebind.attacker.example",
+            "localhost.attacker.example",
+            "host.local.attacker.example",
+            "127.0.0.1.nip.io",
+            "evil.example:8080",
+            "host.local:abc",
+            "[::1",
+            "[::1]x",
+            "a b",
+            "",
+        ] {
+            assert!(!host_is_allowed(host, &[]), "{host:?} must be refused");
+        }
+    }
+
     /// A TraktClient whose `refresh` simulates a CONCURRENT refresh: it rotates the stored token's
     /// refresh string (as if another /refresh just succeeded and Trakt invalidated ours), then fails.
     struct RotatingThenFailingRefresh {
@@ -1262,7 +1480,7 @@ mod tests {
     async fn refresh_failure_on_a_concurrently_rotated_token_does_not_flag_reenrolment() {
         // A second concurrent /refresh rotates the stored token; our refresh then fails against the
         // now-stale token. That false-alarm failure must NOT set needs_reenrolment over the freshly
-        // good record (which would make background jobs skip a healthy account).
+        // good record (the accounts page would then ask the operator to re-enrol a healthy account).
         let store = mem_store();
         store
             .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
@@ -1353,8 +1571,8 @@ mod tests {
     #[tokio::test]
     async fn refresh_rate_limit_does_not_flag_reenrolment() {
         // A persistent 429 during refresh is transient throttling, not an auth failure — the single-
-        // use grant was never processed. It must NOT flag re-enrolment (which never self-heals, since
-        // background jobs skip flagged accounts), unlike the genuine-failure case above.
+        // use grant was never processed. It must NOT flag re-enrolment (a spurious accounts-page
+        // marker prompting a needless re-enrolment), unlike the genuine-failure case above.
         let store = mem_store();
         store
             .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))

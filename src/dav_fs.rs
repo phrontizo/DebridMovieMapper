@@ -30,6 +30,23 @@ fn parse_content_range_start(v: &str) -> Option<u64> {
         .ok()
 }
 
+/// The `DebridVfs::timestamps` key for `path`: its relative form with no leading/trailing `/` or
+/// leading `./`, and the root (`.`) as the empty string. `open`, `read_dir` and `metadata` all key
+/// through this so a file reports the same mtime whether it is listed, stat'ed or opened.
+fn timestamp_key(path: &DavPath) -> String {
+    let rel = path.as_rel_ospath();
+    let key = rel
+        .to_str()
+        .unwrap_or("")
+        .trim_matches('/')
+        .trim_start_matches("./");
+    if key == "." {
+        String::new()
+    } else {
+        key.to_string()
+    }
+}
+
 /// Resolve a `SeekFrom` against the current position `pos` and the object `size` to a new absolute
 /// offset, rejecting a seek that would land before byte 0 (or overflow `i64`). Shared by
 /// `ProxiedMediaFile` and `VirtualFile`'s `DavFile::seek` so the underflow guard lives in one place.
@@ -133,15 +150,10 @@ impl DavFileSystem for DebridFileSystem {
     ) -> FsFuture<'a, Box<dyn DavFile>> {
         async move {
             let rel = path.as_rel_ospath();
-            // Timestamp lookup key, normalised exactly like the `metadata`/`read_dir` paths so an
-            // opened file reports the SAME mtime it does when listed (see below — the open-file
-            // metadata used to hardcode UNIX_EPOCH, confusing media-server change detection).
-            let ts_key = rel
-                .to_str()
-                .unwrap_or("")
-                .trim_matches('/')
-                .trim_start_matches("./")
-                .to_string();
+            // Timestamp lookup key, shared with `metadata`/`read_dir` so an opened file reports the
+            // SAME mtime it does when listed (see below — the open-file metadata used to hardcode
+            // UNIX_EPOCH, confusing media-server change detection).
+            let ts_key = timestamp_key(path);
             let name = rel
                 .to_str()
                 .and_then(|s| s.rsplit('/').next())
@@ -220,19 +232,14 @@ impl DavFileSystem for DebridFileSystem {
         async move {
             let vfs = self.vfs.read().await;
             let node = Self::find_node_ref(&vfs, path).ok_or(FsError::NotFound)?;
-            let path_str = path
-                .as_rel_ospath()
-                .to_str()
-                .unwrap_or("")
-                .trim_matches('/')
-                .trim_start_matches("./");
+            let base = timestamp_key(path);
             if let VfsNode::Directory { children } = node {
                 let mut entries: Vec<Box<dyn DavDirEntry>> = Vec::new();
                 for (name, child) in children {
-                    let child_path = if path_str.is_empty() || path_str == "." {
+                    let child_path = if base.is_empty() {
                         name.clone()
                     } else {
-                        format!("{}/{}", path_str, name)
+                        format!("{}/{}", base, name)
                     };
                     let modified_time = vfs
                         .timestamps
@@ -257,13 +264,11 @@ impl DavFileSystem for DebridFileSystem {
         async move {
             let vfs = self.vfs.read().await;
             let node = Self::find_node_ref(&vfs, path).ok_or(FsError::NotFound)?;
-            let path_str = path
-                .as_rel_ospath()
-                .to_str()
-                .unwrap_or("")
-                .trim_matches('/')
-                .trim_start_matches("./");
-            let modified_time = vfs.timestamps.get(path_str).copied().unwrap_or(UNIX_EPOCH);
+            let modified_time = vfs
+                .timestamps
+                .get(&timestamp_key(path))
+                .copied()
+                .unwrap_or(UNIX_EPOCH);
             Ok(Box::new(DebridMetaData::from_node(node, modified_time)) as Box<dyn DavMetaData>)
         }
         .boxed()
@@ -529,9 +534,10 @@ impl ProxiedMediaFile {
     /// Fetch a byte range from the CDN with up to 3 attempts, branching by failure kind (each arm's
     /// full rationale is in the inline comments):
     ///
-    /// - **Connection error** (TCP failure, timeout): retry the SAME url — the URL is still valid,
-    ///   the error is transient. `cdn_url`/the resolution are intentionally left intact so many
-    ///   concurrent readers don't all re-resolve through the rate-limiter at once (a stampede).
+    /// - **Connection error** (TCP failure, timeout), while sending the request OR reading the body:
+    ///   retry once on the SAME url — the URL is still valid, the error is transient (a partial body
+    ///   is discarded). `cdn_url`/the resolution are intentionally left intact so many concurrent
+    ///   readers don't all re-resolve through the rate-limiter at once (a stampede).
     ///
     /// - **Persistent 5xx**: NOT a stale URL — the file is (transiently) broken on the provider, so
     ///   again do NOT invalidate. Retry the same url; once a retry still 5xxs, escalate to instant
@@ -542,10 +548,12 @@ impl ProxiedMediaFile {
     ///   oversized body, or a Content-Range mismatch): drop `cdn_url` + invalidate the resolution so
     ///   the next attempt re-resolves a fresh URL.
     async fn fetch_cdn_range(&mut self, pos: u64, range_end: u64) -> Result<Bytes, FsError> {
-        // Three attempts: original url, one cheap fresh-url retry, then (only if a 5xx persisted) one
-        // post-instant-repair fetch. `repaired` caps the repair escalation at once per call.
+        // Three attempts: the original url, one retry (the same url after a connection error or a
+        // 5xx; a freshly re-resolved url after a stale 4xx / non-compliant response), then (only if a
+        // 5xx persisted) one post-instant-repair fetch. `repaired` caps the repair escalation at once
+        // per call.
         let mut repaired = false;
-        for attempt in 0..3u8 {
+        'attempts: for attempt in 0..3u8 {
             let cdn_url = self.resolve_cdn_url().await?;
 
             let resp = match self
@@ -699,12 +707,19 @@ impl ProxiedMediaFile {
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        // Strip the signed CDN URL from the error Display (see above).
+                        // The connection died after the headers (a mid-body reset, a pooled
+                        // keep-alive connection closing, the client timeout firing during the body):
+                        // the same transient failure as the send-error arm above, so retry once on
+                        // the SAME url without invalidating, discarding the partial body. Strip the
+                        // signed CDN URL from the error Display (see above).
                         tracing::warn!(
                             "CDN body read failed for {}: {}",
                             self.name,
                             e.without_url()
                         );
+                        if attempt == 0 {
+                            continue 'attempts;
+                        }
                         return Err(FsError::GeneralFailure);
                     }
                 }
@@ -801,34 +816,6 @@ impl DavFile for ProxiedMediaFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Compile-time check: ProxiedMediaFile has all expected fields.
-    /// Fails to compile if any field is removed or renamed.
-    #[allow(dead_code)]
-    fn _assert_proxied_media_file_has_on_demand_fields(
-        repair_manager: Arc<RepairManager>,
-        provider: Arc<dyn crate::provider::DebridProvider>,
-    ) {
-        use crate::provider::FileLocator;
-        let _ = ProxiedMediaFile {
-            name: String::new(),
-            locator: FileLocator {
-                ..Default::default()
-            },
-            file_size: 0,
-            repair_manager,
-            provider,
-            http_client: reqwest::Client::new(),
-            pos: 0,
-            cdn_url: None,
-            buffer: Bytes::new(),
-            buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            modified_time: SystemTime::UNIX_EPOCH,
-            confirmed_read: false,
-            first_read_bytes: BUFFER_SIZE as u64,
-        };
-    }
 
     #[test]
     fn debrid_metadata_from_node_extracts_correct_fields() {
@@ -1091,20 +1078,9 @@ mod provider_abstraction_tests {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    #[test]
-    fn debrid_filesystem_accepts_trait_object() {
-        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
-        let vfs = Arc::new(RwLock::new(DebridVfs::new()));
-        let repair = Arc::new(RepairManager::new(provider.clone()));
-        let http = reqwest::Client::new();
-        let ra = Arc::new(crate::read_activity::ReadActivity::without_startup_grace());
-        let _fs = DebridFileSystem::new(provider, vfs, repair, http, ra);
-    }
-
-    #[tokio::test]
-    async fn opened_nfo_reports_the_real_mtime_not_unix_epoch() {
-        use dav_server::fs::{DavFileSystem, OpenOptions};
-
+    /// A filesystem over one movie, `Movies/Test Movie [tmdbid-123]/{Test.mkv, movie.nfo}`, whose
+    /// torrent was added 2023-01-01 and whose media file is 1000 bytes.
+    fn one_movie_fs() -> DebridFileSystem {
         let torrents = vec![(
             crate::rd_client::TorrentInfo {
                 id: "t1".to_string(),
@@ -1138,13 +1114,75 @@ mod provider_abstraction_tests {
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
         let repair = Arc::new(RepairManager::new(provider.clone()));
         let ra = Arc::new(crate::read_activity::ReadActivity::without_startup_grace());
-        let fs = DebridFileSystem::new(
+        DebridFileSystem::new(
             provider,
             Arc::new(RwLock::new(vfs)),
             repair,
             reqwest::Client::new(),
             ra,
-        );
+        )
+    }
+
+    #[tokio::test]
+    async fn listed_entries_report_the_real_mtime_and_size() {
+        // A PROPFIND listing (`read_dir`) must key each child's timestamp exactly as the VFS stores
+        // it; a mismatch would date every listed item 1970 and defeat media-server change detection.
+        use dav_server::fs::{DavFileSystem, ReadDirMeta};
+        use futures_util::StreamExt;
+        let fs = one_movie_fs();
+        let added = crate::vfs::parse_rd_date("2023-01-01");
+        assert_ne!(added, SystemTime::UNIX_EPOCH);
+
+        let folder = DavPath::new("/Movies/Test Movie [tmdbid-123]").unwrap();
+        let mut entries = DavFileSystem::read_dir(&fs, &folder, ReadDirMeta::Data)
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let entry = entry.unwrap();
+            let name = String::from_utf8(entry.name()).unwrap();
+            let md = entry.metadata().await.unwrap();
+            assert_eq!(md.modified().unwrap(), added, "{name}: listed mtime");
+            if name == "Test.mkv" {
+                assert_eq!(md.len(), 1000);
+            }
+            seen.push(name);
+        }
+        seen.sort();
+        assert_eq!(seen, vec!["Test.mkv", "movie.nfo"]);
+
+        // The listing of a section keys its child folders the same way.
+        let movies = DavPath::new("/Movies").unwrap();
+        let mut entries = DavFileSystem::read_dir(&fs, &movies, ReadDirMeta::Data)
+            .await
+            .unwrap();
+        let entry = entries.next().await.unwrap().unwrap();
+        assert_eq!(entry.metadata().await.unwrap().modified().unwrap(), added);
+    }
+
+    #[tokio::test]
+    async fn stat_reports_the_real_mtime_for_folder_media_and_nfo() {
+        use dav_server::fs::DavFileSystem;
+        let fs = one_movie_fs();
+        let added = crate::vfs::parse_rd_date("2023-01-01");
+        for (path, is_dir) in [
+            ("/Movies/Test Movie [tmdbid-123]", true),
+            ("/Movies/Test Movie [tmdbid-123]/", true),
+            ("/Movies/Test Movie [tmdbid-123]/Test.mkv", false),
+            ("/Movies/Test Movie [tmdbid-123]/movie.nfo", false),
+        ] {
+            let md = DavFileSystem::metadata(&fs, &DavPath::new(path).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(md.modified().unwrap(), added, "{path}: stat mtime");
+            assert_eq!(md.is_dir(), is_dir, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn opened_nfo_reports_the_real_mtime_not_unix_epoch() {
+        use dav_server::fs::{DavFileSystem, OpenOptions};
+        let fs = one_movie_fs();
 
         // Open the generated NFO and the media file; both must report the SAME real mtime
         // (derived from `added: 2023-01-01`), NOT the old hardcoded UNIX_EPOCH for the NFO.
@@ -1170,43 +1208,8 @@ mod provider_abstraction_tests {
         );
     }
 
-    #[test]
-    fn proxied_media_file_holds_locator() {
-        use crate::provider::FileLocator;
-        let loc = FileLocator {
-            hash: "h".to_string(),
-            torrent_id: "t".to_string(),
-            file_id: 3,
-            file_path: "Movie/Movie.mkv".to_string(),
-            link: Some("https://rd/x".to_string()),
-        };
-        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            resolved_url: Some("https://cdn/movie".to_string()),
-            ..Default::default()
-        });
-        let repair = Arc::new(RepairManager::new(provider.clone()));
-        let f = ProxiedMediaFile {
-            name: "Movie.mkv".to_string(),
-            locator: loc.clone(),
-            file_size: 10,
-            repair_manager: repair,
-            provider,
-            http_client: reqwest::Client::new(),
-            pos: 0,
-            cdn_url: None,
-            buffer: bytes::Bytes::new(),
-            buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            modified_time: SystemTime::UNIX_EPOCH,
-            confirmed_read: false,
-            first_read_bytes: BUFFER_SIZE as u64,
-        };
-        assert_eq!(f.locator.file_id, 3);
-    }
-
     #[tokio::test]
     async fn fetch_bytes_rejects_range_ignoring_200_after_seek() {
-        use crate::provider::FileLocator;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // A CDN that ignores the Range header and always replies 200 OK with the
@@ -1228,28 +1231,8 @@ mod provider_abstraction_tests {
             }
         });
 
-        let url = format!("http://{}/", addr);
-        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            resolved_url: Some(url.clone()),
-            ..Default::default()
-        });
-        let repair = Arc::new(RepairManager::new(provider.clone()));
-        let mut f = ProxiedMediaFile {
-            name: "Movie.mkv".to_string(),
-            locator: FileLocator::default(),
-            file_size: 1000,
-            repair_manager: repair,
-            provider,
-            http_client: reqwest::Client::new(),
-            pos: 500, // a seek to a non-zero offset
-            cdn_url: Some(url),
-            buffer: bytes::Bytes::new(),
-            buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            modified_time: SystemTime::UNIX_EPOCH,
-            confirmed_read: false,
-            first_read_bytes: BUFFER_SIZE as u64,
-        };
+        // A seek to a non-zero offset.
+        let mut f = proxied_for(format!("http://{}/", addr), 500, 1000);
 
         // The 200 carries the file from offset 0, not from 500 — serving it would hand the
         // reader the wrong bytes. It must error instead.
@@ -1261,16 +1244,23 @@ mod provider_abstraction_tests {
     }
 
     /// Spawn a local server that replies `200 OK` with the given Content-Length header and
-    /// body, ignoring the Range header. Returns the base URL.
-    async fn spawn_range_ignoring_200(content_length: u64, body: &'static [u8]) -> String {
+    /// body, ignoring the Range header, then closes the connection. Returns the base URL and a
+    /// count of accepted connections (one request each).
+    async fn spawn_range_ignoring_200(
+        content_length: u64,
+        body: &'static [u8],
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = requests.clone();
         tokio::spawn(async move {
             for _ in 0..4 {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     break;
                 };
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut buf = [0u8; 1024];
                 let _ = sock.read(&mut buf).await;
                 let head = format!(
@@ -1282,24 +1272,27 @@ mod provider_abstraction_tests {
                 let _ = sock.flush().await;
             }
         });
-        format!("http://{}/", addr)
+        (format!("http://{}/", addr), requests)
     }
 
-    fn proxied_for(url: String, pos: u64, file_size: u64) -> ProxiedMediaFile {
-        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            resolved_url: Some(url.clone()),
-            ..Default::default()
-        });
-        let repair = Arc::new(RepairManager::new(provider.clone()));
+    /// The one place tests build a `ProxiedMediaFile`: `Movie.mkv`, `file_size` bytes, at position
+    /// 0 with no resolved CDN url and an empty read-ahead buffer, a repair manager over `provider`,
+    /// read activity without the start-up grace, a `UNIX_EPOCH` mtime and the default first-read
+    /// window. Tests override fields on the returned value.
+    fn proxied(
+        provider: Arc<dyn DebridProvider>,
+        locator: crate::provider::FileLocator,
+        file_size: u64,
+    ) -> ProxiedMediaFile {
         ProxiedMediaFile {
             name: "Movie.mkv".to_string(),
-            locator: crate::provider::FileLocator::default(),
+            locator,
             file_size,
-            repair_manager: repair,
+            repair_manager: Arc::new(RepairManager::new(provider.clone())),
             provider,
             http_client: reqwest::Client::new(),
-            pos,
-            cdn_url: Some(url),
+            pos: 0,
+            cdn_url: None,
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
@@ -1307,6 +1300,19 @@ mod provider_abstraction_tests {
             confirmed_read: false,
             first_read_bytes: BUFFER_SIZE as u64,
         }
+    }
+
+    /// A `ProxiedMediaFile` at `pos` whose url `url` is already resolved (and is what the mock
+    /// provider re-resolves to).
+    fn proxied_for(url: String, pos: u64, file_size: u64) -> ProxiedMediaFile {
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            resolved_url: Some(url.clone()),
+            ..Default::default()
+        });
+        let mut f = proxied(provider, crate::provider::FileLocator::default(), file_size);
+        f.pos = pos;
+        f.cdn_url = Some(url);
+        f
     }
 
     #[test]
@@ -1327,15 +1333,23 @@ mod provider_abstraction_tests {
     }
 
     #[tokio::test]
-    async fn fetch_bytes_rejects_whole_object_200_at_offset_zero() {
-        // A 200 whose Content-Length exceeds the fetch window (whole multi-GB object) must
-        // be refused even at offset 0, rather than buffered into memory.
-        let url = spawn_range_ignoring_200(999_999_999, b"only-headers-matter").await;
+    async fn fetch_bytes_fails_a_200_whose_body_ends_before_the_window() {
+        // A whole-object 200 at offset 0 is ACCEPTED, even with a multi-GB Content-Length (TorBox
+        // streams the whole object; see
+        // `fetch_cdn_range_accepts_range_ignoring_200_with_oversized_content_length_at_offset_0`).
+        // But a body that ends short of both its Content-Length and the window (the connection
+        // closes mid-body) must fail after one same-url retry, never serve truncated bytes.
+        let (url, requests) = spawn_range_ignoring_200(999_999_999, b"only-headers-matter").await;
         let mut f = proxied_for(url, 0, 5_000_000_000);
         let result = f.fetch_bytes(8).await;
         assert!(
             result.is_err(),
-            "a whole-object 200 larger than the fetch window must be rejected"
+            "a 200 whose body is cut short must not be served"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the body read error is retried once"
         );
     }
 
@@ -1344,7 +1358,7 @@ mod provider_abstraction_tests {
         // A small whole-object 200 at offset 0 (Content-Length within the fetch window) is
         // legitimate (the bytes start at 0 = pos) and must be served.
         let body: &[u8] = b"ZEROBYTES1234567"; // 16 bytes
-        let url = spawn_range_ignoring_200(body.len() as u64, body).await;
+        let (url, _) = spawn_range_ignoring_200(body.len() as u64, body).await;
         let mut f = proxied_for(url, 0, body.len() as u64);
         let data = f
             .fetch_bytes(8)
@@ -1466,30 +1480,17 @@ mod provider_abstraction_tests {
             invalidate_calls: counter.clone(),
             ..Default::default()
         });
-        let repair = Arc::new(RepairManager::new(provider.clone()));
-        let f = ProxiedMediaFile {
-            name: "Movie.mkv".to_string(),
-            locator: crate::provider::FileLocator::default(),
-            file_size,
-            repair_manager: repair,
-            provider,
-            http_client: reqwest::Client::new(),
-            pos,
-            cdn_url: Some(url),
-            buffer: bytes::Bytes::new(),
-            buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            modified_time: SystemTime::UNIX_EPOCH,
-            confirmed_read: false,
-            first_read_bytes: BUFFER_SIZE as u64,
-        };
+        let mut f = proxied(provider, crate::provider::FileLocator::default(), file_size);
+        f.pos = pos;
+        f.cdn_url = Some(url);
         (f, counter)
     }
 
     #[tokio::test]
     async fn fetch_cdn_range_invalidates_on_http_error() {
-        // A 4xx/5xx means the CDN URL has expired — drop the cached resolution so a fresh
-        // URL is fetched on retry.
+        // A stale 4xx (403/410) means the CDN URL has expired — drop the cached resolution so a
+        // fresh URL is fetched on retry. (A 5xx is NOT treated as stale and does not invalidate;
+        // see `fetch_cdn_range_transient_5xx_retries_same_url_without_invalidating`.)
         let url = spawn_always_status("403 Forbidden").await;
         let (mut f, invalidate_calls) = proxied_with_counter(url, 0, 1000);
         let _ = f.fetch_bytes(8).await; // errors after retries
@@ -1744,24 +1745,9 @@ mod provider_abstraction_tests {
     #[tokio::test]
     async fn metadata_reports_plumbed_mtime() {
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
-        let repair = Arc::new(RepairManager::new(provider.clone()));
         let ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let mut f = ProxiedMediaFile {
-            name: "M.mkv".into(),
-            locator: crate::provider::FileLocator::default(),
-            file_size: 42,
-            repair_manager: repair,
-            provider,
-            http_client: reqwest::Client::new(),
-            pos: 0,
-            cdn_url: None,
-            buffer: bytes::Bytes::new(),
-            buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            modified_time: ts,
-            confirmed_read: false,
-            first_read_bytes: BUFFER_SIZE as u64,
-        };
+        let mut f = proxied(provider, crate::provider::FileLocator::default(), 42);
+        f.modified_time = ts;
         let md = f.metadata().await.unwrap();
         assert_eq!(
             md.modified().unwrap(),
@@ -1772,6 +1758,24 @@ mod provider_abstraction_tests {
     }
 
     #[tokio::test]
+    async fn metadata_of_a_hidden_torrent_reports_size_zero() {
+        // A Broken/hidden torrent's open file reports an empty, epoch-dated file so a player never
+        // reads it while its replacement downloads.
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
+        let locator = crate::provider::FileLocator {
+            torrent_id: "t".into(),
+            ..Default::default()
+        };
+        let mut f = proxied(provider, locator, 42);
+        f.modified_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        f.repair_manager.mark_broken("t").await;
+        let md = f.metadata().await.unwrap();
+        assert_eq!(md.len(), 0);
+        assert_eq!(md.modified().unwrap(), SystemTime::UNIX_EPOCH);
+        assert!(!md.is_dir());
+    }
+
+    #[tokio::test]
     async fn read_bytes_stamps_read_activity() {
         use crate::read_activity::ReadActivity;
         let ra = Arc::new(ReadActivity::without_startup_grace());
@@ -1779,26 +1783,13 @@ mod provider_abstraction_tests {
             resolved_url: Some("http://127.0.0.1:0/none".into()),
             ..Default::default()
         });
-        let mut f = ProxiedMediaFile {
-            name: "x.mkv".into(),
-            locator: crate::provider::FileLocator {
-                hash: "abc123".into(),
-                torrent_id: "t".into(),
-                ..Default::default()
-            },
-            file_size: 10,
-            repair_manager: Arc::new(RepairManager::new(provider.clone())),
-            provider,
-            http_client: reqwest::Client::new(),
-            pos: 0,
-            cdn_url: None,
-            buffer: Bytes::new(),
-            buffer_start: 0,
-            read_activity: ra.clone(),
-            modified_time: SystemTime::UNIX_EPOCH,
-            confirmed_read: false,
-            first_read_bytes: BUFFER_SIZE as u64,
+        let locator = crate::provider::FileLocator {
+            hash: "abc123".into(),
+            torrent_id: "t".into(),
+            ..Default::default()
         };
+        let mut f = proxied(provider, locator, 10);
+        f.read_activity = ra.clone();
         // The CDN fetch will fail (unroutable URL), but the stamp happens before the fetch.
         let _ = f.read_bytes(4).await;
         let window = std::time::Duration::from_secs(300);
@@ -1809,12 +1800,23 @@ mod provider_abstraction_tests {
         assert!(ra.torrents_idle(["other"], window).await);
     }
 
+    /// The locator of the broken movie file the instant-repair tests start from (torrent `old_tid`;
+    /// the mock's repaired torrent is `new_tid`).
+    fn broken_movie_locator() -> crate::provider::FileLocator {
+        crate::provider::FileLocator {
+            hash: "H".to_string(),
+            torrent_id: "old_tid".to_string(),
+            file_id: 1,
+            file_path: "/Movie.mkv".to_string(),
+            link: Some("https://rd/oldlink".to_string()),
+        }
+    }
+
     #[tokio::test]
     async fn resolve_cdn_url_repairs_and_swaps_locator_on_unavailable() {
         // The headline repair-on-playback flow: resolving the broken torrent returns
         // Unavailable, instant repair produces a fresh locator, the file swaps to it,
         // invalidates the old resolution, and re-resolves to a working URL.
-        use crate::provider::FileLocator;
         use crate::rd_client::{AddMagnetResponse, TorrentFile, TorrentInfo};
 
         let invalidate_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1842,30 +1844,7 @@ mod provider_abstraction_tests {
             invalidate_calls: invalidate_calls.clone(),
             ..Default::default()
         };
-        let provider: Arc<dyn DebridProvider> = Arc::new(mock);
-        let repair = Arc::new(RepairManager::new(provider.clone()));
-        let mut f = ProxiedMediaFile {
-            name: "Movie.mkv".to_string(),
-            locator: FileLocator {
-                hash: "H".to_string(),
-                torrent_id: "old_tid".to_string(),
-                file_id: 1,
-                file_path: "/Movie.mkv".to_string(),
-                link: Some("https://rd/oldlink".to_string()),
-            },
-            file_size: 1000,
-            repair_manager: repair,
-            provider,
-            http_client: reqwest::Client::new(),
-            pos: 0,
-            cdn_url: None,
-            buffer: bytes::Bytes::new(),
-            buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            modified_time: SystemTime::UNIX_EPOCH,
-            confirmed_read: false,
-            first_read_bytes: BUFFER_SIZE as u64,
-        };
+        let mut f = proxied(Arc::new(mock), broken_movie_locator(), 1000);
 
         let url = f
             .resolve_cdn_url()
@@ -1881,10 +1860,9 @@ mod provider_abstraction_tests {
     #[tokio::test]
     async fn fetch_cdn_range_persistent_5xx_escalates_to_instant_repair() {
         // A file that resolves fine but whose CDN persistently returns 500 on the bytes is broken on
-        // the provider, not a stale URL. After the cheap fresh-URL retry still 5xxs, the byte-fetch
-        // path must escalate to instant repair (re-add by hash) — swapping the locator — rather than
-        // failing forever and letting the player retry-storm the 500.
-        use crate::provider::FileLocator;
+        // the provider, not a stale URL. After one same-URL retry (no re-resolve) still 5xxs, the
+        // byte-fetch path must escalate to instant repair (re-add by hash) — swapping the locator —
+        // rather than failing forever and letting the player retry-storm the 500.
         use crate::rd_client::{AddMagnetResponse, TorrentFile, TorrentInfo};
 
         // The CDN always 500s (both the original and the re-resolved/repaired URL point here).
@@ -1911,30 +1889,8 @@ mod provider_abstraction_tests {
             }),
             ..Default::default()
         };
-        let provider: Arc<dyn DebridProvider> = Arc::new(mock);
-        let repair = Arc::new(RepairManager::new(provider.clone()));
-        let mut f = ProxiedMediaFile {
-            name: "Movie.mkv".to_string(),
-            locator: FileLocator {
-                hash: "H".to_string(),
-                torrent_id: "old_tid".to_string(),
-                file_id: 1,
-                file_path: "/Movie.mkv".to_string(),
-                link: Some("https://rd/oldlink".to_string()),
-            },
-            file_size: 1000,
-            repair_manager: repair,
-            provider,
-            http_client: reqwest::Client::new(),
-            pos: 0,
-            cdn_url: Some(url),
-            buffer: bytes::Bytes::new(),
-            buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            modified_time: SystemTime::UNIX_EPOCH,
-            confirmed_read: false,
-            first_read_bytes: BUFFER_SIZE as u64,
-        };
+        let mut f = proxied(Arc::new(mock), broken_movie_locator(), 1000);
+        f.cdn_url = Some(url);
 
         // The read still fails (the repaired CDN also 500s), but repair must have been attempted —
         // proven by the locator swapping to the repaired torrent.
@@ -1951,7 +1907,6 @@ mod provider_abstraction_tests {
         // URL and the byte read then COMPLETES inline. The escalation test above proves repair is
         // attempted; this proves the post-repair re-fetch (the `continue` after attempt_instant_repair)
         // actually recovers — so a persistent 500 self-heals instead of retry-storming the player.
-        use crate::provider::FileLocator;
         use crate::rd_client::{AddMagnetResponse, TorrentFile, TorrentInfo};
         let body: &[u8] = b"REPAIREDBYTES!!!"; // 16 bytes
         let url_500 = spawn_always_status("500 Internal Server Error").await;
@@ -1981,29 +1936,8 @@ mod provider_abstraction_tests {
             }),
             ..Default::default()
         });
-        let repair = Arc::new(RepairManager::new(provider.clone()));
-        let mut f = ProxiedMediaFile {
-            name: "Movie.mkv".to_string(),
-            locator: FileLocator {
-                hash: "H".to_string(),
-                torrent_id: "old_tid".to_string(),
-                file_id: 1,
-                file_path: "/Movie.mkv".to_string(),
-                link: Some("https://rd/oldlink".to_string()),
-            },
-            file_size: body.len() as u64,
-            repair_manager: repair,
-            provider,
-            http_client: reqwest::Client::new(),
-            pos: 0,
-            cdn_url: Some(url_500),
-            buffer: bytes::Bytes::new(),
-            buffer_start: 0,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            modified_time: SystemTime::UNIX_EPOCH,
-            confirmed_read: false,
-            first_read_bytes: BUFFER_SIZE as u64,
-        };
+        let mut f = proxied(provider, broken_movie_locator(), body.len() as u64);
+        f.cdn_url = Some(url_500);
         let data = f
             .fetch_bytes(8)
             .await
@@ -2066,6 +2000,85 @@ mod provider_abstraction_tests {
         );
     }
 
+    /// Server whose first `truncated` connections answer `206` declaring `Content-Length: body.len()`
+    /// but write only half the body before closing (a mid-body reset), and whose later connections
+    /// send the full `206`. Counts accepted connections (one request each).
+    async fn spawn_truncating_206(
+        body: &'static [u8],
+        truncated: usize,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let sent = if n < truncated {
+                    &body[..body.len() / 2]
+                } else {
+                    body
+                };
+                let _ = sock.write_all(sent).await;
+                let _ = sock.flush().await;
+                // Dropping the socket closes it; for a truncated reply that is a mid-body reset.
+            }
+        });
+        (format!("http://{}/", addr), requests)
+    }
+
+    #[tokio::test]
+    async fn fetch_cdn_range_retries_a_body_read_error_on_the_same_url() {
+        // A connection that dies after the headers (a mid-body reset, a pooled connection closing,
+        // the client timeout firing during the body) is the same transient failure as a send
+        // error: retry once on the SAME url, without invalidating, and serve the bytes.
+        let body: &[u8] = b"MIDBODYRESET1234"; // 16 bytes
+        let (url, requests) = spawn_truncating_206(body, 1).await;
+        let (mut f, invalidate_calls) = proxied_with_counter(url, 0, body.len() as u64);
+        let data = f
+            .fetch_bytes(8)
+            .await
+            .expect("a truncated body on attempt 0 then a full 206 must recover");
+        assert_eq!(&data[..], b"MIDBODYR");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            invalidate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a body read error must NOT invalidate the cached resolution"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_cdn_range_fails_after_a_second_body_read_error() {
+        // Every response is cut short: the read is retried exactly once, then fails rather than
+        // serving truncated bytes, and the resolution is left alone.
+        let body: &[u8] = b"MIDBODYRESET1234"; // 16 bytes
+        let (url, requests) = spawn_truncating_206(body, usize::MAX).await;
+        let (mut f, invalidate_calls) = proxied_with_counter(url, 0, body.len() as u64);
+        assert!(f.fetch_bytes(8).await.is_err());
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one retry, then fail"
+        );
+        assert_eq!(
+            invalidate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn fetch_bytes_serves_from_read_ahead_buffer_without_network() {
         // A read fully inside the 2 MB read-ahead buffer must be served from it — no CDN fetch, no
@@ -2077,23 +2090,10 @@ mod provider_abstraction_tests {
             invalidate_calls: counter.clone(),
             ..Default::default()
         });
-        let repair = Arc::new(RepairManager::new(provider.clone()));
-        let mut f = ProxiedMediaFile {
-            name: "Movie.mkv".to_string(),
-            locator: crate::provider::FileLocator::default(),
-            file_size: 10_000,
-            repair_manager: repair,
-            provider,
-            http_client: reqwest::Client::new(),
-            pos: 104,
-            cdn_url: None,
-            buffer: bytes::Bytes::from_static(b"ABCDEFGHIJ"), // [100, 110)
-            buffer_start: 100,
-            read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            modified_time: SystemTime::UNIX_EPOCH,
-            confirmed_read: false,
-            first_read_bytes: BUFFER_SIZE as u64,
-        };
+        let mut f = proxied(provider, crate::provider::FileLocator::default(), 10_000);
+        f.pos = 104;
+        f.buffer = bytes::Bytes::from_static(b"ABCDEFGHIJ"); // [100, 110)
+        f.buffer_start = 100;
         let data = f
             .fetch_bytes(4)
             .await
@@ -2123,28 +2123,14 @@ mod provider_abstraction_tests {
             invalidate_calls: counter.clone(),
             ..Default::default()
         });
-        let repair = Arc::new(RepairManager::new(provider.clone()));
-        repair.mark_broken("t").await; // hide the torrent
-        let mut f = ProxiedMediaFile {
-            name: "x.mkv".to_string(),
-            locator: crate::provider::FileLocator {
-                hash: "abc123".into(),
-                torrent_id: "t".into(),
-                ..Default::default()
-            },
-            file_size: 10,
-            repair_manager: repair,
-            provider,
-            http_client: reqwest::Client::new(),
-            pos: 0,
-            cdn_url: None,
-            buffer: bytes::Bytes::new(),
-            buffer_start: 0,
-            read_activity: ra.clone(),
-            modified_time: SystemTime::UNIX_EPOCH,
-            confirmed_read: false,
-            first_read_bytes: BUFFER_SIZE as u64,
+        let locator = crate::provider::FileLocator {
+            hash: "abc123".into(),
+            torrent_id: "t".into(),
+            ..Default::default()
         };
+        let mut f = proxied(provider, locator, 10);
+        f.read_activity = ra.clone();
+        f.repair_manager.mark_broken("t").await; // hide the torrent
         assert!(
             f.read_bytes(4).await.is_err(),
             "a hidden torrent's read must fail fast"

@@ -1,3 +1,6 @@
+mod common;
+
+use common::{encode_path_preserve_slashes, tmdb_client, token};
 use dav_server::davpath::DavPath;
 use dav_server::fs::{DavFileSystem, OpenOptions};
 use debridmoviemapper::dav_fs::DebridFileSystem;
@@ -5,28 +8,11 @@ use debridmoviemapper::identification::identify_torrent;
 use debridmoviemapper::provider::DebridProvider;
 use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::repair::RepairManager;
-use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::torbox_client::TorBoxClient;
 use debridmoviemapper::vfs::{DebridVfs, VfsNode};
 use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
-fn tmdb_client() -> Arc<TmdbClient> {
-    let key = std::env::var("TMDB_API_KEY")
-        .expect("TMDB_API_KEY must be set")
-        .trim()
-        .to_string();
-    Arc::new(TmdbClient::new(key).unwrap())
-}
-
-/// A trimmed, non-empty env var, or None — so a provider's test skips when its token is unset.
-fn token(var: &str) -> Option<String> {
-    std::env::var(var)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
 
 // --- Player simulation: open media files via WebDAV and read real CDN bytes (per provider) ---
 
@@ -34,7 +20,6 @@ fn token(var: &str) -> Option<String> {
 #[ignore]
 async fn test_video_player_simulation_real_debrid() {
     let _ = tracing_subscriber::fmt::try_init();
-    dotenvy::dotenv().ok();
     let Some(t) = token("RD_API_TOKEN") else {
         println!("skipping test_video_player_simulation_real_debrid: RD_API_TOKEN not set");
         return;
@@ -46,7 +31,6 @@ async fn test_video_player_simulation_real_debrid() {
 #[ignore]
 async fn test_video_player_simulation_torbox() {
     let _ = tracing_subscriber::fmt::try_init();
-    dotenvy::dotenv().ok();
     let Some(t) = token("TORBOX_API_KEY") else {
         println!("skipping test_video_player_simulation_torbox: TORBOX_API_KEY not set");
         return;
@@ -240,7 +224,6 @@ async fn run_player_simulation(provider: Arc<dyn DebridProvider>, label: &str) {
 #[ignore]
 async fn test_media_file_size_consistency_real_debrid() {
     let _ = tracing_subscriber::fmt::try_init();
-    dotenvy::dotenv().ok();
     let Some(t) = token("RD_API_TOKEN") else {
         println!("skipping test_media_file_size_consistency_real_debrid: RD_API_TOKEN not set");
         return;
@@ -252,7 +235,6 @@ async fn test_media_file_size_consistency_real_debrid() {
 #[ignore]
 async fn test_media_file_size_consistency_torbox() {
     let _ = tracing_subscriber::fmt::try_init();
-    dotenvy::dotenv().ok();
     let Some(t) = token("TORBOX_API_KEY") else {
         println!("skipping test_media_file_size_consistency_torbox: TORBOX_API_KEY not set");
         return;
@@ -365,13 +347,6 @@ async fn run_size_consistency(provider: Arc<dyn DebridProvider>, label: &str) {
     );
 
     println!("  ✓ [{label}] Media file sizes are consistent across all metadata paths");
-}
-
-fn encode_path_preserve_slashes(p: &str) -> String {
-    p.split('/')
-        .map(|seg| urlencoding::encode(seg).to_string())
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 fn find_video_files(

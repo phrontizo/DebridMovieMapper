@@ -7,11 +7,15 @@
 //! TorBox's `200` to `Transient`, so every TorBox probe deferred forever; now it accepts a `200`
 //! for the offset-0 front read (mirroring `dav_fs::fetch_cdn_range`, which always handled it).
 //!
-//! Uses the Creative-Commons *Sintel* torrent (cached on both services), and cleans up after itself.
-//! Each sub-test skips cleanly if its token (`RD_API_TOKEN` / `TORBOX_API_KEY`) is unset.
+//! Uses the Creative-Commons *Sintel* torrent (cached on both services), and cleans up after itself,
+//! also when a step fails. Each sub-test skips cleanly if its token (`RD_API_TOKEN` /
+//! `TORBOX_API_KEY`) is unset.
 
+mod common;
+
+use common::{cleanup_by_hash, sintel_magnet, with_cleanup, SINTEL_HASH};
 use debridmoviemapper::acquire::locator_for;
-use debridmoviemapper::probe::{probe_tracks, ProbeError};
+use debridmoviemapper::probe::{probe_tracks, ProbeError, Track};
 use debridmoviemapper::provider::DebridProvider;
 use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::torbox_client::TorBoxClient;
@@ -19,36 +23,33 @@ use debridmoviemapper::vfs::is_video_file;
 use std::sync::Arc;
 use std::time::Duration;
 
-const SINTEL_HASH: &str = "08ada5a7a6183aae1e09d831df6748d566095a10";
-
-fn sintel_magnet() -> String {
-    format!(
-        "magnet:?xt=urn:btih:{}&dn=Sintel&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce",
-        SINTEL_HASH
+/// Add Sintel, resolve its video file's CDN url through the real provider path, probe it, clean up
+/// (also when Sintel never resolves).
+async fn run_probe(provider: Arc<dyn DebridProvider>, label: &str) {
+    cleanup_by_hash(&provider, SINTEL_HASH).await;
+    let outcome = with_cleanup(
+        probe_sintel(&provider, label),
+        cleanup_by_hash(&provider, SINTEL_HASH),
     )
-}
-
-fn token(var: &str) -> Option<String> {
-    dotenvy::dotenv().ok();
-    std::env::var(var).ok().filter(|s| !s.trim().is_empty())
-}
-
-async fn find_id_by_hash(provider: &Arc<dyn DebridProvider>, hash: &str) -> Option<String> {
-    let ts = provider.get_torrents().await.ok()?;
-    ts.into_iter()
-        .find(|t| t.hash.eq_ignore_ascii_case(hash))
-        .map(|t| t.id)
-}
-
-async fn cleanup(provider: &Arc<dyn DebridProvider>, hash: &str) {
-    if let Some(id) = find_id_by_hash(provider, hash).await {
-        let _ = provider.delete_torrent(&id).await;
+    .await;
+    assert!(
+        !matches!(outcome, Err(ProbeError::Transient)),
+        "[{label}] probe deferred (Transient) — the CDN's range response was NOT read; \
+         this is exactly the bug the 200-handling fix addresses"
+    );
+    match outcome {
+        Ok(tracks) => println!("[{label}] probe OK — {} track(s) parsed", tracks.len()),
+        Err(e) => {
+            println!("[{label}] probe reached a non-deferring verdict: {e:?} (fetch succeeded)")
+        }
     }
 }
 
-/// Add Sintel, resolve its video file's CDN url through the real provider path, probe it, clean up.
-async fn run_probe(provider: Arc<dyn DebridProvider>, label: &str) {
-    cleanup(&provider, SINTEL_HASH).await;
+/// Add Sintel, wait until its video file resolves to a CDN url, and probe that url.
+async fn probe_sintel(
+    provider: &Arc<dyn DebridProvider>,
+    label: &str,
+) -> Result<Vec<Track>, ProbeError> {
     let id = provider
         .add_magnet(&sintel_magnet())
         .await
@@ -58,7 +59,7 @@ async fn run_probe(provider: Arc<dyn DebridProvider>, label: &str) {
 
     // Poll until the file list resolves, the torrent is downloaded, and the locator resolves to a
     // CDN url (RD: needs the per-file link to populate after selection; TorBox: cached/instant).
-    let mut resolved: Option<(String, usize)> = None;
+    let mut resolved: Option<String> = None;
     for _ in 0..40 {
         if let Ok(info) = provider.get_torrent_info(&id).await {
             let video = info.files.iter().find(|f| is_video_file(&f.path)).cloned();
@@ -75,7 +76,7 @@ async fn run_probe(provider: Arc<dyn DebridProvider>, label: &str) {
                 if info.status == "downloaded" {
                     let locator = locator_for(&info, SINTEL_HASH, &video.path);
                     if let Ok(url) = provider.resolve_url(&locator).await {
-                        resolved = Some((url, video.path.len()));
+                        resolved = Some(url);
                         break;
                     }
                 }
@@ -84,7 +85,7 @@ async fn run_probe(provider: Arc<dyn DebridProvider>, label: &str) {
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
-    let (url, _) = resolved
+    let url = resolved
         .unwrap_or_else(|| panic!("[{label}] Sintel never reached a resolvable downloaded video"));
 
     let http = reqwest::Client::builder()
@@ -95,25 +96,13 @@ async fn run_probe(provider: Arc<dyn DebridProvider>, label: &str) {
     // it must NOT defer with `Transient`. (`Transient` is precisely what the old code returned for
     // TorBox's Range-ignoring 200.) Any other outcome — tracks parsed, or an accept-verdict like
     // TracksNotFound/Unsupported when the header isn't in the front window — means the fetch worked.
-    let outcome = probe_tracks(&http, &url).await;
-    cleanup(&provider, SINTEL_HASH).await;
-    assert!(
-        !matches!(outcome, Err(ProbeError::Transient)),
-        "[{label}] probe deferred (Transient) — the CDN's range response was NOT read; \
-         this is exactly the bug the 200-handling fix addresses"
-    );
-    match outcome {
-        Ok(tracks) => println!("[{label}] probe OK — {} track(s) parsed", tracks.len()),
-        Err(e) => {
-            println!("[{label}] probe reached a non-deferring verdict: {e:?} (fetch succeeded)")
-        }
-    }
+    probe_tracks(&http, &url).await
 }
 
 #[tokio::test]
 #[ignore]
 async fn probe_works_through_real_debrid_cdn() {
-    let Some(rd) = token("RD_API_TOKEN") else {
+    let Some(rd) = common::token("RD_API_TOKEN") else {
         println!("skipping probe_works_through_real_debrid_cdn: RD_API_TOKEN not set");
         return;
     };
@@ -123,7 +112,7 @@ async fn probe_works_through_real_debrid_cdn() {
 #[tokio::test]
 #[ignore]
 async fn probe_works_through_torbox_cdn() {
-    let Some(tb) = token("TORBOX_API_KEY") else {
+    let Some(tb) = common::token("TORBOX_API_KEY") else {
         println!("skipping probe_works_through_torbox_cdn: TORBOX_API_KEY not set");
         return;
     };

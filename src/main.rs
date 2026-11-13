@@ -107,12 +107,15 @@ fn http1_builder() -> http1::Builder {
     b
 }
 
-/// Docker liveness probe. Actually exercises the request/handler path (a minimal HTTP request),
-/// NOT just `accept()`: the accept loop completes the TCP handshake BEFORE the connection-permit
-/// check, so a bare `connect()` succeeds even when the pool is exhausted and the handler immediately
-/// drops the stream — which would report a wedged, request-rejecting container as healthy and never
-/// get it restarted. Requiring an HTTP status line back catches that. HTTP/1.0 so the server closes
-/// the connection after responding (no keep-alive idle to wait on).
+/// Docker liveness probe. Sends a real `OPTIONS /` request and requires an HTTP status line back
+/// within 5s, rather than a bare `connect()`: the kernel completes the TCP handshake on its own, so a
+/// connect succeeds even when the accept loop or the handler path is dead or hung. Any status line
+/// counts as healthy, including the 503 the accept loop sends when the connection pool is full: a
+/// saturated pool is busy, not wedged, and a Docker restart would kill every stream. Only when the
+/// 503-rejecter pool is exhausted too (the connection is dropped) does a full pool read unhealthy.
+/// So a permit pool that leaks for good is NOT healed by a restart; `HEADER_READ_TIMEOUT` and TCP
+/// keepalive (`set_tcp_keepalive`) are what bound permit leaks. HTTP/1.0 so the server closes the
+/// connection after responding (no keep-alive idle to wait on).
 fn healthcheck(port: u16) -> bool {
     use std::io::{Read, Write};
     let Ok(addr) = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>() else {
@@ -204,8 +207,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Jellyfin notification disabled (set JELLYFIN_URL, JELLYFIN_API_KEY, JELLYFIN_RCLONE_MOUNT_PATH to enable)");
     }
 
-    // Open the metadata cache. Store::open never fails on an incompatible/corrupt
-    // database: it moves the old file aside (<db_path>.corrupt) and recreates it.
+    // Open the metadata store. A genuinely corrupt DB is moved aside (<db_path>.corrupt[.N]) and
+    // recreated; an intact-but-unusable one (newer schema, older redb format, locked by another
+    // instance, I/O/permission error) fails startup here rather than being discarded.
     let store = debridmoviemapper::store::Store::open(&config.db_path)?;
 
     // Surface a build failure as a startup error (consistent with the TMDB/provider/scraper clients)
@@ -305,17 +309,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Request reads in whole-buffer (2 MB) chunks rather than dav-server's 16 KB default, so each
         // 2 MB read-ahead is drained in one `read_bytes` call instead of ~128 — collapsing the
         // per-read lock/async overhead (repair health + read-activity) by the same factor under the
-        // many concurrent rclone readers. `fetch_bytes` already clamps the fetch to BUFFER_SIZE, so
-        // sizing is unchanged; a buffer hit just returns more of the existing refcounted slice.
+        // many concurrent rclone readers. `fetch_bytes` sizes each CDN fetch independently of the
+        // requested `len` (BUFFER_SIZE on a warm miss, `first_read_bytes`/CDN_FIRST_READ_MB on a cold
+        // one), so this only changes how many `read_bytes` calls drain a buffer; a buffer hit just
+        // returns more of the existing refcounted slice.
         .read_buf_size(debridmoviemapper::dav_fs::BUFFER_SIZE)
         .build_handler();
 
     // Local-network Trakt enrolment routes (no auth — trusted LAN), present only when Trakt is
     // configured. Served on the same listener; `/trakt*` requests are routed here below.
-    let enrolment: Option<Arc<EnrolmentService>> = app_state
-        .trakt_client
-        .clone()
-        .map(|t| Arc::new(EnrolmentService::new(t, app_state.store.clone())));
+    let enrol_allowed_hosts = app_state
+        .config
+        .trakt
+        .as_ref()
+        .map(|t| t.enrol_allowed_hosts.clone())
+        .unwrap_or_default();
+    let enrolment: Option<Arc<EnrolmentService>> = app_state.trakt_client.clone().map(|t| {
+        Arc::new(
+            EnrolmentService::new(t, app_state.store.clone())
+                .with_allowed_hosts(enrol_allowed_hosts),
+        )
+    });
     if enrolment.is_some() {
         info!("Trakt enrolment page available at /trakt/accounts");
     }

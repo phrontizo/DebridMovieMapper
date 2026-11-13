@@ -1,245 +1,141 @@
-use debridmoviemapper::identification::identify_torrent;
-use debridmoviemapper::provider::FileLocator;
-use debridmoviemapper::rd_client::{RealDebridClient, TorrentInfo};
-use debridmoviemapper::repair::RepairManager;
-use debridmoviemapper::tmdb_client::TmdbClient;
+//! Live Real-Debrid repair integration tests (`#[ignore]`; require `RD_API_TOKEN`, skip without it).
+//!
+//! `test_instant_repair_of_sintel` MODIFIES the live account: it adds Blender's Creative-Commons
+//! *Sintel*, repairs it, and deletes every Sintel copy afterwards (also when it fails). It never
+//! repairs one of the account's own torrents: a Real-Debrid repair re-adds the hash under a new id
+//! and deletes the original, which would churn a library torrent or, if it can't re-cache, lose
+//! it. `test_broken_torrents_hidden_from_webdav` only reads the account.
+
+mod common;
+
+use common::{cleanup_by_hash, find_ids_by_hash, with_cleanup, SINTEL_HASH};
+use debridmoviemapper::acquire::locator_for;
+use debridmoviemapper::provider::DebridProvider;
+use debridmoviemapper::rd_client::RealDebridClient;
+use debridmoviemapper::repair::{RepairFailure, RepairManager};
+use debridmoviemapper::vfs::is_video_file;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
-/// Build a `FileLocator` for a torrent's first selected file — the modern on-demand repair entry
-/// point (`try_instant_repair`) is keyed on a `FileLocator`, not a whole `TorrentInfo`.
-fn first_locator(info: &TorrentInfo) -> Option<FileLocator> {
-    info.files
-        .iter()
-        .find(|f| f.selected == 1)
-        .map(|f| FileLocator {
-            hash: info.hash.clone(),
-            torrent_id: info.id.clone(),
-            file_id: f.id,
-            file_path: f.path.clone(),
-            link: info.links.first().cloned(),
-        })
+/// The Real-Debrid provider, or `None` (after printing a skip line for `test`) when `RD_API_TOKEN`
+/// is unset or blank. A set token that the provider then rejects is a real failure, not a skip.
+fn rd_provider(test: &str) -> Option<Arc<dyn DebridProvider>> {
+    let Some(rd) = common::token("RD_API_TOKEN") else {
+        println!("skipping {test}: RD_API_TOKEN not set");
+        return None;
+    };
+    Some(Arc::new(RealDebridClient::new(rd).unwrap()))
 }
 
+/// What a CDN 503 does on the read path, on a torrent this test owns: the torrent is marked broken
+/// (hidden from WebDAV), then repaired at once (a first repair has no cooldown), and the repair
+/// hands back a locator for the same file in the re-added torrent.
 #[tokio::test]
 #[ignore]
-async fn test_repair_process_integration() {
+async fn test_instant_repair_of_sintel() {
     let _ = tracing_subscriber::fmt::try_init();
-    dotenvy::dotenv().ok();
-
-    let api_token = std::env::var("RD_API_TOKEN")
-        .expect("RD_API_TOKEN must be set")
-        .trim()
-        .to_string();
-    let tmdb_api_key = std::env::var("TMDB_API_KEY")
-        .expect("TMDB_API_KEY must be set")
-        .trim()
-        .to_string();
-
-    let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key).unwrap());
-    let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
-
-    println!("Fetching torrents...");
-    let torrents = rd_client
-        .get_torrents()
-        .await
-        .expect("Failed to get torrents");
-
-    let downloaded: Vec<_> = torrents
-        .into_iter()
-        .filter(|t| t.status == "downloaded")
-        .take(5)
-        .collect();
-
-    if downloaded.is_empty() {
-        println!("No downloaded torrents found, skipping test.");
+    let Some(provider) = rd_provider("test_instant_repair_of_sintel") else {
         return;
-    }
+    };
+    // Delete any Sintel left by an interrupted run; afterwards delete the original and the
+    // replacement the repair adds (both carry the Sintel hash).
+    cleanup_by_hash(&provider, SINTEL_HASH).await;
+    with_cleanup(
+        repair_sintel(&provider),
+        cleanup_by_hash(&provider, SINTEL_HASH),
+    )
+    .await;
+}
 
-    println!(
-        "Found {} downloaded torrents (using first 5)",
-        downloaded.len()
+async fn repair_sintel(provider: &Arc<dyn DebridProvider>) {
+    let info = common::add_sintel_downloaded(provider, "real-debrid").await;
+    let video = info
+        .files
+        .iter()
+        .find(|f| f.selected == 1 && is_video_file(&f.path))
+        .expect("Sintel should have a selected video file");
+    let locator = locator_for(&info, &info.hash, &video.path);
+    let repair_manager = RepairManager::new(provider.clone());
+
+    println!("\n=== Mark Broken ===");
+    repair_manager.mark_broken(&info.id).await;
+    assert!(
+        repair_manager.should_hide_torrent(&info.id).await,
+        "a broken torrent should be hidden from WebDAV"
     );
+    println!("  ✓ Torrent marked broken and hidden");
 
-    // Prepare data with metadata for health check (skip torrents deleted by prior repair runs)
-    let mut torrent_data = Vec::new();
-    for torrent in &downloaded {
-        match rd_client.get_torrent_info(&torrent.id).await {
-            Ok(info) => {
-                let metadata = identify_torrent(&info, &tmdb_client).await;
-                torrent_data.push((info, metadata));
+    println!("\n=== Instant Repair ===");
+    match repair_manager.try_instant_repair(&locator).await {
+        Ok(new_locator) => {
+            assert_eq!(
+                new_locator.file_path, locator.file_path,
+                "the repair should hand back a locator for the same file"
+            );
+            assert!(
+                new_locator.hash.eq_ignore_ascii_case(SINTEL_HASH),
+                "the repaired locator should carry Sintel's hash, got {}",
+                new_locator.hash
+            );
+            assert!(
+                !repair_manager
+                    .should_hide_torrent(&new_locator.torrent_id)
+                    .await,
+                "the repaired torrent should be visible"
+            );
+            assert!(
+                find_ids_by_hash(provider, SINTEL_HASH)
+                    .await
+                    .contains(&new_locator.torrent_id),
+                "the repaired torrent {} should be listed",
+                new_locator.torrent_id
+            );
+            if new_locator.torrent_id != info.id {
+                // Real-Debrid re-adds under a new id; the repair deletes the original.
+                let mut gone = false;
+                for _ in 0..10 {
+                    if !find_ids_by_hash(provider, SINTEL_HASH)
+                        .await
+                        .contains(&info.id)
+                    {
+                        gone = true;
+                        break;
+                    }
+                    sleep(Duration::from_secs(1)).await;
+                }
+                assert!(
+                    gone,
+                    "the repair should delete the original torrent {}",
+                    info.id
+                );
             }
-            Err(e) => {
-                println!("Skipping torrent {} (info unavailable: {})", torrent.id, e);
-            }
+            println!("  ✓ Repaired: {} -> {}", info.id, new_locator.torrent_id);
         }
-    }
-
-    if torrent_data.is_empty() {
-        println!("No accessible downloaded torrents found, skipping test.");
-        return;
-    }
-
-    // Test 1: Mark a torrent as broken and verify it can be detected
-    println!("\n=== Test 2: Mark Broken ===");
-    if let Some((info, _)) = torrent_data.first() {
-        println!("Marking torrent as broken: {}", info.filename);
-        repair_manager.mark_broken(&info.id).await;
-
-        sleep(Duration::from_millis(100)).await;
-
-        // Check if torrent should be hidden
-        let should_hide = repair_manager.should_hide_torrent(&info.id).await;
-        println!("  Should hide torrent: {}", should_hide);
-        assert!(should_hide, "Broken torrent should be hidden from WebDAV");
-        println!("  ✓ Torrent successfully marked as broken");
-    }
-
-    // Test 3: Repair a broken torrent
-    println!("\n=== Test 3: Repair Broken Torrent ===");
-    if let Some((info, _)) = torrent_data.first() {
-        println!("Attempting to repair torrent: {}", info.filename);
-        match first_locator(info) {
-            Some(locator) => match repair_manager.try_instant_repair(&locator).await {
-                Ok(_) => println!("  ✓ Repair completed successfully"),
-                Err(e) => println!("  Repair failed (expected for some torrents): {}", e),
-            },
-            None => println!("  No selected file to repair; skipping"),
+        // The re-added torrent hadn't settled (or cached) within repair's short window. Neither is
+        // a failure of the repair path: the budget is reset and a later read retries.
+        Err(e @ (RepairFailure::NotCached(_) | RepairFailure::Deferred(_))) => {
+            println!("  Repair deferred: {e}")
         }
+        Err(RepairFailure::Failed(e)) => panic!("instant repair of Sintel failed: {e}"),
     }
 
-    // Test 4: Verify status summary works
-    println!("\n=== Test 4: Status Summary ===");
+    println!("\n=== Status Summary ===");
     let (healthy, repairing, failed) = repair_manager.get_status_summary().await;
     println!(
         "  Healthy: {}, Repairing/Broken: {}, Failed: {}",
         healthy, repairing, failed
     );
-    println!("  ✓ Status summary retrieved successfully");
-
-    // Test 5: Verify torrents can be retrieved
-    println!("\n=== Test 5: Verify Torrent Retrieval ===");
-    let all_torrents = rd_client
-        .get_torrents()
-        .await
-        .expect("Failed to get torrents after repair");
-    println!(
-        "  Retrieved {} torrents after repair operations",
-        all_torrents.len()
-    );
-    assert!(
-        !all_torrents.is_empty(),
-        "Should have torrents after repair"
-    );
-    println!("  ✓ Torrents still accessible after repair");
-
-    println!("\n=== All Tests Passed ===");
-}
-
-#[tokio::test]
-#[ignore]
-async fn test_503_triggers_immediate_repair() {
-    let _ = tracing_subscriber::fmt::try_init();
-    dotenvy::dotenv().ok();
-
-    let api_token = std::env::var("RD_API_TOKEN")
-        .expect("RD_API_TOKEN must be set")
-        .trim()
-        .to_string();
-
-    let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-    let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
-
-    println!("\n=== Test: 503 Error Triggers Immediate Repair ===");
-
-    // Get a test torrent
-    let torrents = rd_client
-        .get_torrents()
-        .await
-        .expect("Failed to get torrents");
-
-    let downloaded: Vec<_> = torrents
-        .into_iter()
-        .filter(|t| t.status == "downloaded")
-        .take(5)
-        .collect();
-
-    if downloaded.is_empty() {
-        println!("No downloaded torrents found, skipping test.");
-        return;
-    }
-
-    // Find a torrent whose info is still accessible (previous tests may have
-    // repaired/deleted some, making their old IDs return 404).
-    let mut info = None;
-    let mut test_torrent = None;
-    for t in &downloaded {
-        match rd_client.get_torrent_info(&t.id).await {
-            Ok(i) => {
-                info = Some(i);
-                test_torrent = Some(t);
-                break;
-            }
-            Err(e) => {
-                println!("Skipping torrent {} (info unavailable: {})", t.id, e);
-            }
-        }
-    }
-
-    let info = info.expect("No accessible downloaded torrent found");
-    let test_torrent = test_torrent.unwrap();
-
-    println!("Using test torrent: {}", info.filename);
-
-    // Simulate a 503 error by marking as broken (this is what happens in WebDAV on 503)
-    println!("Simulating 503 error during playback...");
-    repair_manager.mark_broken(&test_torrent.id).await;
-
-    // Check immediately
-    sleep(Duration::from_millis(100)).await;
-
-    // Verify torrent should be hidden
-    let should_hide = repair_manager.should_hide_torrent(&test_torrent.id).await;
-    println!("Should hide after 503: {}", should_hide);
-    assert!(should_hide, "Torrent should be immediately hidden on 503");
-    println!("  ✓ Torrent immediately marked as broken and hidden");
-
-    // Now trigger repair
-    println!("Triggering immediate repair...");
-    match first_locator(&info) {
-        Some(locator) => match repair_manager.try_instant_repair(&locator).await {
-            Ok(_) => println!("  ✓ Repair completed successfully"),
-            Err(e) => {
-                println!("  Repair failed (expected for some torrents): {}", e);
-                println!("  ✓ Repair was attempted immediately");
-            }
-        },
-        None => println!("  No selected file to repair; skipping"),
-    }
-
-    // Check status summary
-    let (_, repairing, failed) = repair_manager.get_status_summary().await;
-    println!(
-        "Status after repair: Repairing/Broken: {}, Failed: {}",
-        repairing, failed
-    );
-
-    println!("\n=== Test Passed: 503 Triggers Immediate Repair ===");
+    assert_eq!(failed, 0, "one repair should never mark a torrent Failed");
 }
 
 #[tokio::test]
 #[ignore]
 async fn test_broken_torrents_hidden_from_webdav() {
     let _ = tracing_subscriber::fmt::try_init();
-    dotenvy::dotenv().ok();
-
-    let api_token = std::env::var("RD_API_TOKEN")
-        .expect("RD_API_TOKEN must be set")
-        .trim()
-        .to_string();
-
-    let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
+    let Some(rd_client) = rd_provider("test_broken_torrents_hidden_from_webdav") else {
+        return;
+    };
+    // Marking is in-memory only: this test never changes the account.
     let repair_manager = Arc::new(RepairManager::new(rd_client.clone()));
 
     println!("\n=== Test: Broken Torrents Hidden from WebDAV ===");
@@ -267,7 +163,7 @@ async fn test_broken_torrents_hidden_from_webdav() {
     }
     println!("  ✓ Torrents initially visible in WebDAV");
 
-    // Mark first two as broken (skip any whose info is unavailable due to prior repairs)
+    // Mark the first two as broken (skip any whose info is unavailable).
     let mut marked_ids = Vec::new();
     for torrent in &downloaded {
         if marked_ids.len() >= 2 {

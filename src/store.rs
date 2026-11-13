@@ -26,6 +26,9 @@ use tracing::{error, info, warn};
 ///   replaces those releases with checked copies.
 pub const SCHEMA_VERSION: u64 = 8;
 
+/// The shape of every JSON-valued table: a string key mapping to serde_json bytes.
+type BytesTable = TableDefinition<'static, &'static str, &'static [u8]>;
+
 /// TMDB identification cache: torrent id -> serde_json((TorrentInfo, MediaMetadata)).
 /// Same name + value encoding as the pre-Store inline table, so existing databases
 /// load unchanged.
@@ -266,8 +269,8 @@ pub enum WatchedState {
     Show { watched_episodes: Vec<(u32, u32)> }, // (season, episode) pairs the user has watched
 }
 
-/// One (user, tmdb_id) row of the materialised wanted-set. Self-describing: it embeds its
-/// own `user`+`tmdb_id` (the composite table key is derived from them) so the reconciler
+/// One (user, media_type, tmdb_id) row of the materialised wanted-set. Self-describing: it embeds
+/// its own `user`+`media_type`+`tmdb_id` (the composite table key is derived from them) so the reconciler
 /// gets a flat, fully-keyed list from `all_wanted()` without re-parsing keys.
 /// Invariant: `media_type` and the `WatchedState` variant (Movie/Show) must agree —
 /// `media_type` drives acquire-engine routing, `WatchedState` drives lifecycle logic.
@@ -291,14 +294,16 @@ pub struct WantedRecord {
 /// Why opening the on-disk database failed, split by recovery strategy.
 enum OpenFailure {
     /// The file is genuinely damaged/unreadable (bad magic, truncated, redb repair aborted) — safe
-    /// to move aside and recreate. The regenerable `matches` cache makes this lossless in practice;
-    /// forward migrations bring an older OUR-schema DB up to date instead of discarding it.
+    /// to move aside and recreate. NOT lossless: the old file is kept as `<path>.corrupt`, but the
+    /// recreated DB starts without the Trakt enrolments, provenance, selections and blacklist (only
+    /// the `matches` cache regenerates). Forward migrations bring an older OUR-schema DB up to date
+    /// instead of discarding it.
     Corrupt(String),
     /// A transient/operational failure: another instance holds the lock, the path is not writable,
     /// disk is full, etc. — OR an INTACT database that this binary cannot safely use but must not
     /// discard: an older redb on-disk format (`UpgradeRequired`, e.g. after a redb dependency bump),
-    /// or a schema written by a NEWER build of this app (version ahead of the binary, e.g. after a
-    /// rollback). In every case the file is intact and holds non-regenerable authoritative data, so
+    /// a NEWER redb on-disk format (a rollback after a redb upgrade rewrote the file), or a schema
+    /// written by a NEWER build of this app (version ahead of the binary, e.g. after a rollback). In every case the file is intact and holds non-regenerable authoritative data, so
     /// the caller fails startup and lets the operator fix the underlying condition (back up /
     /// migrate / roll the binary forward) instead.
     Transient(String),
@@ -306,8 +311,9 @@ enum OpenFailure {
 
 /// `true` for an I/O error kind that means the *file* is malformed/truncated (corruption we can
 /// recover from), as opposed to an operational failure (permissions, disk full, …) that must not
-/// discard a possibly-intact database. redb surfaces a bad header / too-short file as
-/// `Io(InvalidData)`; a truncated file as `Io(UnexpectedEof)`.
+/// discard a possibly-intact database. redb surfaces a bad header as `Io(InvalidData)` and a file
+/// truncated below its header as `Io(UnexpectedEof)`. (A longer truncation — an intact header
+/// recording a layout longer than the file — makes redb panic instead; `try_open` catches that.)
 fn io_kind_is_corruption(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -341,6 +347,16 @@ fn db_open_failure(e: redb::DatabaseError) -> OpenFailure {
     let corrupt = match &e {
         // redb tried to auto-repair the file and gave up → genuinely damaged, safe to recreate.
         DatabaseError::RepairAborted => true,
+        // An INTACT database in a NEWER redb on-disk format (a rollback after a redb upgrade
+        // rewrote the file). redb has no dedicated variant for it: it reports the commit slot's
+        // format version as `Corrupted("Expected file format version <= N, found M")`. Like an
+        // older format (`UpgradeRequired`, below), it must fail startup and keep the file rather
+        // than be moved aside with all its non-regenerable tables.
+        DatabaseError::Storage(StorageError::Corrupted(msg))
+            if msg.starts_with("Expected file format version") =>
+        {
+            false
+        }
         DatabaseError::Storage(StorageError::Corrupted(_)) => true,
         DatabaseError::Storage(StorageError::Io(io)) => io_kind_is_corruption(io.kind()),
         // Everything else is transient (fail startup, keep the file). In particular
@@ -351,12 +367,24 @@ fn db_open_failure(e: redb::DatabaseError) -> OpenFailure {
         // migrate rather than lose data.
         _ => false,
     };
-    let msg = format!("open failed: {e}");
     if corrupt {
-        OpenFailure::Corrupt(msg)
-    } else {
-        OpenFailure::Transient(msg)
+        return OpenFailure::Corrupt(format!("open failed: {e}"));
     }
+    // What the operator should check, per cause (the newer-schema case in `try_open` carries its own).
+    let hint = match &e {
+        DatabaseError::DatabaseAlreadyOpen => " — check that no other instance is running",
+        DatabaseError::Storage(StorageError::Io(_)) => {
+            " — check that the path is writable and the disk is not full"
+        }
+        DatabaseError::Storage(StorageError::Corrupted(_)) => {
+            " — the file was written by a newer redb on-disk format; run a newer build of this app"
+        }
+        DatabaseError::UpgradeRequired(_) => {
+            " — the file is in an older redb on-disk format; back it up and migrate it"
+        }
+        _ => "",
+    };
+    OpenFailure::Transient(format!("open failed: {e}{hint}"))
 }
 
 /// Classify an error surfacing during schema read/init on an already-opened database. A corruption
@@ -385,11 +413,12 @@ pub struct Store {
 impl Store {
     /// Open (or create) the database at `path`, recovering automatically from a genuinely
     /// unreadable / corrupt file (bad magic, truncated, redb repair aborted) rather than failing
-    /// startup. A *transient/incompatible* failure — another instance holds the lock, the path is
-    /// not writable, disk full, an older redb on-disk format (`UpgradeRequired`), OR a schema written
-    /// by a NEWER build of this app (e.g. after a rollback) — leaves the file intact and fails
-    /// startup instead, because discarding a possibly-intact database would lose non-regenerable
-    /// authoritative data. Synchronous — called once at startup.
+    /// startup: the file is moved aside to `<path>.corrupt` and a fresh, empty DB is created. A
+    /// *transient/incompatible* failure — another instance holds the lock, the path is not writable,
+    /// disk full, an older or NEWER redb on-disk format, OR a schema written by a NEWER build of this
+    /// app (e.g. after a rollback) — leaves the file intact and fails startup instead, because
+    /// discarding a possibly-intact database would lose non-regenerable authoritative data.
+    /// Synchronous — called once at startup.
     pub fn open(path: &str) -> Result<Self, AppError> {
         let db = match Self::try_open(path) {
             Ok(db) => db,
@@ -403,8 +432,7 @@ impl Store {
             Err(OpenFailure::Transient(reason)) => {
                 return Err(AppError::Config(format!(
                     "Database {path} could not be opened ({reason}). Refusing to discard a \
-                     possibly-intact database — check that no other instance is running and that \
-                     {path} is writable."
+                     possibly-intact database."
                 )));
             }
         };
@@ -430,7 +458,19 @@ impl Store {
     /// [`OpenFailure`] classifying *why* it failed so the caller can decide between
     /// recovering (move aside) and refusing to discard an intact database.
     fn try_open(path: &str) -> Result<Database, OpenFailure> {
-        let db = Database::create(path).map_err(db_open_failure)?;
+        // redb `assert!`s rather than returning an error on some damaged files (a header that is
+        // intact but records a layout longer than the file, e.g. after an interrupted copy, or a
+        // damaged page-size field). Catch that panic and classify it as corruption so `open` moves
+        // the file aside like any other damaged DB instead of crash-looping at startup. The unwind
+        // drops the file handle (and its lock), so the rename that follows works.
+        let db = match std::panic::catch_unwind(|| Database::create(path)) {
+            Ok(r) => r.map_err(db_open_failure)?,
+            Err(_) => {
+                return Err(OpenFailure::Corrupt(
+                    "redb panicked opening the file (truncated or damaged header)".into(),
+                ))
+            }
+        };
         let version =
             Self::read_version(&db).map_err(|e| schema_failure("schema read failed", e))?;
         if version > SCHEMA_VERSION {
@@ -649,35 +689,44 @@ impl Store {
     /// that fail to deserialise are skipped rather than failing the whole load.
     pub async fn load_all_matches(&self) -> HashMap<String, (TorrentInfo, MediaMetadata)> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut map = HashMap::new();
-            if let Ok(read_txn) = db.begin_read() {
-                if let Ok(table) = read_txn.open_table(MATCHES_TABLE) {
-                    if let Ok(iter) = table.iter() {
-                        for entry in iter.flatten() {
-                            let (key, value) = entry;
-                            if let Ok(data) =
-                                serde_json::from_slice::<(TorrentInfo, MediaMetadata)>(value.value())
-                            {
-                                map.insert(key.value().to_string(), data);
-                            }
-                        }
-                    }
-                }
-            }
-            map
+        let r = tokio::task::spawn_blocking(move || {
+            Self::scan_json::<(TorrentInfo, MediaMetadata)>(&db, MATCHES_TABLE, "matches")
+                .into_iter()
+                .collect()
         })
-        .await
-        .unwrap_or_else(|e| {
-            error!("Failed to load persisted matches: {:?}", e);
-            HashMap::new()
+        .await;
+        Self::join_or_default("load_all_matches", r)
+    }
+
+    /// Whether the identification cache holds any entry. The scan loop keeps the cache through a run
+    /// of wholesale-empty provider listings and drops it only once it accepts the account as empty,
+    /// so the reconciler treats an empty listing as suspect while this is `true`. A read failure is
+    /// logged and reads as `true` (suspect: the reconciler then holds back rather than acting).
+    pub async fn has_matches(&self) -> bool {
+        let db = self.db.clone();
+        let r = tokio::task::spawn_blocking(move || {
+            let read = || -> Result<bool, redb::Error> {
+                let txn = db.begin_read()?;
+                let table = txn.open_table(MATCHES_TABLE)?;
+                let any = table.first()?.is_some();
+                Ok(any)
+            };
+            read().unwrap_or_else(|e| {
+                error!("has_matches: read failed: {e}");
+                true
+            })
+        })
+        .await;
+        r.unwrap_or_else(|e| {
+            error!("has_matches: blocking read task failed: {e:?}");
+            true
         })
     }
 
     /// Look up a single cached identification by torrent id.
     pub async fn get_match(&self, id: String) -> Option<(TorrentInfo, MediaMetadata)> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
+        let r = tokio::task::spawn_blocking(move || {
             let read_txn = Self::read_or_log("get_match begin_read", db.begin_read())?;
             let table =
                 Self::read_or_log("get_match open_table", read_txn.open_table(MATCHES_TABLE))?;
@@ -687,11 +736,8 @@ impl Store {
                 serde_json::from_slice::<(TorrentInfo, MediaMetadata)>(entry.value()),
             )
         })
-        .await
-        .unwrap_or_else(|e| {
-            error!("get_match: blocking read task failed: {e}");
-            None
-        })
+        .await;
+        Self::join_or_default("get_match", r)
     }
 
     /// Batch-insert identifications. Serialises with the same encoding as before; an
@@ -833,6 +879,120 @@ impl Store {
         }
     }
 
+    /// Collapse a read accessor's `spawn_blocking` join result: a JoinError (the blocking task
+    /// panicked or was cancelled) is logged under `label` and falls back to the empty/zero default
+    /// rather than reading downstream as a silent "empty". Most of these accessors read
+    /// authoritative, non-regenerable tables (owned/wanted/selection/trakt_tokens/blacklist), where
+    /// an undiagnosed empty read can drive mass re-acquire or wrong lifecycle decisions.
+    fn join_or_default<T: Default>(label: &str, r: Result<T, tokio::task::JoinError>) -> T {
+        r.unwrap_or_else(|e| {
+            error!("{label}: blocking read task failed: {e:?}");
+            T::default()
+        })
+    }
+
+    /// Visit every row of the `&str → bytes` table `def` in one read transaction. A begin_read /
+    /// open_table / iter failure and every per-row read failure is logged under `label` rather
+    /// than silently swallowed. Returns `false` when the table could not be read at all (no rows
+    /// were visited), `true` otherwise (an unreadable row is skipped).
+    fn scan_rows(
+        db: &Database,
+        def: BytesTable,
+        label: &str,
+        mut visit: impl FnMut(&str, &[u8]),
+    ) -> bool {
+        let txn = match db.begin_read() {
+            Ok(t) => t,
+            Err(e) => {
+                error!("{label}: begin_read failed: {e}");
+                return false;
+            }
+        };
+        let table = match txn.open_table(def) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("{label}: open_table failed: {e}");
+                return false;
+            }
+        };
+        let iter = match table.iter() {
+            Ok(i) => i,
+            Err(e) => {
+                error!("{label}: iter failed: {e}");
+                return false;
+            }
+        };
+        for entry in iter {
+            match entry {
+                Ok((k, v)) => visit(k.value(), v.value()),
+                Err(e) => error!("{label} row read failed (skipped): {e}"),
+            }
+        }
+        true
+    }
+
+    /// Every row of `def` with its key, deserialised as `T`. A row that won't deserialise is logged
+    /// and skipped (see [`Self::scan_rows`] for the read failures).
+    fn scan_json<T: serde::de::DeserializeOwned>(
+        db: &Database,
+        def: BytesTable,
+        label: &str,
+    ) -> Vec<(String, T)> {
+        let mut out = Vec::new();
+        Self::scan_rows(db, def, label, |k, v| {
+            match serde_json::from_slice::<T>(v) {
+                Ok(rec) => out.push((k.to_string(), rec)),
+                Err(e) => error!("{label} row {k} failed to deserialise (skipped): {e}"),
+            }
+        });
+        out
+    }
+
+    /// One read-modify-write of the JSON record at `key` in `def`, in a single write transaction.
+    /// `Ok(None)` when there is no record (nothing is written, so a missing record is never
+    /// resurrected). Otherwise `f` mutates the decoded record and returns whether it changed it; a
+    /// changed record is re-serialised and written back, and the result is `Ok(Some(changed))`. A
+    /// record that won't deserialise or re-serialise is an `Err` (`AppError::Task`, prefixed with
+    /// `ctx`), never a phantom `Ok`: the transaction is dropped without committing, so the caller
+    /// learns the change did not land.
+    fn update_json<T: serde::Serialize + serde::de::DeserializeOwned>(
+        db: &Database,
+        def: BytesTable,
+        key: &str,
+        ctx: &str,
+        f: impl FnOnce(&mut T) -> bool,
+    ) -> Result<Option<bool>, AppError> {
+        let txn = db.begin_write().map_err(|e| AppError::Db(e.into()))?;
+        let outcome = {
+            let mut table = txn.open_table(def).map_err(|e| AppError::Db(e.into()))?;
+            // Copy the bytes out so the read borrow ends before the `&mut` insert.
+            let existing: Option<Vec<u8>> = table
+                .get(key)
+                .map_err(|e| AppError::Db(e.into()))?
+                .map(|guard| guard.value().to_vec());
+            match existing {
+                None => None,
+                Some(raw) => {
+                    let mut rec = serde_json::from_slice::<T>(&raw).map_err(|e| {
+                        AppError::Task(format!("{ctx}: corrupt record for {key}: {e}"))
+                    })?;
+                    let changed = f(&mut rec);
+                    if changed {
+                        let bytes = serde_json::to_vec(&rec).map_err(|e| {
+                            AppError::Task(format!("{ctx}: re-serialise failed for {key}: {e}"))
+                        })?;
+                        table
+                            .insert(key, bytes.as_slice())
+                            .map_err(|e| AppError::Db(e.into()))?;
+                    }
+                    Some(changed)
+                }
+            }
+        };
+        txn.commit().map_err(|e| AppError::Db(e.into()))?;
+        Ok(outcome)
+    }
+
     // ── owned_hashes accessors ────────────────────────────────────────────────
 
     pub async fn put_owned(&self, hash: String, rec: OwnedRecord) -> Result<(), AppError> {
@@ -912,7 +1072,7 @@ impl Store {
     pub async fn get_owned(&self, hash: String) -> Option<OwnedRecord> {
         let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
+        let r = tokio::task::spawn_blocking(move || {
             let txn = Self::read_or_log("get_owned begin_read", db.begin_read())?;
             let table = Self::read_or_log("get_owned open_table", txn.open_table(OWNED_TABLE))?;
             let e = Self::read_or_log("get_owned get", table.get(hash.as_str()))??;
@@ -921,11 +1081,8 @@ impl Store {
                 serde_json::from_slice::<OwnedRecord>(e.value()),
             )
         })
-        .await
-        .unwrap_or_else(|e| {
-            error!("get_owned: blocking read task failed: {e}");
-            None
-        })
+        .await;
+        Self::join_or_default("get_owned", r)
     }
 
     pub async fn set_owned_status(
@@ -936,48 +1093,25 @@ impl Store {
         let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-            let txn = db.begin_write().map_err(|e| AppError::Db(e.into()))?;
-            {
-                let mut table = txn
-                    .open_table(OWNED_TABLE)
-                    .map_err(|e| AppError::Db(e.into()))?;
-                // Read the raw bytes into an owned Vec first so the read borrow ends
-                // before we call insert (which needs &mut table).
-                let existing: Option<Vec<u8>> = table
-                    .get(hash.as_str())
-                    .map_err(|e| AppError::Db(e.into()))?
-                    .map(|guard| guard.value().to_vec());
-                match existing {
-                    Some(raw) => {
-                        // A record that won't deserialise / re-serialise is a real failure: surface
-                        // it (Err, NOT a phantom Ok) via an early `?` so the txn is dropped without
-                        // committing and the caller — e.g. `observe` marking a torrent `Verified` —
-                        // learns the status change did not land, instead of believing it did while
-                        // the record silently stays `Pending`. (Both are effectively unreachable for
-                        // this plain struct, but must never be swallowed.)
-                        let mut rec = serde_json::from_slice::<OwnedRecord>(&raw).map_err(|e| {
-                            AppError::Task(format!(
-                                "set_owned_status: corrupt owned record for {hash}: {e}"
-                            ))
-                        })?;
-                        rec.status = status;
-                        let bytes = serde_json::to_vec(&rec).map_err(|e| {
-                            AppError::Task(format!(
-                                "set_owned_status: re-serialise failed for {hash}: {e}"
-                            ))
-                        })?;
-                        table
-                            .insert(hash.as_str(), bytes.as_slice())
-                            .map_err(|e| AppError::Db(e.into()))?;
-                    }
-                    // A missing record is a legitimate no-op (e.g. a hash reaped between listing and
-                    // here), NOT a failure — commit nothing and return Ok.
-                    None => {
-                        warn!("set_owned_status: no owned record for {hash}; status change skipped")
-                    }
-                }
+            // A record that won't deserialise / re-serialise is a real failure surfaced as `Err`
+            // (NOT a phantom Ok), so the caller — e.g. `observe` marking a torrent `Verified` —
+            // learns the status change did not land instead of believing it did while the record
+            // silently stays `Pending`.
+            let outcome = Self::update_json::<OwnedRecord>(
+                &db,
+                OWNED_TABLE,
+                &hash,
+                "set_owned_status",
+                |rec| {
+                    rec.status = status;
+                    true
+                },
+            )?;
+            // A missing record is a legitimate no-op (e.g. a hash reaped between listing and here),
+            // NOT a failure — nothing is written and the result is Ok.
+            if outcome.is_none() {
+                warn!("set_owned_status: no owned record for {hash}; status change skipped");
             }
-            txn.commit().map_err(|e| AppError::Db(e.into()))?;
             Ok(())
         })
         .await;
@@ -1001,49 +1135,25 @@ impl Store {
         let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<bool, AppError> {
-            let txn = db.begin_write().map_err(|e| AppError::Db(e.into()))?;
-            let wrote = {
-                let mut table = txn
-                    .open_table(OWNED_TABLE)
-                    .map_err(|e| AppError::Db(e.into()))?;
-                // Copy the bytes out so the read borrow ends before the `&mut` insert.
-                let existing: Option<Vec<u8>> = table
-                    .get(hash.as_str())
-                    .map_err(|e| AppError::Db(e.into()))?
-                    .map(|guard| guard.value().to_vec());
-                match existing {
-                    Some(raw) => {
-                        let mut rec = serde_json::from_slice::<OwnedRecord>(&raw).map_err(|e| {
-                            AppError::Task(format!(
-                                "backfill_title_languages_if_unset: corrupt owned record for {hash}: {e}"
-                            ))
-                        })?;
-                        let mut changed = false;
-                        if rec.request.spoken_languages.is_none() {
-                            rec.request.spoken_languages = Some(spoken);
-                            changed = true;
-                        }
-                        if rec.request.original_language.is_none() && original_language.is_some() {
-                            rec.request.original_language = original_language;
-                            changed = true;
-                        }
-                        if changed {
-                            let bytes = serde_json::to_vec(&rec).map_err(|e| {
-                                AppError::Task(format!(
-                                    "backfill_title_languages_if_unset: re-serialise failed for {hash}: {e}"
-                                ))
-                            })?;
-                            table
-                                .insert(hash.as_str(), bytes.as_slice())
-                                .map_err(|e| AppError::Db(e.into()))?;
-                        }
-                        changed
+            let outcome = Self::update_json::<OwnedRecord>(
+                &db,
+                OWNED_TABLE,
+                &hash,
+                "backfill_title_languages_if_unset",
+                |rec| {
+                    let mut changed = false;
+                    if rec.request.spoken_languages.is_none() {
+                        rec.request.spoken_languages = Some(spoken);
+                        changed = true;
                     }
-                    None => false,
-                }
-            };
-            txn.commit().map_err(|e| AppError::Db(e.into()))?;
-            Ok(wrote)
+                    if rec.request.original_language.is_none() && original_language.is_some() {
+                        rec.request.original_language = original_language;
+                        changed = true;
+                    }
+                    changed
+                },
+            )?;
+            Ok(outcome == Some(true))
         })
         .await;
         Self::flatten_join_app(result)
@@ -1062,43 +1172,56 @@ impl Store {
         let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<bool, AppError> {
-            let txn = db.begin_write().map_err(|e| AppError::Db(e.into()))?;
-            let wrote = {
-                let mut table = txn
-                    .open_table(OWNED_TABLE)
-                    .map_err(|e| AppError::Db(e.into()))?;
-                // Copy the bytes out so the read borrow ends before the `&mut` insert.
-                let existing: Option<Vec<u8>> = table
-                    .get(hash.as_str())
-                    .map_err(|e| AppError::Db(e.into()))?
-                    .map(|guard| guard.value().to_vec());
-                match existing {
-                    Some(raw) => {
-                        let mut rec = serde_json::from_slice::<OwnedRecord>(&raw).map_err(|e| {
-                            AppError::Task(format!(
-                                "set_quality_if_unset: corrupt owned record for {hash}: {e}"
-                            ))
-                        })?;
-                        if rec.quality.is_none() {
-                            rec.quality = Some(quality);
-                            let bytes = serde_json::to_vec(&rec).map_err(|e| {
-                                AppError::Task(format!(
-                                    "set_quality_if_unset: re-serialise failed for {hash}: {e}"
-                                ))
-                            })?;
-                            table
-                                .insert(hash.as_str(), bytes.as_slice())
-                                .map_err(|e| AppError::Db(e.into()))?;
-                            true
-                        } else {
-                            false
-                        }
+            let outcome = Self::update_json::<OwnedRecord>(
+                &db,
+                OWNED_TABLE,
+                &hash,
+                "set_quality_if_unset",
+                |rec| {
+                    if rec.quality.is_none() {
+                        rec.quality = Some(quality);
+                        true
+                    } else {
+                        false
                     }
-                    None => false,
-                }
-            };
-            txn.commit().map_err(|e| AppError::Db(e.into()))?;
-            Ok(wrote)
+                },
+            )?;
+            Ok(outcome == Some(true))
+        })
+        .await;
+        Self::flatten_join_app(result)
+    }
+
+    /// Set `request.imdb_id` of the owned record for `hash` ONLY while it is empty, as one
+    /// read-modify-write transaction that touches no other field. The account mirror writes an empty
+    /// id when TMDB's `external_ids` lookup fails transiently, and nothing else would ever fill it
+    /// (the hash stays owned, so the mirror never revisits it): the scan loop's daily backfill uses
+    /// this so it can't overwrite a recorded id or clobber a concurrent write to another field.
+    /// Returns `true` if it wrote; `false` when an id is already recorded or the record is missing
+    /// (never resurrected).
+    pub async fn set_imdb_id_if_empty(
+        &self,
+        hash: String,
+        imdb_id: String,
+    ) -> Result<bool, AppError> {
+        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, AppError> {
+            let outcome = Self::update_json::<OwnedRecord>(
+                &db,
+                OWNED_TABLE,
+                &hash,
+                "set_imdb_id_if_empty",
+                |rec| {
+                    if rec.request.imdb_id.is_empty() {
+                        rec.request.imdb_id = imdb_id;
+                        true
+                    } else {
+                        false
+                    }
+                },
+            )?;
+            Ok(outcome == Some(true))
         })
         .await;
         Self::flatten_join_app(result)
@@ -1121,47 +1244,14 @@ impl Store {
 
     pub async fn all_owned(&self) -> Vec<(String, OwnedRecord)> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut out = Vec::new();
-            if let Ok(txn) = db.begin_read() {
-                if let Ok(table) = txn.open_table(OWNED_TABLE) {
-                    if let Ok(iter) = table.iter() {
-                        for entry in iter {
-                            // owned_hashes is authoritative + non-regenerable: a silently-dropped row
-                            // becomes an invisible torrent (duplicate re-acquire / lost provenance /
-                            // remove churn) that is undiagnosable — so log BOTH a per-row read error
-                            // (which `.flatten()` would have swallowed) and a deserialise error.
-                            let (k, v) = match entry {
-                                Ok(kv) => kv,
-                                Err(e) => {
-                                    error!("owned_hashes row read failed (skipped): {}", e);
-                                    continue;
-                                }
-                            };
-                            match serde_json::from_slice::<OwnedRecord>(v.value()) {
-                                Ok(rec) => out.push((k.value().to_string(), rec)),
-                                Err(e) => error!(
-                                    "owned_hashes row {} failed to deserialise (skipped): {}",
-                                    k.value(),
-                                    e
-                                ),
-                            }
-                        }
-                    }
-                }
-            }
-            out
+        // owned_hashes is authoritative + non-regenerable: a silently-dropped row becomes an
+        // invisible torrent (duplicate re-acquire / lost provenance / remove churn), so every read
+        // and deserialise failure is logged (`scan_json`).
+        let r = tokio::task::spawn_blocking(move || {
+            Self::scan_json::<OwnedRecord>(&db, OWNED_TABLE, "owned_hashes")
         })
-        .await
-        .unwrap_or_else(|e| {
-            // Mirror `load_all_matches`: log a blocking-read JoinError rather than silently
-            // returning an empty set. These accessors read authoritative, non-regenerable tables
-            // (owned/wanted/selection/trakt_tokens/blacklist); a swallowed failure reads
-            // downstream as "empty" with zero diagnostic and can drive mass re-acquire / wrong
-            // lifecycle decisions.
-            error!("store: blocking read task failed: {e:?}");
-            Default::default()
-        })
+        .await;
+        Self::join_or_default("all_owned", r)
     }
 
     // ── authoritative_ids accessors ───────────────────────────────────────────
@@ -1171,6 +1261,7 @@ impl Store {
         hash: String,
         meta: crate::vfs::MediaMetadata,
     ) -> Result<(), AppError> {
+        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
         let bytes = match serde_json::to_vec(&meta) {
             Ok(b) => b,
             Err(e) => {
@@ -1199,8 +1290,9 @@ impl Store {
     }
 
     pub async fn authoritative_meta(&self, hash: String) -> Option<crate::vfs::MediaMetadata> {
+        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
+        let r = tokio::task::spawn_blocking(move || {
             let txn = Self::read_or_log("authoritative_meta begin_read", db.begin_read())?;
             let table =
                 Self::read_or_log("authoritative_meta open_table", txn.open_table(AUTH_TABLE))?;
@@ -1210,14 +1302,12 @@ impl Store {
                 serde_json::from_slice::<crate::vfs::MediaMetadata>(e.value()),
             )
         })
-        .await
-        .unwrap_or_else(|e| {
-            error!("authoritative_meta: blocking read task failed: {e}");
-            None
-        })
+        .await;
+        Self::join_or_default("authoritative_meta", r)
     }
 
     pub async fn remove_authoritative(&self, hash: String) -> Result<(), AppError> {
+        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
@@ -1267,6 +1357,9 @@ impl Store {
         Self::flatten_join(result)
     }
 
+    /// Single-hash blacklist lookup. Test-only: production filters with `blacklisted_hashes_for` /
+    /// `all_blacklisted_hashes` (one read per title / per tick rather than one per candidate).
+    #[cfg(test)]
     pub async fn is_blacklisted(
         &self,
         kind: crate::scraper::MediaKind,
@@ -1275,7 +1368,7 @@ impl Store {
     ) -> bool {
         let key = blacklist_key(kind, tmdb_id, &hash);
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
+        let r = tokio::task::spawn_blocking(move || {
             // Log-then-default on a transient read failure, matching `read_or_log`'s convention: a
             // silent false "not blacklisted" would let a rejected hash be re-added, invisibly.
             let txn = match db.begin_read() {
@@ -1300,8 +1393,8 @@ impl Store {
                 }
             }
         })
-        .await
-        .unwrap_or(false)
+        .await;
+        Self::join_or_default("is_blacklisted", r)
     }
 
     /// Every blacklisted infohash (lowercased), across ALL media types and tmdb_ids. Used by the
@@ -1311,43 +1404,20 @@ impl Store {
     /// blacklisted under (the wrong-title case). One read per scan tick.
     pub async fn all_blacklisted_hashes(&self) -> std::collections::HashSet<String> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
+        let r = tokio::task::spawn_blocking(move || {
+            // A dropped blacklist row silently re-adopts a hash the engine rejected (regenerable via
+            // the TTL, so it self-heals — but keep it diagnosable): `scan_rows` logs read failures.
             let mut out = std::collections::HashSet::new();
-            if let Ok(txn) = db.begin_read() {
-                if let Ok(table) = txn.open_table(BLACKLIST_TABLE) {
-                    if let Ok(iter) = table.iter() {
-                        for entry in iter {
-                            // Log a per-row read error rather than `.flatten()`-swallowing it: a
-                            // dropped blacklist row silently re-adopts a hash the engine rejected.
-                            // (Regenerable via the TTL, so it self-heals — but keep it diagnosable,
-                            // consistent with the other `all_*` accessors.)
-                            let (k, _) = match entry {
-                                Ok(kv) => kv,
-                                Err(e) => {
-                                    error!("blacklist row read failed (skipped): {}", e);
-                                    continue;
-                                }
-                            };
-                            // key = "<m|s>|tmdb_id|hash" → the hash is everything after the LAST '|'.
-                            if let Some((_, hash)) = k.value().rsplit_once('|') {
-                                out.insert(hash.to_ascii_lowercase());
-                            }
-                        }
-                    }
+            Self::scan_rows(&db, BLACKLIST_TABLE, "blacklist", |k, _| {
+                // key = "<m|s>|tmdb_id|hash" → the hash is everything after the LAST '|'.
+                if let Some((_, hash)) = k.rsplit_once('|') {
+                    out.insert(hash.to_ascii_lowercase());
                 }
-            }
+            });
             out
         })
-        .await
-        .unwrap_or_else(|e| {
-            // Mirror `load_all_matches`: log a blocking-read JoinError rather than silently
-            // returning an empty set. These accessors read authoritative, non-regenerable tables
-            // (owned/wanted/selection/trakt_tokens/blacklist); a swallowed failure reads
-            // downstream as "empty" with zero diagnostic and can drive mass re-acquire / wrong
-            // lifecycle decisions.
-            error!("store: blocking read task failed: {e:?}");
-            Default::default()
-        })
+        .await;
+        Self::join_or_default("all_blacklisted_hashes", r)
     }
 
     /// Remove blacklist entries stamped (`at`) strictly before `cutoff_at` (Unix seconds). The
@@ -1359,7 +1429,7 @@ impl Store {
     /// age 0 (pruned) — it predates the `at` field and is regenerable anyway.
     pub async fn prune_blacklist_before(&self, cutoff_at: u64) -> usize {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || -> usize {
+        let r = tokio::task::spawn_blocking(move || -> usize {
             // A begin_write/open_table/iter/commit failure here means the append-only blacklist
             // stopped pruning — `warn!` it rather than silently returning 0, so a persistent write
             // failure (which would let the table grow unbounded) is visible in the logs instead of
@@ -1421,8 +1491,8 @@ impl Store {
             }
             removed
         })
-        .await
-        .unwrap_or(0)
+        .await;
+        Self::join_or_default("prune_blacklist_before", r)
     }
 
     /// Every blacklisted infohash (lowercased) for a SINGLE `(media_type, tmdb_id)` title — the
@@ -1438,41 +1508,48 @@ impl Store {
         // Reuse the key builder with an empty hash to get the exact `<m|s>|tmdb_id|` prefix.
         let prefix = blacklist_key(kind, tmdb_id, "");
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
+        let r = tokio::task::spawn_blocking(move || {
             let mut out = std::collections::HashSet::new();
-            if let Ok(txn) = db.begin_read() {
-                if let Ok(table) = txn.open_table(BLACKLIST_TABLE) {
-                    // The key is "<m|s>|tmdb_id|hash", so this title's rows are a contiguous,
-                    // lexicographically-ordered key range. A keyed range scan reads only those rows
-                    // (O(log n + matches)) instead of the whole table (which grows to 30 days of
-                    // churn under the TTL). Any key that sorts at/after `prefix` but does NOT start
-                    // with it sorts strictly AFTER the entire matching block, so the first
-                    // non-matching key ends the scan.
-                    if let Ok(iter) = table.range(prefix.as_str()..) {
-                        for entry in iter.flatten() {
-                            let (k, _) = entry;
-                            match k.value().strip_prefix(&prefix) {
-                                Some(hash) => {
-                                    out.insert(hash.to_ascii_lowercase());
-                                }
-                                None => break,
-                            }
-                        }
+            let Some(txn) = Self::read_or_log("blacklisted_hashes_for begin_read", db.begin_read())
+            else {
+                return out;
+            };
+            let Some(table) = Self::read_or_log(
+                "blacklisted_hashes_for open_table",
+                txn.open_table(BLACKLIST_TABLE),
+            ) else {
+                return out;
+            };
+            // The key is "<m|s>|tmdb_id|hash", so this title's rows are a contiguous,
+            // lexicographically-ordered key range. A keyed range scan reads only those rows
+            // (O(log n + matches)) instead of the whole table (which grows to 30 days of churn under
+            // the TTL). Any key that sorts at/after `prefix` but does NOT start with it sorts
+            // strictly AFTER the entire matching block, so the first non-matching key ends the scan.
+            let Some(iter) = Self::read_or_log(
+                "blacklisted_hashes_for range",
+                table.range(prefix.as_str()..),
+            ) else {
+                return out;
+            };
+            for entry in iter {
+                let (k, _) = match entry {
+                    Ok(kv) => kv,
+                    Err(e) => {
+                        error!("blacklist row read failed (skipped): {e}");
+                        continue;
                     }
+                };
+                match k.value().strip_prefix(&prefix) {
+                    Some(hash) => {
+                        out.insert(hash.to_ascii_lowercase());
+                    }
+                    None => break,
                 }
             }
             out
         })
-        .await
-        .unwrap_or_else(|e| {
-            // Mirror `load_all_matches`: log a blocking-read JoinError rather than silently
-            // returning an empty set. These accessors read authoritative, non-regenerable tables
-            // (owned/wanted/selection/trakt_tokens/blacklist); a swallowed failure reads
-            // downstream as "empty" with zero diagnostic and can drive mass re-acquire / wrong
-            // lifecycle decisions.
-            error!("store: blocking read task failed: {e:?}");
-            Default::default()
-        })
+        .await;
+        Self::join_or_default("blacklisted_hashes_for", r)
     }
 
     // ── trakt_tokens accessors ────────────────────────────────────────────────
@@ -1523,41 +1600,22 @@ impl Store {
     ) -> Result<bool, AppError> {
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<bool, AppError> {
-            let txn = db.begin_write().map_err(|e| AppError::Db(e.into()))?;
-            let applied = {
-                let mut table = txn
-                    .open_table(TRAKT_TOKENS_TABLE)
-                    .map_err(|e| AppError::Db(e.into()))?;
-                let existing: Option<Vec<u8>> = table
-                    .get(slug.as_str())
-                    .map_err(|e| AppError::Db(e.into()))?
-                    .map(|g| g.value().to_vec());
-                match existing {
-                    // Record removed since it was read (a concurrent /remove) — do not resurrect it.
-                    None => false,
-                    Some(raw) => {
-                        let mut current: TraktTokens =
-                            serde_json::from_slice(&raw).map_err(|e| {
-                                AppError::Task(format!("corrupt TraktTokens for {slug}: {e}"))
-                            })?;
-                        if current.refresh != expected_refresh {
-                            // A concurrent refresh rotated the single-use token — that write wins.
-                            false
-                        } else {
-                            mutate(&mut current);
-                            let bytes = serde_json::to_vec(&current).map_err(|e| {
-                                AppError::Task(format!("re-serialise TraktTokens for {slug}: {e}"))
-                            })?;
-                            table
-                                .insert(slug.as_str(), bytes.as_slice())
-                                .map_err(|e| AppError::Db(e.into()))?;
-                            true
-                        }
+            // A missing record (removed since it was read — a concurrent /remove) is `None`: never
+            // resurrected. A rotated refresh token means a concurrent refresh won — leave it alone.
+            let outcome = Self::update_json::<TraktTokens>(
+                &db,
+                TRAKT_TOKENS_TABLE,
+                &slug,
+                "update_trakt_tokens_if_refresh_matches",
+                |current| {
+                    if current.refresh != expected_refresh {
+                        return false;
                     }
-                }
-            };
-            txn.commit().map_err(|e| AppError::Db(e.into()))?;
-            Ok(applied)
+                    mutate(current);
+                    true
+                },
+            )?;
+            Ok(outcome == Some(true))
         })
         .await;
         Self::flatten_join_app(result)
@@ -1565,7 +1623,7 @@ impl Store {
 
     pub async fn get_trakt_tokens(&self, slug: String) -> Option<TraktTokens> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
+        let r = tokio::task::spawn_blocking(move || {
             let txn = Self::read_or_log("get_trakt_tokens begin_read", db.begin_read())?;
             let table = Self::read_or_log(
                 "get_trakt_tokens open_table",
@@ -1577,11 +1635,8 @@ impl Store {
                 serde_json::from_slice::<TraktTokens>(e.value()),
             )
         })
-        .await
-        .unwrap_or_else(|e| {
-            error!("get_trakt_tokens: blocking read task failed: {e}");
-            None
-        })
+        .await;
+        Self::join_or_default("get_trakt_tokens", r)
     }
 
     pub async fn remove_trakt_tokens(&self, slug: String) -> Result<(), AppError> {
@@ -1598,48 +1653,47 @@ impl Store {
         Self::flatten_join(result)
     }
 
+    /// Remove a Trakt account: its token row AND every one of its `wanted` rows, in ONE write
+    /// transaction, so a store failure part-way can't leave wanted rows behind for a slug that no
+    /// longer appears anywhere (nothing would ever prune them: only a sync of an enrolled account
+    /// rewrites its rows). The user's rows are one contiguous key range (`wanted_key` starts with
+    /// `"{slug}|"`, and a slug contains no `|`).
+    pub async fn remove_trakt_account(&self, slug: String) -> Result<(), AppError> {
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            let txn = db.begin_write()?;
+            {
+                txn.open_table(TRAKT_TOKENS_TABLE)?.remove(slug.as_str())?;
+                let mut wanted = txn.open_table(WANTED_TABLE)?;
+                let prefix = format!("{slug}|");
+                let mut keys = Vec::new();
+                for entry in wanted.range(prefix.as_str()..)? {
+                    let (k, _) = entry?;
+                    if !k.value().starts_with(&prefix) {
+                        break;
+                    }
+                    keys.push(k.value().to_string());
+                }
+                for k in &keys {
+                    wanted.remove(k.as_str())?;
+                }
+            }
+            txn.commit()?;
+            Ok(())
+        })
+        .await;
+        Self::flatten_join(result)
+    }
+
     /// Returns all stored Trakt token entries as (slug, tokens) pairs.
     pub async fn all_trakt_tokens(&self) -> Vec<(String, TraktTokens)> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut out = Vec::new();
-            if let Ok(txn) = db.begin_read() {
-                if let Ok(table) = txn.open_table(TRAKT_TOKENS_TABLE) {
-                    if let Ok(iter) = table.iter() {
-                        for entry in iter {
-                            // Authoritative table: log a per-row read error rather than `.flatten()`
-                            // silently dropping it (a lost token row = an account that stops syncing).
-                            let (k, v) = match entry {
-                                Ok(kv) => kv,
-                                Err(e) => {
-                                    error!("trakt_tokens row read failed (skipped): {}", e);
-                                    continue;
-                                }
-                            };
-                            match serde_json::from_slice::<TraktTokens>(v.value()) {
-                                Ok(tokens) => out.push((k.value().to_string(), tokens)),
-                                Err(e) => error!(
-                                    "trakt_tokens row {} failed to deserialise (skipped): {}",
-                                    k.value(),
-                                    e
-                                ),
-                            }
-                        }
-                    }
-                }
-            }
-            out
+        // Authoritative table: a lost token row is an account that silently stops syncing.
+        let r = tokio::task::spawn_blocking(move || {
+            Self::scan_json::<TraktTokens>(&db, TRAKT_TOKENS_TABLE, "trakt_tokens")
         })
-        .await
-        .unwrap_or_else(|e| {
-            // Mirror `load_all_matches`: log a blocking-read JoinError rather than silently
-            // returning an empty set. These accessors read authoritative, non-regenerable tables
-            // (owned/wanted/selection/trakt_tokens/blacklist); a swallowed failure reads
-            // downstream as "empty" with zero diagnostic and can drive mass re-acquire / wrong
-            // lifecycle decisions.
-            error!("store: blocking read task failed: {e:?}");
-            Default::default()
-        })
+        .await;
+        Self::join_or_default("all_trakt_tokens", r)
     }
 
     // ── wanted accessors ──────────────────────────────────────────────────────
@@ -1675,6 +1729,55 @@ impl Store {
         Self::flatten_join(result)
     }
 
+    /// Rewrite one user's `wanted` rows — remove the `remove` keys, upsert `put` — in ONE write
+    /// transaction that first checks the user is still enrolled (has a token row). Returns
+    /// `Ok(false)` and writes nothing when the account is gone, so a sync racing an account removal
+    /// can never resurrect the rows `remove_trakt_account` just deleted as permanent orphans (the
+    /// check and the writes are atomic). Every `put` record must belong to `slug`.
+    pub async fn replace_user_wanted_if_enrolled(
+        &self,
+        slug: String,
+        remove: Vec<(crate::vfs::MediaType, u64)>,
+        put: Vec<WantedRecord>,
+    ) -> Result<bool, AppError> {
+        // Serialise before opening the transaction so a serde failure writes nothing.
+        let mut rows = Vec::with_capacity(put.len());
+        for rec in &put {
+            debug_assert_eq!(rec.user, slug, "a wanted row written for another user");
+            let bytes = serde_json::to_vec(rec).map_err(|e| {
+                AppError::Task(format!(
+                    "serialise WantedRecord for {}|{}: {e}",
+                    rec.user, rec.tmdb_id
+                ))
+            })?;
+            rows.push((wanted_key(&rec.user, &rec.media_type, rec.tmdb_id), bytes));
+        }
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, redb::Error> {
+            let txn = db.begin_write()?;
+            {
+                if txn
+                    .open_table(TRAKT_TOKENS_TABLE)?
+                    .get(slug.as_str())?
+                    .is_none()
+                {
+                    return Ok(false); // dropped without committing: nothing written
+                }
+                let mut wanted = txn.open_table(WANTED_TABLE)?;
+                for (media_type, tmdb_id) in &remove {
+                    wanted.remove(wanted_key(&slug, media_type, *tmdb_id).as_str())?;
+                }
+                for (key, bytes) in &rows {
+                    wanted.insert(key.as_str(), bytes.as_slice())?;
+                }
+            }
+            txn.commit()?;
+            Ok(true)
+        })
+        .await;
+        Self::flatten_join(result)
+    }
+
     /// Single-key `wanted` lookup. Test-only: production reads the whole set via `all_wanted`.
     #[cfg(test)]
     pub async fn get_wanted(
@@ -1685,7 +1788,7 @@ impl Store {
     ) -> Option<WantedRecord> {
         let key = wanted_key(&user, &media_type, tmdb_id);
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
+        let r = tokio::task::spawn_blocking(move || {
             let txn = Self::read_or_log("get_wanted begin_read", db.begin_read())?;
             let table = Self::read_or_log("get_wanted open_table", txn.open_table(WANTED_TABLE))?;
             let e = Self::read_or_log("get_wanted get", table.get(key.as_str()))??;
@@ -1694,11 +1797,8 @@ impl Store {
                 serde_json::from_slice::<WantedRecord>(e.value()),
             )
         })
-        .await
-        .unwrap_or_else(|e| {
-            error!("get_wanted: blocking read task failed: {e}");
-            None
-        })
+        .await;
+        Self::join_or_default("get_wanted", r)
     }
 
     pub async fn remove_wanted(
@@ -1725,50 +1825,22 @@ impl Store {
     /// `user` and `tmdb_id`), so the reconciler can work with a flat list without re-parsing keys.
     pub async fn all_wanted(&self) -> Vec<WantedRecord> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut out = Vec::new();
-            if let Ok(txn) = db.begin_read() {
-                if let Ok(table) = txn.open_table(WANTED_TABLE) {
-                    if let Ok(iter) = table.iter() {
-                        for entry in iter {
-                            // Authoritative table: log a per-row read error (a swallowed wanted row
-                            // would silently drop a user's desired title from the reconcile set).
-                            let (k, v) = match entry {
-                                Ok(kv) => kv,
-                                Err(e) => {
-                                    error!("wanted row read failed (skipped): {}", e);
-                                    continue;
-                                }
-                            };
-                            match serde_json::from_slice::<WantedRecord>(v.value()) {
-                                Ok(rec) => out.push(rec),
-                                Err(e) => error!(
-                                    "wanted row {} failed to deserialise (skipped): {}",
-                                    k.value(),
-                                    e
-                                ),
-                            }
-                        }
-                    }
-                }
-            }
-            out
+        // Authoritative table: a swallowed row would silently drop a user's desired title from the
+        // reconcile set.
+        let r = tokio::task::spawn_blocking(move || {
+            Self::scan_json::<WantedRecord>(&db, WANTED_TABLE, "wanted")
+                .into_iter()
+                .map(|(_, rec)| rec)
+                .collect()
         })
-        .await
-        .unwrap_or_else(|e| {
-            // Mirror `load_all_matches`: log a blocking-read JoinError rather than silently
-            // returning an empty set. These accessors read authoritative, non-regenerable tables
-            // (owned/wanted/selection/trakt_tokens/blacklist); a swallowed failure reads
-            // downstream as "empty" with zero diagnostic and can drive mass re-acquire / wrong
-            // lifecycle decisions.
-            error!("store: blocking read task failed: {e:?}");
-            Default::default()
-        })
+        .await;
+        Self::join_or_default("all_wanted", r)
     }
 
     // ── selection accessors (SP3) ─────────────────────────────────────────────
 
     pub async fn put_selection(&self, slot: String, entry: SelectionEntry) -> Result<(), AppError> {
+        // Serialise before opening the transaction to avoid partial writes on serde failure.
         let bytes = match serde_json::to_vec(&entry) {
             Ok(b) => b,
             Err(e) => {
@@ -1779,7 +1851,6 @@ impl Store {
                 )));
             }
         };
-        // Serialise before opening the transaction to avoid partial writes on serde failure.
         let db = self.db.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
             let txn = db.begin_write()?;
@@ -1799,7 +1870,7 @@ impl Store {
     /// tests. The VFS build path reads the whole map at once via `all_selection`.
     pub async fn get_selection(&self, slot: String) -> Option<SelectionEntry> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
+        let r = tokio::task::spawn_blocking(move || {
             let txn = Self::read_or_log("get_selection begin_read", db.begin_read())?;
             let table =
                 Self::read_or_log("get_selection open_table", txn.open_table(SELECTION_TABLE))?;
@@ -1809,11 +1880,8 @@ impl Store {
                 serde_json::from_slice::<SelectionEntry>(e.value()),
             )
         })
-        .await
-        .unwrap_or_else(|e| {
-            error!("get_selection: blocking read task failed: {e}");
-            None
-        })
+        .await;
+        Self::join_or_default("get_selection", r)
     }
 
     /// Atomically repoint `slot` to `new` only while it still holds `expected` (compare-and-set, one
@@ -1871,45 +1939,13 @@ impl Store {
 
     pub async fn all_selection(&self) -> Vec<(String, SelectionEntry)> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut out = Vec::new();
-            if let Ok(txn) = db.begin_read() {
-                if let Ok(table) = txn.open_table(SELECTION_TABLE) {
-                    if let Ok(iter) = table.iter() {
-                        for entry in iter {
-                            // Authoritative table: log a per-row read error (a swallowed selection row
-                            // would silently revert that slot to the largest-bytes VFS fallback).
-                            let (k, v) = match entry {
-                                Ok(kv) => kv,
-                                Err(e) => {
-                                    error!("selection row read failed (skipped): {}", e);
-                                    continue;
-                                }
-                            };
-                            match serde_json::from_slice::<SelectionEntry>(v.value()) {
-                                Ok(rec) => out.push((k.value().to_string(), rec)),
-                                Err(e) => error!(
-                                    "selection row {} failed to deserialise (skipped): {}",
-                                    k.value(),
-                                    e
-                                ),
-                            }
-                        }
-                    }
-                }
-            }
-            out
+        // Authoritative table: a swallowed row would silently revert that slot to the largest-bytes
+        // VFS fallback.
+        let r = tokio::task::spawn_blocking(move || {
+            Self::scan_json::<SelectionEntry>(&db, SELECTION_TABLE, "selection")
         })
-        .await
-        .unwrap_or_else(|e| {
-            // Mirror `load_all_matches`: log a blocking-read JoinError rather than silently
-            // returning an empty set. These accessors read authoritative, non-regenerable tables
-            // (owned/wanted/selection/trakt_tokens/blacklist); a swallowed failure reads
-            // downstream as "empty" with zero diagnostic and can drive mass re-acquire / wrong
-            // lifecycle decisions.
-            error!("store: blocking read task failed: {e:?}");
-            Default::default()
-        })
+        .await;
+        Self::join_or_default("all_selection", r)
     }
 
     // ── upgrade_checks cursor (SP3) ───────────────────────────────────────────
@@ -1925,7 +1961,7 @@ impl Store {
     ) -> u64 {
         let key = upgrade_check_key(media_type, tmdb_id);
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
+        let r = tokio::task::spawn_blocking(move || {
             // Log-then-default on a transient read failure, matching `read_or_log`'s convention: a
             // silent 0 ("never checked") would make an already-checked title re-process early, invisibly.
             let txn = match db.begin_read() {
@@ -1950,8 +1986,8 @@ impl Store {
                 }
             }
         })
-        .await
-        .unwrap_or(0)
+        .await;
+        Self::join_or_default("get_upgrade_checked", r)
     }
 
     pub async fn set_upgrade_checked(
@@ -1986,9 +2022,9 @@ impl Store {
         // Build the keep-set reading ONLY request.kind + request.tmdb_id from each owned row (via a
         // minimal serde view), not the full OwnedRecord — this runs ~daily over the whole owned
         // table, whose provenance/provides/quality blobs are irrelevant to the cursor key.
-        let keep: std::collections::HashSet<String> = {
+        let keep: Option<std::collections::HashSet<String>> = {
             let db = db.clone();
-            tokio::task::spawn_blocking(move || {
+            let r = tokio::task::spawn_blocking(move || {
                 #[derive(serde::Deserialize)]
                 struct OwnedKeyReq {
                     kind: crate::scraper::MediaKind,
@@ -1999,48 +2035,31 @@ impl Store {
                     request: OwnedKeyReq,
                 }
                 let mut keep = std::collections::HashSet::new();
-                if let Ok(txn) = db.begin_read() {
-                    if let Ok(table) = txn.open_table(OWNED_TABLE) {
-                        if let Ok(iter) = table.iter() {
-                            for entry in iter {
-                                let v = match entry {
-                                    Ok((_, v)) => v,
-                                    // Log a row-read error rather than silently dropping the row from
-                                    // the keep-set (matching the `all_*` convention): a corrupt-but-
-                                    // still-owned row omitted here would prune that title's upgrade
-                                    // cursor with no diagnostic.
-                                    Err(e) => {
-                                        error!("prune_upgrade_checks: owned row read failed: {e}");
-                                        continue;
-                                    }
-                                };
-                                match serde_json::from_slice::<OwnedKeyView>(v.value()) {
-                                    Ok(view) => {
-                                        let media_type = media_kind_to_type(view.request.kind);
-                                        keep.insert(upgrade_check_key(
-                                            &media_type,
-                                            view.request.tmdb_id,
-                                        ));
-                                    }
-                                    Err(e) => error!(
-                                        "prune_upgrade_checks: owned row deserialise failed: {e}"
-                                    ),
-                                }
+                // A row-read error (logged by `scan_rows`) or a deserialise error omits that row from
+                // the keep-set, pruning its title's cursor (regenerable) — logged, not silent.
+                let read =
+                    Self::scan_rows(&db, OWNED_TABLE, "prune_upgrade_checks: owned", |_, v| {
+                        match serde_json::from_slice::<OwnedKeyView>(v) {
+                            Ok(view) => {
+                                let media_type = media_kind_to_type(view.request.kind);
+                                keep.insert(upgrade_check_key(&media_type, view.request.tmdb_id));
+                            }
+                            Err(e) => {
+                                error!("prune_upgrade_checks: owned row deserialise failed: {e}")
                             }
                         }
-                    }
-                }
-                keep
+                    });
+                read.then_some(keep)
             })
-            .await
-            .unwrap_or_else(|e| {
-                // A swallowed JoinError here yields an EMPTY keep-set, which would prune every
-                // title's upgrade cursor. Log it rather than doing that silently.
-                error!("prune_upgrade_checks: owned-keep blocking read task failed: {e:?}");
-                Default::default()
-            })
+            .await;
+            Self::join_or_default("prune_upgrade_checks: owned keep-set", r)
         };
-        tokio::task::spawn_blocking(move || -> usize {
+        // The owned table could not be read: an empty keep-set would prune EVERY title's cursor, so
+        // prune nothing this time (the failure is already logged).
+        let Some(keep) = keep else {
+            return 0;
+        };
+        let r = tokio::task::spawn_blocking(move || -> usize {
             // As in `prune_blacklist_before`: surface a begin_write/open_table/iter/commit failure
             // via `warn!` rather than a silent 0, so a persistent write failure that stalls pruning
             // of this otherwise append-only cursor table is visible instead of reading as "nothing
@@ -2102,8 +2121,8 @@ impl Store {
             }
             removed
         })
-        .await
-        .unwrap_or(0)
+        .await;
+        Self::join_or_default("prune_upgrade_checks_not_owned", r)
     }
 }
 
@@ -2178,6 +2197,19 @@ mod tests {
         let all = store.load_all_matches().await;
         assert_eq!(all.len(), 2);
         assert!(all.contains_key("a") && all.contains_key("b"));
+    }
+
+    #[tokio::test]
+    async fn has_matches_reports_whether_the_cache_holds_any_entry() {
+        let store = mem_store();
+        assert!(!store.has_matches().await);
+        store
+            .put_matches(vec![("a".to_string(), info("a"), movie("A"))])
+            .await
+            .unwrap();
+        assert!(store.has_matches().await);
+        store.remove_matches(vec!["a".to_string()]).await.unwrap();
+        assert!(!store.has_matches().await);
     }
 
     #[tokio::test]
@@ -2561,6 +2593,80 @@ mod tests {
         );
     }
 
+    /// Write a real file DB with one cached match through `Store::open`, then close it.
+    async fn write_real_db(path: &str) {
+        let store = Store::open(path).unwrap();
+        store
+            .put_matches(vec![("a".to_string(), info("a"), movie("A"))])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_refuses_a_newer_redb_format_without_discarding_it() {
+        // redb rejects a file whose commit-slot format version is ahead of the library with
+        // `StorageError::Corrupted("Expected file format version <= 3, found N")` — no dedicated
+        // variant. That is an INTACT database written by a newer redb (a rollback after a redb
+        // upgrade rewrote the file), so `open` must fail startup and keep the file, exactly like the
+        // older-format (`UpgradeRequired`) and newer-schema cases — never move it aside.
+        let tmp = TempDb::new("newer_redb_format");
+        write_real_db(&tmp.path).await;
+        let mut bytes = std::fs::read(&tmp.path).unwrap();
+        // The two commit slots' format-version bytes (redb 3 header layout).
+        bytes[64] = 4;
+        bytes[192] = 4;
+        std::fs::write(&tmp.path, &bytes).unwrap();
+
+        let result = Store::open(&tmp.path);
+        assert!(
+            matches!(result, Err(AppError::Config(_))),
+            "a newer redb on-disk format must fail startup, got {:?}",
+            result.as_ref().map(|_| ())
+        );
+        assert!(
+            !std::path::Path::new(&tmp.corrupt_path()).exists(),
+            "an intact newer-format DB must NOT be moved aside"
+        );
+        assert_eq!(
+            std::fs::read(&tmp.path).unwrap(),
+            bytes,
+            "the file must be left exactly as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_recovers_from_a_truncated_db_instead_of_panicking() {
+        // A file that keeps an intact header but is shorter than the layout it records (an
+        // interrupted copy/restore) makes redb PANIC inside `Database::create` (an `assert!` on the
+        // file length), not return an error. `open` must catch that and move the file aside like
+        // any other corruption, rather than crash-looping the service at startup.
+        let tmp = TempDb::new("truncated");
+        write_real_db(&tmp.path).await;
+        let len = std::fs::metadata(&tmp.path).unwrap().len();
+        assert!(len > 1000, "a real DB is larger than its header");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp.path)
+            .unwrap();
+        f.set_len(len / 2).unwrap();
+        drop(f);
+
+        let store = Store::open(&tmp.path).expect("a truncated DB must be recovered, not panic");
+        assert!(
+            std::path::Path::new(&tmp.corrupt_path()).exists(),
+            "the truncated file must be moved aside"
+        );
+        assert!(
+            store.get_match("a".to_string()).await.is_none(),
+            "the recreated DB starts empty"
+        );
+        store
+            .put_matches(vec![("b".to_string(), info("b"), movie("B"))])
+            .await
+            .unwrap();
+        assert!(store.get_match("b".to_string()).await.is_some());
+    }
+
     // ── SP1 Task 6 tests ──────────────────────────────────────────────────────
 
     use crate::scraper::MediaKind;
@@ -2674,6 +2780,25 @@ mod tests {
         );
         store.remove_owned("aBcDeF".into()).await.unwrap();
         assert!(store.get_owned("abcdef".into()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn authoritative_accessors_are_case_insensitive_on_the_hash_key() {
+        // Like the owned table: a provider-cased write must be found, and removed, by the lowercase
+        // owned key, so a removal can never leave a stale identification override behind.
+        let store = mem_store();
+        store
+            .put_authoritative("ABC".into(), movie("A"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.authoritative_meta("abc".into()).await,
+            Some(movie("A")),
+            "a lowercase read must find an upper-case write"
+        );
+        store.remove_authoritative("AbC".into()).await.unwrap();
+        assert!(store.authoritative_meta("abc".into()).await.is_none());
+        assert!(store.authoritative_meta("ABC".into()).await.is_none());
     }
 
     #[tokio::test]
@@ -2842,8 +2967,9 @@ mod tests {
 
     #[test]
     fn from_database_refuses_a_newer_than_supported_schema() {
-        // `from_database` (unlike `open`, which move-aside-recovers) must REFUSE a schema newer than
-        // this binary supports rather than run against it — opposite behaviours, both must be pinned.
+        // `from_database` must REFUSE a schema newer than this binary supports rather than run against
+        // it. `open` refuses it too (`open_refuses_a_newer_version_without_discarding_it`); this test
+        // pins the `from_database` path.
         let db = Database::builder()
             .create_with_backend(InMemoryBackend::new())
             .unwrap();
@@ -3762,7 +3888,7 @@ mod tests {
     #[tokio::test]
     async fn migrates_v7_db_flags_unverifiable_selected_files() {
         // v7→v8: an owned record SERVED from a file the probe can never read (any selection entry
-        // pointing at its hash has a non-MKV/MP4 extension — e.g. YAGA S01E04's Russian-dub `.avi`
+        // pointing at its hash has a non-MKV/MP4 extension — e.g. a show episode served from a Russian-dub `.avi`
         // pack) is flagged `quality.unverified`, so the upgrade pass replaces it with a checked copy.
         let tmp = TempDb::new("migrate_v7_v8");
         let q = || {
@@ -3785,7 +3911,7 @@ mod tests {
                 // e: a pack serving one `.mkv` slot AND one `.avi` slot → flagged (ANY entry).
                 for (h, quality) in [("a", q()), ("b", q()), ("c", None), ("d", q()), ("e", q())] {
                     let rec = OwnedRecord {
-                        request: req("tt7", 314360),
+                        request: req("tt7", 5150),
                         provenance: Provenance::watchlist("u"),
                         added_at: 1,
                         status: OwnedStatus::Verified,
@@ -3804,12 +3930,12 @@ mod tests {
                 let mut st = txn.open_table(sdef).unwrap();
                 for (slot, hash, path) in [
                     (
-                        "e|314360|1|4",
+                        "e|5150|1|4",
                         "a",
-                        "x/Yaga.S01E01-E04.WEBRip.XviD.Rus/Yaga.s01e04.avi",
+                        "x/Show.S01E01-E04.WEBRip.XviD.Rus/Show.s01e04.avi",
                     ),
                     ("m|77", "b", "y/Movie.2020.1080p.BluRay.mkv"),
-                    ("e|314360|1|5", "c", "x/Yaga.s01e05.avi"),
+                    ("e|5150|1|5", "c", "x/Show.s01e05.avi"),
                     ("e|500|1|1", "e", "z/Show.s01e01.mkv"),
                     ("e|500|1|2", "e", "z/Show.s01e02.AVI"),
                 ] {
@@ -3859,11 +3985,7 @@ mod tests {
         assert_eq!(a.provenance, Provenance::watchlist("u"));
         assert_eq!(a.quality.unwrap().score, 1_111_000);
         assert_eq!(
-            store
-                .get_selection("e|314360|1|4".into())
-                .await
-                .unwrap()
-                .hash,
+            store.get_selection("e|5150|1|4".into()).await.unwrap().hash,
             "a"
         );
         drop(store);
@@ -4195,6 +4317,153 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(store.get_selection(gone).await, None);
+    }
+
+    #[tokio::test]
+    async fn set_imdb_id_if_empty_fills_only_an_empty_imdb_id() {
+        let store = mem_store();
+        let rec = OwnedRecord {
+            request: req("", 603),
+            provenance: Provenance { entries: vec![] },
+            added_at: 100,
+            status: OwnedStatus::Verified,
+            provides: vec![(1, 2)],
+            quality: None,
+        };
+        store.put_owned("hempty".into(), rec.clone()).await.unwrap();
+        store
+            .put_owned(
+                "hset".into(),
+                OwnedRecord {
+                    request: req("tt9", 603),
+                    ..rec.clone()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .set_imdb_id_if_empty("HEMPTY".into(), "tt0133093".into())
+            .await
+            .unwrap());
+        let got = store.get_owned("hempty".into()).await.unwrap();
+        assert_eq!(got.request.imdb_id, "tt0133093");
+        assert_eq!(got.provides, vec![(1, 2)], "other fields intact");
+        assert_eq!(got.added_at, 100);
+        assert!(
+            !store
+                .set_imdb_id_if_empty("hset".into(), "tt0133093".into())
+                .await
+                .unwrap(),
+            "a recorded IMDB id is never overwritten"
+        );
+        assert_eq!(
+            store
+                .get_owned("hset".into())
+                .await
+                .unwrap()
+                .request
+                .imdb_id,
+            "tt9"
+        );
+        assert!(
+            !store
+                .set_imdb_id_if_empty("missing".into(), "tt1".into())
+                .await
+                .unwrap(),
+            "a missing record is never resurrected"
+        );
+        assert!(store.get_owned("missing".into()).await.is_none());
+    }
+
+    fn wanted_row(user: &str, tmdb_id: u64) -> WantedRecord {
+        WantedRecord {
+            user: user.into(),
+            tmdb_id,
+            media_type: MediaType::Movie,
+            sources: WantedSources {
+                watchlist: true,
+                in_progress: false,
+            },
+            watched_state: WatchedState::Movie { watched: false },
+            show_status: None,
+            imdb_id: None,
+        }
+    }
+
+    fn tokens_for(user: &str) -> TraktTokens {
+        TraktTokens {
+            access: "a".into(),
+            refresh: "r".into(),
+            expires_at: 0,
+            username: user.into(),
+            needs_reenrolment: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_user_wanted_if_enrolled_writes_nothing_for_a_removed_account() {
+        let store = mem_store();
+        assert!(!store
+            .replace_user_wanted_if_enrolled("alice".into(), vec![], vec![wanted_row("alice", 1)])
+            .await
+            .unwrap());
+        assert!(
+            store.all_wanted().await.is_empty(),
+            "no row is written for an account without tokens"
+        );
+
+        store
+            .put_trakt_tokens("alice".into(), tokens_for("alice"))
+            .await
+            .unwrap();
+        store.put_wanted(wanted_row("alice", 1)).await.unwrap();
+        store.put_wanted(wanted_row("bob", 1)).await.unwrap();
+        assert!(store
+            .replace_user_wanted_if_enrolled(
+                "alice".into(),
+                vec![(MediaType::Movie, 1)],
+                vec![wanted_row("alice", 2)]
+            )
+            .await
+            .unwrap());
+        let mut rows: Vec<(String, u64)> = store
+            .all_wanted()
+            .await
+            .into_iter()
+            .map(|r| (r.user, r.tmdb_id))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![("alice".to_string(), 2), ("bob".to_string(), 1)],
+            "the pruned key is gone, the new row written, another user's row untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_trakt_account_drops_the_tokens_and_only_that_users_wanted_rows() {
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".into(), tokens_for("alice"))
+            .await
+            .unwrap();
+        store
+            .put_trakt_tokens("bob".into(), tokens_for("bob"))
+            .await
+            .unwrap();
+        store.put_wanted(wanted_row("alice", 1)).await.unwrap();
+        store.put_wanted(wanted_row("alice", 2)).await.unwrap();
+        store.put_wanted(wanted_row("bob", 1)).await.unwrap();
+        store.remove_trakt_account("alice".into()).await.unwrap();
+        assert!(store.get_trakt_tokens("alice".into()).await.is_none());
+        assert!(store.get_trakt_tokens("bob".into()).await.is_some());
+        let rows: Vec<String> = store
+            .all_wanted()
+            .await
+            .into_iter()
+            .map(|r| r.user)
+            .collect();
+        assert_eq!(rows, vec!["bob".to_string()]);
     }
 
     #[tokio::test]

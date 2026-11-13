@@ -334,9 +334,9 @@ mod tests {
     #[tokio::test]
     async fn map_is_bounded_and_eviction_preserves_all_idle() {
         let ra = ReadActivity::without_startup_grace();
-        // Stream far more distinct paths than the cap; the most-recent one is "live".
+        // Stream far more distinct hashes than the cap; the most-recent one is "live".
         for i in 0..(MAX_TRACKED + 500) {
-            ra.touch(&format!("Movies/{i}/file.mkv")).await;
+            ra.touch(&format!("{i:040x}")).await;
         }
         let len = ra.last_read.read().await.len();
         assert!(

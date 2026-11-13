@@ -1,8 +1,12 @@
 # Keep dependencies patched. The GitHub Actions in ci.yml/release.yml are referenced by floating
-# major-version tags (e.g. actions/checkout@v6); those jobs hold registry credentials
+# major-version tags (e.g. actions/checkout@v7); those jobs hold registry credentials
 # (packages: write, and contents: write in release.yml), so a compromised upstream tag could
 # exfiltrate them. Dependabot opens update PRs (and surfaces advisories) for the actions and the
 # Cargo tree, so drift/vulnerabilities are caught rather than silently carried.
+#
+# Dependabot reads this file only from the default branch (main), and without `target-branch` it
+# opens PRs only against main. The `v2` entries cover the development line; they take effect once
+# this file is on main.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
@@ -12,5 +16,17 @@ updates:
 
   - package-ecosystem: "cargo"
     directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "v2"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    target-branch: "v2"
     schedule:
       interval: "weekly"

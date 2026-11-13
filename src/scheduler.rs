@@ -332,6 +332,7 @@ fn make_test_app(with_trakt: bool) -> crate::app_state::AppState {
             None,
             None,
             None,
+            None,
         );
         Some(Arc::new(crate::trakt_client::MockTrakt::default()))
     } else {
@@ -435,7 +436,7 @@ mod trakt_gate_tests {
         assert!(app.config.upgrade.enabled());
         // a config with interval 0 disables it
         let mut cfg = (*app.config).clone();
-        cfg.upgrade = crate::config::UpgradeConfig::from_parts(Some("0".into()), None, None, None);
+        cfg.upgrade = crate::config::UpgradeConfig::from_parts(Some("0".into()), None, None);
         app.config = std::sync::Arc::new(cfg);
         assert!(!app.config.upgrade.enabled());
     }
@@ -609,14 +610,12 @@ mod tests {
         );
     }
 
-    /// `supervise` stops restarting once shutdown is signalled, even if the loop keeps panicking.
+    /// `supervise` never starts the loop when shutdown is already signalled.
     #[tokio::test(start_paused = true)]
-    async fn supervise_stops_on_shutdown_after_panic() {
+    async fn supervise_does_not_start_after_shutdown() {
         let runs = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = watch::channel(false);
         let r = runs.clone();
-        // Signal shutdown up front: after the first panicked run the supervisor must observe it and
-        // not restart again.
         tx.send(true).unwrap();
         supervise(rx, Duration::from_secs(3600), move || {
             let r = r.clone();
@@ -628,6 +627,64 @@ mod tests {
         .await;
         // With shutdown already set, the loop guard returns before running at all.
         assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// A shutdown that arrives while `supervise` waits out the restart backoff after a panic ends
+    /// supervision at once: no restart, and no waiting out the (long) backoff.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_stops_when_shutdown_arrives_during_backoff() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = watch::channel(false);
+        let r = runs.clone();
+        let handle = tokio::spawn(supervise(rx, Duration::from_secs(3600), move || {
+            let r = r.clone();
+            async move {
+                r.fetch_add(1, Ordering::SeqCst);
+                panic!("always panics");
+            }
+        }));
+        settle().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        settle().await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "one panicked run, then parked in the backoff"
+        );
+        tx.send(true).unwrap();
+        // The paused clock auto-advances to the earliest timer, so a supervisor still sleeping out
+        // its 3600s backoff would let this 1s timeout fire first.
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("shutdown during the backoff must end supervision without waiting it out")
+            .unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "no restart after shutdown");
+    }
+
+    /// A loop that panics after shutdown was signalled mid-run is not restarted.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_does_not_restart_a_loop_that_panics_after_shutdown() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = watch::channel(false);
+        let (r, rel) = (runs.clone(), release.clone());
+        let handle = tokio::spawn(supervise(rx, Duration::from_secs(3600), move || {
+            let (r, rel) = (r.clone(), rel.clone());
+            async move {
+                r.fetch_add(1, Ordering::SeqCst);
+                rel.notified().await;
+                panic!("panics on its way out");
+            }
+        }));
+        settle().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the loop is running");
+        tx.send(true).unwrap();
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("a panic after shutdown must end supervision")
+            .unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "no restart after shutdown");
     }
 
     /// Yield a few times so a task woken by a paused-clock `advance` gets polled to its next await.

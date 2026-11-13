@@ -2,7 +2,9 @@
 # Use BUILDPLATFORM so the builder always runs natively (no QEMU emulation).
 # Pin the toolchain minor version (not floating `rust:slim`) so the build image is reproducible over
 # time — a new stable Rust / clippy / libc can otherwise change build output or newly fail without any
-# source change. Bump this deliberately alongside the CI stable toolchain.
+# source change. This tag and `rust-version` in Cargo.toml must be bumped together: CI lints and tests
+# on the latest stable, and `rust-version` is what makes its clippy run flag (incompatible_msrv) a std
+# API newer than this image's compiler.
 FROM --platform=$BUILDPLATFORM rust:1.96-slim AS builder
 
 # Install build dependencies including cross-compilation toolchain for arm64
@@ -54,7 +56,9 @@ RUN mkdir -p /empty-data && chown 65534:65534 /empty-data
 # Stage 2: Final runtime image (minimal 'scratch' image)
 FROM scratch
 
-# Copy system CA certificates so that the app can make HTTPS requests
+# The app does not read this bundle today: reqwest is built with `rustls-tls`, which trusts the
+# webpki-roots certificates compiled into the binary. It is copied so that switching to native roots
+# (rustls-native-certs) later keeps working on scratch, which has no CA store of its own.
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /app/debridmoviemapper /debridmoviemapper
 COPY LICENCE THIRD-PARTY-NOTICES /

@@ -97,10 +97,8 @@ struct TbCreate {
     // (rather than recording an unusable "0" that would never resolve and get reaped/blacklisted).
     #[serde(default, deserialize_with = "null_to_default")]
     torrent_id: i64,
-    // Returned by createtorrent but not used (we derive the canonical torrent later).
-    #[allow(dead_code)]
-    #[serde(default, deserialize_with = "null_to_default")]
-    hash: String,
+    // createtorrent also returns the infohash; serde ignores it (we derive the canonical torrent
+    // later).
 }
 
 /// Normalised status: a finished download (cached OR Inactive/uncached but owned) maps to
@@ -285,15 +283,21 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
     crate::provider::is_retryable_5xx(status)
 }
 
-/// Whether a `requestdl` failure is a clearly-PERMANENT auth/permission error (401/403) that a
-/// re-add-by-hash cannot fix, so `resolve_locator` surfaces it as `Http` (hard read failure) rather
-/// than `Unavailable` (trigger a pointless repair on every read). Everything else — a 5xx, a 404
-/// (a stale torrent_id that re-add can recover), or a statusless transport error — is treated as
-/// available-later (`Unavailable`) so the read path repairs.
-fn requestdl_status_is_permanent(status: Option<reqwest::StatusCode>) -> bool {
+/// Whether a `requestdl` failure must fail the read WITHOUT instant repair, so `resolve_locator`
+/// surfaces it as `Http` (hard read failure) rather than `Unavailable` (trigger a repair): a clearly
+/// permanent auth/permission error (401/403) that a re-add-by-hash cannot fix, or throttling (429)
+/// that outlasted the read budget — throttling says nothing about whether the bytes exist, and a
+/// same-id re-add would spend scarce `createtorrent` calls inside the throttled window. Everything
+/// else — a 5xx, a 404 (a stale torrent_id that re-add can recover), or a statusless transport
+/// error — is treated as available-later (`Unavailable`) so the read path repairs.
+fn requestdl_status_skips_repair(status: Option<reqwest::StatusCode>) -> bool {
     matches!(
         status,
-        Some(s) if s == reqwest::StatusCode::UNAUTHORIZED || s == reqwest::StatusCode::FORBIDDEN
+        Some(
+            reqwest::StatusCode::UNAUTHORIZED
+                | reqwest::StatusCode::FORBIDDEN
+                | reqwest::StatusCode::TOO_MANY_REQUESTS
+        )
     )
 }
 
@@ -342,6 +346,9 @@ pub struct TorBoxClient {
     base: String,
     rate_limiter: Arc<AdaptiveRateLimiter>,
     resolve_cache: Arc<RwLock<HashMap<(String, u32), CachedUrl>>>,
+    /// Our own deletes, so a multi-page `mylist` can re-list when one may have shifted its pages
+    /// (see `provider::DeleteTracker`).
+    deletes: crate::provider::DeleteTracker,
 }
 
 /// Percent-encode `v` exactly as reqwest encodes a query-parameter value (form-urlencoding), so the
@@ -385,6 +392,7 @@ impl TorBoxClient {
             base: TORBOX_BASE.to_string(),
             rate_limiter: Arc::new(AdaptiveRateLimiter::new()),
             resolve_cache: Arc::new(RwLock::new(HashMap::new())),
+            deletes: crate::provider::DeleteTracker::default(),
         })
     }
 
@@ -568,12 +576,12 @@ impl TorBoxClient {
                     ),
                 },
                 Err(e) => {
-                    // The serde error carries only position/type (line/column), never body content or
-                    // the token, and the body itself is NOT logged (only its length) — so nothing here
-                    // needs redacting.
+                    // The body itself is NOT logged (only its length), but serde_json's message can
+                    // quote a mismatched scalar value from it (`invalid type: string "…", expected
+                    // …`), so it goes through `redact` like `detail` above.
                     warn!(
                         "TorBox decode failed: {} (body {} bytes, not logged)",
-                        e,
+                        self.redact(&e.to_string()),
                         text.len()
                     );
                     // A truncated/partial 200 body is transient — retry rather than discard the whole
@@ -595,8 +603,8 @@ impl TorBoxClient {
     }
 
     /// Send a request whose success requires `success:true` AND a `data` payload, returning the
-    /// decoded `data`. A `success:true` with no `data` — or a `success:false` — is a soft failure
-    /// (retried/surfaced as a synthetic 502 by `send_enveloped`), never rewarded to the limiter.
+    /// decoded `data`. A `success:true` with no `data` — or a `success:false` — is a soft failure,
+    /// surfaced (not retried) as a synthetic 502 by `send_enveloped`, never rewarded to the limiter.
     ///
     /// `max_attempts` is an explicit budget: the synchronous on-read playback resolve
     /// (`resolve_locator`) passes a SMALL budget (3) so a black-holing endpoint (packets dropped →
@@ -638,7 +646,30 @@ impl TorBoxClient {
         .await
     }
 
+    /// The whole torrent listing. If one of our own deletes may have landed while it was paging (see
+    /// `provider::DeleteTracker`), the pages may have shifted under it and dropped a live torrent, so
+    /// it lists again — up to `MAX_LISTING_ATTEMPTS` times, then fails rather than return a listing
+    /// that may be short (mirrors the RD client's `get_torrents`).
     pub async fn list_torrents_raw(&self) -> Result<Vec<Torrent>, reqwest::Error> {
+        for attempt in 1..=crate::provider::MAX_LISTING_ATTEMPTS {
+            let since = self.deletes.snapshot();
+            let (torrents, spans_pages) = self.list_mylist_pages().await?;
+            if !spans_pages || !self.deletes.changed_since(since) {
+                return Ok(torrents);
+            }
+            warn!(
+                "TorBox mylist overlapped a delete (attempt {}/{}); listing again in case the \
+                 pages shifted",
+                attempt,
+                crate::provider::MAX_LISTING_ATTEMPTS
+            );
+        }
+        Err(synthetic_bad_gateway())
+    }
+
+    /// Fetch every `mylist` page once. Also returns whether the listing ran past a single short page
+    /// — only then can a delete on a fetched page shift an unfetched item back onto it.
+    async fn list_mylist_pages(&self) -> Result<(Vec<Torrent>, bool), reqwest::Error> {
         // TorBox `/torrents/mylist` returns at most `limit` torrents (standard page = 1000; up to
         // 10000 supported) and accepts `offset`. A single unbounded fetch would SILENTLY TRUNCATE
         // the library for accounts with >1000 torrents — and downstream treats an owned title absent
@@ -647,7 +678,9 @@ impl TorBoxClient {
         // (a short-but-non-final page must NOT be mistaken for end-of-list — see `paginate`).
         const PAGE: usize = 1000;
         const MAX_PAGES: usize = 50; // 50k-torrent backstop against an offset-ignoring API
+        let mut requests = 0usize;
         let (raw, hit_cap) = paginate(PAGE, MAX_PAGES, |offset| {
+            requests += 1;
             let url = format!(
                 "{}/torrents/mylist?bypass_cache=true&limit={}&offset={}",
                 self.base, PAGE, offset
@@ -672,7 +705,11 @@ impl TorBoxClient {
             );
             return Err(synthetic_bad_gateway());
         }
-        Ok(map_listed_torrents(&raw))
+        // More than two requests means at least two non-empty pages (plus the empty terminator); a
+        // full first page means the terminator was fetched at a page boundary, so an item can still
+        // have shifted out of reach.
+        let spans_pages = requests > 2 || raw.len() >= PAGE;
+        Ok((map_listed_torrents(&raw), spans_pages))
     }
 
     pub async fn torrent_info_raw(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
@@ -771,6 +808,8 @@ impl TorBoxClient {
             return Err(synthetic_bad_gateway());
         }
         let body = serde_json::json!({ "torrent_id": torrent_id, "operation": "delete" });
+        // Held across the retries: the delete can land on any attempt.
+        let _in_flight = self.deletes.begin();
         // NOTE: unlike Real-Debrid (which maps a 404 on delete to `Ok(())` for idempotency), TorBox
         // has no clean "already gone" signal here — controltorrent returns `success:false` with an
         // unstable detail string, so a delete of an already-removed torrent surfaces as `Err`. We do
@@ -797,15 +836,20 @@ impl TorBoxClient {
         let file_id = loc.file_id.to_string();
         // Bounded budget (3): this is the synchronous on-read resolve, so a wedged/black-holing
         // endpoint must fail over to instant repair fast rather than run the full 6-attempt loop
-        // (mirrors the RD client's fast-fail `unrestrict_link` read path).
+        // (mirrors the RD client's fast-fail `unrestrict_link` read path). Each attempt gets the
+        // short `READ_PATH_REQUEST_TIMEOUT` rather than the client's 60 s, so an endpoint that
+        // accepts the connection and then hangs costs 3 × 15 s, not 3 minutes.
         match self
             .send_data_n::<String, _>(
                 || {
-                    self.client.get(&url).query(&[
-                        ("token", self.api_key.as_str()),
-                        ("torrent_id", loc.torrent_id.as_str()),
-                        ("file_id", file_id.as_str()),
-                    ])
+                    self.client
+                        .get(&url)
+                        .timeout(crate::provider::READ_PATH_REQUEST_TIMEOUT)
+                        .query(&[
+                            ("token", self.api_key.as_str()),
+                            ("torrent_id", loc.torrent_id.as_str()),
+                            ("file_id", file_id.as_str()),
+                        ])
                 },
                 3,
             )
@@ -818,13 +862,13 @@ impl TorBoxClient {
             Err(e) => {
                 // A 5xx / connection error / malformed response means the bytes aren't currently
                 // available → signal repair (Unavailable). A clearly-permanent auth/permission
-                // failure (401/403) won't be fixed by a re-add-by-hash, so surface it as Http to
-                // avoid a pointless repair cycle on every read. (A 404 stays Unavailable: it can be a
-                // stale torrent_id that re-add-by-hash recovers.) Log at debug — read-path, not an
-                // error, and during a repair storm info! would spam.
-                if requestdl_status_is_permanent(e.status()) {
+                // failure (401/403) won't be fixed by a re-add-by-hash, and a 429 says nothing about
+                // the bytes, so surface those as Http to avoid a pointless repair on every read. (A
+                // 404 stays Unavailable: it can be a stale torrent_id that re-add-by-hash recovers.)
+                // Log at debug — read-path, not an error, and during a repair storm info! would spam.
+                if requestdl_status_skips_repair(e.status()) {
                     debug!(
-                        "TorBox requestdl auth/permission error ({:?}) for torrent {} file {}",
+                        "TorBox requestdl auth/permission/throttle error ({:?}) for torrent {} file {}",
                         e.status(),
                         loc.torrent_id,
                         loc.file_id
@@ -917,6 +961,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_torrent_raw_posts_the_controltorrent_delete_body() {
+        // Pin the wire shape of a delete: POST .../torrents/controltorrent with
+        // {"torrent_id": <numeric id>, "operation": "delete"}, and `success:true` maps to Ok.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read until the whole JSON body has arrived (headers and body may come separately).
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !req.ends_with(b"}") {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+            }
+            let body = r#"{"success":true,"detail":"deleted"}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+            let _ = sock.flush().await;
+            let _ = tx.send(String::from_utf8_lossy(&req).to_string());
+        });
+        let client = TorBoxClient::with_base("fake".to_string(), format!("http://{addr}"));
+        let before = client.deletes.snapshot();
+        client
+            .delete_torrent_raw("42")
+            .await
+            .expect("success:true is Ok");
+        let req = rx.await.unwrap();
+        assert!(
+            req.starts_with("POST /torrents/controltorrent "),
+            "wrong request line: {}",
+            req.lines().next().unwrap_or_default()
+        );
+        let json = req.split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(json).unwrap(),
+            serde_json::json!({ "torrent_id": 42, "operation": "delete" })
+        );
+        assert!(
+            client.deletes.changed_since(before),
+            "a delete is recorded so a concurrent multi-page listing re-lists"
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_cache_invalidate_and_evict() {
         let client = TorBoxClient::new("fake".to_string()).unwrap();
         let loc = crate::provider::FileLocator {
@@ -956,23 +1053,90 @@ mod tests {
     }
 
     #[test]
-    fn requestdl_status_is_permanent_only_for_auth_failures() {
+    fn requestdl_status_skips_repair_only_for_auth_failures_and_throttling() {
         use reqwest::StatusCode;
         // 401/403 are permanent → resolve_locator surfaces Http (no pointless repair).
-        assert!(requestdl_status_is_permanent(Some(
+        assert!(requestdl_status_skips_repair(Some(
             StatusCode::UNAUTHORIZED
         )));
-        assert!(requestdl_status_is_permanent(Some(StatusCode::FORBIDDEN)));
+        assert!(requestdl_status_skips_repair(Some(StatusCode::FORBIDDEN)));
+        // A 429 says nothing about the bytes: fail the read, don't spend createtorrent calls on a
+        // same-id re-add.
+        assert!(requestdl_status_skips_repair(Some(
+            StatusCode::TOO_MANY_REQUESTS
+        )));
         // A 5xx, a 404 (stale torrent_id, recoverable), and a statusless transport error are all
         // "available later" → Unavailable → the read path repairs.
-        assert!(!requestdl_status_is_permanent(Some(
+        assert!(!requestdl_status_skips_repair(Some(
             StatusCode::INTERNAL_SERVER_ERROR
         )));
-        assert!(!requestdl_status_is_permanent(Some(
+        assert!(!requestdl_status_skips_repair(Some(
             StatusCode::BAD_GATEWAY
         )));
-        assert!(!requestdl_status_is_permanent(Some(StatusCode::NOT_FOUND)));
-        assert!(!requestdl_status_is_permanent(None));
+        assert!(!requestdl_status_skips_repair(Some(StatusCode::NOT_FOUND)));
+        assert!(!requestdl_status_skips_repair(None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_locator_gives_up_on_a_hanging_endpoint_within_the_read_timeout() {
+        // An endpoint that accepts the connection and never answers must cost the read at most
+        // 3 × READ_PATH_REQUEST_TIMEOUT, not 3 × the client's 60 s timeout.
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                held.push(sock); // keep it open, never reply
+            }
+        });
+        let client = TorBoxClient::with_base("fake".to_string(), format!("http://{addr}"));
+        let loc = crate::provider::FileLocator {
+            torrent_id: "1".to_string(),
+            file_id: 2,
+            ..Default::default()
+        };
+        let started = tokio::time::Instant::now();
+        let r = client.resolve_locator(&loc).await;
+        assert!(
+            matches!(r, Err(AppError::Unavailable)),
+            "a hanging endpoint is a transport failure → Unavailable, got {r:?}"
+        );
+        assert!(
+            started.elapsed()
+                <= 3 * crate::provider::READ_PATH_REQUEST_TIMEOUT + Duration::from_secs(5),
+            "the read-path budget must bound each attempt, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_locator_maps_a_persistent_429_to_http_not_unavailable() {
+        // A throttled requestdl that outlasts the 3-attempt read budget must fail the read as `Http`
+        // (the real 429), not `Unavailable`, so `dav_fs` does not run instant repair on a healthy
+        // torrent.
+        let (url, count) = spawn_status_repeating(429).await;
+        let client = TorBoxClient::with_base("fake".to_string(), url);
+        let loc = crate::provider::FileLocator {
+            torrent_id: "1".to_string(),
+            file_id: 2,
+            ..Default::default()
+        };
+        match client.resolve_locator(&loc).await {
+            Err(AppError::Http(e)) => assert_eq!(
+                e.status(),
+                Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+                "the surfaced error must carry the real 429"
+            ),
+            other => panic!("a persistent 429 must map to Http, not repair: {other:?}"),
+        }
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "a 429 is still retried within the 3-attempt read budget"
+        );
     }
 
     #[test]
@@ -1233,6 +1397,85 @@ mod tests {
         );
     }
 
+    /// Serve a paginated `mylist` whose first page holds `page1_len` torrents — plus one more at
+    /// offset 1000 when that fills the 1000-item page — and, while serving the first page of each
+    /// listing that `bump` selects (1-based), record a delete on the client's tracker, as if another
+    /// job deleted a torrent mid-listing. Returns the listing result and the first-page fetch count.
+    async fn mylist_with_concurrent_deletes(
+        page1_len: usize,
+        bump: fn(usize) -> bool,
+    ) -> (Result<Vec<Torrent>, reqwest::Error>, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(TorBoxClient::with_base(
+            "fake".to_string(),
+            format!("http://{addr}"),
+        ));
+        let page1_hits = Arc::new(AtomicUsize::new(0));
+        let (c, hits) = (client.clone(), page1_hits.clone());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let data = if req.contains("offset=0 ") {
+                    if bump(hits.fetch_add(1, Ordering::SeqCst) + 1) {
+                        drop(c.deletes.begin());
+                    }
+                    let items: Vec<String> = (1..=page1_len)
+                        .map(|i| format!(r#"{{"id":{i},"hash":"h{i}"}}"#))
+                        .collect();
+                    format!("[{}]", items.join(","))
+                } else if req.contains("offset=1000 ") && page1_len >= 1000 {
+                    r#"[{"id":5000,"hash":"tail"}]"#.to_string()
+                } else {
+                    "[]".to_string()
+                };
+                let body = format!(r#"{{"success":true,"data":{data}}}"#);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let r = client.list_torrents_raw().await;
+        (r, page1_hits.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn mylist_relists_when_a_delete_lands_mid_listing() {
+        // A delete during a multi-page listing may have shifted an item from the next page onto
+        // one already fetched, where it is never returned. List again rather than trust it.
+        let (r, page1_fetches) = mylist_with_concurrent_deletes(1000, |listing| listing == 1).await;
+        assert_eq!(
+            r.expect("the second, undisturbed listing succeeds").len(),
+            1001
+        );
+        assert_eq!(page1_fetches, 2, "the disturbed listing is retried once");
+    }
+
+    #[tokio::test]
+    async fn mylist_fails_when_deletes_keep_shifting_the_pages() {
+        let (r, page1_fetches) = mylist_with_concurrent_deletes(1000, |_| true).await;
+        assert!(r.is_err(), "a listing that never settles must be an Err");
+        assert_eq!(
+            page1_fetches,
+            crate::provider::MAX_LISTING_ATTEMPTS as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn mylist_ignores_a_delete_when_everything_fits_on_one_page() {
+        let (r, page1_fetches) = mylist_with_concurrent_deletes(2, |_| true).await;
+        assert_eq!(r.expect("a single-page listing stands").len(), 2);
+        assert_eq!(page1_fetches, 1, "no re-list for a single short page");
+    }
+
     #[test]
     fn tbcreate_tolerates_null_or_mistyped_torrent_id() {
         // createtorrent's torrent_id is decoded defensively (null_to_default), so a present `null`
@@ -1247,13 +1490,6 @@ mod tests {
         );
         let v: TbCreate = serde_json::from_str(r#"{"torrent_id": 42, "hash": "abc"}"#).unwrap();
         assert_eq!(v.torrent_id, 42);
-    }
-
-    #[test]
-    fn torbox_client_constructs() {
-        use crate::provider::DebridProvider;
-        let c = TorBoxClient::new("fake".to_string()).unwrap();
-        assert_eq!(c.name(), "torbox");
     }
 
     #[test]
@@ -1330,7 +1566,7 @@ mod tests {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     break;
                 };
-                let n = c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut buf = [0u8; 2048];
                 let _ = sock.read(&mut buf).await;
                 let body = if i == 0 { first } else { second };
@@ -1338,7 +1574,6 @@ mod tests {
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                let _ = n; // silence unused in case of a single-connection run
                 let _ = sock.write_all(head.as_bytes()).await;
                 let _ = sock.write_all(body.as_bytes()).await;
                 let _ = sock.flush().await;

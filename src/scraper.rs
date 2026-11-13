@@ -103,9 +103,8 @@ impl TorrentioScraper {
         self
     }
 
-    /// Override (trimmed) wins; else template Torrentio from provider + token.
-    /// NOTE: verify the `<provider>=<token>` option syntax against torrentio.strem.fun/configure;
-    /// the live scraper test guards drift.
+    /// Override (trimmed) wins; else Torrentio templated as `<provider>=<token>` (further options
+    /// are `|`-separated). The live scraper test guards the syntax.
     pub fn build_base_url(
         override_url: Option<String>,
         provider: ProviderKind,
@@ -156,7 +155,7 @@ static RESOLVE_RE: LazyLock<Regex> =
 /// A debrid-keyed Torrentio returns url-only streams (no `infoHash`/`fileIdx` fields), so this
 /// recovers the hash the acquisition engine needs to add the torrent by magnet.
 /// Note: only 40-hex (BitTorrent v1) infohashes are recovered; a 32-char base32 hash (rare, and
-/// not emitted by debrid-keyed Torrentio) would not match and the stream would be skipped.
+/// not emitted by Torrentio) would not match and the stream would be skipped.
 fn hash_idx_from_url(url: &str) -> Option<(String, Option<usize>)> {
     let c = RESOLVE_RE.captures(url)?;
     // Lowercase the recovered hash to match every other write path (the explicit-`infoHash` branch
@@ -182,13 +181,14 @@ fn is_config_error_status(status: reqwest::StatusCode) -> bool {
     )
 }
 
-/// Whether `h` is a structurally-valid (already-lowercased) BitTorrent infohash: 40 hex chars
-/// (v1) or a 32-char base32 hash (a-z2-7). Guards the explicit-`infoHash` field so a malformed
-/// value (e.g. a truncated `aabbcc`) can't build an invalid `magnet:?xt=urn:btih:…` and burn a
-/// provider add — mirroring the strictness of the URL-recovery path (`RESOLVE_RE` requires 40-hex).
+/// Whether `h` is a structurally-valid (already-lowercased) BitTorrent v1 infohash: 40 hex chars.
+/// Guards the explicit-`infoHash` field so a malformed value (e.g. a truncated `aabbcc`) can't
+/// build an invalid `magnet:?xt=urn:btih:…` and burn a provider add — the same strictness as the
+/// URL-recovery path (`RESOLVE_RE` requires 40-hex). A 32-char base32 hash is rejected too: owned
+/// records, the blacklist, the mirror and the provider listings all key torrents by the 40-hex form
+/// a provider reports, so a base32-keyed candidate would never match its own listing entry.
 fn is_valid_infohash(h: &str) -> bool {
-    (h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit()))
-        || (h.len() == 32 && h.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')))
+    h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Parse a Stremio stream response into raw candidates. Uses the explicit `infoHash` field when
@@ -200,7 +200,7 @@ pub fn parse_streams(v: &serde_json::Value) -> Vec<RawCandidate> {
         return out;
     };
     for s in streams {
-        // Take the explicit `infoHash` only when it is structurally valid (40-hex / 32 base32).
+        // Take the explicit `infoHash` only when it is structurally valid (40-hex).
         // A present-but-EMPTY or malformed infoHash is degenerate (would build an invalid
         // `magnet:?xt=urn:btih:…`), so treat it like a missing one — fall through to the debrid-url
         // hash recovery (else skip). `is_valid_infohash` mirrors the URL-recovery path's strictness.
@@ -258,6 +258,16 @@ impl Scraper for TorrentioScraper {
         season: Option<u32>,
         episode: Option<u32>,
     ) -> Result<Vec<RawCandidate>, AppError> {
+        // Never interpolate a malformed id into the token-bearing URL path (a `/`, `?` or `#` would
+        // change it): Torrentio is IMDB-keyed, so such an id could only fail anyway. Same guard as
+        // `tmdb_client::find_by_imdb`; checked before the limiter so it costs no paced request.
+        if !crate::tmdb_client::is_well_formed_imdb_id(imdb_id) {
+            debug!(
+                "scrape: skipping malformed IMDB id {:?} (expected `tt<digits>`)",
+                imdb_id
+            );
+            return Ok(Vec::new());
+        }
         let url = Self::stream_url(&self.base_url, imdb_id, kind, season, episode);
         // Paced through the shared limiter; a 429 backs it off (honouring `Retry-After`) and the
         // request is retried, up to MAX_SCRAPE_ATTEMPTS, before surfacing as the retriable error.
@@ -491,8 +501,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_streams_skips_a_base32_explicit_infohash() {
+        // Owned records, the blacklist, the mirror and every provider listing key torrents by the
+        // 40-hex form, so a 32-char base32 hash would never match its own listing entry (observe
+        // would reap it as dead while the mirror re-adopted it under its hex hash). Like a malformed
+        // hash, it is treated as missing: with no recoverable url the stream is skipped.
+        let json = serde_json::json!({
+            "streams": [
+                { "name": "x", "title": "y", "infoHash": "mfrggzdfmztwq2lknnwg23tpobyxe43u" }
+            ]
+        });
+        assert!(parse_streams(&json).is_empty());
+    }
+
+    #[test]
     fn parse_streams_rejects_a_malformed_explicit_infohash() {
-        // A non-empty but structurally-invalid explicit infoHash (not 40-hex, not 32 base32) must
+        // A non-empty but structurally-invalid explicit infoHash (not 40-hex) must
         // be treated like a missing one — it would otherwise build an invalid
         // `magnet:?xt=urn:btih:aabbcc` and burn a provider add. With no recoverable url, it's skipped.
         let json = serde_json::json!({
@@ -714,6 +738,28 @@ mod tests {
             "tok",
             reqwest::Client::new(),
         )
+    }
+
+    /// A malformed IMDB id is never put into the (token-bearing) addon URL path: `find` returns no
+    /// candidates without sending a request, as `tmdb_client::find_by_imdb` does.
+    #[tokio::test]
+    async fn find_skips_a_malformed_imdb_id_without_a_request() {
+        use std::sync::atomic::Ordering;
+        let (url, hits) = spawn_sequence_server(vec![("200 OK", "", ONE_STREAM)]).await;
+        let scraper = scraper_at(url);
+        for bad in ["../evil", "tt12/../x", "tt1?x=1", "tt", "12345"] {
+            let got = scraper.find(bad, MediaKind::Movie, None, None).await;
+            assert!(
+                matches!(&got, Ok(v) if v.is_empty()),
+                "{bad:?} must yield no candidates, got {got:?}"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "no request was sent");
+        let got = scraper
+            .find("tt0111161", MediaKind::Movie, None, None)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1, "control: a well-formed id is scraped");
     }
 
     /// Torrentio answers a burst with 429. A throttled scrape backs off — honouring `Retry-After` —

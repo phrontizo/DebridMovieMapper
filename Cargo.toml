@@ -3,6 +3,11 @@ name = "debridmoviemapper"
 version = "1.0.7"
 edition = "2021"
 license = "MIT"
+# The oldest compiler the code must build with: the Dockerfile's builder image (rust:<this>-slim).
+# CI lints/tests on the latest stable, so this is what makes clippy's `incompatible_msrv` lint flag
+# a std API newer than the image's compiler in the lint job instead of only in the Docker build.
+# Bump it together with the Dockerfile's `FROM rust:<version>-slim` line.
+rust-version = "1.96"
 
 [dependencies]
 async-trait = "0.1"

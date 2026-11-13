@@ -11,7 +11,21 @@ use debridmoviemapper::store::Store;
 use debridmoviemapper::tasks::sync_trakt;
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::trakt_client::{TraktClient, TraktClientImpl};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// The temp database holding the test's live Trakt tokens. Dropping it deletes the file and its
+/// `.corrupt` sibling, so the tokens are removed when an assertion fails or the test panics, too.
+struct TempDb(PathBuf);
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let mut corrupt = self.0.clone().into_os_string();
+        corrupt.push(".corrupt");
+        let _ = std::fs::remove_file(corrupt);
+    }
+}
 
 #[tokio::test]
 #[ignore]
@@ -48,6 +62,8 @@ async fn trakt_live_device_flow_and_sync() {
     let tmdb = TmdbClient::new(tmdb_key).expect("tmdb client");
     let path = std::env::temp_dir().join(format!("dmm_trakt_integ_{}.redb", std::process::id()));
     let path_str = path.to_str().expect("temp path is valid UTF-8").to_string();
+    // Declared before `store`, so it is dropped (and the file deleted) after the store closes.
+    let _temp_db = TempDb(path);
     let store = Store::open(&path_str).expect("store");
 
     let dc = trakt.device_code().await.expect("device_code");
@@ -122,8 +138,30 @@ async fn trakt_live_device_flow_and_sync() {
             "wanted rows must be keyed by the enrolled slug"
         );
     }
+}
 
-    // Best-effort temp-file cleanup.
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(format!("{}.corrupt", path_str));
+/// Offline check of `TempDb` (no network; plain `cargo test`): a panicking test still deletes the
+/// token file and its `.corrupt` sibling.
+#[test]
+fn temp_db_removes_the_token_file_when_the_test_panics() {
+    let path = std::env::temp_dir().join(format!(
+        "dmm_trakt_tempdb_check_{}.redb",
+        std::process::id()
+    ));
+    let mut corrupt = path.clone().into_os_string();
+    corrupt.push(".corrupt");
+    std::fs::write(&path, b"tokens").unwrap();
+    std::fs::write(&corrupt, b"tokens").unwrap();
+
+    let guarded = path.clone();
+    let outcome = std::panic::catch_unwind::<_, ()>(move || {
+        let _temp_db = TempDb(guarded);
+        panic!("an assertion failed");
+    });
+    assert!(outcome.is_err());
+    assert!(!path.exists(), "the token file should be deleted");
+    assert!(
+        !std::path::Path::new(&corrupt).exists(),
+        "the .corrupt sibling should be deleted"
+    );
 }

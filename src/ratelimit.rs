@@ -5,6 +5,24 @@ const MAX_INTERVAL_MS: u64 = 30_000; // 30s ceiling under sustained throttling
 pub const MAX_RETRY_AFTER_SECS: u64 = 300; // Cap Retry-After / proactive wait to 5 minutes
 const LOW_REMAINING: u64 = 2; // proactively pause when a provider's window is nearly spent
 
+/// How long to hold off for an advertised window reset at `reset_epoch_secs`, given the current
+/// time `now_unix` (both UNIX-epoch seconds), or `None` when the reading gives no usable wait.
+///
+/// A non-finite reset (a header parsed as `inf`/`nan` — both accepted by `f64::from_str`) means "no
+/// usable pacing info", NOT "wait the maximum": `inf.min(300)` and `nan.min(300)` both collapse to
+/// 300, so one garbage header would park ALL provider traffic (the limiter is shared) for the full
+/// cap. A legitimate TorBox reset lands within the current window (seconds, at most ~a minute), so a
+/// delta beyond `MAX_RETRY_AFTER_SECS` is a bad reading too, not a long-but-real wait: a reset sent
+/// in MILLISECONDS instead of seconds (e.g. 1.78e12), or a clock set before the UNIX epoch making
+/// `now_unix` 0 (so `reset - 0 ≈ 1.78e9`). Clamping such a value to the cap would park the shared
+/// limiter for 5 minutes off one header, so it is ignored (the reactive 429 path still protects us).
+/// A reset already in the past needs no wait.
+fn plausible_wait_secs(reset_epoch_secs: f64, now_unix: f64) -> Option<f64> {
+    let wait_secs = reset_epoch_secs - now_unix;
+    (wait_secs.is_finite() && wait_secs > 0.0 && wait_secs <= MAX_RETRY_AFTER_SECS as f64)
+        .then_some(wait_secs)
+}
+
 struct RateLimiterState {
     /// Current interval between requests in milliseconds
     interval_ms: u64,
@@ -35,15 +53,17 @@ impl Default for AdaptiveRateLimiter {
 }
 
 impl AdaptiveRateLimiter {
-    /// The providers' limiter: a 100 ms baseline (10 req/s).
+    /// TorBox's limiter: a 100 ms baseline (10 req/s), on top of which TorBox's rate-limit headers
+    /// pace proactively (`observe_rate_limit`).
     pub fn new() -> Self {
         Self::with_min_interval(Duration::from_millis(MIN_INTERVAL_MS))
     }
 
     /// A limiter whose baseline is `min_interval` (at least 1 ms): requests are spaced by it when
-    /// nothing is throttled, a 429 backs off from it, and recovery never goes below it. The scraper
-    /// uses this — Torrentio sends no rate-limit headers, so steady pacing is what keeps a burst of
-    /// scrapes under its limit.
+    /// nothing is throttled, a 429 backs off from it, and recovery never goes below it. Used where
+    /// the service sends no rate-limit headers, so steady pacing is what keeps a burst under its
+    /// limit: the Real-Debrid client (250 ms, RD's documented 250 requests/minute) and the scraper
+    /// (Torrentio).
     pub fn with_min_interval(min_interval: Duration) -> Self {
         let min_interval_ms = (min_interval.as_millis() as u64).max(1);
         Self {
@@ -107,13 +127,6 @@ impl AdaptiveRateLimiter {
     /// (Real-Debrid). NB: that path is multiplicative both ways (double on 429, halve on success) —
     /// i.e. MIMD, not the additive recovery of textbook AIMD.
     pub async fn observe_rate_limit(&self, remaining: u64, reset_epoch_secs: f64) {
-        // A non-finite reset (a header parsed as `inf`/`nan` — both accepted by `f64::from_str`) means
-        // "no usable pacing info", NOT "wait the maximum": `inf.min(300)` and `nan.min(300)` both
-        // collapse to 300, so without this guard one garbage header would park ALL provider traffic
-        // (the limiter is shared) for the full cap. Ignore it. (Also avoids a `from_secs_f64(NaN)`.)
-        if !reset_epoch_secs.is_finite() {
-            return;
-        }
         // Park only once the window is down to its last `LOW_REMAINING` slots. This deliberately
         // strands those final slots (we wait for the reset rather than spend them) as headroom
         // against a miscounted window tripping a 429 — a small, intentional throughput cost.
@@ -124,15 +137,7 @@ impl AdaptiveRateLimiter {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        let wait_secs = reset_epoch_secs - now_unix;
-        // A legitimate TorBox reset lands within the current window (seconds, at most ~a minute), so
-        // a delta beyond MAX_RETRY_AFTER_SECS is not a long-but-real wait — it's a bad reading: a
-        // reset sent in MILLISECONDS instead of seconds (e.g. 1.78e12), or a clock set before the
-        // UNIX epoch making `now_unix` 0 (so `reset - 0 ≈ 1.78e9`). Clamping such a value to the cap
-        // (the old `.min(MAX_RETRY_AFTER_SECS)`) would park the SHARED limiter for the full 5 minutes
-        // off one garbage header — the same availability cliff the non-finite guard above avoids — so
-        // ignore an out-of-range delta entirely (the reactive 429 path still protects us).
-        if wait_secs > 0.0 && wait_secs <= MAX_RETRY_AFTER_SECS as f64 {
+        if let Some(wait_secs) = plausible_wait_secs(reset_epoch_secs, now_unix) {
             let mut state = self.state.lock().await;
             let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(wait_secs);
             if deadline > state.next_allowed {
@@ -158,8 +163,8 @@ mod tests {
         rl.state.lock().await.interval_ms
     }
 
-    /// A limiter built with a custom baseline (the scraper's) spaces requests by it, backs off from
-    /// it on a 429, and never recovers BELOW it — while `new()` keeps the providers' 100 ms baseline.
+    /// A limiter built with a custom baseline (the scraper's, RD's) spaces requests by it, backs off
+    /// from it on a 429, and never recovers BELOW it — while `new()` keeps TorBox's 100 ms baseline.
     #[tokio::test(start_paused = true)]
     async fn a_custom_baseline_paces_requests_and_bounds_recovery() {
         let rl = AdaptiveRateLimiter::with_min_interval(Duration::from_millis(1_000));
@@ -354,17 +359,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plausible_wait_secs_accepts_only_a_short_future_reset() {
+        let now = now_unix_secs();
+        // A reset a few seconds out is a real wait.
+        let w = plausible_wait_secs(now + 10.0, now).expect("a near-future reset is a wait");
+        assert!((w - 10.0).abs() < 1e-6, "got {w}");
+        assert!(plausible_wait_secs(now + MAX_RETRY_AFTER_SECS as f64, now).is_some());
+        // A clock set before the UNIX epoch degrades `now_unix` to 0, so the delta is a whole epoch
+        // of seconds: not a wait.
+        assert_eq!(plausible_wait_secs(now, 0.0), None);
+        // A reset sent in milliseconds instead of seconds (~1.78e12).
+        assert_eq!(plausible_wait_secs(1_780_000_000_000.0, now), None);
+        // Already reset, or exactly now: nothing to wait for.
+        assert_eq!(plausible_wait_secs(now - 5.0, now), None);
+        assert_eq!(plausible_wait_secs(now, now), None);
+        // Non-finite headers (`inf`/`nan` both parse as f64).
+        assert_eq!(plausible_wait_secs(f64::INFINITY, now), None);
+        assert_eq!(plausible_wait_secs(f64::NAN, now), None);
+    }
+
     #[tokio::test]
     async fn observe_rate_limit_ignores_an_implausibly_large_delta() {
-        // A finite-but-wrong-magnitude reset — a value sent in MILLISECONDS instead of seconds, or a
-        // pre-epoch clock making `now_unix` 0 — yields a delta far beyond the cap. It must be ignored
-        // (not clamped to the 300s cap, which would park all shared provider traffic for 5 minutes).
+        // A finite-but-wrong-magnitude reset — e.g. a value sent in MILLISECONDS instead of seconds —
+        // yields a delta far beyond the cap. It must be ignored (not clamped to the 300s cap, which
+        // would park all shared provider traffic for 5 minutes). The pre-epoch-clock case needs an
+        // injected clock, so `plausible_wait_secs_accepts_only_a_short_future_reset` covers it.
         let limiter = AdaptiveRateLimiter::new();
         let before = { limiter.state.lock().await.next_allowed };
         // `reset` in milliseconds (~1.78e12) rather than seconds → delta ≈ 1.78e12.
         limiter.observe_rate_limit(0, 1_780_000_000_000.0).await;
-        // A pre-epoch clock degrades `now_unix` to 0, so `reset - 0` is a whole epoch of seconds.
-        limiter.observe_rate_limit(0, now_unix_secs()).await;
         let state = limiter.state.lock().await;
         assert_eq!(
             state.next_allowed, before,

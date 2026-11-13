@@ -110,19 +110,58 @@ static SEED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{1f464}\s*(\d+
 // stall-reaped by `observe`. The `⚡` (U+26A1) emoji marker is checked separately in `parse`.
 static CACHED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(?:rd|tb)\+").unwrap());
 
-// Cam / telesync / telecine / screener / R5 / workprint / pre-DVD markers (the quality floor).
+// Cam / telesync / telecine / screener / R5 / workprint / pre-DVD markers (the quality floor) come
+// in two groups. This first group is never an ordinary word, so it counts anywhere in the text.
 // NOTE: bare `ts` is handled by `TS_RE` (below), NOT here — `\bts\b` would match the `.ts`/`.m2ts`
 // transport-stream CONTAINER extension (both are served video formats), wrongly cam-rejecting a
 // legitimate `.ts` release. `hd-?ts` stays here (unambiguous — never a container extension).
-static CAM_RE: LazyLock<Regex> = LazyLock::new(|| {
-    // Bare `tc` (telecine) is included alongside `hd-?tc`/`tele-?cine`: unlike `ts`, there is no `.tc`
-    // CONTAINER extension, so the word-bounded `\btc\b` is unambiguous (it matches a standalone `TC`
-    // tag, not a substring like "catch").
+static CAM_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"\b(cam|cam-?rip|hd-?cam|hq-?cam|hd-?ts|tele-?sync|hd-?tc|tele-?cine|tc|scr|screener|dvd-?scr|bd-?scr|work-?print|r5|pre-?dvd|predvd)\b",
+        r"\b(cam-?rip|hd-?cam|hq-?cam|hd-?ts|tele-?sync|hd-?tc|tele-?cine|dvd-?scr|bd-?scr|work-?print|pre-?dvd|predvd)\b",
     )
     .unwrap()
 });
+// The bare markers, which are also title words (Cam, Body Cam, Nanny Cam). They count only in a
+// line's tag part (`tag_part`) or inside brackets, so a title containing one is not cam-rejected.
+// Bare `tc` (telecine) is here alongside `hd-?tc`/`tele-?cine`: unlike `ts`, there is no `.tc`
+// CONTAINER extension, so the word-bounded `\btc\b` matches a standalone `TC` tag, not "catch".
+static CAM_WORD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(cam|tc|scr|screener|r5)\b").unwrap());
+
+// Where a line's release tags begin: its first year or SxxEyy (season/episode) token. Scene and
+// P2P names put the title first with the year or episode code straight after it, so a title word
+// (`Cam.2018…`, `Charlotte's.Web.2006…`) sits before this point and a tag (`….2025.HDCAM…`)
+// after it.
+// A resolution token is deliberately NOT an anchor: in `Movie HDCAM 720p` the tag precedes it.
+static TAGS_START_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:(?:19|20)\d{2}\b|s\d{1,3}(?:e\d{1,4})?)").unwrap());
+
+// A bracketed group on a line (`[HDCAM]`, `(2025)`): a tag group even when it precedes the title.
+static BRACKET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[\[(]([^\[\]()]*)[\])]").unwrap());
+
+/// The part of one (lowercased) release-name line that carries its tags: everything after its first
+/// year or SxxEyy token, or the whole line when it has neither (a year-less name can't be split).
+fn tag_part(line: &str) -> &str {
+    TAGS_START_RE.find(line).map_or(line, |m| &line[m.end()..])
+}
+
+/// Whether the (lowercased) name/description marks a cam / telesync / screener source.
+fn is_cam_source(lower: &str) -> bool {
+    CAM_TAG_RE.is_match(lower)
+        || lower.lines().any(|line| {
+            let tags = tag_part(line);
+            CAM_WORD_RE.is_match(tags)
+                || TS_RE.is_match(tags)
+                || BRACKET_RE.captures_iter(line).any(|group| {
+                    let group = &group[1];
+                    // Padded so a lone `[TS]` meets `TS_RE`'s separators; a bracketed `….ts` file
+                    // name is still the container, not a telesync tag.
+                    CAM_WORD_RE.is_match(group)
+                        || (TS_RE.is_match(&format!(" {group} ")) && !group.ends_with(".ts"))
+                })
+        })
+}
 
 // A bare `ts` telesync tag, but NOT a trailing `.ts` container extension. Requiring a trailing
 // separator means `…1080p.HDTV.ts` (a real transport-stream file) is treated as a container, while a
@@ -137,7 +176,9 @@ static TS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[ .\-_\n])ts[
 // explicit `web-dl`/`webrip`/etc. checks miss. Separator-bounded (start/space/`.`/`-`/`_`/newline on
 // both sides) so it matches `WEB` as a standalone token but not a substring of another word
 // (`webrip` is handled explicitly; `spiderweb` won't match). Without this, a bare-`WEB` release falls
-// to `Source::Other` (tier 0) — scoring BELOW HDTV and blocking a legitimate HDTV→WEB upgrade.
+// to `Source::Other` (tier 0) — scoring BELOW HDTV and blocking a legitimate HDTV→WEB upgrade. Like
+// the bare cam words it is matched only in a line's `tag_part`, so the title word in
+// `Charlotte's.Web.2006.720p.HDTV` doesn't make an HDTV release WEB.
 static WEB_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|[ ._\n-])web(?:[ ._\n-]|$)").unwrap());
 
@@ -169,7 +210,7 @@ static DV_RE: LazyLock<Regex> =
 
 /// Classify the release source from its (lowercased) name/description.
 fn detect_source(lower: &str) -> Source {
-    if CAM_RE.is_match(lower) || TS_RE.is_match(lower) {
+    if is_cam_source(lower) {
         Source::Cam
     } else if lower.contains("remux") {
         Source::Remux
@@ -197,7 +238,7 @@ fn detect_source(lower: &str) -> Source {
         || lower.contains("pcok")
         || lower.contains("pmtp")
         || lower.contains("itunes")
-        || WEB_RE.is_match(lower)
+        || lower.lines().any(|line| WEB_RE.is_match(tag_part(line)))
     {
         Source::Web
     } else if lower.contains("hdtv") {
@@ -247,10 +288,14 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
         Codec::Other
     };
 
-    let hdr = lower.contains("hdr")
-        || lower.contains("dolby vision")
-        || lower.contains("dovi")
-        || DV_RE.is_match(&lower);
+    // A substring test, so a glued `2160pHDR` still counts, run with the two common non-HDR tokens
+    // containing "hdr" removed first: `HDRip` (a plain HD rip) and `HDRezka` (a Russian voice-over
+    // studio label).
+    let hdr_text = lower.replace("hdrip", " ").replace("hdrezka", " ");
+    let hdr = hdr_text.contains("hdr")
+        || hdr_text.contains("dolby vision")
+        || hdr_text.contains("dovi")
+        || DV_RE.is_match(&hdr_text);
 
     let cached = CACHED_RE.is_match(&text) || text.contains('\u{26a1}');
 
@@ -391,6 +436,10 @@ const LANG_WORDS: &[(&str, &str)] = &[
     ("chinese", "chi"),
     ("thai", "tha"),
     ("vietnamese", "vie"),
+    ("tamil", "tam"),
+    ("telugu", "tel"),
+    ("malayalam", "mal"),
+    ("kannada", "kan"),
     // Scene/tracker abbreviations (3+ letters only — a 2-letter token like `it`/`de`/`es` collides
     // with ordinary words in release names). French variants: `vff` (VF France), `vfq` (VF Québec),
     // `vfi` (VF internationale), `truefrench`; Spanish: `castellano` (Spain), `latino` (LatAm);
@@ -423,54 +472,57 @@ const LANG_WORDS: &[(&str, &str)] = &[
 ];
 
 /// Torrentio's regional-indicator flags, keyed by the 2-letter country code they spell, mapped to
-/// the ISO 639-2/B code of that country's language (the form `score` compares against).
-const FLAG_LANGS: &[(&str, &str)] = &[
-    ("GB", "eng"),
-    ("US", "eng"),
-    ("RU", "rus"),
-    ("FR", "fre"),
-    ("IT", "ita"),
-    ("ES", "spa"),
-    ("MX", "spa"),
-    ("DE", "ger"),
-    ("PT", "por"),
-    ("BR", "por"),
-    ("PL", "pol"),
-    ("CZ", "cze"),
-    ("SK", "slo"),
-    ("NL", "dut"),
-    ("JP", "jpn"),
-    ("KR", "kor"),
-    ("CN", "chi"),
-    ("TW", "chi"),
-    ("IN", "hin"),
-    ("UA", "ukr"),
-    ("HU", "hun"),
-    ("BG", "bul"),
-    ("RS", "srp"),
-    ("HR", "hrv"),
-    ("DK", "dan"),
-    ("SE", "swe"),
-    ("NO", "nor"),
-    ("FI", "fin"),
-    ("TR", "tur"),
-    ("IL", "heb"),
-    ("GR", "gre"),
-    ("RO", "rum"),
-    ("LT", "lit"),
-    ("LV", "lav"),
-    ("EE", "est"),
-    ("SI", "slv"),
-    ("SA", "ara"),
-    ("IR", "per"),
-    ("VN", "vie"),
-    ("ID", "ind"),
-    ("MY", "may"),
-    ("TH", "tha"),
+/// the ISO 639-2/B code(s) of that country's language (the form `score` compares against). A flag
+/// Torrentio uses for several languages maps to all of them: 🇮🇳 stands for Hindi, Tamil or Telugu
+/// audio (and other Indian languages), so it satisfies a requirement for any of them while still
+/// marking a release as a dub for, say, an English title.
+const FLAG_LANGS: &[(&str, &[&str])] = &[
+    ("GB", &["eng"]),
+    ("US", &["eng"]),
+    ("RU", &["rus"]),
+    ("FR", &["fre"]),
+    ("IT", &["ita"]),
+    ("ES", &["spa"]),
+    ("MX", &["spa"]),
+    ("DE", &["ger"]),
+    ("PT", &["por"]),
+    ("BR", &["por"]),
+    ("PL", &["pol"]),
+    ("CZ", &["cze"]),
+    ("SK", &["slo"]),
+    ("NL", &["dut"]),
+    ("JP", &["jpn"]),
+    ("KR", &["kor"]),
+    ("CN", &["chi"]),
+    ("TW", &["chi"]),
+    ("IN", &["hin", "tam", "tel", "mal", "kan"]),
+    ("UA", &["ukr"]),
+    ("HU", &["hun"]),
+    ("BG", &["bul"]),
+    ("RS", &["srp"]),
+    ("HR", &["hrv"]),
+    ("DK", &["dan"]),
+    ("SE", &["swe"]),
+    ("NO", &["nor"]),
+    ("FI", &["fin"]),
+    ("TR", &["tur"]),
+    ("IL", &["heb"]),
+    ("GR", &["gre"]),
+    ("RO", &["rum"]),
+    ("LT", &["lit"]),
+    ("LV", &["lav"]),
+    ("EE", &["est"]),
+    ("SI", &["slv"]),
+    ("SA", &["ara"]),
+    ("IR", &["per"]),
+    ("VN", &["vie"]),
+    ("ID", &["ind"]),
+    ("MY", &["may"]),
+    ("TH", &["tha"]),
 ];
 
 /// Map each regional-indicator flag emoji in `text` (a pair of chars in `U+1F1E6..=U+1F1FF`, which
-/// spell a 2-letter country code `A`–`Z`) to its language code via `FLAG_LANGS`, in order of
+/// spell a 2-letter country code `A`–`Z`) to its language code(s) via `FLAG_LANGS`, in order of
 /// appearance. Consecutive indicators pair up left to right (so `🇬🇧🇮🇹` is GB, IT); a lone indicator
 /// and an unknown country are ignored.
 fn flag_languages(text: &str) -> Vec<&'static str> {
@@ -490,8 +542,8 @@ fn flag_languages(text: &str) -> Vec<&'static str> {
         };
         chars.next();
         let country: String = [first, second].iter().collect();
-        if let Some((_, code)) = FLAG_LANGS.iter().find(|(cc, _)| *cc == country) {
-            out.push(*code);
+        if let Some((_, codes)) = FLAG_LANGS.iter().find(|(cc, _)| *cc == country) {
+            out.extend_from_slice(codes);
         }
     }
     out
@@ -583,25 +635,29 @@ pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
 /// audio languages and none of them — nor a `mul` multi-audio tag — satisfies a CONCRETE requirement:
 /// one language (`Lang`), or any of several (`AnyOf` — `Original` resolved against the title's TMDB
 /// original + spoken languages by `with_resolved_audio`). A raw `Original` has no per-title context,
-/// so it never applies; nor does it to an untagged release.
+/// so it never applies; nor does it to an untagged release, or when a wanted language is "no
+/// language" (TMDB `xx`, a dialogue-free title — `probe::verify` skips its audio check too).
 pub fn wrong_audio_language(r: &ReleaseInfo, prefs: &QualityPrefs) -> bool {
     let wants: &[String] = match &prefs.audio {
         AudioReq::Lang(want) => std::slice::from_ref(want),
         AudioReq::AnyOf(wants) => wants,
         AudioReq::Original => &[],
     };
-    if wants.is_empty() || r.languages.is_empty() {
+    if wants.is_empty()
+        || r.languages.is_empty()
+        || wants.iter().any(|w| crate::probe::is_no_language(w))
+    {
         return false;
     }
-    // Normalise both sides to ISO 639-2 (3-letter) before comparing — exactly as `probe::verify`
-    // does via `lang_eq`. `AudioReq::parse` only lowercases the configured value, so a 2-letter
-    // `AUDIO_LANGUAGE` (e.g. `en`) must map to `eng` to match a release tagged "English" (parsed
-    // to `eng`); a raw `l == want` would otherwise penalise the CORRECT-language release here even
-    // though the probe accepts it — an inconsistency between acquisition ranking and verification.
-    let wants: Vec<String> = wants.iter().map(|w| crate::probe::to_iso639_2(w)).collect();
+    // Compare with `probe::lang_eq`, exactly as `probe::verify` does: it normalises both sides to
+    // ISO 639-2 (3-letter) and knows macrolanguages. `AudioReq::parse` only lowercases the
+    // configured value, so a 2-letter `AUDIO_LANGUAGE` (e.g. `en`) must map to `eng` to match a
+    // release tagged "English" (parsed to `eng`); a raw `l == want` would otherwise penalise the
+    // CORRECT-language release here even though the probe accepts it — an inconsistency between
+    // acquisition ranking and verification.
     !r.languages
         .iter()
-        .any(|l| l == "mul" || wants.contains(&crate::probe::to_iso639_2(l)))
+        .any(|l| l == "mul" || wants.iter().any(|w| crate::probe::lang_eq(l, w)))
 }
 
 pub fn rank(candidates: Vec<ReleaseInfo>, prefs: &QualityPrefs) -> Vec<ReleaseInfo> {
@@ -701,11 +757,11 @@ impl QualitySummary {
 /// keep-priority, upgrade baselines, consolidation): its resolution or source tier is 0 (that axis
 /// untagged). A known RESOLUTION still stays a floor: an unknown copy is below every known quality
 /// at its resolution, never below a lower-resolution one ([`quality_rank`]), and the upgrade pass
-/// only replaces it with a known release at or above that resolution ([`is_target_improvement`]). A copy with NO recorded quality is unknown too
-/// ([`QualitySummary::unknown`]). The one exception is a copy whose resolution is ABOVE `ceiling`
-/// (`MAX_RESOLUTION`): its resolution is known and higher than anything acquisition would fetch, so
-/// it is never unknown-lowest — replacing it is a corrective downgrade, gated by
-/// `ALLOW_RESOLUTION_DOWNGRADE`, whatever its source tier.
+/// only replaces it with a known release at or above that resolution ([`is_target_improvement`]).
+/// A copy with NO recorded quality is unknown too ([`QualitySummary::unknown`]). The one exception
+/// is a copy whose resolution is ABOVE `ceiling` (`MAX_RESOLUTION`): its resolution is known and
+/// higher than anything acquisition would fetch, so it is never unknown-lowest — replacing it is a
+/// corrective downgrade, gated by `ALLOW_RESOLUTION_DOWNGRADE`, whatever its source tier.
 pub fn is_unknown_quality(q: &QualitySummary, ceiling: u16) -> bool {
     q.resolution <= ceiling && (q.resolution == 0 || q.source_tier == 0)
 }
@@ -785,9 +841,10 @@ pub fn is_target_improvement(
     // ANY known-quality cached within-ceiling candidate (the upgrade pass adopts it only on a probe
     // `Pass`) that keeps its resolution when that is tagged — a known resolution stays a floor, so
     // this ungated path never trades resolution down — and never by an unknown one; a known current
-    // is never "improved" by an unknown candidate. The swap records the adopted release's known quality, so the next visit compares two
-    // known copies under the rules below — it converges. An over-ceiling current is never unknown
-    // (its known resolution is above the ceiling) and falls through to the corrective-downgrade rules.
+    // is never "improved" by an unknown candidate. The swap records the adopted release's known
+    // quality, so the next visit compares two known copies under the rules below — it converges. An
+    // over-ceiling current is never unknown (its known resolution is above the ceiling) and falls
+    // through to the corrective-downgrade rules.
     let ceiling = prefs.max_resolution.height();
     if current.resolution <= ceiling {
         let candidate_known =
@@ -1175,13 +1232,13 @@ mod tests {
 
     #[test]
     fn parse_tags_language_abbreviations() {
-        // Scene/tracker abbreviations, not just full language names (YAGA's `Rus`, Nightborn's `VFF`).
-        let yaga = langs("t", "Yaga.s01e04.WEBRip.XviD.Rus.RuDub.tv.avi");
-        assert!(yaga.contains(&"rus".to_string()), "{yaga:?}");
-        let vff = langs("t", "Nightborn.2026.MULTi.VFF.1080p.WEBRip");
+        // Scene/tracker abbreviations, not just full language names (e.g. `Rus`, `VFF`).
+        let rus = langs("t", "Show.s01e04.WEBRip.XviD.Rus.RuDub.tv.avi");
+        assert!(rus.contains(&"rus".to_string()), "{rus:?}");
+        let vff = langs("t", "Film.2026.MULTi.VFF.1080p.WEBRip");
         assert!(vff.contains(&"fre".to_string()), "{vff:?}");
         assert!(vff.contains(&"mul".to_string()), "{vff:?}");
-        let esp = langs("t", "Nightborn (2026) [Bluray 1080p][Esp]");
+        let esp = langs("t", "Film (2026) [Bluray 1080p][Esp]");
         assert!(esp.contains(&"spa".to_string()), "{esp:?}");
         let ita_eng = langs("t", "Danza.con.il.diavolo.ITA.ENG.1080p");
         assert!(ita_eng.contains(&"ita".to_string()), "{ita_eng:?}");
@@ -1203,6 +1260,73 @@ mod tests {
         // unknown flag is ignored.
         let adjacent = langs("t", "Film.English.1080p\n🇺🇸🇫🇷🇦🇶");
         assert_eq!(adjacent, vec!["eng".to_string(), "fre".to_string()]);
+    }
+
+    #[test]
+    fn tmdb_pseudo_language_codes_are_not_penalised_wrongly() {
+        // TMDB's non-ISO codes reach `score` through `with_resolved_audio`: `cn` (Cantonese) is
+        // satisfied by a Chinese tag, `sh` (Serbo-Croatian) by a Croatian or Serbian one, and `xx`
+        // (No Language) puts no requirement on the audio at all.
+        let tagged = |desc: &str| parse(&raw("t", desc, "h", Some("f.mkv")));
+        let want = |code: &str| {
+            let mut p = prefs();
+            p.audio = AudioReq::Lang(code.to_string());
+            p
+        };
+        assert!(!wrong_audio_language(
+            &tagged("Film.1080p\n🇨🇳"),
+            &want("cn")
+        ));
+        assert!(!wrong_audio_language(
+            &tagged("Film.1080p.Chinese"),
+            &want("cn")
+        ));
+        assert!(wrong_audio_language(&tagged("Film.1080p\n🇬🇧"), &want("cn")));
+        assert!(!wrong_audio_language(
+            &tagged("Film.1080p\n🇭🇷"),
+            &want("sh")
+        ));
+        assert!(!wrong_audio_language(
+            &tagged("Film.1080p\n🇷🇸"),
+            &want("sh")
+        ));
+        assert!(wrong_audio_language(&tagged("Film.1080p\n🇬🇧"), &want("sh")));
+        assert!(!wrong_audio_language(
+            &tagged("Film.1080p.Rus"),
+            &want("xx")
+        ));
+        let any_of = {
+            let mut p = prefs();
+            p.audio = AudioReq::AnyOf(vec!["xx".into(), "en".into()]);
+            p
+        };
+        assert!(!wrong_audio_language(&tagged("Film.1080p.Rus"), &any_of));
+    }
+
+    #[test]
+    fn india_flag_covers_every_language_torrentio_renders_with_it() {
+        // Torrentio shows Hindi, Tamil and Telugu audio all as 🇮🇳, so the flag says the audio is
+        // one of India's languages, not which. A 🇮🇳 release of a Tamil or Telugu title is not
+        // penalised; for an English title it still is.
+        let flagged = parse(&raw("t", "Film.2023.1080p.WEB-DL\n🇮🇳", "h1", Some("f.mkv")));
+        let untagged = parse(&raw("t", "Film.2023.1080p.WEB-DL", "h2", Some("f.mkv")));
+        for want in ["hi", "ta", "te", "ml", "kn"] {
+            let mut p = prefs();
+            p.audio = AudioReq::Lang(want.to_string());
+            assert!(!wrong_audio_language(&flagged, &p), "🇮🇳 for a {want} title");
+            assert_eq!(score(&flagged, &p), score(&untagged, &p), "{want}");
+        }
+        let mut en = prefs();
+        en.audio = AudioReq::Lang("en".to_string());
+        assert!(
+            wrong_audio_language(&flagged, &en),
+            "🇮🇳 for an English title"
+        );
+        // The full language names are tagged too.
+        let tamil = langs("t", "Film (2023) Tamil 1080p WEB-DL");
+        assert_eq!(tamil, vec!["tam".to_string()]);
+        let telugu = langs("t", "Film (2023) Telugu 1080p WEB-DL");
+        assert_eq!(telugu, vec!["tel".to_string()]);
     }
 
     #[test]
@@ -1235,7 +1359,7 @@ mod tests {
     fn subtitle_only_markers_do_not_tag_audio() {
         // VOSTFR = original audio with French subtitles; `Napisy` (Polish) = subtitles. Neither says
         // anything about the AUDIO language, so neither may tag one.
-        let vostfr = langs("t", "YAGA S01E04 - Saison 1 VOSTFR HDTV 2026");
+        let vostfr = langs("t", "Show S01E04 - Saison 1 VOSTFR HDTV 2026");
         assert!(vostfr.is_empty(), "{vostfr:?}");
         let napisy = langs("t", "Film.2020.1080p.WEB-DL.Napisy.PL.Subs");
         assert!(napisy.is_empty(), "{napisy:?}");
@@ -1311,11 +1435,11 @@ mod tests {
         p.audio = AudioReq::Lang("en".to_string());
         let rus = parse(&raw(
             "t",
-            "Yaga.S01E04.1080p.Rus.ColdFilm",
+            "Show.S01E04.1080p.Rus.ColdFilm",
             "h1",
-            Some("Yaga.mkv"),
+            Some("Show.mkv"),
         ));
-        let web = parse(&raw("t", "Yaga.S01E04.1080p.WEB", "h2", Some("Yaga.mkv")));
+        let web = parse(&raw("t", "Show.S01E04.1080p.WEB", "h2", Some("Show.mkv")));
         let (rus_s, web_s) = (score(&rus, &p).unwrap(), score(&web, &p).unwrap());
         assert!(
             web_s - rus_s >= 50_000,
@@ -1470,6 +1594,83 @@ mod tests {
             Some("Movie.mkv"),
         ));
         assert!(score(&good, &prefs()).is_some());
+    }
+
+    #[test]
+    fn cam_word_in_the_title_is_not_a_cam_source() {
+        // The bare cam markers (`cam`, `tc`, `scr`, `r5`, `ts`) are also ordinary title words. A
+        // title such as Cam (2018) must not have every one of its releases cam-rejected: the
+        // markers are read only after the title, i.e. after the first year or SxxEyy token of a
+        // line.
+        for name in [
+            "Cam.2018.1080p.NF.WEB-DL.DDP5.1.x264-NTG",
+            "Spy.Cam.2023.1080p.BluRay.x264",
+            "Body.Cam.2020.1080p.WEB",
+            "Nanny Cam (2014) [720p] [WEBRip]",
+            "Dash.Cam.S01E02.1080p.WEB.H264-GRP",
+        ] {
+            let c = raw(
+                "Torrentio\n1080p",
+                &format!("{name}\nRD+"),
+                "h",
+                Some("x.mkv"),
+            );
+            let r = parse(&c);
+            assert_ne!(
+                r.source,
+                Source::Cam,
+                "{name}: the title word is not a cam tag"
+            );
+            assert!(score(&r, &prefs()).is_some(), "{name} must be acquirable");
+        }
+        // The same file name on its own (an account-mirror copy) is clean too.
+        let mirror = raw("Cam.2018.1080p.NF.WEB-DL.x264.mkv", "", "h", None);
+        assert_eq!(parse(&mirror).source, Source::Web);
+        // A cam tag after the year, a year-less line, a bracketed tag before the title, an
+        // unambiguous tag before the year, and Torrentio's own quality line are all still caught.
+        for (name, desc) in [
+            ("Torrentio\n1080p", "Movie.2025.1080p.CAM.x265"),
+            ("Torrentio\n1080p", "Movie.2025.HDTS.x264"),
+            ("Torrentio\n720p", "Movie Name HDCAM 720p"),
+            ("Torrentio\n1080p", "[HDCAM] Movie (2025)"),
+            ("Torrentio\n1080p", "[CAM] Movie (2025) 1080p"),
+            ("Torrentio\n1080p", "[TS] Movie (2025) 1080p"),
+            ("Torrentio\n1080p", "TELESYNC Movie 2025 1080p"),
+            ("Torrentio\nCAM", "Movie.2025.1080p.x264"),
+            ("Torrentio\n1080p", "Cam.2018.1080p.CAM.x264"),
+        ] {
+            let c = raw(name, &format!("{desc}\nRD+"), "h", Some("x.mkv"));
+            assert_eq!(
+                parse(&c).source,
+                Source::Cam,
+                "{name} / {desc} is a cam source"
+            );
+        }
+    }
+
+    #[test]
+    fn web_word_in_the_title_is_not_a_web_source() {
+        // A bare `web` token is the scene WEB tag only after the title: Charlotte's Web is not a
+        // WEB release unless it says so after its year.
+        let hdtv = raw("t", "Charlotte's.Web.2006.720p.HDTV.x264", "h", None);
+        assert_eq!(parse(&hdtv).source, Source::Hdtv);
+        let dvdrip = raw("t", "Charlotte's.Web.2006.DVDRip.x264", "h", None);
+        assert_eq!(parse(&dvdrip).source, Source::Other);
+        let show = raw("t", "Web.Therapy.S01E01.720p.HDTV.x264", "h", None);
+        assert_eq!(parse(&show).source, Source::Hdtv);
+        // A real WEB tag after the year/episode, or on a year-less line, still counts.
+        for name in [
+            "Movie.2024.1080p.WEB.H264-GRP",
+            "Movie.Name.WEB.1080p",
+            "Charlotte's.Web.2006.1080p.WEB.x264",
+            "Show.S01E01.1080p.WEB",
+        ] {
+            assert_eq!(
+                parse(&raw("t", name, "h", None)).source,
+                Source::Web,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1957,6 +2158,19 @@ mod tests {
             !parse(&dvd).hdr,
             "'DVD' contains 'dv' but must NOT be read as Dolby Vision"
         );
+        // `HDRip` (a plain HD rip) and `HDRezka` (a Russian voice-over studio) contain "hdr" but
+        // are not HDR.
+        let hdrip = raw("x", "Movie.2019.720p.HDRip.x264", "g", None);
+        assert!(!parse(&hdrip).hdr, "HDRip is not HDR");
+        let hdrezka = raw("x", "Movie.2020.1080p.WEB-DL.HDRezka.Studio", "h", None);
+        assert!(!parse(&hdrezka).hdr, "HDRezka is not HDR");
+        // Real HDR tags, including one glued to the resolution, still are.
+        let hdr10 = raw("x", "Movie.2020.2160p.HDR10+.WEB-DL", "i", None);
+        assert!(parse(&hdr10).hdr, "HDR10+ → hdr");
+        let glued = raw("x", "Movie.2160pHDR.x265", "j", None);
+        assert!(parse(&glued).hdr, "glued 2160pHDR → hdr");
+        let both = raw("x", "Movie.2020.2160p.HDR.HDRip.x265", "k", None);
+        assert!(parse(&both).hdr, "an HDR tag next to HDRip still counts");
     }
 
     #[test]

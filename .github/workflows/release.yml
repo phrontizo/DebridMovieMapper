@@ -16,7 +16,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Verify Cargo.toml version matches the tag
         run: |
@@ -34,7 +34,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -54,7 +54,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -71,7 +71,7 @@ jobs:
       packages: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # `secrets` cannot be used in `if:` conditions, so resolve availability into a step
       # output here (secrets ARE allowed in `env`/`run`) and gate later steps on it.
@@ -119,13 +119,17 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # `latest=auto` adds `:latest` for a release tag (v1.2.3) but not for a pre-release
+      # (v1.2.3-rc.1), so compose users pulling `:latest` never get a pre-release image.
+      # Don't add `type=raw,value=latest`: it would move `:latest` on every tag push.
       - name: Extract version tags
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ steps.images.outputs.value }}
+          flavor: |
+            latest=auto
           tags: |
-            type=raw,value=latest
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
@@ -142,6 +146,6 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true

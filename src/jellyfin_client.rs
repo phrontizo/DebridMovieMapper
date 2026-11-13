@@ -65,8 +65,10 @@ fn sample_change_paths(changes: &[VfsChange], max: usize) -> String {
 
 pub struct JellyfinClient {
     url: String,
-    /// Pre-built sensitive header value so the key is never printed in debug output.
-    api_key_header: HeaderValue,
+    /// Pre-built `Authorization: MediaBrowser Token="<key>"` value, marked sensitive so the key is
+    /// never printed in debug output. Jellyfin 12 disables the legacy `X-Emby-Token` header (and
+    /// the `api_key` query parameter) by default; this scheme also works on Jellyfin 10.x.
+    auth_header: HeaderValue,
     mount_path: String,
     http: reqwest::Client,
 }
@@ -87,20 +89,28 @@ impl JellyfinClient {
                 parsed.scheme()
             ));
         }
-        let mut api_key_header = HeaderValue::from_str(&api_key).map_err(|e| {
+        // The key is sent as the quoted `Token` parameter of `Authorization: MediaBrowser …`, so a
+        // character that would end or split that parameter is refused (Jellyfin keys are hex).
+        if api_key.contains(['"', '\\', ',']) {
+            return Err(
+                "Jellyfin API key must not contain a double quote, backslash or comma".to_string(),
+            );
+        }
+        let mut auth_header = HeaderValue::from_str(&format!("MediaBrowser Token=\"{api_key}\""))
+            .map_err(|e| {
             format!(
                 "Jellyfin API key contains invalid HTTP header characters: {}",
                 e
             )
         })?;
-        api_key_header.set_sensitive(true);
+        auth_header.set_sensitive(true);
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| format!("Failed to build Jellyfin HTTP client: {}", e))?;
         Ok(Self {
             url,
-            api_key_header,
+            auth_header,
             mount_path: mount_path.trim_end_matches('/').to_string(),
             http,
         })
@@ -153,7 +163,7 @@ impl JellyfinClient {
             let result = self
                 .http
                 .post(&url)
-                .header("X-Emby-Token", self.api_key_header.clone())
+                .header(reqwest::header::AUTHORIZATION, self.auth_header.clone())
                 .json(&body)
                 .send()
                 .await;
@@ -217,15 +227,26 @@ impl JellyfinClient {
     /// Try to create a JellyfinClient from environment variables.
     /// Returns None if any of the required env vars are missing or invalid.
     pub fn from_env() -> Option<Self> {
+        Self::from_values(
+            std::env::var("JELLYFIN_URL").ok(),
+            std::env::var("JELLYFIN_API_KEY").ok(),
+            std::env::var("JELLYFIN_RCLONE_MOUNT_PATH").ok(),
+        )
+    }
+
+    /// `from_env` on already-read values (`None` = the variable is unset), so the handling can be
+    /// tested without mutating the process environment.
+    fn from_values(
+        url: Option<String>,
+        api_key: Option<String>,
+        mount_path: Option<String>,
+    ) -> Option<Self> {
         // Trim and treat blank-as-unset for every value, matching `Config`'s env handling — a
         // whitespace-only value (e.g. from quoted compose YAML) must not build a client that POSTs
         // to a malformed URL at runtime.
-        let url = std::env::var("JELLYFIN_URL").ok()?.trim().to_string();
-        let api_key = std::env::var("JELLYFIN_API_KEY").ok()?.trim().to_string();
-        let mount_path = std::env::var("JELLYFIN_RCLONE_MOUNT_PATH")
-            .ok()?
-            .trim()
-            .to_string();
+        let url = url?.trim().to_string();
+        let api_key = api_key?.trim().to_string();
+        let mount_path = mount_path?.trim().to_string();
 
         if url.is_empty() || api_key.is_empty() || mount_path.is_empty() {
             return None;
@@ -386,8 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn notify_changes_skips_empty() {
-        // Just verify it doesn't panic on empty input
+    fn build_request_body_empty_has_no_updates() {
         let client = JellyfinClient::new(
             "http://jellyfin:8096".to_string(),
             "test-key".to_string(),
@@ -397,6 +417,111 @@ mod tests {
         let body = client.build_request_body(&[]);
         let updates = body["Updates"].as_array().unwrap();
         assert!(updates.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notify_changes_with_no_changes_sends_nothing_and_does_not_wait() {
+        // An empty change set must return at once: no request, and no NOTIFICATION_DELAY sleep
+        // (under a paused clock a sleep would auto-advance time by the full delay).
+        use std::sync::atomic::Ordering;
+        let (url, counter) = spawn_counting_server(500, 0).await;
+        let client = JellyfinClient::new(url, "key".to_string(), "/media".to_string()).unwrap();
+        let start = tokio::time::Instant::now();
+        client.notify_changes(&[]).await;
+        assert!(
+            start.elapsed() < NOTIFICATION_DELAY,
+            "an empty change set must not wait out the notification delay"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "an empty change set sends no request"
+        );
+    }
+
+    #[test]
+    fn new_rejects_an_api_key_that_would_break_the_quoted_auth_param() {
+        // The key goes inside `Token="…"` in the Authorization header; a quote, backslash or comma
+        // would end or split that parameter, so such a key is refused at construction.
+        for bad in ["ab\"cd", "ab\\cd", "ab,cd"] {
+            assert!(
+                JellyfinClient::new(
+                    "http://jellyfin:8096".to_string(),
+                    bad.to_string(),
+                    "/media".to_string()
+                )
+                .is_err(),
+                "API key {bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// Loopback that answers every request 200 and records each request's head (request line +
+    /// headers), so a test can check what the client sent.
+    async fn spawn_capturing_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let h2 = heads.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                let head = text
+                    .split("\r\n\r\n")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                h2.lock().unwrap().push(head);
+                let reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = sock.write_all(reply.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{}", addr), heads)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notify_changes_authenticates_with_the_mediabrowser_authorization_header() {
+        // Jellyfin 12 disables the legacy X-Emby-Token header by default; the supported form is
+        // `Authorization: MediaBrowser Token="<key>"` (which Jellyfin 10.x accepts too).
+        let (url, heads) = spawn_capturing_server().await;
+        let client =
+            JellyfinClient::new(url, "test-key".to_string(), "/media".to_string()).unwrap();
+        client.notify_changes(&one_change()).await;
+        let heads = heads.lock().unwrap();
+        assert_eq!(heads.len(), 1, "one notification request");
+        let headers: Vec<(String, String)> = heads[0]
+            .split("\r\n")
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+            .collect();
+        let auth: Vec<&str> = headers
+            .iter()
+            .filter(|(name, _)| name == "authorization")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(
+            auth,
+            vec!["MediaBrowser Token=\"test-key\""],
+            "request head: {}",
+            heads[0]
+        );
+        assert!(
+            !headers.iter().any(|(name, _)| name == "x-emby-token"),
+            "the deprecated X-Emby-Token header must not be sent: {}",
+            heads[0]
+        );
     }
 
     #[test]
@@ -450,36 +575,42 @@ mod tests {
     }
 
     #[test]
-    fn from_env_trims_values_and_treats_blank_as_unset() {
-        // Use uniquely-scoped restore so this test doesn't disturb a real environment if one is set.
-        let restore = |k: &str, v: Option<String>| match v {
-            Some(v) => std::env::set_var(k, v),
-            None => std::env::remove_var(k),
-        };
-        let prev = (
-            std::env::var("JELLYFIN_URL").ok(),
-            std::env::var("JELLYFIN_API_KEY").ok(),
-            std::env::var("JELLYFIN_RCLONE_MOUNT_PATH").ok(),
-        );
+    fn from_values_trims_values_and_treats_blank_as_unset() {
+        // `from_env` delegates to `from_values`, so this covers the env handling without touching
+        // the process environment (which other tests in this binary share).
+        let some = |s: &str| Some(s.to_string());
 
         // Whitespace-padded values must be trimmed (and not build a malformed-URL client).
-        std::env::set_var("JELLYFIN_URL", "  http://jellyfin:8096  ");
-        std::env::set_var("JELLYFIN_API_KEY", "  abc123  ");
-        std::env::set_var("JELLYFIN_RCLONE_MOUNT_PATH", "  /media  ");
-        let client = JellyfinClient::from_env().expect("trimmed config builds a client");
+        let client = JellyfinClient::from_values(
+            some("  http://jellyfin:8096  "),
+            some("  abc123  "),
+            some("  /media  "),
+        )
+        .expect("trimmed config builds a client");
         assert_eq!(client.url, "http://jellyfin:8096");
         assert_eq!(client.mount_path, "/media");
 
-        // A whitespace-only value is treated as unset → None.
-        std::env::set_var("JELLYFIN_URL", "   ");
+        // A whitespace-only or missing value is treated as unset → None.
         assert!(
-            JellyfinClient::from_env().is_none(),
+            JellyfinClient::from_values(some("   "), some("abc123"), some("/media")).is_none(),
             "a whitespace-only JELLYFIN_URL must be treated as unset"
         );
-
-        restore("JELLYFIN_URL", prev.0);
-        restore("JELLYFIN_API_KEY", prev.1);
-        restore("JELLYFIN_RCLONE_MOUNT_PATH", prev.2);
+        assert!(
+            JellyfinClient::from_values(some("http://jellyfin:8096"), some(" "), some("/media"))
+                .is_none(),
+            "a whitespace-only JELLYFIN_API_KEY must be treated as unset"
+        );
+        assert!(
+            JellyfinClient::from_values(some("http://jellyfin:8096"), some("abc123"), None)
+                .is_none(),
+            "an unset JELLYFIN_RCLONE_MOUNT_PATH disables the client"
+        );
+        // An invalid value (here a schemeless URL) disables the client rather than panicking.
+        assert!(
+            JellyfinClient::from_values(some("jellyfin:8096"), some("abc123"), some("/media"))
+                .is_none(),
+            "an invalid JELLYFIN_URL disables the client"
+        );
     }
 
     /// Loopback that replies `fail_status` (empty body) on the first `fail_n` connections, then 200,

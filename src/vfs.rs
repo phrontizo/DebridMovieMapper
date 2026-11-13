@@ -8,36 +8,78 @@ use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Resolved live-selection for `build`: slot key (`store::movie_slot`/`episode_slot`) ->
-/// `SelectionEntry`. An empty map ⇒ no managed selection ⇒ build uses its largest-bytes fallback,
-/// i.e. exactly the pre-SP3 behaviour (external / un-managed torrents are unaffected).
+/// `SelectionEntry`. A slot with no managed selection (or a stale one) gets the pre-SP3 behaviour,
+/// so external / un-managed torrents are unaffected: a movie falls back to its largest streamable
+/// torrent, and an unmanaged show episode keeps every distinct file name, same-named copies
+/// resolving to the largest torrent. A multi-episode file is hidden only when every episode it
+/// carries is selected from another present copy.
 pub type SelectionMap = std::collections::HashMap<String, crate::store::SelectionEntry>;
 
-/// Parse the FIRST SxxExx episode code from a file name (for folder/season placement and the SP3
-/// selection-slot key). Mirrors the primary `SxxExx` match + dash-concatenated "Show - 409 - Title"
-/// → S04E09 fallback of `acquire::parse_se_all`; the multi-episode continuation `acquire::parse_se_all`
-/// adds is deliberately NOT needed here — VFS builds one node per file (a double-episode file is one
-/// `.strm` placed under its first episode's season), so a single representative `(season, episode)`
-/// is exactly right.
-fn parse_se(name: &str) -> Option<(u32, u32)> {
-    // The `SxxExx` arm is deliberately NOT word-anchored (unlike `SEASON_RE`). Its leading
-    // `s\d{1,2}e\d{1,3}` sub-pattern matches `acquire::parse_se_all`'s so the VFS and the acquisition
-    // engine agree on which file supplies which episode; the multi-episode continuation group
-    // `acquire::parse_se_all` appends is intentionally omitted here (see the fn doc — VFS keys off the
-    // FIRST episode only). A literal `e` must immediately follow the digits, so a mid-token match is
-    // very unlikely in practice; the shared leading sub-pattern must be changed in both if tightened.
-    static SE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})e(\d{1,3})").unwrap());
-    if let Some(c) = SE.captures(name) {
-        return Some((
-            c.get(1)?.as_str().parse().ok()?,
-            c.get(2)?.as_str().parse().ok()?,
-        ));
-    }
-    // Exactly 3 digits (season 1–9): excludes 4-digit year/date tokens that would mis-decode (see
-    // `acquire::parse_se_all`). Kept identical to that copy's fallback.
+/// Parse ALL `(season, episode)` pairs a file name declares: a single `SxxEyy`, a contiguous
+/// MULTI-episode file (`S01E01E02`, `S01E01-E02`, `S01E01.E02`), or the dash-concatenated absolute
+/// code (`Show - 409 - Title` → `[(4, 9)]`). Empty when no episode code is found. The first element
+/// is the file's FIRST code (`parse_se`).
+///
+/// The VFS build uses every code for its selection gate (a double-episode file stays visible while
+/// any episode it carries is not served by another copy), and the first one for season placement.
+/// `acquire::parse_se_all` is a copy of this function, used for `provides` and the `selection` slots
+/// `observe` writes; the two must agree on which file supplies which episode, so the acquisition
+/// engine should call this one instead.
+///
+/// The `SxxEyy` arm is deliberately NOT word-anchored (unlike `SEASON_RE`); a literal `e` must
+/// immediately follow the season digits, so a mid-token match is very unlikely in practice. Each
+/// continuation REQUIRES an explicit `e` before its number so a resolution/codec token can't be
+/// mis-parsed as an episode (`S01E01.1080p` → the `.1080` has no `e`, so it is NOT a continuation).
+///
+/// KNOWN LIMITATIONS: a RANGE form spanning more than two episodes (`S01E01-E03`) yields only the
+/// explicit endpoints `[(1,1),(1,3)]`; and a 3-digit dash code is decoded as concatenated `SxxEyy`,
+/// so an absolute (anime) number (`One Piece - 409 - …`) reads as a phantom `(4, 9)`. Exactly 3
+/// digits (season 1–9) are accepted, so a 4-digit year/date token (`Show - 2024 - Title`) never
+/// decodes, and an episode-00 decode is rejected.
+pub(crate) fn parse_se_all(name: &str) -> Vec<(u32, u32)> {
+    static SE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})e(\d{1,3})((?:[-_. ]?e\d{1,3})*)").unwrap());
+    static EP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)e(\d{1,3})").unwrap());
     static DASH_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s-\s(\d{3})\s-\s").unwrap());
-    let code: u32 = DASH_CODE.captures(name)?.get(1)?.as_str().parse().ok()?;
+    if let Some(c) = SE.captures(name) {
+        // The `\d{1,2}`/`\d{1,3}` captures always parse to `u32`, so this always returns when `SE`
+        // matches.
+        if let (Some(s), Some(e1)) = (
+            c.get(1).and_then(|m| m.as_str().parse::<u32>().ok()),
+            c.get(2).and_then(|m| m.as_str().parse::<u32>().ok()),
+        ) {
+            let mut eps = vec![(s, e1)];
+            if let Some(rest) = c.get(3).map(|m| m.as_str()) {
+                for cap in EP.captures_iter(rest) {
+                    if let Some(e) = cap.get(1).and_then(|m| m.as_str().parse::<u32>().ok()) {
+                        if !eps.contains(&(s, e)) {
+                            eps.push((s, e));
+                        }
+                    }
+                }
+            }
+            return eps;
+        }
+    }
+    let Some(code) = DASH_CODE
+        .captures(name)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse::<u32>().ok())
+    else {
+        return Vec::new();
+    };
     let (season, episode) = (code / 100, code % 100);
-    (season >= 1 && episode >= 1).then_some((season, episode))
+    if season >= 1 && episode >= 1 {
+        vec![(season, episode)]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The FIRST episode code in a file name (`parse_se_all`'s first element): the file's season folder
+/// and the slot `episode_of_file` reports.
+fn parse_se(name: &str) -> Option<(u32, u32)> {
+    parse_se_all(name).into_iter().next()
 }
 
 /// The selected video files of `t` the VFS can actually EMIT: a selected video file is emittable
@@ -60,10 +102,47 @@ pub(crate) fn emittable_video_files(t: &TorrentInfo) -> Vec<&crate::rd_client::T
     out
 }
 
-/// The `(season, episode)` slot a file is shown under: the first episode code in its basename,
-/// exactly as the build keys episode selections.
+/// The first episode code in a file's basename: the episode whose season folder the build places
+/// it in. (The build's selection gate checks every code a multi-episode file carries, see
+/// `parse_se_all`.)
 pub(crate) fn episode_of_file(path: &str) -> Option<(u32, u32)> {
     parse_se(path.rsplit('/').next().unwrap_or(path))
+}
+
+/// `true` the first time this process sees `(kind, torrent_id)`. `build` re-runs every scan tick, so
+/// a per-torrent anomaly it reports (an archive-only torrent, a selected-file/link count mismatch)
+/// is logged at warn once and at debug after that, instead of ~1,440 identical warn lines a day.
+fn warn_once(kind: &'static str, torrent_id: &str) -> bool {
+    static WARNED: LazyLock<std::sync::Mutex<std::collections::HashSet<(&'static str, String)>>> =
+        LazyLock::new(Default::default);
+    WARNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert((kind, torrent_id.to_string()))
+}
+
+/// Log the selected-file/link count mismatch of an RD torrent (warn once per torrent, see
+/// `warn_once`). Such a torrent's files without a positional link are skipped.
+fn note_link_count_mismatch(torrent: &TorrentInfo) {
+    let selected_count = torrent.files.iter().filter(|f| f.selected == 1).count();
+    if torrent.links.is_empty() || selected_count == torrent.links.len() {
+        return;
+    }
+    if warn_once("link-count", &torrent.id) {
+        tracing::warn!(
+            "Torrent '{}': selected file count ({}) != link count ({})",
+            torrent.filename,
+            selected_count,
+            torrent.links.len()
+        );
+    } else {
+        tracing::debug!(
+            "Torrent '{}': selected file count ({}) != link count ({})",
+            torrent.filename,
+            selected_count,
+            torrent.links.len()
+        );
+    }
 }
 
 /// Extract the numeric tmdb id from a `MediaMetadata.external_id` like `"tmdb:1396"`.
@@ -317,28 +396,42 @@ impl DebridVfs {
         let mut shows_nodes = BTreeMap::new();
         let mut timestamps: HashMap<String, SystemTime> = HashMap::new();
 
-        // Group torrents by media (using title, year, type, and external ID)
-        let mut media_groups: HashMap<MediaMetadata, Vec<TorrentInfo>> = HashMap::new();
+        // Group torrents by media (`MediaMetadata`'s Eq: the external ID when set, else title + year).
+        // Torrents of one group can still carry different titles (a cached identification next to
+        // an authoritative acquire title, a TMDB rename, a case difference), and the group's
+        // metadata names its folder and NFO. Pick the representative by the smallest (title, year)
+        // rather than the first one listed, so the provider's listing order can't rename the folder
+        // between ticks.
+        let mut media_groups: HashMap<MediaMetadata, (MediaMetadata, Vec<TorrentInfo>)> =
+            HashMap::new();
         for (torrent, metadata) in torrents {
-            media_groups.entry(metadata).or_default().push(torrent);
+            if let Some((rep, group)) = media_groups.get_mut(&metadata) {
+                if (&metadata.title, &metadata.year) < (&rep.title, &rep.year) {
+                    *rep = metadata;
+                }
+                group.push(torrent);
+            } else {
+                media_groups.insert(metadata.clone(), (metadata, vec![torrent]));
+            }
         }
 
         // Sort groups to ensure deterministic naming for conflicts
-        let mut sorted_metadata: Vec<_> = media_groups.keys().cloned().collect();
-        sorted_metadata.sort_by(|a, b| {
+        let mut sorted_groups: Vec<_> = media_groups.into_values().collect();
+        sorted_groups.sort_by(|(a, _), (b, _)| {
             a.title
                 .cmp(&b.title)
                 .then_with(|| a.year.cmp(&b.year))
                 .then_with(|| a.external_id.cmp(&b.external_id))
+                .then_with(|| a.media_type.cmp(&b.media_type))
         });
 
         let mut used_movie_names: HashMap<String, u32> = HashMap::new();
         let mut used_show_names: HashMap<String, u32> = HashMap::new();
 
-        for metadata in sorted_metadata {
-            let mut torrents = media_groups.remove(&metadata).unwrap();
-            // Sort torrents by size descending to pick the best/largest one
-            torrents.sort_by_key(|t| std::cmp::Reverse(t.bytes));
+        for (metadata, mut torrents) in sorted_groups {
+            // Sort torrents by size descending to pick the best/largest one (equal sizes by hash, so
+            // the listing order can't flip which one wins).
+            torrents.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.hash.cmp(&b.hash)));
 
             let base_name = sanitize_filename(&metadata.title);
 
@@ -388,10 +481,11 @@ impl DebridVfs {
                 candidate
             };
 
-            // Warn about archive-only torrents that can't be streamed. This is a purely diagnostic
-            // pass that re-scans every selected file with `is_video_file`/`is_archive_file` (which the
-            // emit path below also does); skip it entirely when warn-level logging is disabled so it
-            // costs nothing then.
+            // Warn (once per torrent, then at debug) about archive-only torrents that can't be
+            // streamed. This is a purely diagnostic pass that re-scans every selected file with
+            // `is_video_file`/`is_archive_file` (which the emit path below also does); skip it
+            // entirely when warn-level logging is disabled so it costs nothing then (debug implies
+            // warn, so the debug repeats are covered by the same check).
             if tracing::enabled!(tracing::Level::WARN) {
                 for torrent in &torrents {
                     let has_video = torrent
@@ -404,11 +498,14 @@ impl DebridVfs {
                             .iter()
                             .any(|f| f.selected == 1 && is_archive_file(&f.path));
                         if has_archive {
-                            tracing::warn!(
-                                "Torrent '{}' contains only archive files (RAR/ZIP) and cannot be streamed — \
-                                 replace it with a non-archive version on your debrid service",
-                                torrent.filename
-                            );
+                            const MSG: &str = "contains only archive files (RAR/ZIP) and cannot \
+                                 be streamed — replace it with a non-archive version on your debrid \
+                                 service";
+                            if warn_once("archive-only", &torrent.id) {
+                                tracing::warn!("Torrent '{}' {MSG}", torrent.filename);
+                            } else {
+                                tracing::debug!("Torrent '{}' {MSG}", torrent.filename);
+                            }
                         }
                     }
                 }
@@ -496,8 +593,8 @@ impl DebridVfs {
                     // present_files would mark a file "present" that the emit loop then refuses to
                     // emit, suppressing every other torrent's copy and vanishing the episode.
                     // Computed BEFORE the loop below moves `torrents`. `present_files` is consulted
-                    // ONLY inside the `if let Some(sel) = selection.get(episode_slot(...))` branch
-                    // below, which can't fire when this show is unidentified (no `show_tmdb`) or the
+                    // ONLY for an episode that has a selection entry (the selection gate below),
+                    // which can't happen when this show is unidentified (no `show_tmdb`) or the
                     // deployment holds no managed selections at all. Skip the build (a per-tick clone
                     // of every selected video file in the group) in those cases — the common
                     // mirror-only / pre-SP3 deployment has an empty `selection`, so this avoids the
@@ -521,16 +618,7 @@ impl DebridVfs {
                         if torrent_ts > show_max_ts {
                             show_max_ts = torrent_ts;
                         }
-                        let selected_count =
-                            torrent.files.iter().filter(|f| f.selected == 1).count();
-                        if !torrent.links.is_empty() && selected_count != torrent.links.len() {
-                            tracing::warn!(
-                                "Torrent '{}': selected file count ({}) != link count ({})",
-                                torrent.filename,
-                                selected_count,
-                                torrent.links.len()
-                            );
-                        }
+                        note_link_count_mismatch(&torrent);
                         let mut link_idx = 0;
                         for file in &torrent.files {
                             if file.selected == 1 {
@@ -539,45 +627,51 @@ impl DebridVfs {
                                     if link.is_some() || torrent.links.is_empty() {
                                         let filename =
                                             file.path.split('/').next_back().unwrap_or(&file.path);
-                                        // Parse the SxxExx / absolute-code once and reuse it for
-                                        // both the selection gate and the season-folder placement
-                                        // below (the regex match is not free).
-                                        let se = parse_se(filename);
-                                        // SP3 selection gate: if this episode has a managed
-                                        // selection, only the selected (hash, file_path) is used;
-                                        // any other torrent's copy of the episode is skipped. With
-                                        // no selection entry, the legacy first/largest-wins dedup
-                                        // below applies unchanged.
-                                        if let (Some(tmdb), Some((se_s, se_e))) = (show_tmdb, se) {
-                                            if let Some(sel) = selection
-                                                .get(&crate::store::episode_slot(tmdb, se_s, se_e))
+                                        // Parse the episode codes once and reuse them for both the
+                                        // selection gate and the season-folder placement below
+                                        // (the regex match is not free).
+                                        let codes = parse_se_all(filename);
+                                        let se = codes.first().copied();
+                                        // SP3 selection gate: a file is skipped only when EVERY
+                                        // episode it carries has a managed selection naming
+                                        // another present (hash, file_path). A multi-episode file
+                                        // (`S01E01E02`) is therefore kept while any one of its
+                                        // slots selects it, or any one of its episodes has no
+                                        // present selection: `observe` writes a slot per episode,
+                                        // so its (1,1) slot can sit on a better singleton while
+                                        // (1,2) selects this file, and hiding the file would lose
+                                        // E02 (a duplicate E01 is the lesser evil). A stale
+                                        // selection (absent hash, or a path that no longer
+                                        // matches) never hides anything: that episode degrades to
+                                        // the legacy first/largest-wins dedup below.
+                                        if let Some(tmdb) = show_tmdb {
+                                            let selected_elsewhere = |&(s, e): &(u32, u32)| {
+                                                selection
+                                                    .get(&crate::store::episode_slot(tmdb, s, e))
+                                                    .is_some_and(|sel| {
+                                                        present_files.contains(&(
+                                                            sel.hash.to_ascii_lowercase(),
+                                                            sel.file_path.clone(),
+                                                        )) && !(torrent
+                                                            .hash
+                                                            .eq_ignore_ascii_case(&sel.hash)
+                                                            && file.path == sel.file_path)
+                                                    })
+                                            };
+                                            if !codes.is_empty()
+                                                && codes.iter().all(selected_elsewhere)
                                             {
-                                                // Enforce the override only when the selected
-                                                // (hash, file_path) is actually present; a stale
-                                                // selection (absent hash, or a path that no longer
-                                                // matches) degrades to the legacy dedup so the
-                                                // episode still appears.
-                                                if present_files.contains(&(
-                                                    sel.hash.to_ascii_lowercase(),
-                                                    sel.file_path.clone(),
-                                                )) {
-                                                    let is_selected = torrent
-                                                        .hash
-                                                        .eq_ignore_ascii_case(&sel.hash)
-                                                        && file.path == sel.file_path;
-                                                    if !is_selected {
-                                                        link_idx += 1;
-                                                        continue;
-                                                    }
-                                                }
+                                                link_idx += 1;
+                                                continue;
                                             }
                                         }
-                                        // Prefer `parse_se` for the folder season: it handles both
-                                        // SxxExx AND the dash-concatenated "Show - 409 - Title"
-                                        // absolute-code form, so such a pack's episodes land in the
-                                        // right Season folder. Fall back to SEASON_RE for the
-                                        // patterns parse_se doesn't cover ("1x09", "Season 4",
-                                        // "Part 2"), then default to season 1.
+                                        // Prefer the FIRST episode code for the folder season: it
+                                        // handles both SxxExx AND the dash-concatenated "Show - 409 -
+                                        // Title" absolute-code form, so such a pack's episodes land
+                                        // in the right Season folder (a double-episode file goes
+                                        // under its first episode's season). Fall back to SEASON_RE
+                                        // for the patterns `parse_se_all` doesn't cover ("1x09",
+                                        // "Season 4", "Part 2"), then default to season 1.
                                         let season = se
                                             .map(|(s, _)| s)
                                             .or_else(|| season_from(filename))
@@ -610,7 +704,7 @@ impl DebridVfs {
                                                 link_idx += 1;
                                                 continue;
                                             }
-                                            let strm_name = Self::add_path_to_tree(
+                                            let file_name = Self::add_path_to_tree(
                                                 season_children,
                                                 filename,
                                                 file.bytes,
@@ -625,7 +719,7 @@ impl DebridVfs {
                                             timestamps.insert(
                                                 format!(
                                                     "{}/{}/{}",
-                                                    show_prefix, season_name, strm_name
+                                                    show_prefix, season_name, file_name
                                                 ),
                                                 torrent_ts,
                                             );
@@ -791,15 +885,7 @@ impl DebridVfs {
     }
 
     fn add_torrent_files(destination: &mut BTreeMap<String, VfsNode>, torrent: &TorrentInfo) {
-        let selected_count = torrent.files.iter().filter(|f| f.selected == 1).count();
-        if !torrent.links.is_empty() && selected_count != torrent.links.len() {
-            tracing::warn!(
-                "Torrent '{}': selected file count ({}) != link count ({})",
-                torrent.filename,
-                selected_count,
-                torrent.links.len()
-            );
-        }
+        note_link_count_mismatch(torrent);
         let mut link_idx = 0;
         for file in &torrent.files {
             if file.selected == 1 {
@@ -975,6 +1061,13 @@ static EXCLUDED_LEADING_METADATA_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// A release-year token. In `is_video_file` a keyword followed by the year (and with none before it)
+/// is part of the title ("The.Extra.Man.2010"), one after the year is a descriptor
+/// ("Movie.2010.Trailer"). A resolution (`1080p`) or codec (`x264`) never matches: the digits run
+/// into a letter, so there is no word boundary.
+static RELEASE_YEAR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:19|20)\d{2}\b").unwrap());
+
 /// An SxxExx episode code marks a real episode — a sample/trailer/extra never carries one — so a
 /// file with one is kept even if its title contains an excluded keyword mid-name (or it is a real
 /// episode mis-foldered under an extras/bonus directory).
@@ -1014,33 +1107,46 @@ pub fn is_video_file(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let filename = lower.rsplit('/').next().unwrap_or(&lower);
     // The filename stem (video extension stripped) — used by the leading-keyword/episode/promo checks.
-    let stem = VIDEO_EXTENSIONS
+    // No video extension means not a video: return before any regex runs (most non-video files —
+    // subtitles, NFOs, images, archives — end here). `.m2ts` is not shadowed by `.ts`:
+    // `"x.m2ts".strip_suffix(".ts")` is `None`.
+    let Some(stem) = VIDEO_EXTENSIONS
         .iter()
         .find_map(|ext| filename.strip_suffix(ext))
-        .unwrap_or(filename);
+    else {
+        return false;
+    };
     let episode = EPISODE_CODE_RE.find(stem);
     // Decide whether an excluded keyword (sample/trailer/extras/…) marks this as an ANCILLARY clip
-    // rather than real content. A genuine ancillary file carries the keyword as a DESCRIPTOR; a real
-    // title carries it as the LEADING token (the show "Extras"/"Trailer Park Boys") or BEFORE the
-    // episode code (e.g. "Some.Trailer.Show.S02E03"). A keyword that appears AFTER the episode code is
-    // a descriptor on an ancillary clip ("Show.S01E01.sample"); so is one with no episode code that
-    // does not lead the title. An episode code alone does NOT rescue a trailing-descriptor sample.
-    let ancillary = match EXCLUDED_VIDEO_RE.find(stem) {
-        None => false,
-        Some(kw) => {
-            // Grant the leading-title exemption only when the keyword truly leads a real title — NOT
-            // when it is immediately followed by a resolution/source tag (a metadata-suffixed clip
-            // like `Trailer.1080p.WEB-DL`, which would otherwise be surfaced as a bogus "movie").
-            if EXCLUDED_LEADING_RE.is_match(stem) && !EXCLUDED_LEADING_METADATA_RE.is_match(stem) {
-                false
-            } else {
-                match &episode {
-                    Some(ep) => kw.start() >= ep.start(),
-                    None => true,
-                }
-            }
-        }
-    };
+    // rather than real content. Every occurrence is judged, and ANY descriptor makes the file
+    // ancillary. An occurrence is a TITLE word when:
+    // - it LEADS the stem as `trailer`/`extras` (the show "Extras"/"Trailer Park Boys", the movie
+    //   "Extras 2020"), unless a resolution/source tag immediately follows it (a metadata-suffixed
+    //   clip like `Trailer.1080p.WEB-DL`, which would otherwise be surfaced as a bogus "movie");
+    // - it comes BEFORE the episode code ("Some.Trailer.Show.S02E03");
+    // - with no episode code, it sits mid-title BEFORE the release year with no year ahead of it
+    //   ("The.Extra.Man.2010.1080p", "The.Bonus.Army.2024") — except `sample`, never a title word.
+    // Anything else is a descriptor: after the episode code ("Show.S01E01.sample" — an episode code
+    // does NOT rescue a trailing-descriptor sample), after the year ("Movie.2010.Trailer"), trailing
+    // with no year ("Movie.Name.Trailer"), or, with no episode code, leading the stem as
+    // `sample`/`bonus`/`featurette` ("sample-<release>").
+    // KNOWN LIMITATIONS: a title that leads with `bonus`/`featurette` ("Bonus.Track.2023") is still
+    // excluded, and a trailer named with the keyword before the year ("Movie.Trailer.2010") is kept.
+    let leading_title =
+        EXCLUDED_LEADING_RE.is_match(stem) && !EXCLUDED_LEADING_METADATA_RE.is_match(stem);
+    let ancillary = EXCLUDED_VIDEO_RE.find_iter(stem).any(|kw| {
+        let title_word = if kw.start() == 0 && leading_title {
+            true
+        } else if let Some(ep) = &episode {
+            kw.start() < ep.start()
+        } else {
+            kw.start() > 0
+                && kw.as_str() != "sample"
+                && RELEASE_YEAR_RE.is_match(&stem[kw.end()..])
+                && !RELEASE_YEAR_RE.is_match(&stem[..kw.start()])
+        };
+        !title_word
+    });
     if ancillary {
         return false;
     }
@@ -1064,7 +1170,7 @@ pub fn is_video_file(path: &str) -> bool {
             }
         }
     }
-    VIDEO_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+    true
 }
 
 /// Collapse `.`/`_`/`-`/space runs in a directory component to single spaces so scene-style names
@@ -1147,21 +1253,23 @@ pub fn diff_trees(old: &VfsNode, new: &VfsNode, prefix: &str) -> Vec<VfsChange> 
     // Track whether any non-directory (leaf) children changed. If so, we
     // report this directory as the change point rather than individual files.
     let mut has_leaf_changes = false;
-
-    for (name, old_child) in old_children {
-        let child_path = if prefix.is_empty() {
-            name.clone()
+    // Built only for the directory branches that use it (not per leaf).
+    let child_path_of = |name: &str| {
+        if prefix.is_empty() {
+            name.to_string()
         } else {
             format!("{}/{}", prefix, name)
-        };
+        }
+    };
 
+    for (name, old_child) in old_children {
         match new_children.get(name) {
             None => {
                 match old_child {
                     VfsNode::Directory { .. } => {
                         // A child directory was removed — report it as deleted
                         changes.push(VfsChange {
-                            path: child_path,
+                            path: child_path_of(name),
                             update_type: UpdateType::Deleted,
                         });
                     }
@@ -1174,18 +1282,11 @@ pub fn diff_trees(old: &VfsNode, new: &VfsNode, prefix: &str) -> Vec<VfsChange> 
             Some(new_child) => {
                 match (old_child, new_child) {
                     (VfsNode::Directory { .. }, VfsNode::Directory { .. }) => {
-                        // Both directories — recurse
-                        let sub = diff_trees(old_child, new_child, &child_path);
-                        if sub.is_empty() && old_child != new_child {
-                            // Children differ but recursion found no deeper change point
-                            // — this directory itself is the change point
-                            changes.push(VfsChange {
-                                path: child_path,
-                                update_type: UpdateType::Modified,
-                            });
-                        } else {
-                            changes.extend(sub);
-                        }
+                        // Both directories — recurse. Two differing directories always yield at
+                        // least one change at or below `child_path` (a removed/added subdirectory
+                        // or a leaf difference reported against `child_path`), so the result needs
+                        // no extra deep comparison.
+                        changes.extend(diff_trees(old_child, new_child, &child_path_of(name)));
                     }
                     (a, b) if a != b => {
                         // Leaf node changed — flag for parent-level reporting
@@ -1202,16 +1303,10 @@ pub fn diff_trees(old: &VfsNode, new: &VfsNode, prefix: &str) -> Vec<VfsChange> 
     // Check for new children
     for (name, new_child) in new_children {
         if !old_children.contains_key(name) {
-            let child_path = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{}/{}", prefix, name)
-            };
-
             match new_child {
                 VfsNode::Directory { children } => {
                     // A new child directory — report the deepest new directory
-                    let deepest = find_deepest_new_dir(&child_path, children);
+                    let deepest = find_deepest_new_dir(&child_path_of(name), children);
                     changes.push(VfsChange {
                         path: deepest,
                         update_type: UpdateType::Created,
@@ -2182,6 +2277,60 @@ mod tests {
     }
 
     #[test]
+    fn same_tmdb_id_group_names_its_folder_independently_of_input_order() {
+        // Two torrents share a TMDB id but carry different titles (e.g. a cached identification and
+        // an authoritative acquire title). The folder name and NFO title must not depend on which
+        // one the provider listing happens to put first, or the folder is renamed between ticks.
+        let torrent = |id: &str, path: &str| TorrentInfo {
+            id: id.to_string(),
+            hash: format!("h{id}"),
+            bytes: 1000,
+            status: "downloaded".to_string(),
+            added: "2024-01-01".to_string(),
+            files: vec![TorrentFile {
+                id: 1,
+                path: path.to_string(),
+                bytes: 1000,
+                selected: 1,
+            }],
+            ..Default::default()
+        };
+        let meta = |title: &str| MediaMetadata {
+            title: title.to_string(),
+            year: Some("2024".to_string()),
+            media_type: MediaType::Show,
+            external_id: Some("tmdb:4242".to_string()),
+        };
+        let a = (torrent("1", "Foo.S01E01.mkv"), meta("Foo"));
+        let b = (torrent("2", "Foo.Bar.S01E02.mkv"), meta("Foo Bar"));
+
+        let shows_of = |vfs: &DebridVfs| -> BTreeMap<String, VfsNode> {
+            let VfsNode::Directory { children } = &vfs.root else {
+                panic!("root is a directory");
+            };
+            let Some(VfsNode::Directory { children: shows }) = children.get("Shows") else {
+                panic!("Shows is a directory");
+            };
+            shows.clone()
+        };
+        let forward = shows_of(&DebridVfs::build(
+            vec![a.clone(), b.clone()],
+            &SelectionMap::new(),
+        ));
+        let reverse = shows_of(&DebridVfs::build(vec![b, a], &SelectionMap::new()));
+        assert_eq!(
+            forward.len(),
+            1,
+            "one folder per TMDB id: {:?}",
+            forward.keys()
+        );
+        assert_eq!(
+            forward, reverse,
+            "folder name, episodes and tvshow.nfo must be identical in either input order"
+        );
+    }
+
+    #[test]
     fn test_nfo_escapes_special_xml_characters() {
         let metadata = MediaMetadata {
             title: "Test & <Movie>".to_string(),
@@ -2407,8 +2556,9 @@ mod tests {
 
     #[test]
     fn is_video_file_no_false_positive_on_bonus_substring() {
-        // "The.Bonus.Army.2024" has "Bonus" as a word, so it WOULD be filtered.
-        // But a movie like "Bonusville" should not be filtered.
+        // "Bonus" inside a longer word is not the keyword (for "The.Bonus.Army.2024", where it is a
+        // whole title word before the year, see
+        // `is_video_file_keeps_a_title_word_keyword_before_the_release_year`).
         assert!(is_video_file("Bonusville.2024.mkv"));
     }
 
@@ -2472,10 +2622,60 @@ mod tests {
     }
 
     #[test]
+    fn is_video_file_keeps_a_title_word_keyword_before_the_release_year() {
+        // A keyword mid-title, before the release year, is part of the title ("The Extra Man",
+        // 2010), not a descriptor. Excluding it hid the film and made every acquisition candidate
+        // look file-less, so each was reaped and blacklisted.
+        assert!(is_video_file("The.Extra.Man.2010.1080p.BluRay.x264.mkv"));
+        assert!(is_video_file("The.Bonus.Army.2024.mkv"));
+        // A descriptor after the year, a trailing keyword with no year, a `sample` anywhere, and a
+        // second, trailing descriptor on such a title are all still excluded.
+        assert!(!is_video_file("The.Extra.Man.2010.1080p.sample.mkv"));
+        assert!(!is_video_file("sample-the.extra.man.2010.1080p.mkv"));
+        assert!(!is_video_file("Movie.Name.2010.Trailer.mkv"));
+        assert!(!is_video_file("Movie.Name.Trailer.mkv"));
+        assert!(!is_video_file("Movie.Name.Extras.mkv"));
+        assert!(!is_video_file("Movie.2010.1080p-sample.mkv"));
+        // A sample of a show whose title leads with a keyword is a sample, not an episode.
+        assert!(!is_video_file("Extras.S01E01.sample.mkv"));
+    }
+
+    #[test]
     fn is_video_file_rejects_non_video_extensions() {
         assert!(!is_video_file("movie.srt"));
         assert!(!is_video_file("movie.nfo"));
         assert!(!is_video_file("movie.txt"));
+        assert!(!is_video_file("movie.mkv.part"));
+        // `.m2ts` is stripped as a whole (`.ts` does not match `x.m2ts`), so the promo check sees
+        // the bare stem.
+        assert!(!is_video_file("RARBG.m2ts"));
+        assert!(is_video_file("Movie.2010.m2ts"));
+    }
+
+    #[test]
+    fn warn_once_is_true_only_the_first_time_a_kind_and_torrent_are_seen() {
+        assert!(warn_once("test-kind", "warn-once-id-x"));
+        assert!(!warn_once("test-kind", "warn-once-id-x"));
+        assert!(warn_once("test-kind", "warn-once-id-y"), "another torrent");
+        assert!(
+            warn_once("test-other-kind", "warn-once-id-x"),
+            "another kind"
+        );
+    }
+
+    #[test]
+    fn parse_se_all_reads_every_episode_code_and_parse_se_the_first() {
+        assert_eq!(parse_se_all("Show.S04E09.1080p.mkv"), vec![(4, 9)]);
+        assert_eq!(parse_se_all("Show.S01E01E02.mkv"), vec![(1, 1), (1, 2)]);
+        assert_eq!(parse_se_all("Show.S01E01-E02.mkv"), vec![(1, 1), (1, 2)]);
+        assert_eq!(parse_se_all("Show.S01E01.1080p.x265.mkv"), vec![(1, 1)]);
+        assert_eq!(parse_se_all("Show - 409 - Title.mkv"), vec![(4, 9)]);
+        assert!(parse_se_all("Show - 2024 - Title.mkv").is_empty());
+        assert!(parse_se_all("Show - 400 - Title.mkv").is_empty());
+        assert!(parse_se_all("Movie.2009.1080p.BluRay.mkv").is_empty());
+        assert_eq!(parse_se("Show.S01E01E02.mkv"), Some((1, 1)));
+        assert_eq!(parse_se("Show - 409 - Title.mkv"), Some((4, 9)));
+        assert_eq!(parse_se("Movie.2009.mkv"), None);
     }
 
     #[test]
@@ -4230,6 +4430,149 @@ mod selection_tests {
         assert_eq!(
             media_count, 2,
             "S01E02 must be self-healed to the emittable copy, not vanished (got {media_count})"
+        );
+    }
+
+    /// A TorBox-style (link-less) show torrent whose selected files are all videos.
+    fn show_torrent(id: &str, hash: &str, bytes: u64, paths: &[&str]) -> TorrentInfo {
+        TorrentInfo {
+            id: id.into(),
+            hash: hash.into(),
+            bytes,
+            status: "downloaded".into(),
+            files: paths
+                .iter()
+                .enumerate()
+                .map(|(i, p)| TorrentFile {
+                    id: i as u32,
+                    path: (*p).into(),
+                    bytes: bytes / paths.len() as u64,
+                    selected: 1,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The sorted media-file names under `Shows/<the only show>/<season>`.
+    fn season_file_names(vfs: &DebridVfs, season: &str) -> Vec<String> {
+        let VfsNode::Directory { children } = &vfs.root else {
+            panic!("root is a directory");
+        };
+        let Some(VfsNode::Directory { children: shows }) = children.get("Shows") else {
+            panic!("Shows is a directory");
+        };
+        let mut names: Vec<String> = shows
+            .values()
+            .filter_map(|show| match show {
+                VfsNode::Directory { children: seasons } => seasons.get(season),
+                _ => None,
+            })
+            .flat_map(|s| match s {
+                VfsNode::Directory { children: eps } => eps
+                    .iter()
+                    .filter(|(_, n)| matches!(n, VfsNode::MediaFile { .. }))
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn sel_entry(hash: &str, file_path: &str) -> SelectionEntry {
+        SelectionEntry {
+            hash: hash.into(),
+            file_path: file_path.into(),
+        }
+    }
+
+    #[test]
+    fn multi_episode_file_selected_for_its_second_episode_stays_visible() {
+        // Pack B holds a double-episode file; a better singleton C holds S01E01. `observe` keeps the
+        // (1,1) slot on C and gives the empty (1,2) slot to B's double file. The double file is keyed
+        // by its FIRST code, (1,1), whose selection names C, so it used to be hidden, and with it the
+        // only copy of E02. A file some slot selects must be emitted.
+        let b = show_torrent(
+            "tb",
+            "h_b",
+            4_000_000_000,
+            &["Show.S01E01E02.mkv", "Show.S01E03.mkv"],
+        );
+        let c = show_torrent("tc", "h_c", 1_000_000_000, &["Show.S01E01.mkv"]);
+        let mut sel = SelectionMap::new();
+        sel.insert(
+            episode_slot(1396, 1, 1),
+            sel_entry("h_c", "Show.S01E01.mkv"),
+        );
+        sel.insert(
+            episode_slot(1396, 1, 2),
+            sel_entry("h_b", "Show.S01E01E02.mkv"),
+        );
+        let vfs = DebridVfs::build(vec![(b, show_meta(1396)), (c, show_meta(1396))], &sel);
+        assert_eq!(
+            season_file_names(&vfs, "Season 01"),
+            vec!["Show.S01E01.mkv", "Show.S01E01E02.mkv", "Show.S01E03.mkv"],
+            "E02's only copy (the double file its slot selects) must not vanish"
+        );
+    }
+
+    #[test]
+    fn multi_episode_file_with_an_unselected_second_episode_stays_visible() {
+        // An unmanaged (mirror) pack: nothing selects (1,2), and (1,1) selects another copy. The
+        // double file is the only copy of E02, so it falls back to the legacy dedup and is emitted.
+        let b = show_torrent(
+            "tb",
+            "h_b",
+            4_000_000_000,
+            &["Show.S01E01E02.mkv", "Show.S01E03.mkv"],
+        );
+        let c = show_torrent("tc", "h_c", 1_000_000_000, &["Show.S01E01.mkv"]);
+        let mut sel = SelectionMap::new();
+        sel.insert(
+            episode_slot(1396, 1, 1),
+            sel_entry("h_c", "Show.S01E01.mkv"),
+        );
+        let vfs = DebridVfs::build(vec![(b, show_meta(1396)), (c, show_meta(1396))], &sel);
+        assert_eq!(
+            season_file_names(&vfs, "Season 01"),
+            vec!["Show.S01E01.mkv", "Show.S01E01E02.mkv", "Show.S01E03.mkv"],
+        );
+    }
+
+    #[test]
+    fn multi_episode_file_selected_elsewhere_for_every_episode_is_suppressed() {
+        // Both episodes the double file carries are selected from other present copies, so it adds
+        // nothing and stays hidden (no duplicates).
+        let b = show_torrent(
+            "tb",
+            "h_b",
+            4_000_000_000,
+            &["Show.S01E01E02.mkv", "Show.S01E03.mkv"],
+        );
+        let c = show_torrent("tc", "h_c", 1_000_000_000, &["Show.S01E01.mkv"]);
+        let d = show_torrent("td", "h_d", 1_000_000_000, &["Show.S01E02.mkv"]);
+        let mut sel = SelectionMap::new();
+        sel.insert(
+            episode_slot(1396, 1, 1),
+            sel_entry("h_c", "Show.S01E01.mkv"),
+        );
+        sel.insert(
+            episode_slot(1396, 1, 2),
+            sel_entry("h_d", "Show.S01E02.mkv"),
+        );
+        let vfs = DebridVfs::build(
+            vec![
+                (b, show_meta(1396)),
+                (c, show_meta(1396)),
+                (d, show_meta(1396)),
+            ],
+            &sel,
+        );
+        assert_eq!(
+            season_file_names(&vfs, "Season 01"),
+            vec!["Show.S01E01.mkv", "Show.S01E02.mkv", "Show.S01E03.mkv"],
         );
     }
 

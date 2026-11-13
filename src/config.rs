@@ -5,9 +5,8 @@ use tracing::warn;
 /// Default WebDAV listen port. Single source for `resolve_port` AND the `from_parts` fall-back warn
 /// so the applied value and the logged value can never drift.
 pub const DEFAULT_PORT: u16 = 8080;
-/// Defaults + floors for the acquisition/scan numeric knobs. Referenced by BOTH the applied value and
-/// the "falling back to N" warning at each parse site (in `from_parts`/`parse_dead_timeout`), so a
-/// change to a default can't leave a stale literal in the operator-facing log message.
+/// Defaults + floors for the acquisition/scan numeric knobs, passed to [`parse_num`], which uses the
+/// default both as the applied value and in its "falling back to N" warning.
 const DEFAULT_SCAN_INTERVAL_SECS: u64 = 60;
 const MIN_SCAN_INTERVAL_SECS: u64 = 10;
 const DEFAULT_STALL_TIMEOUT_SECS: u64 = 1800;
@@ -34,6 +33,25 @@ pub fn resolve_port(raw: Option<&str>) -> (u16, bool) {
         },
         None => (DEFAULT_PORT, false),
     }
+}
+
+/// Parse a numeric env knob. Unset or blank → `default`; a value that doesn't parse as `T` warns
+/// (`Invalid NAME value '…', falling back to N`) and falls back to `default`; the result, the
+/// default included, is then clamped to `[min, max]` (`max: None` = no upper bound), so lowering a
+/// default below its floor can't skip the clamp.
+fn parse_num<T>(raw: Option<String>, name: &str, default: T, min: T, max: Option<T>) -> T
+where
+    T: std::str::FromStr + Ord + Copy + std::fmt::Display,
+{
+    let v = match raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(s) => s.parse::<T>().unwrap_or_else(|_| {
+            warn!("Invalid {name} value '{s}', falling back to {default}");
+            default
+        }),
+        None => default,
+    };
+    let v = v.max(min);
+    max.map_or(v, |m| v.min(m))
 }
 
 /// Hard resolution ceiling. Compare via `height()` (pixel height), not by variant order.
@@ -181,7 +199,7 @@ impl QualityPrefs {
     /// only then be rejected at probe time — burning an acquire cycle. Resolving here makes
     /// acquisition ranking down-rank it up front, exactly as `probe::verify` rejects it (which
     /// resolves `Original` the same way). Accepting the spoken languages too means a title whose TMDB
-    /// original language isn't its main audio (Nightborn: `fi` original, mostly English) doesn't
+    /// original language isn't its main audio (e.g. a `fi`-original film whose dialogue is mostly English) doesn't
     /// down-rank every correctly-tagged release. No known language, or an explicit `Lang`, is left
     /// unchanged.
     pub fn with_resolved_audio(
@@ -219,6 +237,11 @@ pub struct TraktConfig {
     /// (the default) — every show you've ever watched with unwatched aired episodes qualifies.
     /// Parsed from `TRAKT_CATCHUP_LOOKBACK` (e.g. `90d`, `12w`, `6mo`; `0`/unset = all-time).
     pub catchup_lookback_secs: Option<u64>,
+    /// Extra hostnames the `/trakt` enrolment routes answer for, on top of the built-in
+    /// local-network names (IP literals, `localhost`, single-label names, `.local`/`.lan`/
+    /// `.internal`/`.home.arpa`) — e.g. a reverse proxy's FQDN. Lowercase, no port. Parsed from
+    /// `TRAKT_ENROL_ALLOWED_HOSTS` (comma-separated); empty by default.
+    pub enrol_allowed_hosts: Vec<String>,
 }
 
 // Manual Debug redacts `client_secret` so a `debug!("{config:?}")` (or a panic message) can never
@@ -234,6 +257,7 @@ impl std::fmt::Debug for TraktConfig {
                 &self.episode_check_interval_secs,
             )
             .field("catchup_lookback_secs", &self.catchup_lookback_secs)
+            .field("enrol_allowed_hosts", &self.enrol_allowed_hosts)
             .finish()
     }
 }
@@ -265,6 +289,39 @@ pub fn parse_lookback(raw: &str) -> Option<u64> {
     }
 }
 
+/// Parse `TRAKT_ENROL_ALLOWED_HOSTS`: comma-separated hostnames, each trimmed, lowercased and stripped
+/// of a trailing root dot; blank entries are skipped. An entry that isn't a bare hostname (a URL, a
+/// port, a path, a space) could never equal a request's hostname, so it is warned about and dropped.
+pub fn parse_allowed_hosts(raw: Option<String>) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in raw.split(',') {
+        let host = entry.trim().to_ascii_lowercase();
+        let host = host.strip_suffix('.').unwrap_or(&host);
+        if host.is_empty() {
+            continue;
+        }
+        let valid = host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+        if valid {
+            out.push(host.to_string());
+        } else {
+            warn!(
+                "Ignoring TRAKT_ENROL_ALLOWED_HOSTS entry '{}': expected a bare hostname \
+                 (no scheme, port or path)",
+                entry.trim()
+            );
+        }
+    }
+    out
+}
+
 impl TraktConfig {
     /// Pure construction from raw optional values (env-independent, for tests).
     ///
@@ -276,6 +333,7 @@ impl TraktConfig {
         sync_interval_secs: Option<String>,
         episode_check_interval_secs: Option<String>,
         catchup_lookback: Option<String>,
+        enrol_allowed_hosts: Option<String>,
     ) -> Option<TraktConfig> {
         let client_id = client_id
             .map(|s| s.trim().to_string())
@@ -289,35 +347,20 @@ impl TraktConfig {
         const DEFAULT_EPISODE: u64 = 3600;
         const MIN_EPISODE: u64 = 300;
 
-        let sync_interval_secs = match sync_interval_secs
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
-                warn!(
-                    "Invalid TRAKT_SYNC_INTERVAL_SECS value '{}', falling back to {}",
-                    s, DEFAULT_SYNC
-                );
-                DEFAULT_SYNC
-            }),
-            None => DEFAULT_SYNC,
-        }
-        .max(MIN_SYNC);
-
-        let episode_check_interval_secs = match episode_check_interval_secs
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
-                warn!(
-                    "Invalid TRAKT_EPISODE_CHECK_INTERVAL_SECS value '{}', falling back to {}",
-                    s, DEFAULT_EPISODE
-                );
-                DEFAULT_EPISODE
-            }),
-            None => DEFAULT_EPISODE,
-        }
-        .max(MIN_EPISODE);
+        let sync_interval_secs = parse_num(
+            sync_interval_secs,
+            "TRAKT_SYNC_INTERVAL_SECS",
+            DEFAULT_SYNC,
+            MIN_SYNC,
+            None,
+        );
+        let episode_check_interval_secs = parse_num(
+            episode_check_interval_secs,
+            "TRAKT_EPISODE_CHECK_INTERVAL_SECS",
+            DEFAULT_EPISODE,
+            MIN_EPISODE,
+            None,
+        );
 
         let catchup_lookback_secs = catchup_lookback.as_deref().and_then(parse_lookback);
 
@@ -327,12 +370,13 @@ impl TraktConfig {
             sync_interval_secs,
             episode_check_interval_secs,
             catchup_lookback_secs,
+            enrol_allowed_hosts: parse_allowed_hosts(enrol_allowed_hosts),
         })
     }
 
     /// Read `TRAKT_CLIENT_ID`, `TRAKT_CLIENT_SECRET`, `TRAKT_SYNC_INTERVAL_SECS`,
-    /// `TRAKT_EPISODE_CHECK_INTERVAL_SECS`, and `TRAKT_CATCHUP_LOOKBACK` from the process
-    /// environment, then delegate to `from_parts`.
+    /// `TRAKT_EPISODE_CHECK_INTERVAL_SECS`, `TRAKT_CATCHUP_LOOKBACK` and
+    /// `TRAKT_ENROL_ALLOWED_HOSTS` from the process environment, then delegate to `from_parts`.
     pub fn from_env() -> Option<TraktConfig> {
         Self::from_parts(
             std::env::var("TRAKT_CLIENT_ID").ok(),
@@ -340,6 +384,7 @@ impl TraktConfig {
             std::env::var("TRAKT_SYNC_INTERVAL_SECS").ok(),
             std::env::var("TRAKT_EPISODE_CHECK_INTERVAL_SECS").ok(),
             std::env::var("TRAKT_CATCHUP_LOOKBACK").ok(),
+            std::env::var("TRAKT_ENROL_ALLOWED_HOSTS").ok(),
         )
     }
 }
@@ -442,36 +487,20 @@ impl AcquisitionConfig {
             // Clamp to a sane floor: STALL_TIMEOUT_SECS=0 would declare every Pending torrent
             // stalled instantly, and MAX_ACQUIRE_ATTEMPTS=0 would make the engine never retry —
             // both footguns, consistent with the other interval knobs which all clamp.
-            stall_timeout_secs: match stall_timeout_secs
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-            {
-                Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
-                    warn!(
-                        "Invalid STALL_TIMEOUT_SECS value '{}', falling back to {}",
-                        s, DEFAULT_STALL_TIMEOUT_SECS
-                    );
-                    DEFAULT_STALL_TIMEOUT_SECS
-                }),
-                None => DEFAULT_STALL_TIMEOUT_SECS,
-            }
-            // Clamp the WHOLE match (parsed and default arms alike), so lowering the default below
-            // the floor can't silently skip the clamp — matching `scan_interval_secs`.
-            .max(MIN_STALL_TIMEOUT_SECS),
-            max_acquire_attempts: match max_acquire_attempts
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-            {
-                Some(s) => s.parse::<u32>().unwrap_or_else(|_| {
-                    warn!(
-                        "Invalid MAX_ACQUIRE_ATTEMPTS value '{}', falling back to {}",
-                        s, DEFAULT_MAX_ACQUIRE_ATTEMPTS
-                    );
-                    DEFAULT_MAX_ACQUIRE_ATTEMPTS
-                }),
-                None => DEFAULT_MAX_ACQUIRE_ATTEMPTS,
-            }
-            .max(MIN_MAX_ACQUIRE_ATTEMPTS),
+            stall_timeout_secs: parse_num(
+                stall_timeout_secs,
+                "STALL_TIMEOUT_SECS",
+                DEFAULT_STALL_TIMEOUT_SECS,
+                MIN_STALL_TIMEOUT_SECS,
+                None,
+            ),
+            max_acquire_attempts: parse_num(
+                max_acquire_attempts,
+                "MAX_ACQUIRE_ATTEMPTS",
+                DEFAULT_MAX_ACQUIRE_ATTEMPTS,
+                MIN_MAX_ACQUIRE_ATTEMPTS,
+                None,
+            ),
             scraper_addon_url: None,
             scraper_proxy_url: None,
             acquire_dead_timeout_secs: DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS,
@@ -508,35 +537,26 @@ impl AcquisitionConfig {
     /// 1000, and any value is clamped to 100–60000 (the limiter needs a non-zero interval to back off
     /// from, and over a minute per scrape would stall acquisition). Pure for unit-testability.
     fn parse_scraper_min_interval(raw: Option<String>) -> u64 {
-        match raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-            Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
-                warn!(
-                    "Invalid SCRAPER_MIN_INTERVAL_MS value '{}', falling back to {}",
-                    s, DEFAULT_SCRAPER_MIN_INTERVAL_MS
-                );
-                DEFAULT_SCRAPER_MIN_INTERVAL_MS
-            }),
-            None => DEFAULT_SCRAPER_MIN_INTERVAL_MS,
-        }
-        .clamp(MIN_SCRAPER_MIN_INTERVAL_MS, MAX_SCRAPER_MIN_INTERVAL_MS)
+        parse_num(
+            raw,
+            "SCRAPER_MIN_INTERVAL_MS",
+            DEFAULT_SCRAPER_MIN_INTERVAL_MS,
+            MIN_SCRAPER_MIN_INTERVAL_MS,
+            Some(MAX_SCRAPER_MIN_INTERVAL_MS),
+        )
     }
 
     /// Parse `ACQUIRE_DEAD_TIMEOUT_SECS`: unset/blank → 600, an unparseable value warns + falls back
     /// to 600 (matching the other interval knobs — a typo like `10m` must be visible, not silently
     /// treated as unset), and any value is clamped up to the 120s floor. Pure for unit-testability.
     fn parse_dead_timeout(raw: Option<String>) -> u64 {
-        match raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-            Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
-                warn!(
-                    "Invalid ACQUIRE_DEAD_TIMEOUT_SECS value '{}', falling back to {}",
-                    s, DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS
-                );
-                DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS
-            }),
-            None => DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS,
-        }
-        // Clamp the WHOLE match (parsed and default arms alike) — see `scan_interval_secs`.
-        .max(MIN_ACQUIRE_DEAD_TIMEOUT_SECS)
+        parse_num(
+            raw,
+            "ACQUIRE_DEAD_TIMEOUT_SECS",
+            DEFAULT_ACQUIRE_DEAD_TIMEOUT_SECS,
+            MIN_ACQUIRE_DEAD_TIMEOUT_SECS,
+            None,
+        )
     }
 }
 
@@ -549,12 +569,11 @@ pub struct UpgradeConfig {
     /// owned title, every pass.
     pub budget_per_tick: Option<u32>,
     pub idle_secs: u64,
-    pub stage_max_secs: u64,
 }
 
 impl Default for UpgradeConfig {
     fn default() -> Self {
-        Self::from_parts(None, None, None, None)
+        Self::from_parts(None, None, None)
     }
 }
 
@@ -570,48 +589,27 @@ impl UpgradeConfig {
         interval_secs: Option<String>,
         budget_per_tick: Option<String>,
         idle_secs: Option<String>,
-        stage_max_secs: Option<String>,
     ) -> Self {
-        fn num(v: Option<String>, default: u64, min: u64, zero_disables: bool, name: &str) -> u64 {
-            // Treat unset OR blank as "use the default" (consistent with how blank string knobs are
-            // treated as unset) — only a non-blank unparseable value warns.
-            match v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-                Some(s) => match s.parse::<u64>() {
-                    Ok(0) if zero_disables => 0,
-                    Ok(n) => n.max(min),
-                    Err(_) => {
-                        warn!(
-                            "Invalid {} value '{}', falling back to {}",
-                            name, s, default
-                        );
-                        default
-                    }
-                },
-                None => default,
-            }
-        }
+        // No floor in the parse itself: 0 must get through it to mean "disabled".
+        let interval_secs = match parse_num(interval_secs, "UPGRADE_INTERVAL_SECS", 86_400, 0, None)
+        {
+            0 => 0,
+            n => n.max(600),
+        };
         UpgradeConfig {
-            interval_secs: num(interval_secs, 86_400, 600, true, "UPGRADE_INTERVAL_SECS"),
+            interval_secs,
             budget_per_tick: parse_upgrade_budget(budget_per_tick),
-            idle_secs: num(idle_secs, 300, 30, false, "UPGRADE_IDLE_SECS"),
-            stage_max_secs: num(
-                stage_max_secs,
-                604_800,
-                3600,
-                false,
-                "UPGRADE_STAGE_MAX_SECS",
-            ),
+            idle_secs: parse_num(idle_secs, "UPGRADE_IDLE_SECS", 300, 30, None),
         }
     }
 
-    /// Read `UPGRADE_INTERVAL_SECS`, `UPGRADE_BUDGET_PER_TICK`, `UPGRADE_IDLE_SECS`,
-    /// and `UPGRADE_STAGE_MAX_SECS` from the process environment, then delegate to `from_parts`.
+    /// Read `UPGRADE_INTERVAL_SECS`, `UPGRADE_BUDGET_PER_TICK` and `UPGRADE_IDLE_SECS` from the
+    /// process environment, then delegate to `from_parts`.
     pub fn from_env() -> Self {
         Self::from_parts(
             std::env::var("UPGRADE_INTERVAL_SECS").ok(),
             std::env::var("UPGRADE_BUDGET_PER_TICK").ok(),
             std::env::var("UPGRADE_IDLE_SECS").ok(),
-            std::env::var("UPGRADE_STAGE_MAX_SECS").ok(),
         )
     }
 }
@@ -694,17 +692,13 @@ const _: () = assert!(
 /// Parse `CDN_FIRST_READ_MB` (whole MB) into a byte count, clamped to [2, 16] MB. Unset/blank/invalid
 /// → the 8 MB default. Standalone + pure so the parse/clamp is unit-testable without the environment.
 fn parse_cdn_first_read_bytes(raw: Option<String>) -> u64 {
-    let mb = match raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-        Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
-            warn!(
-                "Invalid CDN_FIRST_READ_MB value '{}', falling back to {}",
-                s, CDN_FIRST_READ_MB_DEFAULT
-            );
-            CDN_FIRST_READ_MB_DEFAULT
-        }),
-        None => CDN_FIRST_READ_MB_DEFAULT,
-    }
-    .clamp(CDN_FIRST_READ_MB_MIN, CDN_FIRST_READ_MB_MAX);
+    let mb = parse_num(
+        raw,
+        "CDN_FIRST_READ_MB",
+        CDN_FIRST_READ_MB_DEFAULT,
+        CDN_FIRST_READ_MB_MIN,
+        Some(CDN_FIRST_READ_MB_MAX),
+    );
     mb * 1024 * 1024
 }
 
@@ -787,21 +781,14 @@ impl Config {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| AppError::Config("TMDB_API_KEY must be set".to_string()))?;
 
-        // Treat unset OR blank as the default (consistent with `db_path` below and the string knobs).
-        let scan_interval_secs = match scan_interval_secs
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            Some(s) => s.parse::<u64>().unwrap_or_else(|_| {
-                warn!(
-                    "Invalid SCAN_INTERVAL_SECS value '{}', falling back to {}",
-                    s, DEFAULT_SCAN_INTERVAL_SECS
-                );
-                DEFAULT_SCAN_INTERVAL_SECS
-            }),
-            None => DEFAULT_SCAN_INTERVAL_SECS,
-        }
-        .max(MIN_SCAN_INTERVAL_SECS); // Enforce a floor to avoid hammering the provider API.
+        // The floor keeps a tiny interval from hammering the provider API.
+        let scan_interval_secs = parse_num(
+            scan_interval_secs,
+            "SCAN_INTERVAL_SECS",
+            DEFAULT_SCAN_INTERVAL_SECS,
+            MIN_SCAN_INTERVAL_SECS,
+            None,
+        );
 
         // Trim + treat blank as unset (consistent with the other env knobs — a quoted/whitespace
         // `DB_PATH` from compose YAML, or an empty `DB_PATH=`, falls back to the default rather than
@@ -916,6 +903,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         c.acquisition.scraper_proxy_url = Some("http://user:SECRETpw@proxy:8080".into());
         // A custom Torrentio addon URL embeds the debrid token (`realdebrid=<TOKEN>`), so it too
@@ -944,6 +932,7 @@ mod tests {
         // Non-secret fields are still printed.
         assert!(dbg.contains("RealDebrid"));
         assert!(dbg.contains("trakt-client-id"));
+        assert!(dbg.contains("cdn_first_read_bytes"));
     }
 
     #[test]
@@ -1250,7 +1239,7 @@ mod tests {
             prefer_hdr: false,
         };
         let spoken = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // Nightborn: original `fi`, spoken [en, fi, es] → any of them, original first, de-duplicated.
+        // A `fi`-original film, spoken [en, fi, es] → any of them, original first, de-duplicated.
         assert_eq!(
             base.with_resolved_audio(Some("fi"), &spoken(&["en", "fi", "es"]))
                 .audio,
@@ -1356,6 +1345,7 @@ mod tests {
             sync.map(String::from),
             episode.map(String::from),
             None, // catchup lookback: covered by its own tests
+            None, // enrol allowed hosts: covered by its own tests
         )
     }
 
@@ -1387,12 +1377,51 @@ mod tests {
             None,
             None,
             Some("6mo".into()),
+            None,
         )
         .unwrap();
         assert_eq!(t.catchup_lookback_secs, Some(6 * 30 * 86_400));
         // unset → all-time (None)
         let t2 = trakt(Some("id"), Some("sec"), None, None).unwrap();
         assert_eq!(t2.catchup_lookback_secs, None);
+    }
+
+    #[test]
+    fn trakt_enrol_allowed_hosts_parsed_into_config() {
+        let t = TraktConfig::from_parts(
+            Some("id".into()),
+            Some("sec".into()),
+            None,
+            None,
+            None,
+            Some(" Media.Example.com , ,proxy.example.org. ".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            t.enrol_allowed_hosts,
+            vec![
+                "media.example.com".to_string(),
+                "proxy.example.org".to_string()
+            ],
+            "trimmed, lowercased, root dot dropped, blanks skipped"
+        );
+        // Unset → no extra hosts (the built-in local-network names still apply).
+        let t2 = trakt(Some("id"), Some("sec"), None, None).unwrap();
+        assert!(t2.enrol_allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn parse_allowed_hosts_drops_entries_that_are_not_bare_hostnames() {
+        // A URL, a port, a path or a space can never equal a Host header's hostname, so such an
+        // entry is warned about and dropped rather than silently never matching.
+        assert_eq!(
+            parse_allowed_hosts(Some(
+                "https://a.example, b.example:443, c example, d.example/x, ok.example".into()
+            )),
+            vec!["ok.example".to_string()]
+        );
+        assert!(parse_allowed_hosts(None).is_empty());
+        assert!(parse_allowed_hosts(Some("  ".into())).is_empty());
     }
 
     #[test]
@@ -1544,49 +1573,42 @@ mod tests {
     #[test]
     fn upgrade_config_defaults_to_daily_and_clamps() {
         // Absent → daily default, all sub-defaults applied.
-        let u = UpgradeConfig::from_parts(None, None, None, None);
+        let u = UpgradeConfig::from_parts(None, None, None);
         assert_eq!(u.interval_secs, 86_400);
         assert_eq!(
             u.budget_per_tick, None,
             "no budget by default: every pass covers the library"
         );
         assert_eq!(u.idle_secs, 300);
-        assert_eq!(u.stage_max_secs, 604_800);
         assert!(u.enabled(), "default (daily) is enabled");
 
         // interval=0 disables the job.
-        let off = UpgradeConfig::from_parts(Some("0".into()), None, None, None);
+        let off = UpgradeConfig::from_parts(Some("0".into()), None, None);
         assert_eq!(off.interval_secs, 0);
         assert!(!off.enabled());
 
         // Below-min interval (but non-zero) clamps up to 600; sub-knobs clamp to their mins.
-        let clamped = UpgradeConfig::from_parts(
-            Some("60".into()),
-            Some("0".into()),
-            Some("5".into()),
-            Some("10".into()),
-        );
+        let clamped =
+            UpgradeConfig::from_parts(Some("60".into()), Some("0".into()), Some("5".into()));
         assert_eq!(clamped.interval_secs, 600);
         assert_eq!(clamped.budget_per_tick, Some(1));
         assert_eq!(clamped.idle_secs, 30);
-        assert_eq!(clamped.stage_max_secs, 3600);
 
         // Invalid → defaults.
-        let bad = UpgradeConfig::from_parts(Some("x".into()), Some("y".into()), None, None);
+        let bad = UpgradeConfig::from_parts(Some("x".into()), Some("y".into()), Some("z".into()));
         assert_eq!(bad.interval_secs, 86_400);
         assert_eq!(bad.budget_per_tick, None);
+        assert_eq!(bad.idle_secs, 300);
 
         // An explicit budget caps each pass; blank is unset.
-        let capped = UpgradeConfig::from_parts(None, Some(" 400 ".into()), None, None);
+        let capped = UpgradeConfig::from_parts(None, Some(" 400 ".into()), None);
         assert_eq!(capped.budget_per_tick, Some(400));
-        let blank = UpgradeConfig::from_parts(None, Some("  ".into()), None, None);
+        let blank = UpgradeConfig::from_parts(None, Some("  ".into()), None);
         assert_eq!(blank.budget_per_tick, None);
     }
 
     #[test]
     fn acquisition_dead_timeout_defaults_to_600() {
-        // The env-override path (ACQUIRE_DEAD_TIMEOUT_SECS) is exercised via from_env,
-        // which is not unit-testable here without mutating the process environment.
         let a = AcquisitionConfig::from_parts(None, None, None, None, None, None, None);
         assert_eq!(a.acquire_dead_timeout_secs, 600);
     }
@@ -1616,23 +1638,5 @@ mod tests {
         assert_eq!(parse_cdn_first_read_bytes(Some("0".into())), mb(2));
         assert_eq!(parse_cdn_first_read_bytes(Some("1".into())), mb(2));
         assert_eq!(parse_cdn_first_read_bytes(Some("999".into())), mb(16));
-    }
-
-    #[test]
-    fn config_debug_redacts_secrets_still() {
-        // Adding the cdn field must not regress secret redaction.
-        let c = parts(
-            Some("rd-secret-xyz"),
-            None,
-            Some("tmdb-secret-xyz"),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let s = format!("{c:?}");
-        assert!(!s.contains("rd-secret-xyz"));
-        assert!(!s.contains("tmdb-secret-xyz"));
-        assert!(s.contains("cdn_first_read_bytes"));
     }
 }

@@ -56,8 +56,9 @@ pub struct LangReq {
 /// set to /B — TMDB's `original_language` is 2-letter and the default `AudioReq::Original` compares
 /// it against a 3-letter track tag, so an incomplete map would FailAudio-blacklist correctly-tagged
 /// foreign releases — and canonicalises the 20 ISO 639-2/T (terminological) 3-letter codes to their
-/// /B equivalents so a /T-tagged track unifies with a /B want. Unknown/already-/B 3-letter and
-/// unknown 2-letter codes pass through unchanged.
+/// /B equivalents so a /T-tagged track unifies with a /B want. Also maps the non-ISO codes TMDB
+/// writes (`cn` Cantonese, `xx` No Language) and the deprecated `sh` (Serbo-Croatian), which has no
+/// ISO 639-2 code. Unknown/already-/B 3-letter and unknown 2-letter codes pass through unchanged.
 pub fn to_iso639_2(code: &str) -> String {
     let c = code.trim().to_ascii_lowercase();
     if c.len() == 3 {
@@ -278,13 +279,48 @@ pub fn to_iso639_2(code: &str) -> String {
         "za" => "zha",
         "zh" => "chi",
         "zu" => "zul",
+        // Not ISO 639-1, but used by TMDB's `original_language`/`spoken_languages`: Cantonese
+        // (most Hong Kong films), "No Language" (a silent or dialogue-free title: ISO 639-2 "no
+        // linguistic content") and the deprecated Serbo-Croatian (the ISO 639-3 macrolanguage;
+        // see `MACROLANGUAGES`).
+        "cn" => "yue",
+        "xx" => "zxx",
+        "sh" => "hbs",
         _ => return c,
     }
     .to_string()
 }
 
-fn lang_eq(a: &str, b: &str) -> bool {
-    to_iso639_2(a) == to_iso639_2(b)
+/// Macrolanguages whose tracks may carry a member language's code instead (all as `to_iso639_2`
+/// returns them). A Chinese track is tagged `chi`/`zho` or, more precisely, Cantonese `yue` or
+/// Mandarin `cmn`; a Serbo-Croatian one `hrv`/`srp`/`bos`/`cnr`; a Norwegian one `nob`/`nno`.
+const MACROLANGUAGES: &[(&str, &[&str])] = &[
+    ("chi", &["yue", "cmn"]),
+    ("hbs", &["hrv", "srp", "bos", "cnr"]),
+    ("nor", &["nob", "nno"]),
+];
+
+/// Whether two language codes name the same language, in any of the forms `to_iso639_2` unifies.
+/// A macrolanguage also matches each of its members (a `yue` track satisfies a `zh` want, a
+/// `chi`-tagged track a Cantonese one), but two members never match each other: Cantonese is not
+/// Mandarin, and Serbian is not Croatian. `pub` so `release::wrong_audio_language` compares exactly
+/// as the probe does.
+pub fn lang_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (to_iso639_2(a), to_iso639_2(b));
+    let member_of = |umbrella: &str, member: &str| {
+        MACROLANGUAGES
+            .iter()
+            .any(|(m, members)| *m == umbrella && members.contains(&member))
+    };
+    a == b || member_of(&a, &b) || member_of(&b, &a)
+}
+
+/// Whether `code` names no spoken language: ISO 639-2 `zxx` ("no linguistic content"), which TMDB
+/// writes `xx` ("No Language") for a silent or dialogue-free title. Wanting it puts no constraint
+/// on the audio, since such a title has no wrong audio language (its music track may be tagged
+/// anything, and an MKV track with no Language element reads as `eng`).
+pub fn is_no_language(code: &str) -> bool {
+    to_iso639_2(code) == "zxx"
 }
 
 enum LangCheck {
@@ -320,16 +356,19 @@ fn check_lang(tracks: &[Track], kind: TrackKind, wants: &[String]) -> LangCheck 
 /// absent). Untagged tracks (no language metadata) are inconclusive — not a failure — so a
 /// correct-but-untagged release isn't wrongly rejected. This deliberately also accepts a
 /// non-matching *tagged* track when an untagged track is present alongside it (the untagged one
-/// could be the wanted language). Note: MKV tracks that OMIT the Language element are pre-resolved
-/// to `eng` by the parser (Matroska's spec default); an MKV track tagged `und`/empty (undetermined)
-/// or an MP4 untagged track resolves to `language: None` and reaches the inconclusive branch.
+/// could be the wanted language). Note: MKV tracks that OMIT both the Language and LanguageBCP47
+/// elements are pre-resolved to `eng` by the parser (Matroska's spec default); an MKV track tagged
+/// `und`/empty (undetermined) or an MP4 untagged track resolves to `language: None` and reaches the
+/// inconclusive branch.
 pub fn verify(tracks: &[Track], req: &LangReq) -> Verify {
     if tracks.is_empty() {
         return Verify::Inconclusive;
     }
     // The acceptable audio languages: an explicit one, an explicit set, or — for the default
     // `Original` — the title's TMDB original language plus its spoken languages (the same set
-    // `QualityPrefs::with_resolved_audio` ranks with). Empty = nothing known → no audio requirement.
+    // `QualityPrefs::with_resolved_audio` ranks with). Empty = nothing known → no audio
+    // requirement, and so is a no-language want (TMDB `xx`: a dialogue-free title has no wrong
+    // audio language).
     let want_audio: Vec<String> = match &req.audio {
         AudioReq::Lang(l) => vec![l.clone()],
         AudioReq::AnyOf(v) => v.clone(),
@@ -338,7 +377,7 @@ pub fn verify(tracks: &[Track], req: &LangReq) -> Verify {
             &req.spoken_languages,
         ),
     };
-    if !want_audio.is_empty() {
+    if !want_audio.is_empty() && !want_audio.iter().any(|w| is_no_language(w)) {
         if let LangCheck::Fail = check_lang(tracks, TrackKind::Audio, &want_audio) {
             return Verify::FailAudio;
         }
@@ -571,6 +610,10 @@ fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, 
     // Whether a Language element was present at all — distinguishes a genuinely-absent element (which
     // Matroska's spec defaults to "eng") from a present-but-`und`/empty one (inconclusive, NOT eng).
     let mut saw_language = false;
+    // The LanguageBCP47 element (Matroska v4): `None` when absent, `Some(None)` when `und`/empty.
+    // When present, the legacy Language element MUST be ignored (RFC 9559), so a track written with
+    // LanguageBCP47 alone (`ru`) is not read as the `eng` default.
+    let mut bcp47: Option<Option<String>> = None;
     let mut pos = start;
     while pos < end {
         let id = read_ebml_id(buf, &mut pos)?;
@@ -612,19 +655,30 @@ fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, 
                     // stray "UND" is non-spec but must not slip through as a wrong-language tag).
                     .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("und"));
             }
+            0x22B59D => {
+                // Only the primary subtag names the language (`pt-BR` → `pt`, `zh-Hant-HK` → `zh`);
+                // `und` and empty are inconclusive, exactly as for the legacy element.
+                bcp47 = Some(
+                    std::str::from_utf8(&buf[pos..p_end])
+                        .ok()
+                        .and_then(|s| s.trim().split('-').next())
+                        .map(str::to_ascii_lowercase)
+                        .filter(|s| !s.is_empty() && s != "und"),
+                );
+            }
             _ => {}
         }
         pos = p_end;
     }
     Ok(Track {
         kind,
-        // Matroska spec: a track with NO Language element is "eng". A present-but-`und`/empty element
-        // stays `None` (inconclusive), so it is never miscounted as a wrong-language tag nor wrongly
-        // auto-passed as "eng".
-        language: if saw_language {
-            language
-        } else {
-            Some("eng".to_string())
+        // LanguageBCP47 wins when present. Otherwise, Matroska spec: a track with NO Language
+        // element is "eng". A present-but-`und`/empty element stays `None` (inconclusive), so it is
+        // never miscounted as a wrong-language tag nor wrongly auto-passed as "eng".
+        language: match bcp47 {
+            Some(tag) => tag,
+            None if saw_language => language,
+            None => Some("eng".to_string()),
         },
     })
 }
@@ -852,7 +906,7 @@ pub async fn probe_tracks(http: &reqwest::Client, cdn_url: &str) -> Result<Vec<T
                 // larger fetch (up to MAX_PROBE_FETCH) covering that element + the following Tracks
                 // and re-parse. If the overrun is past the cap, accept (can't verify → unknown)
                 // rather than churn; a header-split under-fetch (None) stays `Transient` (defer).
-                // Mirrors the MP4 large-`moov` recovery above.
+                // Mirrors the MP4 large-`moov` recovery below.
                 match front_mkv_tracks_extent(&front) {
                     Some(end) if end <= MAX_PROBE_FETCH as u64 => {
                         // Fetch the full MAX_PROBE_FETCH window rather than exactly `[0, end)`: `end`
@@ -1729,13 +1783,38 @@ mod tests {
         );
     }
 
+    /// Read one HTTP request's headers from `sock` and return its `Range` header value ("" when
+    /// absent), or `None` when the client went away first.
+    async fn read_range_header(sock: &mut tokio::net::TcpStream) -> Option<String> {
+        use tokio::io::AsyncReadExt;
+        let mut req = Vec::new();
+        let mut chunk = [0u8; 2048];
+        while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => req.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let req = String::from_utf8_lossy(&req).to_string();
+        Some(
+            req.lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("range")
+                        .then(|| v.trim().to_string())
+                })
+                .unwrap_or_default(),
+        )
+    }
+
     /// Serve `file` over HTTP honouring `Range` like a real CDN: `bytes=a-b` / `bytes=a-` /
     /// `bytes=-n` → `206` with `Content-Range` + exact `Content-Length`; a start at/past EOF → `416`.
     /// Returns the base URL plus a log of every `Range` header received (in arrival order).
     async fn serve_ranges_logged(
         file: Vec<u8>,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let file = std::sync::Arc::new(file);
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1746,24 +1825,9 @@ mod tests {
                 let file = file.clone();
                 let log = server_log.clone();
                 tokio::spawn(async move {
-                    let mut req = Vec::new();
-                    let mut chunk = [0u8; 2048];
-                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
-                        match sock.read(&mut chunk).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => req.extend_from_slice(&chunk[..n]),
-                        }
-                    }
-                    let req = String::from_utf8_lossy(&req).to_string();
-                    let range = req
-                        .lines()
-                        .find_map(|l| {
-                            let (k, v) = l.split_once(':')?;
-                            k.trim()
-                                .eq_ignore_ascii_case("range")
-                                .then(|| v.trim().to_string())
-                        })
-                        .unwrap_or_default();
+                    let Some(range) = read_range_header(&mut sock).await else {
+                        return;
+                    };
                     log.lock().unwrap().push(range.clone());
                     let len = file.len() as u64;
                     let spec = range.strip_prefix("bytes=").unwrap_or("");
@@ -1803,6 +1867,120 @@ mod tests {
     async fn serve_ranges(file: Vec<u8>) -> String {
         serve_ranges_logged(file).await.0
     }
+
+    /// Serve `file` like a CDN that IGNORES `Range` (TorBox's can): every request gets `200 OK` and
+    /// the object from byte 0, whatever range it asked for. `Content-Length` declares a multi-GB
+    /// object, but only `file` is sent and the connection is then held open, so a client that tried
+    /// to read the whole body would hang instead of returning. Returns the base URL plus a log of
+    /// every `Range` header received.
+    async fn serve_ignoring_range(
+        file: Vec<u8>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::AsyncWriteExt;
+        let file = std::sync::Arc::new(file);
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_log = log.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let file = file.clone();
+                let log = server_log.clone();
+                tokio::spawn(async move {
+                    let Some(range) = read_range_header(&mut sock).await else {
+                        return;
+                    };
+                    log.lock().unwrap().push(range);
+                    let head = "HTTP/1.1 200 OK\r\nContent-Length: 9000000000\r\n\r\n";
+                    if sock.write_all(head.as_bytes()).await.is_ok()
+                        && sock.write_all(&file).await.is_ok()
+                    {
+                        let _ = sock.flush().await;
+                    }
+                    // Hold the connection (and the unsent rest of the "body") open.
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        (format!("http://{}/", addr), log)
+    }
+
+    /// Run a probe call under a deadline: one that waits for the rest of a body never sent hangs.
+    async fn within_deadline<T>(fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+            .await
+            .expect("the probe must not wait for the rest of a Range-ignoring 200 body")
+    }
+
+    #[tokio::test]
+    async fn probe_tracks_reads_the_front_window_of_a_range_ignoring_200() {
+        // TorBox's CDN may answer the offset-0 probe with `200 OK`, streaming the whole object.
+        // `read_body` must accept that for the front read, keep the first 4 MB and drop the
+        // connection, and the MKV parse then finds the Tracks inside that window. Requiring a `206`
+        // here once made every TorBox probe defer forever.
+        let mut audio = ebml_elem(0x83, &[2]);
+        audio.extend(ebml_elem(0x22B59C, b"jpn"));
+        let mut seg = ebml_elem(0x1654AE6B, &ebml_elem(0xAE, &audio));
+        // A 6 MB Void after Tracks, so the body runs well past the 4 MB window.
+        seg.extend(ebml_elem(0xEC, &vec![0u8; 6 * 1024 * 1024]));
+        let mut file = ebml_elem(0x1A45DFA3, &[]);
+        file.extend(ebml_elem_sized(0x18538067, 8_000_000_000, &seg));
+        let (url, log) = serve_ignoring_range(file).await;
+        let tracks = within_deadline(probe_tracks(&reqwest::Client::new(), &url))
+            .await
+            .expect("a Range-ignoring 200 at offset 0 is a usable front read");
+        assert!(
+            tracks
+                .iter()
+                .any(|t| t.kind == TrackKind::Audio && t.language.as_deref() == Some("jpn")),
+            "got {tracks:?}"
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![format!("bytes=0-{}", 4 * 1024 * 1024 - 1)],
+            "one front read, no recovery fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_a_range_ignoring_200_away_from_offset_zero() {
+        // A `200` carries the object from byte 0, so it is the right bytes only for a read that
+        // starts there: the front window is kept, anything else is the wrong bytes → Transient.
+        let file: Vec<u8> = (0..=255u8).cycle().take(64 * 1024).collect();
+        let (url, _log) = serve_ignoring_range(file.clone()).await;
+        let http = reqwest::Client::new();
+        let front = within_deadline(fetch_range(&http, &url, 0, 99)).await;
+        assert_eq!(front.as_deref(), Ok(&file[..100]));
+        let mid = within_deadline(fetch_range(&http, &url, 100, 199)).await;
+        assert_eq!(mid, Err(ProbeError::Transient));
+        let tail = within_deadline(fetch_suffix(&http, &url, 1024)).await;
+        assert_eq!(tail, Err(ProbeError::Transient));
+    }
+
+    #[tokio::test]
+    async fn probe_tracks_non_faststart_mp4_behind_a_range_ignoring_200_defers() {
+        // A non-faststart MP4 needs a read away from offset 0 (the trailing moov at the mdat's end,
+        // then the suffix). Behind a CDN that ignores Range both come back as `200` with the head,
+        // which must never be parsed as the moov: the probe defers (Transient) for a later retry.
+        let with_ftyp = mp4_with(&[(b"soun", packed("eng"))]);
+        let ftyp_len = u32::from_be_bytes(with_ftyp[0..4].try_into().unwrap()) as usize;
+        let moov = with_ftyp[ftyp_len..].to_vec();
+        let payload = 5 * 1024 * 1024;
+        let file = non_faststart_mp4((8 + payload) as u32, payload, &moov);
+        let (url, log) = serve_ignoring_range(file).await;
+        let result = within_deadline(probe_tracks(&reqwest::Client::new(), &url)).await;
+        assert_eq!(result, Err(ProbeError::Transient));
+        let ranges = log.lock().unwrap().clone();
+        let target = format!("bytes={}-", 40 + 8 + payload);
+        assert!(
+            ranges.iter().any(|r| r.starts_with(&target)),
+            "the targeted trailing-moov read was attempted: {ranges:?}"
+        );
+        assert!(
+            ranges.contains(&format!("bytes=-{}", 4 * 1024 * 1024)),
+            "the suffix read was attempted: {ranges:?}"
+        );
+    }
     /// A non-faststart MP4: `ftyp` + `free` + an `mdat` whose header DECLARES `mdat_declared` bytes
     /// (header included) but carries `payload` zero bytes, followed by `trailer` (the `moov`, or
     /// nothing). The front 4 MB lands entirely inside the `mdat`.
@@ -1817,7 +1995,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_tracks_mp4_reads_trailing_moov_at_exact_offset() {
-        // Nightborn shape: ftyp, free, a 5 MiB mdat, then the moov at EOF. The 4 MB front read sees
+        // Non-faststart shape: ftyp, free, a 5 MiB mdat, then the moov at EOF. The 4 MB front read sees
         // no moov, and the 4 MB SUFFIX starts mid-mdat (not on a box boundary), so before the fix the
         // probe accepted as TracksNotFound without ever checking the language. The mdat's declared
         // end is the exact offset of the trailing moov → ONE targeted read there must yield tracks.
@@ -2011,6 +2189,55 @@ mod tests {
         );
     }
 
+    /// The language of a one-track MKV whose audio TrackEntry carries the given `Language` and
+    /// `LanguageBCP47` elements (each omitted when `None`).
+    fn mkv_audio_language(legacy: Option<&str>, bcp47: Option<&str>) -> Option<String> {
+        let mut audio = ebml_elem(0x83, &[2]);
+        if let Some(l) = legacy {
+            audio.extend(ebml_elem(0x22B59C, l.as_bytes()));
+        }
+        if let Some(l) = bcp47 {
+            audio.extend(ebml_elem(0x22B59D, l.as_bytes()));
+        }
+        let segment = ebml_elem(0x18538067, &ebml_elem(0x1654AE6B, &ebml_elem(0xAE, &audio)));
+        let mut bytes = ebml_elem(0x1A45DFA3, &[]);
+        bytes.extend(segment);
+        let tracks = parse_mkv_tracks(&bytes).expect("parse");
+        assert_eq!(tracks.len(), 1);
+        tracks[0].language.clone()
+    }
+
+    #[test]
+    fn mkv_language_bcp47_overrides_the_legacy_language_element() {
+        // RFC 9559: when LanguageBCP47 is present the legacy Language element (whose absence means
+        // `eng`) is ignored. A track written with LanguageBCP47 alone is not English.
+        let ru = mkv_audio_language(None, Some("ru"));
+        assert_eq!(ru.as_deref(), Some("ru"));
+        assert!(lang_eq(ru.as_deref().unwrap(), "rus"));
+        assert_eq!(
+            mkv_audio_language(Some("eng"), Some("ja")).as_deref(),
+            Some("ja")
+        );
+        // Only the primary subtag names the language.
+        assert_eq!(
+            mkv_audio_language(None, Some("pt-BR")).as_deref(),
+            Some("pt")
+        );
+        assert_eq!(
+            mkv_audio_language(None, Some("zh-Hant-HK")).as_deref(),
+            Some("zh")
+        );
+        // `und`/empty stay inconclusive, as with the legacy element.
+        assert_eq!(mkv_audio_language(None, Some("und")), None);
+        assert_eq!(mkv_audio_language(Some("eng"), Some("")), None);
+        // Without LanguageBCP47 the legacy rules are unchanged.
+        assert_eq!(
+            mkv_audio_language(Some("fre"), None).as_deref(),
+            Some("fre")
+        );
+        assert_eq!(mkv_audio_language(None, None).as_deref(), Some("eng"));
+    }
+
     #[test]
     fn verify_tagged_wrong_audio_still_fails() {
         // A track positively tagged with a non-matching language is still rejected (a real dub).
@@ -2193,7 +2420,7 @@ mod tests {
 
     #[test]
     fn verify_original_accepts_a_spoken_language() {
-        // Nightborn: TMDB original_language `fi`, spoken [en, fi, es]; the release's audio is `eng`.
+        // A film with TMDB original_language `fi`, spoken [en, fi, es]; the release's audio is `eng`.
         // Under AUDIO_LANGUAGE=original the acceptable set is original ∪ spoken → Pass, not BadAudio.
         let req = LangReq {
             audio: AudioReq::Original,
@@ -2230,6 +2457,78 @@ mod tests {
             spoken_languages: vec!["en".into()],
         };
         assert_eq!(verify(&eng_audio(), &req), Verify::FailAudio);
+    }
+
+    fn audio(lang: &str) -> Vec<Track> {
+        vec![Track {
+            kind: TrackKind::Audio,
+            language: Some(lang.into()),
+        }]
+    }
+
+    fn original(code: &str) -> LangReq {
+        LangReq {
+            audio: AudioReq::Original,
+            subtitle: SubReq::None,
+            original_language: Some(code.into()),
+            spoken_languages: vec![],
+        }
+    }
+
+    #[test]
+    fn verify_tmdb_cantonese_original_matches_chinese_tracks() {
+        // TMDB writes `cn` (not an ISO 639-1 code) for Cantonese. Its tracks are tagged with the
+        // Chinese macrolanguage (`chi`/`zho`) or ISO 639-3 `yue`, all of which must pass; a
+        // Mandarin (`cmn`) dub of a Cantonese title is still the wrong language.
+        let req = original("cn");
+        for tag in ["chi", "zho", "yue"] {
+            assert_eq!(verify(&audio(tag), &req), Verify::Pass, "{tag}");
+        }
+        assert_eq!(verify(&audio("cmn"), &req), Verify::FailAudio);
+        assert_eq!(verify(&audio("eng"), &req), Verify::FailAudio);
+        // A Mandarin title (`zh`) passes its `cmn`- or `chi`-tagged track.
+        assert_eq!(verify(&audio("cmn"), &original("zh")), Verify::Pass);
+        assert_eq!(verify(&audio("zho"), &original("zh")), Verify::Pass);
+    }
+
+    #[test]
+    fn verify_tmdb_no_language_original_has_no_audio_requirement() {
+        // TMDB's `xx` ("No Language") marks a silent or dialogue-free title: whatever its music
+        // track is tagged (`eng` is the MKV default for an absent tag, or `zxx`), there is no wrong
+        // language.
+        let req = original("xx");
+        for tag in ["eng", "zxx", "rus"] {
+            assert_eq!(verify(&audio(tag), &req), Verify::Pass, "{tag}");
+        }
+        let mut with_spoken = original("xx");
+        with_spoken.spoken_languages = vec!["en".into()];
+        assert_eq!(verify(&audio("rus"), &with_spoken), Verify::Pass);
+        assert!(is_no_language("xx") && is_no_language("zxx") && !is_no_language("en"));
+    }
+
+    #[test]
+    fn verify_tmdb_serbo_croatian_original_matches_its_members() {
+        // TMDB writes the deprecated `sh` (Serbo-Croatian) for many Yugoslav-era titles; their
+        // tracks are tagged Croatian, Serbian or Bosnian.
+        let req = original("sh");
+        for tag in ["hrv", "srp", "bos", "hbs"] {
+            assert_eq!(verify(&audio(tag), &req), Verify::Pass, "{tag}");
+        }
+        assert_eq!(verify(&audio("eng"), &req), Verify::FailAudio);
+        // The members stay distinct languages: a Serbian track is not Croatian.
+        assert_eq!(verify(&audio("srp"), &original("hr")), Verify::FailAudio);
+    }
+
+    #[test]
+    fn lang_eq_matches_a_macrolanguage_with_its_members_only() {
+        assert!(lang_eq("zh", "yue") && lang_eq("yue", "chi") && lang_eq("cn", "zho"));
+        assert!(lang_eq("no", "nob") && lang_eq("nb", "nor") && lang_eq("nn", "no"));
+        assert!(
+            !lang_eq("yue", "cmn"),
+            "two members of a macrolanguage differ"
+        );
+        assert!(!lang_eq("nob", "nno"));
+        assert!(!lang_eq("hr", "sr"));
     }
 
     #[test]

@@ -10,15 +10,27 @@ use tracing::{debug, error, warn};
 
 const MAX_CACHE_SIZE: usize = 10_000;
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
+/// Baseline spacing between RD API requests. RD documents a limit of 250 requests per minute
+/// (240 ms apart) and sends no rate-limit headers, so steady pacing is the only proactive control;
+/// pacing faster guarantees 429s on any burst (a first-run identification of every torrent, a
+/// multi-page listing alongside other jobs).
+const RD_MIN_INTERVAL_MS: u64 = 250;
 
 use crate::provider::synthetic_bad_gateway;
 
-/// Whether an `unrestrict/link` failure is a genuinely PERMANENT client error (a bad token) that
-/// instant repair can't fix — only 401/403. Everything else (a 5xx, a transport-level failure, or a
-/// stale/expired-link 404 that a re-add-by-hash recovers) maps to `AppError::Unavailable` → repair.
-/// Mirrors TorBox's `requestdl_status_is_permanent` so the two providers behave symmetrically.
-fn unrestrict_status_is_permanent(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN
+/// Whether an `unrestrict/link` failure must fail the read WITHOUT instant repair: a bad token
+/// (401/403), which a re-add can't fix, or throttling (429), which says nothing about whether the
+/// bytes exist (repairing would re-add, and on RD delete, a healthy torrent while adding about five
+/// more calls to the API that is throttling us). Everything else (a 5xx, a transport-level failure,
+/// or a stale/expired-link 404 that a re-add-by-hash recovers) maps to `AppError::Unavailable` →
+/// repair. Mirrors TorBox's `requestdl_status_skips_repair` so the two providers behave alike.
+fn unrestrict_status_skips_repair(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+    )
 }
 
 /// Build `{base}/{prefix}/{seg}` with `seg` PERCENT-ENCODED as a single path segment, so a
@@ -223,6 +235,9 @@ pub struct RealDebridClient {
     /// endpoint path, e.g. `https://api.real-debrid.com/rest/1.0`). Overridable in tests so the
     /// higher-level methods can be exercised against a loopback server.
     base_url: String,
+    /// Our own deletes, so a multi-page `get_torrents` can re-list when one may have shifted its
+    /// pages (see `provider::DeleteTracker`).
+    deletes: crate::provider::DeleteTracker,
 }
 
 // `DebridProvider` requires `Debug`, but `unrestrict_cache` holds restricted RD `link`s and signed
@@ -266,8 +281,11 @@ impl RealDebridClient {
         Ok(Self {
             client,
             unrestrict_cache: Arc::new(RwLock::new(HashMap::new())),
-            rate_limiter: Arc::new(AdaptiveRateLimiter::new()),
+            rate_limiter: Arc::new(AdaptiveRateLimiter::with_min_interval(
+                Duration::from_millis(RD_MIN_INTERVAL_MS),
+            )),
             base_url: "https://api.real-debrid.com/rest/1.0".to_string(),
+            deletes: crate::provider::DeleteTracker::default(),
         })
     }
 
@@ -333,7 +351,32 @@ impl RealDebridClient {
             || crate::provider::is_retryable_5xx(status)
     }
 
+    /// The whole torrent listing. If one of our own deletes may have landed while it was paging (see
+    /// `provider::DeleteTracker`), the pages may have shifted under it and dropped a live torrent, so
+    /// it lists again — up to `MAX_LISTING_ATTEMPTS` times, then fails rather than return a listing
+    /// that may be short.
     pub async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
+        for attempt in 1..=crate::provider::MAX_LISTING_ATTEMPTS {
+            let since = self.deletes.snapshot();
+            let (torrents, spans_pages) = self.list_torrent_pages().await?;
+            if !spans_pages || !self.deletes.changed_since(since) {
+                return Ok(torrents);
+            }
+            warn!(
+                "RD torrent listing overlapped a delete (attempt {}/{}); listing again in case the \
+                 pages shifted",
+                attempt,
+                crate::provider::MAX_LISTING_ATTEMPTS
+            );
+        }
+        Err(synthetic_bad_gateway(
+            b"get_torrents: concurrent deletes kept shifting the pages",
+        ))
+    }
+
+    /// Fetch every page once. Also returns whether the listing ran past a single short page — only
+    /// then can a delete on a fetched page shift an unfetched item back onto it.
+    async fn list_torrent_pages(&self) -> Result<(Vec<Torrent>, bool), reqwest::Error> {
         // RD's /torrents default page size is 100; request it explicitly (was 50) to halve the
         // per-scan round-trips + rate-limiter pressure on large libraries. (RD sends no rate-limit
         // headers, so fewer requests directly means a faster scan tick.)
@@ -346,6 +389,7 @@ impl RealDebridClient {
         const MAX_PAGES: u32 = 2000;
         let mut all_torrents = Vec::new();
         let mut page = 1u32;
+        let mut non_empty_pages = 0usize;
         loop {
             // Allow ONE page beyond the cap as an empty-terminator probe. An account holding EXACTLY
             // MAX_PAGES*PAGE_LIMIT items has a FULL final page at MAX_PAGES, so `page` advances to
@@ -379,6 +423,7 @@ impl RealDebridClient {
                         break;
                     }
                     all_torrents.extend(torrents);
+                    non_empty_pages += 1;
                     page += 1;
                 }
                 Err(e) => {
@@ -401,7 +446,10 @@ impl RealDebridClient {
             }
         }
         debug!("Fetched {} torrents in total.", all_torrents.len());
-        Ok(all_torrents)
+        // A full first page means the empty terminator was fetched at a page boundary, so an item
+        // can still have shifted out of reach even with only one non-empty page.
+        let spans_pages = non_empty_pages > 1 || all_torrents.len() >= PAGE_LIMIT as usize;
+        Ok((all_torrents, spans_pages))
     }
 
     pub async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
@@ -442,10 +490,17 @@ impl RealDebridClient {
         // Small retry budget (3, vs the default 10): this is the synchronous playback path, so a
         // transport-level hang (timeout/connect) must not retry ~10×60s. After this budget a
         // persistent failure surfaces to `resolve_url`, which maps it to `AppError::Unavailable`
-        // → instant repair, rather than stalling the WebDAV read.
+        // → instant repair, rather than stalling the WebDAV read. Each attempt also gets the short
+        // `READ_PATH_REQUEST_TIMEOUT` instead of the client's 60 s, so an endpoint that accepts the
+        // connection and then hangs costs 3 × 15 s rather than 3 minutes.
         let response: UnrestrictResponse = self
             .fetch_with_retry_n(
-                || self.client.post(&url).form(&[("link", link)]),
+                || {
+                    self.client
+                        .post(&url)
+                        .timeout(crate::provider::READ_PATH_REQUEST_TIMEOUT)
+                        .form(&[("link", link)])
+                },
                 &[
                     reqwest::StatusCode::INTERNAL_SERVER_ERROR,
                     reqwest::StatusCode::BAD_GATEWAY,
@@ -507,6 +562,8 @@ impl RealDebridClient {
     /// Returns Ok(()) even if torrent doesn't exist (404), as the end state is the same
     pub async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error> {
         let url = build_id_url(&self.base_url, "torrents/delete", torrent_id);
+        // Held across the retries: the delete can land on any attempt.
+        let _in_flight = self.deletes.begin();
         let result: Result<serde_json::Value, _> = self
             .fetch_with_retry(
                 || self.client.delete(&url),
@@ -661,7 +718,9 @@ impl RealDebridClient {
                                     // fields — a partial/changed 200 body could otherwise emit a
                                     // capability URL, breaking the "never log the link" invariant. The
                                     // serde error names the failing field/offset; the length is enough
-                                    // to spot a schema change.
+                                    // to spot a schema change. (Its message can quote a mismatched
+                                    // SCALAR value, but `link`/`download` are strings decoded into
+                                    // `String` fields, so they never appear as a mismatched value.)
                                     error!(
                                         "Failed to decode RD response: {}. Status: {}, body {} bytes (redacted)",
                                         e, status, text.len()
@@ -708,7 +767,7 @@ impl RealDebridClient {
                     last_error = Some(e);
                     // Small backoff before retrying a statusless transport error (connection
                     // refused/reset, timeout). Without it a fast-failing endpoint (e.g. connection
-                    // refused) spins the whole budget in a tight warn loop — the rate limiter's 100ms
+                    // refused) spins the whole budget in a tight warn loop — the rate limiter's 250ms
                     // baseline spacing isn't enough. Kept SMALL (100ms·attempt, capped 1s) rather than
                     // the 5xx exponential backoff (up to 30s) so the latency-sensitive
                     // `unrestrict_link` resolve path still fails over to instant repair quickly.
@@ -803,14 +862,16 @@ impl crate::provider::DebridProvider for RealDebridClient {
         match self.unrestrict_link(link).await {
             Ok(resp) => Ok(resp.download),
             Err(e) => {
-                // Map to `Unavailable` (→ instant repair) UNLESS the failure is a genuinely permanent
-                // client error (401/403 bad token) that a re-add can't fix — mirroring TorBox's
-                // `requestdl_status_is_permanent`. A 5xx or a transport-level failure (no status) is
-                // transient; a stale/expired-link 4xx such as 404 is recoverable by a re-add-by-hash,
-                // so it routes to repair too rather than failing hard. unrestrict makes 5xx terminal
-                // and uses a small retry budget, so this returns promptly (instead of the full
-                // ~10×60s window) and lets `dav_fs` fast-fail to instant repair.
-                if e.status().is_some_and(unrestrict_status_is_permanent) {
+                // Map to `Unavailable` (→ instant repair) UNLESS the failure is a bad token (401/403)
+                // that a re-add can't fix, or throttling (429) that outlasted the read budget —
+                // throttling says nothing about whether the bytes exist, so the read fails fast as
+                // `Http` without a re-add (mirroring TorBox's `requestdl_status_skips_repair`). A 5xx
+                // or a transport-level failure (no status) is transient; a stale/expired-link 4xx such
+                // as 404 is recoverable by a re-add-by-hash, so it routes to repair too rather than
+                // failing hard. unrestrict makes 5xx terminal and uses a small retry budget, so this
+                // returns promptly (instead of the full ~10×60s window) and lets `dav_fs` fast-fail
+                // to instant repair.
+                if e.status().is_some_and(unrestrict_status_skips_repair) {
                     Err(crate::error::AppError::Http(e))
                 } else {
                     Err(crate::error::AppError::Unavailable)
@@ -868,6 +929,21 @@ mod tests {
             ..Default::default()
         };
         assert!(!format!("{t:?}").contains("RESTRICTED"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paces_requests_within_rds_documented_rate_limit() {
+        // RD documents 250 requests per minute and sends no rate-limit headers, so the baseline
+        // spacing is the only proactive control: it must not be tighter than 60 s / 250 = 240 ms.
+        let client = RealDebridClient::new("fake".to_string()).unwrap();
+        let t0 = tokio::time::Instant::now();
+        client.rate_limiter.wait_for_token().await;
+        client.rate_limiter.wait_for_token().await;
+        assert!(
+            t0.elapsed() >= Duration::from_millis(60_000 / 250),
+            "two back-to-back requests were only {:?} apart",
+            t0.elapsed()
+        );
     }
 
     // --- should_retry_status ---
@@ -1187,6 +1263,114 @@ mod tests {
         );
     }
 
+    /// Serve a paginated `/torrents` listing whose page 1 holds `page1_len` torrents — plus one more
+    /// on page 2 when that fills the 100-item page — and, while serving page 1 of each listing that
+    /// `bump` selects (1-based), record a delete on the client's tracker, as if another job deleted
+    /// a torrent mid-listing. Returns the listing result and how many times page 1 was fetched.
+    async fn list_with_concurrent_deletes(
+        page1_len: usize,
+        bump: fn(usize) -> bool,
+    ) -> (Result<Vec<Torrent>, reqwest::Error>, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(
+            RealDebridClient::new("fake".to_string())
+                .unwrap()
+                .with_base_url(format!("http://{addr}")),
+        );
+        let page1_hits = Arc::new(AtomicUsize::new(0));
+        let (c, hits) = (client.clone(), page1_hits.clone());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = if req.contains("page=1&") {
+                    if bump(hits.fetch_add(1, Ordering::SeqCst) + 1) {
+                        drop(c.deletes.begin());
+                    }
+                    let items: Vec<String> = (0..page1_len)
+                        .map(|i| format!(r#"{{"id":"a{i}"}}"#))
+                        .collect();
+                    format!("[{}]", items.join(","))
+                } else if req.contains("page=2&") && page1_len >= 100 {
+                    r#"[{"id":"b"}]"#.to_string()
+                } else {
+                    "[]".to_string()
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let r = client.get_torrents().await;
+        (r, page1_hits.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn get_torrents_relists_when_a_delete_lands_mid_listing() {
+        // A delete during a multi-page listing may have shifted an item from page 2 onto page 1,
+        // where it is never returned. The listing must not be trusted: list again.
+        let (r, page1_fetches) = list_with_concurrent_deletes(100, |listing| listing == 1).await;
+        assert_eq!(
+            r.expect("the second, undisturbed listing succeeds").len(),
+            101
+        );
+        assert_eq!(page1_fetches, 2, "the disturbed listing is retried once");
+    }
+
+    #[tokio::test]
+    async fn get_torrents_fails_when_deletes_keep_shifting_the_pages() {
+        // If every attempt overlaps a delete, fail the listing (callers skip the tick) rather than
+        // return an Ok that may be missing a live torrent.
+        let (r, page1_fetches) = list_with_concurrent_deletes(100, |_| true).await;
+        assert!(r.is_err(), "a listing that never settles must be an Err");
+        assert_eq!(
+            page1_fetches,
+            crate::provider::MAX_LISTING_ATTEMPTS as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn get_torrents_ignores_a_delete_when_everything_fits_on_one_page() {
+        // With every torrent on one short page, a delete can't push anything past what was fetched.
+        let (r, page1_fetches) = list_with_concurrent_deletes(2, |_| true).await;
+        assert_eq!(r.expect("a single-page listing stands").len(), 2);
+        assert_eq!(page1_fetches, 1, "no re-list for a single short page");
+    }
+
+    #[tokio::test]
+    async fn select_files_and_delete_succeed_on_204_no_content_in_one_request() {
+        // RD answers selectFiles and delete with `204 No Content`. fetch_with_retry decodes "[]" for
+        // a 204 only (an empty-body 200 must still fail), so both calls must be Ok on the first try.
+        use std::sync::atomic::Ordering;
+        let (url, count) = spawn_counting("HTTP/1.1 204 No Content", "").await;
+        let client = RealDebridClient::new("fake".to_string())
+            .unwrap()
+            .with_base_url(url);
+        client
+            .select_files("1", "2")
+            .await
+            .expect("a 204 on selectFiles is success");
+        assert_eq!(count.load(Ordering::SeqCst), 1, "no retry on a 204");
+        let before = client.deletes.snapshot();
+        client
+            .delete_torrent("1")
+            .await
+            .expect("a 204 on delete is success");
+        assert_eq!(count.load(Ordering::SeqCst), 2, "no retry on a 204");
+        assert!(
+            client.deletes.changed_since(before),
+            "a delete is recorded so a concurrent multi-page listing re-lists"
+        );
+    }
+
     #[tokio::test]
     async fn delete_torrent_treats_404_as_success() {
         // Deleting an already-absent torrent must be idempotent: a 404 is the desired end state.
@@ -1372,6 +1556,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_url_maps_a_persistent_429_to_http_not_unavailable() {
+        // Throttling says nothing about whether the bytes exist. A 429 that outlasts the 3-attempt
+        // read budget must fail the read as a hard `Http` error, never `Unavailable`: that would
+        // send `dav_fs` into instant repair, which re-adds (and on RD deletes) a healthy torrent and
+        // adds about five more calls to the API that is already throttling us.
+        use crate::provider::DebridProvider as _;
+        let (url, count) = spawn_counting("HTTP/1.1 429 Too Many Requests", "{}").await;
+        let client = RealDebridClient::new("fake".to_string())
+            .unwrap()
+            .with_base_url(url);
+        let loc = crate::provider::FileLocator {
+            hash: "h".to_string(),
+            torrent_id: "t".to_string(),
+            file_id: 0,
+            file_path: "/x.mkv".to_string(),
+            link: Some("https://real-debrid.com/d/abc".to_string()),
+        };
+        match client.resolve_url(&loc).await {
+            Err(crate::error::AppError::Http(e)) => assert_eq!(
+                e.status(),
+                Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+                "the surfaced error must carry the real 429"
+            ),
+            other => panic!("a persistent 429 must map to Http, not repair: {other:?}"),
+        }
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "a 429 is still retried within the 3-attempt read budget"
+        );
+    }
+
+    /// Spawn a loopback server that accepts every connection and reads the request but never
+    /// answers — an endpoint that is up at the TCP level and then hangs.
+    async fn spawn_never_answers() -> String {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                held.push(sock); // keep it open, never reply
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_url_gives_up_on_a_hanging_endpoint_within_the_read_timeout() {
+        // The on-read resolve must not wait out the client's 60 s timeout on each of its 3 attempts
+        // (3 minutes) when the API accepts the connection and never answers.
+        use crate::provider::DebridProvider as _;
+        let client = RealDebridClient::new("fake".to_string())
+            .unwrap()
+            .with_base_url(spawn_never_answers().await);
+        let loc = crate::provider::FileLocator {
+            torrent_id: "t".to_string(),
+            link: Some("https://real-debrid.com/d/abc".to_string()),
+            ..Default::default()
+        };
+        let started = tokio::time::Instant::now();
+        let r = client.resolve_url(&loc).await;
+        assert!(
+            matches!(r, Err(crate::error::AppError::Unavailable)),
+            "a hanging endpoint is a transport failure → Unavailable, got {r:?}"
+        );
+        assert!(
+            started.elapsed()
+                <= 3 * crate::provider::READ_PATH_REQUEST_TIMEOUT + Duration::from_secs(5),
+            "the read-path budget must bound each attempt, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn unrestrict_status_skips_repair_for_auth_and_throttling_only() {
+        use reqwest::StatusCode;
+        assert!(unrestrict_status_skips_repair(StatusCode::UNAUTHORIZED));
+        assert!(unrestrict_status_skips_repair(StatusCode::FORBIDDEN));
+        assert!(unrestrict_status_skips_repair(
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+        // A stale-link 404 and every 5xx are recoverable by a re-add, so they still repair.
+        assert!(!unrestrict_status_skips_repair(StatusCode::NOT_FOUND));
+        assert!(!unrestrict_status_skips_repair(
+            StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!unrestrict_status_skips_repair(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
+
+    #[tokio::test]
     async fn resolve_url_success_returns_the_download_link() {
         // The trait-level `resolve_url` SUCCESS path returns the unrestricted `download` URL (the
         // field `dav_fs` streams bytes from), NOT `link`. The error paths are covered above; this
@@ -1454,32 +1733,6 @@ mod tests {
             r.is_ok(),
             "wait_for_retry must return immediately on the final attempt, not sleep Retry-After"
         );
-    }
-
-    // --- Compile-time signature checks for the unified fetch_with_retry ---
-    // These functions are never called; they exist only to fail compilation
-    // if the method signatures change unexpectedly.
-
-    #[allow(dead_code)]
-    async fn _assert_fetch_with_retry_accepts_terminal_statuses(client: &RealDebridClient) {
-        // Verifies fetch_with_retry accepts &[StatusCode] as second argument.
-        // If the signature changes this will not compile.
-        let _: Result<serde_json::Value, _> = client
-            .fetch_with_retry(
-                || client.client.get("https://example.com"),
-                &[
-                    reqwest::StatusCode::NOT_FOUND,
-                    reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                ],
-            )
-            .await;
-    }
-
-    #[allow(dead_code)]
-    async fn _assert_fetch_with_retry_accepts_empty_terminal_statuses(client: &RealDebridClient) {
-        let _: Result<serde_json::Value, _> = client
-            .fetch_with_retry(|| client.client.get("https://example.com"), &[])
-            .await;
     }
 
     // --- Cache eviction ---

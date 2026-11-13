@@ -1,10 +1,15 @@
+//! Live Real-Debrid media-file and NFO generation tests (`#[ignore]`; read the account only). Each
+//! skips when `RD_API_TOKEN` is unset or blank.
+
+mod common;
+
+use common::encode_path_preserve_slashes;
 use dav_server::davpath::DavPath;
 use dav_server::fs::{DavFileSystem as DavFsTrait, OpenOptions};
 use debridmoviemapper::dav_fs::DebridFileSystem;
 use debridmoviemapper::identification::identify_torrent;
 use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::repair::RepairManager;
-use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::vfs::{DebridVfs, VfsNode, VIDEO_EXTENSIONS};
 use futures_util::StreamExt;
 use std::sync::Arc;
@@ -15,19 +20,13 @@ use tokio::sync::RwLock;
 #[ignore]
 async fn test_media_file_generation() {
     let _ = tracing_subscriber::fmt::try_init();
-    dotenvy::dotenv().ok();
-
-    let api_token = std::env::var("RD_API_TOKEN")
-        .expect("RD_API_TOKEN must be set")
-        .trim()
-        .to_string();
-    let tmdb_api_key = std::env::var("TMDB_API_KEY")
-        .expect("TMDB_API_KEY must be set")
-        .trim()
-        .to_string();
+    let Some(api_token) = common::token("RD_API_TOKEN") else {
+        println!("skipping test_media_file_generation: RD_API_TOKEN not set");
+        return;
+    };
+    let tmdb_client = common::tmdb_client();
 
     let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key).unwrap());
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 
     println!("Fetching torrents...");
@@ -152,19 +151,13 @@ async fn test_media_file_generation() {
 #[ignore]
 async fn test_media_filename_keeps_original_extension() {
     let _ = tracing_subscriber::fmt::try_init();
-    dotenvy::dotenv().ok();
-
-    let api_token = std::env::var("RD_API_TOKEN")
-        .expect("RD_API_TOKEN must be set")
-        .trim()
-        .to_string();
-    let tmdb_api_key = std::env::var("TMDB_API_KEY")
-        .expect("TMDB_API_KEY must be set")
-        .trim()
-        .to_string();
+    let Some(api_token) = common::token("RD_API_TOKEN") else {
+        println!("skipping test_media_filename_keeps_original_extension: RD_API_TOKEN not set");
+        return;
+    };
+    let tmdb_client = common::tmdb_client();
 
     let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key).unwrap());
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 
     let torrents = rd_client
@@ -239,19 +232,13 @@ async fn test_media_filename_keeps_original_extension() {
 #[ignore]
 async fn test_nfo_generation_with_media() {
     let _ = tracing_subscriber::fmt::try_init();
-    dotenvy::dotenv().ok();
-
-    let api_token = std::env::var("RD_API_TOKEN")
-        .expect("RD_API_TOKEN must be set")
-        .trim()
-        .to_string();
-    let tmdb_api_key = std::env::var("TMDB_API_KEY")
-        .expect("TMDB_API_KEY must be set")
-        .trim()
-        .to_string();
+    let Some(api_token) = common::token("RD_API_TOKEN") else {
+        println!("skipping test_nfo_generation_with_media: RD_API_TOKEN not set");
+        return;
+    };
+    let tmdb_client = common::tmdb_client();
 
     let rd_client = Arc::new(RealDebridClient::new(api_token).unwrap());
-    let tmdb_client = Arc::new(TmdbClient::new(tmdb_api_key).unwrap());
     let vfs = Arc::new(RwLock::new(DebridVfs::new()));
 
     let torrents = rd_client
@@ -366,11 +353,4 @@ fn count_nfo_and_folders(
             count_nfo_and_folders(child, child_name, nfo_count, media_folders);
         }
     }
-}
-
-fn encode_path_preserve_slashes(p: &str) -> String {
-    p.split('/')
-        .map(|seg| urlencoding::encode(seg).to_string())
-        .collect::<Vec<_>>()
-        .join("/")
 }

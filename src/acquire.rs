@@ -14,14 +14,29 @@ use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcquireOutcome {
-    /// Confirmed: cached + verified (or accepted-with-warning).
+    /// A candidate is already owned for this title and present on the provider, so nothing was
+    /// added. It may itself still be `Pending` (`observe` settles it).
     Acquired(String),
-    /// Added; downloading or probe deferred — `observe` finishes it.
+    /// This candidate was added and recorded `Pending`; `observe` resolves it (title check, probe)
+    /// once its files appear.
     Pending(String),
-    /// No candidate passed (all blacklisted / above ceiling / wrong-title / failed).
+    /// No non-blacklisted candidate within the ceiling and filters could be added (none scraped,
+    /// every add failed, or the request names no episode for a show).
     NoAcceptableRelease,
-    /// Scraper unreachable; retry later.
+    /// The scraper or the provider listing was unreachable; retry later.
     TemporarilyUnavailable,
+}
+
+/// The verdict of a [`TitleValidator`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleCheck {
+    /// The file is the requested title (and, for a show, declares the requested episode).
+    Match,
+    /// The file is something else.
+    Mismatch,
+    /// No verdict: TMDB could not be reached (an outage past the client's retry budget, or a
+    /// rejected API key). The caller must not reject the release on it; check again later.
+    Unavailable,
 }
 
 /// Validates an acquired file genuinely matches the requested title (reuses `identify_name`).
@@ -34,7 +49,7 @@ pub trait TitleValidator: Send + Sync {
         kind: MediaKind,
         season: Option<u32>,
         episode: Option<u32>,
-    ) -> bool;
+    ) -> TitleCheck;
 }
 
 /// Probes a cached file's tracks (seam over `probe::probe_tracks` for testability).
@@ -67,7 +82,7 @@ impl TitleValidator for TmdbTitleValidator {
         kind: MediaKind,
         season: Option<u32>,
         episode: Option<u32>,
-    ) -> bool {
+    ) -> TitleCheck {
         // Reuse the existing identification logic; confident == resolves to the expected tmdb id.
         // identify_name needs the file(s) for its show-vs-movie heuristic; the selected file
         // (whose name carries any SxxExx pattern) is enough to drive that for a single title.
@@ -77,24 +92,42 @@ impl TitleValidator for TmdbTitleValidator {
             bytes: 0,
             selected: 1,
         }];
-        let meta = crate::identification::identify_name(file_name, &files, &self.tmdb).await;
-        let id_ok = matches!(
-            &meta,
-            Some(m) if m.external_id.as_deref() == Some(format!("tmdb:{}", expected).as_str())
+        let found = crate::identification::identify_name(file_name, &files, &self.tmdb).await;
+        title_check(&found, file_name, expected, kind, season, episode)
+    }
+}
+
+/// [`TmdbTitleValidator`]'s verdict for the identification `found` of `file_name`. A TMDB failure
+/// with nothing matched is `Unavailable`, never a `Mismatch`, so an outage can't get a correct
+/// release blacklisted.
+fn title_check(
+    found: &crate::identification::Identification,
+    file_name: &str,
+    expected: u64,
+    kind: MediaKind,
+    season: Option<u32>,
+    episode: Option<u32>,
+) -> TitleCheck {
+    use crate::identification::Identification;
+    let m = match found {
+        Identification::Identified(m) => m,
+        Identification::NoMatch => return TitleCheck::Mismatch,
+        Identification::Unavailable => return TitleCheck::Unavailable,
+    };
+    if m.external_id.as_deref() != Some(format!("tmdb:{}", expected).as_str()) {
+        return TitleCheck::Mismatch;
+    }
+    // A show's file must declare the requested episode — a multi-episode file (e.g. `S01E01E02`)
+    // requested for its second episode included.
+    let episode_ok = kind != MediaKind::Series
+        || matches!(
+            (season, episode),
+            (Some(s), Some(e)) if parse_se_all(file_name).contains(&(s, e))
         );
-        if !id_ok {
-            return false;
-        }
-        if kind == MediaKind::Series {
-            // Accept the file if it declares the requested episode — including a multi-episode file
-            // (e.g. `S01E01E02`) requested for its second episode.
-            matches!(
-                (season, episode),
-                (Some(s), Some(e)) if parse_se_all(file_name).contains(&(s, e))
-            )
-        } else {
-            true
-        }
+    if episode_ok {
+        TitleCheck::Match
+    } else {
+        TitleCheck::Mismatch
     }
 }
 
@@ -208,12 +241,12 @@ pub struct AcquisitionEngine {
     /// hash -> deferred-probe state (count + last-probe time): bounds the initial fast re-probe
     /// burst then backs off. A transient-deferring probe is never accepted unverified.
     verify_attempts: Arc<Mutex<HashMap<String, DeferState>>>,
-    /// hash -> consecutive title-validation failures. `validate` makes a live TMDB call and returns
-    /// `false` on a transient TMDB outage (indistinguishable from a genuine title mismatch), so a
-    /// single failure must NOT immediately blacklist+delete a possibly-correct cached release — we
-    /// require two CONSECUTIVE failures (≥2 scan ticks apart) before treating it as a real WrongTitle.
-    /// A single-tick TMDB blip (incl. the first observe after a restart, when this map is empty) thus
-    /// rides out; a genuine mismatch is still rejected one tick later. In-memory (best-effort).
+    /// hash -> consecutive title-validation mismatches. A TMDB outage comes back
+    /// `TitleCheck::Unavailable` and counts no strike; a `Mismatch` still needs two CONSECUTIVE
+    /// results (≥2 scan ticks apart) before the release is rejected as WrongTitle, so a one-tick
+    /// glitch that still reads as a mismatch (one of the concurrent movie/TV searches failing while
+    /// the other returns a different title) rides out. A genuine mismatch is rejected one tick
+    /// later. In-memory (best-effort).
     validate_fails: Arc<Mutex<HashMap<String, u32>>>,
     /// torrent_id -> when `get_torrent_info` FIRST started failing consecutively for a listed Pending
     /// torrent. Every other Pending arm in `observe` has a `dead_timeout` escape; the info-fetch arm
@@ -223,6 +256,12 @@ pub struct AcquisitionEngine {
     /// endpoint persistently errors) is still reaped + re-scraped instead of stranding Pending forever.
     /// In-memory (best-effort), pruned to live listing ids each tick like `progress`.
     info_fail_since: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+/// A show request that names no single episode (an account-mirror season pack's record). Shows are
+/// acquired per episode, so such a request can't be scraped.
+fn requests_no_episode(req: &AcquireRequest) -> bool {
+    req.kind == MediaKind::Series && (req.season.is_none() || req.episode.is_none())
 }
 
 /// The representative video for a movie request: the largest video file (the feature). Used both to
@@ -338,14 +377,22 @@ const VERIFY_BACKOFF: Duration = Duration::from_secs(3600);
 /// churning good releases, short enough that a genuinely-dead release is eventually swapped out.
 const VERIFY_DEADLINE_SECS: u64 = 24 * 3600;
 
+/// How long a release must itself have been deferring before the verify deadline may replace it.
+/// `added_at` is when the torrent was ADDED, so an uncached release that took more than
+/// `VERIFY_DEADLINE_SECS` to download would otherwise be replaced after its first
+/// `MAX_VERIFY_ATTEMPTS` re-probes (a few minutes of CDN trouble) — a day's download thrown away
+/// without the hourly re-probes the back-off is there to give it.
+const VERIFY_DEADLINE_MIN_DEFER: Duration = Duration::from_secs(2 * 3600);
+
 /// Per-hash deferred-probe state for transient (CDN-unavailable) probes: how many times we've
-/// probed-and-deferred (to bound the fast burst) and when we last probed (to back off afterwards).
-/// In-memory only — reset on restart; the hard deadline is anchored on the persisted `added_at`,
-/// so a restart can't extend a release's grace period without bound.
+/// probed-and-deferred (to bound the fast burst), when we last probed (to back off afterwards) and
+/// when it first deferred (epoch seconds, for `VERIFY_DEADLINE_MIN_DEFER`). In-memory only — reset
+/// on restart; the hard deadline is anchored on the persisted `added_at`.
 #[derive(Clone, Copy)]
 struct DeferState {
     attempts: u32,
     last_probe: Instant,
+    first_defer_at: u64,
 }
 
 impl AcquisitionEngine {
@@ -384,6 +431,16 @@ impl AcquisitionEngine {
     /// longer judged or deleted prematurely. `provenance` is recorded and preserved across
     /// `observe`'s re-acquire (sticky).
     pub async fn acquire(&self, req: AcquireRequest, provenance: Provenance) -> AcquireOutcome {
+        // A show is acquired one episode at a time. A request naming none (an account-mirror season
+        // pack's record) would scrape S1E1 — the scraper's default — whatever season it held, and
+        // every candidate added could only end in EpisodeMissing → blacklist → delete → next.
+        if requests_no_episode(&req) {
+            warn!(
+                "acquire: tmdb {} — show request names no episode; not scraping",
+                req.tmdb_id
+            );
+            return AcquireOutcome::NoAcceptableRelease;
+        }
         let candidates = match self
             .scraper
             .find(&req.imdb_id, req.kind, req.season, req.episode)
@@ -438,81 +495,114 @@ impl AcquisitionEngine {
                 .join(", ")
         );
 
-        // Live provider listing (lazily fetched once, only when an owned candidate is hit). Outer
-        // Option = "fetched?", inner = "fetch succeeded?". Used to distinguish "already acquired"
-        // from a lapsed/externally-deleted owned record that must be RE-added.
+        // Live provider listing (lazily fetched once: at the first candidate owned for this title,
+        // or before the first add). Outer Option = "fetched?", inner = "fetch succeeded?". Used to
+        // distinguish "already acquired" from a lapsed/externally-deleted owned record that must be
+        // RE-added, and to keep untracked torrents already in the account out of the add loop.
         let mut present: Option<Option<std::collections::HashSet<String>>> = None;
-        let top_candidates: Vec<_> = ranked
-            .into_iter()
-            .take(self.max_attempts as usize)
-            .collect();
 
-        // Order-independent idempotency pre-scan: if ANY ranked candidate is already owned AND
-        // confirmed present on the provider, this title is already acquired — short-circuit
-        // regardless of rank order. Without this, a higher-ranked NON-owned candidate iterated first
-        // would be `add_magnet`'d (a DUPLICATE torrent) even though a lower-ranked owned+present
-        // candidate exists. A transient listing failure (inner `None`) preserves the old idempotent
-        // behaviour (treat an owned record as present) rather than re-adding on a listing blip.
+        // Order-independent idempotency pre-scan over EVERY ranked candidate (owned lookups only;
+        // adds stay limited to the top `max_attempts` below): if ANY is already owned for THIS title
+        // and confirmed present on the provider, this title is already acquired — short-circuit
+        // regardless of rank order. Without this, a higher-ranked NON-owned candidate would be
+        // `add_magnet`'d (a DUPLICATE torrent) even though a lower-ranked owned+present candidate
+        // exists. A transient listing failure (inner `None`) preserves the old idempotent behaviour
+        // (treat an owned record as present) rather than re-adding on a listing blip.
         //
-        // Cache each candidate's owned-ness as we read it so the add loop below need not re-issue the
-        // same `get_owned` (a spawn_blocking redb read) for every candidate — the pre-scan visits
-        // every candidate before the add loop runs unless it short-circuits on an owned+present hit
-        // first, so the cache is complete by the time the add loop consults it.
-        let mut owned_cache: std::collections::HashMap<String, bool> =
+        // Cache each candidate's owner (`(kind, tmdb_id)` of its owned record, `None` = not owned)
+        // as we read it so the add loop below need not re-issue the same `get_owned` (a
+        // spawn_blocking redb read): the pre-scan visits every candidate before the add loop runs
+        // unless it short-circuits first, so the cache is complete by the time the add loop reads it.
+        let this_title = (req.kind, req.tmdb_id);
+        let mut owner: std::collections::HashMap<String, Option<(MediaKind, u64)>> =
             std::collections::HashMap::new();
-        for cand in &top_candidates {
-            let is_owned = self.store.get_owned(cand.info_hash.clone()).await.is_some();
-            owned_cache.insert(cand.info_hash.clone(), is_owned);
-            if is_owned {
-                if present.is_none() {
-                    present = Some(self.provider.get_torrents().await.ok().map(|ts| {
-                        ts.iter()
-                            .map(|t| t.hash.to_ascii_lowercase())
-                            .collect::<std::collections::HashSet<String>>()
-                    }));
-                }
-                let owned_present = match present.as_ref().expect("just fetched") {
-                    Some(p) => p.contains(&cand.info_hash.to_ascii_lowercase()),
-                    None => true, // listing unavailable → keep the old idempotent behaviour
-                };
-                if owned_present {
-                    debug!(
-                        "acquire: tmdb {} — {} already owned + present (idempotent, no re-add)",
-                        req.tmdb_id, cand.info_hash
-                    );
-                    return AcquireOutcome::Acquired(cand.info_hash.clone());
-                }
+        for cand in &ranked {
+            let rec_owner = self
+                .store
+                .get_owned(cand.info_hash.clone())
+                .await
+                .map(|r| (r.request.kind, r.request.tmdb_id));
+            owner.insert(cand.info_hash.clone(), rec_owner);
+            if rec_owner != Some(this_title) {
+                continue;
+            }
+            if present.is_none() {
+                present = Some(self.present_hashes().await);
+            }
+            let owned_present = match present.as_ref().expect("just fetched") {
+                Some(p) => p.contains(&cand.info_hash.to_ascii_lowercase()),
+                None => true, // listing unavailable → keep the old idempotent behaviour
+            };
+            if owned_present {
+                debug!(
+                    "acquire: tmdb {} — {} already owned + present (idempotent, no re-add)",
+                    req.tmdb_id, cand.info_hash
+                );
+                return AcquireOutcome::Acquired(cand.info_hash.clone());
             }
         }
 
-        for cand in top_candidates.into_iter() {
-            // Reuse the pre-scan's owned lookup rather than re-reading redb (defensive `unwrap_or`:
-            // the pre-scan visited every candidate before reaching here, so this is always populated).
-            if owned_cache.get(&cand.info_hash).copied().unwrap_or(false) {
-                // `present` is already populated: the pre-scan fetches it on the FIRST owned candidate
-                // it encounters, and it visits every candidate before this add loop runs, so any owned
-                // candidate reaching here was preceded by that fetch (the re-fetch this branch used to
-                // do was dead code). Short-circuit as idempotent "already acquired" ONLY when the
-                // torrent is confirmed PRESENT. A confirmed-ABSENT owned hash falls through to re-add —
-                // the title lapsed (cache lost / externally deleted), the documented re-acquire case.
-                // An unknown listing (fetch failed, or — defensively — never fetched) is treated as
-                // present, preserving the old idempotent behaviour rather than a spurious re-add.
-                let confirmed_absent = matches!(
-                    present.as_ref(),
-                    Some(Some(p)) if !p.contains(&cand.info_hash.to_ascii_lowercase())
-                );
-                if !confirmed_absent {
+        if ranked.is_empty() {
+            debug!(
+                "acquire: tmdb {} — no acceptable release ({} scraped, none passed filters)",
+                req.tmdb_id,
+                candidates.len()
+            );
+            return AcquireOutcome::NoAcceptableRelease;
+        }
+        // A candidate already in the account that this title doesn't own must never be added: on
+        // TorBox an add of a present infohash returns the EXISTING torrent's id, so the engine would
+        // adopt a torrent it never added (a still-downloading manual add, an unidentified torrent)
+        // as its own Pending record — and delete it on any rejection, or remove it later as an
+        // engine copy. So the listing must be known before the first add: if it can't be fetched,
+        // add nothing and retry later (mirrors the upgrade engine's `add_staging_candidate`).
+        if present.is_none() {
+            present = Some(self.present_hashes().await);
+        }
+        let Some(Some(present_set)) = present.as_ref() else {
+            warn!(
+                "acquire: tmdb {} — provider listing unavailable; not adding a candidate this time",
+                req.tmdb_id
+            );
+            return AcquireOutcome::TemporarilyUnavailable;
+        };
+
+        // Add the best eligible candidate, trying the next one only when the add itself fails, for
+        // at most `max_attempts` adds.
+        let mut attempts = 0u32;
+        for cand in ranked {
+            let hash_lc = cand.info_hash.to_ascii_lowercase();
+            match owner.get(&cand.info_hash).copied().flatten() {
+                // Owned for this title but not present (the pre-scan returned on a present one): the
+                // title lapsed (cache lost / externally deleted), the documented re-acquire case.
+                Some(o) if o == this_title => {
                     debug!(
-                        "acquire: tmdb {} — {} already owned + present (idempotent, no re-add)",
+                        "acquire: tmdb {} — owned {} is absent (lapsed) — re-adding",
                         req.tmdb_id, cand.info_hash
                     );
-                    return AcquireOutcome::Acquired(cand.info_hash.clone());
                 }
-                debug!(
-                    "acquire: tmdb {} — owned {} is absent (lapsed) — re-adding",
-                    req.tmdb_id, cand.info_hash
-                );
+                // Owned under ANOTHER title: adding it would overwrite that title's owned record (and
+                // on TorBox adopt its torrent). Most likely one of the two is misidentified.
+                Some((kind, other)) => {
+                    warn!(
+                        "acquire: tmdb {} — candidate {} is owned under {:?} tmdb {} (possible misidentification); skipping it",
+                        req.tmdb_id, cand.info_hash, kind, other
+                    );
+                    continue;
+                }
+                None if present_set.contains(&hash_lc) => {
+                    debug!(
+                        "acquire: tmdb {} — {} is already in the provider account but not tracked; not adding it",
+                        req.tmdb_id, cand.info_hash
+                    );
+                    continue;
+                }
+                None => {}
             }
+            if attempts >= self.max_attempts {
+                break;
+            }
+            attempts += 1;
             debug!(
                 "acquire: tmdb {} — adding {}",
                 req.tmdb_id,
@@ -574,22 +664,28 @@ impl AcquisitionEngine {
             }
             // A DIFFERENT owned hash for this exact slot may have lapsed off the provider (we just
             // added a better/replacement release above it). Reap its orphaned records — but only
-            // against a confirmed, non-empty listing (reuse the pre-scan's `present`); skip on an
-            // unknown/empty listing so a transient glitch can't reap a still-owned record.
-            if let Some(Some(present_set)) = present.as_ref() {
-                if !present_set.is_empty() {
-                    self.reap_lapsed_superseded(&req, &cand.info_hash, present_set)
-                        .await;
-                }
+            // against a non-empty listing, so a spurious empty one can't reap a still-owned record.
+            if !present_set.is_empty() {
+                self.reap_lapsed_superseded(&req, &cand.info_hash, present_set)
+                    .await;
             }
             return AcquireOutcome::Pending(cand.info_hash);
         }
         debug!(
-            "acquire: tmdb {} — no acceptable release ({} scraped, none passed filters/attempts)",
+            "acquire: tmdb {} — no acceptable release ({} scraped, none could be added)",
             req.tmdb_id,
             candidates.len()
         );
         AcquireOutcome::NoAcceptableRelease
+    }
+
+    /// The provider listing's info hashes, lowercased; `None` when the listing can't be fetched.
+    async fn present_hashes(&self) -> Option<std::collections::HashSet<String>> {
+        self.provider.get_torrents().await.ok().map(|ts| {
+            ts.iter()
+                .map(|t| t.hash.to_ascii_lowercase())
+                .collect::<std::collections::HashSet<String>>()
+        })
     }
 
     /// Validate a file name against an expected title (used by the upgrade engine before staging).
@@ -600,7 +696,7 @@ impl AcquisitionEngine {
         kind: MediaKind,
         season: Option<u32>,
         episode: Option<u32>,
-    ) -> bool {
+    ) -> TitleCheck {
         self.validator
             .validate(file_name, tmdb_id, kind, season, episode)
             .await
@@ -652,6 +748,10 @@ impl AcquisitionEngine {
                     "verify: probe transient for tmdb {} hash {} (file_id={}) — fetched url ok but the probe window read failed; defer",
                     req.tmdb_id, locator.hash, locator.file_id
                 );
+                // The URL may be the bad part (stale, or a 403/404/410): drop the provider's cached
+                // resolution so the next attempt resolves a fresh one instead of re-fetching the same
+                // URL for the hours the provider caches it.
+                self.provider.invalidate(locator).await;
                 VerifyResult::Defer
             }
         }
@@ -817,6 +917,8 @@ impl AcquisitionEngine {
         // "absent" and, past the dead-timeout, blacklist + reap it. Treat empty like a failed listing
         // for reaping (the reconciler already skips a *failed* get_torrents tick for the same reason).
         let listing_empty = torrents.is_empty();
+        // Set once a title check this tick finds TMDB unreachable (see the validation step).
+        let mut tmdb_down = false;
         for (hash, rec) in &owned {
             let Some(t) = by_hash.get(hash.as_str()).copied() else {
                 // Not in the listing. A Pending torrent that never registered/resolved is dead
@@ -1026,8 +1128,11 @@ impl AcquisitionEngine {
             // unfetchable past the deadline it is treated as effectively broken and replaced
             // (blacklist + re-acquire), bounded by the blacklist so it can't churn.
             let defer_state = self.verify_attempts.lock().await.get(hash).copied();
-            if defer_state.is_some_and(|st| st.attempts >= MAX_VERIFY_ATTEMPTS) {
-                if now_secs().saturating_sub(rec.added_at) > VERIFY_DEADLINE_SECS {
+            if let Some(st) = defer_state.filter(|st| st.attempts >= MAX_VERIFY_ATTEMPTS) {
+                let now = now_secs();
+                if now.saturating_sub(rec.added_at) > VERIFY_DEADLINE_SECS
+                    && now.saturating_sub(st.first_defer_at) >= VERIFY_DEADLINE_MIN_DEFER.as_secs()
+                {
                     self.fail_and_reacquire(
                         hash,
                         &t.id,
@@ -1038,12 +1143,10 @@ impl AcquisitionEngine {
                     .await;
                     continue;
                 }
-                if defer_state.is_some_and(|st| st.last_probe.elapsed() < VERIFY_BACKOFF) {
+                if st.last_probe.elapsed() < VERIFY_BACKOFF {
                     debug!(
                         "observe: tmdb {} hash {} probe still deferring (attempts={}) — backing off",
-                        rec.request.tmdb_id,
-                        hash,
-                        defer_state.map(|s| s.attempts).unwrap_or(0)
+                        rec.request.tmdb_id, hash, st.attempts
                     );
                     continue; // within the back-off window — wait before re-probing
                 }
@@ -1056,29 +1159,42 @@ impl AcquisitionEngine {
                 .to_string();
             // Validate ONLY on the first downloaded tick (`defer_state.is_none()`). The file name is
             // invariant, so re-validating adds nothing — but `validate` makes an UNCACHED live TMDB
-            // call, and a transient TMDB failure makes it return `false`, which would `fail_and_reacquire`
-            // (blacklist + delete) an already-validated, correct, cached release. A probe only runs
-            // after validation passes, so a recorded `defer_state` already implies a prior pass.
+            // call, and a glitch that reads as a mismatch would `fail_and_reacquire` (blacklist +
+            // delete) an already-validated, correct, cached release. A probe only runs after
+            // validation passes, so a recorded `defer_state` already implies a prior pass.
             if defer_state.is_none() {
-                let ok = self
-                    .validator
-                    .validate(
-                        &file_name,
-                        rec.request.tmdb_id,
-                        rec.request.kind,
-                        rec.request.season,
-                        rec.request.episode,
-                    )
-                    .await;
-                if ok {
-                    // Passed → clear any prior transient-failure count and fall through to the probe.
-                    self.validate_fails.lock().await.remove(hash);
+                // Once one check this tick found TMDB unreachable, don't spend another full retry
+                // cycle on each remaining record: they wait for the next tick too.
+                let check = if tmdb_down {
+                    TitleCheck::Unavailable
                 } else {
-                    // `validate` can't distinguish a transient TMDB outage from a real mismatch, so
-                    // only blacklist+delete after TWO CONSECUTIVE failures (a single-tick blip — incl.
-                    // the first observe after a restart — rides out); a genuine WrongTitle is rejected
-                    // on the next tick. The record stays Pending (invisible — no selection written yet)
-                    // meanwhile, so the one-tick delay is harmless.
+                    self.validator
+                        .validate(
+                            &file_name,
+                            rec.request.tmdb_id,
+                            rec.request.kind,
+                            rec.request.season,
+                            rec.request.episode,
+                        )
+                        .await
+                };
+                if check == TitleCheck::Match {
+                    // Passed → clear any prior mismatch count and fall through to the probe.
+                    self.validate_fails.lock().await.remove(hash);
+                } else if check == TitleCheck::Unavailable {
+                    // No verdict (TMDB outage / rejected key): no strike, nothing blacklisted. The
+                    // record stays Pending and is checked again next tick, however long TMDB is down.
+                    tmdb_down = true;
+                    debug!(
+                        "observe: tmdb {} hash {} title check unavailable (TMDB unreachable) — re-checking next tick",
+                        rec.request.tmdb_id, hash
+                    );
+                    continue;
+                } else {
+                    // Only blacklist+delete after TWO CONSECUTIVE mismatches (a single-tick glitch —
+                    // incl. the first observe after a restart — rides out); a genuine WrongTitle is
+                    // rejected on the next tick. The record stays Pending (invisible — no selection
+                    // written yet) meanwhile, so the one-tick delay is harmless.
                     let fails = {
                         let mut m = self.validate_fails.lock().await;
                         let c = m.entry(hash.to_string()).or_insert(0);
@@ -1097,7 +1213,7 @@ impl AcquisitionEngine {
                         .await;
                     } else {
                         debug!(
-                            "observe: tmdb {} hash {} title-validation failed ({}/2) — re-checking next tick (transient TMDB?)",
+                            "observe: tmdb {} hash {} title-validation mismatch ({}/2) — re-checking next tick",
                             rec.request.tmdb_id, hash, fails
                         );
                     }
@@ -1133,6 +1249,7 @@ impl AcquisitionEngine {
                     let st = m.entry(hash.to_string()).or_insert(DeferState {
                         attempts: 0,
                         last_probe: Instant::now(),
+                        first_defer_at: now_secs(),
                     });
                     st.attempts += 1;
                     st.last_probe = Instant::now();
@@ -1241,6 +1358,15 @@ impl AcquisitionEngine {
             // pack is only reaped when the provider actually lost it, so those episodes were already
             // gone. `monitor_episodes` re-acquires the full missing set (owned-episode coverage via
             // the `provides` union) on its next cycle, so the gap is bounded latency, not lost content.
+            // A show record naming no episode (an account-mirror season pack) is left to it entirely:
+            // there is no single episode to restore (see `acquire`).
+            if requests_no_episode(req) {
+                debug!(
+                    "observe: tmdb {} reaped {} names no episode; leaving re-acquisition to monitor_episodes",
+                    req.tmdb_id, hash
+                );
+                return;
+            }
             let _ = self.acquire(req.clone(), provenance.clone()).await; // promotes the next candidate (bad hash now blacklisted)
         }
     }
@@ -1615,6 +1741,31 @@ mod tests {
             file_name: Some("Movie.2023.1080p.x265.mkv".into()),
         }
     }
+    /// Like [`provider_returning`] for a FRESH add: the account listing does not hold the hash yet
+    /// (`acquire` never adds a hash already in the account that the title doesn't own).
+    fn provider_adding(status: &str, hash: &str) -> Arc<dyn DebridProvider> {
+        Arc::new(MockProvider {
+            add_magnet: Some(AddMagnetResponse {
+                id: format!("tid_{hash}"),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TI {
+                id: format!("tid_{hash}"),
+                hash: hash.into(),
+                status: status.into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "Movie.2023.1080p.x265.mkv".into(),
+                    bytes: 10,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/file".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/file".into()),
+            ..Default::default()
+        })
+    }
     fn provider_returning(status: &str, hash: &str) -> Arc<dyn DebridProvider> {
         Arc::new(MockProvider {
             // List the torrent so `get_torrents()` reports the hash as PRESENT — an owned+present
@@ -1642,6 +1793,7 @@ mod tests {
         })
     }
 
+    /// `true` → `Match`, `false` → `Mismatch`.
     struct OkValidator(bool);
     #[async_trait]
     impl TitleValidator for OkValidator {
@@ -1652,12 +1804,16 @@ mod tests {
             _k: MediaKind,
             _s: Option<u32>,
             _e: Option<u32>,
-        ) -> bool {
-            self.0
+        ) -> TitleCheck {
+            if self.0 {
+                TitleCheck::Match
+            } else {
+                TitleCheck::Mismatch
+            }
         }
     }
-    /// Validator that returns `false` for its first `fail_first` calls, then `true` — simulates a
-    /// transient TMDB outage that recovers (B5).
+    /// Validator that returns `Mismatch` for its first `fail_first` calls, then `Match` — a one-tick
+    /// glitch that still reads as a mismatch, then recovers (B5).
     struct FailThenPassValidator {
         fail_first: u32,
         calls: std::sync::atomic::AtomicU32,
@@ -1671,9 +1827,32 @@ mod tests {
             _k: MediaKind,
             _s: Option<u32>,
             _e: Option<u32>,
-        ) -> bool {
+        ) -> TitleCheck {
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            n >= self.fail_first
+            if n >= self.fail_first {
+                TitleCheck::Match
+            } else {
+                TitleCheck::Mismatch
+            }
+        }
+    }
+    /// Validator for a TMDB outage: every check is `Unavailable`. Counts its calls.
+    #[derive(Default)]
+    struct UnavailableValidator {
+        calls: std::sync::atomic::AtomicU32,
+    }
+    #[async_trait]
+    impl TitleValidator for UnavailableValidator {
+        async fn validate(
+            &self,
+            _f: &str,
+            _t: u64,
+            _k: MediaKind,
+            _s: Option<u32>,
+            _e: Option<u32>,
+        ) -> TitleCheck {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            TitleCheck::Unavailable
         }
     }
     struct CannedProber(Result<Vec<Track>, ProbeError>);
@@ -1797,7 +1976,7 @@ mod tests {
             candidates: vec![cand("h1", true)],
         });
         let eng = engine(
-            provider_returning("downloaded", "h1"),
+            provider_adding("downloaded", "h1"),
             scraper,
             Arc::new(OkValidator(true)),
             Arc::new(CannedProber(Ok(vec![]))),
@@ -1824,6 +2003,193 @@ mod tests {
                 .as_deref(),
             Some("tmdb:27205")
         );
+    }
+
+    /// Two cached candidates: `h1` (REMUX, ranked first) and `h2` (WEB).
+    fn two_ranked_candidates() -> Vec<RawCandidate> {
+        vec![
+            RawCandidate {
+                name: "Torrentio\n1080p".into(),
+                description: "Movie.2023.1080p.REMUX.x265\nRD+".into(),
+                info_hash: "h1".into(),
+                file_idx: Some(0),
+                file_name: Some("Movie.2023.1080p.REMUX.mkv".into()),
+            },
+            RawCandidate {
+                name: "Torrentio\n1080p".into(),
+                description: "Movie.2023.1080p.WEB.x265\nRD+".into(),
+                info_hash: "h2".into(),
+                file_idx: Some(0),
+                file_name: Some("Movie.2023.1080p.WEB.mkv".into()),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn acquire_never_adds_an_untracked_torrent_already_in_the_account() {
+        // The top candidate is already in the account but untracked (a still-downloading manual
+        // add, an unidentified torrent). On TorBox an add of it returns the EXISTING torrent's id,
+        // so the engine would adopt — and on any rejection delete — a torrent it never added.
+        let st = store();
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![torrent("tid_user", "h1", "downloading", 40.0)],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_h2".into(),
+                uri: String::new(),
+            }),
+            added: added.clone(),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper {
+                candidates: two_ranked_candidates(),
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        let out = eng.acquire(req(), Provenance::watchlist("alice")).await;
+        assert_eq!(out, AcquireOutcome::Pending("h2".into()));
+        assert_eq!(
+            *added.lock().unwrap(),
+            vec!["h2".to_string()],
+            "the untracked torrent's hash is never added"
+        );
+        assert!(st.get_owned("h1".into()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn acquire_adds_nothing_when_the_listing_is_unavailable() {
+        // Without the listing, presence can't be ruled out, so nothing is added (retry later).
+        let st = store();
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            fail_get_torrents: true,
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_h1".into(),
+                uri: String::new(),
+            }),
+            added: added.clone(),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper {
+                candidates: two_ranked_candidates(),
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        let out = eng.acquire(req(), Provenance::watchlist("alice")).await;
+        assert_eq!(out, AcquireOutcome::TemporarilyUnavailable);
+        assert!(added.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn acquire_skips_a_candidate_owned_under_another_title() {
+        // The top candidate is owned + present under a DIFFERENT tmdb id (a misidentified mirror
+        // copy, say). It must not count as this title being acquired, nor be added over that title's
+        // record: the next candidate is added instead.
+        let st = store();
+        let other = AcquireRequest {
+            tmdb_id: 999,
+            metadata: MediaMetadata {
+                external_id: Some("tmdb:999".into()),
+                ..meta()
+            },
+            ..req()
+        };
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: other,
+                provenance: Provenance {
+                    entries: Vec::new(),
+                },
+                added_at: 1,
+                status: OwnedStatus::Verified,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![torrent("tid_h1", "h1", "downloaded", 100.0)],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_h2".into(),
+                uri: String::new(),
+            }),
+            added: added.clone(),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper {
+                candidates: two_ranked_candidates(),
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        let out = eng.acquire(req(), Provenance::watchlist("alice")).await;
+        assert_eq!(out, AcquireOutcome::Pending("h2".into()));
+        assert_eq!(*added.lock().unwrap(), vec!["h2".to_string()]);
+        assert_eq!(
+            st.get_owned("h1".into()).await.unwrap().request.tmdb_id,
+            999,
+            "the other title's record is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_is_idempotent_on_an_owned_copy_ranked_below_the_add_attempts() {
+        // With MAX_ACQUIRE_ATTEMPTS=1 only the top candidate may be added, but an owned + present
+        // copy ranked second still means the title is acquired: nothing is added.
+        let st = store();
+        st.put_owned(
+            "h2".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::watchlist("alice"),
+                added_at: 1,
+                status: OwnedStatus::Verified,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![torrent("tid_h2", "h2", "downloaded", 100.0)],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_h1".into(),
+                uri: String::new(),
+            }),
+            added: added.clone(),
+            ..Default::default()
+        });
+        let eng = AcquisitionEngine::new(
+            provider,
+            Arc::new(MockScraper {
+                candidates: two_ranked_candidates(),
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+            prefs(),
+            1,
+            Duration::from_secs(1800),
+            Duration::from_secs(600),
+        );
+        let out = eng.acquire(req(), Provenance::watchlist("alice")).await;
+        assert_eq!(out, AcquireOutcome::Acquired("h2".into()));
+        assert!(added.lock().unwrap().is_empty(), "no duplicate is added");
     }
 
     #[tokio::test]
@@ -2382,8 +2748,10 @@ mod tests {
 
     #[tokio::test]
     async fn observe_unfetchable_past_deadline_replaces() {
-        // A torrent whose probe has been deferring since long before the verify deadline is treated
-        // as effectively broken: blacklisted + re-acquired (not accepted, not left forever).
+        // A torrent added past the verify deadline whose probe has kept deferring is treated as
+        // effectively broken: blacklisted + re-acquired (not accepted, not left forever) — but only
+        // once it has been deferring for a while itself. A download that took longer than the
+        // deadline must not lose its whole hourly re-probe window to a few minutes of CDN trouble.
         let st = store();
         st.put_owned(
             "h1".into(),
@@ -2407,10 +2775,25 @@ mod tests {
             st.clone(),
         );
         let torrents = vec![torrent("tid_h1", "h1", "downloaded", 100.0)];
-        // Fast burst first (probes every tick while attempts < MAX), then the deadline fires.
+        // Fast burst first (probes every tick while attempts < MAX). The record is past the deadline
+        // by `added_at`, but it has only just started deferring: it is kept for the back-off.
         for _ in 0..(MAX_VERIFY_ATTEMPTS + 1) {
             eng.observe(&torrents).await;
         }
+        assert!(
+            !st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await,
+            "a release that has only just started deferring keeps its re-probe window"
+        );
+        assert!(st.get_owned("h1".into()).await.is_some());
+        // Once it has been deferring for longer than the floor, the deadline fires.
+        eng.verify_attempts
+            .lock()
+            .await
+            .get_mut("h1")
+            .expect("deferring")
+            .first_defer_at -= VERIFY_DEADLINE_MIN_DEFER.as_secs() + 1;
+        eng.observe(&torrents).await;
         assert!(
             st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
                 .await,
@@ -2419,6 +2802,63 @@ mod tests {
         assert!(
             st.get_owned("h1".into()).await.is_none(),
             "and its owned record replaced (removed pending re-acquire)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_probe_drops_the_cached_cdn_url() {
+        // probe_tracks' contract: on `Transient` the caller re-resolves. The provider caches resolved
+        // URLs for hours, so without dropping the entry every re-probe would fetch the same bad URL.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let invalidated = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrent_info: Some(TI {
+                id: "tid_h1".into(),
+                hash: "h1".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "Movie.2023.1080p.x265.mkv".into(),
+                    bytes: 10,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/file".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/file".into()),
+            invalidate_calls: invalidated.clone(),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Err(ProbeError::Transient))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await;
+        assert_eq!(
+            invalidated.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the deferred probe's URL is dropped so the next attempt resolves a fresh one"
+        );
+        assert_eq!(
+            st.get_owned("h1".into()).await.unwrap().status,
+            OwnedStatus::Pending
         );
     }
 
@@ -2609,6 +3049,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observe_waits_out_a_tmdb_outage_without_rejecting_the_release() {
+        // TMDB stays unreachable for many ticks (an outage, or a rejected API key): the title check
+        // has no verdict, so the correct release must stay Pending — never blacklisted, never
+        // deleted, never replaced — and verify once TMDB answers again.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::watchlist("alice"),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![torrent("tid_h1", "h1", "downloaded", 100.0)],
+            torrent_info: Some(TI {
+                id: "tid_h1".into(),
+                hash: "h1".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "Movie.2023.1080p.x265.mkv".into(),
+                    bytes: 10,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/file".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/file".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let validator = Arc::new(UnavailableValidator::default());
+        let eng = engine(
+            provider.clone(),
+            Arc::new(MockScraper {
+                candidates: vec![cand("h2", true)],
+            }),
+            validator.clone(),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        for _ in 0..5 {
+            eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+                .await;
+        }
+        assert_eq!(
+            validator.calls.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "the title is checked again every tick"
+        );
+        assert!(
+            !st.is_blacklisted(MediaKind::Movie, 27205, "h1".into())
+                .await,
+            "an unavailable title check must never blacklist the release"
+        );
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "an unavailable title check must never delete the release"
+        );
+        assert_eq!(
+            st.get_owned("h1".into()).await.unwrap().status,
+            OwnedStatus::Pending,
+            "the release waits, Pending, for TMDB to answer"
+        );
+        assert!(
+            st.get_owned("h2".into()).await.is_none(),
+            "no replacement is acquired"
+        );
+        // TMDB answers again: the same release verifies.
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await;
+        assert_eq!(
+            st.get_owned("h1".into()).await.unwrap().status,
+            OwnedStatus::Verified
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_checks_titles_against_an_unreachable_tmdb_once_per_tick() {
+        // Each check against an unreachable TMDB costs a full retry cycle, so after the first one
+        // comes back Unavailable the other Pending records wait for the next tick unchecked.
+        let st = store();
+        for h in ["h1", "h2"] {
+            st.put_owned(
+                h.into(),
+                OwnedRecord {
+                    request: req(),
+                    provenance: Provenance::watchlist("alice"),
+                    added_at: now_secs(),
+                    status: OwnedStatus::Pending,
+                    provides: vec![],
+                    quality: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let validator = Arc::new(UnavailableValidator::default());
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            validator.clone(),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        eng.observe(&[
+            torrent("tid_h1", "h1", "downloaded", 100.0),
+            torrent("tid_h1", "h2", "downloaded", 100.0),
+        ])
+        .await;
+        assert_eq!(
+            validator.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one unavailable check per tick"
+        );
+        for h in ["h1", "h2"] {
+            assert_eq!(
+                st.get_owned(h.into()).await.unwrap().status,
+                OwnedStatus::Pending
+            );
+        }
+    }
+
+    #[test]
+    fn title_check_maps_an_unavailable_identification_to_no_verdict() {
+        use crate::identification::Identification;
+        let identified = |id: u64| {
+            Identification::Identified(MediaMetadata {
+                title: "Movie".into(),
+                year: Some("2023".into()),
+                media_type: MediaType::Movie,
+                external_id: Some(format!("tmdb:{id}")),
+            })
+        };
+        let movie = |found: &Identification| {
+            title_check(found, "Movie.2023.mkv", 27205, MediaKind::Movie, None, None)
+        };
+        assert_eq!(movie(&identified(27205)), TitleCheck::Match);
+        assert_eq!(movie(&identified(1)), TitleCheck::Mismatch);
+        assert_eq!(movie(&Identification::NoMatch), TitleCheck::Mismatch);
+        assert_eq!(
+            movie(&Identification::Unavailable),
+            TitleCheck::Unavailable,
+            "a TMDB failure is no verdict, never a mismatch"
+        );
+        // A show's file must declare the requested episode.
+        let show = |e: u32| {
+            title_check(
+                &identified(27205),
+                "Show.S01E01E02.mkv",
+                27205,
+                MediaKind::Series,
+                Some(1),
+                Some(e),
+            )
+        };
+        assert_eq!(show(2), TitleCheck::Match);
+        assert_eq!(show(3), TitleCheck::Mismatch);
+    }
+
+    #[tokio::test]
     async fn observe_prunes_stale_validate_fails_for_unowned_hash() {
         // The per-hash `validate_fails` counter (the transient-TMDB two-strikes tolerance) must be
         // bounded to currently-owned hashes each tick, exactly like `verify_attempts`/`progress`.
@@ -2633,6 +3248,112 @@ mod tests {
             !eng.validate_fails.lock().await.contains_key("ghost"),
             "a validate_fails entry for an unowned hash must be pruned each observe tick"
         );
+    }
+
+    /// A show request naming no episode — the shape of an account-mirror series record (and of an
+    /// over-ceiling pack replacement built from one).
+    fn episodeless_series_req() -> AcquireRequest {
+        AcquireRequest {
+            kind: MediaKind::Series,
+            season: None,
+            episode: None,
+            metadata: MediaMetadata {
+                media_type: MediaType::Show,
+                ..meta()
+            },
+            ..req()
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_reaps_a_dead_episodeless_series_record_without_reacquiring() {
+        // A dead mirror season pack (series record with no requested episode) is reaped, but must NOT
+        // re-acquire: the scraper would default the missing episode to S1E1, and every candidate it
+        // added could only end in EpisodeMissing → blacklist → delete → next. `monitor_episodes`
+        // re-acquires a wanted show's missing episodes through the `provides` union instead.
+        let st = store();
+        st.put_owned(
+            "hpack".into(),
+            OwnedRecord {
+                request: episodeless_series_req(),
+                provenance: Provenance {
+                    entries: Vec::new(),
+                },
+                added_at: now_secs(),
+                status: OwnedStatus::Verified,
+                provides: vec![(2, 1), (2, 2)],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![torrent("tid_pack", "hpack", "dead", 0.0)],
+            deleted: deleted.clone(),
+            added: added.clone(),
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_new".into(),
+                uri: String::new(),
+            }),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper {
+                candidates: vec![cand("hs1e1", true)],
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_pack", "hpack", "dead", 0.0)])
+            .await;
+        assert!(
+            st.get_owned("hpack".into()).await.is_none(),
+            "the dead record is reaped"
+        );
+        assert!(
+            st.is_blacklisted(MediaKind::Series, 27205, "hpack".into())
+                .await
+        );
+        assert_eq!(*deleted.lock().unwrap(), vec!["tid_pack".to_string()]);
+        assert!(
+            added.lock().unwrap().is_empty(),
+            "nothing is re-acquired for a record that names no episode"
+        );
+        assert!(st.get_owned("hs1e1".into()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn acquire_refuses_a_series_request_without_an_episode() {
+        // Defence in depth: no caller may turn an episode-less show request into an S1E1 scrape.
+        let st = store();
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            added: added.clone(),
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_new".into(),
+                uri: String::new(),
+            }),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper {
+                candidates: vec![cand("hs1e1", true)],
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        let out = eng
+            .acquire(episodeless_series_req(), Provenance::watchlist("alice"))
+            .await;
+        assert_eq!(out, AcquireOutcome::NoAcceptableRelease);
+        assert!(added.lock().unwrap().is_empty());
+        assert!(st.get_owned("hs1e1".into()).await.is_none());
     }
 
     #[tokio::test]
@@ -3315,7 +4036,8 @@ mod tests {
 
     #[tokio::test]
     async fn observe_verifies_spoken_language_audio_under_original() {
-        // Nightborn: TMDB original_language `fi`, spoken [en, fi]; the release's audio is `eng`.
+        // A `fi`-original film: TMDB original_language `fi`, spoken [en, fi]; the release's audio is
+        // `eng`.
         // Under the default `AUDIO_LANGUAGE=original` an English track is acceptable (it is one of
         // the title's spoken languages) → Verified, NOT reaped/blacklisted as BadAudio.
         let st = store();
@@ -3447,11 +4169,11 @@ mod tests {
         };
         let st = store();
         let eng = engine(
-            provider_returning("downloaded", "heng"),
+            provider_adding("downloaded", "heng"),
             Arc::new(MockScraper {
                 candidates: vec![
-                    mk("hfre", "Nightborn.2026.1080p.WEB.x265.French"),
-                    mk("heng", "Nightborn.2026.1080p.WEB.x264.English"),
+                    mk("hfre", "Film.2026.1080p.WEB.x265.French"),
+                    mk("heng", "Film.2026.1080p.WEB.x264.English"),
                 ],
             }),
             Arc::new(OkValidator(true)),
@@ -3489,7 +4211,7 @@ mod tests {
         .await
         .unwrap();
         let eng = engine(
-            provider_returning("downloaded", "h2"),
+            provider_adding("downloaded", "h2"),
             Arc::new(MockScraper {
                 candidates: vec![cand("h1", true), cand("h2", true)],
             }),

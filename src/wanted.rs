@@ -1,12 +1,16 @@
 //! Pure reconcile-core for the SP2 Trakt wanted-set lifecycle.
 //!
 //! These functions contain ZERO I/O: no store, no provider, no network, no async. They take
-//! plain data assembled by the caller (Task 8 builds a [`TitleView`] per title from the store +
-//! provider availability) and return the lifecycle decisions — acquire and removal [`Action`]s.
+//! plain data assembled by the caller (`tasks::plan_reconcile_ops` — movies plus show Trigger B —
+//! and `tasks::plan_episode_actions` — show episodes plus Trigger A — each build a [`TitleView`] per
+//! title from the store + provider availability) and return the lifecycle decisions — acquire and
+//! removal [`Action`]s.
 //!
 //! Keeping the correctness-critical lifecycle rules pure makes them exhaustively unit-testable
 //! without fixtures. The two removal triggers are:
-//!   - **Trigger A** (finished): everyone who currently wants a title has finished watching it.
+//!   - **Trigger A** (finished): every user who currently wants the title has finished it — never
+//!     while any user watchlists it. "Currently wants" means it is still in their Trakt watchlist or
+//!     `/sync/playback`; see [`trigger_a_finished`] for what that leaves out.
 //!   - **Trigger B** (abandoned): the watchlist that added it was abandoned and nobody wants it.
 //!
 //! A title with any **manual** provenance is never auto-removed, regardless of Trakt state.
@@ -15,12 +19,14 @@ use crate::store::{Provenance, ProvenanceEntry, WantedRecord, WatchedState};
 use crate::tmdb_client::ShowStatus;
 use crate::vfs::MediaType;
 
-/// The currently-owned engine copy of a title (the caller assembles this from `owned_hashes`
-/// + provider availability). Movies leave `owned_episodes` empty.
+/// The title's owned group: its engine-acquired and account-mirror (empty-provenance) owned records,
+/// aggregated per tmdb_id by the caller from `owned_hashes` + provider availability. Which of the
+/// group's hashes a removal deletes is decided by `tasks::removal_hashes`. Movies leave
+/// `owned_episodes` empty.
 ///
 /// KNOWN LIMITATION (M2/L1): `available` is a SINGLE flag for the whole title and
 /// `owned_episodes` is the union across all owning hashes — the reconcile-core cannot model
-/// "episode S01E03's pack is present but S01E05's pack lapsed". The caller (Task 8) sets
+/// "episode S01E03's pack is present but S01E05's pack lapsed". The caller sets
 /// `available` from the group's overall presence; if it folds episodes whose hash is absent
 /// into `owned_episodes`, a lapsed per-episode pack reads as "covered" and is NOT re-acquired
 /// until the WHOLE group reports unavailable. In practice the account-mirror/`provides` union
@@ -36,15 +42,15 @@ pub struct Owned {
     pub owned_episodes: Vec<(u32, u32)>, // shows: which (season, episode) are owned
 }
 
-/// Everything the reconciler needs about ONE title (one tmdb_id), assembled by the caller (Task 8).
+/// Everything the reconciler needs about ONE title (one tmdb_id), assembled by the caller.
 #[derive(Debug, Clone)]
 pub struct TitleView {
     pub tmdb_id: u64,
     pub media_type: MediaType,
     pub wanted: Vec<WantedRecord>, // per-user current wanted rows for this title (empty → nobody wants it)
-    /// The engine-owned copy of this title, or `None` if not owned. The reconciler models
-    /// ONE owned copy per title: for shows acquired episode-by-episode (multiple hashes),
-    /// the caller (Task 8) MUST aggregate all per-episode hashes into a single `Owned` whose
+    /// The title's owned group (engine-acquired and account-mirror records), or `None` if not
+    /// owned. The reconciler models ONE owned copy per title: for shows acquired episode-by-episode
+    /// (multiple hashes), the caller MUST aggregate all per-episode hashes into a single `Owned` whose
     /// `owned_episodes` is the union across hashes. The `Action::Remove`'s `hash` field is only a
     /// representative — the executor maps the `RemoveReason` to the actual hash set to delete (via
     /// `tasks::removal_hashes`, which scopes by trigger: engine-acquired hashes only for `Abandoned`,
@@ -137,6 +143,13 @@ pub fn user_finished(r: &WantedRecord, aired: &[(u32, u32)]) -> bool {
 /// Trigger A: every user who currently wants this title has finished it.
 /// Requires at least one wanting user — with no wanters this returns `false` (Trigger B's job).
 ///
+/// What that leaves out: Trakt drops a title from `/sync/playback` once it has been watched through,
+/// so a title acquired only from in-progress usually stops being wanted by the time it is finished.
+/// With no wanters, Trigger A never fires and (with no watchlist provenance) neither does Trigger B,
+/// so such a title is KEPT. Trigger A in practice reclaims a title still in `/sync/playback` while
+/// already watched (a paused re-watch), or a show that `REMOVE_FINISHED_SHOWS` folds back into the
+/// wanted set once it is finished and ended.
+///
 /// A **watchlisted** title is an explicit "keep this available" signal and is NEVER finished-removed:
 /// re-adding a title you've already watched to your watchlist means you want to (re)watch it, so it
 /// must stay acquired regardless of watched state. So Trigger A does not fire while ANY user
@@ -171,17 +184,25 @@ pub fn trigger_b_abandoned(wanted: &[WantedRecord], provenance: &Provenance) -> 
     entered_via_watchlist && !wanted.iter().any(wants)
 }
 
-/// Whether the reconciler should remove this title's engine copy.
-/// Only engine-owned, non-manual titles are removable; then either trigger fires.
-pub fn should_remove(title: &TitleView) -> bool {
-    let Some(owned) = &title.owned else {
-        return false; // only engine-owned titles are removable
-    };
-    if owned.provenance.has_manual_entry() {
-        return false; // manual provenance is never auto-removed
-    }
-    trigger_a_finished(&title.wanted, &title.aired_episodes)
-        || trigger_b_abandoned(&title.wanted, &owned.provenance)
+/// The removal predicate `reconcile_title` applies to an owned title: a title with manual
+/// provenance is never removable; otherwise either trigger removes it. `finished` is Trigger A,
+/// which the caller computes once per title.
+fn removable(owned: &Owned, finished: bool, wanted: &[WantedRecord]) -> bool {
+    !owned.provenance.has_manual_entry()
+        && (finished || trigger_b_abandoned(wanted, &owned.provenance))
+}
+
+/// Whether the reconciler would remove this title: owned, and [`removable`]. Test-only shorthand
+/// for the exact predicate `reconcile_title` uses.
+#[cfg(test)]
+fn should_remove(title: &TitleView) -> bool {
+    title.owned.as_ref().is_some_and(|owned| {
+        removable(
+            owned,
+            trigger_a_finished(&title.wanted, &title.aired_episodes),
+            &title.wanted,
+        )
+    })
 }
 
 /// True iff episode `e` is owned AND currently available (a lapsed cache → false, forcing re-acquire).
@@ -200,15 +221,12 @@ pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
     // former repeated evaluations.
     let finished = trigger_a_finished(&title.wanted, &title.aired_episodes);
 
-    // Removal first: if a title qualifies for removal we never also acquire it. Reuse `finished`
-    // rather than routing through `should_remove` (which would recompute Trigger A): removal is
-    // `owned && !manual && (A || B)`, and inside this branch `owned` holds, so `A == finished`.
+    // Removal first: if a title qualifies for removal we never also acquire it.
     if let Some(owned) = &title.owned {
-        let removable = !owned.provenance.has_manual_entry()
-            && (finished || trigger_b_abandoned(&title.wanted, &owned.provenance));
-        if removable {
-            // Distinguish the trigger so the executor removes the right hash set: Trigger A
-            // (finished) is a full cleanup incl. mirror copies; Trigger B (abandoned) keeps mirror.
+        if removable(owned, finished, &title.wanted) {
+            // Distinguish the trigger so the executor removes the right hash set
+            // (`tasks::removal_hashes`): Trigger A (finished) also reclaims mirror copies for a show
+            // under REMOVE_FINISHED_SHOWS; Trigger B (abandoned) always keeps them.
             // removable == A || B, so if A didn't fire it must be B.
             let reason = if finished {
                 RemoveReason::Finished
@@ -335,11 +353,6 @@ pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
     }
 }
 
-/// Reconcile a batch of titles, preserving per-title and within-title action order.
-pub fn reconcile(titles: &[TitleView]) -> Vec<Action> {
-    titles.iter().flat_map(reconcile_title).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +470,20 @@ mod tests {
                 reason: RemoveReason::Finished
             }]
         );
+    }
+
+    #[test]
+    fn finished_in_progress_movie_no_longer_wanted_is_kept() {
+        // Pins the documented keep behaviour: a movie acquired only from in-progress whose wanted row
+        // has gone (Trakt dropped it from /sync/playback once it was watched through) has no current
+        // wanter for Trigger A and no watchlist provenance for Trigger B, so it stays in the library.
+        let t = movie_title(
+            1,
+            vec![],
+            Some(owned("h", Provenance::in_progress("alice"), true, vec![])),
+        );
+        assert!(!should_remove(&t));
+        assert_eq!(reconcile_title(&t), vec![]);
     }
 
     #[test]
@@ -1278,8 +1305,8 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_flat_maps_and_preserves_order() {
-        let titles = vec![
+    fn reconcile_title_handles_a_mix_of_titles() {
+        let titles = [
             // wanted, not owned → AcquireMovie
             movie_title(10, vec![watchlist_movie_record("a", 10, false)], None),
             // finished + owned (non-manual), in-progress-only (not watchlisted) → Remove
@@ -1294,7 +1321,7 @@ mod tests {
             movie_title(12, vec![], None),
         ];
         assert_eq!(
-            reconcile(&titles),
+            titles.iter().flat_map(reconcile_title).collect::<Vec<_>>(),
             vec![
                 Action::AcquireMovie { tmdb_id: 10 },
                 Action::Remove {
