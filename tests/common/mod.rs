@@ -41,17 +41,66 @@ pub fn tmdb_client() -> Arc<TmdbClient> {
     Arc::new(TmdbClient::new(key).unwrap())
 }
 
-/// The ids of every torrent in the account whose hash is `hash` (compared case-insensitively). A
-/// listing failure reads as none.
-pub async fn find_ids_by_hash(provider: &Arc<dyn DebridProvider>, hash: &str) -> Vec<String> {
-    match provider.get_torrents().await {
-        Ok(torrents) => torrents
-            .into_iter()
-            .filter(|t| t.hash.eq_ignore_ascii_case(hash))
-            .map(|t| t.id)
-            .collect(),
-        Err(_) => Vec::new(),
+/// The ids of every torrent in the account whose hash is `hash` (compared case-insensitively), or
+/// the listing's error, so an assertion can tell a failed listing from a missing torrent.
+pub async fn find_ids_by_hash(
+    provider: &Arc<dyn DebridProvider>,
+    hash: &str,
+) -> Result<Vec<String>, reqwest::Error> {
+    Ok(provider
+        .get_torrents()
+        .await?
+        .into_iter()
+        .filter(|t| t.hash.eq_ignore_ascii_case(hash))
+        .map(|t| t.id)
+        .collect())
+}
+
+/// Call `list` (a listing of one hash's torrent ids, e.g. [`find_ids_by_hash`]) up to `attempts`
+/// times, `every` apart, until it returns an id. TorBox's backend can lag right after an add: the
+/// listing may leave out a torrent whose own lookup already reports `downloaded` (the same
+/// inconsistency that makes `mylist?id=` 404 a torrent that exists, see `STAGED_INFO_BACKOFF` in
+/// `src/upgrade.rs`), so one listing can't show the torrent is missing. On giving up, the error
+/// says how many listings failed (with the last error) and how many left the torrent out.
+pub async fn poll_until_listed<F, Fut, E>(
+    mut list: F,
+    attempts: u32,
+    every: Duration,
+) -> Result<Vec<String>, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<String>, E>>,
+    E: std::fmt::Display,
+{
+    let (mut missing, mut errored) = (0u32, 0u32);
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(every).await;
+        }
+        match list().await {
+            Ok(ids) if !ids.is_empty() => return Ok(ids),
+            Ok(_) => missing += 1,
+            Err(e) => {
+                errored += 1;
+                last_error = Some(e.to_string());
+            }
+        }
     }
+    let outcome = match (missing, errored) {
+        (_, 0) => format!("the torrent was missing from all {missing} listings"),
+        (0, _) => format!("all {errored} listings errored"),
+        _ => format!(
+            "the torrent was missing from {missing} listings and {errored} listings errored"
+        ),
+    };
+    let last = last_error
+        .map(|e| format!("; last listing error: {e}"))
+        .unwrap_or_default();
+    Err(format!(
+        "{outcome} ({attempts} polls, {}s apart){last}",
+        every.as_secs()
+    ))
 }
 
 /// Best effort: delete every torrent whose hash is one of `hashes` (compared case-insensitively),

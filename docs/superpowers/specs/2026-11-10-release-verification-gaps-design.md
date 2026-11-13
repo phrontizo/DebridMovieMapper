@@ -2,21 +2,23 @@
 
 **Date:** 2026-11-10 · **Status:** approved ("do all 5") · **Branch:** `v2`
 
-## Problem (live evidence, hydra DB copy 2026-11-10)
+## Problem (live evidence from a deployment's database)
 
-**Nightborn (movie, tmdb 964849)** is held as `Nightborn.2026.Multi.Vff.WEBRIP.mp4` (SD, French dub +
-a `fin`-tagged VO track, French subtitles only). TMDB says `original_language = fi`, but the film is
+**A `fi`-original film** is held as an SD `Film.2026.Multi.Vff.WEBRIP.mp4`-shaped release (French dub
++ a `fin`-tagged VO track, French subtitles only). TMDB says `original_language = fi`, but the film is
 mostly English. With the default `AUDIO_LANGUAGE=original` every correctly `eng`-tagged release was
-blacklisted `BadAudio` (20/21 Oct, and the upgrade pass on 6 Nov). Two French releases were blacklisted
-`BadSubtitle` (so `SUBTITLE_LANGUAGE=en` is set). The owned SD file — same group, same track layout —
-was accepted two minutes later only because it is a non-faststart MP4 (`ftyp`,`free`, 721 MB `mdat`,
-then a 6.3 MB `moov` at EOF): the 4 MB suffix probe can't parse it → `TracksNotFound` → Accept.
+blacklisted `BadAudio`, at acquisition and again by the upgrade pass. Two French releases were
+blacklisted `BadSubtitle` (a subtitle requirement is configured). The owned SD file — same group, same
+track layout — was accepted only because it is a non-faststart MP4 (`ftyp`,`free`, a several-hundred-MB
+`mdat`, then a `moov` of a few MB at EOF): the 4 MB suffix probe can't parse it → `TracksNotFound` →
+Accept.
 
-**YAGA S01E04 (show, tmdb 314360)** is served from `Yaga.S01E01-E04.WEBRip.XviD.Rus` (Russian-dub SD
-`.avi` pack) acquired 6 Nov 00:41 UTC, the air date, while E01–E03 are 1080p ENG/ITA WEB-DLs. The
-name's `Rus` and Torrentio's 🇷🇺 flag aren't recognised (no ranking penalty), `.avi` is `Unsupported` →
-Accept (no language check), and the upgrade engine never revisits it: per-episode upgrades only cover
-single-episode torrents, pack correction only over-ceiling packs, consolidation only full-season packs.
+**An example show's S01E04** is served from a `Show.S01E01-E04.WEBRip.XviD.Rus`-shaped release (a
+Russian-dub SD `.avi` pack) acquired on the episode's air date, while E01–E03 are 1080p ENG/ITA WEB-DLs.
+The name's `Rus` and Torrentio's 🇷🇺 flag aren't recognised (no ranking penalty), `.avi` is
+`Unsupported` → Accept (no language check), and the upgrade engine never revisits it: per-episode
+upgrades only cover single-episode torrents, pack correction only over-ceiling packs, consolidation
+only full-season packs.
 
 ## Design
 

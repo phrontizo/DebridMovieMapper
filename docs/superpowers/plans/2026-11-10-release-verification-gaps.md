@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Stop wrong-language / low-quality releases slipping into the library (Nightborn, YAGA S01E04) and let the upgrade engine replace the ones already there.
+**Goal:** Stop wrong-language / low-quality releases slipping into the library (a `fi`-original film held as a French dub, an example show's S01E04 served from a Russian-dub `.avi` pack) and let the upgrade engine replace the ones already there.
 
 **Architecture:** Five independent fixes across the probe (`probe.rs`), release parsing/scoring (`release.rs`, `config.rs`), TMDB metadata plumbing (`tmdb_client.rs`, `store.rs`, `tasks.rs`, `acquire.rs`) and the upgrade engine (`upgrade.rs`), each test-first and committed separately.
 
@@ -65,11 +65,11 @@
 - `parse` keeps de-duplicating codes. `mul` is pushed only when a `MULTI_RE` match is NOT immediately followed by `sub` (Torrentio's `Multi Subs`).
 
 - [ ] **Step 1: Write failing tests** (release tests module, `raw(name, desc, hash, file)` helper):
-  - `parse_tags_language_abbreviations`: `Yaga.s01e04.WEBRip.XviD.Rus.RuDub.tv.avi` → languages contain `rus`; `Nightborn.2026.MULTi.VFF.1080p.WEBRip` → contain `fre` and `mul`; `Nightborn (2026) [Bluray 1080p][Esp]` → contain `spa`; `Danza.con.il.diavolo.ITA.ENG.1080p` → contain `ita` and `eng`.
+  - `parse_tags_language_abbreviations`: `Show.s01e04.WEBRip.XviD.Rus.RuDub.tv.avi` → languages contain `rus`; `Film.2026.MULTi.VFF.1080p.WEBRip` → contain `fre` and `mul`; `Film (2026) [Bluray 1080p][Esp]` → contain `spa`; `Danza.con.il.diavolo.ITA.ENG.1080p` → contain `ita` and `eng`.
   - `parse_maps_torrentio_flags_to_languages`: desc `"👤 9 💾 1.7 GB ⚙️ EXT\n🇷🇺"` → `rus`; desc `"…\n🇬🇧 / 🇮🇹"` → `eng` + `ita`.
   - `multi_subs_marker_is_not_multi_audio`: desc `"Multi Subs / 🇷🇺"` → no `mul`, has `rus`; desc `"Multi Audio / 🇬🇧 / 🇫🇷"` → has `mul`.
-  - `subtitle_only_markers_do_not_tag_audio`: `YAGA S01E04 - Saison 1 VOSTFR HDTV 2026` (no flag) → languages empty.
-  - `score_penalises_russian_tagged_release_for_english_original`: with `prefs().audio = AudioReq::Lang("en")`, `score(Yaga.S01E04.1080p.Rus.ColdFilm)` < `score(Yaga.S01E04.1080p.WEB)` by ≥ 50_000.
+  - `subtitle_only_markers_do_not_tag_audio`: `Show S01E04 - Saison 1 VOSTFR HDTV 2026` (no flag) → languages empty.
+  - `score_penalises_russian_tagged_release_for_english_original`: with `prefs().audio = AudioReq::Lang("en")`, `score(Show.S01E04.1080p.Rus.ColdFilm)` < `score(Show.S01E04.1080p.WEB)` by ≥ 50_000.
 - [ ] **Step 2: Run** `cargo test --lib release::` — new tests FAIL.
 - [ ] **Step 3: Implement** the table additions, `flag_languages` (decode pairs of chars in `U+1F1E6..=U+1F1FF` to `A`–`Z`), the `Multi Subs` exclusion (inspect the text right after each `MULTI_RE` match end), and fold flag codes into `languages` (de-duplicated). Existing tests (`multi_is_separator_bounded_not_a_substring`, `language_words_are_separator_bounded_not_substrings`, etc.) must stay green.
 - [ ] **Step 4: Run** `cargo test --lib` — all PASS.
@@ -97,7 +97,7 @@
 - Produces (upgrade.rs): `async fn backfill_spoken_languages(app: &AppState, tmdb_id: u64, media_type: &MediaType, hashes: &[String], rec: &mut OwnedRecord)` — no-op unless `rec.request.spoken_languages.is_none()`; on `app.tmdb_client.details` Ok, sets `Some(list)` on `rec` and read-modify-writes every record in `hashes` via `get_owned`/`put_owned`; on Err logs at debug and leaves everything `None`. Called in `run_upgrade_once` for each title right before dispatch.
 
 - [ ] **Step 1: Write failing tests:**
-  - tmdb: `parse_details_captures_spoken_languages` (`{"title":"Nightborn","release_date":"2026-07-01","original_language":"fi","spoken_languages":[{"iso_639_1":"en"},{"iso_639_1":"fi"},{"iso_639_1":"es"}]}` → `spoken_languages == ["en","fi","es"]`); missing key → empty vec. Adjust the two existing `parse_details` tests to the struct.
+  - tmdb: `parse_details_captures_spoken_languages` (`{"title":"Film","release_date":"2026-07-01","original_language":"fi","spoken_languages":[{"iso_639_1":"en"},{"iso_639_1":"fi"},{"iso_639_1":"es"}]}` → `spoken_languages == ["en","fi","es"]`); missing key → empty vec. Adjust the two existing `parse_details` tests to the struct.
   - store: `acquire_request_without_spoken_languages_decodes_as_none` (legacy JSON of an `OwnedRecord` → `request.spoken_languages == None`).
   - config: `with_resolved_audio_unions_original_and_spoken` (`(Some("fi"), ["en","fi","es"])` → `AnyOf(["fi","en","es"])`); existing single-language assertions keep `Lang(..)` with `&[]`; explicit `Lang("de")` ignores spoken.
   - probe: `verify_original_accepts_a_spoken_language` (eng audio, original `fi`, spoken `[en,fi,es]` → `Pass`); `verify_original_without_spoken_still_requires_original` (eng audio, original `fi`, spoken `[]` → `FailAudio`); `verify_explicit_audio_ignores_spoken` (`Lang("de")`, spoken `[en]`, eng audio → `FailAudio`).
@@ -156,7 +156,7 @@
   - `pack_kept_while_it_still_serves_another_episode` (served_by E3:pack too → `false`).
   - `pack_kept_when_an_unserved_episode_is_not_covered_elsewhere` (other_provides lacks E2 → `false`).
 - [ ] **Step 2: Write failing integration-style tests** following the existing show upgrade tests (`MockProvider` + scripted scraper + `app_with`):
-  - `pack_served_episode_is_upgraded_and_superseded_pack_pruned` — YAGA shape: singletons E1–E3 (1080p WEB, Verified, slots → singletons), pack P providing E1–E4 (resolution 0, WEB tier, `unverified: true`), slot E4 → P; scraper offers a cached 1080p single for E4 → slot E4 repointed to the new hash, P deleted from the provider and its owned record removed, E1–E3 untouched.
+  - `pack_served_episode_is_upgraded_and_superseded_pack_pruned` — the example show's shape: singletons E1–E3 (1080p WEB, Verified, slots → singletons), pack P providing E1–E4 (resolution 0, WEB tier, `unverified: true`), slot E4 → P; scraper offers a cached 1080p single for E4 → slot E4 repointed to the new hash, P deleted from the provider and its owned record removed, E1–E3 untouched.
   - `pack_served_episode_upgrade_keeps_pack_serving_other_episodes` — pack serves E3 and E4, only E4 has a better single → E4 repointed, pack kept.
   - `pack_sample_first_skips_remaining_episodes_when_nothing_better` — pack serves E1–E3, scraper returns no improving candidate for E1 → exactly one scrape issued for that pack (count scraper calls).
   - `over_ceiling_pack_is_left_to_pack_correction` — pack with `resolution > ceiling` → phase (a2) issues no scrape for it.
@@ -170,4 +170,4 @@
 - [ ] **Step 1:** `cargo fmt --check && cargo clippy --all-targets -- -D warnings` — clean.
 - [ ] **Step 2:** Full test gate (Global Constraints) — all pass; record counts.
 - [ ] **Step 3:** Confirm `CLAUDE.md`/`README.md` describe all five behaviours (grep for `spoken`, `unverified`, `schema v8`, `pack-served`/`multi-episode pack`, `flag`).
-- [ ] **Step 4:** Ask the user before `git push origin v2` (CI publishes `:v2edge`) and before `ssh hydra-media "redeploy debridmoviemapper"` (interrupts playback). After a redeploy, watch `ssh hydra-media "logs debridmoviemapper --since 10m"` for the v8 migration and the next upgrade tick.
+- [ ] **Step 4:** Ask the user before `git push origin v2` (CI publishes `:v2edge`) and before redeploying the service (interrupts playback). After a redeploy, watch the service logs for the v8 migration and the next upgrade tick.

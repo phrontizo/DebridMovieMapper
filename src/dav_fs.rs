@@ -540,20 +540,25 @@ impl ProxiedMediaFile {
     ///   readers don't all re-resolve through the rate-limiter at once (a stampede).
     ///
     /// - **Persistent 5xx**: NOT a stale URL — the file is (transiently) broken on the provider, so
-    ///   again do NOT invalidate. Retry the same url; once a retry still 5xxs, escalate to instant
-    ///   repair (re-add by hash) ONCE — a cached replacement fixes playback inline, else the read
-    ///   fails (rather than the player retry-storming a 500 forever).
+    ///   again do NOT invalidate. Retry the same url; only when that retry still 5xxs (two 5xx in a
+    ///   row, whatever failed before them) escalate to instant repair (re-add by hash) ONCE — a
+    ///   cached replacement fixes playback inline, else the read fails (rather than the player
+    ///   retry-storming a 500 forever). A single 5xx after another kind of failure is just retried.
     ///
     /// - **Genuinely stale / non-compliant** (expired 403/410, a Range-ignoring 200 on a seek, an
     ///   oversized body, or a Content-Range mismatch): drop `cdn_url` + invalidate the resolution so
     ///   the next attempt re-resolves a fresh URL.
     async fn fetch_cdn_range(&mut self, pos: u64, range_end: u64) -> Result<Bytes, FsError> {
         // Three attempts: the original url, one retry (the same url after a connection error or a
-        // 5xx; a freshly re-resolved url after a stale 4xx / non-compliant response), then (only if a
-        // 5xx persisted) one post-instant-repair fetch. `repaired` caps the repair escalation at once
-        // per call.
+        // 5xx; a freshly re-resolved url after a stale 4xx / non-compliant response), then either one
+        // post-instant-repair fetch (when the retry 5xxed again) or a same-url retry of a 5xx that
+        // followed a different failure. `repaired` caps the repair escalation at once per call;
+        // `prev_5xx` (whether the previous attempt got a 5xx) makes it need two 5xx in a row.
         let mut repaired = false;
+        let mut prev_5xx = false;
         'attempts: for attempt in 0..3u8 {
+            // Every arm but the 5xx one leaves this false for the next attempt.
+            let after_5xx = std::mem::take(&mut prev_5xx);
             let cdn_url = self.resolve_cdn_url().await?;
 
             let resp = match self
@@ -631,20 +636,25 @@ impl ProxiedMediaFile {
                 // resolution for a 5xx: with many concurrent readers (one ProxiedMediaFile per rclone
                 // read-ahead) all invalidating at once, the next reads would serialise through the
                 // rate-limited resolve path (~63s hang) — the exact stampede the connection-error arm
-                // above avoids. Retry the SAME url; once a retry (attempt > 0) still 5xxs, escalate to
-                // instant repair (re-add by hash) ONCE — a cached replacement fixes playback inline,
-                // else the read fails (instead of the player retry-storming a 500 forever). The repair
-                // cooldown bounds re-add attempts. (`oversized`/`range_mismatch` require a 2xx, so they
-                // never reach this `is_server_error` arm.)
+                // above avoids. Retry the SAME url; once that retry still 5xxs (the previous attempt
+                // was a 5xx too), escalate to instant repair (re-add by hash) ONCE — a cached
+                // replacement fixes playback inline, else the read fails (instead of the player
+                // retry-storming a 500 forever). A single 5xx after a connection error, a body-read
+                // error or a stale URL is only retried: a repair hides the torrent from every other
+                // stream while it runs and on Real-Debrid re-adds it, so it needs two 5xx in a row.
+                // The repair cooldown bounds re-add attempts. (`oversized`/`range_mismatch` require a
+                // 2xx, so they never reach this `is_server_error` arm.)
                 if status.is_server_error() {
-                    if attempt > 0 && !repaired {
+                    // (Not on the last attempt: no fetch would be left to use the repair.)
+                    if after_5xx && !repaired && attempt < 2 {
                         repaired = true;
                         if self.attempt_instant_repair().await.is_ok() {
                             continue; // fetch again against the repaired torrent's fresh url
                         }
                         return Err(FsError::GeneralFailure);
                     }
-                    if attempt == 0 {
+                    if attempt < 2 {
+                        prev_5xx = true;
                         continue; // retry the SAME url (no invalidate) — a transient origin blip
                     }
                     return Err(FsError::GeneralFailure);
@@ -1947,6 +1957,121 @@ mod provider_abstraction_tests {
             f.locator.torrent_id, "new_tid",
             "the locator must have swapped to the repaired torrent"
         );
+    }
+
+    /// Server that answers its first requests in turn from `first` — a status line such as
+    /// "500 Internal Server Error" (no body), or `DROP` to close the connection unanswered (a
+    /// transport error on the client) — then serves `206` with `body`. Every response closes its
+    /// connection.
+    async fn spawn_sequence_then_206(
+        first: &'static [&'static str],
+        body: &'static [u8],
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for n in 0..first.len() + 3 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                if first.get(n) == Some(&DROP) {
+                    drop(sock);
+                    continue;
+                }
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                match first.get(n) {
+                    Some(status) => {
+                        let head = format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                    }
+                    None => {
+                        let head = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(body).await;
+                    }
+                }
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{}/", addr)
+    }
+    const DROP: &str = "DROP";
+
+    /// A `ProxiedMediaFile` on [`broken_movie_locator`] whose url `url` is resolved, over a provider
+    /// with which an instant repair WOULD succeed (the hash re-adds as the cached `new_tid`), so a
+    /// test can tell from `f.locator.torrent_id` whether the fetch escalated to a repair.
+    fn proxied_repairable(url: String, file_size: u64) -> ProxiedMediaFile {
+        use crate::rd_client::{AddMagnetResponse, TorrentFile, TorrentInfo};
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            resolved_url: Some(url.clone()),
+            add_magnet: Some(AddMagnetResponse {
+                id: "new_tid".to_string(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "new_tid".to_string(),
+                hash: "H".to_string(),
+                status: "downloaded".to_string(),
+                files: vec![TorrentFile {
+                    id: 5,
+                    path: "/Movie.mkv".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                }],
+                links: vec!["https://rd/newlink".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut f = proxied(provider, broken_movie_locator(), file_size);
+        f.cdn_url = Some(url);
+        f
+    }
+
+    /// One 5xx is retried on the same url, whatever failed before it: only two 5xx IN A ROW
+    /// escalate to instant repair (which hides the torrent from every other stream while it runs,
+    /// and on Real-Debrid re-adds it). Here a stale 403 (re-resolved) is followed by a single 500,
+    /// then the bytes.
+    #[tokio::test]
+    async fn fetch_cdn_range_a_single_5xx_after_a_stale_url_does_not_repair() {
+        let body: &[u8] = b"AFTERSTALE123456"; // 16 bytes
+        let url =
+            spawn_sequence_then_206(&["403 Forbidden", "500 Internal Server Error"], body).await;
+        let mut f = proxied_repairable(url, body.len() as u64);
+
+        let data = f
+            .fetch_bytes(8)
+            .await
+            .expect("403, 500, then 206 must serve the bytes");
+
+        assert_eq!(&data[..], b"AFTERSTA");
+        assert_eq!(
+            f.locator.torrent_id, "old_tid",
+            "a single 5xx must not escalate to instant repair"
+        );
+    }
+
+    /// The same after a connection error: a dropped connection, then one 500, then the bytes.
+    #[tokio::test]
+    async fn fetch_cdn_range_a_single_5xx_after_a_connection_error_does_not_repair() {
+        let body: &[u8] = b"AFTERDROP1234567"; // 16 bytes
+        let url = spawn_sequence_then_206(&[DROP, "500 Internal Server Error"], body).await;
+        let mut f = proxied_repairable(url, body.len() as u64);
+
+        let data = f
+            .fetch_bytes(8)
+            .await
+            .expect("a dropped connection, 500, then 206 must serve the bytes");
+
+        assert_eq!(&data[..], b"AFTERDRO");
+        assert_eq!(f.locator.torrent_id, "old_tid");
     }
 
     /// Server that DROPS the first accepted connection (a transport error on the client) then serves a

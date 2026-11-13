@@ -22,9 +22,13 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 ///
 /// The VFS build uses every code for its selection gate (a double-episode file stays visible while
 /// any episode it carries is not served by another copy), and the first one for season placement.
-/// `acquire::parse_se_all` is a copy of this function, used for `provides` and the `selection` slots
-/// `observe` writes; the two must agree on which file supplies which episode, so the acquisition
-/// engine should call this one instead.
+/// The acquisition engine uses it too, for a show's `provides`, the `selection` slots `observe`
+/// writes and the title check's episode test, so the VFS and the engine always agree on which file
+/// supplies which episode. A multi-episode file contributes every episode it carries: reporting only
+/// the first would leave the second looking un-owned, and `monitor_episodes` would re-acquire it as a
+/// duplicate singleton. The dash-code fallback exists for the same reason: without it a pack named
+/// `Show - 409 - Title` derives an empty `provides`, so the reconciler sees none of its episodes as
+/// owned and re-acquires the whole show as per-episode torrents (permanent duplicates).
 ///
 /// The `SxxEyy` arm is deliberately NOT word-anchored (unlike `SEASON_RE`); a literal `e` must
 /// immediately follow the season digits, so a mid-token match is very unlikely in practice. Each
@@ -32,10 +36,13 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// mis-parsed as an episode (`S01E01.1080p` → the `.1080` has no `e`, so it is NOT a continuation).
 ///
 /// KNOWN LIMITATIONS: a RANGE form spanning more than two episodes (`S01E01-E03`) yields only the
-/// explicit endpoints `[(1,1),(1,3)]`; and a 3-digit dash code is decoded as concatenated `SxxEyy`,
-/// so an absolute (anime) number (`One Piece - 409 - …`) reads as a phantom `(4, 9)`. Exactly 3
-/// digits (season 1–9) are accepted, so a 4-digit year/date token (`Show - 2024 - Title`) never
-/// decodes, and an episode-00 decode is rejected.
+/// explicit endpoints `[(1,1),(1,3)]` (the middle one may be re-acquired as a duplicate; such
+/// single files are uncommon); and a 3-digit dash code is decoded as concatenated `SxxEyy`, so an
+/// absolute (anime) number (`One Piece - 409 - …`) reads as a phantom `(4, 9)`, which can suppress
+/// re-acquiring the real S04E09 and write a wrong selection slot — accepted, since concatenated
+/// Western packs are far more common and an empty `provides` was worse. Exactly 3 digits (season
+/// 1–9) are accepted, so a 4-digit year/date token (`Show - 2024 - Title`) never decodes, and an
+/// episode-00 decode is rejected.
 pub(crate) fn parse_se_all(name: &str) -> Vec<(u32, u32)> {
     static SE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})e(\d{1,3})((?:[-_. ]?e\d{1,3})*)").unwrap());
@@ -522,10 +529,13 @@ impl DebridVfs {
                     // ASYMMETRY (B11): unlike the episode path, this matches the selection by HASH only
                     // and then emits ALL selected streamable video files of that torrent (exactly one,
                     // for a single-feature movie) — it does NOT enforce the stored
-                    // `SelectionEntry.file_path`. That is safe because a movie torrent holds a
-                    // single feature (the acquisition + upgrade pack-guards reject multi-feature packs),
-                    // so the hash uniquely identifies the file; the stored `file_path` is forward-compat
-                    // only. Enforcing it here (without the episode path's largest-bytes self-heal on a
+                    // `SelectionEntry.file_path`. That is safe because a movie torrent the engine adds
+                    // holds a single feature (the acquisition + upgrade pack-guards reject multi-feature
+                    // packs), so the hash uniquely identifies the file. An account-mirror copy can be a
+                    // multi-film collection: emitting every selected file then shows each film, and
+                    // dedup and the upgrade engine never remove such a copy
+                    // (`tasks::multi_feature_hashes`). The stored `file_path` is forward-compat only.
+                    // Enforcing it here (without the episode path's largest-bytes self-heal on a
                     // path mismatch) would risk HIDING a movie after a re-acquire shifted the path, so
                     // the hash-only match is deliberate.
                     let selected_hash = tmdb_id_of(&metadata)
@@ -1068,9 +1078,11 @@ static EXCLUDED_LEADING_METADATA_RE: LazyLock<Regex> = LazyLock::new(|| {
 static RELEASE_YEAR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:19|20)\d{2}\b").unwrap());
 
-/// An SxxExx episode code marks a real episode — a sample/trailer/extra never carries one — so a
-/// file with one is kept even if its title contains an excluded keyword mid-name (or it is a real
-/// episode mis-foldered under an extras/bonus directory).
+/// An SxxExx episode code marks a real episode, so a file with one is kept when an excluded keyword
+/// other than `sample` sits BEFORE the code (a title word: "Some.Trailer.Show.S02E03"), and when it
+/// sits in an extras/bonus directory (a mis-foldered real episode). It never rescues a `sample`
+/// keyword or a file in a `Sample`/`Samples` folder: scene samples carry the full release name and
+/// its episode code (`sample-show.s01e01…`, `Sample/show.s01e01…`).
 static EPISODE_CODE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)s\d{1,2}e\d{1,3}").unwrap());
 
@@ -1087,7 +1099,8 @@ static EXCLUDED_PROMO_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// Directory names that indicate extras/bonus content. Checked case-insensitively.
+/// Directory names that indicate extras/bonus content. Checked case-insensitively, for files with no
+/// episode code only (a real episode may be mis-foldered under one).
 const EXCLUDED_DIRS: &[&str] = &[
     "extras",
     "bonus",
@@ -1096,8 +1109,11 @@ const EXCLUDED_DIRS: &[&str] = &[
     "deleted scenes",
     "interviews",
     "trailers",
-    "samples",
 ];
+
+/// Sample folder names (`Sample/` is the scene standard). Checked case-insensitively for EVERY file,
+/// episode-coded ones included: no real episode lives in a sample folder.
+const SAMPLE_DIRS: &[&str] = &["sample", "samples"];
 
 pub fn is_video_file(path: &str) -> bool {
     // ASCII lowercasing: the extensions/keywords/episode codes matched below are all ASCII, so
@@ -1125,23 +1141,25 @@ pub fn is_video_file(path: &str) -> bool {
     //   clip like `Trailer.1080p.WEB-DL`, which would otherwise be surfaced as a bogus "movie");
     // - it comes BEFORE the episode code ("Some.Trailer.Show.S02E03");
     // - with no episode code, it sits mid-title BEFORE the release year with no year ahead of it
-    //   ("The.Extra.Man.2010.1080p", "The.Bonus.Army.2024") — except `sample`, never a title word.
+    //   ("The.Extra.Man.2010.1080p", "The.Bonus.Army.2024").
+    // `sample` is never a title word, wherever it sits ("sample-show.s01e01…" is a sample).
     // Anything else is a descriptor: after the episode code ("Show.S01E01.sample" — an episode code
     // does NOT rescue a trailing-descriptor sample), after the year ("Movie.2010.Trailer"), trailing
     // with no year ("Movie.Name.Trailer"), or, with no episode code, leading the stem as
-    // `sample`/`bonus`/`featurette` ("sample-<release>").
+    // `bonus`/`featurette`.
     // KNOWN LIMITATIONS: a title that leads with `bonus`/`featurette` ("Bonus.Track.2023") is still
     // excluded, and a trailer named with the keyword before the year ("Movie.Trailer.2010") is kept.
     let leading_title =
         EXCLUDED_LEADING_RE.is_match(stem) && !EXCLUDED_LEADING_METADATA_RE.is_match(stem);
     let ancillary = EXCLUDED_VIDEO_RE.find_iter(stem).any(|kw| {
-        let title_word = if kw.start() == 0 && leading_title {
+        let title_word = if kw.as_str() == "sample" {
+            false
+        } else if kw.start() == 0 && leading_title {
             true
         } else if let Some(ep) = &episode {
             kw.start() < ep.start()
         } else {
             kw.start() > 0
-                && kw.as_str() != "sample"
                 && RELEASE_YEAR_RE.is_match(&stem[kw.end()..])
                 && !RELEASE_YEAR_RE.is_match(&stem[..kw.start()])
         };
@@ -1154,20 +1172,20 @@ pub fn is_video_file(path: &str) -> bool {
     if EXCLUDED_PROMO_RE.is_match(stem) {
         return false;
     }
-    // Exclude files in directories that indicate extras/bonus content — unless the file is a real
-    // episode (a mis-foldered "Extras/Show.S01E01.mkv" episode must not be dropped).
-    if episode.is_none() {
-        for component in lower.split('/') {
-            if component == filename {
-                continue;
-            }
-            // Normalise scene separators (`Deleted.Scenes`, `behind_the_scenes`) to spaces so the
-            // dotted/underscored directory forms match the space-separated EXCLUDED_DIRS entries —
-            // not only literal-space directory names.
-            let normalized = normalize_dir_component(component);
-            if EXCLUDED_DIRS.iter().any(|d| *d == normalized.as_ref()) {
-                return false;
-            }
+    // Exclude files in a sample folder (always), and in directories that indicate extras/bonus
+    // content unless the file is a real episode (a mis-foldered "Extras/Show.S01E01.mkv" episode
+    // must not be dropped).
+    for component in lower.split('/') {
+        if component == filename {
+            continue;
+        }
+        // Normalise scene separators (`Deleted.Scenes`, `behind_the_scenes`) to spaces so the
+        // dotted/underscored directory forms match the space-separated EXCLUDED_DIRS entries —
+        // not only literal-space directory names.
+        let normalized = normalize_dir_component(component);
+        let dir = normalized.as_ref();
+        if SAMPLE_DIRS.contains(&dir) || (episode.is_none() && EXCLUDED_DIRS.contains(&dir)) {
+            return false;
         }
     }
     true
@@ -2619,6 +2637,20 @@ mod tests {
         assert!(!is_video_file("Sample/show.s01e01.1080p-grp.sample.mkv"));
         // `sample-<release>.mkv` is a real ancillary form — `sample` is NOT a leading-title keyword.
         assert!(!is_video_file("sample-the.matrix.1999.1080p.mkv"));
+        // ... including for an episode: a `sample` keyword BEFORE the episode code is still the
+        // sample marker, never a title word. (Kept as a video, such a clip showed next to the real
+        // S01E01 and could take its selection slot.)
+        assert!(!is_video_file("sample-show.s01e01.1080p-grp.mkv"));
+        // A file in a Sample/ (or Samples/) folder is a sample even when it carries an episode code
+        // and no keyword in its own name: no real episode ever lives in a sample folder.
+        assert!(!is_video_file(
+            "Show.S01E01.1080p-GRP/Sample/show.s01e01.1080p-grp.mkv"
+        ));
+        assert!(!is_video_file("Show.S01.1080p-GRP/Samples/show.s01e02.mkv"));
+        assert!(!is_video_file("Movie.2010/Sample/movie.2010.1080p.mkv"));
+        // A mis-foldered real episode under an extras/bonus directory is still kept.
+        assert!(is_video_file("Extras/Extras.S01E01.mkv"));
+        assert!(is_video_file("Show/Bonus/Show.S01E01.mkv"));
     }
 
     #[test]
@@ -2676,6 +2708,64 @@ mod tests {
         assert_eq!(parse_se("Show.S01E01E02.mkv"), Some((1, 1)));
         assert_eq!(parse_se("Show - 409 - Title.mkv"), Some((4, 9)));
         assert_eq!(parse_se("Movie.2009.mkv"), None);
+    }
+
+    #[test]
+    fn parse_se_all_handles_sxxexx_and_dash_concatenated_codes() {
+        // A single-digit season/episode.
+        assert_eq!(parse_se_all("Show S1E5.mkv"), vec![(1, 5)]);
+        // Dash-concatenated 3-digit form ("409" = S04E09).
+        assert_eq!(
+            parse_se_all("Rick and Morty - 409 - Childrick of Mort.mkv"),
+            vec![(4, 9)]
+        );
+        // Must NOT misread a resolution or year as an episode code.
+        assert!(parse_se_all("Movie (1999).mkv").is_empty());
+        // A date-named daily-show file must NOT decode (no 3-digit dash token).
+        assert!(parse_se_all("The Daily Show - 2021 - 03 - 14.mkv").is_empty());
+        // No episode marker at all.
+        assert!(parse_se_all("Just A Movie.mkv").is_empty());
+    }
+
+    #[test]
+    fn parse_se_all_handles_multi_episode_files() {
+        // Contiguous multi-episode files contribute ALL their episodes (so `provides` is complete and
+        // the reconciler doesn't re-acquire a contained episode as a duplicate singleton).
+        assert_eq!(
+            parse_se_all("Show.S01E01E02.1080p.mkv"),
+            vec![(1, 1), (1, 2)]
+        );
+        assert_eq!(
+            parse_se_all("Show.S01E01E02E03.mkv"),
+            vec![(1, 1), (1, 2), (1, 3)]
+        );
+        assert_eq!(
+            parse_se_all("Show S02E03E04E05.mkv"),
+            vec![(2, 3), (2, 4), (2, 5)]
+        );
+        // A resolution/codec token after the episode must NOT be parsed as a further episode (the
+        // continuation requires an explicit `e` before each number).
+        assert_eq!(parse_se_all("Show.S01E07.720p.WEB.mkv"), vec![(1, 7)]);
+    }
+
+    #[test]
+    fn parse_se_all_documented_limitations_are_stable() {
+        // Pin the CURRENT (documented) behaviour so a silent regression is caught.
+
+        // KNOWN LIMITATION: a >2-episode RANGE records only the explicit endpoints, dropping the
+        // middle — "S01E01-E03" → [(1,1),(1,3)], NOT (1,2).
+        assert_eq!(
+            parse_se_all("Show.S01E01-E03.1080p.mkv"),
+            vec![(1, 1), (1, 3)]
+        );
+
+        // KNOWN LIMITATION: the dash-concatenated code fallback requires SPACE-dash-SPACE, so a
+        // DOT-separated Torrentio name is not matched and yields empty `provides`.
+        assert!(parse_se_all("Rick.and.Morty.-.409.-.Childrick.of.Mort.mkv").is_empty());
+
+        // KNOWN LIMITATION: anime ABSOLUTE numbering is indistinguishable from a concatenated
+        // SxxEyy code, so absolute "409" decodes to a phantom (4, 9) rather than the real ep 409.
+        assert_eq!(parse_se_all("One Piece - 409 - Return.mkv"), vec![(4, 9)]);
     }
 
     #[test]

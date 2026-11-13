@@ -1,16 +1,23 @@
-target/
+# Docker matches these patterns from the context root, so a bare `target/` would exclude only the
+# top-level one. The `**/` forms also cover a nested checkout (a git worktree's own target dir,
+# database or .env). The Dockerfile COPYs only Cargo.toml, Cargo.lock, src/, LICENCE and
+# THIRD-PARTY-NOTICES, none of which these patterns match.
+**/target/
 # The redb database (file or directory) and its `.corrupt[.N]` backups hold Trakt tokens: keep
 # them out of the build context.
-metadata.db*
-.env
+**/metadata.db*
+**/.env
 .git/
 .idea/
 # Logs (any *.log, not just the old run.log name) — keeps stray logs out of the build context.
-*.log
+**/*.log
 # Review-loop iteration scratch files (git-ignored, so absent from a clean CI clone, but present on
 # a local `docker build .` where they bloat the context sent to the daemon). Mirror .gitignore.
 iter-*.jsonl
 iter-*.err
+# Local git worktrees and tooling state (git-ignored or untracked, so only on a local build).
+.worktrees/
+.superpowers/
 # Repo content the build never COPYs — excluded to shrink the context sent to the daemon.
 docs/
 examples/
@@ -18,3 +25,5 @@ tests/
 .claude/
 .github/
 rclone/
+about.toml
+about.hbs

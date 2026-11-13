@@ -1,0 +1,15 @@
+# cargo-about configuration for THIRD-PARTY-NOTICES (template: about.hbs). Regenerate with
+#   cargo about generate --offline --locked -o THIRD-PARTY-NOTICES about.hbs
+# whenever Cargo.lock changes.
+
+# Licences we accept, in order of preference: a crate offering a choice is listed under the first
+# one here that it allows (so MIT wherever it is an option).
+accepted = ["MIT", "BSL-1.0", "Apache-2.0", "ISC", "BSD-3-Clause", "Unicode-3.0", "CDLA-Permissive-2.0"]
+# The targets the release image is built for (Dockerfile); crates used only on other platforms
+# (Windows, wasm, UEFI) are not in the distributed binary.
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+ignore-dev-dependencies = true
+# Skips this crate itself (`publish = false`): its own licence is the LICENCE file.
+private = { ignore = true }
+# chrono's LICENSE.txt holds both the MIT and Apache-2.0 texts; this splits out the MIT one.
+workarounds = ["chrono"]

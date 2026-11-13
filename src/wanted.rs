@@ -21,25 +21,25 @@ use crate::vfs::MediaType;
 
 /// The title's owned group: its engine-acquired and account-mirror (empty-provenance) owned records,
 /// aggregated per tmdb_id by the caller from `owned_hashes` + provider availability. Which of the
-/// group's hashes a removal deletes is decided by `tasks::removal_hashes`. Movies leave
-/// `owned_episodes` empty.
+/// group's hashes a removal deletes is decided by `tasks::removal_hashes`.
 ///
-/// KNOWN LIMITATION (M2/L1): `available` is a SINGLE flag for the whole title and
-/// `owned_episodes` is the union across all owning hashes — the reconcile-core cannot model
-/// "episode S01E03's pack is present but S01E05's pack lapsed". The caller sets
-/// `available` from the group's overall presence; if it folds episodes whose hash is absent
-/// into `owned_episodes`, a lapsed per-episode pack reads as "covered" and is NOT re-acquired
-/// until the WHOLE group reports unavailable. In practice the account-mirror/`provides` union
-/// makes this benign (a present season pack covers the gap, and a fully-lapsed group flips
-/// `available=false` → re-acquire); a per-hash `present_episodes` set would be the precise fix
-/// but is deferred — it would require threading per-hash presence through the caller and is not
-/// worth the churn given the union behaviour above.
+/// Shows (`tasks::plan_episode_actions`): availability is per EPISODE. `owned_episodes` is every
+/// episode the group owns (the union of its records' `provides`); `covered_episodes` is the subset
+/// supplied by a copy that is present in the listing or still `Pending`, and only those count as
+/// covered — an episode whose only copy left the account is re-acquired while the rest of the show
+/// is present. `available` is false only when no copy of the show is present or pending (then
+/// nothing is covered). A suspect empty listing counts every owned episode as covered. A manual
+/// show restores a lapsed, already-watched episode from `owned_episodes` (see `reconcile_title`).
+///
+/// Movies (`tasks::plan_reconcile_ops`): `available` is group presence, and both episode lists are
+/// empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Owned {
     pub hash: String,
     pub provenance: Provenance,
     pub available: bool, // false → cache lapsed / missing / 503 → re-acquire
-    pub owned_episodes: Vec<(u32, u32)>, // shows: which (season, episode) are owned
+    pub owned_episodes: Vec<(u32, u32)>, // shows: every (season, episode) the group owns
+    pub covered_episodes: Vec<(u32, u32)>, // shows: owned episodes a present/pending copy supplies
 }
 
 /// Everything the reconciler needs about ONE title (one tmdb_id), assembled by the caller.
@@ -50,11 +50,13 @@ pub struct TitleView {
     pub wanted: Vec<WantedRecord>, // per-user current wanted rows for this title (empty → nobody wants it)
     /// The title's owned group (engine-acquired and account-mirror records), or `None` if not
     /// owned. The reconciler models ONE owned copy per title: for shows acquired episode-by-episode
-    /// (multiple hashes), the caller MUST aggregate all per-episode hashes into a single `Owned` whose
-    /// `owned_episodes` is the union across hashes. The `Action::Remove`'s `hash` field is only a
-    /// representative — the executor maps the `RemoveReason` to the actual hash set to delete (via
-    /// `tasks::removal_hashes`, which scopes by trigger: engine-acquired hashes only for `Abandoned`,
-    /// and likewise for `Finished` except a show under `REMOVE_FINISHED_SHOWS`, which reclaims all).
+    /// (multiple hashes), the caller MUST aggregate all per-episode hashes into a single `Owned`
+    /// whose `owned_episodes` is the union across the group's hashes and whose `covered_episodes`
+    /// is the union across its covering (present or pending) hashes. The `Action::Remove`'s `hash`
+    /// field is only a representative — the executor maps the `RemoveReason` to the actual hash set
+    /// to delete (via `tasks::removal_hashes`, which scopes by trigger: engine-acquired hashes only
+    /// for `Abandoned`, and likewise for `Finished` except a show under `REMOVE_FINISHED_SHOWS`,
+    /// which reclaims all).
     /// Assembling one `TitleView` per *hash* would make Trigger A misfire on partial coverage —
     /// assemble per *tmdb_id*.
     pub owned: Option<Owned>,
@@ -205,10 +207,11 @@ fn should_remove(title: &TitleView) -> bool {
     })
 }
 
-/// True iff episode `e` is owned AND currently available (a lapsed cache → false, forcing re-acquire).
+/// True iff episode `e` is supplied by a present or pending copy (a lapsed cache → false, forcing
+/// re-acquire).
 fn episode_covered(title: &TitleView, e: &(u32, u32)) -> bool {
     match &title.owned {
-        Some(owned) => owned.available && owned.owned_episodes.contains(e),
+        Some(owned) => owned.available && owned.covered_episodes.contains(e),
         None => false,
     }
 }
@@ -419,6 +422,7 @@ mod tests {
             hash: hash.to_string(),
             provenance,
             available,
+            covered_episodes: eps.clone(),
             owned_episodes: eps,
         }
     }
@@ -777,6 +781,50 @@ mod tests {
                     tmdb_id: 30,
                     season: 1,
                     episode: 2
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn manual_partially_lapsed_finished_show_restores_the_lapsed_episodes() {
+        // One of a manual show's packs left the account while the other is present: the show is
+        // still available, but the absent pack's already-WATCHED episodes are no longer covered and
+        // must be restored (a manual show stays complete), while the present pack's are left alone.
+        let aired = vec![(1, 1), (1, 2), (1, 3), (1, 4)];
+        let mut o = owned(
+            "h",
+            Provenance::manual(),
+            /*available*/ true,
+            /*owned_episodes*/ vec![(1, 1), (1, 2), (1, 3), (1, 4)],
+        );
+        o.covered_episodes = vec![(1, 1), (1, 2)];
+        let t = show_title(
+            32,
+            vec![show_record(
+                "alice",
+                32,
+                /*watchlisted*/ false,
+                /*in_progress*/ true,
+                /*watched_eps*/ vec![(1, 1), (1, 2), (1, 3), (1, 4)],
+                ShowStatus::Ended,
+            )],
+            Some(o),
+            aired,
+        );
+        assert!(!should_remove(&t));
+        assert_eq!(
+            reconcile_title(&t),
+            vec![
+                Action::AcquireEpisode {
+                    tmdb_id: 32,
+                    season: 1,
+                    episode: 3
+                },
+                Action::AcquireEpisode {
+                    tmdb_id: 32,
+                    season: 1,
+                    episode: 4
                 },
             ]
         );

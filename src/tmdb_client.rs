@@ -99,9 +99,10 @@ tokio::task_local! {
 
 /// Run `fut`, also reporting whether any TMDB search inside it FAILED (the request itself: a
 /// transport error, a 5xx after the retry budget, or a 4xx), as opposed to a genuine empty result.
-/// `identification::identify_name` returns `None` for both, so this is how the scan loop tells "TMDB
-/// has no such title" (cache it) from "TMDB could not be reached" (identify it again later). Scoped
-/// to `fut`'s own polls, so a search failing in another job never counts.
+/// `identification::identify_torrent` returns the same name-derived fallback (`external_id: None`)
+/// for both, so this is how the scan loop tells "TMDB has no such title" (cache it) from "TMDB could
+/// not be reached" (identify it again later). Scoped to `fut`'s own polls, so a search failing in
+/// another job never counts.
 pub async fn track_search_failures<F: std::future::Future>(fut: F) -> (F::Output, bool) {
     SEARCH_FAILED
         .scope(std::cell::Cell::new(false), async move {
@@ -716,9 +717,11 @@ mod tests {
         let c = TmdbClient::new("k".into()).unwrap();
         assert_eq!(c.find_by_imdb("../evil").await.unwrap(), None);
         assert_eq!(c.find_by_imdb("").await.unwrap(), None);
-        assert_eq!(c.find_by_imdb("tt").await.unwrap(), None); // prefix but no digits
-        assert_eq!(c.find_by_imdb("tt12a34").await.unwrap(), None); // non-digit tail
-                                                                    // Well-formed ids pass the shape gate (this asserts the guard, not the network round-trip).
+        // Prefix but no digits.
+        assert_eq!(c.find_by_imdb("tt").await.unwrap(), None);
+        // Non-digit tail.
+        assert_eq!(c.find_by_imdb("tt12a34").await.unwrap(), None);
+        // Well-formed ids pass the shape gate (this asserts the guard, not the network round-trip).
         assert!(is_well_formed_imdb_id("tt0111161"));
         assert!(is_well_formed_imdb_id("tt15239678"));
     }

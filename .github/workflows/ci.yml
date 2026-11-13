@@ -47,8 +47,27 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
+  # Builds on the oldest supported compiler, the Dockerfile's rust:<version>-slim image, so a pull
+  # request fails here rather than in the post-merge Docker build when it locks a dependency that
+  # needs a newer rustc or uses a language feature stabilised after that version (clippy's
+  # incompatible_msrv only covers std APIs). Bump this toolchain together with the Dockerfile's
+  # `FROM rust:<version>-slim` line and `rust-version` in Cargo.toml.
+  msrv:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.96
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check on the minimum supported Rust version
+        run: cargo check --locked --all-targets
+
   build-and-push:
-    needs: test
+    needs: [test, msrv]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:

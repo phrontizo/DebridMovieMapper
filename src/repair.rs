@@ -17,6 +17,14 @@ const MAX_REPAIR_ATTEMPTS: u32 = 3;
 /// client: a 60 s per-request timeout), so during a provider outage it could otherwise hold the read
 /// — and a connection permit — for minutes. A normal repair takes a few seconds.
 const INSTANT_REPAIR_TIMEOUT: Duration = Duration::from_secs(30);
+/// The waits before each retry of a 404 on one of the instant repair's torrent lookups (the torrent
+/// under repair, the re-add right after it is added, the final check). TorBox's `mylist?id=`
+/// sometimes answers 404 for a torrent that exists (21 times in ten minutes on 2026-11-13; see the
+/// upgrade engine's longer `STAGED_INFO_BACKOFF`). Kept short because the read is waiting, and on
+/// Real-Debrid a 404 means the torrent is gone: at most 1.5 s a lookup, 4.5 s a repair, well inside
+/// `INSTANT_REPAIR_TIMEOUT`.
+pub(crate) const REPAIR_INFO_NOT_FOUND_BACKOFF: [Duration; 2] =
+    [Duration::from_millis(500), Duration::from_secs(1)];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepairState {
@@ -90,9 +98,13 @@ pub struct RepairManager {
 /// stranded `Repairing`, which `should_hide_torrent`/`hidden_torrent_ids` treat as hidden. A hidden
 /// torrent can never re-trigger repair (reads short-circuit on `should_hide_torrent`) and is not
 /// pruned while it is still listed, so it would be trapped until process restart. On drop while
-/// still armed, the guard resets a *still-`Repairing`* torrent back to `Healthy`; a normal
-/// completion calls [`RepairInProgressGuard::disarm`], so on completion the guard is a no-op (every
-/// exit path already sets a terminal state) and it only fires on cancellation.
+/// still armed, the guard resets a *still-`Repairing`* torrent back to `Healthy` and resets its
+/// attempt budget (`repair_attempts` → 0) while keeping the cooldown, like
+/// `note_transient_repair_failure`: a repair that never finished is no evidence the file is broken,
+/// and counting it would let three cancellations (with no good read between them) trap the torrent
+/// `Failed`/hidden. A normal completion calls [`RepairInProgressGuard::disarm`], so on completion the
+/// guard is a no-op (every exit path already sets a terminal state) and it only fires on
+/// cancellation.
 struct RepairInProgressGuard {
     health_status: Arc<RwLock<HashMap<String, TorrentHealth>>>,
     torrent_id: String,
@@ -135,11 +147,64 @@ impl Drop for RepairInProgressGuard {
                 if let Some(h) = map.get_mut(&torrent_id) {
                     if h.state == RepairState::Repairing {
                         h.state = RepairState::Healthy;
+                        // Keep `last_repair_trigger`: the cooldown still spaces the next attempt.
+                        h.repair_attempts = 0;
                     }
                 }
             });
         }
     }
+}
+
+/// Deletes the torrent an instant repair added but never adopted, when the repair is cut short (its
+/// timeout fires, or the read awaiting it is dropped) while `materialise` or the steps after it are
+/// mid-await. Their own failure cleanup only runs if the future completes, and a Real-Debrid
+/// torrent left un-selected sits in `waiting_files_selection` for good: the scan loop's same-hash
+/// dedup only collapses `downloaded` torrents.
+///
+/// `materialise` fills `slot` with the new id as soon as the add returns (never a same-id TorBox
+/// re-add, which IS the torrent under repair). The repair takes the id back out of `slot` before it
+/// adopts the add (before deleting the superseded torrent), so a timeout during that delete can't
+/// remove both copies; a repair that runs to completion empties the slot too, having settled the
+/// add itself.
+struct UnadoptedAddGuard {
+    provider: Arc<dyn DebridProvider>,
+    slot: Arc<std::sync::Mutex<Option<String>>>,
+    /// The torrent under repair: never deleted here.
+    keep: String,
+}
+
+impl Drop for UnadoptedAddGuard {
+    fn drop(&mut self) {
+        let Some(id) = take_unadopted(&self.slot) else {
+            return;
+        };
+        if id == self.keep {
+            return;
+        }
+        // `Drop` cannot await, so delete from a detached task (the read has given up already).
+        // Without a runtime (shutdown) the delete is skipped and the add is left behind.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let provider = Arc::clone(&self.provider);
+            handle.spawn(async move {
+                warn!(
+                    "Instant repair was cut short; deleting the torrent {} it added",
+                    id
+                );
+                if let Err(e) = provider.delete_torrent(&id).await {
+                    error!(
+                        "Failed to delete torrent {} after a cut-short repair: {}",
+                        id, e
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// Empty an [`UnadoptedAddGuard`] slot, returning the id it held.
+fn take_unadopted(slot: &std::sync::Mutex<Option<String>>) -> Option<String> {
+    slot.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 impl RepairManager {
@@ -322,12 +387,14 @@ impl RepairManager {
     /// Returns (new_torrent_id, new_torrent_info) on success.
     /// On failure, `reacquire::materialise` deletes a leaked NEW-id torrent (never `old_torrent_id`,
     /// passed as `protect_id`), and the old torrent is kept visible (`Healthy`) with its attempt
-    /// budget reset (`note_transient_repair_failure`).
+    /// budget reset (`note_transient_repair_failure`). The new id goes into `added` as soon as the add
+    /// returns, for [`UnadoptedAddGuard`].
     async fn add_and_select_files(
         &self,
         old_torrent_id: &str,
         old_info: &TorrentInfo,
         wait_duration: Duration,
+        added: &std::sync::Mutex<Option<String>>,
     ) -> Result<(String, TorrentInfo), String> {
         // Selector: match the new torrent's files to the old torrent's previously-selected paths.
         let old_info_cl = old_info.clone();
@@ -355,6 +422,7 @@ impl RepairManager {
             wait_duration,
             wait_duration,
             Some(old_torrent_id),
+            Some(added),
             select,
         )
         .await
@@ -485,21 +553,32 @@ impl RepairManager {
         // `Repairing` torrent on drop; a normal completion disarms it (see `RepairInProgressGuard`).
         let mut guard =
             RepairInProgressGuard::armed(Arc::clone(&self.health_status), torrent_id.to_string());
+        // The same cancellation (or the timeout below) can strand a NEW-id torrent the repair added
+        // but never adopted; this guard deletes it on drop (see `UnadoptedAddGuard`).
+        let added = Arc::new(std::sync::Mutex::new(None));
+        let _add_guard = UnadoptedAddGuard {
+            provider: Arc::clone(&self.provider),
+            slot: Arc::clone(&added),
+            keep: torrent_id.to_string(),
+        };
         // Bound the whole repair: the read that triggered it is waiting (see
         // `INSTANT_REPAIR_TIMEOUT`). On timeout the inner future is dropped at an await, which is
-        // the same cancellation the guard covers, but the guard only resets the STATE — so also
-        // reset the attempt budget here (keeping the cooldown), or repeated timeouts during an
-        // outage would climb to `MAX_REPAIR_ATTEMPTS` and trap the torrent `Failed`/hidden. A
-        // timeout after RD's `add_magnet` can leave the new-id torrent behind; it carries the same
-        // hash, so once it is downloaded the scan loop's same-hash duplicate deletion collapses the
-        // pair back to one torrent (the same path as any other leaked repair add).
+        // the same cancellation the guards cover: `_add_guard` deletes a new-id torrent added but not
+        // adopted when this function returns, and the attempt budget is reset here (keeping the
+        // cooldown), as the state guard does on a dropped read, so repeated timeouts during an
+        // outage can't climb to `MAX_REPAIR_ATTEMPTS` and trap the torrent `Failed`/hidden.
         let result = match tokio::time::timeout(
             INSTANT_REPAIR_TIMEOUT,
-            self.instant_repair_inner(locator, torrent_id),
+            self.instant_repair_inner(locator, torrent_id, &added),
         )
         .await
         {
-            Ok(result) => result,
+            Ok(result) => {
+                // Ran to completion, so it settled any torrent it added itself (adopted it, or
+                // deleted it on failure): nothing for the guard to clean up.
+                take_unadopted(&added);
+                result
+            }
             Err(_) => {
                 self.note_transient_repair_failure(torrent_id).await;
                 Err(RepairFailure::Deferred(format!(
@@ -515,13 +594,23 @@ impl RepairManager {
     /// The body of [`RepairManager::try_instant_repair`] after the `Repairing` transition, split out
     /// so the outer method can wrap it in a cancellation-safety guard. Every exit path sets a
     /// terminal health state, so the guard is a no-op unless this future is cancelled mid-await.
+    /// `added` holds a new-id torrent the repair added and has not adopted yet (see
+    /// `UnadoptedAddGuard`); it is emptied before each step that adopts the add.
     async fn instant_repair_inner(
         &self,
         locator: &crate::provider::FileLocator,
         torrent_id: &str,
+        added: &std::sync::Mutex<Option<String>>,
     ) -> Result<crate::provider::FileLocator, RepairFailure> {
-        // Fetch old torrent info to know which files were selected (for re-selection).
-        let old_info = match self.provider.get_torrent_info(torrent_id).await {
+        // Fetch old torrent info to know which files were selected (for re-selection). Every lookup
+        // here retries TorBox's spurious 404 briefly (`REPAIR_INFO_NOT_FOUND_BACKOFF`).
+        let old_info = match crate::provider::torrent_info_retrying_not_found(
+            &*self.provider,
+            torrent_id,
+            &REPAIR_INFO_NOT_FOUND_BACKOFF,
+        )
+        .await
+        {
             Ok(info) => info,
             Err(e) => {
                 // Transient listing failure, no replacement produced — keep the torrent VISIBLE
@@ -538,7 +627,7 @@ impl RepairManager {
 
         info!("Instant repair: adding magnet for hash {}", old_info.hash);
         let (new_torrent_id, _new_info) = match self
-            .add_and_select_files(torrent_id, &old_info, Duration::from_millis(500))
+            .add_and_select_files(torrent_id, &old_info, Duration::from_millis(500), added)
             .await
         {
             Ok(pair) => pair,
@@ -561,7 +650,13 @@ impl RepairManager {
         // Brief wait for the provider to process file selection.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let final_info = match self.provider.get_torrent_info(&new_torrent_id).await {
+        let final_info = match crate::provider::torrent_info_retrying_not_found(
+            &*self.provider,
+            &new_torrent_id,
+            &REPAIR_INFO_NOT_FOUND_BACKOFF,
+        )
+        .await
+        {
             Ok(info) => info,
             Err(e) => {
                 // The re-add already succeeded; only the final info fetch blipped (transient). There
@@ -587,6 +682,9 @@ impl RepairManager {
             // Match the SAME file by path (provider-neutral; no positional link index).
             match Self::locator_for_file(&final_info, &locator.hash, &locator.file_path) {
                 Some(new_locator) => {
+                    // Adopting the add: from here a cut-short repair must not delete it, since
+                    // `complete_repair` deletes the superseded torrent first.
+                    take_unadopted(added);
                     self.complete_repair(torrent_id, &new_torrent_id).await;
                     info!(
                         "Instant repair SUCCEEDED for torrent {} -> new ID {} (file {})",
@@ -637,6 +735,9 @@ impl RepairManager {
             // download we're leaving to complete. Only the genuinely-new-id (RD) case deletes the
             // old broken torrent and records a replacement for the scan loop.
             if !same_torrent {
+                // The add becomes the replacement left to download: a cut-short repair must not
+                // delete it as well as the superseded torrent being deleted here.
+                take_unadopted(added);
                 if let Err(e) = self.provider.delete_torrent(torrent_id).await {
                     warn!("Failed to delete old torrent {}: {}", torrent_id, e);
                 }
@@ -2349,5 +2450,342 @@ mod tests {
             "Repair should be rate-limited after mark_broken preserves trigger"
         );
         assert_eq!(result.unwrap_err(), "Repair rate limited");
+    }
+
+    // ── repairs cut short (a timeout or a dropped read), and TorBox's 404 blips ─────────────────
+
+    /// Yield until `done` holds (detached tasks such as a guard's cleanup get to run), up to 200
+    /// times; returns whether it did.
+    async fn yield_until(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if done() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        done()
+    }
+
+    /// A 404 `reqwest::Error`, as TorBox's `mylist?id=` sometimes answers for a torrent that exists.
+    fn not_found_error() -> reqwest::Error {
+        reqwest::Response::from(
+            hyper::Response::builder()
+                .status(404)
+                .body(hyper::body::Bytes::new())
+                .unwrap(),
+        )
+        .error_for_status()
+        .unwrap_err()
+    }
+
+    /// The torrent under repair, `tid`: one selected file, `/Movie.mkv`.
+    fn old_movie_info() -> TorrentInfo {
+        TorrentInfo {
+            id: "tid".to_string(),
+            hash: "H".to_string(),
+            status: "downloaded".to_string(),
+            files: vec![crate::rd_client::TorrentFile {
+                id: 5,
+                path: "/Movie.mkv".to_string(),
+                bytes: 1000,
+                selected: 1,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Real-Debrid's re-add of `tid`'s hash: a NEW id, `new`, with the same file, in `status`.
+    fn new_movie_info(status: &str) -> TorrentInfo {
+        TorrentInfo {
+            id: "new".to_string(),
+            status: status.to_string(),
+            ..old_movie_info()
+        }
+    }
+
+    fn tid_locator() -> FileLocator {
+        FileLocator {
+            hash: "H".to_string(),
+            torrent_id: "tid".to_string(),
+            file_id: 5,
+            file_path: "/Movie.mkv".to_string(),
+            link: None,
+        }
+    }
+
+    /// A provider scripted per torrent id. `add_magnet` returns the new id `new` (Real-Debrid
+    /// behaviour); `get_torrent_info` answers from `infos`, never returns for an id in `hang_info`,
+    /// and with `flaky_lookups` answers every other lookup of each id (the 1st, 3rd, ...) with a 404;
+    /// `delete_torrent` records the id, then never returns for one in `hang_delete`.
+    #[derive(Debug, Default)]
+    struct ScriptedProvider {
+        infos: HashMap<String, TorrentInfo>,
+        hang_info: HashSet<String>,
+        hang_delete: HashSet<String>,
+        flaky_lookups: bool,
+        lookups: std::sync::Mutex<HashMap<String, usize>>,
+        adds: std::sync::atomic::AtomicUsize,
+        deleted: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptedProvider {
+        fn deleted(&self) -> Vec<String> {
+            self.deleted.lock().unwrap().clone()
+        }
+        fn lookups_of(&self, id: &str) -> usize {
+            self.lookups.lock().unwrap().get(id).copied().unwrap_or(0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DebridProvider for ScriptedProvider {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+        async fn get_torrents(&self) -> Result<Vec<crate::rd_client::Torrent>, reqwest::Error> {
+            Ok(vec![])
+        }
+        async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
+            let n = {
+                let mut lookups = self.lookups.lock().unwrap();
+                let n = lookups.entry(id.to_string()).or_default();
+                *n += 1;
+                *n
+            };
+            if self.hang_info.contains(id) {
+                return std::future::pending().await;
+            }
+            if self.flaky_lookups && n % 2 == 1 {
+                return Err(not_found_error());
+            }
+            Ok(self.infos.get(id).cloned().unwrap_or_default())
+        }
+        async fn add_magnet(
+            &self,
+            _magnet: &str,
+        ) -> Result<crate::rd_client::AddMagnetResponse, reqwest::Error> {
+            self.adds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::rd_client::AddMagnetResponse {
+                id: "new".to_string(),
+                uri: String::new(),
+            })
+        }
+        async fn select_files(&self, _t: &str, _f: &str) -> Result<(), reqwest::Error> {
+            Ok(())
+        }
+        async fn delete_torrent(&self, id: &str) -> Result<(), reqwest::Error> {
+            self.deleted.lock().unwrap().push(id.to_string());
+            if self.hang_delete.contains(id) {
+                return std::future::pending().await;
+            }
+            Ok(())
+        }
+        async fn resolve_url(&self, _l: &FileLocator) -> Result<String, crate::error::AppError> {
+            Err(crate::error::AppError::Unavailable)
+        }
+        async fn invalidate(&self, _l: &FileLocator) {}
+    }
+
+    /// A repair cut short by a dropped read reached no verdict on the file, so (like a timed-out
+    /// one) it must not count toward `MAX_REPAIR_ATTEMPTS`; otherwise three cancellations with no
+    /// good read between them trap the torrent `Failed`/hidden until restart. The cooldown it set
+    /// is kept.
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_in_flight_repair_resets_the_attempt_budget() {
+        // The clock is paused and the test task keeps yielding, so the repair parks mid-way with
+        // the torrent `Repairing`.
+        let provider = Arc::new(ScriptedProvider {
+            infos: [("tid".to_string(), old_movie_info())]
+                .into_iter()
+                .collect(),
+            hang_info: ["new".to_string()].into_iter().collect(),
+            ..Default::default()
+        });
+        let manager = Arc::new(RepairManager::new(provider));
+        {
+            let mut hm = manager.health_status.write().await;
+            hm.insert(
+                "tid".to_string(),
+                TorrentHealth {
+                    torrent_id: "tid".to_string(),
+                    state: RepairState::Healthy,
+                    repair_attempts: MAX_REPAIR_ATTEMPTS - 1,
+                    last_repair_trigger: Some(
+                        std::time::Instant::now() - Duration::from_secs(REPAIR_COOLDOWN_SECS + 1),
+                    ),
+                },
+            );
+        }
+        let m = manager.clone();
+        let handle = tokio::spawn(async move { m.try_instant_repair(&tid_locator()).await });
+        let mut hidden = false;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            if manager.should_hide_torrent("tid").await {
+                hidden = true;
+                break;
+            }
+        }
+        assert!(hidden, "the repair should have begun (Repairing = hidden)");
+        assert!(!handle.is_finished(), "the repair must still be in flight");
+        handle.abort();
+        let mut visible = false;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            if !manager.should_hide_torrent("tid").await {
+                visible = true;
+                break;
+            }
+        }
+        assert!(visible, "the guard must un-hide the torrent");
+
+        {
+            let hm = manager.health_status.read().await;
+            let h = hm.get("tid").expect("health entry present");
+            assert_eq!(h.state, RepairState::Healthy);
+            assert_eq!(
+                h.repair_attempts, 0,
+                "a cancelled repair is not a broken-file signal, so it must not climb toward Failed"
+            );
+            assert!(
+                h.last_repair_trigger
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(REPAIR_COOLDOWN_SECS)),
+                "the cooldown the cancelled repair set is kept"
+            );
+        }
+        // Once the cooldown is over, the next read may repair again rather than hitting the cap.
+        manager
+            .health_status
+            .write()
+            .await
+            .get_mut("tid")
+            .unwrap()
+            .last_repair_trigger =
+            Some(std::time::Instant::now() - Duration::from_secs(REPAIR_COOLDOWN_SECS + 1));
+        assert!(manager.check_and_begin_repair("tid").await.is_ok());
+    }
+
+    /// A repair that times out after Real-Debrid's re-add minted a new id must delete that torrent:
+    /// it was never selected, so it sits in `waiting_files_selection` forever and the scan loop's
+    /// same-hash dedup (which only collapses `downloaded` torrents) never removes it.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_repair_deletes_the_torrent_it_added() {
+        let provider = Arc::new(ScriptedProvider {
+            infos: [("tid".to_string(), old_movie_info())]
+                .into_iter()
+                .collect(),
+            // The re-added torrent's lookup hangs: the repair times out between add and select.
+            hang_info: ["new".to_string()].into_iter().collect(),
+            ..Default::default()
+        });
+        let manager = RepairManager::new(provider.clone());
+
+        let r = manager.try_instant_repair(&tid_locator()).await;
+
+        assert!(
+            matches!(r, Err(RepairFailure::Deferred(_))),
+            "a timed-out repair is a deferral, got {r:?}"
+        );
+        assert!(
+            yield_until(|| !provider.deleted().is_empty()).await,
+            "the unadopted add must be deleted"
+        );
+        assert_eq!(
+            provider.deleted(),
+            vec!["new".to_string()],
+            "only the unadopted add is deleted, never the torrent under repair"
+        );
+        assert!(!manager.should_hide_torrent("tid").await);
+    }
+
+    /// The same when the read that triggered the repair is dropped (the player disconnects) after
+    /// the re-add.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_repair_deletes_the_torrent_it_added() {
+        let provider = Arc::new(ScriptedProvider {
+            infos: [("tid".to_string(), old_movie_info())]
+                .into_iter()
+                .collect(),
+            hang_info: ["new".to_string()].into_iter().collect(),
+            ..Default::default()
+        });
+        let manager = Arc::new(RepairManager::new(provider.clone()));
+        let m = manager.clone();
+        let handle = tokio::spawn(async move { m.try_instant_repair(&tid_locator()).await });
+        assert!(
+            yield_until(|| provider.adds.load(std::sync::atomic::Ordering::SeqCst) > 0).await,
+            "the repair should have re-added the hash"
+        );
+        assert!(!handle.is_finished(), "the repair must still be in flight");
+
+        handle.abort();
+
+        assert!(
+            yield_until(|| !provider.deleted().is_empty()).await,
+            "the unadopted add must be deleted"
+        );
+        assert_eq!(provider.deleted(), vec!["new".to_string()]);
+    }
+
+    /// Once the repair has adopted its add (here: the not-cached path, which deletes the superseded
+    /// torrent and leaves the new one to download), a timeout must NOT delete the add as well, or
+    /// both copies would be gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_repair_cut_short_after_adopting_its_add_keeps_it() {
+        let provider = Arc::new(ScriptedProvider {
+            infos: [
+                ("tid".to_string(), old_movie_info()),
+                ("new".to_string(), new_movie_info("downloading")),
+            ]
+            .into_iter()
+            .collect(),
+            // Deleting the superseded torrent hangs, so the timeout fires after the adoption.
+            hang_delete: ["tid".to_string()].into_iter().collect(),
+            ..Default::default()
+        });
+        let manager = RepairManager::new(provider.clone());
+
+        let r = manager.try_instant_repair(&tid_locator()).await;
+
+        assert!(matches!(r, Err(RepairFailure::Deferred(_))), "got {r:?}");
+        yield_until(|| false).await; // let any detached cleanup run
+        assert_eq!(
+            provider.deleted(),
+            vec!["tid".to_string()],
+            "the adopted add must survive (only the superseded torrent's delete was attempted)"
+        );
+    }
+
+    /// TorBox's `mylist?id=` sometimes answers 404 for a torrent that exists. Each of the repair's
+    /// three lookups (the torrent under repair, the re-add right after it is added, and the final
+    /// check) retries such a 404 briefly instead of failing the read.
+    #[tokio::test(start_paused = true)]
+    async fn instant_repair_retries_a_404_on_its_torrent_lookups() {
+        let provider = Arc::new(ScriptedProvider {
+            infos: [
+                ("tid".to_string(), old_movie_info()),
+                ("new".to_string(), new_movie_info("downloaded")),
+            ]
+            .into_iter()
+            .collect(),
+            flaky_lookups: true,
+            ..Default::default()
+        });
+        let manager = RepairManager::new(provider.clone());
+
+        let new = manager
+            .try_instant_repair(&tid_locator())
+            .await
+            .expect("each 404 is retried, so the repair succeeds");
+
+        assert_eq!(new.torrent_id, "new");
+        assert_eq!(new.file_path, "/Movie.mkv");
+        assert_eq!(provider.lookups_of("tid"), 2, "one 404, then found");
+        assert_eq!(
+            provider.lookups_of("new"),
+            4,
+            "the post-add and the final lookup each 404 once, then find it"
+        );
+        assert_eq!(provider.deleted(), vec!["tid".to_string()]);
     }
 }

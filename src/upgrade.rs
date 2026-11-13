@@ -39,18 +39,28 @@ enum UpgradeSkip {
 /// (`UPGRADE_BUDGET_PER_TICK` unset) every title is visited, and a budget caps the pass as
 /// [`upgrade_batch`] describes.
 pub async fn run_upgrade_once(app: &AppState) {
-    run_upgrade_once_with(app, |tmdb_id, media_type| {
-        app.tmdb_client.details(tmdb_id, media_type)
-    })
+    run_upgrade_once_with(
+        app,
+        |tmdb_id, media_type| app.tmdb_client.details(tmdb_id, media_type),
+        |tmdb_id| async move {
+            let today = chrono::Utc::now().date_naive();
+            crate::tasks::aired_episodes(&app.tmdb_client, tmdb_id, today)
+                .await
+                .pairs
+        },
+    )
     .await
 }
 
-/// [`run_upgrade_once`] with the TMDB `details` fetch (used only by the per-title language backfill,
-/// [`LanguageBackfill`]) injected, so tests can drive the backfill without the network.
-async fn run_upgrade_once_with<F, Fut>(app: &AppState, fetch_details: F)
+/// [`run_upgrade_once`] with its two TMDB lookups injected, so tests drive them offline: the
+/// `details` fetch (used only by the per-title language backfill, [`LanguageBackfill`]) and a
+/// show's aired `(season, episode)` set (used only by consolidation, [`try_consolidate_show`]).
+async fn run_upgrade_once_with<F, Fut, A, AFut>(app: &AppState, fetch_details: F, fetch_aired: A)
 where
     F: Fn(u64, MediaType) -> Fut,
     Fut: Future<Output = Result<TitleDetails, reqwest::Error>>,
+    A: Fn(u64) -> AFut,
+    AFut: Future<Output = Vec<(u32, u32)>>,
 {
     let budget = app.config.upgrade.budget_per_tick.map(|b| b as usize);
     let idle_window = Duration::from_secs(app.config.upgrade.idle_secs);
@@ -62,12 +72,15 @@ where
     // has to be known first. The scan loop's account-mirror pass does the same each scan; this covers
     // an upgrade tick that runs before it (e.g. at start-up). Only a record whose file name is
     // unknown anywhere stays `None` (and is then unknown-lowest).
-    {
+    //
+    // The same persisted identifications name the multi-film collections (more than one selected
+    // feature-sized video): a mirrored collection is recorded as ONE film's copy, so the movie path
+    // must never prune it (see `try_upgrade_movie`).
+    let collections = {
         let owned = app.store.all_owned().await;
+        let matches = app.store.load_all_matches().await;
+        let infos: Vec<&crate::rd_client::TorrentInfo> = matches.values().map(|(i, _)| i).collect();
         if owned.iter().any(|(_, r)| r.quality.is_none()) {
-            let matches = app.store.load_all_matches().await;
-            let infos: Vec<&crate::rd_client::TorrentInfo> =
-                matches.values().map(|(i, _)| i).collect();
             crate::tasks::backfill_owned_quality(
                 &app.store,
                 &app.config.acquisition.prefs,
@@ -76,7 +89,8 @@ where
             )
             .await;
         }
-    }
+        crate::tasks::multi_feature_hashes(infos)
+    };
 
     // Group owned by tmdb_id (reuse the tasks helper); titles needing attention go first, then the
     // least-recently-checked.
@@ -178,9 +192,11 @@ where
             Err(skip) => Err(skip),
             Ok(()) => match media_type {
                 MediaType::Movie => {
-                    try_upgrade_movie(app, tmdb_id, &hashes, &rec, idle_window).await
+                    try_upgrade_movie(app, tmdb_id, &hashes, &rec, idle_window, &collections).await
                 }
-                MediaType::Show => try_upgrade_show(app, tmdb_id, &hashes, idle_window).await,
+                MediaType::Show => {
+                    try_upgrade_show(app, tmdb_id, &hashes, idle_window, &fetch_aired).await
+                }
             },
         };
         match outcome {
@@ -380,10 +396,11 @@ where
 
     /// Backfill the group's TMDB languages if any of its records has never had them fetched, before
     /// the title is dispatched. `Ok(())` = proceed (nothing to do, filled, or a permanent TMDB
-    /// refusal — see [`tmdb_error_is_permanent`]). `Err(Deferred)` = a transient TMDB failure (now or
-    /// earlier this tick): nothing is written and the title is NOT dispatched, so no staging probe
-    /// runs with the original-only rule (which could blacklist correct spoken-language releases for
-    /// the blacklist TTL); its cursor stays unstamped and it is retried next tick.
+    /// refusal — see [`crate::tmdb_client::error_is_permanent`]). `Err(Deferred)` = a transient
+    /// TMDB failure (now or earlier this tick): nothing is written and the title is NOT dispatched,
+    /// so no staging probe runs with the original-only rule (which could blacklist correct
+    /// spoken-language releases for the blacklist TTL); its cursor stays unstamped and it is
+    /// retried next tick.
     async fn run(
         &mut self,
         app: &AppState,
@@ -418,7 +435,7 @@ where
             }
             // Waiting won't fix it, and deferring would park the title at the head of the
             // round-robin forever: proceed with the recorded languages (the pre-backfill rule).
-            Err(e) if tmdb_error_is_permanent(&e) => {
+            Err(e) if crate::tmdb_client::error_is_permanent(&e) => {
                 debug!(
                     "upgrade: tmdb {} language backfill refused ({}); proceeding with the recorded languages",
                     tmdb_id, e
@@ -433,13 +450,6 @@ where
             }
         }
     }
-}
-
-/// A TMDB failure that will not fix itself by waiting: a 4xx other than 429 (bad API key, unknown
-/// id). A 429, a 5xx, or a failure with no HTTP status (transport/decode) is transient.
-fn tmdb_error_is_permanent(e: &reqwest::Error) -> bool {
-    e.status()
-        .is_some_and(|s| s.is_client_error() && s != reqwest::StatusCode::TOO_MANY_REQUESTS)
 }
 
 /// True when the in-hand representative `rec` or ANY owned record in `hashes` has never had its
@@ -808,8 +818,11 @@ async fn apply_upgrade(
         ));
     }
     // Repoint every slot. If ANY selection write fails, do NOT prune (pruning behind a stale
-    // selection would leave a slot resolving to a hash we're about to delete) — defer the prune; the
-    // staged copy stays owned and is reclaimed by the duplicate-dedup pass.
+    // selection would leave a slot resolving to a hash we're about to delete) — defer the prune.
+    // Unlike the two defers above this one does NOT roll back: the staged copy stays owned (some
+    // slots may already point at it) and the old copy stays in place. Only
+    // `selection::repoint_to_better_copies` (for the slots) or an enabled `DEDUP_REMOVE_DUPLICATES`
+    // tidies the pair up afterwards.
     for (slot, file_path) in &staged.slot_files {
         if let Err(e) = app
             .store
@@ -997,6 +1010,7 @@ async fn try_upgrade_movie(
     owned_hashes: &[String],
     owned_rec: &OwnedRecord,
     idle_window: Duration,
+    collections: &std::collections::HashSet<String>,
 ) -> Result<(), UpgradeSkip> {
     // 1. Baseline = the BEST quality across ALL owned copies of this title — NOT an arbitrary one.
     //    The swap below prunes EVERY owned hash, so if a title has multiple present copies,
@@ -1014,6 +1028,34 @@ async fn try_upgrade_movie(
     let Some(current) = best_owned_quality(app, owned_hashes).await else {
         return Err(UpgradeSkip::NoChange("no owned copy left".into()));
     };
+    let mut group_owned: Vec<(String, OwnedRecord)> = Vec::new();
+    for h in owned_hashes {
+        if let Some(r) = app.store.get_owned(h.clone()).await {
+            group_owned.push((h.clone(), r));
+        }
+    }
+    // A `Pending` copy is `observe`'s: it is still downloading or unchecked, and `observe` repoints
+    // the film's slot to it once it settles. A swap now would prune it mid-download (an uncached
+    // copy's quality makes any cached release read as an improvement). Reconsider the title once it
+    // has settled.
+    if group_owned
+        .iter()
+        .any(|(_, r)| r.status == OwnedStatus::Pending)
+    {
+        return Err(UpgradeSkip::Deferred(
+            "a copy of the film is still Pending; deferring".into(),
+        ));
+    }
+    // A multi-film collection mirrored as this film's copy: the VFS shows every film in it, so a
+    // swap would prune (and the repointed slot hide) the other films. Never upgrade it.
+    if group_owned
+        .iter()
+        .any(|(h, _)| collections.contains(&h.to_ascii_lowercase()))
+    {
+        return Err(UpgradeSkip::NoChange(
+            "owned copy is a multi-feature collection".into(),
+        ));
+    }
     // Corrective-downgrade guard: if the baseline is a WITHIN-ceiling copy (so any adopted candidate
     // is rated `Improvement::Upgrade`, bypassing the downgrade gate) yet the SERVED slot points at a
     // separate over-ceiling copy we are deliberately RETAINING (ALLOW_RESOLUTION_DOWNGRADE off), then
@@ -1074,18 +1116,16 @@ async fn try_upgrade_movie(
     // The movie baseline spans all owned copies (the swap prunes them all), so the first hash is a
     // stable stand-in for the downgrade preview log.
     let old_hash = owned_hashes.first().map(String::as_str).unwrap_or("");
-    // Merge the title's sticky provenance ONCE from records fetched by hash (a small point-lookup
-    // set), instead of re-scanning the entire owned table via group_owned_by_tmdb inside
-    // stage_and_verify — mirrors the show path (upgrade_show_episodes_and_packs). `owned_hashes` IS
-    // the movie's full group (the swap prunes them all), so the merge equals the old group
-    // provenance; an empty set (every copy raced away) merges to EMPTY — the same non-manual fallback.
-    let mut group_owned: Vec<(String, OwnedRecord)> = Vec::new();
-    for h in owned_hashes {
-        if let Some(r) = app.store.get_owned(h.clone()).await {
-            group_owned.push((h.clone(), r));
-        }
-    }
-    let group_prov = merged_provenance(&group_owned);
+    // Prune the superseded copies — but NOT an over-ceiling copy unless corrective downgrade is
+    // enabled (`supersede_hashes`), so a within-ceiling upgrade never deletes an over-ceiling copy
+    // as collateral. The staged copy inherits the provenance of exactly the copies it supersedes.
+    let supersede = supersede_hashes(app, owned_hashes).await;
+    let prov = superseded_provenance(
+        group_owned
+            .iter()
+            .filter(|(h, _)| supersede.iter().any(|s| s.eq_ignore_ascii_case(h)))
+            .map(|(_, r)| r),
+    );
     // The swap prunes every copy and repoints the film's slot, so a read of any copy holds it back.
     let copies = copies_serving(app, MediaKind::Movie, tmdb_id, None).await;
     // Try ranked candidates best-first until one is adopted (in-tick fall-through), mirroring the
@@ -1102,12 +1142,8 @@ async fn try_upgrade_movie(
                 "a copy of the film is being read; deferring upgrade".into(),
             ));
         }
-        match stage_and_verify(app, tmdb_id, &req, &cand, &group_prov).await {
+        match stage_and_verify(app, tmdb_id, &req, &cand, &prov).await {
             Ok(staged) => {
-                // Prune the superseded copies — but NOT an over-ceiling copy unless corrective
-                // downgrade is enabled (`supersede_hashes`), so a within-ceiling upgrade never
-                // deletes an over-ceiling copy as collateral.
-                let supersede = supersede_hashes(app, owned_hashes).await;
                 apply_upgrade(
                     app,
                     StagedUpgrade {
@@ -1115,7 +1151,7 @@ async fn try_upgrade_movie(
                         torrent_id: staged.1,
                         slot_files: vec![(movie_slot(tmdb_id), staged.2)],
                     },
-                    PrunePlan::Hashes(supersede),
+                    PrunePlan::Hashes(supersede.clone()),
                     idle_window,
                 )
                 .await?;
@@ -1337,8 +1373,8 @@ async fn stage_and_verify(
     }
     // Record Verified with sticky provenance from the owned record we are upgrading; on a failed
     // write the candidate is rolled back and the title deferred ([`record_staged`]). Sticky
-    // provenance = the merge across the title's current owned copies, computed ONCE by the caller
-    // from records already in hand (no full owned-table re-scan) — see `merged_provenance`.
+    // provenance = that of the copies the swap supersedes, computed ONCE by the caller from records
+    // already in hand (no full owned-table re-scan) — see `superseded_provenance`.
     record_staged(
         app,
         &hash,
@@ -1455,19 +1491,28 @@ async fn prune_owned_hash_in(app: &AppState, hash: &str, torrents: &[crate::rd_c
     }
 }
 
-/// The merged sticky provenance across a group's owned records — preserves Manual / per-user origins
-/// across an upgrade swap. Computed from records the caller ALREADY holds (the movie path builds it
-/// from `owned_hashes`, the show paths from `group_hashes`) instead of re-scanning the entire `owned`
-/// table; equals `group_owned_by_tmdb(..).provenance` for the same group because both fold the group's
-/// records with the identical `Provenance::merge`. An empty slice (every owned copy raced away between
-/// grouping and staging) folds to EMPTY provenance — a plain mirror, NOT `manual()` (which would
-/// permanently mislabel an engine-staged copy as a protected manual add). NB: it builds
-/// `entries: []` explicitly, since `Provenance::default()` == `manual()`.
-fn merged_provenance(owned: &[(String, OwnedRecord)]) -> crate::store::Provenance {
+/// The provenance a staged replacement inherits: that of the copies it SUPERSEDES (prunes, or takes
+/// slots from), never the whole title group's. EMPTY (account-mirror semantics) as soon as one
+/// superseded copy is a mirror record (empty provenance): upgrading a copy the user added
+/// themselves must not hand its replacement a Trakt provenance, which `tasks::removal_hashes` would
+/// count as engine-acquired and Trigger B would then delete (the old mirror copy is pruned by the
+/// swap, so the user's content would be gone). Otherwise the merge of the superseded copies'
+/// provenance, so a watchlist acquisition keeps its lifecycle. Nothing superseded (every copy raced
+/// away) folds to EMPTY as well — a plain mirror, NOT `manual()` (which would permanently mislabel
+/// an engine-staged copy as a protected manual add). NB: it builds `entries: []` explicitly, since
+/// `Provenance::default()` == `manual()`.
+fn superseded_provenance<'a>(
+    superseded: impl IntoIterator<Item = &'a OwnedRecord>,
+) -> crate::store::Provenance {
     let mut prov = crate::store::Provenance {
         entries: Vec::new(),
     };
-    for (_, r) in owned {
+    for r in superseded {
+        if r.provenance.entries.is_empty() {
+            return crate::store::Provenance {
+                entries: Vec::new(),
+            };
+        }
         prov.merge(&r.provenance);
     }
     prov
@@ -1475,23 +1520,24 @@ fn merged_provenance(owned: &[(String, OwnedRecord)]) -> crate::store::Provenanc
 
 /// Inputs to the pure consolidation decision for ONE season.
 #[derive(Debug, Clone)]
-pub struct ConsolidationInput {
-    pub season: u32,
+struct ConsolidationInput {
     /// Episodes of this season aired per TMDB (the "full season" target).
-    pub aired_episodes: Vec<u32>,
+    aired_episodes: Vec<u32>,
     /// (episode, quality) for each episode we currently own INDIVIDUALLY in this season.
-    pub owned_episode_quality: Vec<(u32, QualitySummary)>,
-    pub pack_cached: bool,
+    owned_episode_quality: Vec<(u32, QualitySummary)>,
+    /// Whether the pack is cached. Production always passes `true` (staging only yields downloaded
+    /// torrents); kept as a test seam for the uncached rejection.
+    pack_cached: bool,
     /// Episodes the candidate pack supplies for this season.
-    pub pack_episodes: Vec<u32>,
+    pack_episodes: Vec<u32>,
     /// Quality of the pack (per-episode quality is assumed uniform across the pack).
-    pub pack_quality: QualitySummary,
+    pack_quality: QualitySummary,
 }
 
 /// Pure: should we consolidate this season's scattered episodes into the candidate pack?
 /// Requires: the pack is CACHED; it is a FULL-season pack (covers every aired episode); and it is
 /// not a quality regression vs ANY episode we currently own (same-or-higher tier AND resolution).
-pub fn consolidation_target(i: &ConsolidationInput) -> bool {
+fn consolidation_target(i: &ConsolidationInput) -> bool {
     if !i.pack_cached {
         return false;
     }
@@ -1571,8 +1617,11 @@ fn season_has_scatter(owned: &[(String, OwnedRecord)], season: u32) -> bool {
 /// only (raw prefs), so it could replace correct-language copies, and untagged audio tracks would
 /// let it pass the probe. So consolidation adopts the BEST pack — consistent with the movie upgrade
 /// path's max-by-score ranking — instead of the first acceptable one in raw scraper order (which,
-/// once adopted, the `already_pack` short-circuit would strand the season on). The async blacklist
-/// filter is applied by the caller (it can't be pure). Pure → unit-testable.
+/// once adopted, the `already_pack` short-circuit would strand the season on). A single-episode
+/// torrent ([`is_single_episode_stream`]) is dropped too: Torrentio lists every E1 single under the
+/// season's episode-1 query, and staging one only to find it isn't a pack cost a full add + poll +
+/// delete cycle per single on every visit. The async blacklist filter is applied by the caller (it
+/// can't be pure). Pure → unit-testable.
 fn rank_cached_pack_candidates(
     raws: &[crate::release::RawCandidate],
     prefs: &crate::config::QualityPrefs,
@@ -1580,6 +1629,7 @@ fn rank_cached_pack_candidates(
 ) -> Vec<release::ReleaseInfo> {
     let mut scored: Vec<(release::ReleaseInfo, i64)> = raws
         .iter()
+        .filter(|c| !is_single_episode_stream(c))
         .map(release::parse)
         .filter(|r| r.cached)
         .filter(|r| !known_unverifiable(r))
@@ -1601,6 +1651,68 @@ fn rank_cached_pack_candidates(
         .filter(|(r, _)| seen.insert(r.info_hash.to_ascii_lowercase()))
         .map(|(r, _)| r)
         .collect()
+}
+
+/// Whether a scraped stream is a SINGLE-episode torrent: its torrent name — the first line of the
+/// stream description (Torrentio's title; a later line names the file inside a pack) — carries
+/// exactly one episode code. A season pack's name carries none (`Show.S01.1080p…`) or a range
+/// (`S01E01-E10`), and a stream without a recognisable code is kept: its content is unknown until
+/// staged.
+fn is_single_episode_stream(c: &crate::release::RawCandidate) -> bool {
+    let name = c.description.lines().next().unwrap_or_default();
+    crate::vfs::parse_se_all(name).len() == 1
+}
+
+/// Consolidation candidates that staged and turned out structurally unusable as a pack for a season
+/// (multi-season, or missing one of its aired episodes), as `(tmdb_id, season, lowercased hash)`.
+/// A torrent's files never change and a season's aired set only grows, so such a candidate is
+/// skipped without staging for the rest of the process's life (staging it again would only repeat
+/// the add + poll + delete on every visit). In memory only: kept out of the acquisition blacklist,
+/// which would also keep the pack from being acquired for one of its episodes. Scoped to one
+/// `AppState` (by its `config`; a `Weak` keeps the address from being reused), so separate states
+/// never share entries.
+type NotSeasonPacks = Vec<(
+    std::sync::Weak<crate::config::Config>,
+    std::collections::HashSet<(u64, u32, String)>,
+)>;
+static NOT_SEASON_PACKS: std::sync::Mutex<NotSeasonPacks> = std::sync::Mutex::new(Vec::new());
+
+/// Run `f` on this `AppState`'s [`NOT_SEASON_PACKS`] entry, dropping the entries of states that are
+/// gone.
+fn with_not_season_packs<R>(
+    app: &AppState,
+    f: impl FnOnce(&mut std::collections::HashSet<(u64, u32, String)>) -> R,
+) -> R {
+    let mut memo = NOT_SEASON_PACKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    memo.retain(|(w, _)| w.strong_count() > 0);
+    let me = std::sync::Arc::as_ptr(&app.config);
+    let i = match memo.iter().position(|(w, _)| std::ptr::eq(w.as_ptr(), me)) {
+        Some(i) => i,
+        None => {
+            memo.push((
+                std::sync::Arc::downgrade(&app.config),
+                std::collections::HashSet::new(),
+            ));
+            memo.len() - 1
+        }
+    };
+    f(&mut memo[i].1)
+}
+
+/// Whether `hash` already staged as structurally unusable for `season` ([`NOT_SEASON_PACKS`]).
+fn known_not_a_season_pack(app: &AppState, tmdb_id: u64, season: u32, hash: &str) -> bool {
+    with_not_season_packs(app, |m| {
+        m.contains(&(tmdb_id, season, hash.to_ascii_lowercase()))
+    })
+}
+
+/// Remember that `hash` is structurally unusable as a pack for `season` ([`NOT_SEASON_PACKS`]).
+fn remember_not_a_season_pack(app: &AppState, tmdb_id: u64, season: u32, hash: &str) {
+    with_not_season_packs(app, |m| {
+        m.insert((tmdb_id, season, hash.to_ascii_lowercase()));
+    });
 }
 
 // ── per-episode upgrade/downgrade + over-ceiling pack correction ──────────────────────────────
@@ -1671,7 +1783,7 @@ async fn stage_episode_candidate(
     base_req: &crate::store::AcquireRequest,
     cand: &release::ReleaseInfo,
     (season, episode): (u32, u32),
-    group_prov: &crate::store::Provenance,
+    prov: &crate::store::Provenance,
     multi_episode: &mut std::collections::HashSet<String>,
 ) -> Result<(String, String, String), UpgradeSkip> {
     let hash = cand.info_hash.clone();
@@ -1780,7 +1892,7 @@ async fn stage_episode_candidate(
         &torrent_id,
         OwnedRecord {
             request: base_req.clone(),
-            provenance: group_prov.clone(),
+            provenance: prov.clone(),
             added_at: now_secs(),
             status: OwnedStatus::Verified,
             provides: vec![(season, episode)],
@@ -1957,8 +2069,9 @@ enum EpisodeUpgrade {
     /// transient glitch on this episode) — move on to the next episode.
     Unchanged,
     /// A player is reading a copy the swap changes, or a post-stage `apply_upgrade` step deferred
-    /// (it already rolled the staged copy back): stop ALL further show work this tick and signal
-    /// deferral.
+    /// (a listing failure or a mid-stage read rolls the staged copy back; a failed selection write
+    /// keeps it owned, possibly with some slots repointed, and leaves the old copy in place): stop
+    /// ALL further show work this tick and signal deferral.
     Deferred,
 }
 
@@ -1973,7 +2086,7 @@ async fn upgrade_episode_slot(
     tmdb_id: u64,
     target: EpisodeTarget<'_>,
     ranked: Vec<(release::ReleaseInfo, release::Improvement)>,
-    group_prov: &crate::store::Provenance,
+    prov: &crate::store::Provenance,
     idle_window: Duration,
     tick: &mut EpisodeTick,
 ) -> EpisodeUpgrade {
@@ -2020,7 +2133,7 @@ async fn upgrade_episode_slot(
             req,
             &cand,
             (season, episode),
-            group_prov,
+            prov,
             &mut tick.multi_episode,
         )
         .await
@@ -2052,10 +2165,11 @@ async fn upgrade_episode_slot(
                         tick.adopted.push(new_hash.clone());
                         return EpisodeUpgrade::Swapped(new_hash); // → the next episode
                     }
-                    // apply_upgrade already rolled back the staged copy. A post-stage defer
-                    // (library became active, or the prune listing/selection write failed) must
-                    // propagate so the caller leaves the round-robin cursor unstamped and this
-                    // work is reconsidered next tick — NOT swallowed as a false "swapped".
+                    // A post-stage defer: a listing failure or a mid-stage read rolled the staged
+                    // copy back, a failed selection write kept it owned (possibly with some slots
+                    // repointed; the old copy stays). Either must propagate so the caller leaves
+                    // the round-robin cursor unstamped and this work is reconsidered next tick —
+                    // NOT swallowed as a false "swapped".
                     Err(_) => return EpisodeUpgrade::Deferred,
                 }
             }
@@ -2110,15 +2224,17 @@ async fn correct_over_ceiling_packs(
 ) -> bool {
     let prefs = &app.config.acquisition.prefs;
     let ceiling = prefs.max_resolution.height();
-    // Merge the group's provenance once from the records in hand (no per-pack owned-table re-scan).
-    let group_prov = merged_provenance(owned);
     // Fetch the per-title blacklist ONCE and test membership in memory (mirrors `rank_changes`),
     // rather than one awaited redb read per ranked candidate.
     let blacklist = app
         .store
         .blacklisted_hashes_for(MediaKind::Series, tmdb_id)
         .await;
-    for (pack_hash, rec) in owned.iter().filter(|(_, r)| r.provides.len() > 1) {
+    // Settled packs only: a `Pending` copy is `observe`'s.
+    for (pack_hash, rec) in owned
+        .iter()
+        .filter(|(_, r)| r.provides.len() > 1 && r.status == OwnedStatus::Verified)
+    {
         let Some(pack_q) = rec.quality.clone() else {
             // No recorded quality (its file name is unknown even after the tick-start backfill) →
             // not known to be over the ceiling: unknown-lowest, handled by phase (a2), not here.
@@ -2262,7 +2378,8 @@ async fn correct_over_ceiling_packs(
                 &torrent_id,
                 OwnedRecord {
                     request: base_req,
-                    provenance: group_prov.clone(),
+                    // The replacement supersedes this pack: it inherits the pack's provenance.
+                    provenance: superseded_provenance([rec]),
                     added_at: now_secs(),
                     status: OwnedStatus::Verified,
                     provides,
@@ -2308,10 +2425,11 @@ async fn correct_over_ceiling_packs(
                     );
                     break; // one correction per pack per tick
                 }
-                // apply_upgrade already rolled back the staged pack. A post-stage defer (library
-                // became active, or the prune listing/selection write failed) must propagate so the
-                // caller leaves the round-robin cursor unstamped and this pack is reconsidered next
-                // tick — NOT swallowed as a false "pack corrected".
+                // A post-stage defer: a listing failure or a mid-stage read rolled the staged pack
+                // back, a failed selection write kept it owned (possibly with some slots repointed;
+                // the old pack stays). Either must propagate so the caller leaves the round-robin
+                // cursor unstamped and this pack is reconsidered next tick — NOT swallowed as a
+                // false "pack corrected".
                 Err(_) => return true,
             }
         }
@@ -2350,15 +2468,19 @@ async fn upgrade_show_episodes_and_packs(
     let Some(imdb_id) = group_imdb_id(app, group_hashes).await else {
         return false;
     };
-    // Merge the group's sticky provenance ONCE from the records already fetched above, instead of
-    // re-scanning the whole owned table per staged episode (see `merged_provenance`).
-    let group_prov = merged_provenance(&owned);
     // What phases (a) and (a2) adopted / found to be multi-episode packs so far this tick.
     let mut tick = EpisodeTick::default();
 
     // (a) Per-singleton-episode upgrade/downgrade.
     let ceiling = app.config.acquisition.prefs.max_resolution.height();
-    for (hash, rec) in owned.iter().filter(|(_, r)| r.provides.len() == 1) {
+    // Settled singletons only. A `Pending` record is `observe`'s: still downloading (its
+    // acquire-time quality says `cached: false`, against which ANY cached release — of any
+    // resolution — reads as an upgrade) or unchecked, and a Pending pack acquired for one episode
+    // lists only that episode until it resolves. Swapping it would delete the download.
+    for (hash, rec) in owned
+        .iter()
+        .filter(|(_, r)| r.provides.len() == 1 && r.status == OwnedStatus::Verified)
+    {
         // No recorded quality → unknown, the lowest: any known cached candidate improves on it.
         let q = rec.quality.clone().unwrap_or_else(QualitySummary::unknown);
         let (season, episode) = rec.provides[0];
@@ -2445,12 +2567,14 @@ async fn upgrade_show_episodes_and_packs(
             baseline: &q,
             supersede: EpisodeSupersede::Singleton(hash),
         };
+        // The replacement supersedes this singleton: it inherits the singleton's provenance (a
+        // mirror copy's replacement stays a mirror record).
         if let EpisodeUpgrade::Deferred = upgrade_episode_slot(
             app,
             tmdb_id,
             target,
             ranked,
-            &group_prov,
+            &superseded_provenance([rec]),
             idle_window,
             &mut tick,
         )
@@ -2475,7 +2599,10 @@ async fn upgrade_show_episodes_and_packs(
     // unimprovable pack, not one per episode it serves. A candidate that turns out to be a
     // multi-episode pack is staged at most once per tick (`EpisodeTick::multi_episode`), not once
     // per served episode.
-    for (pack_hash, rec) in owned.iter().filter(|(_, r)| r.provides.len() > 1) {
+    for (pack_hash, rec) in owned
+        .iter()
+        .filter(|(_, r)| r.provides.len() > 1 && r.status == OwnedStatus::Verified)
+    {
         // No recorded quality → unknown on both axes, the lowest (see `pack_split_no_regression`).
         let q = rec.quality.clone().unwrap_or_else(QualitySummary::unknown);
         if q.resolution > ceiling {
@@ -2550,12 +2677,13 @@ async fn upgrade_show_episodes_and_packs(
                     served_by: &served_by,
                 },
             };
+            // The single takes the slot from the pack: it inherits the pack's provenance.
             match upgrade_episode_slot(
                 app,
                 tmdb_id,
                 target,
                 ranked,
-                &group_prov,
+                &superseded_provenance([rec]),
                 idle_window,
                 &mut tick,
             )
@@ -2594,12 +2722,17 @@ async fn upgrade_show_episodes_and_packs(
 /// per-season scrapes would be wasted) when the phase deferred AND a copy of the show is still being
 /// read — consolidation's own read check would discard the work anyway; a defer for another reason
 /// (e.g. a transient listing failure) still lets consolidation run.
-async fn try_upgrade_show(
+async fn try_upgrade_show<A, AFut>(
     app: &AppState,
     tmdb_id: u64,
     group_hashes: &[String],
     idle_window: Duration,
-) -> Result<(), UpgradeSkip> {
+    fetch_aired: &A,
+) -> Result<(), UpgradeSkip>
+where
+    A: Fn(u64) -> AFut,
+    AFut: Future<Output = Vec<(u32, u32)>>,
+{
     let deferred = upgrade_show_episodes_and_packs(app, tmdb_id, group_hashes, idle_window).await;
     // If the episode/pack phase deferred because a copy of the show is being read, consolidation's
     // own read check would most likely discard its swap/prune too — so skip its network calls
@@ -2625,7 +2758,8 @@ async fn try_upgrade_show(
     // by dedup). Feeding consolidation the fresh set makes `season_owned_quality` see the upgraded
     // episode, so the no-regression gate correctly rejects a lower-quality pack.
     let fresh_hashes = current_show_hashes(app, tmdb_id).await;
-    let consolidated = try_consolidate_show(app, tmdb_id, &fresh_hashes, idle_window).await;
+    let consolidated =
+        try_consolidate_show(app, tmdb_id, &fresh_hashes, idle_window, fetch_aired).await;
     if deferred {
         return Err(UpgradeSkip::Deferred(
             "show per-episode/pack upgrade deferred mid-tick".into(),
@@ -2652,12 +2786,19 @@ async fn current_show_hashes(app: &AppState, tmdb_id: u64) -> Vec<String> {
 /// season. Non-destructive: a pack that fails any gate (not cached / above the resolution ceiling /
 /// not a full season / a quality regression / wrong title) is deleted and the scattered episodes
 /// keep their selection untouched. The idle gate drops the staged pack on defer (no dangling stage).
-async fn try_consolidate_show(
+/// `fetch_aired` yields the show's aired `(season, episode)` set (`tasks::aired_episodes` in
+/// production); it is called only when a season is held as scattered singles.
+async fn try_consolidate_show<A, AFut>(
     app: &AppState,
     tmdb_id: u64,
     group_hashes: &[String],
     idle_window: Duration,
-) -> Result<(), UpgradeSkip> {
+    fetch_aired: &A,
+) -> Result<(), UpgradeSkip>
+where
+    A: Fn(u64) -> AFut,
+    AFut: Future<Output = Vec<(u32, u32)>>,
+{
     // Owned per-episode records for this show: hash -> OwnedRecord.
     let mut owned: Vec<(String, OwnedRecord)> = Vec::new();
     for h in group_hashes {
@@ -2688,21 +2829,18 @@ async fn try_consolidate_show(
     if !scattered {
         return Ok(());
     }
-    let today = chrono::Utc::now().date_naive();
     // Per-season completeness is enough here: a season only ever proceeds below when its
     // `season_aired` is non-empty, which means that season's air-date lookup succeeded — so
     // consolidation never prunes against a season whose aired set is unknown.
-    let aired = crate::tasks::aired_episodes(&app.tmdb_client, tmdb_id, today)
-        .await
-        .pairs;
+    let aired = fetch_aired(tmdb_id).await;
     consolidate_show_seasons(app, tmdb_id, group_hashes, &owned, &aired, idle_window).await
 }
 
 /// The post-aired-lookup body of [`try_consolidate_show`]: given the already-resolved owned records
 /// and the show's aired-episode set, consolidate each scattered season into a full-season cached
-/// pack. Split out from `try_consolidate_show` so the destructive staging → record → repoint → prune
-/// orchestration is unit-testable WITHOUT the live TMDB aired-episode lookup (which the wrapper does,
-/// and which is exercised by the live smoke). Behaviour is identical to the previously-inlined body.
+/// pack. Split out from `try_consolidate_show` (which resolves the aired set through its injected
+/// lookup) so the staging → record → repoint → prune orchestration can be driven with an aired set
+/// directly.
 async fn consolidate_show_seasons(
     app: &AppState,
     tmdb_id: u64,
@@ -2736,9 +2874,6 @@ async fn consolidate_show_seasons(
         ));
     }
 
-    // The group's sticky provenance, merged ONCE from the `owned` records already in hand (no
-    // `owned`-table re-scan) — see `merged_provenance`.
-    let prov = merged_provenance(owned);
     // Fetch the per-title blacklist ONCE and test membership in memory (mirrors `rank_changes`),
     // rather than one awaited redb read per ranked candidate across every season.
     let blacklist = app
@@ -2772,6 +2907,13 @@ async fn consolidate_show_seasons(
         // re-notify). Require genuine scatter to merge. (Once episodes accumulate into ≥2 records the
         // season is consolidated; a single record is left for the acquisition path to fill.)
         if !season_has_scatter(owned, season) {
+            continue;
+        }
+        // A `Pending` record supplying the season is `observe`'s (still downloading or unchecked):
+        // leave the season alone until it settles rather than count it as scatter and prune it.
+        if owned.iter().any(|(_, r)| {
+            r.status == OwnedStatus::Pending && r.provides.iter().any(|(s, _)| *s == season)
+        }) {
             continue;
         }
 
@@ -2816,7 +2958,9 @@ async fn consolidate_show_seasons(
         // a pack above the ceiling would pass the no-regression check yet violate it, so it's excluded).
         let order = ordering_prefs(app, &sample.request);
         for r in rank_cached_pack_candidates(&raws, &order, group_hashes) {
-            if blacklist.contains(&r.info_hash.to_ascii_lowercase()) {
+            if blacklist.contains(&r.info_hash.to_ascii_lowercase())
+                || known_not_a_season_pack(app, tmdb_id, season, &r.info_hash)
+            {
                 continue;
             }
             // `consolidation_target`'s no-regression half needs only the scraped quality: skip a
@@ -2853,6 +2997,7 @@ async fn consolidate_show_seasons(
             // so provides/selection/prune stay consistent for the target season.
             if eps.iter().any(|(s, _, _)| *s != season) {
                 let _ = app.provider.delete_torrent(&torrent_id).await;
+                remember_not_a_season_pack(app, tmdb_id, season, &r.info_hash);
                 continue;
             }
             let pack_episodes: Vec<u32> = eps
@@ -2862,7 +3007,6 @@ async fn consolidate_show_seasons(
                 .collect();
 
             let input = ConsolidationInput {
-                season,
                 aired_episodes: season_aired.clone(),
                 owned_episode_quality: season_owned_q.clone(),
                 pack_cached: true,
@@ -2875,7 +3019,13 @@ async fn consolidate_show_seasons(
                 pack_quality,
             };
             if !consolidation_target(&input) {
-                let _ = app.provider.delete_torrent(&torrent_id).await; // non-destructive: drop the staged pack
+                // Non-destructive: drop the staged pack. A pack missing an aired episode stays
+                // missing it (its files never change), so it is never staged again. (The
+                // no-regression half was already checked before staging.)
+                let _ = app.provider.delete_torrent(&torrent_id).await;
+                if !season_aired.iter().all(|e| input.pack_episodes.contains(e)) {
+                    remember_not_a_season_pack(app, tmdb_id, season, &r.info_hash);
+                }
                 continue;
             }
             // Validate the show identity on a representative episode file, then apply the SAME
@@ -2984,6 +3134,27 @@ async fn consolidate_show_seasons(
             // ([`record_staged`]), so the scattered episodes are never pruned against an unrecorded
             // pack, and the next tick stages it afresh.
             let provides: Vec<(u32, u32)> = eps.iter().map(|(s, e, _)| (*s, *e)).collect();
+            let pack_eps_for_season: std::collections::HashSet<u32> = eps
+                .iter()
+                .filter(|(s, _, _)| *s == season)
+                .map(|(_, e, _)| *e)
+                .collect();
+            // Every owned hash this pack fully supersedes for the season (pruned below). M-2
+            // safety: EVERY episode it provides is for this season AND covered by the new pack, so
+            // no held episode is left with an un-repointed selection.
+            let superseded: Vec<&(String, OwnedRecord)> = owned
+                .iter()
+                .filter(|(h, rec)| {
+                    !h.eq_ignore_ascii_case(&r.info_hash)
+                        && !rec.provides.is_empty()
+                        && rec
+                            .provides
+                            .iter()
+                            .all(|(s, e)| *s == season && pack_eps_for_season.contains(e))
+                })
+                .collect();
+            // The pack inherits the provenance of exactly the copies it supersedes.
+            let prov = superseded_provenance(superseded.iter().map(|(_, rec)| rec));
             record_staged(
                 app,
                 &r.info_hash,
@@ -3036,29 +3207,13 @@ async fn consolidate_show_seasons(
                     "s{season} selection repoint failed; deferring prune"
                 )));
             }
-            // Prune every owned hash this new pack fully supersedes for the season — scattered
-            // single episodes AND any smaller/older pack (e.g. a prior full-season pack that didn't
-            // cover a newly-aired episode). M-2 safety: prune a hash ONLY when EVERY episode it
-            // provides is for this season AND covered by the new pack, so no held episode is left
-            // with an un-repointed selection. (The provider listing was fetched once at the top of
-            // this consolidation block, before the idle gate — reused here for all prunes.)
-            let pack_eps_for_season: std::collections::HashSet<u32> = eps
-                .iter()
-                .filter(|(s, _, _)| *s == season)
-                .map(|(_, e, _)| *e)
-                .collect();
-            for (h, rec) in owned {
-                if h.eq_ignore_ascii_case(&r.info_hash) {
-                    continue; // never prune the pack we just adopted
-                }
-                let superseded = !rec.provides.is_empty()
-                    && rec
-                        .provides
-                        .iter()
-                        .all(|(s, e)| *s == season && pack_eps_for_season.contains(e));
-                if superseded {
-                    prune_owned_hash_in(app, h, &listing).await;
-                }
+            // Prune every owned hash this new pack fully supersedes for the season (`superseded`
+            // above) — scattered single episodes AND any smaller/older pack (e.g. a prior
+            // full-season pack that didn't cover a newly-aired episode), never the adopted pack.
+            // (The provider listing was fetched once at the top of this consolidation block,
+            // before the idle gate — reused here for all prunes.)
+            for (h, _) in &superseded {
+                prune_owned_hash_in(app, h, &listing).await;
             }
             info!(
                 "consolidate: tmdb {} season {} -> pack {}",
@@ -3348,14 +3503,14 @@ mod tests {
     }
 
     #[test]
-    fn merged_provenance_of_a_vanished_group_is_empty_not_manual() {
+    fn superseded_provenance_of_a_vanished_group_is_empty_not_manual() {
         // If every owned copy of a title is concurrently pruned between grouping and staging, the
         // staged upgrade must inherit EMPTY provenance (a plain mirror) — NOT manual(), which would
         // permanently mislabel an engine-staged copy as a protected manual add (run_upgrade_once
-        // skips a manual group forever, and dedup never auto-removes a manual copy). merged_provenance
-        // over no records folds to empty (it builds `entries: []`, not Provenance::default() ==
-        // manual()) — the same fallback the movie/show upgrade paths rely on.
-        let prov = merged_provenance(&[]);
+        // skips a manual group forever, and dedup never auto-removes a manual copy).
+        // superseded_provenance over no records folds to empty (it builds `entries: []`, not
+        // Provenance::default() == manual()) — the fallback the movie/show upgrade paths rely on.
+        let prov = superseded_provenance(std::iter::empty());
         assert!(
             prov.entries.is_empty(),
             "a vanished group must fall back to EMPTY provenance, got {:?}",
@@ -3442,6 +3597,7 @@ mod tests {
             &["hold".to_string()],
             &hold,
             Duration::from_secs(300),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -3715,6 +3871,7 @@ mod tests {
             &["h2160".to_string(), "hold".to_string()],
             &rec,
             Duration::from_secs(0),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(r.is_ok(), "the within-ceiling upgrade proceeds");
@@ -3817,6 +3974,7 @@ mod tests {
             &["h2160".to_string(), "hold".to_string()],
             &rec,
             Duration::from_secs(0),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -5198,11 +5356,21 @@ mod tests {
 
     #[tokio::test]
     async fn tmdb_error_permanence_classification() {
-        assert!(tmdb_error_is_permanent(&http_status_error(404)));
-        assert!(tmdb_error_is_permanent(&http_status_error(401)));
-        assert!(!tmdb_error_is_permanent(&http_status_error(429)));
-        assert!(!tmdb_error_is_permanent(&http_status_error(502)));
-        assert!(!tmdb_error_is_permanent(&http_status_error(500)));
+        assert!(crate::tmdb_client::error_is_permanent(&http_status_error(
+            404
+        )));
+        assert!(crate::tmdb_client::error_is_permanent(&http_status_error(
+            401
+        )));
+        assert!(!crate::tmdb_client::error_is_permanent(&http_status_error(
+            429
+        )));
+        assert!(!crate::tmdb_client::error_is_permanent(&http_status_error(
+            502
+        )));
+        assert!(!crate::tmdb_client::error_is_permanent(&http_status_error(
+            500
+        )));
         // No HTTP status (transport / decode failure) → transient.
         let decode = reqwest::Response::from(
             hyper::Response::builder()
@@ -5214,7 +5382,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(decode.status().is_none());
-        assert!(!tmdb_error_is_permanent(&decode));
+        assert!(!crate::tmdb_client::error_is_permanent(&decode));
     }
 
     /// A legacy `fi`-original movie (mostly English; spoken languages never fetched) owned as a
@@ -5302,6 +5470,7 @@ mod tests {
         run_upgrade_once_with(
             &app,
             canned_details(calls.clone(), || Ok(fi_film_details())),
+            |_| async { Vec::new() },
         )
         .await;
 
@@ -5340,6 +5509,7 @@ mod tests {
         run_upgrade_once_with(
             &app,
             canned_details(calls.clone(), || Err(http_status_error(503))),
+            |_| async { Vec::new() },
         )
         .await;
 
@@ -5551,6 +5721,161 @@ mod tests {
         );
         assert!(deleted.lock().unwrap().contains(&"t-hold".to_string()));
         assert!(store.get_upgrade_checked(&MediaType::Movie, 27205).await > 0);
+    }
+
+    fn mirror() -> Provenance {
+        Provenance { entries: vec![] }
+    }
+
+    /// Re-record `hash`'s owned record as an account-mirror copy (empty provenance).
+    async fn make_mirror(store: &Store, hash: &str) {
+        let mut rec = store.get_owned(hash.into()).await.unwrap();
+        rec.provenance = mirror();
+        store.put_owned(hash.into(), rec).await.unwrap();
+    }
+
+    /// A film owned both as an engine copy and as the user's own (mirror) copy: the swap prunes
+    /// both, so the upgrade inherits the mirror copy's EMPTY provenance. Handing it the engine
+    /// copy's watchlist provenance would let Trigger B delete it once the watchlist is abandoned,
+    /// with the user's own copy already pruned.
+    #[tokio::test]
+    async fn a_movie_upgrade_that_supersedes_a_mirror_copy_stays_a_mirror_record() {
+        let store = mem_store();
+        let engine = put_movie_copy(&store, 27205, "tt1", "hold").await;
+        let mirror_copy = put_movie_copy(&store, 27205, "tt1", "hmirror").await;
+        make_mirror(&store, "hmirror").await;
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = remux_staging_provider(vec![engine, mirror_copy], deleted.clone());
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![remux_candidate()],
+        });
+        let app = app_with(scraper, provider, store.clone());
+
+        run_upgrade_once(&app).await;
+
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hnew"
+        );
+        let rec = store.get_owned("hnew".into()).await.unwrap();
+        assert!(
+            rec.provenance.entries.is_empty(),
+            "the upgrade of a mirror copy stays a mirror record, got {:?}",
+            rec.provenance
+        );
+        let groups = crate::tasks::group_owned_by_tmdb(&store).await;
+        assert!(
+            !groups[&(MediaType::Movie, 27205)]
+                .engine_hashes
+                .contains(&"hnew".to_string()),
+            "so Trigger B never targets it"
+        );
+    }
+
+    /// A `Pending` copy is `observe`'s (still downloading, or unchecked): the film is left alone
+    /// until it settles instead of having the download pruned by a swap.
+    #[tokio::test]
+    async fn a_movie_with_a_pending_copy_is_left_to_observe() {
+        let store = mem_store();
+        let settled = put_movie_copy(&store, 27205, "tt1", "hold").await;
+        let mut pending = store.get_owned("hold".into()).await.unwrap();
+        pending.status = OwnedStatus::Pending;
+        pending.quality.as_mut().unwrap().cached = false;
+        store.put_owned("hpend".into(), pending).await.unwrap();
+        let downloading = Torrent {
+            id: "t-hpend".into(),
+            hash: "hpend".into(),
+            status: "downloading".into(),
+            ..Default::default()
+        };
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = remux_staging_provider(vec![settled, downloading], deleted.clone());
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![remux_candidate()],
+        });
+        let app = app_with(scraper, provider, store.clone());
+        let rec = store.get_owned("hold".into()).await.unwrap();
+
+        let r = try_upgrade_movie(
+            &app,
+            27205,
+            &["hold".to_string(), "hpend".to_string()],
+            &rec,
+            Duration::from_secs(0),
+            &std::collections::HashSet::new(),
+        )
+        .await;
+
+        assert!(matches!(r, Err(UpgradeSkip::Deferred(_))));
+        assert!(deleted.lock().unwrap().is_empty(), "nothing deleted");
+        assert!(store.get_owned("hnew".into()).await.is_none());
+        assert!(store.get_owned("hpend".into()).await.is_some());
+    }
+
+    /// A mirrored copy that is a multi-film collection (two selected feature-sized videos in its
+    /// persisted identification) is recorded as one film's copy; the VFS shows every film in it,
+    /// so a swap would delete the others. It is never upgraded. With one of the films selected it
+    /// is a single-film copy and is upgraded as before.
+    #[tokio::test]
+    async fn a_mirrored_multi_film_collection_is_never_upgraded() {
+        for second_selected in [1, 0] {
+            let store = mem_store();
+            let old = put_movie_copy(&store, 27205, "tt1", "hold").await;
+            make_mirror(&store, "hold").await;
+            store
+                .put_matches(vec![(
+                    "t-hold".into(),
+                    TorrentInfo {
+                        id: "t-hold".into(),
+                        hash: "hold".into(),
+                        status: "downloaded".into(),
+                        files: vec![
+                            TorrentFile {
+                                id: 0,
+                                path: "Coll/Film.One.2001.1080p.mkv".into(),
+                                bytes: 8_000_000_000,
+                                selected: 1,
+                            },
+                            TorrentFile {
+                                id: 1,
+                                path: "Coll/Film.Two.2004.1080p.mkv".into(),
+                                bytes: 8_000_000_000,
+                                selected: second_selected,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    movie_meta(),
+                )])
+                .await
+                .unwrap();
+            let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = remux_staging_provider(vec![old], deleted.clone());
+            let scraper = Arc::new(MockScraper {
+                candidates: vec![remux_candidate()],
+            });
+            let app = app_with(scraper, provider, store.clone());
+
+            run_upgrade_once(&app).await;
+
+            let served = store.get_selection(movie_slot(27205)).await.unwrap().hash;
+            if second_selected == 1 {
+                assert_eq!(served, "hold", "the collection keeps its slot");
+                assert!(store.get_owned("hold".into()).await.is_some());
+                assert!(
+                    store.get_owned("hnew".into()).await.is_none(),
+                    "nothing staged"
+                );
+                assert!(deleted.lock().unwrap().is_empty(), "nothing deleted");
+                assert!(
+                    store.get_upgrade_checked(&MediaType::Movie, 27205).await > 0,
+                    "evaluated (no change), so the cursor advances"
+                );
+            } else {
+                assert_eq!(served, "hnew", "control: a single-film copy is upgraded");
+                assert!(deleted.lock().unwrap().contains(&"t-hold".to_string()));
+            }
+        }
     }
 
     /// A title whose copy is being read is skipped (cursor unchanged, so the next pass retries it),
@@ -6397,6 +6722,7 @@ mod tests {
             &h.owned_hashes,
             &h.rec,
             Duration::from_secs(0),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(matches!(r, Ok(()) | Err(UpgradeSkip::NoChange(_))));
@@ -6429,6 +6755,7 @@ mod tests {
             &h.owned_hashes,
             &h.rec,
             Duration::from_secs(0),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(r.is_ok());
@@ -6472,6 +6799,7 @@ mod tests {
             &h.owned_hashes,
             &h.rec,
             Duration::from_secs(0),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(matches!(r, Err(UpgradeSkip::NoChange(_))), "{r:?}");
@@ -6502,6 +6830,7 @@ mod tests {
             &h.owned_hashes,
             &h.rec,
             Duration::from_secs(0),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(r.is_ok(), "control: {r:?}");
@@ -6633,7 +6962,15 @@ mod tests {
 
         let owned = vec![owned_hash.clone()];
         let rec = app.store.get_owned(owned_hash.clone()).await.unwrap();
-        let r = try_upgrade_movie(&app, TMDB, &owned, &rec, Duration::from_secs(0)).await;
+        let r = try_upgrade_movie(
+            &app,
+            TMDB,
+            &owned,
+            &rec,
+            Duration::from_secs(0),
+            &std::collections::HashSet::new(),
+        )
+        .await;
         assert!(
             r.is_ok(),
             "fall-through should adopt the good candidate: {r:?}"
@@ -6783,6 +7120,7 @@ mod tests {
             std::slice::from_ref(&owned),
             &rec,
             Duration::from_secs(0),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -6817,6 +7155,7 @@ mod tests {
             std::slice::from_ref(&owned),
             &rec,
             Duration::from_secs(0),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -6905,6 +7244,7 @@ mod tests {
             std::slice::from_ref(&owned),
             &rec,
             Duration::from_secs(0),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -6932,7 +7272,6 @@ mod tests {
     fn full_cached_season_pack_no_regression_consolidates() {
         // Owned scattered: E01 (WEB 1080p), E02 (WEB 1080p). Pack: cached BluRay 1080p covering E01-E03.
         let input = ConsolidationInput {
-            season: 1,
             aired_episodes: vec![1, 2, 3],
             owned_episode_quality: vec![
                 (
@@ -6975,7 +7314,6 @@ mod tests {
     #[test]
     fn partial_season_pack_is_rejected() {
         let input = ConsolidationInput {
-            season: 1,
             aired_episodes: vec![1, 2, 3],
             owned_episode_quality: vec![(1, q1080_web()), (2, q1080_web())],
             pack_cached: true,
@@ -6991,7 +7329,6 @@ mod tests {
     #[test]
     fn quality_regression_pack_is_rejected() {
         let input = ConsolidationInput {
-            season: 1,
             aired_episodes: vec![1, 2, 3],
             owned_episode_quality: vec![(1, q2160_remux()), (2, q1080_web())], // E01 is 2160 REMUX
             pack_cached: true,
@@ -7007,7 +7344,6 @@ mod tests {
     #[test]
     fn uncached_pack_is_rejected() {
         let input = ConsolidationInput {
-            season: 1,
             aired_episodes: vec![1, 2, 3],
             owned_episode_quality: vec![(1, q1080_web())],
             pack_cached: false,
@@ -7020,7 +7356,6 @@ mod tests {
     #[test]
     fn empty_aired_set_is_rejected() {
         let input = ConsolidationInput {
-            season: 1,
             aired_episodes: vec![],
             owned_episode_quality: vec![],
             pack_cached: true,
@@ -7264,7 +7599,6 @@ mod tests {
 
         // A candidate WEB full-season pack would downgrade E1..E8 (REMUX) → must be rejected.
         let input = ConsolidationInput {
-            season: 1,
             aired_episodes: (1..=10).collect(),
             owned_episode_quality: q,
             pack_cached: true,
@@ -7288,7 +7622,6 @@ mod tests {
             "the unknown contributor is represented, not a skip"
         );
         let pack = |q: QualitySummary| ConsolidationInput {
-            season: 1,
             aired_episodes: vec![9, 10, 11],
             owned_episode_quality: q2.clone(),
             pack_cached: true,
@@ -7565,10 +7898,9 @@ mod tests {
     // These exercise `try_consolidate_show`'s destructive multi-step body (stage cached full-season
     // pack → record owned with full-season `provides` → repoint episode `selection` slots → prune the
     // superseded scattered episode torrents) and its recovery branches. They call the extracted
-    // `consolidate_show_seasons` directly with an injected aired-episode set, so they stay fully
-    // deterministic and offline: the only thing `consolidate_show_seasons` does NOT cover is the thin
-    // TMDB aired-episode lookup that the `try_consolidate_show` wrapper performs (covered by the live
-    // smoke, not unit tests — `aired_episodes` is documented as such).
+    // `consolidate_show_seasons` directly with an aired-episode set, so they stay fully
+    // deterministic and offline. The `try_consolidate_show` / `try_upgrade_show` wrappers take the
+    // aired lookup injected (`canned_aired`), and are driven offline the same way.
 
     const SHOW_TMDB: u64 = 1399;
 
@@ -8469,6 +8801,7 @@ mod tests {
             &["hold".to_string()],
             &hold,
             Duration::from_secs(300),
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(matches!(res, Err(UpgradeSkip::Deferred(_))), "{res:?}");
@@ -8682,18 +9015,9 @@ mod tests {
 
     // ── per-episode upgrade/downgrade + over-ceiling pack correction tests ───────────────────
     //
-    // These call `upgrade_show_episodes_and_packs` directly rather than the public dispatch
-    // target `try_upgrade_show`. `try_upgrade_show` always additionally invokes the TMDB-driven
-    // `try_consolidate_show` (see its doc comment) — reaching a REAL `https://api.themoviedb.org`
-    // call whenever the show group still has a resolvable IMDB id after this phase runs (true in
-    // every scenario below, since a resolvable id is exactly what's needed to exercise real
-    // scrape/upgrade logic here). Every OTHER show test in this module deliberately avoids that by
-    // calling `consolidate_show_seasons` (the pure/offline half of that same split) instead of
-    // `try_consolidate_show` — this mirrors that precedent so these new tests stay fully
-    // deterministic and network-free too. `try_upgrade_show` itself is exercised structurally by
-    // the `run_upgrade_once` dispatch (Movie/Show branch) — its own behaviour beyond "call the two
-    // pieces in order" is covered by this file's existing (unchanged) consolidation tests plus the
-    // cases below.
+    // These call `upgrade_show_episodes_and_packs` directly, to pin the episode/pack phases alone.
+    // The whole show visit (`try_upgrade_show`: these phases, then consolidation, with the aired
+    // lookup injected) is driven offline by the tests at the end of this module.
 
     /// A cached 1080p WEB-DL single-episode candidate for S01E01 — a meaningful upgrade over a
     /// 720p WEB singleton (same source tier, higher resolution).
@@ -11529,27 +11853,30 @@ mod tests {
         }
     }
 
-    /// One show visit offline: phases (a)/(a2)/(b) on the CURRENT group, then consolidation on the
-    /// re-read group — exactly `try_upgrade_show`'s order, minus its live TMDB aired lookup.
+    /// One show visit offline: the real [`try_upgrade_show`] on the CURRENT group, with the aired
+    /// set injected in place of the TMDB lookup.
     async fn show_upgrade_visit(app: &AppState, aired: &[(u32, u32)]) {
         let hashes = current_show_hashes(app, SHOW_TMDB).await;
-        upgrade_show_episodes_and_packs(app, SHOW_TMDB, &hashes, Duration::from_secs(0)).await;
-        let fresh = current_show_hashes(app, SHOW_TMDB).await;
-        let mut owned = Vec::new();
-        for h in &fresh {
-            if let Some(r) = app.store.get_owned(h.clone()).await {
-                owned.push((h.clone(), r));
-            }
-        }
-        let _ = consolidate_show_seasons(
+        let _ = try_upgrade_show(
             app,
             SHOW_TMDB,
-            &fresh,
-            &owned,
-            aired,
+            &hashes,
             Duration::from_secs(0),
+            &canned_aired(aired, Arc::new(AtomicUsize::new(0))),
         )
         .await;
+    }
+
+    /// An injected aired-episode lookup returning `aired` and counting its calls.
+    fn canned_aired(
+        aired: &[(u32, u32)],
+        calls: Arc<AtomicUsize>,
+    ) -> impl Fn(u64) -> std::future::Ready<Vec<(u32, u32)>> {
+        let aired = aired.to_vec();
+        move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(aired.clone())
+        }
     }
 
     /// The observable show state: owned hashes (sorted) and each episode slot's hash.
@@ -12520,5 +12847,537 @@ mod tests {
                 .hash,
             "hpack"
         );
+    }
+
+    // ── iteration 2: provenance, Pending, single-episode streams, the show dispatch ──────────
+
+    /// A show the user already held part of (a mirror singleton, empty provenance) with the rest
+    /// acquired for a watchlist: upgrading the mirror episode gives the replacement the MIRROR
+    /// copy's provenance, not the group's watchlist one — or Trigger B would delete it when the
+    /// show is un-watchlisted, the user's own copy being already pruned.
+    #[tokio::test]
+    async fn upgrading_a_mirror_episode_in_a_mixed_show_keeps_it_a_mirror_record() {
+        let store = mem_store();
+        let h = show_harness_singleton_720_ep_in(store.clone(), false).await;
+        make_mirror(&store, "e720").await;
+        store
+            .put_owned("e2".into(), ep_record(1, 2, q1080_web()))
+            .await
+            .unwrap();
+        upgrade_show_episodes_and_packs(
+            &h.app,
+            h.tmdb,
+            &["e2".to_string(), "e720".to_string()],
+            Duration::from_secs(0),
+        )
+        .await;
+        let new = store
+            .get_owned(h.cand_1080_hash.clone())
+            .await
+            .expect("the 1080p E01 is adopted");
+        assert!(
+            new.provenance.entries.is_empty(),
+            "got {:?}",
+            new.provenance
+        );
+        assert!(
+            store.get_owned("e720".into()).await.is_none(),
+            "mirror copy pruned"
+        );
+        let groups = crate::tasks::group_owned_by_tmdb(&store).await;
+        let g = &groups[&(MediaType::Show, SHOW_TMDB)];
+        assert!(!g.engine_hashes.contains(&h.cand_1080_hash));
+        assert_eq!(
+            g.engine_hashes,
+            vec!["e2".to_string()],
+            "the watchlist episode stays engine-acquired"
+        );
+    }
+
+    /// Consolidating a season held partly as the user's own singles (mirror) and partly as engine
+    /// singles: the pack supersedes a mirror copy, so it is recorded as a mirror record. An
+    /// all-engine season's pack keeps the engine provenance.
+    #[tokio::test]
+    async fn consolidating_mirror_singles_records_the_pack_as_a_mirror_record() {
+        for (e1_mirror, want_empty) in [(true, true), (false, false)] {
+            let store = mem_store();
+            seed_two_scattered_episodes(&store).await;
+            if e1_mirror {
+                make_mirror(&store, "e1").await;
+            }
+            let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+                torrents: show_listing(),
+                add_magnet: Some(AddMagnetResponse {
+                    id: "tpack".into(),
+                    uri: String::new(),
+                }),
+                torrent_info: Some(pack_info()),
+                resolved_url: Some("https://cdn/p1".into()),
+                ..Default::default()
+            });
+            let app = app_with(
+                Arc::new(MockScraper {
+                    candidates: vec![season_pack_candidate()],
+                }),
+                provider,
+                store.clone(),
+            );
+            let mut owned = Vec::new();
+            for h in group_two() {
+                owned.push((h.clone(), store.get_owned(h).await.unwrap()));
+            }
+            consolidate_show_seasons(
+                &app,
+                SHOW_TMDB,
+                &group_two(),
+                &owned,
+                &[(1, 1), (1, 2)],
+                Duration::from_secs(0),
+            )
+            .await
+            .unwrap();
+            let pack = store.get_owned("hpack".into()).await.expect("adopted");
+            if want_empty {
+                assert!(pack.provenance.entries.is_empty(), "{:?}", pack.provenance);
+            } else {
+                assert_eq!(pack.provenance, Provenance::watchlist("a"));
+            }
+        }
+    }
+
+    /// A `Pending` singleton is `observe`'s: its uncached acquire-time quality makes ANY cached
+    /// release read as an upgrade (here a 720p one for a 1080p download), and the swap would delete
+    /// the download. It is left alone.
+    #[tokio::test]
+    async fn a_pending_singleton_is_never_replaced() {
+        let store = mem_store();
+        store
+            .put_owned("a1".into(), ep_record(1, 1, q1080_web()))
+            .await
+            .unwrap();
+        let mut pending = ep_record(1, 2, q1080_web());
+        pending.status = OwnedStatus::Pending;
+        pending.quality.as_mut().unwrap().cached = false;
+        store.put_owned("p2".into(), pending).await.unwrap();
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent {
+                id: "ta1".into(),
+                hash: "a1".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            add_magnet: Some(AddMagnetResponse {
+                id: "t720".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "t720".into(),
+                hash: "h720".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "S.S01E02.720p.WEB-DL.mkv".into(),
+                    bytes: 1_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/720".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/720".into()),
+            added: added.clone(),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![RawCandidate {
+                    name: "Torrentio\n720p".into(),
+                    description: "S.S01E02.720p.WEB-DL.x264\nRD+".into(),
+                    info_hash: "h720".into(),
+                    file_idx: Some(0),
+                    file_name: Some("S.S01E02.720p.WEB-DL.mkv".into()),
+                }],
+            }),
+            provider,
+            store.clone(),
+        );
+        upgrade_show_episodes_and_packs(
+            &app,
+            SHOW_TMDB,
+            &["a1".to_string(), "p2".to_string()],
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(added.lock().unwrap().is_empty(), "nothing staged");
+        assert!(deleted.lock().unwrap().is_empty(), "nothing deleted");
+        assert!(store.get_owned("p2".into()).await.is_some());
+    }
+
+    /// A season with a `Pending` record is left to `observe` until it settles: it is neither
+    /// counted as scatter nor pruned by a consolidation.
+    #[tokio::test]
+    async fn a_season_with_a_pending_record_is_not_consolidated() {
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+        let mut e2 = store.get_owned("e2".into()).await.unwrap();
+        e2.status = OwnedStatus::Pending;
+        store.put_owned("e2".into(), e2).await.unwrap();
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            torrent_info: Some(pack_info()),
+            added: added.clone(),
+            ..Default::default()
+        });
+        let app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![season_pack_candidate()],
+            }),
+            provider,
+            store.clone(),
+        );
+        let mut owned = Vec::new();
+        for h in group_two() {
+            owned.push((h.clone(), store.get_owned(h).await.unwrap()));
+        }
+        let r = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned,
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert!(added.lock().unwrap().is_empty(), "no pack staged");
+        assert!(store.get_owned("e2".into()).await.is_some());
+    }
+
+    /// The season's episode-1 query lists every E1 single besides the packs: a single is never
+    /// staged as a consolidation pack (it could only be added, polled and deleted again).
+    #[tokio::test]
+    async fn consolidation_never_stages_a_single_episode_stream() {
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+        let single = RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            // Higher-scoring than the pack, so it would be tried first.
+            description: "S.S01E01.1080p.BluRay.REMUX.x265\nRD+".into(),
+            info_hash: "hsingle".into(),
+            file_idx: Some(0),
+            file_name: Some("S.S01E01.1080p.BluRay.REMUX.mkv".into()),
+        };
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            torrent_info_by_id: [("hpack".to_string(), pack_info())].into_iter().collect(),
+            resolved_url: Some("https://cdn/p1".into()),
+            added: added.clone(),
+            ..Default::default()
+        });
+        let app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![single, season_pack_candidate()],
+            }),
+            provider,
+            store.clone(),
+        );
+        consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(added.lock().unwrap().clone(), vec!["hpack".to_string()]);
+        assert!(
+            store.get_owned("hpack".into()).await.is_some(),
+            "the pack is adopted"
+        );
+    }
+
+    #[test]
+    fn single_episode_streams_are_told_apart_from_packs() {
+        let stream = |description: &str| RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: description.into(),
+            info_hash: "h".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        assert!(is_single_episode_stream(&stream(
+            "Show.S01E01.1080p.WEB\nRD+"
+        )));
+        // A pack's name has no episode code (its file line does) or a range.
+        assert!(!is_single_episode_stream(&stream(
+            "Show.S01.1080p.WEB\nShow.S01E01.1080p.WEB.mkv\nRD+"
+        )));
+        assert!(!is_single_episode_stream(&stream(
+            "Show.S01E01-E10.1080p\nRD+"
+        )));
+        assert!(!is_single_episode_stream(&stream(
+            "Show Complete Series\nRD+"
+        )));
+    }
+
+    /// A pack that staged and turned out to miss an aired episode is skipped without staging on
+    /// later visits: its files never change, and the season's aired set only grows.
+    #[tokio::test]
+    async fn a_partial_pack_is_staged_at_most_once() {
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack".into(),
+                uri: String::new(),
+            }),
+            // E01 + E02 only, while E03 has aired.
+            torrent_info: Some(pack_info()),
+            resolved_url: Some("https://cdn/p1".into()),
+            added: added.clone(),
+            ..Default::default()
+        });
+        let app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![season_pack_candidate()],
+            }),
+            provider,
+            store.clone(),
+        );
+        for _ in 0..2 {
+            consolidate_show_seasons(
+                &app,
+                SHOW_TMDB,
+                &group_two(),
+                &owned_two(),
+                &[(1, 1), (1, 2), (1, 3)],
+                Duration::from_secs(0),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(added.lock().unwrap().clone(), vec!["hpack".to_string()]);
+        assert!(
+            store.get_owned("hpack".into()).await.is_none(),
+            "never adopted"
+        );
+    }
+
+    /// Consolidation with scattered seasons but an empty aired set (a failed TMDB lookup) defers
+    /// and stages nothing.
+    #[tokio::test]
+    async fn consolidation_with_an_empty_aired_set_defers() {
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            torrent_info: Some(pack_info()),
+            added: added.clone(),
+            ..Default::default()
+        });
+        let app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![season_pack_candidate()],
+            }),
+            provider,
+            store.clone(),
+        );
+        let r = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[],
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(matches!(r, Err(UpgradeSkip::Deferred(_))));
+        assert!(added.lock().unwrap().is_empty());
+    }
+
+    /// A show visited through the real pass: its singleton is upgraded, the cursor is stamped, and
+    /// a show no longer holding scattered singles never asks for its aired set.
+    #[tokio::test]
+    async fn a_show_is_visited_through_the_upgrade_pass() {
+        let h = show_harness_singleton_720_ep().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        run_upgrade_once_with(
+            &h.app,
+            canned_details(Arc::new(AtomicUsize::new(0)), || Ok(fi_film_details())),
+            canned_aired(&[(1, 1)], calls.clone()),
+        )
+        .await;
+        assert_eq!(
+            h.app
+                .store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            h.cand_1080_hash
+        );
+        assert!(
+            h.app
+                .store
+                .get_upgrade_checked(&MediaType::Show, SHOW_TMDB)
+                .await
+                > 0,
+            "evaluated: the cursor advances"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no scatter: no aired lookup"
+        );
+    }
+
+    /// Three scattered 1080p singles, E01 upgraded to BluRay by phase (a) in the same visit.
+    /// Consolidation must judge the season on the CURRENT group (the upgraded single included), so
+    /// the WEB pack, below the new BluRay E01, is never adopted (it would regress E01 and orphan
+    /// its copy).
+    #[tokio::test]
+    async fn consolidation_after_an_episode_swap_sees_the_upgraded_episode() {
+        let store = mem_store();
+        let mut q720 = q720_web();
+        q720.score = 0;
+        store
+            .put_owned("e1".into(), ep_record(1, 1, q720))
+            .await
+            .unwrap();
+        store
+            .put_owned("e2".into(), ep_record(1, 2, q1080_web()))
+            .await
+            .unwrap();
+        store
+            .put_owned("e3".into(), ep_record(1, 3, q1080_web()))
+            .await
+            .unwrap();
+        let bluray_single = RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "S.S01E01.1080p.BluRay.x264\nRD+".into(),
+            info_hash: "hbd1".into(),
+            file_idx: Some(0),
+            file_name: Some("S.S01E01.1080p.BluRay.x264.mkv".into()),
+        };
+        let web_pack = RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "S.S01.1080p.WEB-DL.x264\nRD+".into(),
+            info_hash: "hwebpack".into(),
+            file_idx: None,
+            file_name: None,
+        };
+        let web_pack_info = TorrentInfo {
+            id: "hwebpack".into(),
+            hash: "hwebpack".into(),
+            status: "downloaded".into(),
+            files: (1..=3)
+                .map(|e| TorrentFile {
+                    id: e,
+                    path: format!("S.S01E0{e}.1080p.WEB-DL.mkv"),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let bluray_info = TorrentInfo {
+            id: "hbd1".into(),
+            hash: "hbd1".into(),
+            status: "downloaded".into(),
+            files: vec![TorrentFile {
+                id: 0,
+                path: "S.S01E01.1080p.BluRay.x264.mkv".into(),
+                bytes: 4_000_000_000,
+                selected: 1,
+            }],
+            ..Default::default()
+        };
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: ["e1", "e2", "e3"]
+                .iter()
+                .map(|h| Torrent {
+                    id: format!("t{h}"),
+                    hash: h.to_string(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                })
+                .collect(),
+            torrent_info_by_id: [
+                ("hbd1".to_string(), bluray_info),
+                ("hwebpack".to_string(), web_pack_info),
+            ]
+            .into_iter()
+            .collect(),
+            resolved_url: Some("https://cdn/x".into()),
+            added: added.clone(),
+            ..Default::default()
+        });
+        let app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![bluray_single, web_pack],
+            }),
+            provider,
+            store.clone(),
+        );
+        let r = try_upgrade_show(
+            &app,
+            SHOW_TMDB,
+            &["e1".to_string(), "e2".to_string(), "e3".to_string()],
+            Duration::from_secs(0),
+            &canned_aired(&[(1, 1), (1, 2), (1, 3)], Arc::new(AtomicUsize::new(0))),
+        )
+        .await;
+        assert!(r.is_ok(), "the visit completes");
+        assert!(
+            store.get_owned("hbd1".into()).await.is_some(),
+            "E01 upgraded"
+        );
+        assert!(
+            !added.lock().unwrap().contains(&"hwebpack".to_string()),
+            "the lower-tier pack is never staged"
+        );
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            "hbd1"
+        );
+    }
+
+    /// The episode phase deferred because a copy of the show is being read: consolidation is
+    /// skipped outright (no aired lookup, no scrape) and the visit defers.
+    #[tokio::test]
+    async fn a_show_being_read_skips_consolidation_and_defers() {
+        let h = show_harness_singleton_720_ep().await;
+        h.app
+            .store
+            .put_owned("e2".into(), ep_record(1, 2, q1080_web()))
+            .await
+            .unwrap();
+        h.app.read_activity.touch("e720").await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let r = try_upgrade_show(
+            &h.app,
+            SHOW_TMDB,
+            &["e2".to_string(), "e720".to_string()],
+            Duration::from_secs(300),
+            &canned_aired(&[(1, 1), (1, 2)], calls.clone()),
+        )
+        .await;
+        assert!(matches!(r, Err(UpgradeSkip::Deferred(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "consolidation skipped");
+        assert!(h.added.lock().unwrap().is_empty(), "nothing staged");
     }
 }

@@ -1,19 +1,10 @@
 //! SP1 live smoke tests. `#[ignore]`; require real tokens in `.env`.
-use debridmoviemapper::provider::{choose_provider, ProviderKind};
+use debridmoviemapper::provider::ProviderKind;
 use debridmoviemapper::scraper::{build_http_client, MediaKind, Scraper, TorrentioScraper};
 
-fn provider_from_env() -> Option<(ProviderKind, String)> {
-    dotenvy::dotenv().ok();
-    choose_provider(
-        std::env::var("RD_API_TOKEN").ok(),
-        std::env::var("TORBOX_API_KEY").ok(),
-    )
-    .ok()
-}
-
 /// A single provider token (RD preferred) for tests that only need to template the Torrentio URL —
-/// unlike `provider_from_env`, this works even when BOTH tokens are set (as in a cross-provider
-/// `.env`), where `choose_provider` deliberately errors.
+/// unlike `provider::choose_provider`, this works even when BOTH tokens are set (as in a
+/// cross-provider `.env`), where `choose_provider` deliberately errors.
 fn single_provider_from_env() -> Option<(ProviderKind, String)> {
     dotenvy::dotenv().ok();
     let non_empty = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
@@ -27,8 +18,8 @@ fn single_provider_from_env() -> Option<(ProviderKind, String)> {
 #[tokio::test]
 #[ignore]
 async fn scraper_live_returns_parseable_streams() {
-    let Some((kind, token)) = provider_from_env() else {
-        eprintln!("skipping: no provider token");
+    let Some((kind, token)) = single_provider_from_env() else {
+        eprintln!("skipping: neither RD_API_TOKEN nor TORBOX_API_KEY is set");
         return;
     };
     let http = reqwest::Client::builder()

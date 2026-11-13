@@ -157,6 +157,37 @@ pub trait DebridProvider: Send + Sync + std::fmt::Debug {
     async fn invalidate(&self, loc: &FileLocator);
 }
 
+/// `get_torrent_info`, retrying a 404 after each wait in `waits` and returning the last 404 once they
+/// are used up. Any other error is returned at once: the provider clients already retry transport
+/// errors, 429s and transient 5xx.
+///
+/// TorBox's `mylist?id=` sometimes answers 404 ("No torrents found for this user") for a torrent that
+/// exists, including one `createtorrent` has just returned. On Real-Debrid a 404 means the torrent is
+/// gone, so a caller on a latency-sensitive path keeps `waits` short.
+pub(crate) async fn torrent_info_retrying_not_found(
+    provider: &dyn DebridProvider,
+    id: &str,
+    waits: &[std::time::Duration],
+) -> Result<TorrentInfo, reqwest::Error> {
+    let mut waits = waits.iter();
+    loop {
+        match provider.get_torrent_info(id).await {
+            Err(e) if e.status() == Some(reqwest::StatusCode::NOT_FOUND) => {
+                let Some(wait) = waits.next() else {
+                    return Err(e);
+                };
+                tracing::debug!(
+                    "torrent {} not found; looking again in {}ms",
+                    id,
+                    wait.as_millis()
+                );
+                tokio::time::sleep(*wait).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Which provider the service should run against this deployment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -346,6 +377,108 @@ mod tests {
         // Once it has finished, a fresh snapshot is clean again.
         let after = t.snapshot();
         assert!(!t.changed_since(after));
+    }
+
+    /// Answers the first `misses` lookups with a 404 (or, with `fail_other`, every lookup with a
+    /// non-404 error), then with a default `TorrentInfo`; `calls` counts lookups.
+    #[derive(Debug, Default)]
+    struct NotFoundAtFirst {
+        misses: usize,
+        fail_other: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl DebridProvider for NotFoundAtFirst {
+        fn name(&self) -> &'static str {
+            "not-found-at-first"
+        }
+        async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
+            Ok(vec![])
+        }
+        async fn get_torrent_info(&self, _id: &str) -> Result<TorrentInfo, reqwest::Error> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_other {
+                return Err(synthetic_bad_gateway(b"down"));
+            }
+            if n < self.misses {
+                return Err(reqwest::Response::from(
+                    hyper::Response::builder()
+                        .status(404)
+                        .body(hyper::body::Bytes::new())
+                        .unwrap(),
+                )
+                .error_for_status()
+                .unwrap_err());
+            }
+            Ok(TorrentInfo::default())
+        }
+        async fn add_magnet(&self, _m: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+            Ok(AddMagnetResponse::default())
+        }
+        async fn select_files(&self, _t: &str, _f: &str) -> Result<(), reqwest::Error> {
+            Ok(())
+        }
+        async fn delete_torrent(&self, _t: &str) -> Result<(), reqwest::Error> {
+            Ok(())
+        }
+        async fn resolve_url(&self, _l: &FileLocator) -> Result<String, AppError> {
+            Err(AppError::Unavailable)
+        }
+        async fn invalidate(&self, _l: &FileLocator) {}
+    }
+
+    const WAITS: [std::time::Duration; 2] = [
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(1),
+    ];
+
+    #[tokio::test(start_paused = true)]
+    async fn torrent_info_lookup_retries_a_404_after_each_wait() {
+        let p = NotFoundAtFirst {
+            misses: 2,
+            ..Default::default()
+        };
+        let start = tokio::time::Instant::now();
+
+        assert!(torrent_info_retrying_not_found(&p, "t", &WAITS)
+            .await
+            .is_ok());
+
+        assert_eq!(p.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(start.elapsed(), std::time::Duration::from_millis(1_500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn torrent_info_lookup_returns_the_404_once_the_waits_are_used_up() {
+        let p = NotFoundAtFirst {
+            misses: usize::MAX,
+            ..Default::default()
+        };
+
+        let err = torrent_info_retrying_not_found(&p, "t", &WAITS)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status(), Some(reqwest::StatusCode::NOT_FOUND));
+        assert_eq!(p.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// The clients already retry transport errors, 429s and 5xx, so only a 404 is retried here.
+    #[tokio::test(start_paused = true)]
+    async fn torrent_info_lookup_does_not_retry_other_errors() {
+        let p = NotFoundAtFirst {
+            fail_other: true,
+            ..Default::default()
+        };
+        let start = tokio::time::Instant::now();
+
+        assert!(torrent_info_retrying_not_found(&p, "t", &WAITS)
+            .await
+            .is_err());
+
+        assert_eq!(p.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
     }
 
     #[test]

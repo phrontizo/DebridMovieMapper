@@ -488,16 +488,26 @@ pub fn parse_mkv_tracks(buf: &[u8]) -> Result<Vec<Track>, ProbeError> {
     if detect_container(buf) != Some(ContainerKind::Mkv) {
         return Err(ProbeError::Corrupt);
     }
+    // The Segment is normally capped (it declares the size of the whole file): that is expected,
+    // and its children are scanned within the buffer.
     let segment = find_ebml_child(buf, 0, buf.len(), 0x18538067)?;
-    let (seg_start, seg_end) = match segment {
+    let (seg_start, seg_end, _) = match segment {
         Some(r) => r,
         None => return Err(ProbeError::TracksNotFound),
     };
     let tracks = find_ebml_child(buf, seg_start, seg_end, 0x1654AE6B)?;
-    let (t_start, t_end) = match tracks {
+    let (t_start, t_end, tracks_capped) = match tracks {
         Some(r) => r,
         None => return Err(ProbeError::TracksNotFound),
     };
+    // A Tracks element that runs past the fetched buffer is incomplete even when the cut lands
+    // exactly on a TrackEntry boundary (the scan below would then end cleanly): the entries after
+    // the cut — possibly the wanted-language track — are missing, so a partial list could reject a
+    // correct release. Defer instead; `probe_tracks` then fetches Tracks' declared extent
+    // (`front_mkv_tracks_extent` reports it).
+    if tracks_capped {
+        return Err(ProbeError::Transient);
+    }
     let mut out = Vec::new();
     let mut pos = t_start;
     while pos < t_end {
@@ -519,13 +529,16 @@ pub fn parse_mkv_tracks(buf: &[u8]) -> Result<Vec<Track>, ProbeError> {
     Ok(out)
 }
 
-/// Find the first child element with `target_id` between [start,end). Returns its payload range.
+/// Find the first child element with `target_id` between [start,end). Returns its payload range,
+/// capped to the buffer, and whether it WAS capped: a known-size element whose declared payload end
+/// lies past the fetched bytes. (An unknown-size element spans to the end of the search region and is
+/// not reported as capped.)
 fn find_ebml_child(
     buf: &[u8],
     start: usize,
     end: usize,
     target_id: u32,
-) -> Result<Option<(usize, usize)>, ProbeError> {
+) -> Result<Option<(usize, usize, bool)>, ProbeError> {
     let mut pos = start;
     while pos < end {
         let id = read_ebml_id(buf, &mut pos)?;
@@ -541,8 +554,10 @@ fn find_ebml_child(
             // Segment declares the size of the WHOLE (multi-GB) file, far beyond our 4 MB front
             // read. That is NOT a truncated read: return it capped to what we have and let the
             // caller scan its children within the buffer. (Checking this before the overrun guard
-            // below is the fix for the probe deferring on every large MKV.)
-            return Ok(Some((payload_start, payload_end.min(buf.len()))));
+            // below is the fix for the probe deferring on every large MKV.) The caller decides
+            // whether a capped match is expected (the Segment) or incomplete (Tracks).
+            let capped = size != u64::MAX && payload_end > buf.len();
+            return Ok(Some((payload_start, payload_end.min(buf.len()), capped)));
         }
         // Not the target: reaching the next sibling means skipping this whole element. If it runs
         // past the fetched buffer we genuinely can't — a truncated read (defer) or a broken size.
@@ -604,6 +619,16 @@ fn front_mkv_tracks_extent(buf: &[u8]) -> Option<u64> {
     None
 }
 
+/// An EBML String element's value, trimmed; `None` when it isn't UTF-8. RFC 8794 §13 lets a writer
+/// terminate or pad a String with NUL octets (an in-place edit that shortens a value keeps the
+/// element's size), and a reader ignores the first NUL and everything after it, so the bytes are cut
+/// there BEFORE decoding (garbage after the terminator can't fail the UTF-8 check). Without the cut,
+/// a NUL-padded `jpn\0` would read as a 4-character code that matches no wanted language.
+fn ebml_string(bytes: &[u8]) -> Option<&str> {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).ok().map(str::trim)
+}
+
 fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, ProbeError> {
     let mut kind = TrackKind::Other;
     let mut language: Option<String> = None;
@@ -643,9 +668,8 @@ fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, 
             }
             0x22B59C => {
                 saw_language = true;
-                language = std::str::from_utf8(&buf[pos..p_end])
-                    .ok()
-                    .map(|s| s.trim().to_string())
+                language = ebml_string(&buf[pos..p_end])
+                    .map(str::to_string)
                     // "und" (ISO-639 *undetermined*) and empty are INCONCLUSIVE, not a positive
                     // tag — treat them like an absent code (`None`) so `check_lang` doesn't count
                     // them as a wrong-language match (mirrors the MP4 `parse_mdhd_language` path).
@@ -659,9 +683,8 @@ fn parse_mkv_track_entry(buf: &[u8], start: usize, end: usize) -> Result<Track, 
                 // Only the primary subtag names the language (`pt-BR` → `pt`, `zh-Hant-HK` → `zh`);
                 // `und` and empty are inconclusive, exactly as for the legacy element.
                 bcp47 = Some(
-                    std::str::from_utf8(&buf[pos..p_end])
-                        .ok()
-                        .and_then(|s| s.trim().split('-').next())
+                    ebml_string(&buf[pos..p_end])
+                        .and_then(|s| s.split('-').next())
                         .map(str::to_ascii_lowercase)
                         .filter(|s| !s.is_empty() && s != "und"),
                 );
@@ -1336,6 +1359,35 @@ mod tests {
             front_mkv_tracks_extent(&bytes2),
             None,
             "no overrun → no recovery extent"
+        );
+    }
+
+    #[test]
+    fn mkv_tracks_cut_at_a_track_entry_boundary_is_transient_not_partial() {
+        // A Tracks element straddling the fetched window whose cut lands EXACTLY after a complete
+        // TrackEntry: the entries after the cut (here the wanted-language audio) are missing. It
+        // must defer (Transient, so probe_tracks' recovery fetch runs), never return the partial
+        // list — that would FailAudio and blacklist a correct release.
+        let mut first = ebml_elem(0x83, &[2]);
+        first.extend(ebml_elem(0x22B59C, b"fre"));
+        let first = ebml_elem(0xAE, &first);
+        let mut second = ebml_elem(0x83, &[2]);
+        second.extend(ebml_elem(0x22B59C, b"eng"));
+        let second = ebml_elem(0xAE, &second);
+        // Tracks declares both entries; only the first is in the buffer.
+        let tracks = ebml_elem_sized(0x1654AE6B, (first.len() + second.len()) as u64, &first);
+        let segment = ebml_elem_sized(0x18538067, 8_000_000_000, &tracks);
+        let mut bytes = ebml_elem(0x1A45DFA3, &[]);
+        bytes.extend(segment);
+
+        assert!(
+            matches!(parse_mkv_tracks(&bytes), Err(ProbeError::Transient)),
+            "a Tracks element capped at the buffer must defer, not return a partial track list"
+        );
+        assert_eq!(
+            front_mkv_tracks_extent(&bytes),
+            Some((bytes.len() + second.len()) as u64),
+            "the recovery fetch must be offered the Tracks element's declared end"
         );
     }
 
@@ -2236,6 +2288,31 @@ mod tests {
             Some("fre")
         );
         assert_eq!(mkv_audio_language(None, None).as_deref(), Some("eng"));
+    }
+
+    #[test]
+    fn mkv_language_strings_end_at_a_nul_terminator() {
+        // RFC 8794 §13: an EBML String may be NUL-terminated/padded, and a reader ignores the first
+        // NUL and everything after it. A padded `jpn\0` must read as `jpn`, not a 4-character code
+        // that matches no wanted language (→ FailAudio → a correct release blacklisted).
+        let jpn = mkv_audio_language(Some("jpn\0"), None);
+        assert_eq!(jpn.as_deref(), Some("jpn"));
+        assert!(lang_eq(jpn.as_deref().unwrap(), "ja"));
+        assert_eq!(
+            mkv_audio_language(None, Some("ja\0\0\0")).as_deref(),
+            Some("ja")
+        );
+        // Bytes after the terminator are ignored even when they aren't valid UTF-8.
+        let mut audio = ebml_elem(0x83, &[2]);
+        audio.extend(ebml_elem(0x22B59D, b"pt-BR\0\xff\xfe"));
+        let segment = ebml_elem(0x18538067, &ebml_elem(0x1654AE6B, &ebml_elem(0xAE, &audio)));
+        let mut bytes = ebml_elem(0x1A45DFA3, &[]);
+        bytes.extend(segment);
+        let tracks = parse_mkv_tracks(&bytes).expect("parse");
+        assert_eq!(tracks[0].language.as_deref(), Some("pt"));
+        // An all-NUL value is empty: inconclusive, NOT the `eng` an absent element defaults to.
+        assert_eq!(mkv_audio_language(Some("\0\0\0"), None), None);
+        assert_eq!(mkv_audio_language(Some("eng"), Some("\0\0")), None);
     }
 
     #[test]

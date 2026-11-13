@@ -3,11 +3,20 @@ name = "debridmoviemapper"
 version = "1.0.7"
 edition = "2021"
 license = "MIT"
+# Not published to crates.io. This also keeps the crate itself out of THIRD-PARTY-NOTICES
+# (about.toml sets cargo-about's `private.ignore`).
+publish = false
 # The oldest compiler the code must build with: the Dockerfile's builder image (rust:<this>-slim).
 # CI lints/tests on the latest stable, so this is what makes clippy's `incompatible_msrv` lint flag
 # a std API newer than the image's compiler in the lint job instead of only in the Docker build.
-# Bump it together with the Dockerfile's `FROM rust:<version>-slim` line.
+# Bump it together with the Dockerfile's `FROM rust:<version>-slim` line (and the CI `msrv` job).
 rust-version = "1.96"
+# Resolver 3 (Cargo >= 1.84, valid with edition 2021) is resolver 2 plus MSRV-aware resolution:
+# `cargo update` and Dependabot then prefer dependency versions whose own `rust-version` is no newer
+# than ours, instead of locking one that only the post-merge rust:<version> Docker build rejects.
+# The CI `msrv` job (cargo check --locked on that toolchain) catches what this can't, e.g. a newer
+# language feature in our own code or a dependency with no compatible version.
+resolver = "3"
 
 [dependencies]
 async-trait = "0.1"

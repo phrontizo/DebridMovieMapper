@@ -199,9 +199,9 @@ impl QualityPrefs {
     /// only then be rejected at probe time — burning an acquire cycle. Resolving here makes
     /// acquisition ranking down-rank it up front, exactly as `probe::verify` rejects it (which
     /// resolves `Original` the same way). Accepting the spoken languages too means a title whose TMDB
-    /// original language isn't its main audio (e.g. a `fi`-original film whose dialogue is mostly English) doesn't
-    /// down-rank every correctly-tagged release. No known language, or an explicit `Lang`, is left
-    /// unchanged.
+    /// original language isn't its main audio (e.g. a `fi`-original film whose dialogue is mostly
+    /// English) doesn't down-rank every correctly-tagged release. No known language, or an explicit
+    /// `Lang`, is left unchanged.
     pub fn with_resolved_audio(
         &self,
         original_language: Option<&str>,
@@ -439,14 +439,22 @@ impl Default for AcquisitionConfig {
 }
 
 impl AcquisitionConfig {
-    /// The single boolean-env parser for the whole crate (see `Config::from_env`'s `env_flag`,
-    /// which delegates here). Accepts `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off`
-    /// (case-insensitive); anything unrecognised (or absent) returns `default`.
-    pub(crate) fn parse_bool(s: Option<String>, default: bool) -> bool {
-        match s.map(|s| s.trim().to_ascii_lowercase()) {
-            Some(v) if v == "true" || v == "1" || v == "yes" || v == "on" => true,
-            Some(v) if v == "false" || v == "0" || v == "no" || v == "off" => false,
-            _ => default,
+    /// The single boolean-env parser for the whole crate (`Config::apply_household_flags` and the
+    /// `PREFER_*` knobs delegate here). Accepts `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off`
+    /// (case-insensitive); anything else returns `default`. An unrecognised non-blank value of the
+    /// env var `name` is `warn!`ed like every other knob's (a typo such as `ture` must be visible,
+    /// not silently read as the default); absent or blank stays silent.
+    pub(crate) fn parse_bool(s: Option<String>, name: &str, default: bool) -> bool {
+        let Some(raw) = s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+            return default;
+        };
+        match raw.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => true,
+            "false" | "0" | "no" | "off" => false,
+            _ => {
+                warn!("Invalid {name} value '{raw}', falling back to {default}");
+                default
+            }
         }
     }
 
@@ -481,8 +489,8 @@ impl AcquisitionConfig {
                 },
                 audio: AudioReq::parse(audio_language),
                 subtitle: SubReq::parse(subtitle_language),
-                prefer_hevc: Self::parse_bool(prefer_hevc, true),
-                prefer_hdr: Self::parse_bool(prefer_hdr, false),
+                prefer_hevc: Self::parse_bool(prefer_hevc, "PREFER_HEVC", true),
+                prefer_hdr: Self::parse_bool(prefer_hdr, "PREFER_HDR", false),
             },
             // Clamp to a sane floor: STALL_TIMEOUT_SECS=0 would declare every Pending torrent
             // stalled instantly, and MAX_ACQUIRE_ATTEMPTS=0 would make the engine never retry —
@@ -752,18 +760,17 @@ impl Config {
     /// the env-NAME → field wiring is unit-testable WITHOUT mutating the process environment (a
     /// name swap would silently enable destructive duplicate deletion when the operator meant
     /// finished-show removal). Each flag delegates to the crate-wide boolean parser, so it accepts the
-    /// same synonyms (`1`/`true`/`yes`/`on`) and defaults to false when unset/unrecognised.
+    /// same synonyms (`1`/`true`/`yes`/`on`) and defaults to false when unset/unrecognised (an
+    /// unrecognised value is `warn!`ed).
     fn apply_household_flags(&mut self, lookup: impl Fn(&str) -> Option<String>) {
-        self.dedup_remove_duplicates =
-            AcquisitionConfig::parse_bool(lookup("DEDUP_REMOVE_DUPLICATES"), false);
-        self.remove_finished_shows =
-            AcquisitionConfig::parse_bool(lookup("REMOVE_FINISHED_SHOWS"), false);
-        self.allow_resolution_downgrade =
-            AcquisitionConfig::parse_bool(lookup("ALLOW_RESOLUTION_DOWNGRADE"), false);
+        let flag = |name: &str| AcquisitionConfig::parse_bool(lookup(name), name, false);
+        self.dedup_remove_duplicates = flag("DEDUP_REMOVE_DUPLICATES");
+        self.remove_finished_shows = flag("REMOVE_FINISHED_SHOWS");
+        self.allow_resolution_downgrade = flag("ALLOW_RESOLUTION_DOWNGRADE");
     }
 
     /// Pure construction from raw optional values — unit-testable without touching
-    /// the process environment. Mirrors the previous inline logic exactly.
+    /// the process environment.
     pub fn from_parts(
         rd_token: Option<String>,
         torbox_token: Option<String>,
@@ -1311,24 +1318,82 @@ mod tests {
         // documented to accept true/1/yes/on (and false/0/no/off), case-insensitively.
         for t in ["true", "1", "yes", "on", "ON", "Yes"] {
             assert!(
-                AcquisitionConfig::parse_bool(Some(t.into()), false),
+                AcquisitionConfig::parse_bool(Some(t.into()), "X", false),
                 "{t} should parse true"
             );
         }
         for f in ["false", "0", "no", "off", "OFF"] {
             assert!(
-                !AcquisitionConfig::parse_bool(Some(f.into()), true),
+                !AcquisitionConfig::parse_bool(Some(f.into()), "X", true),
                 "{f} should parse false"
             );
         }
         // An unrecognised value (or absence) returns the supplied default, both polarities.
-        assert!(AcquisitionConfig::parse_bool(Some("garbage".into()), true));
+        assert!(AcquisitionConfig::parse_bool(
+            Some("garbage".into()),
+            "X",
+            true
+        ));
         assert!(!AcquisitionConfig::parse_bool(
             Some("garbage".into()),
+            "X",
             false
         ));
-        assert!(AcquisitionConfig::parse_bool(None, true));
-        assert!(!AcquisitionConfig::parse_bool(None, false));
+        assert!(AcquisitionConfig::parse_bool(None, "X", true));
+        assert!(!AcquisitionConfig::parse_bool(None, "X", false));
+        assert!(AcquisitionConfig::parse_bool(Some("  ".into()), "X", true));
+    }
+
+    /// Everything `warn!`ed while `f` runs, on this thread.
+    fn captured_warnings(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn parse_bool_warns_on_an_unrecognised_value_but_not_on_blank_or_absent() {
+        // A typo like `ALLOW_RESOLUTION_DOWNGRADE=ture` must be visible (as every numeric knob's is),
+        // not silently read as the default while the operator believes the flag is on.
+        let logs = captured_warnings(|| {
+            assert!(!AcquisitionConfig::parse_bool(
+                Some("ture".into()),
+                "ALLOW_RESOLUTION_DOWNGRADE",
+                false
+            ));
+        });
+        assert!(
+            logs.contains("Invalid ALLOW_RESOLUTION_DOWNGRADE value 'ture', falling back to false"),
+            "an unrecognised value must warn, naming the variable: {logs:?}"
+        );
+        // Absent or blank (compose passes `${VAR:-}` empties) stays silent, as does a valid value.
+        let logs = captured_warnings(|| {
+            AcquisitionConfig::parse_bool(None, "PREFER_HDR", false);
+            AcquisitionConfig::parse_bool(Some("  ".into()), "PREFER_HDR", false);
+            AcquisitionConfig::parse_bool(Some("On".into()), "PREFER_HDR", false);
+        });
+        assert!(
+            logs.is_empty(),
+            "absent/blank/valid must not warn: {logs:?}"
+        );
     }
 
     // ── TraktConfig tests ────────────────────────────────────────────────────
@@ -1360,7 +1425,8 @@ mod tests {
         assert_eq!(parse_lookback("6mo"), Some(6 * 30 * 86_400));
         assert_eq!(parse_lookback("3MO"), Some(3 * 30 * 86_400)); // case-insensitive
         assert_eq!(parse_lookback("garbage"), None); // unparseable → all-time
-                                                     // A bare unit with no number (strip_suffix → "") is unparseable → all-time, not a panic.
+
+        // A bare unit with no number (strip_suffix → "") is unparseable → all-time, not a panic.
         assert_eq!(parse_lookback("d"), None);
         assert_eq!(parse_lookback("w"), None);
         assert_eq!(parse_lookback("mo"), None);

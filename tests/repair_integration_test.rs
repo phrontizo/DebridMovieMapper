@@ -83,21 +83,23 @@ async fn repair_sintel(provider: &Arc<dyn DebridProvider>) {
                     .await,
                 "the repaired torrent should be visible"
             );
+            let listed = find_ids_by_hash(provider, SINTEL_HASH)
+                .await
+                .unwrap_or_else(|e| panic!("listing the account failed: {e}"));
             assert!(
-                find_ids_by_hash(provider, SINTEL_HASH)
-                    .await
-                    .contains(&new_locator.torrent_id),
-                "the repaired torrent {} should be listed",
+                listed.contains(&new_locator.torrent_id),
+                "the repaired torrent {} should be listed (listed Sintel ids: {listed:?})",
                 new_locator.torrent_id
             );
             if new_locator.torrent_id != info.id {
                 // Real-Debrid re-adds under a new id; the repair deletes the original.
                 let mut gone = false;
                 for _ in 0..10 {
-                    if !find_ids_by_hash(provider, SINTEL_HASH)
-                        .await
-                        .contains(&info.id)
-                    {
+                    // A failed listing proves nothing either way, so it doesn't count as gone.
+                    if matches!(
+                        find_ids_by_hash(provider, SINTEL_HASH).await,
+                        Ok(ids) if !ids.contains(&info.id)
+                    ) {
                         gone = true;
                         break;
                     }

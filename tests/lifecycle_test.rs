@@ -14,7 +14,7 @@ mod common;
 
 use common::{cleanup_by_hash, find_ids_by_hash, with_cleanup, SINTEL_HASH};
 use debridmoviemapper::identification::identify_torrent;
-use debridmoviemapper::provider::DebridProvider;
+use debridmoviemapper::provider::{DebridProvider, ProviderKind};
 use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::torbox_client::TorBoxClient;
@@ -22,10 +22,10 @@ use debridmoviemapper::vfs::{DebridVfs, VfsNode};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Serialises the tests in this binary. Each adds and deletes Sintel, and `lifecycle_torbox` and
-/// `lifecycle_acquire_sintel_by_imdb` can share one account: run together, one test's cleanup could
-/// delete the torrent the other is still checking. A tokio mutex isn't poisoned by a failed test,
-/// so the rest still run.
+/// Serialises the tests in this binary. Each adds and deletes Sintel, and a provider's
+/// `lifecycle_*` and `lifecycle_acquire_sintel_by_imdb_*` tests share one account: run together,
+/// one test's cleanup could delete the torrent the other is still checking. A tokio mutex isn't
+/// poisoned by a failed test, so the rest still run.
 static LIVE_ACCOUNT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Recursively search the VFS for a `MediaFile` whose path ends with `suffix`.
@@ -71,11 +71,17 @@ async fn lifecycle_steps(provider: &Arc<dyn DebridProvider>, tmdb: &Arc<TmdbClie
     let info = common::add_sintel_downloaded(provider, label).await;
     let id = info.id.clone();
 
-    // 4. Appears in the provider's list.
-    assert!(
-        !find_ids_by_hash(provider, SINTEL_HASH).await.is_empty(),
-        "[{label}] torrent should appear in get_torrents()"
-    );
+    // 4. Appears in the provider's list. TorBox's listing can lag an add that already reports
+    // `downloaded`, so poll it every 2 s for up to 30 s before failing.
+    if let Err(why) = common::poll_until_listed(
+        || find_ids_by_hash(provider, SINTEL_HASH),
+        16,
+        Duration::from_secs(2),
+    )
+    .await
+    {
+        panic!("[{label}] torrent should appear in get_torrents(): {why}");
+    }
 
     // 5. Appears in the built library (VFS).
     let metadata = identify_torrent(&info, tmdb).await;
@@ -94,14 +100,22 @@ async fn lifecycle_steps(provider: &Arc<dyn DebridProvider>, tmdb: &Arc<TmdbClie
 
     // 7. Disappears from the provider's list.
     let mut gone = false;
+    let mut last = String::new();
     for _ in 0..20 {
-        if find_ids_by_hash(provider, SINTEL_HASH).await.is_empty() {
-            gone = true;
-            break;
+        match find_ids_by_hash(provider, SINTEL_HASH).await {
+            Ok(ids) if ids.is_empty() => {
+                gone = true;
+                break;
+            }
+            Ok(ids) => last = format!("still listed as {ids:?}"),
+            Err(e) => last = format!("the last listing errored: {e}"),
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    assert!(gone, "[{label}] torrent should disappear after delete");
+    assert!(
+        gone,
+        "[{label}] torrent should disappear after delete ({last})"
+    );
     println!("[{label}] disappeared after delete ✓");
 }
 
@@ -133,23 +147,38 @@ async fn lifecycle_torbox() {
 
 #[tokio::test]
 #[ignore]
-async fn lifecycle_acquire_sintel_by_imdb() {
+async fn lifecycle_acquire_sintel_by_imdb_real_debrid() {
     let _live = LIVE_ACCOUNT.lock().await;
-    dotenvy::dotenv().ok();
-    let Ok((kind, provider_token)) = debridmoviemapper::provider::choose_provider(
-        std::env::var("RD_API_TOKEN").ok(),
-        std::env::var("TORBOX_API_KEY").ok(),
-    ) else {
-        eprintln!("skipping: no provider token");
+    let Some(rd) = common::token("RD_API_TOKEN") else {
+        println!("skipping lifecycle_acquire_sintel_by_imdb_real_debrid: RD_API_TOKEN not set");
         return;
     };
+    run_acquire(ProviderKind::RealDebrid, rd, "real-debrid").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn lifecycle_acquire_sintel_by_imdb_torbox() {
+    let _live = LIVE_ACCOUNT.lock().await;
+    let Some(tb) = common::token("TORBOX_API_KEY") else {
+        println!("skipping lifecycle_acquire_sintel_by_imdb_torbox: TORBOX_API_KEY not set");
+        return;
+    };
+    run_acquire(ProviderKind::TorBox, tb, "torbox").await;
+}
+
+/// Acquire Sintel by IMDB id through the `AcquisitionEngine` on one provider, drive `observe`
+/// until it verifies, and check it lands under `Movies/`. Each provider runs it separately (like
+/// `run_lifecycle`), so a `.env` that sets both tokens tests both instead of skipping: the service's
+/// `choose_provider` deliberately refuses that combination.
+async fn run_acquire(kind: ProviderKind, provider_token: String, label: &str) {
     // With a provider configured, TMDB is required: a missing key or a TMDB failure fails the test.
     let tmdb = common::tmdb_client();
     let provider: Arc<dyn debridmoviemapper::provider::DebridProvider> = match kind {
-        debridmoviemapper::provider::ProviderKind::RealDebrid => Arc::new(
+        ProviderKind::RealDebrid => Arc::new(
             debridmoviemapper::rd_client::RealDebridClient::new(provider_token.clone()).unwrap(),
         ),
-        debridmoviemapper::provider::ProviderKind::TorBox => Arc::new(
+        ProviderKind::TorBox => Arc::new(
             debridmoviemapper::torbox_client::TorBoxClient::new(provider_token.clone()).unwrap(),
         ),
     };
@@ -158,7 +187,10 @@ async fn lifecycle_acquire_sintel_by_imdb() {
         .build()
         .unwrap();
     let mut dbp = std::env::temp_dir();
-    dbp.push(format!("dmm_sp1_lifecycle_{}.redb", std::process::id()));
+    dbp.push(format!(
+        "dmm_sp1_lifecycle_{label}_{}.redb",
+        std::process::id()
+    ));
     let store = debridmoviemapper::store::Store::open(dbp.to_str().unwrap()).unwrap();
     let scraper: Arc<dyn debridmoviemapper::scraper::Scraper> =
         Arc::new(debridmoviemapper::scraper::TorrentioScraper::new(
@@ -187,8 +219,8 @@ async fn lifecycle_acquire_sintel_by_imdb() {
     let imdb = "tt1727587";
     let (tmdb_id, mtype) = match tmdb.find_by_imdb(imdb).await {
         Ok(Some(v)) => v,
-        Ok(None) => panic!("TMDB found no title for Sintel's IMDB id {imdb}"),
-        Err(e) => panic!("TMDB find_by_imdb({imdb}) failed: {e}"),
+        Ok(None) => panic!("[{label}] TMDB found no title for Sintel's IMDB id {imdb}"),
+        Err(e) => panic!("[{label}] TMDB find_by_imdb({imdb}) failed: {e}"),
     };
     let details = tmdb
         .details(tmdb_id, mtype.clone())
@@ -222,9 +254,9 @@ async fn lifecycle_acquire_sintel_by_imdb() {
         {
             debridmoviemapper::acquire::AcquireOutcome::Pending(h)
             | debridmoviemapper::acquire::AcquireOutcome::Acquired(h) => h,
-            other => panic!("unexpected acquire outcome: {other:?}"),
+            other => panic!("[{label}] unexpected acquire outcome: {other:?}"),
         };
-        eprintln!("acquire outcome hash: {}", hash);
+        eprintln!("[{label}] acquire outcome hash: {hash}");
 
         // Drive observe until the store shows Verified.
         // Sintel is a small, widely-cached CC torrent, so it should verify within a few ticks.
@@ -243,7 +275,7 @@ async fn lifecycle_acquire_sintel_by_imdb() {
         }
         assert!(
             verified,
-            "Sintel should verify via observe within the poll window"
+            "[{label}] Sintel should verify via observe within the poll window"
         );
 
         // Build the VFS from the acquired torrent alone, the way the scan loop resolves it (the
@@ -255,7 +287,7 @@ async fn lifecycle_acquire_sintel_by_imdb() {
             selection
                 .values()
                 .any(|e| e.hash.eq_ignore_ascii_case(&hash)),
-            "observe should write a selection entry for the verified torrent {hash}"
+            "[{label}] observe should write a selection entry for the verified torrent {hash}"
         );
         let torrents = provider
             .get_torrents()
@@ -278,14 +310,14 @@ async fn lifecycle_acquire_sintel_by_imdb() {
         }
         assert!(
             !acquired.is_empty(),
-            "the acquired torrent {hash} should be listed by the provider"
+            "[{label}] the acquired torrent {hash} should be listed by the provider"
         );
         let vfs = DebridVfs::build(acquired, &selection);
         assert!(
             movies_has_torrent(&vfs.root, &hash),
-            "Sintel ({hash}) should appear under Movies/ after verify"
+            "[{label}] Sintel ({hash}) should appear under Movies/ after verify"
         );
-        eprintln!("Sintel appears in Movies/ via VFS ✓");
+        eprintln!("[{label}] Sintel appears in Movies/ via VFS ✓");
     };
 
     // Cleanup, also after a failed assertion: delete every torrent the engine recorded as owned,
@@ -381,6 +413,92 @@ async fn with_cleanup_runs_cleanup_when_the_body_panics() {
         cleaned.load(Ordering::SeqCst),
         "cleanup should run although the body panicked"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn poll_until_listed_waits_for_a_late_listing() {
+    let calls = std::cell::Cell::new(0u32);
+    let ids = common::poll_until_listed(
+        || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                match n {
+                    1 => Err("HTTP 500".to_string()),
+                    2 => Ok(Vec::new()),
+                    _ => Ok(vec!["42".to_string()]),
+                }
+            }
+        },
+        16,
+        Duration::from_secs(2),
+    )
+    .await;
+    assert_eq!(ids, Ok(vec!["42".to_string()]));
+    assert_eq!(calls.get(), 3, "polling stops once the torrent is listed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn poll_until_listed_says_when_the_torrent_was_missing() {
+    let err = common::poll_until_listed(
+        || async { Ok::<_, String>(Vec::new()) },
+        3,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("missing from all 3 listings"), "{err}");
+    assert!(!err.contains("errored"), "{err}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn poll_until_listed_says_when_the_listing_errored() {
+    let err = common::poll_until_listed(
+        || async { Err::<Vec<String>, _>("HTTP 503") },
+        3,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("all 3 listings errored"), "{err}");
+    assert!(err.contains("HTTP 503"), "{err}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn poll_until_listed_reports_both_outcomes_when_they_mix() {
+    let calls = std::cell::Cell::new(0u32);
+    let err = common::poll_until_listed(
+        || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                if n.is_multiple_of(2) {
+                    Err("HTTP 502".to_string())
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+        },
+        4,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("missing from 2 listings"), "{err}");
+    assert!(err.contains("2 listings errored"), "{err}");
+    assert!(err.contains("HTTP 502"), "{err}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn poll_until_listed_waits_at_most_its_window() {
+    let start = tokio::time::Instant::now();
+    let _ = common::poll_until_listed(
+        || async { Ok::<_, String>(Vec::new()) },
+        16,
+        Duration::from_secs(2),
+    )
+    .await;
+    assert_eq!(start.elapsed(), Duration::from_secs(30));
 }
 
 #[tokio::test]

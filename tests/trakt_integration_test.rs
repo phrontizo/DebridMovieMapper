@@ -14,16 +14,68 @@ use debridmoviemapper::trakt_client::{TraktClient, TraktClientImpl};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// The temp database holding the test's live Trakt tokens. Dropping it deletes the file and its
-/// `.corrupt` sibling, so the tokens are removed when an assertion fails or the test panics, too.
+/// The temp directory holding the test's live Trakt token database. Dropping it deletes the
+/// directory with everything in it (the database and any `.corrupt` sibling), so the tokens are
+/// removed when an assertion fails or the test panics, too. (Not on Ctrl-C/kill: the process exits
+/// without unwinding, which is why the test prints the path first.)
 struct TempDb(PathBuf);
 
 impl Drop for TempDb {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-        let mut corrupt = self.0.clone().into_os_string();
-        corrupt.push(".corrupt");
-        let _ = std::fs::remove_file(corrupt);
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The directory the test's live Trakt tokens are kept in: one per run, inside Cargo's per-target
+/// scratch dir (`CARGO_TARGET_TMPDIR`, under the git-ignored target dir) rather than the shared
+/// system temp dir, where other local users could read the tokens.
+fn token_db_dir() -> PathBuf {
+    std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("dmm_trakt_integ_{}", std::process::id()))
+}
+
+/// Creates `dir` so that only the current user can read it (mode 0700 on Unix; an existing
+/// directory, e.g. from an aborted run with a reused pid, is tightened too).
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn token_db_dir_is_private_and_outside_the_shared_temp_dir() {
+    // The live tokens must not land in the shared system temp dir, where other local users can
+    // read them and where an aborted (Ctrl-C) run would leave them behind.
+    let dir = token_db_dir();
+    assert!(
+        dir.starts_with(env!("CARGO_TARGET_TMPDIR")),
+        "{} should be under Cargo's per-target scratch dir",
+        dir.display()
+    );
+    assert_ne!(
+        dir.parent(),
+        Some(std::env::temp_dir().as_path()),
+        "{} should not sit directly in the shared temp dir",
+        dir.display()
+    );
+
+    // A separate directory from the live test's, so the two never touch each other's files.
+    let probe = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("dmm_trakt_integ_selftest_{}", std::process::id()));
+    let _cleanup = TempDb(probe.clone());
+    create_private_dir(&probe).expect("create the private dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&probe).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "the token dir should be readable by its owner only"
+        );
     }
 }
 
@@ -60,11 +112,18 @@ async fn trakt_live_device_flow_and_sync() {
         reqwest::Client::new(),
     ));
     let tmdb = TmdbClient::new(tmdb_key).expect("tmdb client");
-    let path = std::env::temp_dir().join(format!("dmm_trakt_integ_{}.redb", std::process::id()));
+    let dir = token_db_dir();
+    // Declared before `store`, so it is dropped (and the directory deleted) after the store closes.
+    let _temp_db = TempDb(dir.clone());
+    create_private_dir(&dir).expect("create the token db dir");
+    let path = dir.join("trakt.redb");
     let path_str = path.to_str().expect("temp path is valid UTF-8").to_string();
-    // Declared before `store`, so it is dropped (and the file deleted) after the store closes.
-    let _temp_db = TempDb(path);
     let store = Store::open(&path_str).expect("store");
+    eprintln!(
+        "Live Trakt tokens are stored in {} (deleted when the test ends; \
+         delete it yourself if you abort the run)",
+        dir.display()
+    );
 
     let dc = trakt.device_code().await.expect("device_code");
 
@@ -141,27 +200,24 @@ async fn trakt_live_device_flow_and_sync() {
 }
 
 /// Offline check of `TempDb` (no network; plain `cargo test`): a panicking test still deletes the
-/// token file and its `.corrupt` sibling.
+/// token directory, with the token file and its `.corrupt` sibling in it.
 #[test]
 fn temp_db_removes_the_token_file_when_the_test_panics() {
-    let path = std::env::temp_dir().join(format!(
-        "dmm_trakt_tempdb_check_{}.redb",
-        std::process::id()
-    ));
-    let mut corrupt = path.clone().into_os_string();
-    corrupt.push(".corrupt");
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("dmm_trakt_tempdb_check_{}", std::process::id()));
+    create_private_dir(&dir).unwrap();
+    let path = dir.join("trakt.redb");
+    let corrupt = dir.join("trakt.redb.corrupt");
     std::fs::write(&path, b"tokens").unwrap();
     std::fs::write(&corrupt, b"tokens").unwrap();
 
-    let guarded = path.clone();
+    let guarded = dir.clone();
     let outcome = std::panic::catch_unwind::<_, ()>(move || {
         let _temp_db = TempDb(guarded);
         panic!("an assertion failed");
     });
     assert!(outcome.is_err());
     assert!(!path.exists(), "the token file should be deleted");
-    assert!(
-        !std::path::Path::new(&corrupt).exists(),
-        "the .corrupt sibling should be deleted"
-    );
+    assert!(!corrupt.exists(), "the .corrupt sibling should be deleted");
+    assert!(!dir.exists(), "the token directory should be deleted");
 }

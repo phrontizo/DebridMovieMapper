@@ -303,9 +303,10 @@ enum OpenFailure {
     /// disk is full, etc. — OR an INTACT database that this binary cannot safely use but must not
     /// discard: an older redb on-disk format (`UpgradeRequired`, e.g. after a redb dependency bump),
     /// a NEWER redb on-disk format (a rollback after a redb upgrade rewrote the file), or a schema
-    /// written by a NEWER build of this app (version ahead of the binary, e.g. after a rollback). In every case the file is intact and holds non-regenerable authoritative data, so
-    /// the caller fails startup and lets the operator fix the underlying condition (back up /
-    /// migrate / roll the binary forward) instead.
+    /// written by a NEWER build of this app (version ahead of the binary, e.g. after a rollback). In
+    /// every case the file is intact and holds non-regenerable authoritative data, so the caller
+    /// fails startup and lets the operator fix the underlying condition (back up / migrate / roll
+    /// the binary forward) instead.
     Transient(String),
 }
 
@@ -452,6 +453,16 @@ impl Store {
         }
         Self::ensure_schema(&db, version).map_err(AppError::Db)?;
         Ok(Store { db })
+    }
+
+    /// A fresh, empty store on an in-memory redb backend at the current schema, for tests (so test
+    /// modules outside this file need no redb types of their own).
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Store {
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .expect("in-memory redb");
+        Store::from_database(Arc::new(db)).expect("schema")
     }
 
     /// Open the file and bring its schema to the current version. Returns an
@@ -725,19 +736,7 @@ impl Store {
 
     /// Look up a single cached identification by torrent id.
     pub async fn get_match(&self, id: String) -> Option<(TorrentInfo, MediaMetadata)> {
-        let db = self.db.clone();
-        let r = tokio::task::spawn_blocking(move || {
-            let read_txn = Self::read_or_log("get_match begin_read", db.begin_read())?;
-            let table =
-                Self::read_or_log("get_match open_table", read_txn.open_table(MATCHES_TABLE))?;
-            let entry = Self::read_or_log("get_match get", table.get(id.as_str()))??;
-            Self::read_or_log(
-                "get_match deserialise",
-                serde_json::from_slice::<(TorrentInfo, MediaMetadata)>(entry.value()),
-            )
-        })
-        .await;
-        Self::join_or_default("get_match", r)
+        self.get_json(MATCHES_TABLE, id, "get_match").await
     }
 
     /// Batch-insert identifications. Serialises with the same encoding as before; an
@@ -868,12 +867,16 @@ impl Store {
     /// genuine miss (`Ok(None)`) from a transient begin_read/open_table/get/deserialise failure that a
     /// bare `.ok()` would silently swallow — a false "absent" on an authoritative table (owned/wanted/
     /// tokens/selection) can drive a duplicate acquire or a wrong lifecycle decision. Mirrors the
-    /// per-row logging the `all_*` scans already do.
-    fn read_or_log<T, E: std::fmt::Display>(ctx: &str, r: Result<T, E>) -> Option<T> {
+    /// per-row logging the `all_*` scans already do. Logged as `{label} {stage}: {e}`.
+    fn read_or_log<T, E: std::fmt::Display>(
+        label: &str,
+        stage: &str,
+        r: Result<T, E>,
+    ) -> Option<T> {
         match r {
             Ok(v) => Some(v),
             Err(e) => {
-                error!("{ctx}: {e}");
+                error!("{label} {stage}: {e}");
                 None
             }
         }
@@ -993,6 +996,76 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Upsert the JSON encoding of `value` at `key` in `def`, in one write transaction. Serialised
+    /// BEFORE the transaction opens, so a serde failure writes nothing: it is logged (`what` names
+    /// the record type) and returned as `AppError::Task`, never a phantom `Ok` (see `flatten_join`).
+    async fn put_json<T: serde::Serialize>(
+        &self,
+        def: BytesTable,
+        key: String,
+        value: &T,
+        what: &str,
+    ) -> Result<(), AppError> {
+        let bytes = match serde_json::to_vec(value) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Failed to serialise {what} for {key}: {e}");
+                return Err(AppError::Task(format!("serialise {what} for {key}: {e}")));
+            }
+        };
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            let txn = db.begin_write()?;
+            {
+                txn.open_table(def)?
+                    .insert(key.as_str(), bytes.as_slice())?;
+            }
+            txn.commit()?;
+            Ok(())
+        })
+        .await;
+        Self::flatten_join(result)
+    }
+
+    /// Remove `key` from `def` in one write transaction (a missing key is a no-op, not an error).
+    async fn remove_key(&self, def: BytesTable, key: String) -> Result<(), AppError> {
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            let txn = db.begin_write()?;
+            {
+                txn.open_table(def)?.remove(key.as_str())?;
+            }
+            txn.commit()?;
+            Ok(())
+        })
+        .await;
+        Self::flatten_join(result)
+    }
+
+    /// Point lookup of the JSON record at `key` in `def`. `None` both for a genuine miss and for a
+    /// read/deserialise failure, which (unlike a miss) is logged under `label` (see `read_or_log`),
+    /// as is a failed blocking task (`join_or_default`).
+    async fn get_json<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        def: BytesTable,
+        key: String,
+        label: &'static str,
+    ) -> Option<T> {
+        let db = self.db.clone();
+        let r = tokio::task::spawn_blocking(move || {
+            let txn = Self::read_or_log(label, "begin_read", db.begin_read())?;
+            let table = Self::read_or_log(label, "open_table", txn.open_table(def))?;
+            let entry = Self::read_or_log(label, "get", table.get(key.as_str()))??;
+            Self::read_or_log(
+                label,
+                "deserialise",
+                serde_json::from_slice::<T>(entry.value()),
+            )
+        })
+        .await;
+        Self::join_or_default(label, r)
+    }
+
     // ── owned_hashes accessors ────────────────────────────────────────────────
 
     pub async fn put_owned(&self, hash: String, rec: OwnedRecord) -> Result<(), AppError> {
@@ -1001,30 +1074,7 @@ impl Store {
         // get/put/remove and `put_owned_if_absent`'s atomic dedup caller-proof — a differently-cased
         // write can never produce a duplicate record for one physical torrent.
         let hash = hash.to_ascii_lowercase();
-        // Serialise before opening the transaction to avoid partial writes on
-        // serde failure (mirrors `replace_match`).
-        let bytes = match serde_json::to_vec(&rec) {
-            Ok(b) => b,
-            Err(e) => {
-                // A serialise failure writes nothing → Err, not a phantom Ok (see `flatten_join`).
-                error!("Failed to serialise OwnedRecord for {}: {}", hash, e);
-                return Err(AppError::Task(format!(
-                    "serialise OwnedRecord for {hash}: {e}"
-                )));
-            }
-        };
-        let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-            let txn = db.begin_write()?;
-            {
-                txn.open_table(OWNED_TABLE)?
-                    .insert(hash.as_str(), bytes.as_slice())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-        .await;
-        Self::flatten_join(result)
+        self.put_json(OWNED_TABLE, hash, &rec, "OwnedRecord").await
     }
 
     /// Insert an owned record ONLY if none exists for `hash`, atomically in one write transaction.
@@ -1071,18 +1121,7 @@ impl Store {
 
     pub async fn get_owned(&self, hash: String) -> Option<OwnedRecord> {
         let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
-        let db = self.db.clone();
-        let r = tokio::task::spawn_blocking(move || {
-            let txn = Self::read_or_log("get_owned begin_read", db.begin_read())?;
-            let table = Self::read_or_log("get_owned open_table", txn.open_table(OWNED_TABLE))?;
-            let e = Self::read_or_log("get_owned get", table.get(hash.as_str()))??;
-            Self::read_or_log(
-                "get_owned deserialise",
-                serde_json::from_slice::<OwnedRecord>(e.value()),
-            )
-        })
-        .await;
-        Self::join_or_default("get_owned", r)
+        self.get_json(OWNED_TABLE, hash, "get_owned").await
     }
 
     pub async fn set_owned_status(
@@ -1229,17 +1268,7 @@ impl Store {
 
     pub async fn remove_owned(&self, hash: String) -> Result<(), AppError> {
         let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
-        let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-            let txn = db.begin_write()?;
-            {
-                txn.open_table(OWNED_TABLE)?.remove(hash.as_str())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-        .await;
-        Self::flatten_join(result)
+        self.remove_key(OWNED_TABLE, hash).await
     }
 
     pub async fn all_owned(&self) -> Vec<(String, OwnedRecord)> {
@@ -1262,63 +1291,18 @@ impl Store {
         meta: crate::vfs::MediaMetadata,
     ) -> Result<(), AppError> {
         let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
-        let bytes = match serde_json::to_vec(&meta) {
-            Ok(b) => b,
-            Err(e) => {
-                // Nothing written on a serialise failure → Err, not a phantom Ok (see `flatten_join`).
-                error!(
-                    "Failed to serialise authoritative metadata for {}: {}",
-                    hash, e
-                );
-                return Err(AppError::Task(format!(
-                    "serialise authoritative metadata for {hash}: {e}"
-                )));
-            }
-        };
-        let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-            let txn = db.begin_write()?;
-            {
-                txn.open_table(AUTH_TABLE)?
-                    .insert(hash.as_str(), bytes.as_slice())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-        .await;
-        Self::flatten_join(result)
+        self.put_json(AUTH_TABLE, hash, &meta, "authoritative metadata")
+            .await
     }
 
     pub async fn authoritative_meta(&self, hash: String) -> Option<crate::vfs::MediaMetadata> {
         let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
-        let db = self.db.clone();
-        let r = tokio::task::spawn_blocking(move || {
-            let txn = Self::read_or_log("authoritative_meta begin_read", db.begin_read())?;
-            let table =
-                Self::read_or_log("authoritative_meta open_table", txn.open_table(AUTH_TABLE))?;
-            let e = Self::read_or_log("authoritative_meta get", table.get(hash.as_str()))??;
-            Self::read_or_log(
-                "authoritative_meta deserialise",
-                serde_json::from_slice::<crate::vfs::MediaMetadata>(e.value()),
-            )
-        })
-        .await;
-        Self::join_or_default("authoritative_meta", r)
+        self.get_json(AUTH_TABLE, hash, "authoritative_meta").await
     }
 
     pub async fn remove_authoritative(&self, hash: String) -> Result<(), AppError> {
         let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
-        let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-            let txn = db.begin_write()?;
-            {
-                txn.open_table(AUTH_TABLE)?.remove(hash.as_str())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-        .await;
-        Self::flatten_join(result)
+        self.remove_key(AUTH_TABLE, hash).await
     }
 
     // ── blacklist accessors ───────────────────────────────────────────────────
@@ -1333,28 +1317,9 @@ impl Store {
     ) -> Result<(), AppError> {
         // Keyed by (media_type, tmdb_id, lowercased hash) — see `blacklist_key`.
         let key = blacklist_key(kind, tmdb_id, &hash);
-        let bytes = match serde_json::to_vec(&serde_json::json!({"reason": reason, "at": at})) {
-            Ok(b) => b,
-            Err(e) => {
-                // Nothing written on a serialise failure → Err, not a phantom Ok (see `flatten_join`).
-                error!("Failed to serialise blacklist entry {}: {}", key, e);
-                return Err(AppError::Task(format!(
-                    "serialise blacklist entry {key}: {e}"
-                )));
-            }
-        };
-        let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-            let txn = db.begin_write()?;
-            {
-                txn.open_table(BLACKLIST_TABLE)?
-                    .insert(key.as_str(), bytes.as_slice())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-        .await;
-        Self::flatten_join(result)
+        let entry = serde_json::json!({"reason": reason, "at": at});
+        self.put_json(BLACKLIST_TABLE, key, &entry, "blacklist entry")
+            .await
     }
 
     /// Single-hash blacklist lookup. Test-only: production filters with `blacklisted_hashes_for` /
@@ -1510,14 +1475,13 @@ impl Store {
         let db = self.db.clone();
         let r = tokio::task::spawn_blocking(move || {
             let mut out = std::collections::HashSet::new();
-            let Some(txn) = Self::read_or_log("blacklisted_hashes_for begin_read", db.begin_read())
-            else {
+            let label = "blacklisted_hashes_for";
+            let Some(txn) = Self::read_or_log(label, "begin_read", db.begin_read()) else {
                 return out;
             };
-            let Some(table) = Self::read_or_log(
-                "blacklisted_hashes_for open_table",
-                txn.open_table(BLACKLIST_TABLE),
-            ) else {
+            let Some(table) =
+                Self::read_or_log(label, "open_table", txn.open_table(BLACKLIST_TABLE))
+            else {
                 return out;
             };
             // The key is "<m|s>|tmdb_id|hash", so this title's rows are a contiguous,
@@ -1525,10 +1489,8 @@ impl Store {
             // (O(log n + matches)) instead of the whole table (which grows to 30 days of churn under
             // the TTL). Any key that sorts at/after `prefix` but does NOT start with it sorts
             // strictly AFTER the entire matching block, so the first non-matching key ends the scan.
-            let Some(iter) = Self::read_or_log(
-                "blacklisted_hashes_for range",
-                table.range(prefix.as_str()..),
-            ) else {
+            let Some(iter) = Self::read_or_log(label, "range", table.range(prefix.as_str()..))
+            else {
                 return out;
             };
             for entry in iter {
@@ -1560,29 +1522,8 @@ impl Store {
         slug: String,
         tokens: TraktTokens,
     ) -> Result<(), AppError> {
-        // Serialise before opening the transaction to avoid partial writes on serde failure.
-        let bytes = match serde_json::to_vec(&tokens) {
-            Ok(b) => b,
-            Err(e) => {
-                // Nothing written on a serialise failure → Err, not a phantom Ok (see `flatten_join`).
-                error!("Failed to serialise TraktTokens for {}: {}", slug, e);
-                return Err(AppError::Task(format!(
-                    "serialise TraktTokens for {slug}: {e}"
-                )));
-            }
-        };
-        let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-            let txn = db.begin_write()?;
-            {
-                txn.open_table(TRAKT_TOKENS_TABLE)?
-                    .insert(slug.as_str(), bytes.as_slice())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-        .await;
-        Self::flatten_join(result)
+        self.put_json(TRAKT_TOKENS_TABLE, slug, &tokens, "TraktTokens")
+            .await
     }
 
     /// Atomically apply `mutate` to the stored tokens for `slug`, but ONLY if the stored `refresh`
@@ -1622,35 +1563,16 @@ impl Store {
     }
 
     pub async fn get_trakt_tokens(&self, slug: String) -> Option<TraktTokens> {
-        let db = self.db.clone();
-        let r = tokio::task::spawn_blocking(move || {
-            let txn = Self::read_or_log("get_trakt_tokens begin_read", db.begin_read())?;
-            let table = Self::read_or_log(
-                "get_trakt_tokens open_table",
-                txn.open_table(TRAKT_TOKENS_TABLE),
-            )?;
-            let e = Self::read_or_log("get_trakt_tokens get", table.get(slug.as_str()))??;
-            Self::read_or_log(
-                "get_trakt_tokens deserialise",
-                serde_json::from_slice::<TraktTokens>(e.value()),
-            )
-        })
-        .await;
-        Self::join_or_default("get_trakt_tokens", r)
+        self.get_json(TRAKT_TOKENS_TABLE, slug, "get_trakt_tokens")
+            .await
     }
 
+    /// Remove only the token row for `slug`. Test-only: production removes an account via
+    /// `remove_trakt_account`, which also drops its `wanted` rows in the same transaction (removing
+    /// the token row alone would orphan them). Tests use it to remove an account mid-sync.
+    #[cfg(test)]
     pub async fn remove_trakt_tokens(&self, slug: String) -> Result<(), AppError> {
-        let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-            let txn = db.begin_write()?;
-            {
-                txn.open_table(TRAKT_TOKENS_TABLE)?.remove(slug.as_str())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-        .await;
-        Self::flatten_join(result)
+        self.remove_key(TRAKT_TOKENS_TABLE, slug).await
     }
 
     /// Remove a Trakt account: its token row AND every one of its `wanted` rows, in ONE write
@@ -1698,35 +1620,12 @@ impl Store {
 
     // ── wanted accessors ──────────────────────────────────────────────────────
 
+    /// Upsert one `wanted` row. Test-only: production writes a user's rows via
+    /// `replace_user_wanted_if_enrolled` (atomic with the enrolment check).
+    #[cfg(test)]
     pub async fn put_wanted(&self, rec: WantedRecord) -> Result<(), AppError> {
-        // Serialise before opening the transaction to avoid partial writes on serde failure.
-        let bytes = match serde_json::to_vec(&rec) {
-            Ok(b) => b,
-            Err(e) => {
-                // Nothing written on a serialise failure → Err, not a phantom Ok (see `flatten_join`).
-                error!(
-                    "Failed to serialise WantedRecord for {}|{}: {}",
-                    rec.user, rec.tmdb_id, e
-                );
-                return Err(AppError::Task(format!(
-                    "serialise WantedRecord for {}|{}: {e}",
-                    rec.user, rec.tmdb_id
-                )));
-            }
-        };
         let key = wanted_key(&rec.user, &rec.media_type, rec.tmdb_id);
-        let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-            let txn = db.begin_write()?;
-            {
-                txn.open_table(WANTED_TABLE)?
-                    .insert(key.as_str(), bytes.as_slice())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-        .await;
-        Self::flatten_join(result)
+        self.put_json(WANTED_TABLE, key, &rec, "WantedRecord").await
     }
 
     /// Rewrite one user's `wanted` rows — remove the `remove` keys, upsert `put` — in ONE write
@@ -1787,20 +1686,13 @@ impl Store {
         tmdb_id: u64,
     ) -> Option<WantedRecord> {
         let key = wanted_key(&user, &media_type, tmdb_id);
-        let db = self.db.clone();
-        let r = tokio::task::spawn_blocking(move || {
-            let txn = Self::read_or_log("get_wanted begin_read", db.begin_read())?;
-            let table = Self::read_or_log("get_wanted open_table", txn.open_table(WANTED_TABLE))?;
-            let e = Self::read_or_log("get_wanted get", table.get(key.as_str()))??;
-            Self::read_or_log(
-                "get_wanted deserialise",
-                serde_json::from_slice::<WantedRecord>(e.value()),
-            )
-        })
-        .await;
-        Self::join_or_default("get_wanted", r)
+        self.get_json(WANTED_TABLE, key, "get_wanted").await
     }
 
+    /// Remove one `wanted` row. Test-only: production removes a user's rows via
+    /// `replace_user_wanted_if_enrolled`, or all of them with the account via
+    /// `remove_trakt_account`.
+    #[cfg(test)]
     pub async fn remove_wanted(
         &self,
         user: String,
@@ -1808,17 +1700,7 @@ impl Store {
         tmdb_id: u64,
     ) -> Result<(), AppError> {
         let key = wanted_key(&user, &media_type, tmdb_id);
-        let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-            let txn = db.begin_write()?;
-            {
-                txn.open_table(WANTED_TABLE)?.remove(key.as_str())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-        .await;
-        Self::flatten_join(result)
+        self.remove_key(WANTED_TABLE, key).await
     }
 
     /// Returns all wanted-set records across all users. Each record is self-keyed (embeds
@@ -1840,48 +1722,18 @@ impl Store {
     // ── selection accessors (SP3) ─────────────────────────────────────────────
 
     pub async fn put_selection(&self, slot: String, entry: SelectionEntry) -> Result<(), AppError> {
-        // Serialise before opening the transaction to avoid partial writes on serde failure.
-        let bytes = match serde_json::to_vec(&entry) {
-            Ok(b) => b,
-            Err(e) => {
-                // Nothing written on a serialise failure → Err, not a phantom Ok (see `flatten_join`).
-                error!("Failed to serialise SelectionEntry for {}: {}", slot, e);
-                return Err(AppError::Task(format!(
-                    "serialise SelectionEntry for {slot}: {e}"
-                )));
-            }
-        };
-        let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-            let txn = db.begin_write()?;
-            {
-                txn.open_table(SELECTION_TABLE)?
-                    .insert(slot.as_str(), bytes.as_slice())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-        .await;
-        Self::flatten_join(result)
+        self.put_json(SELECTION_TABLE, slot, &entry, "SelectionEntry")
+            .await
     }
 
     /// Single-slot `selection` point lookup. Used by `acquire::record_verified` to gate a
-    /// season-pack's episode-slot overwrite on quality (don't clobber a better single), and by the
-    /// tests. The VFS build path reads the whole map at once via `all_selection`.
+    /// season-pack's episode-slot overwrite on quality (don't clobber a better single), by the
+    /// upgrade engine to look up the copy a slot serves before a swap or prune (the read-gate's
+    /// `copies_serving`, an episode's served baseline, consolidation's repoint set, the over-ceiling
+    /// retention check), and by the tests. The VFS build path reads the whole map at once via
+    /// `all_selection`.
     pub async fn get_selection(&self, slot: String) -> Option<SelectionEntry> {
-        let db = self.db.clone();
-        let r = tokio::task::spawn_blocking(move || {
-            let txn = Self::read_or_log("get_selection begin_read", db.begin_read())?;
-            let table =
-                Self::read_or_log("get_selection open_table", txn.open_table(SELECTION_TABLE))?;
-            let e = Self::read_or_log("get_selection get", table.get(slot.as_str()))??;
-            Self::read_or_log(
-                "get_selection deserialise",
-                serde_json::from_slice::<SelectionEntry>(e.value()),
-            )
-        })
-        .await;
-        Self::join_or_default("get_selection", r)
+        self.get_json(SELECTION_TABLE, slot, "get_selection").await
     }
 
     /// Atomically repoint `slot` to `new` only while it still holds `expected` (compare-and-set, one
@@ -1924,17 +1776,7 @@ impl Store {
     }
 
     pub async fn remove_selection(&self, slot: String) -> Result<(), AppError> {
-        let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-            let txn = db.begin_write()?;
-            {
-                txn.open_table(SELECTION_TABLE)?.remove(slot.as_str())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-        .await;
-        Self::flatten_join(result)
+        self.remove_key(SELECTION_TABLE, slot).await
     }
 
     pub async fn all_selection(&self) -> Vec<(String, SelectionEntry)> {
@@ -2133,13 +1975,6 @@ mod tests {
     use redb::backends::InMemoryBackend;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    fn mem_store() -> Store {
-        let db = Database::builder()
-            .create_with_backend(InMemoryBackend::new())
-            .unwrap();
-        Store::from_database(Arc::new(db)).unwrap()
-    }
-
     #[tokio::test]
     async fn flatten_join_surfaces_write_task_failure_as_err() {
         // A panic (or cancellation) in a write accessor's blocking task must surface as an error,
@@ -2174,7 +2009,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_then_get_round_trips() {
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_matches(vec![("t1".to_string(), info("t1"), movie("Movie"))])
             .await
@@ -2186,7 +2021,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_batch_then_load_all() {
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_matches(vec![
                 ("a".to_string(), info("a"), movie("A")),
@@ -2201,7 +2036,7 @@ mod tests {
 
     #[tokio::test]
     async fn has_matches_reports_whether_the_cache_holds_any_entry() {
-        let store = mem_store();
+        let store = Store::in_memory();
         assert!(!store.has_matches().await);
         store
             .put_matches(vec![("a".to_string(), info("a"), movie("A"))])
@@ -2214,7 +2049,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_deletes_entry() {
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_matches(vec![("x".to_string(), info("x"), movie("X"))])
             .await
@@ -2225,7 +2060,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_swaps_old_for_new() {
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_matches(vec![("old".to_string(), info("old"), movie("Title"))])
             .await
@@ -2249,7 +2084,7 @@ mod tests {
     #[tokio::test]
     async fn replace_with_missing_old_id_still_inserts_new() {
         // Removing a non-existent key is a no-op in redb; the insert must still happen.
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .replace_match(
                 "ghost".to_string(),
@@ -2667,7 +2502,7 @@ mod tests {
         assert!(store.get_match("b".to_string()).await.is_some());
     }
 
-    // ── SP1 Task 6 tests ──────────────────────────────────────────────────────
+    // ── owned / authoritative / blacklist tests ───────────────────────────────
 
     use crate::scraper::MediaKind;
 
@@ -2686,7 +2521,7 @@ mod tests {
 
     #[tokio::test]
     async fn owned_round_trip_and_status_update() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let rec = OwnedRecord {
             request: req("tt1", 27205),
             provenance: Provenance::manual(),
@@ -2715,7 +2550,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_owned_if_absent_writes_only_when_absent_and_never_clobbers() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let engine_rec = OwnedRecord {
             request: req("tt1", 27205),
             provenance: Provenance::watchlist("alice"), // provenance-bearing (engine) record
@@ -2751,7 +2586,7 @@ mod tests {
         // read, `put_owned_if_absent` dedups across case (so one physical torrent can't produce two
         // records), and remove works regardless of case. Guards the invariant against a future
         // non-lowercasing hash source.
-        let store = mem_store();
+        let store = Store::in_memory();
         let rec = OwnedRecord {
             request: req("tt1", 27205),
             provenance: Provenance::watchlist("alice"),
@@ -2786,7 +2621,7 @@ mod tests {
     async fn authoritative_accessors_are_case_insensitive_on_the_hash_key() {
         // Like the owned table: a provider-cased write must be found, and removed, by the lowercase
         // owned key, so a removal can never leave a stale identification override behind.
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_authoritative("ABC".into(), movie("A"))
             .await
@@ -2805,7 +2640,7 @@ mod tests {
     async fn set_owned_status_on_missing_hash_is_a_noop_not_a_phantom_record() {
         // A status change for a hash with no owned record must be a silent no-op (Ok), NOT create a
         // phantom record — a phantom owned row is an invisible/duplicate torrent in the lifecycle.
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .set_owned_status("ghost".to_string(), OwnedStatus::Verified)
             .await
@@ -2822,7 +2657,7 @@ mod tests {
         // A status change against an existing-but-undeserialisable record must surface an Err (so the
         // caller knows the change did not land), NOT commit-and-return-Ok while the record silently
         // keeps its old status.
-        let store = mem_store();
+        let store = Store::in_memory();
         {
             let txn = store.db.begin_write().unwrap();
             {
@@ -2846,7 +2681,7 @@ mod tests {
         // owned_hashes is authoritative + non-regenerable: one un-deserialisable row must NOT abort
         // iteration (that would make the WHOLE library invisible → mass duplicate re-acquire). It is
         // skipped; the good rows survive.
-        let store = mem_store();
+        let store = Store::in_memory();
         // Inject a garbage row directly into the owned table.
         {
             let txn = store.db.begin_write().unwrap();
@@ -2885,7 +2720,7 @@ mod tests {
         // The TTL prune uses a STRICT `<`: a row stamped exactly AT the cutoff is NOT pruned (it
         // becomes retryable one second later). Guards an off-by-one (`<` → `<=`) that would change
         // when a rejected hash becomes re-acquirable.
-        let store = mem_store();
+        let store = Store::in_memory();
         let m = MediaKind::Movie;
         let cutoff = 1_000u64;
         store
@@ -2918,7 +2753,7 @@ mod tests {
         // The prune's `.unwrap_or(0)` means a malformed / `at`-less row is treated as age 0 and
         // pruned (rather than lingering forever). Insert a raw row lacking `at` and confirm it's
         // removed by any cutoff.
-        let store = mem_store();
+        let store = Store::in_memory();
         let key = blacklist_key(MediaKind::Movie, 1, "h");
         {
             let txn = store.db.begin_write().unwrap();
@@ -2990,7 +2825,7 @@ mod tests {
 
     #[tokio::test]
     async fn authoritative_round_trip() {
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_authoritative("h1".to_string(), movie("Auth"))
             .await
@@ -3009,7 +2844,7 @@ mod tests {
 
     #[tokio::test]
     async fn blacklist_add_and_check() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let m = MediaKind::Movie;
         assert!(!store.is_blacklisted(m, 27205, "h1".to_string()).await);
         store
@@ -3026,7 +2861,7 @@ mod tests {
         // A movie and a show sharing a numeric TMDB id must keep INDEPENDENT rejection histories —
         // a hash rejected for the movie must not suppress the unrelated show (which may legitimately
         // want it), and vice versa.
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .blacklist_add(MediaKind::Movie, 1396, "h".to_string(), "WrongTitle", 1)
             .await
@@ -3061,7 +2896,7 @@ mod tests {
     async fn blacklist_is_case_insensitive_on_hash() {
         // A hash added in one case must be found when queried in another (and vice versa), so a
         // rejected hash can never be silently re-added on a case mismatch.
-        let store = mem_store();
+        let store = Store::in_memory();
         let m = MediaKind::Movie;
         let upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF01".to_string();
         let lower = upper.to_ascii_lowercase();
@@ -3077,7 +2912,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_blacklist_before_removes_only_stale_rows() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let m = MediaKind::Movie;
         store
             .blacklist_add(m, 1, "old".into(), "WrongTitle", 100)
@@ -3099,7 +2934,7 @@ mod tests {
 
     #[tokio::test]
     async fn blacklisted_hashes_for_is_scoped_to_tmdb_and_lowercased() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let m = MediaKind::Movie;
         store
             .blacklist_add(m, 12, "AAA".into(), "WrongTitle", 1)
@@ -3129,7 +2964,7 @@ mod tests {
         assert!(store.blacklisted_hashes_for(m, 999).await.is_empty());
     }
 
-    // ── SP2 Task 3 tests (trakt_tokens + wanted) ─────────────────────────────
+    // ── trakt_tokens + wanted tests ───────────────────────────────────────────
 
     use crate::tmdb_client::ShowStatus;
 
@@ -3190,7 +3025,7 @@ mod tests {
 
     #[tokio::test]
     async fn trakt_tokens_round_trip() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let tok1 = trakt_tokens_fixture("access1", "alice");
         let tok2 = TraktTokens {
             access: "access2".to_string(),
@@ -3235,7 +3070,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_trakt_tokens_cas_applies_only_on_matching_refresh() {
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_trakt_tokens(
                 "alice".to_string(),
@@ -3345,7 +3180,7 @@ mod tests {
 
     #[tokio::test]
     async fn wanted_round_trip() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let movie_rec = movie_wanted("alice", 27205);
         let show_rec = show_wanted("bob", 1396);
 
@@ -3407,7 +3242,7 @@ mod tests {
     async fn wanted_movie_and_show_with_same_tmdb_id_coexist() {
         // TMDB movie and TV id-spaces are independent: a movie and a show with the SAME numeric id
         // must both persist (the key carries a media-type discriminator), not overwrite each other.
-        let store = mem_store();
+        let store = Store::in_memory();
         let movie = movie_wanted("alice", 1396);
         let show = show_wanted("alice", 1396);
         store.put_wanted(movie.clone()).await.unwrap();
@@ -3443,7 +3278,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_wanted_aggregates_multi_user_same_tmdb_id() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let rec_a = movie_wanted("userA", 123);
         let rec_b = WantedRecord {
             user: "userB".to_string(),
@@ -4140,7 +3975,7 @@ mod tests {
         );
     }
 
-    // ── SP2 Task 4 tests (per-user provenance on OwnedRecord) ─────────────────
+    // ── per-user provenance on OwnedRecord tests ──────────────────────────────
 
     /// Old-schema records (with `"source"` key, no `"provenance"` key) must decode as
     /// `Provenance::manual()` — the safe default the reconciler never auto-removes.
@@ -4204,7 +4039,7 @@ mod tests {
     /// language. An account-mirror record (both `None`) gains both.
     #[tokio::test]
     async fn backfill_title_languages_if_unset_fills_only_unset_fields() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let mut legacy = OwnedRecord {
             request: req("tt1", 27205),
             provenance: Provenance::watchlist("alice"),
@@ -4276,14 +4111,11 @@ mod tests {
         assert!(store.get_owned("hgone".into()).await.is_none());
     }
 
-    /// The quality backfill (re-deriving a `quality: None` record's quality from its file name) sets
-    /// `quality` ONLY where it is still `None`, in one write transaction touching nothing else — a
-    /// recorded quality is never overwritten and a missing record is never resurrected.
     /// The repoint is a compare-and-set: it writes only while the slot still holds the entry the
     /// caller planned from, so it can never clobber a swap the upgrade engine made in between.
     #[tokio::test]
     async fn repoint_selection_if_writes_only_over_the_expected_entry() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let entry = |h: &str, p: &str| SelectionEntry {
             hash: h.into(),
             file_path: p.into(),
@@ -4321,7 +4153,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_imdb_id_if_empty_fills_only_an_empty_imdb_id() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let rec = OwnedRecord {
             request: req("", 603),
             provenance: Provenance { entries: vec![] },
@@ -4402,7 +4234,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_user_wanted_if_enrolled_writes_nothing_for_a_removed_account() {
-        let store = mem_store();
+        let store = Store::in_memory();
         assert!(!store
             .replace_user_wanted_if_enrolled("alice".into(), vec![], vec![wanted_row("alice", 1)])
             .await
@@ -4442,7 +4274,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_trakt_account_drops_the_tokens_and_only_that_users_wanted_rows() {
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_trakt_tokens("alice".into(), tokens_for("alice"))
             .await
@@ -4466,9 +4298,12 @@ mod tests {
         assert_eq!(rows, vec!["bob".to_string()]);
     }
 
+    /// The quality backfill (re-deriving a `quality: None` record's quality from its file name) sets
+    /// `quality` ONLY where it is still `None`, in one write transaction touching nothing else — a
+    /// recorded quality is never overwritten and a missing record is never resurrected.
     #[tokio::test]
     async fn set_quality_if_unset_fills_only_a_missing_quality() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let rec = OwnedRecord {
             request: req("tt1", 27205),
             provenance: Provenance { entries: vec![] },
@@ -4531,7 +4366,7 @@ mod tests {
     /// through the store with all entries intact.
     #[tokio::test]
     async fn provenance_round_trips_through_store() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let expected_prov = Provenance {
             entries: vec![
                 ProvenanceEntry::Watchlist {
@@ -4560,7 +4395,7 @@ mod tests {
         // `#[serde(default)]` only fires on an ABSENT key (that path → manual, covered separately),
         // so an explicitly-empty vec must round-trip as empty. A regression (e.g. a custom
         // (de)serializer) could silently flip empty→manual and wrongly protect mirror content.
-        let store = mem_store();
+        let store = Store::in_memory();
         let rec = OwnedRecord {
             request: req("tt1", 27205),
             provenance: Provenance { entries: vec![] },
@@ -4581,11 +4416,11 @@ mod tests {
         );
     }
 
-    // ── SP3 Task 2 tests (OwnedRecord provides/quality, selection, upgrade_checks) ─
+    // ── OwnedRecord provides/quality, selection, upgrade_checks tests ─────────
 
     #[tokio::test]
     async fn owned_record_provides_and_quality_round_trip() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let rec = OwnedRecord {
             request: req("tt1", 1396),
             provenance: Provenance::manual(),
@@ -4625,7 +4460,7 @@ mod tests {
 
     #[tokio::test]
     async fn selection_round_trip_and_remove() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let slot = crate::store::episode_slot(1396, 1, 2);
         store
             .put_selection(
@@ -4651,7 +4486,7 @@ mod tests {
     #[tokio::test]
     async fn upgrade_checked_cursor_round_trip() {
         use crate::vfs::MediaType;
-        let store = mem_store();
+        let store = Store::in_memory();
         assert_eq!(
             store.get_upgrade_checked(&MediaType::Show, 1396).await,
             0,
@@ -4682,7 +4517,7 @@ mod tests {
     #[tokio::test]
     async fn prune_upgrade_checks_drops_rows_for_titles_no_longer_owned() {
         use crate::vfs::MediaType;
-        let store = mem_store();
+        let store = Store::in_memory();
         // Cursor rows for a still-owned movie (101), a still-owned show (303), and a title that has
         // since left the library (movie 202). A show with the SAME numeric id as an owned MOVIE (101)
         // is NOT owned → its cursor must be pruned (the media-type discriminator keeps them distinct).

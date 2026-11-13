@@ -24,26 +24,51 @@ use std::time::{Duration, Instant};
 /// repair, so deleting it on a transient failure (e.g. a re-activating torrent that briefly reports
 /// `files: null`) would be permanent data loss. Real-Debrid mints a fresh id, so its leaked-torrent
 /// cleanup is unaffected (`new_id != protect_id`). Pass `None` to always clean up.
+///
+/// `added`: where to record the id the add returned (only when it is not `protect_id`), as soon as
+/// it is known. The cleanup above runs only if this future is polled to completion, so a caller that
+/// may drop it mid-await (the instant repair's timeout, or a dropped read) uses the slot to delete
+/// the torrent itself. A torrent left un-selected on Real-Debrid stays in `waiting_files_selection`
+/// for good: the scan loop's same-hash dedup only collapses `downloaded` torrents.
+///
+/// The post-add lookup retries a 404 on the instant repair's short schedule
+/// (`repair::REPAIR_INFO_NOT_FOUND_BACKOFF`): TorBox's `mylist?id=` sometimes 404s a torrent
+/// `createtorrent` has just returned.
 pub async fn materialise(
     provider: &dyn DebridProvider,
     hash: &str,
     settle: Duration,
     max_wait: Duration,
     protect_id: Option<&str>,
+    added: Option<&std::sync::Mutex<Option<String>>>,
     select: impl Fn(&TorrentInfo) -> Vec<u32>,
 ) -> Result<(String, TorrentInfo), AppError> {
     let magnet = format!("magnet:?xt=urn:btih:{}", hash);
-    let added = provider.add_magnet(&magnet).await.map_err(AppError::Http)?;
-    let new_id = added.id;
+    let new_id = provider
+        .add_magnet(&magnet)
+        .await
+        .map_err(AppError::Http)?
+        .id;
     // Skip the leaked-torrent delete when the add recovered the protected (real) torrent.
     let cleanup_ok = protect_id != Some(new_id.as_str());
+    if cleanup_ok {
+        if let Some(slot) = added {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_id.clone());
+        }
+    }
 
     let deadline = Instant::now() + max_wait;
     let (info, ids) = loop {
         if !settle.is_zero() {
             tokio::time::sleep(settle).await;
         }
-        let info = match provider.get_torrent_info(&new_id).await {
+        let info = match crate::provider::torrent_info_retrying_not_found(
+            provider,
+            &new_id,
+            &crate::repair::REPAIR_INFO_NOT_FOUND_BACKOFF,
+        )
+        .await
+        {
             Ok(i) => i,
             Err(e) => {
                 if cleanup_ok {
@@ -120,6 +145,7 @@ mod tests {
             Duration::from_millis(0),
             Duration::from_millis(0),
             None,
+            None,
             |info| {
                 info.files
                     .iter()
@@ -142,6 +168,7 @@ mod tests {
             "H",
             Duration::from_millis(0),
             Duration::from_millis(0),
+            None,
             None,
             |_| Vec::<u32>::new(),
         )
@@ -226,6 +253,7 @@ mod tests {
             Duration::from_millis(5),
             Duration::from_secs(2),
             None,
+            None,
             mkv_selector,
         )
         .await
@@ -245,6 +273,7 @@ mod tests {
             "H",
             Duration::from_millis(5),
             Duration::from_millis(40),
+            None,
             None,
             mkv_selector,
         )
@@ -309,6 +338,7 @@ mod tests {
             Duration::from_millis(0),
             Duration::from_millis(0),
             Some("tid"),
+            None,
             |_| Vec::<u32>::new(),
         )
         .await;
@@ -318,6 +348,38 @@ mod tests {
             "protect_id must suppress the cleanup delete of the real torrent, got: {:?}",
             provider.deleted.lock().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn materialise_records_the_added_id_unless_it_is_protected() {
+        // The slot lets a caller that may drop the future mid-await delete the add itself; the
+        // protected (same-id) torrent is never put in it.
+        let provider = DeleteRecordingProvider::default();
+        let unprotected = std::sync::Mutex::new(None);
+        let _ = materialise(
+            &provider,
+            "H",
+            Duration::ZERO,
+            Duration::ZERO,
+            None,
+            Some(&unprotected),
+            |_| Vec::<u32>::new(),
+        )
+        .await;
+        assert_eq!(*unprotected.lock().unwrap(), Some("tid".to_string()));
+
+        let protected = std::sync::Mutex::new(None);
+        let _ = materialise(
+            &provider,
+            "H",
+            Duration::ZERO,
+            Duration::ZERO,
+            Some("tid"),
+            Some(&protected),
+            |_| Vec::<u32>::new(),
+        )
+        .await;
+        assert_eq!(*protected.lock().unwrap(), None);
     }
 
     #[tokio::test]
@@ -333,6 +395,7 @@ mod tests {
             Duration::from_millis(0),
             Duration::from_millis(0),
             None, // not protected → cleanup must fire
+            None,
             |_| Vec::<u32>::new(),
         )
         .await;

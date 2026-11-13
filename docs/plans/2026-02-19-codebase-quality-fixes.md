@@ -79,7 +79,7 @@ feat: update Cargo.toml deps (add redb, thiserror, move urlencoding to dev)
 **Step 1: In every file, replace all occurrences of:**
 
 ```rust
-let tmdb_api_key = std::env::var("TMDB_API_KEY").unwrap_or_else(|_| "839969cf4f1e183aa5f010f7c4c643f1".to_string());
+let tmdb_api_key = std::env::var("TMDB_API_KEY").unwrap_or_else(|_| "<redacted>".to_string());
 ```
 
 with:
@@ -1224,7 +1224,7 @@ cargo build --release
 **Step 4: Verify no tokens in source:**
 
 ```bash
-grep -r "839969cf" src/ tests/ || echo "No hardcoded TMDB key found"
+grep -rn 'TMDB_API_KEY").unwrap_or_else(|_| "' src/ tests/ || echo "No hardcoded TMDB key found"
 grep -r "RD_API_TOKEN.*=" src/ tests/ --include="*.rs" | grep -v "env::var" | grep -v "must be set" || echo "No hardcoded RD token found"
 ```
 

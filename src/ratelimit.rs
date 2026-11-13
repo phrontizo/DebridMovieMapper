@@ -53,8 +53,8 @@ impl Default for AdaptiveRateLimiter {
 }
 
 impl AdaptiveRateLimiter {
-    /// TorBox's limiter: a 100 ms baseline (10 req/s), on top of which TorBox's rate-limit headers
-    /// pace proactively (`observe_rate_limit`).
+    /// The default 100 ms baseline (10 req/s), used by TorBox (which also paces from its rate-limit
+    /// headers via `observe_rate_limit`) and the Trakt client.
     pub fn new() -> Self {
         Self::with_min_interval(Duration::from_millis(MIN_INTERVAL_MS))
     }
@@ -102,9 +102,10 @@ impl AdaptiveRateLimiter {
     /// Record a 429 throttle — double the interval and optionally respect Retry-After.
     ///
     /// Under concurrency, N requests that each independently receive a 429 each double the interval,
-    /// so a burst can jump it by up to ~2^N in one tick (saturating to `MAX_INTERVAL_MS`); recovery
-    /// is then one halving per success. This is bounded and self-correcting (the interval is capped
-    /// and `record_success` walks it back), so it's accepted rather than de-duplicated per window.
+    /// so a burst can jump it by up to ~2^N in one tick (saturating to `max_interval_ms`: the 30 s
+    /// ceiling, or the baseline when that is higher); recovery is then one halving per success. This
+    /// is bounded and self-correcting (the interval is capped and `record_success` walks it back), so
+    /// it's accepted rather than de-duplicated per window.
     pub async fn record_throttle(&self, retry_after: Option<u64>) {
         let mut state = self.state.lock().await;
         state.interval_ms = state
@@ -164,7 +165,8 @@ mod tests {
     }
 
     /// A limiter built with a custom baseline (the scraper's, RD's) spaces requests by it, backs off
-    /// from it on a 429, and never recovers BELOW it — while `new()` keeps TorBox's 100 ms baseline.
+    /// from it on a 429, and never recovers BELOW it — while `new()` keeps the default 100 ms
+    /// baseline.
     #[tokio::test(start_paused = true)]
     async fn a_custom_baseline_paces_requests_and_bounds_recovery() {
         let rl = AdaptiveRateLimiter::with_min_interval(Duration::from_millis(1_000));

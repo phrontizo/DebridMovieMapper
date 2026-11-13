@@ -104,14 +104,25 @@ impl TorrentioScraper {
     }
 
     /// Override (trimmed) wins; else Torrentio templated as `<provider>=<token>` (further options
-    /// are `|`-separated). The live scraper test guards the syntax.
+    /// are `|`-separated). The live scraper test guards the syntax. An override pasted as the
+    /// addon's manifest URL (`<base>/manifest.json`, what a Stremio configure page hands out) has
+    /// the suffix dropped: kept, every stream URL would 404, which reads as "no streams".
     pub fn build_base_url(
         override_url: Option<String>,
         provider: ProviderKind,
         token: &str,
     ) -> String {
         if let Some(u) = override_url {
-            return u.trim().trim_end_matches('/').to_string();
+            const MANIFEST: &str = "/manifest.json";
+            let mut base = u.trim().trim_end_matches('/');
+            let cut = base.len().saturating_sub(MANIFEST.len());
+            if base
+                .get(cut..)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(MANIFEST))
+            {
+                base = base[..cut].trim_end_matches('/');
+            }
+            return base.to_string();
         }
         let opt = match provider {
             ProviderKind::RealDebrid => "realdebrid",
@@ -420,6 +431,31 @@ mod tests {
             "TOKEN",
         );
         assert_eq!(base, "https://my.host/comet/abc");
+    }
+
+    #[test]
+    fn override_url_pasted_as_a_manifest_url_yields_the_addon_base() {
+        // A Stremio addon's configure page hands out `<base>/manifest.json`; with the suffix kept,
+        // every stream URL is `<base>/manifest.json/stream/…`, which 404s (= "no streams").
+        for pasted in [
+            "https://example.invalid/realdebrid=TOKEN/manifest.json",
+            "https://example.invalid/realdebrid=TOKEN/manifest.json/",
+            " https://example.invalid/realdebrid=TOKEN/Manifest.JSON ",
+        ] {
+            let base = TorrentioScraper::build_base_url(
+                Some(pasted.into()),
+                ProviderKind::RealDebrid,
+                "OTHER",
+            );
+            assert_eq!(
+                base, "https://example.invalid/realdebrid=TOKEN",
+                "{pasted:?}"
+            );
+            assert_eq!(
+                TorrentioScraper::stream_url(&base, "tt0000001", MediaKind::Movie, None, None),
+                "https://example.invalid/realdebrid=TOKEN/stream/movie/tt0000001.json"
+            );
+        }
     }
 
     #[test]

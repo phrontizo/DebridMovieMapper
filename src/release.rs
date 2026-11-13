@@ -122,35 +122,66 @@ static CAM_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 // The bare markers, which are also title words (Cam, Body Cam, Nanny Cam). They count only in a
-// line's tag part (`tag_part`) or inside brackets, so a title containing one is not cam-rejected.
+// line's tag part (`cam_word_part`) or inside brackets, so a title containing one is not
+// cam-rejected.
 // Bare `tc` (telecine) is here alongside `hd-?tc`/`tele-?cine`: unlike `ts`, there is no `.tc`
 // CONTAINER extension, so the word-bounded `\btc\b` matches a standalone `TC` tag, not "catch".
 static CAM_WORD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(cam|tc|scr|screener|r5)\b").unwrap());
 
-// Where a line's release tags begin: its first year or SxxEyy (season/episode) token. Scene and
-// P2P names put the title first with the year or episode code straight after it, so a title word
-// (`Cam.2018…`, `Charlotte's.Web.2006…`) sits before this point and a tag (`….2025.HDCAM…`)
-// after it.
+// Where a line's release tags begin: its first year, SxxEyy (season/episode) or `Season N` token.
+// Scene and P2P names put the title first with the year or episode code straight after it, so a
+// title word (`Cam.2018…`, `Charlotte's.Web.2006…`) sits before this point and a tag
+// (`….2025.HDCAM…`) after it.
 // A resolution token is deliberately NOT an anchor: in `Movie HDCAM 720p` the tag precedes it.
-static TAGS_START_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(?:(?:19|20)\d{2}\b|s\d{1,3}(?:e\d{1,4})?)").unwrap());
+static TAGS_START_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:(?:19|20)\d{2}\b|s\d{1,3}(?:e\d{1,4})?|seasons?[\s._-]*\d{1,2}\b)").unwrap()
+});
+
+// A show line's episode code (`S02E03`, `S01E01E02`, `S01E13v2`, `S02`) or `Season N` token. Unlike
+// `TAGS_START_RE` it is word-bounded on both sides, so a title such as `S1m0ne` is not one.
+static EPISODE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:s\d{1,3}(?:e\d{1,4})*(?:v\d{1,2})?|seasons?[\s._-]*\d{1,2})\b").unwrap()
+});
+
+// The first resolution / source / codec tag: where a show line's tags begin after its episode
+// title. The resolution has no trailing boundary, like `RES_RE` (`1080p10bit`).
+static QUALITY_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:\d{3,4}p|(?:4k|uhd|hdtv|web|web-?dl|web-?rip|blu-?ray|bdrip|brrip|dvdrip|hdrip|remux|[xh]\.?26[45]|hevc|avc|xvid)\b)").unwrap()
+});
 
 // A bracketed group on a line (`[HDCAM]`, `(2025)`): a tag group even when it precedes the title.
 static BRACKET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[\[(]([^\[\]()]*)[\])]").unwrap());
 
 /// The part of one (lowercased) release-name line that carries its tags: everything after its first
-/// year or SxxEyy token, or the whole line when it has neither (a year-less name can't be split).
+/// year, SxxEyy or `Season N` token, or the whole line when it has none (a year-less name can't be
+/// split).
 fn tag_part(line: &str) -> &str {
     TAGS_START_RE.find(line).map_or(line, |m| &line[m.end()..])
+}
+
+/// The part of one (lowercased) line in which the bare cam markers count. A show line names its
+/// episode after the episode code (`Show.S02E03.Nanny.Cam.720p.HDTV`, `Show - S01E05 - Hidden Cam
+/// WEBDL-1080p`), so there it starts at the first resolution/source/codec tag after the code (right
+/// after the code when no such tag follows). Any other line: its [`tag_part`]. Telesync/cam
+/// releases of TV episodes are all but unheard of, and the unambiguous tags (`HDCAM`, `TELESYNC`, …)
+/// and a bracketed `[CAM]` still count anywhere.
+fn cam_word_part(line: &str) -> &str {
+    let Some(code) = EPISODE_CODE_RE.find(line) else {
+        return tag_part(line);
+    };
+    let rest = &line[code.end()..];
+    QUALITY_TAG_RE
+        .find(rest)
+        .map_or(rest, |tag| &rest[tag.start()..])
 }
 
 /// Whether the (lowercased) name/description marks a cam / telesync / screener source.
 fn is_cam_source(lower: &str) -> bool {
     CAM_TAG_RE.is_match(lower)
         || lower.lines().any(|line| {
-            let tags = tag_part(line);
+            let tags = cam_word_part(line);
             CAM_WORD_RE.is_match(tags)
                 || TS_RE.is_match(tags)
                 || BRACKET_RE.captures_iter(line).any(|group| {
@@ -1645,6 +1676,61 @@ mod tests {
                 Source::Cam,
                 "{name} / {desc} is a cam source"
             );
+        }
+    }
+
+    #[test]
+    fn cam_word_in_an_episode_title_is_not_a_cam_source() {
+        // A show's episode title follows its SxxEyy code, so a bare cam word in it sits after the
+        // code. On a show line the bare markers count only from the first resolution/source/codec
+        // tag on, and a year-less `Season N` pack name is split at its season token too.
+        for (name, source) in [
+            ("Some.Show.S02E03.Nanny.Cam.720p.HDTV.x264", Source::Hdtv),
+            ("Show - S01E05 - Hidden Cam WEBDL-1080p.mkv", Source::Web),
+            ("Some.Show.S01E07.The.TS.Files.1080p.WEB.H264", Source::Web),
+            (
+                "Some.Show.2019.S01E02.Spy.Cam.1080p.BluRay.x264",
+                Source::BluRay,
+            ),
+            ("Dash.Cam.Season.1.1080p.WEB", Source::Web),
+        ] {
+            let c = raw(
+                "Torrentio\n1080p",
+                &format!("{name}\nRD+"),
+                "h",
+                Some("x.mkv"),
+            );
+            let r = parse(&c);
+            assert_eq!(
+                r.source, source,
+                "{name}: the episode title is not a cam tag"
+            );
+            assert!(score(&r, &prefs()).is_some(), "{name} must be acquirable");
+        }
+        // A season pack whose description lists such an episode file is clean too.
+        let pack = raw(
+            "Torrentio\n720p",
+            "Some.Show.S02.720p.HDTV.x264\nSome.Show.S02E03.Nanny.Cam.720p.HDTV.x264.mkv\nRD+",
+            "h",
+            Some("x.mkv"),
+        );
+        assert_ne!(parse(&pack).source, Source::Cam);
+        // Real cam tags on a show line are still caught: an unambiguous tag anywhere, a bracketed
+        // one, and a bare one after the quality tags.
+        for desc in [
+            "Some.Show.S01E01.720p.HDCAM",
+            "Some.Show.S01E01.[CAM].mkv",
+            "Some.Show.S01E01.1080p.CAM.x264",
+            "Some.Show.S01E01.1080p.TS.x264",
+            "Some.Show.S01E01.CAM",
+        ] {
+            let c = raw(
+                "Torrentio\n1080p",
+                &format!("{desc}\nRD+"),
+                "h",
+                Some("x.mkv"),
+            );
+            assert_eq!(parse(&c).source, Source::Cam, "{desc} is a cam source");
         }
     }
 

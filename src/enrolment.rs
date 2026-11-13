@@ -120,6 +120,20 @@ impl EnrolmentService {
                 }
                 redirect("/trakt/accounts")
             }
+            // Removing is two-step: the accounts page's Remove button GETs this confirmation page
+            // (no state change), whose own form POSTs below. Removing an account drops its wanted
+            // rows, and the next Trakt cycle then deletes the content only it wanted.
+            (&Method::GET, ["trakt", "accounts", slug, "remove"]) => {
+                let slug = decode_path_segment(slug);
+                match self.store.get_trakt_tokens(slug.clone()).await {
+                    Some(tok) => html(StatusCode::OK, confirm_remove_html(&slug, &tok.username)),
+                    None => html(
+                        StatusCode::NOT_FOUND,
+                        "<h1>404 Not Found</h1><p>No such account. <a href=\"/trakt/accounts\">Back to accounts</a></p>"
+                            .to_string(),
+                    ),
+                }
+            }
             (&Method::POST, ["trakt", "accounts", slug, "remove"]) => {
                 let slug = decode_path_segment(slug);
                 if let Err(e) = self.remove_account(&slug).await {
@@ -218,16 +232,16 @@ impl EnrolmentService {
                     .await?;
                 Ok(())
             }
-            Err(AppError::RateLimited) => {
-                // A rate-limit (persistent 429) is transient, NOT an auth failure: the grant was
-                // never processed, so the single-use refresh token is untouched and next cycle will
-                // retry. Don't flag `needs_reenrolment`: it is an accounts-page marker (background
-                // sync keeps syncing a flagged account and clears it on the next success), and a
-                // spurious one sends the operator off to re-enrol a healthy account. Leave the
-                // record intact.
+            Err(e) if crate::trakt_client::refresh_error_is_transient(&e) => {
+                // A rate-limit (persistent 429), a 5xx or a transport failure is transient, NOT an
+                // auth failure. Don't flag `needs_reenrolment`: it is an accounts-page marker
+                // (background sync keeps syncing a flagged account and clears it on the next
+                // success), and a spurious one sends the operator off to re-enrol a healthy
+                // account. Leave the record intact. If Trakt did process the grant before the 5xx
+                // and rotate the token, the next refresh gets a 4xx `invalid_grant` and flags then.
                 info!(
-                    "Trakt refresh for '{}' was rate-limited (429) — not flagging, will retry next cycle",
-                    slug
+                    "Trakt refresh for '{}' failed transiently ({}) — not flagging, will retry next cycle",
+                    slug, e
                 );
                 Ok(())
             }
@@ -365,6 +379,16 @@ pub async fn poll_to_completion(
             }
             DeviceTokenPoll::Expired => {
                 return Err(AppError::Config("Trakt device code expired".to_string()))
+            }
+            DeviceTokenPoll::Rejected(code) => {
+                let hint = if matches!(code, 401 | 403) {
+                    " (check TRAKT_CLIENT_ID / TRAKT_CLIENT_SECRET)"
+                } else {
+                    ""
+                };
+                return Err(AppError::Upstream(format!(
+                    "Trakt device-token poll returned HTTP {code}{hint}"
+                )));
             }
         }
     }
@@ -585,8 +609,19 @@ fn enrol_html(dc: &DeviceCode) -> String {
     )
 }
 
-/// The accounts list page: each linked account with username + slug, a re-enrolment marker
-/// when flagged, per-account refresh/remove forms, and a form to enrol a new account.
+/// Shown next to a flagged account. The flag is set by a failed sync (any read failure, even a
+/// transient one, or a refresh failure that `trakt_client::refresh_error_is_transient` doesn't
+/// excuse) and cleared by the next successful one, so it says what to do if it
+/// persists — and that Remove is the wrong fix: it drops the account's wanted rows, so the next
+/// Trakt cycle deletes the content only it wanted.
+const REENROL_HINT: &str = " <strong>&#9888; the last sync failed</strong> \
+     (this clears by itself after the next successful sync). If it persists, click \
+     <em>Enrol a new account</em> and approve as the same Trakt user: that replaces the \
+     account's tokens in place. Do not Remove the account first.";
+
+/// The accounts list page: each linked account with username + slug, a sync-failure marker (with
+/// what to do about it) when flagged, per-account refresh/remove buttons (Remove leads to a
+/// confirmation page), and a form to enrol a new account.
 fn accounts_html(accounts: &[(String, TraktTokens)]) -> String {
     let mut rows = String::new();
     if accounts.is_empty() {
@@ -595,7 +630,7 @@ fn accounts_html(accounts: &[(String, TraktTokens)]) -> String {
         rows.push_str("<ul>");
         for (slug, tok) in accounts {
             let marker = if tok.needs_reenrolment {
-                " <strong>&#9888; needs re-enrolment</strong>"
+                REENROL_HINT
             } else {
                 ""
             };
@@ -603,7 +638,7 @@ fn accounts_html(accounts: &[(String, TraktTokens)]) -> String {
                 "<li><strong>{user}</strong> (slug: {slug}){marker} \
                  <form method=\"post\" action=\"/trakt/accounts/{slug_path}/refresh\" style=\"display:inline\">\
                  <button type=\"submit\">Refresh</button></form> \
-                 <form method=\"post\" action=\"/trakt/accounts/{slug_path}/remove\" style=\"display:inline\">\
+                 <form method=\"get\" action=\"/trakt/accounts/{slug_path}/remove\" style=\"display:inline\">\
                  <button type=\"submit\">Remove</button></form></li>",
                 user = esc(&tok.username),
                 slug = esc(slug),
@@ -619,6 +654,28 @@ fn accounts_html(accounts: &[(String, TraktTokens)]) -> String {
          <hr><form method=\"post\" action=\"/trakt/enrol\">\
          <button type=\"submit\">Enrol a new account</button></form></body></html>",
         rows = rows,
+    )
+}
+
+/// The confirmation page the accounts page's Remove button leads to. Removing is destructive
+/// beyond the tokens: the account's wanted rows go with it, and the next Trakt sync then deletes
+/// the content its watchlist acquired that no other linked account wants.
+fn confirm_remove_html(slug: &str, username: &str) -> String {
+    format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Remove Trakt account</title></head>\
+         <body><h1>Remove {user} (slug: {slug})?</h1>\
+         <p>On the next Trakt sync, content acquired from this account's watchlist that no other \
+         linked account wants will be deleted. Removing the last linked account deletes all \
+         watchlist-acquired content.</p>\
+         <p>To re-authorise this account instead, go back and click <em>Enrol a new account</em>, \
+         then approve as the same Trakt user: that replaces its tokens in place and deletes \
+         nothing.</p>\
+         <form method=\"post\" action=\"/trakt/accounts/{slug_path}/remove\">\
+         <button type=\"submit\">Remove the account</button></form>\
+         <p><a href=\"/trakt/accounts\">Cancel</a></p></body></html>",
+        user = esc(username),
+        slug = esc(slug),
+        slug_path = encode_path_segment(slug),
     )
 }
 
@@ -757,6 +814,25 @@ mod tests {
         assert!(poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
             .await
             .is_err());
+        assert!(store.all_trakt_tokens().await.is_empty());
+    }
+
+    /// A 401 on the token poll (a wrong client secret) is reported with its status and a hint,
+    /// not as an expired code.
+    #[tokio::test]
+    async fn poll_to_completion_rejected_names_the_status_and_stores_nothing() {
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            poll: DeviceTokenPoll::Rejected(401),
+            ..Default::default()
+        });
+        let store = mem_store();
+        let err = poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("401"), "{err}");
+        assert!(err.contains("TRAKT_CLIENT_SECRET"), "{err}");
+        assert!(!err.contains("expired"), "{err}");
         assert!(store.all_trakt_tokens().await.is_empty());
     }
 
@@ -918,6 +994,27 @@ mod tests {
         assert_eq!(tok.refresh, "RT", "the refresh token must be preserved");
     }
 
+    /// A 5xx (or transport failure) on refresh is transient: the account is not flagged.
+    #[tokio::test]
+    async fn refresh_account_does_not_flag_a_transient_failure() {
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".into(), tokens_fixture("OLD", "Alice"))
+            .await
+            .unwrap();
+        let trakt = Arc::new(MockTrakt {
+            transient_refresh: true,
+            ..Default::default()
+        });
+        let svc = EnrolmentService::new(trakt, store.clone());
+
+        svc.refresh_account("alice").await.unwrap();
+
+        let tok = store.get_trakt_tokens("alice".into()).await.unwrap();
+        assert!(!tok.needs_reenrolment, "a 503 must not flag the account");
+        assert_eq!(tok.refresh, "RT", "the record is left intact");
+    }
+
     #[tokio::test]
     async fn refresh_account_does_not_resurrect_concurrently_removed_account() {
         use crate::trakt_client::{
@@ -1044,10 +1141,102 @@ mod tests {
         assert!(page.contains("Alice"));
         assert!(page.contains("alice"));
         assert!(page.contains("Bob"));
-        assert!(page.contains("needs re-enrolment"));
+        assert!(page.contains("the last sync failed"));
+        assert!(
+            page.contains("Do not Remove the account first"),
+            "the flagged account carries the re-enrol guidance"
+        );
+        assert_eq!(
+            page.matches("the last sync failed").count(),
+            1,
+            "only the flagged account is marked"
+        );
         assert!(page.contains("/trakt/accounts/alice/refresh"));
         assert!(page.contains("/trakt/accounts/bob/remove"));
+        assert!(
+            page.contains("<form method=\"get\" action=\"/trakt/accounts/bob/remove\""),
+            "Remove leads to the confirmation page instead of removing"
+        );
+        assert!(!page.contains("method=\"post\" action=\"/trakt/accounts/bob/remove\""));
         assert!(page.contains("/trakt/enrol"));
+    }
+
+    async fn body_text(r: Response<Body>) -> String {
+        use futures_util::StreamExt;
+        let mut body = r.into_body();
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next().await {
+            out.extend_from_slice(&chunk.unwrap());
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    /// GET .../remove only renders the confirmation page: it changes nothing, warns what removal
+    /// deletes, and carries the POST form that does remove. An unknown slug is a 404.
+    #[tokio::test]
+    async fn remove_confirmation_page_warns_and_changes_nothing() {
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
+            .await
+            .unwrap();
+        store
+            .put_wanted(crate::store::WantedRecord {
+                user: "alice".into(),
+                tmdb_id: 33,
+                media_type: crate::vfs::MediaType::Movie,
+                sources: crate::store::WantedSources {
+                    watchlist: true,
+                    in_progress: false,
+                },
+                watched_state: crate::store::WatchedState::Movie { watched: false },
+                show_status: None,
+                imdb_id: None,
+            })
+            .await
+            .unwrap();
+        let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), store.clone());
+
+        let r = svc
+            .handle(routed_req(
+                Method::GET,
+                "http://host.local/trakt/accounts/alice/remove",
+                true,
+            ))
+            .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let page = body_text(r).await;
+        assert!(page.contains("will be deleted"), "{page}");
+        assert!(page.contains("Removing the last linked account"), "{page}");
+        assert!(page.contains("Enrol a new account"), "{page}");
+        assert!(
+            page.contains("<form method=\"post\" action=\"/trakt/accounts/alice/remove\">"),
+            "{page}"
+        );
+        assert!(store.get_trakt_tokens("alice".into()).await.is_some());
+        assert_eq!(
+            store.all_wanted().await.len(),
+            1,
+            "the confirmation page must not drop wanted rows"
+        );
+
+        let r = svc
+            .handle(routed_req(
+                Method::GET,
+                "http://host.local/trakt/accounts/nobody/remove",
+                true,
+            ))
+            .await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn confirm_remove_html_escapes_and_encodes_the_slug() {
+        let page = confirm_remove_html("a\" <x", "<script>alert(1)</script>");
+        assert!(!page.contains("<script>alert(1)</script>"));
+        assert!(page.contains("&lt;script&gt;"));
+        assert!(page.contains("/trakt/accounts/a%22%20%3Cx/remove"));
+        assert!(!page.contains("a\" <x"));
     }
 
     // ── security: HTML-escaping (XSS) ─────────────────────────────────────────

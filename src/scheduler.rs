@@ -1,5 +1,5 @@
-//! Background-job scheduler (SP2 Task 10). Splits the single `run_scan_loop` spawn into
-//! cooperating periodic tasks over a shared [`AppState`]:
+//! Background-job scheduler. Splits the single `run_scan_loop` spawn into cooperating periodic
+//! tasks over a shared [`AppState`]:
 //!
 //! - **Scan task** = `run_scan_loop`: per tick, sharing one `get_torrents`, the account sync (VFS
 //!   mirror) + acquisition verification (`engine.observe`), plus (SP3) `record_mirror_owned` and
@@ -13,7 +13,8 @@
 //!   ([`upgrade_first_run_delay`]), during which it could do nothing.
 //!
 //! The Trakt cycle + monitor tasks are spawned ONLY when `trakt_jobs_enabled(&app)` — i.e. both a
-//! Trakt client and `config.trakt` are present; otherwise the service runs exactly as before.
+//! Trakt client and `config.trakt` are present; otherwise those two tasks are not spawned, while the
+//! scan task and (unless `UPGRADE_INTERVAL_SECS=0`) the upgrade task still run.
 
 use crate::app_state::AppState;
 use crate::tasks::{monitor_episodes, reconcile_wanted, run_scan_loop, sync_trakt, ScanConfig};
@@ -310,12 +311,7 @@ fn make_test_app(with_trakt: bool) -> crate::app_state::AppState {
     use tokio::sync::RwLock;
 
     let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
-    let db = Arc::new(
-        redb::Database::builder()
-            .create_with_backend(redb::backends::InMemoryBackend::new())
-            .unwrap(),
-    );
-    let store = Store::from_database(db).unwrap();
+    let store = Store::in_memory();
     let mut config = Config::from_parts(
         None,
         Some("tb".to_string()),
@@ -384,7 +380,8 @@ mod trakt_gate_tests {
     use super::*;
 
     /// Without a Trakt client (no Trakt config), `trakt_jobs_enabled` returns false — the
-    /// scheduler runs ONLY the scan task, exactly as before Trakt was introduced.
+    /// scheduler spawns neither the Trakt cycle nor the episode monitor. The scan loop and the
+    /// upgrade job (gated on `UPGRADE_INTERVAL_SECS` alone) are unaffected.
     #[test]
     fn disabled_when_no_trakt_client() {
         let app = make_test_app(false);

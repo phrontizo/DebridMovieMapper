@@ -362,12 +362,20 @@ impl RealDebridClient {
             if !spans_pages || !self.deletes.changed_since(since) {
                 return Ok(torrents);
             }
-            warn!(
-                "RD torrent listing overlapped a delete (attempt {}/{}); listing again in case the \
-                 pages shifted",
-                attempt,
-                crate::provider::MAX_LISTING_ATTEMPTS
-            );
+            if attempt < crate::provider::MAX_LISTING_ATTEMPTS {
+                warn!(
+                    "RD torrent listing overlapped a delete (attempt {}/{}); listing again in case \
+                     the pages shifted",
+                    attempt,
+                    crate::provider::MAX_LISTING_ATTEMPTS
+                );
+            } else {
+                warn!(
+                    "RD torrent listing overlapped a delete on all {} attempts; giving up (callers \
+                     skip this tick)",
+                    crate::provider::MAX_LISTING_ATTEMPTS
+                );
+            }
         }
         Err(synthetic_bad_gateway(
             b"get_torrents: concurrent deletes kept shifting the pages",

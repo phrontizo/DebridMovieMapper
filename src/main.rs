@@ -73,17 +73,40 @@ fn log_directive(rust_log: Option<String>) -> String {
 /// `header_read_timeout` closing an idle keep-alive connection (`HeaderTimeout`, or the textual
 /// "error reading header: operation timed out"). hyper 1.x doesn't expose typed accessors for these,
 /// so we match its Debug output. `real_header_read_timeout_is_classified_ignorable` drives a LIVE
-/// timeout through `serve_connection` and asserts production's classification still treats it as
-/// benign, so a hyper upgrade that changes the timeout error's shape fails CI rather than silently
-/// demoting the wrong errors; `ignorable_disconnect_matches_expected_hyper_debug_strings` separately
-/// pins this function's accepted/rejected substrings. (io-level kinds are handled separately, by
-/// downcast.) The timeout match is scoped to the "reading header" phrase rather than a bare
-/// "timed out" so a genuine upstream/CDN body timeout (whose Debug also contains "timed out") is NOT
-/// misclassified as an ignorable disconnect.
+/// timeout through `serve_connection` and asserts production's classification
+/// (`is_benign_connection_error`) still treats it as benign, so a hyper upgrade that changes the
+/// timeout error's shape fails CI rather than silently demoting the wrong errors;
+/// `ignorable_disconnect_matches_expected_hyper_debug_strings` separately pins this function's
+/// accepted/rejected substrings. (io-level kinds are handled separately, by downcast, in
+/// `is_benign_connection_error`.) The timeout match is scoped to the "reading header" phrase rather
+/// than a bare "timed out" so a genuine upstream/CDN body timeout (whose Debug also contains "timed
+/// out") is NOT misclassified as an ignorable disconnect.
 fn dbg_is_ignorable_disconnect(dbg: &str) -> bool {
     dbg.contains("IncompleteMessage")
         || dbg.contains("HeaderTimeout")
         || dbg.contains("reading header")
+}
+
+/// Whether a `serve_connection` error is a benign client-side disconnect or our own idle keep-alive
+/// `header_read_timeout`, so the accept loop drops it silently instead of logging it. Typed io-kind
+/// inspection of the error's source first (reset / broken pipe / timed out / unexpected EOF), then
+/// the Debug-string fallback (`dbg_is_ignorable_disconnect`) for hyper variants without typed
+/// accessors. The accept loop and `real_header_read_timeout_is_classified_ignorable` both call it.
+fn is_benign_connection_error(err: &hyper::Error) -> bool {
+    use std::error::Error;
+    let io_benign = err
+        .source()
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .is_some_and(|io_err| {
+            matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        });
+    io_benign || dbg_is_ignorable_disconnect(&format!("{err:?}"))
 }
 
 /// Whether a request path is routed to the Trakt enrolment service rather than WebDAV. Matches the
@@ -107,15 +130,18 @@ fn http1_builder() -> http1::Builder {
     b
 }
 
-/// Docker liveness probe. Sends a real `OPTIONS /` request and requires an HTTP status line back
-/// within 5s, rather than a bare `connect()`: the kernel completes the TCP handshake on its own, so a
-/// connect succeeds even when the accept loop or the handler path is dead or hung. Any status line
-/// counts as healthy, including the 503 the accept loop sends when the connection pool is full: a
-/// saturated pool is busy, not wedged, and a Docker restart would kill every stream. Only when the
-/// 503-rejecter pool is exhausted too (the connection is dropped) does a full pool read unhealthy.
-/// So a permit pool that leaks for good is NOT healed by a restart; `HEADER_READ_TIMEOUT` and TCP
-/// keepalive (`set_tcp_keepalive`) are what bound permit leaks. HTTP/1.0 so the server closes the
-/// connection after responding (no keep-alive idle to wait on).
+/// Docker `HEALTHCHECK` probe (`--healthcheck`). Sends a real `OPTIONS /` request and requires an
+/// HTTP status line back within 5s, rather than a bare `connect()`: the kernel completes the TCP
+/// handshake on its own, so a connect succeeds even when the accept loop or the handler path is dead
+/// or hung. Any status line counts as healthy, including the 503 the accept loop sends when the
+/// connection pool is full: a saturated pool is busy, not wedged, and anything that acts on health
+/// (Swarm, Kubernetes, an autoheal sidecar) would otherwise restart it and kill every stream. Only
+/// when the 503-rejecter pool is exhausted too (the connection is dropped) does a full pool read
+/// unhealthy. Plain Docker / Compose never restart an unhealthy container (`restart:` policies act
+/// only on exit); with the shipped compose.yml the status only gates `depends_on: service_healthy`
+/// at start-up, so a wedged server stays wedged until someone intervenes. `HEADER_READ_TIMEOUT` and
+/// TCP keepalive (`set_tcp_keepalive`) are what bound permit leaks. HTTP/1.0 so the server closes
+/// the connection after responding (no keep-alive idle to wait on).
 fn healthcheck(port: u16) -> bool {
     use std::io::{Read, Write};
     let Ok(addr) = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>() else {
@@ -137,8 +163,8 @@ fn healthcheck(port: u16) -> bool {
     }
     // Read until we have at least the 5-byte "HTTP/" status-line prefix. A single read() can
     // deliver fewer bytes than were sent, so requiring the prefix in the FIRST chunk could mark a
-    // healthy server unhealthy on a short read (→ a spurious container restart). The read timeout
-    // set above bounds the loop; an error/timeout or EOF-before-5-bytes reports unhealthy.
+    // healthy server unhealthy on a short read. The read timeout set above bounds the loop; an
+    // error/timeout or EOF-before-5-bytes reports unhealthy.
     let mut buf = [0u8; 64];
     let mut filled = 0;
     while filled < 5 {
@@ -345,7 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // connection is simply dropped (closed) without a 503. The bound is set to MAX_CONNECTIONS so the
     // 503-rejecter pool is at least as large as the connection pool: that preserves the
     // healthcheck-503 guarantee (a transiently-saturated server still answers the `--healthcheck`
-    // probe with 503 rather than a bare drop → Docker keeps it alive) for any realistic load, while
+    // probe with 503 rather than a bare drop → it reads HEALTHY) for any realistic load, while
     // still capping the absolute worst case — each rejecter is a tiny ≤1s task, so this ceiling is
     // cheap and is only approached under a pathological multi-hundred-connection burst.
     const MAX_REJECTERS: usize = MAX_CONNECTIONS;
@@ -386,7 +412,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A minimal 503 sent to a connection rejected for pool saturation. Sending a real HTTP response
     // (rather than a bare TCP drop) means a transiently-saturated-but-alive server still answers the
     // `--healthcheck` probe's `OPTIONS /` with an `HTTP/` status line — so it reports HEALTHY (busy,
-    // not wedged) instead of being restarted by Docker, which would kill every in-flight stream.
+    // not wedged) rather than UNHEALTHY, which an orchestrator acting on health would answer with a
+    // restart that kills every in-flight stream. (Plain Docker / Compose don't restart an unhealthy
+    // container; see `healthcheck`.)
     const REJECT_503: &[u8] =
         b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
     // Throttle the saturation WARN so a reconnect storm can't spam the log (the accept()-error path
@@ -493,26 +521,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await
                     {
-                        use std::error::Error;
-                        // Benign client-side disconnects + our own idle keep-alive header timeout:
-                        // typed io-kind inspection first, then a documented Debug-string fallback for
-                        // hyper variants without typed accessors.
-                        let io_benign = err
-                            .source()
-                            .and_then(|s| s.downcast_ref::<std::io::Error>())
-                            .is_some_and(|io_err| {
-                                matches!(
-                                    io_err.kind(),
-                                    std::io::ErrorKind::ConnectionReset
-                                        | std::io::ErrorKind::BrokenPipe
-                                        | std::io::ErrorKind::TimedOut
-                                        | std::io::ErrorKind::UnexpectedEof
-                                )
-                            });
-                        let dbg = format!("{:?}", err);
-                        if io_benign || dbg_is_ignorable_disconnect(&dbg) {
+                        // Benign client-side disconnects + our own idle keep-alive header timeout.
+                        if is_benign_connection_error(&err) {
                             return;
                         }
+                        let dbg = format!("{:?}", err);
                         // A `User(Body)` error is our response-body stream failing (e.g. a CDN fetch
                         // returning `GeneralFailure`). The body-producing layer (`dav_fs`) already
                         // logs the concrete cause at WARN, so logging it again here at ERROR is just
@@ -564,8 +577,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dbg_is_ignorable_disconnect, healthcheck, http1_builder, is_trakt_path, log_directive,
-        set_tcp_keepalive,
+        dbg_is_ignorable_disconnect, healthcheck, http1_builder, is_benign_connection_error,
+        is_trakt_path, log_directive, set_tcp_keepalive,
     };
     use tokio::net::{TcpListener, TcpStream};
 
@@ -723,7 +736,6 @@ mod tests {
         use hyper::service::service_fn;
         use hyper::{Request, Response};
         use hyper_util::rt::{TokioIo, TokioTimer};
-        use std::error::Error;
         use tokio::net::{TcpListener, TcpStream};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -751,24 +763,11 @@ mod tests {
             .await
             .unwrap()
             .expect_err("a client that never sends headers must trigger the header-read timeout");
-        // Mirror production's exact classification (main.rs serve_connection error arm): an io-kind
-        // TimedOut/reset/EOF source OR the Debug-string classifier.
-        let dbg = format!("{err:?}");
-        let io_benign = err
-            .source()
-            .and_then(|s| s.downcast_ref::<std::io::Error>())
-            .is_some_and(|io_err| {
-                matches!(
-                    io_err.kind(),
-                    std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::UnexpectedEof
-                )
-            });
+        // The classifier the serve_connection error arm calls, so an edit to production's
+        // classification is tested too.
         assert!(
-            io_benign || dbg_is_ignorable_disconnect(&dbg),
-            "a real hyper header-read timeout must classify as a benign disconnect, got: {dbg:?}"
+            is_benign_connection_error(&err),
+            "a real hyper header-read timeout must classify as a benign disconnect, got: {err:?}"
         );
     }
 

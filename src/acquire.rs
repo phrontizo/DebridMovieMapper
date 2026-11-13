@@ -14,16 +14,20 @@ use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcquireOutcome {
-    /// A candidate is already owned for this title and present on the provider, so nothing was
-    /// added. It may itself still be `Pending` (`observe` settles it).
+    /// A candidate is already owned for this title, supplies the request (for a show, the requested
+    /// episode, or coverage not yet known) and is present on the provider, so nothing was added. It
+    /// may itself still be `Pending` (`observe` settles it).
     Acquired(String),
     /// This candidate was added and recorded `Pending`; `observe` resolves it (title check, probe)
     /// once its files appear.
     Pending(String),
-    /// No non-blacklisted candidate within the ceiling and filters could be added (none scraped,
-    /// every add failed, or the request names no episode for a show).
+    /// No non-blacklisted candidate within the ceiling and filters could be added: none scraped or
+    /// all filtered/blacklisted, every remaining candidate already in the account (untracked, owned
+    /// under another title, or a present copy of the show that doesn't provide the episode), the
+    /// `max_attempts` add attempts all failed, or the request names no episode for a show.
     NoAcceptableRelease,
-    /// The scraper or the provider listing was unreachable; retry later.
+    /// The scraper or the provider listing was unreachable, or an added candidate couldn't be
+    /// recorded (the add was deleted again); retry later.
     TemporarilyUnavailable,
 }
 
@@ -122,87 +126,13 @@ fn title_check(
     let episode_ok = kind != MediaKind::Series
         || matches!(
             (season, episode),
-            (Some(s), Some(e)) if parse_se_all(file_name).contains(&(s, e))
+            (Some(s), Some(e)) if crate::vfs::parse_se_all(file_name).contains(&(s, e))
         );
     if episode_ok {
         TitleCheck::Match
     } else {
         TitleCheck::Mismatch
     }
-}
-
-/// Parse ALL `(season, episode)` pairs a filename declares. Handles a single `SxxEyy`, a contiguous
-/// MULTI-episode file (`S01E01E02`, `S01E01-E02`, `S01E01.E02`), and the dash-concatenated absolute
-/// code (`Show - 409 - Title` → `[(4, 9)]`). Returns an empty `Vec` when no episode code is found.
-///
-/// Multi-episode handling matters for `provides`: a double-episode file reporting only its FIRST
-/// episode leaves the second looking un-owned, so `monitor_episodes` re-acquires it as a duplicate
-/// singleton — the same failure the dash-code fallback prevents for packs, in a different form.
-///
-/// KNOWN LIMITATION — a RANGE form spanning >2 episodes (`S01E01-E03`) records only the explicit
-/// endpoints `[(1,1),(1,3)]`, dropping the middle `(1,2)` (so it may re-acquire the middle as a
-/// duplicate). The common 2-episode forms (`S01E01E02`, `S01E01-E02`) and explicit lists
-/// (`S01E01E02E03`) parse fully; range-named SINGLE files spanning 3+ episodes are uncommon (such
-/// content is usually a season pack of separate per-episode files), so this is an accepted edge.
-fn parse_se_all(name: &str) -> Vec<(u32, u32)> {
-    use regex::Regex;
-    use std::sync::LazyLock;
-    // Primary: SxxEyy, plus any contiguous `Eyy` continuations in the SAME season. The continuation
-    // REQUIRES an explicit `e` before each number so a resolution/codec token can't be mis-parsed as
-    // an episode (`S01E01.1080p` → the `.1080` has no `e`, so it is NOT a continuation).
-    static SE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})e(\d{1,3})((?:[-_. ]?e\d{1,3})*)").unwrap());
-    if let Some(c) = SE.captures(name) {
-        if let (Some(s), Some(e1)) = (
-            c.get(1).and_then(|m| m.as_str().parse::<u32>().ok()),
-            c.get(2).and_then(|m| m.as_str().parse::<u32>().ok()),
-        ) {
-            let mut eps = vec![(s, e1)];
-            if let Some(rest) = c.get(3).map(|m| m.as_str()) {
-                static EP: LazyLock<Regex> =
-                    LazyLock::new(|| Regex::new(r"(?i)e(\d{1,3})").unwrap());
-                for cap in EP.captures_iter(rest) {
-                    if let Some(e) = cap.get(1).and_then(|m| m.as_str().parse::<u32>().ok()) {
-                        let pair = (s, e);
-                        if !eps.contains(&pair) {
-                            eps.push(pair);
-                        }
-                    }
-                }
-            }
-            return eps;
-        }
-        // The `\d{1,2}`/`\d{1,3}` captures always parse to `u32`, so the `if let` above always
-        // returns when `SE` matches; reaching here would require that to change, in which case
-        // falling through to the dash-code fallback (which won't match an SxxExx name) is correct.
-    }
-    // Fallback: the dash-delimited CONCATENATED SxxEyy code some packs use instead of "S04E09",
-    // e.g. "Rick and Morty - 409 - Childrick of Mort.mkv" → S04E09 (last two digits = episode,
-    // leading digit = season). Without this, such packs derive an empty `provides`, so the
-    // reconciler thinks no episodes are owned and re-acquires the whole show as per-episode torrents
-    // (permanent duplicates). EXACTLY 3 digits (season 1–9): this deliberately excludes 4-digit
-    // tokens, which collide with years ("Show - 2024 - Title", date-named daily episodes
-    // "... - 2021 - 03 - 14") and would mis-decode to a phantom (20, NN) episode. A show with ≥10
-    // seasons using concatenated coding is rare and ambiguous with years anyway — rely on `SxxExx`
-    // for those. The " - NNN - " (space-dash-space) anchor avoids resolution false positives.
-    //
-    // KNOWN LIMITATION — absolute (anime) numbering: a 3-digit token here is decoded as concatenated
-    // SxxEyy, but absolute episode numbers are indistinguishable from it ("One Piece - 409 - …" is
-    // absolute ep 409, not S4E9). For such releases this records a phantom (4,9) as `provides`,
-    // which can suppress re-acquisition of the real S4E9 and write a wrong VFS selection slot. This
-    // is an accepted trade-off: the common concatenated-pack case (Western shows) is far more
-    // prevalent, and the prior behaviour (empty `provides` → whole-show re-acquire churn) was worse.
-    static DASH_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s-\s(\d{3})\s-\s").unwrap());
-    if let Some(c) = DASH_CODE.captures(name) {
-        if let Some(code) = c.get(1).and_then(|m| m.as_str().parse::<u32>().ok()) {
-            let (season, episode) = (code / 100, code % 100);
-            // Reject an implausible decode (episode 00) so a stray number can't masquerade.
-            if season >= 1 && episode >= 1 {
-                return vec![(season, episode)];
-            }
-        }
-    }
-    Vec::new()
 }
 
 use crate::now_unix_secs as now_secs;
@@ -258,6 +188,23 @@ pub struct AcquisitionEngine {
     info_fail_since: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
+/// Whether `rec`, an owned record of the requested title, already supplies `req`. A movie copy
+/// always does. A show copy does when it lists the requested episode in `provides`, when it is still
+/// `Pending` (its `provides` is settled only once `observe` verifies it, so an in-flight pack lists
+/// just the episode it was added for), or when its `provides` is empty (file names `parse_se_all`
+/// can't decode, e.g. `1x06`: the VFS still emits those files, so the coverage is unknown and
+/// assumed — adding a singleton for every episode would duplicate them all).
+fn supplies_request(rec: &OwnedRecord, req: &AcquireRequest) -> bool {
+    match (req.kind, req.season, req.episode) {
+        (MediaKind::Series, Some(s), Some(e)) => {
+            rec.status == OwnedStatus::Pending
+                || rec.provides.is_empty()
+                || rec.provides.contains(&(s, e))
+        }
+        _ => true,
+    }
+}
+
 /// A show request that names no single episode (an account-mirror season pack's record). Shows are
 /// acquired per episode, so such a request can't be scraped.
 fn requests_no_episode(req: &AcquireRequest) -> bool {
@@ -307,7 +254,7 @@ pub(crate) fn episode_files(info: &TorrentInfo) -> Vec<(u32, u32, String)> {
             let name = f.path.rsplit('/').next().unwrap_or(&f.path);
             // A multi-episode file contributes ALL its episodes (so `provides` is complete and the
             // reconciler doesn't re-acquire a contained episode as a duplicate singleton).
-            parse_se_all(name)
+            crate::vfs::parse_se_all(name)
                 .into_iter()
                 .map(move |(s, e)| (s, e, f.path.clone()))
         })
@@ -375,23 +322,28 @@ const VERIFY_BACKOFF: Duration = Duration::from_secs(3600);
 /// torrent may stay Pending before `observe` treats it as effectively broken and replaces it
 /// (blacklist + re-acquire). Long enough to ride out an extended provider/CDN outage without
 /// churning good releases, short enough that a genuinely-dead release is eventually swapped out.
+/// It is only ever applied to a probe that has just deferred again, so a release is never replaced
+/// on the strength of an old probe.
 const VERIFY_DEADLINE_SECS: u64 = 24 * 3600;
 
 /// How long a release must itself have been deferring before the verify deadline may replace it.
 /// `added_at` is when the torrent was ADDED, so an uncached release that took more than
 /// `VERIFY_DEADLINE_SECS` to download would otherwise be replaced after its first
-/// `MAX_VERIFY_ATTEMPTS` re-probes (a few minutes of CDN trouble) — a day's download thrown away
-/// without the hourly re-probes the back-off is there to give it.
+/// `MAX_VERIFY_ATTEMPTS` re-probes (a few minutes of CDN trouble) — a day's download thrown away.
+/// With the hourly back-off, the floor buys it at least one back-off re-probe after the fast burst;
+/// it is replaced by the first re-probe that still defers once the floor has passed (about two
+/// hours after its first deferral). In-memory like the rest of `DeferState`, so a restart starts
+/// the floor (and the burst) over.
 const VERIFY_DEADLINE_MIN_DEFER: Duration = Duration::from_secs(2 * 3600);
 
 /// Per-hash deferred-probe state for transient (CDN-unavailable) probes: how many times we've
 /// probed-and-deferred (to bound the fast burst), when we last probed (to back off afterwards) and
-/// when it first deferred (epoch seconds, for `VERIFY_DEADLINE_MIN_DEFER`). In-memory only — reset
-/// on restart; the hard deadline is anchored on the persisted `added_at`.
+/// when it first deferred (for `VERIFY_DEADLINE_MIN_DEFER`), both in epoch seconds. In-memory only —
+/// reset on restart; the hard deadline is anchored on the persisted `added_at`.
 #[derive(Clone, Copy)]
 struct DeferState {
     attempts: u32,
-    last_probe: Instant,
+    last_probe_at: u64,
     first_defer_at: u64,
 }
 
@@ -502,12 +454,17 @@ impl AcquisitionEngine {
         let mut present: Option<Option<std::collections::HashSet<String>>> = None;
 
         // Order-independent idempotency pre-scan over EVERY ranked candidate (owned lookups only;
-        // adds stay limited to the top `max_attempts` below): if ANY is already owned for THIS title
-        // and confirmed present on the provider, this title is already acquired — short-circuit
-        // regardless of rank order. Without this, a higher-ranked NON-owned candidate would be
-        // `add_magnet`'d (a DUPLICATE torrent) even though a lower-ranked owned+present candidate
-        // exists. A transient listing failure (inner `None`) preserves the old idempotent behaviour
-        // (treat an owned record as present) rather than re-adding on a listing blip.
+        // adds stay limited to `max_attempts` add attempts below, and candidates skipped there as
+        // already in the account don't count): if ANY is already owned for THIS title, supplies the
+        // request (`supplies_request`: for a show, the requested episode, or unknown/unsettled
+        // coverage) and is confirmed present on the provider, the request is already acquired —
+        // short-circuit regardless of rank order. Without this, a higher-ranked NON-owned candidate
+        // would be `add_magnet`'d (a DUPLICATE torrent) even though a lower-ranked owned+present
+        // candidate exists. A present owned copy of the show that does NOT provide the episode (a
+        // pack with only some files selected) is no short-circuit — the episode would never be
+        // added — and the add loop never re-adds it either. A transient listing failure (inner
+        // `None`) preserves the old idempotent behaviour (treat an owned record as present) rather
+        // than re-adding on a listing blip.
         //
         // Cache each candidate's owner (`(kind, tmdb_id)` of its owned record, `None` = not owned)
         // as we read it so the add loop below need not re-issue the same `get_owned` (a
@@ -517,13 +474,10 @@ impl AcquisitionEngine {
         let mut owner: std::collections::HashMap<String, Option<(MediaKind, u64)>> =
             std::collections::HashMap::new();
         for cand in &ranked {
-            let rec_owner = self
-                .store
-                .get_owned(cand.info_hash.clone())
-                .await
-                .map(|r| (r.request.kind, r.request.tmdb_id));
+            let rec = self.store.get_owned(cand.info_hash.clone()).await;
+            let rec_owner = rec.as_ref().map(|r| (r.request.kind, r.request.tmdb_id));
             owner.insert(cand.info_hash.clone(), rec_owner);
-            if rec_owner != Some(this_title) {
+            if rec_owner != Some(this_title) || !rec.is_some_and(|r| supplies_request(&r, &req)) {
                 continue;
             }
             if present.is_none() {
@@ -573,8 +527,23 @@ impl AcquisitionEngine {
         for cand in ranked {
             let hash_lc = cand.info_hash.to_ascii_lowercase();
             match owner.get(&cand.info_hash).copied().flatten() {
-                // Owned for this title but not present (the pre-scan returned on a present one): the
-                // title lapsed (cache lost / externally deleted), the documented re-acquire case.
+                // Owned for this title and present, yet not a short-circuit in the pre-scan: a copy
+                // of the show that doesn't provide the requested episode. Re-adding it would add
+                // nothing (on TorBox it would adopt the torrent over its record, and `observe` would
+                // then delete it as EpisodeMissing), so try the next candidate.
+                Some(o) if o == this_title && present_set.contains(&hash_lc) => {
+                    debug!(
+                        "acquire: tmdb {} — owned {} is present but doesn't provide S{:02}E{:02}; not re-adding it",
+                        req.tmdb_id,
+                        cand.info_hash,
+                        req.season.unwrap_or_default(),
+                        req.episode.unwrap_or_default()
+                    );
+                    continue;
+                }
+                // Owned for this title but not present (the pre-scan returned on a present one that
+                // supplies the request): the title lapsed (cache lost / externally deleted), the
+                // documented re-acquire case.
                 Some(o) if o == this_title => {
                     debug!(
                         "acquire: tmdb {} — owned {} is absent (lapsed) — re-adding",
@@ -624,7 +593,12 @@ impl AcquisitionEngine {
                 (MediaKind::Series, Some(s), Some(e)) => vec![(s, e)],
                 _ => vec![],
             };
-            let _ = self
+            // If either write fails, roll the add back (as the upgrade engine's `record_staged`
+            // does): an untracked torrent would be skipped by every later acquire as already in the
+            // account, and the account mirror would adopt it with no provenance (never removed by
+            // the lifecycle, never title-checked or probed). The hash was absent from the listing
+            // before the add, so `added.id` is ours to delete, on TorBox too.
+            let recorded = match self
                 .store
                 .put_owned(
                     cand.info_hash.clone(),
@@ -637,11 +611,29 @@ impl AcquisitionEngine {
                         quality: Some(release::QualitySummary::of(&cand, &self.prefs)),
                     },
                 )
-                .await;
-            let _ = self
-                .store
-                .put_authoritative(cand.info_hash.clone(), req.metadata.clone())
-                .await;
+                .await
+            {
+                Err(e) => Err(("owned-record", e)),
+                Ok(()) => match self
+                    .store
+                    .put_authoritative(cand.info_hash.clone(), req.metadata.clone())
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        let _ = self.store.remove_owned(cand.info_hash.clone()).await;
+                        Err(("authoritative", e))
+                    }
+                },
+            };
+            if let Err((what, e)) = recorded {
+                warn!(
+                    "acquire: tmdb {} — added {} but its {} write failed ({}); deleted the add, retrying later",
+                    req.tmdb_id, cand.info_hash, what, e
+                );
+                let _ = self.provider.delete_torrent(&added.id).await;
+                return AcquireOutcome::TemporarilyUnavailable;
+            }
             // Best-effort: if the file list is already present (cached), select now so it is
             // immediately resolvable; otherwise observe selects once metadata resolves.
             //
@@ -1121,29 +1113,15 @@ impl AcquisitionEngine {
                 }
                 continue;
             }
-            // Deferred-probe back-off + hard deadline. A downloaded torrent whose probe keeps
-            // coming back Transient (CDN momentarily unavailable) is re-probed every tick for the
-            // first MAX_VERIFY_ATTEMPTS (to catch a quick blip), then only on a back-off (so we
-            // don't re-fetch 4 MB every tick). It is NEVER accepted unverified; if it stays
-            // unfetchable past the deadline it is treated as effectively broken and replaced
-            // (blacklist + re-acquire), bounded by the blacklist so it can't churn.
+            // Deferred-probe back-off. A downloaded torrent whose probe keeps coming back Transient
+            // (CDN momentarily unavailable) is re-probed every tick for the first
+            // MAX_VERIFY_ATTEMPTS (to catch a quick blip), then only on a back-off (so we don't
+            // re-fetch 4 MB every tick). It is NEVER accepted unverified; the hard deadline that
+            // replaces it is applied in the `VerifyResult::Defer` arm below, on a re-probe that has
+            // just deferred again, so a CDN that recovered since the last probe is given its chance.
             let defer_state = self.verify_attempts.lock().await.get(hash).copied();
             if let Some(st) = defer_state.filter(|st| st.attempts >= MAX_VERIFY_ATTEMPTS) {
-                let now = now_secs();
-                if now.saturating_sub(rec.added_at) > VERIFY_DEADLINE_SECS
-                    && now.saturating_sub(st.first_defer_at) >= VERIFY_DEADLINE_MIN_DEFER.as_secs()
-                {
-                    self.fail_and_reacquire(
-                        hash,
-                        &t.id,
-                        &rec.request,
-                        "ProbeUnfetchable",
-                        &rec.provenance,
-                    )
-                    .await;
-                    continue;
-                }
-                if st.last_probe.elapsed() < VERIFY_BACKOFF {
+                if now_secs().saturating_sub(st.last_probe_at) < VERIFY_BACKOFF.as_secs() {
                     debug!(
                         "observe: tmdb {} hash {} probe still deferring (attempts={}) — backing off",
                         rec.request.tmdb_id, hash, st.attempts
@@ -1240,25 +1218,45 @@ impl AcquisitionEngine {
                     self.progress.lock().await.remove(&t.id);
                 }
                 VerifyResult::Defer => {
-                    // Record the deferred attempt + when we probed (drives the back-off/deadline
-                    // gate above). Crucially we do NOT accept-unverified: the record stays Pending
-                    // (so the upgrade engine's Verified gate skips it and the VFS keeps the prior
-                    // selection), is re-probed on the back-off, and is replaced only past the
-                    // deadline. This prevents freezing a wrong-language release into the library.
+                    // Record the deferred attempt + when we probed (drives the back-off gate above).
+                    // Crucially we do NOT accept-unverified: the record stays Pending (so the upgrade
+                    // engine's Verified gate skips it and the VFS keeps the prior selection), is
+                    // re-probed on the back-off, and is replaced only by a re-probe that still defers
+                    // past the deadline. This prevents freezing a wrong-language release into the
+                    // library.
+                    let now = now_secs();
                     let mut m = self.verify_attempts.lock().await;
                     let st = m.entry(hash.to_string()).or_insert(DeferState {
                         attempts: 0,
-                        last_probe: Instant::now(),
-                        first_defer_at: now_secs(),
+                        last_probe_at: now,
+                        first_defer_at: now,
                     });
                     st.attempts += 1;
-                    st.last_probe = Instant::now();
-                    let attempts = st.attempts;
+                    st.last_probe_at = now;
+                    let (attempts, first_defer_at) = (st.attempts, st.first_defer_at);
                     drop(m);
-                    debug!(
-                        "observe: tmdb {} hash {} probe deferred (attempt {}) — CDN transient, will re-probe",
-                        rec.request.tmdb_id, hash, attempts
-                    );
+                    // Hard deadline: still unfetchable past `VERIFY_DEADLINE_SECS` since it was added,
+                    // and deferring for at least `VERIFY_DEADLINE_MIN_DEFER` itself → effectively
+                    // broken; replace it (blacklist + re-acquire), bounded by the blacklist so it
+                    // can't churn.
+                    if attempts >= MAX_VERIFY_ATTEMPTS
+                        && now.saturating_sub(rec.added_at) > VERIFY_DEADLINE_SECS
+                        && now.saturating_sub(first_defer_at) >= VERIFY_DEADLINE_MIN_DEFER.as_secs()
+                    {
+                        self.fail_and_reacquire(
+                            hash,
+                            &t.id,
+                            &rec.request,
+                            "ProbeUnfetchable",
+                            &rec.provenance,
+                        )
+                        .await;
+                    } else {
+                        debug!(
+                            "observe: tmdb {} hash {} probe deferred (attempt {}) — CDN transient, will re-probe",
+                            rec.request.tmdb_id, hash, attempts
+                        );
+                    }
                 }
                 VerifyResult::Reject(reason) => {
                     self.fail_and_reacquire(hash, &t.id, &rec.request, reason, &rec.provenance)
@@ -1439,76 +1437,6 @@ mod tests {
     use crate::store::Provenance;
     use crate::vfs::{MediaMetadata, MediaType};
     use redb::backends::InMemoryBackend;
-
-    #[test]
-    fn parse_se_handles_sxxexx_and_dash_concatenated_codes() {
-        // Standard SxxExx → a single-element vec.
-        assert_eq!(parse_se_all("Show.S04E09.1080p.mkv"), vec![(4, 9)]);
-        assert_eq!(parse_se_all("Show S1E5.mkv"), vec![(1, 5)]);
-        // Dash-concatenated 3-digit form ("409" = S04E09).
-        assert_eq!(
-            parse_se_all("Rick and Morty - 409 - Childrick of Mort.mkv"),
-            vec![(4, 9)]
-        );
-        // Must NOT misread a resolution or year as an episode code.
-        assert!(parse_se_all("Movie.2009.1080p.BluRay.mkv").is_empty());
-        assert!(parse_se_all("Movie (1999).mkv").is_empty());
-        // A 4-digit dash-delimited YEAR must NOT decode (would have been a phantom S20E24).
-        assert!(parse_se_all("Show - 2024 - Title.mkv").is_empty());
-        // A date-named daily-show file must NOT decode (no 3-digit dash token).
-        assert!(parse_se_all("The Daily Show - 2021 - 03 - 14.mkv").is_empty());
-        // Implausible decode rejected (episode 00).
-        assert!(parse_se_all("Show - 400 - Title.mkv").is_empty());
-        // No episode marker at all.
-        assert!(parse_se_all("Just A Movie.mkv").is_empty());
-    }
-
-    #[test]
-    fn parse_se_all_documented_limitations_are_stable() {
-        // Pin the CURRENT (documented) behaviour so a silent regression is caught.
-
-        // Contiguous multi-episode forms parse FULLY.
-        assert_eq!(parse_se_all("Show.S01E01E02.mkv"), vec![(1, 1), (1, 2)]);
-        assert_eq!(parse_se_all("Show.S01E01-E02.mkv"), vec![(1, 1), (1, 2)]);
-        assert_eq!(
-            parse_se_all("Show.S01E01E02E03.mkv"),
-            vec![(1, 1), (1, 2), (1, 3)]
-        );
-
-        // KNOWN LIMITATION: a >2-episode RANGE records only the explicit endpoints, dropping the
-        // middle — "S01E01-E03" → [(1,1),(1,3)], NOT (1,2).
-        assert_eq!(
-            parse_se_all("Show.S01E01-E03.1080p.mkv"),
-            vec![(1, 1), (1, 3)]
-        );
-
-        // KNOWN LIMITATION: the dash-concatenated code fallback requires SPACE-dash-SPACE, so a
-        // DOT-separated Torrentio name is not matched and yields empty `provides`.
-        assert!(parse_se_all("Rick.and.Morty.-.409.-.Childrick.of.Mort.mkv").is_empty());
-
-        // KNOWN LIMITATION: anime ABSOLUTE numbering is indistinguishable from a concatenated
-        // SxxEyy code, so absolute "409" decodes to a phantom (4, 9) rather than the real ep 409.
-        assert_eq!(parse_se_all("One Piece - 409 - Return.mkv"), vec![(4, 9)]);
-    }
-
-    #[test]
-    fn parse_se_all_handles_multi_episode_files() {
-        // Contiguous multi-episode files contribute ALL their episodes (so `provides` is complete and
-        // the reconciler doesn't re-acquire a contained episode as a duplicate singleton).
-        assert_eq!(
-            parse_se_all("Show.S01E01E02.1080p.mkv"),
-            vec![(1, 1), (1, 2)]
-        );
-        assert_eq!(parse_se_all("Show.S01E01-E02.mkv"), vec![(1, 1), (1, 2)]);
-        assert_eq!(
-            parse_se_all("Show S02E03E04E05.mkv"),
-            vec![(2, 3), (2, 4), (2, 5)]
-        );
-        // A resolution/codec token after the episode must NOT be parsed as a further episode (the
-        // continuation requires an explicit `e` before each number).
-        assert_eq!(parse_se_all("Show.S01E01.1080p.x265.mkv"), vec![(1, 1)]);
-        assert_eq!(parse_se_all("Show.S01E07.720p.WEB.mkv"), vec![(1, 7)]);
-    }
 
     #[test]
     fn select_target_picks_largest_so_acquire_and_observe_agree() {
@@ -2192,6 +2120,85 @@ mod tests {
         assert!(added.lock().unwrap().is_empty(), "no duplicate is added");
     }
 
+    /// A redb backend whose writes fail once `fail` is set (a full disk, an I/O error), so a test can
+    /// make a `Store` write fail after the store was created.
+    #[derive(Debug)]
+    struct FailingWrites {
+        inner: InMemoryBackend,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl FailingWrites {
+        fn check(&self) -> Result<(), std::io::Error> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(std::io::Error::other("injected write failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl redb::StorageBackend for FailingWrites {
+        fn len(&self) -> Result<u64, std::io::Error> {
+            self.inner.len()
+        }
+        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+            self.inner.read(offset, out)
+        }
+        fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+            self.check()?;
+            self.inner.set_len(len)
+        }
+        fn sync_data(&self) -> Result<(), std::io::Error> {
+            self.check()?;
+            self.inner.sync_data()
+        }
+        fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+            self.check()?;
+            self.inner.write(offset, data)
+        }
+    }
+
+    #[tokio::test]
+    async fn acquire_rolls_back_an_add_whose_owned_record_cannot_be_written() {
+        // The add succeeded but the Pending record couldn't be written: the torrent would sit in the
+        // account untracked — skipped by every later acquire as "already in the account", then
+        // adopted by the account mirror with no provenance (never removed, never title-checked or
+        // probed). Delete it (it was absent before the add, so the id is ours) and retry later.
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let db = redb::Database::builder()
+            .create_with_backend(FailingWrites {
+                inner: InMemoryBackend::new(),
+                fail: fail.clone(),
+            })
+            .unwrap();
+        let st = Store::from_database(Arc::new(db)).unwrap();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_h1".into(),
+                uri: String::new(),
+            }),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper {
+                candidates: vec![cand("h1", true)],
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st,
+        );
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let out = eng.acquire(req(), Provenance::watchlist("alice")).await;
+        assert_eq!(out, AcquireOutcome::TemporarilyUnavailable);
+        assert_eq!(
+            *deleted.lock().unwrap(),
+            vec!["tid_h1".to_string()],
+            "the untracked add is deleted"
+        );
+    }
+
     #[tokio::test]
     async fn acquire_tries_next_candidate_when_add_magnet_fails() {
         // The top-ranked candidate's add_magnet fails (a provider hiccup / "already queued"); acquire
@@ -2608,6 +2615,126 @@ mod tests {
         );
     }
 
+    /// A show request for S01E`episode` of tmdb 27205.
+    fn series_req_for(episode: u32) -> AcquireRequest {
+        AcquireRequest {
+            imdb_id: "tt1".into(),
+            tmdb_id: 27205,
+            kind: MediaKind::Series,
+            season: Some(1),
+            episode: Some(episode),
+            original_language: Some("eng".into()),
+            spoken_languages: Some(vec![]),
+            metadata: MediaMetadata {
+                title: "Show".into(),
+                year: Some("2023".into()),
+                media_type: MediaType::Show,
+                external_id: Some("tmdb:27205".into()),
+            },
+        }
+    }
+
+    /// Acquire S01E06 when the show's owned season pack `hpack` (with the given status and
+    /// `provides`) is present and ranked first (1080p), with a 720p singleton `hs` ranked second.
+    /// Returns the outcome, the hashes added, and the store.
+    async fn acquire_e06_with_owned_pack(
+        status: OwnedStatus,
+        provides: Vec<(u32, u32)>,
+    ) -> (AcquireOutcome, Vec<String>, Store) {
+        let st = store();
+        st.put_owned(
+            "hpack".into(),
+            OwnedRecord {
+                request: series_req_for(1),
+                provenance: Provenance {
+                    entries: Vec::new(),
+                },
+                added_at: 1,
+                status,
+                provides,
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![torrent("tid_hpack", "hpack", "downloaded", 100.0)],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid_hs".into(),
+                uri: String::new(),
+            }),
+            added: added.clone(),
+            ..Default::default()
+        });
+        let pack = RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "Show.S01.1080p.BluRay.x265\nRD+".into(),
+            info_hash: "hpack".into(),
+            file_idx: Some(5),
+            file_name: Some("Show.S01E06.1080p.BluRay.x265.mkv".into()),
+        };
+        let single = RawCandidate {
+            name: "Torrentio\n720p".into(),
+            description: "Show.S01E06.720p.WEB.x265\nRD+".into(),
+            info_hash: "hs".into(),
+            file_idx: Some(0),
+            file_name: Some("Show.S01E06.720p.WEB.x265.mkv".into()),
+        };
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper {
+                candidates: vec![pack, single],
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        let out = eng
+            .acquire(series_req_for(6), Provenance::watchlist("alice"))
+            .await;
+        let added = added.lock().unwrap().clone();
+        (out, added, st)
+    }
+
+    #[tokio::test]
+    async fn acquire_adds_an_episode_an_owned_present_pack_does_not_provide() {
+        // A present, settled pack of the show that doesn't provide S01E06 (a Real-Debrid pack with
+        // only some files selected) is not this episode being acquired. It must not short-circuit
+        // as Acquired — the episode would never be added — nor be re-added (on TorBox that adopts
+        // the pack over its record); the next candidate is added instead.
+        let (out, added, st) = acquire_e06_with_owned_pack(
+            OwnedStatus::Verified,
+            vec![(1, 1), (1, 2), (1, 3), (1, 4), (1, 5)],
+        )
+        .await;
+        assert_eq!(out, AcquireOutcome::Pending("hs".into()));
+        assert_eq!(added, vec!["hs".to_string()], "the pack is never re-added");
+        let pack = st.get_owned("hpack".into()).await.expect("pack kept");
+        assert_eq!(pack.status, OwnedStatus::Verified);
+        assert_eq!(pack.added_at, 1, "the pack's record is untouched");
+        assert_eq!(pack.provides.len(), 5);
+        assert_eq!(pack.request.episode, Some(1));
+    }
+
+    #[tokio::test]
+    async fn acquire_is_idempotent_on_a_present_pending_pack_of_the_show() {
+        // A Pending pack's `provides` isn't settled yet (it lists only the episode it was added
+        // for), so it still counts as acquiring the requested episode: nothing is added.
+        let (out, added, _) = acquire_e06_with_owned_pack(OwnedStatus::Pending, vec![(1, 1)]).await;
+        assert_eq!(out, AcquireOutcome::Acquired("hpack".into()));
+        assert!(added.is_empty());
+    }
+
+    #[tokio::test]
+    async fn acquire_is_idempotent_on_a_present_pack_with_unknown_coverage() {
+        // A settled pack whose file names decode no episode (`provides` empty) may well hold the
+        // episode — the VFS still emits its files — so it stays conservative: nothing is added.
+        let (out, added, _) = acquire_e06_with_owned_pack(OwnedStatus::Verified, vec![]).await;
+        assert_eq!(out, AcquireOutcome::Acquired("hpack".into()));
+        assert!(added.is_empty());
+    }
+
     #[tokio::test]
     async fn acquire_returns_temporarily_unavailable_on_scrape_error() {
         // A scraper error (a retryable addon outage) must surface as TemporarilyUnavailable so the
@@ -2786,13 +2913,9 @@ mod tests {
             "a release that has only just started deferring keeps its re-probe window"
         );
         assert!(st.get_owned("h1".into()).await.is_some());
-        // Once it has been deferring for longer than the floor, the deadline fires.
-        eng.verify_attempts
-            .lock()
-            .await
-            .get_mut("h1")
-            .expect("deferring")
-            .first_defer_at -= VERIFY_DEADLINE_MIN_DEFER.as_secs() + 1;
+        // Once it has been deferring for longer than the floor, the next back-off re-probe that
+        // still defers replaces it.
+        age_defer_state(&eng, "h1").await;
         eng.observe(&torrents).await;
         assert!(
             st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
@@ -2802,6 +2925,68 @@ mod tests {
         assert!(
             st.get_owned("h1".into()).await.is_none(),
             "and its owned record replaced (removed pending re-acquire)"
+        );
+    }
+
+    /// Move `hash`'s deferred-probe state back so it has been deferring for longer than
+    /// `VERIFY_DEADLINE_MIN_DEFER` and its last probe is past `VERIFY_BACKOFF`.
+    async fn age_defer_state(eng: &AcquisitionEngine, hash: &str) {
+        let mut m = eng.verify_attempts.lock().await;
+        let st = m.get_mut(hash).expect("deferring");
+        st.first_defer_at -= VERIFY_DEADLINE_MIN_DEFER.as_secs() + 1;
+        st.last_probe_at -= VERIFY_BACKOFF.as_secs() + 1;
+    }
+
+    #[tokio::test]
+    async fn observe_past_the_verify_deadline_reprobes_before_replacing() {
+        // Past both deadlines the release is still probed once more before it is replaced: a CDN
+        // that recovered since the last (hourly) probe gets the release verified, not blacklisted.
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::manual(),
+                added_at: 1, // epoch ⇒ far past the verify deadline
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let eng = engine(
+            provider_returning("downloaded", "h1"),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![Track {
+                kind: crate::probe::TrackKind::Audio,
+                language: Some("eng".into()),
+            }]))),
+            st.clone(),
+        );
+        // The fast burst is spent, it has deferred for longer than the floor, and the back-off since
+        // its last probe has passed.
+        let now = now_secs();
+        eng.verify_attempts.lock().await.insert(
+            "h1".into(),
+            DeferState {
+                attempts: MAX_VERIFY_ATTEMPTS,
+                last_probe_at: now,
+                first_defer_at: now,
+            },
+        );
+        age_defer_state(&eng, "h1").await;
+        eng.observe(&[torrent("tid_h1", "h1", "downloaded", 100.0)])
+            .await;
+        assert!(
+            !st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
+                .await,
+            "a release whose re-probe now passes is not blacklisted"
+        );
+        assert_eq!(
+            st.get_owned("h1".into()).await.expect("kept").status,
+            OwnedStatus::Verified
         );
     }
 

@@ -75,6 +75,18 @@ pub struct TraktUser {
     pub username: String,
 }
 
+/// Whether a `refresh` failure is transient (the cycle is skipped, the account is not flagged
+/// `needs_reenrolment`): a persistent 429 (`RateLimited`), an incoherent answer (`Upstream`), a
+/// transport failure (no HTTP status) or a 5xx. A 4xx such as `invalid_grant` is a genuine auth
+/// failure, and so is anything else.
+pub(crate) fn refresh_error_is_transient(e: &AppError) -> bool {
+    match e {
+        AppError::RateLimited | AppError::Upstream(_) => true,
+        AppError::Http(e) => e.status().is_none_or(|s| s.is_server_error()),
+        _ => false,
+    }
+}
+
 /// Single-poll outcome of `POST /oauth/device/token`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DeviceTokenPoll {
@@ -83,6 +95,9 @@ pub enum DeviceTokenPoll {
     Authorized(TraktTokenResponse),
     Denied,
     Expired,
+    /// Any other terminal status, carried so the enrolment log names it: a 401/403 is usually a
+    /// wrong `TRAKT_CLIENT_ID` / `TRAKT_CLIENT_SECRET` (the secret is first sent on this poll).
+    Rejected(u16),
 }
 
 /// Per-show watched-episode set, for the removal finish-test.
@@ -273,9 +288,11 @@ impl TraktClientImpl {
     /// As `send_with_retry`, but `retry_server_errors == false` retries ONLY 429 (a rate-limit is
     /// definitely-not-processed → safe to resend), NOT a 5xx/transport error. Used by the OAuth
     /// refresh grant: its refresh token is SINGLE-USE, so if Trakt processed the grant (rotating the
-    /// token) and THEN the response 5xx'd or the socket dropped, a resend of the now-consumed token
-    /// would return `invalid_grant` (4xx) and wrongly flag the account `needs_reenrolment`. Failing
-    /// fast on the first 5xx/transport error avoids converting that transient blip into re-enrolment.
+    /// token) and THEN the response 5xx'd or the socket dropped, a resend would double-spend the
+    /// now-consumed token. Failing fast on the first 5xx/transport error avoids that resend; the
+    /// callers then treat the failure as a skipped cycle, not a re-enrolment
+    /// ([`refresh_error_is_transient`]). If Trakt did rotate the token, the next cycle's refresh
+    /// gets a 4xx `invalid_grant` and flags the account then.
     async fn send_with_retry_opts(
         &self,
         make_request: impl Fn() -> reqwest::RequestBuilder,
@@ -722,7 +739,9 @@ pub(crate) fn parse_user(v: &serde_json::Value) -> TraktUser {
 ///   418 I'm a teapot  -> the user explicitly denied the request.
 ///   429 Too Many Req  -> polling too fast; normally absorbed by the retry helper, mapped to
 ///                        Pending defensively so a stray 429 doesn't abort enrolment.
-/// Any other status is treated as terminal (Expired) so the caller's poll loop can't spin forever.
+/// Any other status (401/403 — typically a wrong client id/secret, since the secret is first sent
+/// on this poll — or anything unlisted) is terminal `Rejected(status)`, so the caller's poll loop
+/// can't spin forever and its error names the status instead of claiming the code expired.
 /// A 5xx never reaches this from `TraktClientImpl::poll_token`, which returns it as a retryable
 /// `Err` instead.
 pub fn interpret_device_token(
@@ -734,7 +753,7 @@ pub fn interpret_device_token(
         400 | 429 => DeviceTokenPoll::Pending,
         418 => DeviceTokenPoll::Denied,
         410 | 404 | 409 => DeviceTokenPoll::Expired,
-        _ => DeviceTokenPoll::Expired,
+        other => DeviceTokenPoll::Rejected(other),
     }
 }
 
@@ -923,12 +942,27 @@ pub struct MockTrakt {
     pub progress: std::collections::HashMap<u64, ShowProgress>,
     /// When true, `watchlist`/`in_progress`/`watched` return `Err`.
     pub fail_reads: bool,
-    /// When true, `refresh` returns `Err`.
+    /// When true, `refresh` returns `Err` (a non-transient one: an auth failure).
     pub fail_refresh: bool,
+    /// When true, `refresh` returns a transient `Err` (an HTTP 503).
+    pub transient_refresh: bool,
     /// Number of transient `poll_token` errors to inject before returning the canned `poll`
     /// (decrements on each call). Default 0 = never errors. Lets tests exercise the transient-retry
     /// path in `enrolment::poll_to_completion`.
     pub poll_errors_before_ok: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+/// A `reqwest::Error` carrying `status`, built without any I/O.
+#[cfg(test)]
+pub(crate) fn http_status_error(status: u16) -> reqwest::Error {
+    reqwest::Response::from(
+        hyper::Response::builder()
+            .status(status)
+            .body(hyper::body::Bytes::new())
+            .unwrap(),
+    )
+    .error_for_status()
+    .unwrap_err()
 }
 
 #[cfg(test)]
@@ -955,6 +989,9 @@ impl TraktClient for MockTrakt {
     async fn refresh(&self, _refresh_token: &str) -> Result<TraktTokenResponse, AppError> {
         if self.fail_refresh {
             return Err(AppError::Config("mock trakt refresh failure".to_string()));
+        }
+        if self.transient_refresh {
+            return Err(AppError::Http(http_status_error(503)));
         }
         Ok(self.token.clone())
     }
@@ -1239,12 +1276,21 @@ mod tests {
             interpret_device_token(StatusCode::TOO_MANY_REQUESTS, &empty),
             DeviceTokenPoll::Pending
         );
-        // 500 → Expired: any unlisted status is terminal here. In practice `poll_token` returns a
-        // 5xx as a retryable Err before calling this (see
+        // 401 → Rejected(401): a wrong client secret, reported as such rather than as an expiry.
+        assert_eq!(
+            interpret_device_token(StatusCode::UNAUTHORIZED, &empty),
+            DeviceTokenPoll::Rejected(401)
+        );
+        assert_eq!(
+            interpret_device_token(StatusCode::FORBIDDEN, &empty),
+            DeviceTokenPoll::Rejected(403)
+        );
+        // 500 → Rejected(500): any unlisted status is terminal here. In practice `poll_token`
+        // returns a 5xx as a retryable Err before calling this (see
         // poll_token_surfaces_a_persistent_5xx_as_an_error_not_expired).
         assert_eq!(
             interpret_device_token(StatusCode::INTERNAL_SERVER_ERROR, &empty),
-            DeviceTokenPoll::Expired
+            DeviceTokenPoll::Rejected(500)
         );
     }
 
@@ -1446,6 +1492,7 @@ mod tests {
             progress: std::collections::HashMap::new(),
             fail_reads: false,
             fail_refresh: false,
+            transient_refresh: false,
             poll_errors_before_ok: Default::default(),
         };
         let client: Arc<dyn TraktClient> = Arc::new(mock);
@@ -1653,12 +1700,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn refresh_errors_are_transient_only_for_throttling_5xx_and_transport() {
+        assert!(refresh_error_is_transient(&AppError::RateLimited));
+        assert!(refresh_error_is_transient(&AppError::Upstream("x".into())));
+        assert!(refresh_error_is_transient(&AppError::Http(
+            http_status_error(503)
+        )));
+        assert!(refresh_error_is_transient(&AppError::Http(
+            http_status_error(500)
+        )));
+        // No HTTP status: a transport failure.
+        let transport = reqwest::Client::new()
+            .get("")
+            .build()
+            .map(|_| ())
+            .unwrap_err();
+        assert!(transport.status().is_none());
+        assert!(refresh_error_is_transient(&AppError::Http(transport)));
+        // invalid_grant (4xx) and anything else are genuine failures.
+        assert!(!refresh_error_is_transient(&AppError::Http(
+            http_status_error(400)
+        )));
+        assert!(!refresh_error_is_transient(&AppError::Http(
+            http_status_error(401)
+        )));
+        assert!(!refresh_error_is_transient(&AppError::Config("x".into())));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn refresh_does_not_retry_a_5xx_single_use_token() {
         // The refresh grant is single-use: a 5xx may mean Trakt already processed it and rotated the
-        // token, so resending would double-spend and could turn a transient blip into a false
-        // needs_reenrolment. refresh() must NOT retry a 5xx (only a read like me() does) — exactly
-        // ONE request, then surface the error. Guards the retry_server_errors == false path.
+        // token, so resending would double-spend it. refresh() must NOT retry a 5xx (only a read
+        // like me() does) — exactly ONE request, then surface the error, which the callers treat as
+        // a skipped cycle (`refresh_error_is_transient`), not a re-enrolment. Guards the
+        // retry_server_errors == false path.
         let (url, counter) = spawn_status_repeating(503).await;
         let client = TraktClientImpl::new("cid".into(), "secret".into(), reqwest::Client::new())
             .with_base_url(url);
@@ -1676,7 +1752,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn refresh_does_not_retry_a_transport_error_single_use_token() {
         // Same single-use guarantee for a transport error (dropped connection): refresh must not
-        // resend — exactly one attempt — unlike me(), which retries a transient transport error.
+        // resend (and so double-spend the token) — exactly one attempt — unlike me(), which retries
+        // a transient transport error. The callers skip the cycle rather than flag the account.
         let (url, counter) = spawn_drop_then_json(1, r#"{"access_token":"a"}"#).await;
         let client = TraktClientImpl::new("cid".into(), "secret".into(), reqwest::Client::new())
             .with_base_url(url);

@@ -30,6 +30,8 @@ pub struct AppState {
     /// (this client AND `config.trakt`); the wanted/token store handles are reachable
     /// via `store`.
     pub trakt_client: Option<Arc<dyn crate::trakt_client::TraktClient>>,
-    /// Proxy read-activity tracker (SP3) — stamped by `dav_fs` reads, read by the upgrade engine.
+    /// Proxy read-activity tracker (SP3) — stamped by `dav_fs` reads; read by every idle-gated
+    /// destructive pass (the upgrade engine's `torrents_idle`, and `all_idle` for dedup removals,
+    /// `execute_remove`, the scan loop's same-hash duplicate deletion and selection repoints).
     pub read_activity: Arc<crate::read_activity::ReadActivity>,
 }

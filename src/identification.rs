@@ -9,21 +9,28 @@ use tracing::{debug, info, warn};
 static CAMEL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([a-z])([A-Z])").unwrap());
 
 // Leading release-group / site garbage to strip: a bracket tag `[...]`, a parenthesised tag, a
-// parenthesised release-year (so a leading "(2020) Title" strips), or a `site.tld - ` prefix.
-// The site must start `www.` or end in a TLD from a short list of torrent-site TLDs that are not
-// English words: a dot-separated show name in front of a ` - ` separator ("Some.Show - S01E01 -
-// Pilot") would otherwise count as a site and be stripped whole, leaving the episode title as the
-// TMDB query. A missed site prefix costs little (the strip-leading-words fallback recovers it); a
-// stripped title identifies the torrent as something else.
+// parenthesised release-year (so a leading "(2020) Title" strips), or a `site.tld - ` prefix
+// (the `site` group). A dot-separated show name in front of a ` - ` separator looks just like a
+// site ("Some.Show - S01E01 - Pilot", "The.Office.UK - S01E01 - …"), and stripping it would leave
+// the episode title as the TMDB query, so `clean_name` keeps a `site` match that is followed
+// straight by an episode code (`SITE_FOLLOWED_BY_EPISODE_RE`): a site prefix is followed by a
+// release name, never by an episode code.
 // A parenthesised TAG must look like a site/URL tag — its content carries a letter AND a `.`/space
 // (e.g. `(www.site.com)`) — so a single parenthesised title WORD like `(Untitled)` (the 2009 film)
 // is kept as title content, and a NON-year numeric title-paren like `(500)` — "(500) Days of
 // Summer" — is likewise kept (no letter at all).
 static PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)^(\[.*?\]|\((?:[^)]*[a-z][^)]*[.\s][^)]*|[^)]*[.\s][^)]*[a-z][^)]*|(?:19|20)\d{2})\)|(?:www\.[\w-]+(?:\.[\w-]+)*\.[a-z]{2,6}|[\w-]+(?:\.[\w-]+)*\.(?:com|org|net|xyz|ws|cc|mx|ru|io|nz|pw|ag|biz|eu|uk|pl|fr|ch|cd))\s+-\s+)\s*",
+        r"(?i)^(\[.*?\]|\((?:[^)]*[a-z][^)]*[.\s][^)]*|[^)]*[.\s][^)]*[a-z][^)]*|(?:19|20)\d{2})\)|(?P<site>[\w-]+(?:\.[\w-]+)*\.[a-z]{2,6}\s+-\s+))\s*",
     )
     .unwrap()
+});
+
+/// What follows a `site.tld - ` that is really a show name: an episode code (`S01E01`, `S01`,
+/// `E05`, `1x01`, a bare ` - NNN - ` number, `Season 2`, `Episode 5`). Matched against the text
+/// after the [`PREFIX_RE`] `site` match (the `regex` crate has no lookahead).
+static SITE_FOLLOWED_BY_EPISODE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:s\d{1,3}\.?e\d{1,4}|s\d{1,3}\b|e\d{1,4}\b|\d{1,2}x\d{2,3}\b|\d{1,3}\s+-\s|seasons?\s*\d+|episodes?\s*\d+)").unwrap()
 });
 
 /// A leading `[Title] (YYYY)` — bracket(s) that are PART of the title (e.g. `[REC] (2007)`),
@@ -127,47 +134,34 @@ pub enum Identification {
     Identified(MediaMetadata),
     /// Every TMDB search answered and nothing matched (or the name has nothing to search for).
     NoMatch,
-    /// Nothing matched, but a TMDB search failed: an outage that outlasted the client's retry
-    /// budget, or a 4xx such as a rejected API key. A full search might still have matched, so this
-    /// is no verdict on the name: a caller must neither cache the fallback for good nor reject the
-    /// release on it.
+    /// A TMDB search failed (an outage that outlasted the client's retry budget, or a 4xx such as
+    /// a rejected API key), whether or not something matched. The searches that failed, or the
+    /// fallback stages the failure cut short, might have held the real match, so a pick from the
+    /// rest is no verdict on the name: a caller must neither cache the fallback for good nor reject
+    /// the release on it.
     Unavailable,
 }
 
 /// The [`Identification`] for a search that selected `selected` (if anything), given whether any of
-/// its TMDB requests failed. A match is a match even when another search failed.
+/// its TMDB requests failed. A failed search makes it [`Identification::Unavailable`] even when
+/// something was selected: with one half of a joined search missing, the other half's best result
+/// can be an unrelated title (a show file picked up as a movie).
 fn conclude(selected: Option<MediaMetadata>, tmdb_unavailable: bool) -> Identification {
-    match selected {
-        Some(m) => Identification::Identified(m),
-        None if tmdb_unavailable => Identification::Unavailable,
-        None => Identification::NoMatch,
+    if tmdb_unavailable {
+        Identification::Unavailable
+    } else if let Some(m) = selected {
+        Identification::Identified(m)
+    } else {
+        Identification::NoMatch
     }
 }
 
-/// [`identify_torrent_checked`]'s result.
-#[derive(Debug, Clone)]
-pub struct TorrentIdentification {
-    pub metadata: MediaMetadata,
-    /// `true` when nothing matched AND a TMDB search failed ([`Identification::Unavailable`]), so
-    /// `metadata` is the name-derived fallback (`external_id: None`) for want of an answer, not
-    /// because the torrent is unidentifiable: identify it again later rather than persisting it.
-    pub provisional: bool,
-}
-
 /// Identify a torrent: its largest video file's name first, then the torrent name. Falls back to a
-/// title cleaned from the names (`external_id: None`) when neither matches; see
-/// [`identify_torrent_checked`] to tell a TMDB outage from a genuine no-match.
+/// title cleaned from the names (`external_id: None`) when neither matches. Once a search comes
+/// back [`Identification::Unavailable`] the torrent-name retry is skipped: it would spend another
+/// full retry cycle (~2.5 min) on the same outage. A caller that must tell such an outage fallback
+/// from a genuine no-match wraps this in [`crate::tmdb_client::track_search_failures`].
 pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) -> MediaMetadata {
-    identify_torrent_checked(info, tmdb).await.metadata
-}
-
-/// [`identify_torrent`], also reporting whether the fallback was used only because TMDB was
-/// unreachable. Once a search comes back [`Identification::Unavailable`] the torrent-name retry is
-/// skipped: it would spend another full retry cycle (~2.5 min) on the same outage.
-pub async fn identify_torrent_checked(
-    info: &rd_client::TorrentInfo,
-    tmdb: &TmdbClient,
-) -> TorrentIdentification {
     let representative_name = info
         .files
         .iter()
@@ -176,14 +170,11 @@ pub async fn identify_torrent_checked(
         .map(|f| f.path.split('/').next_back().unwrap_or(&f.path))
         .unwrap_or(&info.filename);
 
+    // Set once a search comes back `Unavailable`: the fallback below is then provisional (for want
+    // of an answer, not because the torrent is unidentifiable).
     let mut provisional = false;
     match identify_name(representative_name, &info.files, tmdb).await {
-        Identification::Identified(metadata) => {
-            return TorrentIdentification {
-                metadata,
-                provisional: false,
-            }
-        }
+        Identification::Identified(metadata) => return metadata,
         Identification::Unavailable => provisional = true,
         Identification::NoMatch => {}
     }
@@ -194,12 +185,7 @@ pub async fn identify_torrent_checked(
             representative_name, info.filename
         );
         match identify_name(&info.filename, &info.files, tmdb).await {
-            Identification::Identified(metadata) => {
-                return TorrentIdentification {
-                    metadata,
-                    provisional: false,
-                }
-            }
+            Identification::Identified(metadata) => return metadata,
             Identification::Unavailable => provisional = true,
             Identification::NoMatch => {}
         }
@@ -222,18 +208,15 @@ pub async fn identify_torrent_checked(
         representative_name,
     );
 
-    TorrentIdentification {
-        metadata: MediaMetadata {
-            title,
-            year,
-            media_type: if is_show_guess(&info.files) {
-                MediaType::Show
-            } else {
-                MediaType::Movie
-            },
-            external_id: None,
+    MediaMetadata {
+        title,
+        year,
+        media_type: if is_show_guess(&info.files) {
+            MediaType::Show
+        } else {
+            MediaType::Movie
         },
-        provisional,
+        external_id: None,
     }
 }
 
@@ -483,8 +466,8 @@ fn score_result(
 
 /// Identify one name (a file or torrent name) via TMDB, running the fallback ladder (CamelCase
 /// split, leading-word strip, after-dash, no-year) while searches come back empty. Returns
-/// [`Identification::Unavailable`] rather than [`Identification::NoMatch`] when nothing matched and
-/// a search failed, and stops issuing further searches once one has failed.
+/// [`Identification::Unavailable`] whenever a search failed (matched or not), and stops issuing
+/// further searches once one has failed.
 pub async fn identify_name(
     name: &str,
     files: &[rd_client::TorrentFile],
@@ -614,6 +597,15 @@ pub async fn identify_name(
         movie_results.extend(movie_no_year.into_results(&mut tmdb_unavailable));
     }
 
+    // A pick from what a failed search left over is no verdict (see `conclude`), so don't make one.
+    if tmdb_unavailable {
+        debug!(
+            "A TMDB search failed while identifying '{}'; no verdict",
+            cleaned_name
+        );
+        return conclude(None, tmdb_unavailable);
+    }
+
     // Score all results and pick the best TV and movie matches.
     // For short titles (≤3 chars), require an exact title match — plus a year match only when the
     // filename actually carries a year (a short title with no year still matches on exact title).
@@ -701,8 +693,8 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     }
 
     // 1. Remove common site prefixes and garbage at the start
-    // Patterns like "[ site ] ", "( site )", "www.site.org - ", "d3us-", "m-", "Bond.50" (see
-    // PREFIX_RE for which `site.tld - ` forms count as a site).
+    // Patterns like "[ site ] ", "( site )", "www.site.org - ", "d3us-", "m-", "Bond.50" (a
+    // `site.tld - ` followed straight by an episode code is kept: it is a show's name, see PREFIX_RE).
     // EXCEPT a leading "[Title] (YYYY)" whose brackets are part of the title (e.g. "[REC] (2007)").
     // Loop so a RUN of consecutive leading tags ("[Group][BD] Title") is fully stripped — a single
     // pass removes only the first group and would leave the next tag's label glued on
@@ -710,10 +702,15 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     // iteration keeps the next tag's opening bracket intact so it is recognised again.
     let mut stripped_any_prefix = false;
     while !TITLE_BRACKET_YEAR_RE.is_match(&title) {
-        let Some(m) = PREFIX_RE.find(&title) else {
+        let Some(caps) = PREFIX_RE.captures(&title) else {
             break;
         };
-        title = title[m.end()..].to_string();
+        let end = caps.get(0).map_or(0, |m| m.end());
+        // A "site" followed straight by an episode code is the show's name (see PREFIX_RE).
+        if caps.name("site").is_some() && SITE_FOLLOWED_BY_EPISODE_RE.is_match(&title[end..]) {
+            break;
+        }
+        title = title[end..].to_string();
         stripped_any_prefix = true;
     }
     // Remove any leftover leading non-alphanumeric run, but only if we stripped a prefix AND we did
@@ -849,11 +846,12 @@ pub fn is_show_guess(files: &[rd_client::TorrentFile]) -> bool {
 }
 
 pub fn normalize_title(s: &str) -> String {
-    let lowered = s.to_lowercase().replace(" and ", " & "); // Standardize 'and' to '&' for comparison
-                                                            // Fold accents/ligatures to their ASCII base, then keep only alphanumerics (spaces/punctuation/
-                                                            // the '&' connector are dropped). A manual push loop (rather than `.map().filter()`) so a single
-                                                            // source char can expand to MULTIPLE ASCII chars — `æ`→`ae`, `œ`→`oe`, `ß`→`ss`, `þ`→`th` — which
-                                                            // a 1:1 `char` map cannot express (e.g. `Æon Flux` → `aeonflux` now matches a filename's `aeonflux`).
+    // Standardize 'and' to '&' for comparison.
+    let lowered = s.to_lowercase().replace(" and ", " & ");
+    // Fold accents/ligatures to their ASCII base, then keep only alphanumerics (spaces/punctuation/
+    // the '&' connector are dropped). A manual push loop (rather than `.map().filter()`) so a single
+    // source char can expand to MULTIPLE ASCII chars — `æ`→`ae`, `œ`→`oe`, `ß`→`ss`, `þ`→`th` — which
+    // a 1:1 `char` map cannot express (e.g. `Æon Flux` → `aeonflux` now matches a filename's `aeonflux`).
     let mut out = String::with_capacity(lowered.len());
     for c in lowered.chars() {
         match c {
@@ -980,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_tmdb_search_with_no_match_is_unavailable_not_no_match() {
+    fn a_failed_tmdb_search_is_unavailable_matched_or_not() {
         let meta = || MediaMetadata {
             title: "Some Movie".into(),
             year: Some("2020".into()),
@@ -992,14 +990,108 @@ mod tests {
         // Nothing matched but a search failed (outage, rejected key): no verdict, so the caller can
         // retry later instead of caching the fallback or blacklisting the release.
         assert!(matches!(conclude(None, true), Identification::Unavailable));
-        // A match found while another search failed is still a match.
+        // Nor is a pick made while another search failed: the failed half could have held the
+        // real match.
         assert!(matches!(
             conclude(Some(meta()), true),
-            Identification::Identified(m) if m.external_id.as_deref() == Some("tmdb:1")
+            Identification::Unavailable
         ));
         assert!(matches!(
             conclude(Some(meta()), false),
             Identification::Identified(_)
+        ));
+    }
+
+    /// A torrent whose only file is `name`, for the loopback identification tests.
+    fn single_file_torrent(name: &str) -> TorrentInfo {
+        TorrentInfo {
+            id: "t1".to_string(),
+            filename: name.to_string(),
+            original_filename: name.to_string(),
+            hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            bytes: 2_000_000_000,
+            original_bytes: 2_000_000_000,
+            host: "host".to_string(),
+            split: 1,
+            progress: 100.0,
+            status: "downloaded".to_string(),
+            added: "2020-01-01".to_string(),
+            files: vec![TorrentFile {
+                id: 1,
+                path: name.to_string(),
+                bytes: 2_000_000_000,
+                selected: 1,
+            }],
+            links: vec![],
+            ended: None,
+        }
+    }
+
+    /// When one of the two joined searches fails, the other half's results are no verdict: the
+    /// missing half (or a stage the failure cut short) could have held the real match. Picking from
+    /// what is left identified a show as an unrelated movie, the scan loop cached it for good, and
+    /// `title_check` read it as a mismatch and got the right release blacklisted.
+    #[tokio::test]
+    async fn a_match_picked_after_a_failed_search_is_no_verdict() {
+        use crate::acquire::{TitleCheck, TitleValidator, TmdbTitleValidator};
+        use crate::scraper::MediaKind;
+        use crate::trakt_client::test_http::{spawn, Reply};
+        const UNRELATED: &str = r#"{"results":[{"id":99,"title":"Unrelated Film",
+            "release_date":"2001-05-01","popularity":20.0,"vote_count":500,"vote_average":7.5}]}"#;
+        // `/search/tv` is not routed, so it answers 404: a failed search.
+        let server = spawn(vec![(
+            "/search/movie?api_key=k&query=Zzqx",
+            Reply::json(UNRELATED),
+        )])
+        .await;
+        let tmdb = TmdbClient::with_base_url("k".into(), server.base_url.clone()).unwrap();
+
+        assert!(
+            matches!(
+                identify_name("Zzqx.mkv", &[], &tmdb).await,
+                Identification::Unavailable
+            ),
+            "a pick from half the results must not be a match"
+        );
+        assert_eq!(server.hits("/search/tv"), 1);
+
+        // The scan loop sees a failed search and a fallback it must not cache.
+        let (metadata, failed) = crate::tmdb_client::track_search_failures(identify_torrent(
+            &single_file_torrent("Zzqx.mkv"),
+            &tmdb,
+        ))
+        .await;
+        assert!(failed);
+        assert_eq!(metadata.external_id, None);
+        assert_eq!(metadata.title, "Zzqx");
+
+        // The acquisition title check defers instead of rejecting the release.
+        let validator = TmdbTitleValidator {
+            tmdb: std::sync::Arc::new(tmdb),
+        };
+        assert_eq!(
+            validator
+                .validate("Zzqx.mkv", 1, MediaKind::Movie, None, None)
+                .await,
+            TitleCheck::Unavailable
+        );
+
+        // Control: with both searches answering, the same movie route identifies an exact title.
+        let ok = spawn(vec![
+            (
+                "/search/movie?api_key=k&query=Zzqx",
+                Reply::json(r#"{"results":[{"id":7,"title":"Zzqx","release_date":"2001-05-01"}]}"#),
+            ),
+            (
+                "/search/tv?api_key=k&query=Zzqx",
+                Reply::json(r#"{"results":[]}"#),
+            ),
+        ])
+        .await;
+        let tmdb = TmdbClient::with_base_url("k".into(), ok.base_url.clone()).unwrap();
+        assert!(matches!(
+            identify_name("Zzqx.mkv", &[], &tmdb).await,
+            Identification::Identified(m) if m.external_id.as_deref() == Some("tmdb:7")
         ));
     }
 
@@ -1275,6 +1367,39 @@ mod tests {
         assert_eq!(
             clean_name("The.Office.Space - S01E01.mkv").0,
             "The Office Space"
+        );
+        // A show name ending in a country code or a TLD-like word is not a site either: a site
+        // prefix is followed by a release name, never straight by an episode code.
+        assert_eq!(
+            clean_name("The.Office.UK - S01E01 - Downsized.mkv").0,
+            "The Office UK"
+        );
+        assert_eq!(
+            clean_name("Shameless.UK - S01E01 - Pilot.mkv").0,
+            "Shameless UK"
+        );
+        assert!(
+            clean_name("The.Net - 1x01 - Pilot.mkv")
+                .0
+                .starts_with("The Net"),
+            "an NxM episode code after the separator keeps the show name"
+        );
+        assert_eq!(
+            clean_name("Some.Show.NZ - 101 - Pilot.mkv").0,
+            "Some Show NZ"
+        );
+        assert_eq!(
+            clean_name("Some.Show.Net - Season 2 - 1080p.mkv").0,
+            "Some Show Net"
+        );
+        // A site whose TLD is on no list is still a site when a release name follows it.
+        assert_eq!(
+            clean_name("Torrent9.to - Some Movie 2020.mkv").0,
+            "Some Movie"
+        );
+        assert_eq!(
+            clean_name("Some-Site.lat - Other Movie 2019 1080p.mkv").0,
+            "Other Movie"
         );
     }
 
@@ -1787,46 +1912,46 @@ mod tests {
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
-        // A real season pack whose files use "Rick and Morty - 4NN - Title" (absolute
+        // A season pack whose files use "Rick and Morty - 4NN - Title" (absolute
         // episode codes, no "S04E09"). The largest file (409) becomes the representative
         // name; before the fix the episode title leaked into the query and it matched the
         // wrong show (tmdb:99966 "All of Us Are Dead").
         let files: Vec<TorrentFile> = [
             (
-                3_280_780_352u64,
+                3_300_000_000u64,
                 "Rick and Morty - 409 - Childrick of Mort.mkv",
             ),
-            (3_080_453_464, "Rick and Morty - 407 - Promortyus.mkv"),
+            (3_100_000_000, "Rick and Morty - 407 - Promortyus.mkv"),
             (
-                2_925_419_418,
+                2_900_000_000,
                 "Rick and Morty - 401 - Edge of Tomorty. Rick Die Rickpeat.mkv",
             ),
             (
-                2_843_834_861,
+                2_800_000_000,
                 "Rick and Morty - 404 - Claw and Hoarder. Special Ricktim's Morty.mkv",
             ),
             (
-                2_806_190_621,
+                2_700_000_000,
                 "Rick and Morty - 406 - Never Ricking Morty.mkv",
             ),
             (
-                2_720_331_553,
+                2_600_000_000,
                 "Rick and Morty - 405 - Rattlestar Ricklactica.mkv",
             ),
             (
-                2_685_110_119,
+                2_500_000_000,
                 "Rick and Morty - 408 - The Vat of Acid Episode.mkv",
             ),
             (
-                2_677_574_737,
+                2_400_000_000,
                 "Rick and Morty - 410 - Star Mort. Rickturn of the Jerri.mkv",
             ),
             (
-                2_573_808_900,
+                2_300_000_000,
                 "Rick and Morty - 403 - One Crew Over the Crewcoo's Morty.mkv",
             ),
             (
-                2_548_892_920,
+                2_200_000_000,
                 "Rick and Morty - 402 - The Old Man and the Seat.mkv",
             ),
         ]
@@ -1844,7 +1969,7 @@ mod tests {
             id: "rm4".to_string(),
             filename: "Rick and Morty (4 season) [Blu-ray Remux 1080p]".to_string(),
             original_filename: "Rick and Morty (4 season) [Blu-ray Remux 1080p]".to_string(),
-            hash: "f06b32c97ea553f5166e0b126be44574f9dfdebf".to_string(),
+            hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
             bytes: 27_000_000_000,
             original_bytes: 27_000_000_000,
             host: "host".to_string(),
