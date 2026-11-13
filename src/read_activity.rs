@@ -72,8 +72,10 @@ impl Default for ReadActivity {
 impl ReadActivity {
     /// A tracker for a freshly started process: for the first idle window after creation
     /// (`UPGRADE_IDLE_SECS`, the window callers pass to [`all_idle`](Self::all_idle)) the library
-    /// counts as NOT idle, so dedup removals, upgrade swaps/prunes and `execute_remove` all defer
-    /// rather than firing on the first tick after a restart (when the in-memory history is empty).
+    /// counts as NOT idle, so every idle-gated destructive step defers rather than firing on the
+    /// first tick after a restart (when the in-memory history is empty): upgrade swaps/prunes
+    /// ([`torrents_idle`](Self::torrents_idle)), dedup removals, `execute_remove`, the scan loop's
+    /// same-hash duplicate deletion and selection repoints ([`all_idle`](Self::all_idle)).
     pub fn new() -> Self {
         Self {
             last_read: Arc::default(),

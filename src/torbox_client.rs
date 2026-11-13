@@ -172,52 +172,55 @@ fn map_listed_torrents(raw: &[TbTorrent]) -> Vec<Torrent> {
     mapped
 }
 
-/// Drive offset/limit pagination: call `fetch_page(offset)` for `offset = 0, limit, 2*limit, …`,
-/// accumulating pages until an EMPTY page signals the natural end, or `max_pages` is reached (a
-/// defensive backstop, e.g. against an API that ignores `offset` and would otherwise loop forever).
-/// Any page error propagates.
+/// Drive offset/limit pagination: call `fetch_page(offset)` starting at `offset = 0`, each next
+/// offset being the number of items returned so far, accumulating pages until an EMPTY page
+/// signals the natural end, or `max_pages` is reached (a defensive backstop, e.g. against an API
+/// that ignores `offset` and would otherwise loop forever). Any page error propagates. The page
+/// size (`limit`) is the caller's: `fetch_page` puts it in the request.
 ///
 /// Termination is on an EMPTY page, NOT merely a short one (mirroring the RD client's
 /// `get_torrents`): a server that returns fewer than `limit` items on a non-final page — a
 /// short-but-not-last page — must not be mistaken for end-of-list, or the listing truncates and
 /// downstream treats the dropped-page titles as lapsed → a re-acquisition storm + duplicate adds.
-/// This costs exactly one extra (empty terminator) fetch per complete listing.
+/// This costs exactly one extra (empty terminator) fetch per complete listing. Advancing by the
+/// items returned rather than by `limit` means a server that caps the page below `limit` loses
+/// nothing (stepping by `limit` would skip each page's tail); a short page caused by anything else
+/// only re-reads some items, which the scan loop skips as page-boundary repeats (same id).
 ///
 /// Returns `(items, hit_cap)`. `hit_cap` is `true` when the loop stopped because it reached
-/// `max_pages` while the FINAL page was still full — i.e. more pages likely remain and `items` is
-/// almost certainly TRUNCATED. The caller MUST treat that as a failure rather than an `Ok`, because
-/// downstream treats an owned title absent from the listing as lapsed → re-acquire, so a truncated
-/// listing would cause a re-acquisition storm + duplicate adds (this mirrors the RD client's
-/// `get_torrents`, which fails rather than returns a partial listing at its own cap).
-async fn paginate<T, E, F, Fut>(
-    limit: usize,
-    max_pages: usize,
-    mut fetch_page: F,
-) -> Result<(Vec<T>, bool), E>
+/// `max_pages` without an empty page and one more fetch (the probe below) still returned items —
+/// i.e. `items` is almost certainly TRUNCATED. The caller MUST treat that as a failure rather than
+/// an `Ok`, because downstream treats an owned title absent from the listing as lapsed →
+/// re-acquire, so a truncated listing would cause a re-acquisition storm + duplicate adds (this
+/// mirrors the RD client's `get_torrents`, which fails rather than returns a partial listing at its
+/// own cap).
+async fn paginate<T, E, F, Fut>(max_pages: usize, mut fetch_page: F) -> Result<(Vec<T>, bool), E>
 where
     F: FnMut(usize) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<T>, E>>,
 {
     let mut all: Vec<T> = Vec::new();
     let mut hit_cap = true; // cleared only if we reach a natural (empty) end
-    for page in 0..max_pages {
-        let items = fetch_page(page * limit).await?;
+    let mut offset = 0usize;
+    for _ in 0..max_pages {
+        let items = fetch_page(offset).await?;
         let empty = items.is_empty();
+        offset += items.len();
         all.extend(items);
         if empty {
             hit_cap = false; // an empty page is the natural end — the listing is complete
             break;
         }
     }
-    // If the loop exhausted `max_pages` with the final page still FULL, the account holds either
-    // EXACTLY `max_pages * limit` items (complete) or more (genuinely truncated) — indistinguishable
-    // without one more look. Probe the next offset: an empty probe means the listing was exactly
+    // If the loop exhausted `max_pages` without an empty page, the account holds either EXACTLY
+    // the items listed (complete) or more (genuinely truncated) — indistinguishable without one
+    // more look. Probe the next offset: an empty probe means the listing was exactly
     // complete, so clear `hit_cap` rather than raising a false-truncation Err at the exact
     // page-count boundary. A non-empty probe confirms real truncation (its items are folded in but
     // `hit_cap` stays set, so the caller still fails the tick). This only ever fires on an account
     // at/above the defensive `max_pages` backstop, so it costs nothing in normal operation.
     if hit_cap {
-        let probe = fetch_page(max_pages * limit).await?;
+        let probe = fetch_page(offset).await?;
         if probe.is_empty() {
             hit_cap = false;
         } else {
@@ -702,7 +705,7 @@ impl TorBoxClient {
         const PAGE: usize = 1000;
         const MAX_PAGES: usize = 50; // 50k-torrent backstop against an offset-ignoring API
         let mut requests = 0usize;
-        let (raw, hit_cap) = paginate(PAGE, MAX_PAGES, |offset| {
+        let (raw, hit_cap) = paginate(MAX_PAGES, |offset| {
             requests += 1;
             let url = format!(
                 "{}/torrents/mylist?bypass_cache=true&limit={}&offset={}",
@@ -1281,10 +1284,10 @@ mod tests {
     async fn paginate_fetches_until_an_empty_page() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = AtomicUsize::new(0);
-        // Two FULL pages (limit=3) then a short page then the empty terminator → 7 items total,
+        // Two FULL pages (of 3) then a short page then the empty terminator → 7 items total,
         // 4 fetches. Termination is on the EMPTY page, not the short one, so a short-but-non-final
         // page can never truncate the listing.
-        let r: Result<(Vec<u32>, bool), &str> = paginate(3, 50, |offset| {
+        let r: Result<(Vec<u32>, bool), &str> = paginate(50, |offset| {
             calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 Ok(match offset {
@@ -1313,14 +1316,15 @@ mod tests {
         // A SHORT but NON-FINAL page (TorBox returns fewer than `limit` before the true end) must
         // NOT be mistaken for end-of-list: pagination continues until an EMPTY page, mirroring the
         // RD client. Here offset 0 is short (2 < 3) yet more items follow; stopping there would
-        // silently drop items 3..6 → a truncated library → re-acquire storm + duplicate adds.
-        let r: Result<(Vec<u32>, bool), &str> = paginate(3, 50, |offset| {
+        // silently drop items 3..6 → a truncated library → re-acquire storm + duplicate adds. Each
+        // next offset is the number of items returned so far.
+        let r: Result<(Vec<u32>, bool), &str> = paginate(50, |offset| {
             calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 Ok(match offset {
                     0 => vec![1, 2],    // short, but NOT the end
-                    3 => vec![3, 4, 5], // full
-                    6 => vec![6],       // short again
+                    2 => vec![3, 4, 5], // full
+                    5 => vec![6],       // short again
                     _ => vec![],        // empty → true end
                 })
             }
@@ -1344,15 +1348,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paginate_does_not_skip_items_when_the_server_caps_the_page() {
+        // A server that caps the page below the requested size (2 items when the caller asks for
+        // 3) must lose nothing: the next page starts where the returned items end, not at the next
+        // multiple of the requested size, which would skip each page's tail.
+        let backing: Vec<u32> = (1..=5).collect();
+        let offsets = std::sync::Mutex::new(Vec::new());
+        let r: Result<(Vec<u32>, bool), &str> = paginate(50, |offset| {
+            offsets.lock().unwrap().push(offset);
+            let page: Vec<u32> = backing.iter().skip(offset).take(2).copied().collect();
+            async move { Ok(page) }
+        })
+        .await;
+        let (items, hit_cap) = r.unwrap();
+        assert_eq!(items, backing, "every item is listed");
+        assert!(!hit_cap);
+        assert_eq!(*offsets.lock().unwrap(), vec![0, 2, 4, 5]);
+    }
+
+    #[tokio::test]
     async fn paginate_stops_on_first_empty_page_and_propagates_errors() {
-        // An immediate empty page (len 0 < limit) ends pagination after one call (not truncated).
+        // An immediate empty page ends pagination after one call (not truncated).
         let r: Result<(Vec<u32>, bool), &str> =
-            paginate(3, 50, |_| async move { Ok(Vec::<u32>::new()) }).await;
+            paginate(50, |_| async move { Ok(Vec::<u32>::new()) }).await;
         let (items, hit_cap) = r.unwrap();
         assert_eq!(items, Vec::<u32>::new());
         assert!(!hit_cap);
         // A page error propagates rather than returning a partial Ok (no truncated-library re-acquire).
-        let r: Result<(Vec<u32>, bool), &str> = paginate(3, 50, |offset| async move {
+        let r: Result<(Vec<u32>, bool), &str> = paginate(50, |offset| async move {
             if offset == 0 {
                 Ok(vec![1, 2, 3])
             } else {
@@ -1371,7 +1394,7 @@ mod tests {
         // (+ one terminator probe), never infinite, AND `hit_cap` is set so the caller refuses the
         // truncated listing rather than returning a partial Ok (which would look like a shrunken
         // library → re-acquire storm). The probe also comes back full → truncation confirmed.
-        let r: Result<(Vec<u32>, bool), &str> = paginate(2, 4, |_| {
+        let r: Result<(Vec<u32>, bool), &str> = paginate(4, |_| {
             calls.fetch_add(1, Ordering::SeqCst);
             async move { Ok(vec![0u32, 1]) }
         })
@@ -1393,10 +1416,11 @@ mod tests {
     async fn paginate_exact_boundary_is_not_truncated() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = AtomicUsize::new(0);
-        // The account holds EXACTLY max_pages*limit (4*2 = 8) items: pages 0..4 are all full, and the
-        // terminator probe at offset 8 is empty → the listing is complete, NOT truncated. Without the
-        // probe this exact multiple would raise a false-truncation Err (re-acquire storm).
-        let r: Result<(Vec<u32>, bool), &str> = paginate(2, 4, |offset| {
+        // The account holds EXACTLY max_pages full pages of 2 (4*2 = 8 items): pages 0..4 are all
+        // full, and the terminator probe at offset 8 is empty → the listing is complete, NOT
+        // truncated. Without the probe this exact multiple would raise a false-truncation Err
+        // (re-acquire storm).
+        let r: Result<(Vec<u32>, bool), &str> = paginate(4, |offset| {
             calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 if offset < 8 {
@@ -2090,7 +2114,8 @@ mod tests {
         assert_eq!(info.id, "0"); // stringized id → default 0
         assert_eq!(info.filename, "Sintel"); // a correctly-typed field is still parsed
         assert!(info.files.is_empty()); // "files": "nope" → default empty
-                                        // A whole list where one entry is type-mismatched must still decode the good entries.
+
+        // A whole list where one entry is type-mismatched must still decode the good entries.
         let arr: Vec<TbTorrent> = serde_json::from_str(&format!("[{},{}]", MYLIST_ITEM, bad))
             .expect("one type-mismatched entry must not fail the whole list");
         assert_eq!(arr.len(), 2);

@@ -7,11 +7,12 @@
 mod common;
 
 use debridmoviemapper::identification::identify_torrent;
-use debridmoviemapper::rd_client::{RealDebridClient, TorrentInfo};
+use debridmoviemapper::rd_client::{RealDebridClient, TorrentFile, TorrentInfo};
 use debridmoviemapper::store::Store;
 use debridmoviemapper::tmdb_client::TmdbClient;
-use debridmoviemapper::vfs::{is_video_file, DebridVfs, MediaMetadata, VfsNode};
+use debridmoviemapper::vfs::{is_video_file, DebridVfs, MediaMetadata, MediaType, VfsNode};
 use futures_util::StreamExt;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{OnceCell, RwLock};
 
@@ -235,10 +236,16 @@ async fn test_vfs_structure() {
     }
 }
 
-/// Test 3: VFS link completeness with tolerance for unrestrict failures.
+/// Test 3: the VFS shows every video file it is meant to (see [`check_completeness`]). A file
+/// missing for any reason other than a design rule is a build bug and fails the test, as does a
+/// selected-file/link-count mismatch on more than `MAX_UNLINKED_RATE` of the selected video files.
 #[tokio::test]
 #[ignore]
 async fn test_vfs_completeness() {
+    /// The share of selected video files that may lack a link (a provider-side anomaly; a much
+    /// higher share suggests the client mis-parses the links).
+    const MAX_UNLINKED_RATE: f64 = 0.20;
+
     let Some(data) = get_shared_data().await else {
         println!("skipping test_vfs_completeness: RD_API_TOKEN not set");
         return;
@@ -249,76 +256,298 @@ async fn test_vfs_completeness() {
     );
 
     println!("Building VFS...");
-    let new_vfs = DebridVfs::build(data.clone(), &debridmoviemapper::vfs::SelectionMap::new());
-    let vfs = Arc::new(RwLock::new(new_vfs));
+    let vfs = DebridVfs::build(data.clone(), &debridmoviemapper::vfs::SelectionMap::new());
+    let report = check_completeness(data, &vfs.root);
 
-    let vfs_lock = vfs.read().await;
-    let mut vfs_links = std::collections::HashSet::new();
-    collect_links(&vfs_lock.root, &mut vfs_links);
-
-    let mut total_video_files = 0;
-    let mut missing = Vec::new();
-
-    for (info, _) in data {
-        let mut link_idx = 0;
-        for file in &info.files {
-            if file.selected == 1 {
-                if is_video_file(&file.path) {
-                    total_video_files += 1;
-                    if let Some(link) = info.links.get(link_idx) {
-                        if !vfs_links.contains(link) {
-                            missing
-                                .push(format!("Torrent: {}, File: {}", info.filename, file.path));
-                        }
-                    }
-                }
-                link_idx += 1;
-            }
-        }
-    }
-
-    let missing_count = missing.len();
-    let skip_rate = if total_video_files > 0 {
-        missing_count as f64 / total_video_files as f64
+    let unlinked_rate = if report.selected_videos > 0 {
+        report.unlinked.len() as f64 / report.selected_videos as f64
     } else {
         0.0
     };
-
     println!("\n=== VFS Completeness ===");
-    println!("Total video files: {}", total_video_files);
-    println!("Present in VFS:    {}", total_video_files - missing_count);
-    println!("Missing from VFS:  {}", missing_count);
-    println!("Skip rate:         {:.1}%", skip_rate * 100.0);
+    println!("Titles:                 {}", report.titles);
+    println!("Selected video files:   {}", report.selected_videos);
+    println!("Shown in the VFS:       {}", report.shown);
+    println!(
+        "Hidden by design:       {} (a movie's other copies, same-named episode copies)",
+        report.hidden
+    );
+    println!(
+        "Without a link:         {} ({:.1}%; selected-file/link-count mismatch)",
+        report.unlinked.len(),
+        unlinked_rate * 100.0
+    );
+    println!("Missing (build bugs):   {}", report.missing.len());
+    for u in &report.unlinked {
+        println!("  WARNING: no link: {}", u);
+    }
+    for m in &report.missing {
+        println!("  ERROR: {}", m);
+    }
 
-    if !missing.is_empty() {
-        println!("\nMissing video files (likely unrestrict failures):");
-        for m in &missing {
-            println!("  WARNING: {}", m);
+    assert!(
+        report.missing.is_empty(),
+        "{} streamable video file(s) are missing from the VFS although no other copy of them is \
+         shown (a movie's other copies and same-named episode copies are already excluded), so the \
+         VFS build dropped them: {:#?}",
+        report.missing.len(),
+        report.missing
+    );
+    assert!(
+        unlinked_rate <= MAX_UNLINKED_RATE,
+        "{}/{} selected video files ({:.1}% > {:.0}%) have no link at their position among the \
+         selected files, so the VFS can't stream them. A selected-file/link-count mismatch this \
+         common suggests the client mis-parses the links rather than the odd provider anomaly.",
+        report.unlinked.len(),
+        report.selected_videos,
+        unlinked_rate * 100.0,
+        MAX_UNLINKED_RATE * 100.0
+    );
+}
+
+/// What [`check_completeness`] found.
+#[derive(Debug, Default)]
+struct Completeness {
+    /// Title groups (one folder each).
+    titles: usize,
+    /// Selected video files across all torrents.
+    selected_videos: usize,
+    /// Streamable files the VFS shows.
+    shown: usize,
+    /// Streamable files the VFS leaves out by design.
+    hidden: usize,
+    /// Selected video files with no link at their position (selected-file/link-count mismatch).
+    unlinked: Vec<String>,
+    /// Streamable files left out with no design rule to explain it: build bugs.
+    missing: Vec<String>,
+}
+
+/// Check the VFS under `root`, built from `data` with no managed selection, against what the build
+/// is meant to show. The build never unrestricts (a file's link is resolved only when it is read),
+/// so a file is left out only by design. With no managed selection the VFS shows:
+/// - for a movie, ONE copy: the largest torrent of the title with a streamable file. The title's
+///   other copies are hidden.
+/// - for a show, each distinct episode file name once, from the largest torrent that has it.
+///   Same-named copies in other torrents are hidden.
+///
+/// A selected video file with no link at its position among the selected files (Real-Debrid's
+/// selected-file/link-count mismatch) can't be streamed and is left out too; those are counted
+/// separately. Any other streamable file that isn't shown is reported as missing.
+fn check_completeness(data: &[(TorrentInfo, MediaMetadata)], root: &VfsNode) -> Completeness {
+    // (torrent id, file path) of every media file the VFS shows.
+    let mut shown_files = HashSet::new();
+    collect_locators(root, &mut shown_files);
+    let shown = |info: &TorrentInfo, file: &TorrentFile| {
+        shown_files.contains(&(info.id.clone(), file.path.clone()))
+    };
+
+    // Group the torrents as the build does: by `MediaMetadata`'s Eq/Hash (the external id, else
+    // title + year), so each group is one folder.
+    let mut groups: HashMap<&MediaMetadata, Vec<&TorrentInfo>> = HashMap::new();
+    for (info, metadata) in data {
+        groups.entry(metadata).or_default().push(info);
+    }
+
+    let mut report = Completeness {
+        titles: groups.len(),
+        ..Default::default()
+    };
+    for (metadata, torrents) in &groups {
+        let mut streamable: Vec<(&TorrentInfo, &TorrentFile)> = Vec::new();
+        for info in torrents {
+            let (linked, no_link) = split_by_link(info);
+            report.selected_videos += linked.len() + no_link.len();
+            report.unlinked.extend(
+                no_link
+                    .iter()
+                    .map(|f| format!("Torrent: {}, File: {}", info.filename, f.path)),
+            );
+            streamable.extend(linked.into_iter().map(|f| (*info, f)));
+        }
+        let shown_here = streamable.iter().filter(|(i, f)| shown(i, f)).count();
+        report.shown += shown_here;
+        match metadata.media_type {
+            MediaType::Movie => {
+                if streamable.is_empty() {
+                    continue;
+                }
+                if shown_here == 0 {
+                    report.missing.push(format!(
+                        "Movie '{}' ({:?}): none of its {} streamable file(s) is shown",
+                        metadata.title,
+                        metadata.external_id,
+                        streamable.len()
+                    ));
+                } else {
+                    report.hidden += streamable.len() - shown_here;
+                }
+            }
+            MediaType::Show => {
+                let shown_names: HashSet<&str> = streamable
+                    .iter()
+                    .filter(|(i, f)| shown(i, f))
+                    .map(|(_, f)| basename(&f.path))
+                    .collect();
+                for (info, file) in streamable.iter().filter(|(i, f)| !shown(i, f)) {
+                    if shown_names.contains(basename(&file.path)) {
+                        report.hidden += 1;
+                    } else {
+                        report.missing.push(format!(
+                            "Show '{}' ({:?}): no copy of {} is shown (torrent: {})",
+                            metadata.title, metadata.external_id, file.path, info.filename
+                        ));
+                    }
+                }
+            }
         }
     }
+    report
+}
 
-    // Allow up to 20% skip rate (unrestrict failures under rate limiting)
-    let max_skip_rate = 0.20;
-    assert!(
-        skip_rate <= max_skip_rate,
-        "Too many video files missing from VFS: {}/{} ({:.1}% > {:.0}% threshold). \
-         This suggests a real bug, not just rate limiting.",
-        missing_count,
-        total_video_files,
-        skip_rate * 100.0,
-        max_skip_rate * 100.0
-    );
-
-    if missing.is_empty() {
-        println!("\nAll video files correctly present in VFS!");
-    } else {
-        println!(
-            "\n{} files missing but within tolerance ({:.1}% <= {:.0}%)",
-            missing_count,
-            skip_rate * 100.0,
-            max_skip_rate * 100.0
-        );
+/// The torrent's selected video files, split into the ones the VFS can stream and the ones it
+/// can't, mirroring the build (`vfs::emittable_video_files`, which isn't public): a file is
+/// streamable when the torrent has no links at all (TorBox resolves by id) or has a link at the
+/// file's position among the SELECTED files (Real-Debrid pairs them by position).
+fn split_by_link(info: &TorrentInfo) -> (Vec<&TorrentFile>, Vec<&TorrentFile>) {
+    let (mut linked, mut no_link) = (Vec::new(), Vec::new());
+    for (position, file) in info.files.iter().filter(|f| f.selected == 1).enumerate() {
+        if !is_video_file(&file.path) {
+            continue;
+        }
+        if info.links.is_empty() || info.links.get(position).is_some() {
+            linked.push(file);
+        } else {
+            no_link.push(file);
+        }
     }
+    (linked, no_link)
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+// --- Offline checks of `check_completeness` (fictional torrents; no account needed) ---
+
+/// A downloaded Real-Debrid-style torrent: every file selected, one positional link per file.
+fn rd_torrent(id: &str, bytes: u64, paths: &[&str]) -> TorrentInfo {
+    TorrentInfo {
+        id: id.to_string(),
+        filename: format!("torrent-{id}"),
+        hash: format!("{id:0>40}"),
+        bytes,
+        status: "downloaded".to_string(),
+        added: "2024-01-01T00:00:00.000Z".to_string(),
+        files: paths
+            .iter()
+            .enumerate()
+            .map(|(n, p)| TorrentFile {
+                id: n as u32 + 1,
+                path: p.to_string(),
+                bytes: bytes / paths.len() as u64,
+                selected: 1,
+            })
+            .collect(),
+        links: paths
+            .iter()
+            .enumerate()
+            .map(|(n, _)| format!("https://example.invalid/d/{id}-{n}"))
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn title(name: &str, tmdb: u64, media_type: MediaType) -> MediaMetadata {
+    MediaMetadata {
+        title: name.to_string(),
+        year: Some("2010".to_string()),
+        media_type,
+        external_id: Some(format!("tmdb:{tmdb}")),
+    }
+}
+
+/// Two copies of a movie, a show whose second torrent repeats an episode file name of the first,
+/// and a torrent with fewer links than selected files.
+fn sample_library() -> Vec<(TorrentInfo, MediaMetadata)> {
+    let film = title("Some Film", 1, MediaType::Movie);
+    let show = title("Some Show", 2, MediaType::Show);
+    let mut short_of_links = rd_torrent(
+        "5",
+        2_000,
+        &["/Other.Show.S01E01.mkv", "/Other.Show.S01E02.mkv"],
+    );
+    short_of_links.links.truncate(1);
+    vec![
+        (
+            rd_torrent("1", 9_000, &["/Some.Film.1080p.mkv"]),
+            film.clone(),
+        ),
+        (rd_torrent("2", 4_000, &["/Some.Film.720p.mkv"]), film),
+        (
+            rd_torrent(
+                "3",
+                8_000,
+                &["/Some.Show.S01E01.mkv", "/Some.Show.S01E02.mkv"],
+            ),
+            show.clone(),
+        ),
+        (
+            rd_torrent(
+                "4",
+                3_000,
+                &["/Some.Show.S01E01.mkv", "/Some.Show.S01E03.mkv"],
+            ),
+            show,
+        ),
+        (short_of_links, title("Other Show", 3, MediaType::Show)),
+    ]
+}
+
+#[test]
+fn completeness_does_not_count_copies_hidden_by_design_as_missing() {
+    let data = sample_library();
+    let vfs = DebridVfs::build(data.clone(), &debridmoviemapper::vfs::SelectionMap::new());
+    let report = check_completeness(&data, &vfs.root);
+    assert!(report.missing.is_empty(), "{report:#?}");
+    assert_eq!(report.titles, 3);
+    assert_eq!(report.selected_videos, 8);
+    // The 1080p film, show episodes E01, E02 and E03, and Other Show's linked E01.
+    assert_eq!(report.shown, 5, "{report:#?}");
+    // The 720p film copy and torrent 4's same-named E01.
+    assert_eq!(report.hidden, 2, "{report:#?}");
+    assert_eq!(report.unlinked.len(), 1, "{report:#?}");
+    assert!(
+        report.unlinked[0].contains("Other.Show.S01E02"),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn completeness_reports_files_the_build_left_out() {
+    let data = sample_library();
+    // A VFS built without the film's torrents and the show's second torrent stands in for a build
+    // that dropped them: the film has no copy shown and E03 has none either.
+    let partial: Vec<_> = data
+        .iter()
+        .filter(|(info, _)| !["1", "2", "4"].contains(&info.id.as_str()))
+        .cloned()
+        .collect();
+    let vfs = DebridVfs::build(partial, &debridmoviemapper::vfs::SelectionMap::new());
+    let report = check_completeness(&data, &vfs.root);
+    assert_eq!(report.missing.len(), 2, "{report:#?}");
+    assert!(
+        report.missing.iter().any(|m| m.contains("Some Film")),
+        "{report:#?}"
+    );
+    assert!(
+        report
+            .missing
+            .iter()
+            .any(|m| m.contains("Some.Show.S01E03")),
+        "{report:#?}"
+    );
+    // Torrent 4's E01 is still covered by torrent 3's.
+    assert_eq!(report.hidden, 1, "{report:#?}");
 }
 
 /// Test 4: VFS timestamps are populated from RD data and stable across rebuilds.
@@ -394,17 +623,16 @@ fn collect_paths(node: &VfsNode, prefix: &str, paths: &mut Vec<String>) {
     }
 }
 
-fn collect_links(node: &VfsNode, links: &mut std::collections::HashSet<String>) {
+/// The (torrent id, file path) of every media file under `node`.
+fn collect_locators(node: &VfsNode, files: &mut HashSet<(String, String)>) {
     match node {
         VfsNode::Directory { children } => {
             for child in children.values() {
-                collect_links(child, links);
+                collect_locators(child, files);
             }
         }
         VfsNode::MediaFile { locator, .. } => {
-            if let Some(link) = &locator.link {
-                links.insert(link.clone());
-            }
+            files.insert((locator.torrent_id.clone(), locator.file_path.clone()));
         }
         VfsNode::VirtualFile { .. } => {}
     }

@@ -14,6 +14,14 @@ services:
       # are reachable only from the host for now (e.g. via an SSH tunnel or a reverse proxy you
       # add). SP4 splits the UI onto its own authenticated port so the proxy stays host-local.
       - "127.0.0.1:${PORT:-8080}:8080"
+    # The settings reach the container ONLY through this list: compose substitutes each ${VAR:-}
+    # from .env (next to this file) or the shell environment, and the app's own .env lookup finds
+    # nothing inside the container. A variable you set in .env that isn't listed here is ignored.
+    # Every pass-through has an empty default, and the app treats an empty value as unset (its
+    # documented default, shown in the comments). JELLYFIN_URL, JELLYFIN_RCLONE_MOUNT_PATH and
+    # DB_PATH are fixed for this stack, and PORT only sets the published host port (see above).
+    # Compose reads .env when it CREATES the container: after editing it run `docker compose up -d`
+    # (which recreates the container); `docker compose restart` keeps the old environment.
     environment:
       # ── Core ──────────────────────────────────────────────────────────────────
       # Pick a debrid provider by setting EXACTLY ONE of these in .env (or the environment).
@@ -24,12 +32,13 @@ services:
       - TORBOX_API_KEY=${TORBOX_API_KEY:-}
       - TMDB_API_KEY=${TMDB_API_KEY:?Set TMDB_API_KEY in .env or environment}
       - DB_PATH=/data/metadata.db
-      # Provider poll cadence (seconds; default 60, min 10). Uncomment to override.
-      # - SCAN_INTERVAL_SECS=60
+      # Provider poll cadence (seconds; default 60, min 10).
+      - SCAN_INTERVAL_SECS=${SCAN_INTERVAL_SECS:-}
       # Size (MB) of the first read-ahead CDN fetch when a media file is opened (default 8, clamped 2–16).
-      # - CDN_FIRST_READ_MB=8
+      - CDN_FIRST_READ_MB=${CDN_FIRST_READ_MB:-}
       # Log verbosity (default: info). Scope to this crate to avoid dependency noise; takes
-      # effect on restart. e.g. debridmoviemapper=debug, or debridmoviemapper::acquire=debug,info
+      # effect when the container is recreated. e.g. debridmoviemapper=debug, or
+      # debridmoviemapper::acquire=debug,info
       - RUST_LOG=${RUST_LOG:-info}
 
       # ── Jellyfin notifications (all three required to enable) ──────────────────
@@ -56,13 +65,18 @@ services:
       # Prefer HEVC/x265 (default true) / HDR (default false).
       - PREFER_HEVC=${PREFER_HEVC:-}
       - PREFER_HDR=${PREFER_HDR:-}
-      # Numeric knobs (uncomment to override the defaults shown):
-      # - STALL_TIMEOUT_SECS=1800        # no-progress timeout before a Pending acquire is retried
-      # - MAX_ACQUIRE_ATTEMPTS=5         # top-ranked candidates one pass tries to add (the next only when an add fails)
-      # - ACQUIRE_DEAD_TIMEOUT_SECS=600  # secs an optimistic add may stay unresolved before reaped (min 120)
-      # - SCRAPER_MIN_INTERVAL_MS=1000   # min spacing between scraper requests (clamped 100–60000; backs off on 429)
-      # - DEDUP_REMOVE_DUPLICATES=false  # true = actually delete redundant duplicate torrents (default: dry-run/log only)
-      # - REMOVE_FINISHED_SHOWS=false    # true = auto-remove fully-watched ended non-watchlisted shows (default: preview/log only)
+      # No-progress timeout (secs) before a Pending acquire is retried (default 1800, min 60).
+      - STALL_TIMEOUT_SECS=${STALL_TIMEOUT_SECS:-}
+      # Top-ranked candidates one pass tries to add, the next only when an add fails (default 5, min 1).
+      - MAX_ACQUIRE_ATTEMPTS=${MAX_ACQUIRE_ATTEMPTS:-}
+      # Secs an optimistic add may stay unresolved before it is reaped (default 600, min 120).
+      - ACQUIRE_DEAD_TIMEOUT_SECS=${ACQUIRE_DEAD_TIMEOUT_SECS:-}
+      # Min spacing (ms) between scraper requests (default 1000, clamped 100–60000; backs off on 429).
+      - SCRAPER_MIN_INTERVAL_MS=${SCRAPER_MIN_INTERVAL_MS:-}
+      # true = actually delete redundant duplicate torrents (default false: dry-run, log only).
+      - DEDUP_REMOVE_DUPLICATES=${DEDUP_REMOVE_DUPLICATES:-}
+      # true = auto-remove fully-watched ended non-watchlisted shows (default false: preview, log only).
+      - REMOVE_FINISHED_SHOWS=${REMOVE_FINISHED_SHOWS:-}
 
       # ── Trakt sync (SP2) ──────────────────────────────────────────────────────
       # Set BOTH id + secret (from a Trakt API app) to drive the library from users'
@@ -72,12 +86,16 @@ services:
       # Then link accounts at the /trakt/accounts page on the published port.
       - TRAKT_CLIENT_ID=${TRAKT_CLIENT_ID:-}
       - TRAKT_CLIENT_SECRET=${TRAKT_CLIENT_SECRET:-}
-      # - TRAKT_SYNC_INTERVAL_SECS=900            # sync + reconcile cadence (min 60)
-      # - TRAKT_EPISODE_CHECK_INTERVAL_SECS=3600  # episode-monitor cadence (min 300)
+      # Sync + reconcile cadence (secs; default 900, min 60).
+      - TRAKT_SYNC_INTERVAL_SECS=${TRAKT_SYNC_INTERVAL_SECS:-}
+      # Episode-monitor cadence (secs; default 3600, min 300).
+      - TRAKT_EPISODE_CHECK_INTERVAL_SECS=${TRAKT_EPISODE_CHECK_INTERVAL_SECS:-}
       # Catch-up: a show you've watched that Trakt reports as behind, last watched within this
       # window, gets every aired episode you haven't watched (including ones that aired before
-      # your last watch). Window: 90d / 12w / 6mo (or a bare number = days); unset/0 = all-time
-      # (default), which can mean many torrents for a large watch history.
+      # your last watch). Window: a number of days, weeks, months (30 days) or years, e.g. 90d,
+      # 12w, 6mo (or 6m / "6 months"), 1y; a bare number = days. unset/0 = all-time (default),
+      # which can mean many torrents for a large watch history; an unrecognised value also means
+      # all-time (with a warning in the log).
       - TRAKT_CATCHUP_LOOKBACK=${TRAKT_CATCHUP_LOOKBACK:-}
       # Extra host names (comma-separated, no scheme or port) the /trakt pages answer for, e.g. a
       # reverse proxy's FQDN. IP addresses, localhost, single-label names (debridmoviemapper) and
@@ -86,12 +104,18 @@ services:
       - TRAKT_ENROL_ALLOWED_HOSTS=${TRAKT_ENROL_ALLOWED_HOSTS:-}
 
       # ── Upgrade engine (SP3) ──────────────────────────────────────────────────
-      # Daily quality-upgrade + full-season consolidation. On by default; set
-      # UPGRADE_INTERVAL_SECS=0 to disable. Uncomment to override the defaults shown:
-      # - UPGRADE_INTERVAL_SECS=86400    # 0 disables; min 600 when non-zero
-      # - UPGRADE_BUDGET_PER_TICK=       # cap on titles re-scored per pass (default: unset = whole library; min 1)
-      # - UPGRADE_IDLE_SECS=300          # read-inactivity before a swap/prune (min 30)
-      # - ALLOW_RESOLUTION_DOWNGRADE=false # true = correct an above-ceiling owned copy to a within-ceiling cached release (default: preview/log only)
+      # Daily quality-upgrade + full-season consolidation. On by default; it adds better cached
+      # releases and deletes the copies they replace, torrents you added yourself included. Put
+      # UPGRADE_INTERVAL_SECS=0 in .env to disable it.
+      # Pass cadence (secs; default 86400 = daily; 0 disables; min 600 when non-zero).
+      - UPGRADE_INTERVAL_SECS=${UPGRADE_INTERVAL_SECS:-}
+      # Cap on titles re-scored per pass (default: unset = the whole library; min 1).
+      - UPGRADE_BUDGET_PER_TICK=${UPGRADE_BUDGET_PER_TICK:-}
+      # Secs without a proxy read before a copy may be swapped, pruned or removed (default 300, min 30).
+      - UPGRADE_IDLE_SECS=${UPGRADE_IDLE_SECS:-}
+      # true = replace an owned copy above MAX_RESOLUTION with a within-ceiling cached release
+      # (default false: preview, log only).
+      - ALLOW_RESOLUTION_DOWNGRADE=${ALLOW_RESOLUTION_DOWNGRADE:-}
     volumes:
       - metadata:/data
     # Overrides Dockerfile HEALTHCHECK with faster intervals for depends_on startup ordering

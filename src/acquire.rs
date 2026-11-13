@@ -245,9 +245,9 @@ fn requests_no_episode(req: &AcquireRequest) -> bool {
 /// The representative video for a movie request: the largest video file (the feature). Used both to
 /// choose what to select and to identify the served file afterwards — the latter matters because
 /// some providers (TorBox) auto-select *every* file, so "first selected" is not the video (it could
-/// be a `.srt`/`.nfo`). `acquire` and `observe` must agree on this (B10) — a misleading addon file
+/// be a `.srt`/`.nfo`). `acquire` and `observe` must select the same file. A misleading addon file
 /// hint/index would have diverged them (one selecting a sample, the other the feature → a broken
-/// locator / stuck Pending) — so neither passes a hint and the largest video is always taken.
+/// locator / stuck Pending), so neither passes a hint and the largest video is always taken.
 fn select_target(info: &TorrentInfo) -> Option<&crate::rd_client::TorrentFile> {
     info.files
         .iter()
@@ -611,10 +611,33 @@ impl AcquisitionEngine {
                 req.tmdb_id,
                 release_summary(&cand)
             );
+            // Open a staging intent BEFORE the add, as the upgrade engine's `add_staging_candidate`
+            // does: from the add until the Pending record below is written the account holds a
+            // torrent no owned record names, and an acquire cut off in between (a dropped job on
+            // shutdown, a caught panic, an OOM kill) must leave a trace, or the account mirror would
+            // adopt the never-checked release as a `Verified` copy. The scan loop's staging sweep
+            // deletes the torrent of an intent left open. Nothing is added without it.
+            if let Err(e) = self
+                .store
+                .put_staging_intent(cand.info_hash.clone(), now_secs())
+                .await
+            {
+                warn!(
+                    "acquire: tmdb {} — staging intent write failed for {} ({}); not adding, retrying later",
+                    req.tmdb_id, cand.info_hash, e
+                );
+                return AcquireOutcome::TemporarilyUnavailable;
+            }
             let magnet = format!("magnet:?xt=urn:btih:{}", cand.info_hash);
             let added = match self.provider.add_magnet(&magnet).await {
                 Ok(a) => a,
                 Err(e) => {
+                    // Nothing was added: close the intent, or a later sweep would delete a torrent of
+                    // this hash the user adds by hand.
+                    let _ = self
+                        .store
+                        .clear_staging_intent(cand.info_hash.clone())
+                        .await;
                     warn!(
                         "add_magnet failed for {}: {} — trying next",
                         cand.info_hash, e
@@ -622,6 +645,17 @@ impl AcquisitionEngine {
                     continue;
                 }
             };
+            if let Err(e) = self
+                .store
+                .set_staging_torrent_id(cand.info_hash.clone(), added.id.clone())
+                .await
+            {
+                // The sweep still finds the torrent by its hash in the listing.
+                warn!(
+                    "acquire: failed to record added torrent id {} for {}: {}",
+                    added.id, cand.info_hash, e
+                );
+            }
             // Record Pending immediately (the verdict belongs to observe).
             let provides = match (req.kind, req.season, req.episode) {
                 (MediaKind::Series, Some(s), Some(e)) => vec![(s, e)],
@@ -662,21 +696,42 @@ impl AcquisitionEngine {
             };
             if let Err((what, e)) = recorded {
                 warn!(
-                    "acquire: tmdb {} — added {} but its {} write failed ({}); deleted the add, retrying later",
+                    "acquire: tmdb {} — added {} but its {} write failed ({}); deleting the add, retrying later",
                     req.tmdb_id, cand.info_hash, what, e
                 );
-                let _ = self.provider.delete_torrent(&added.id).await;
+                // Close the intent only once the torrent is gone: a failed delete keeps it, so the
+                // account mirror leaves the unchecked torrent alone and the staging sweep deletes it
+                // (as the upgrade engine's `discard_staged` does).
+                match self.provider.delete_torrent(&added.id).await {
+                    Ok(()) => {
+                        let _ = self
+                            .store
+                            .clear_staging_intent(cand.info_hash.clone())
+                            .await;
+                    }
+                    Err(e) => warn!(
+                        "acquire: deleting the unrecorded add {} ({}) failed: {}; the staging sweep retries it",
+                        cand.info_hash, added.id, e
+                    ),
+                }
                 return AcquireOutcome::TemporarilyUnavailable;
             }
+            // Recorded `Pending`: the intent is done. A failed clear is harmless — the sweep closes an
+            // intent whose hash is owned without deleting anything.
+            let _ = self
+                .store
+                .clear_staging_intent(cand.info_hash.clone())
+                .await;
             // Best-effort: if the file list is already present (cached), select now so it is
             // immediately resolvable; otherwise observe selects once metadata resolves.
             //
             // Select WITHOUT the addon hint (None, None) so the chosen file matches what `observe`
             // later records/probes (`select_target` = the largest video). A valid
             // single-feature movie's feature IS the largest (the pack-guard rejects multi-feature),
-            // so this is correct; and it avoids the B10 mismatch where a misleading hint points at a
-            // non-largest file (e.g. a sample) — acquire would select that while observe probes the
-            // largest, leaving the largest unselected → a broken locator → a stuck Pending.
+            // so this is correct; and it keeps acquire and observe on the same file when a misleading
+            // hint points at a non-largest file (e.g. a sample) — acquire would select that while
+            // observe probes the largest, leaving the largest unselected → a broken locator → a stuck
+            // Pending.
             if let Ok(info) = self.provider.get_torrent_info(&added.id).await {
                 let ids = select_ids_for(req.kind, &info);
                 if !ids.is_empty() {
@@ -786,9 +841,12 @@ impl AcquisitionEngine {
     /// Write `provides` and the per-slot `selection` entries for a now-Verified owned torrent,
     /// and update its status. For a movie: one `movie_slot` entry for the selected file. For a
     /// show: `episode_slot` entries for every SE-mapped selected file, and `provides` is that set.
-    /// `unverified` is the probe verdict's flag (`true` for an `Accept` — the tracks couldn't be
-    /// checked — `false` for a `Pass`), stamped on the record's quality snapshot so the upgrade pass
-    /// can later replace an unchecked release with a checked one.
+    /// `unverified` is stamped on the record's quality snapshot so the upgrade pass can later replace
+    /// an unchecked release with a checked one: `true` for an `Accept` (the tracks couldn't be
+    /// checked) or for a `Pass` that checked no audio language ([`Self::audio_unchecked`]),
+    /// otherwise `false`. Returns whether the record was verified: `false`, with nothing written,
+    /// when it is gone (removed while the probe ran) or the write failed (the next tick verifies it
+    /// again).
     async fn record_verified(
         &self,
         hash: &str,
@@ -796,7 +854,7 @@ impl AcquisitionEngine {
         info: &TorrentInfo,
         selected_path: &str,
         unverified: bool,
-    ) {
+    ) -> bool {
         // Compute the SE-mapped episode set for a series (this hash's `provides` — the season-pack
         // churn fix); a movie supplies none.
         let eps: Vec<(u32, u32, String)> = match req.kind {
@@ -804,43 +862,49 @@ impl AcquisitionEngine {
             MediaKind::Series => episode_files(info),
         };
 
-        // Single read-modify-write FIRST so status (+ series `provides`) and the cached-quality
-        // refresh commit together with no intermediate window — AND so the slot-overwrite gate below
-        // sees this hash's REFRESHED quality. CRITICAL: a torrent reaching this point is `downloaded`
-        // (present on the provider), so it IS cached — refresh the acquire-time `quality` snapshot
-        // (an UNCACHED candidate recorded `cached: false`) via `mark_cached`, else the upgrade
-        // engine's "`!current.cached` → any cached candidate is an upgrade" rule would later replace
-        // this working copy with a LOWER-quality cached release and delete it.
-        let Some(mut rec) = self.store.get_owned(hash.to_string()).await else {
-            // Record vanished (removed concurrently while the probe ran, e.g. by `execute_remove`,
-            // which deleted its torrent): write no selection, or a slot would point at a hash
-            // nothing owns. (A transient read failure leaves the record Pending; the next tick
-            // verifies it again.)
-            debug!(
-                "observe: tmdb {} hash {} record vanished before it was verified; not writing selection",
-                req.tmdb_id, hash
-            );
-            return;
+        // One atomic read-modify-write FIRST, so status (+ series `provides`) and the cached-quality
+        // refresh commit together, a record removed concurrently is never written back, AND the
+        // slot-overwrite gate below sees this hash's REFRESHED quality. CRITICAL: a torrent reaching
+        // this point is `downloaded` (present on the provider), so it IS cached — refresh the
+        // acquire-time `quality` snapshot (an UNCACHED candidate recorded `cached: false`), else the
+        // upgrade engine's "`!current.cached` → any cached candidate is an upgrade" rule would later
+        // replace this working copy with a LOWER-quality cached release and delete it.
+        let provides =
+            (req.kind == MediaKind::Series).then(|| eps.iter().map(|(s, e, _)| (*s, *e)).collect());
+        let new_quality = match self
+            .store
+            .mark_verified_if_present(hash.to_string(), provides, unverified)
+            .await
+        {
+            Ok(Some(q)) => q,
+            Ok(None) => {
+                // Record vanished (removed concurrently while the probe ran, e.g. by
+                // `execute_remove`, which deleted its torrent): write no selection, or a slot would
+                // point at a hash nothing owns.
+                debug!(
+                    "observe: tmdb {} hash {} record vanished before it was verified; not writing selection",
+                    req.tmdb_id, hash
+                );
+                return false;
+            }
+            Err(e) => {
+                // Still Pending: the next tick verifies it again.
+                warn!(
+                    "observe: tmdb {} hash {} could not be marked verified ({}); retrying next tick",
+                    req.tmdb_id, hash, e
+                );
+                return false;
+            }
         };
-        rec.status = OwnedStatus::Verified;
-        if req.kind == MediaKind::Series {
-            rec.provides = eps.iter().map(|(s, e, _)| (*s, *e)).collect();
-        }
-        if let Some(q) = rec.quality.as_mut() {
-            q.mark_cached();
-            q.unverified = unverified;
-        }
-        let new_quality: Option<crate::release::QualitySummary> = rec.quality.clone();
-        let _ = self.store.put_owned(hash.to_string(), rec).await;
 
         // Write the selection slot(s). For a MOVIE the acquire path is authoritative for the single
         // title slot (re-acquire repoints to the fresh copy), so write unconditionally. For a SERIES
-        // pack, DON'T let a (possibly lower-quality) pack STEAL a sibling-episode slot that already
-        // points at a different, BETTER single release — that would serve a worse file and let the
-        // dedup set-cover delete the better copy. `provides` (set above) already covers the whole
-        // pack regardless of which slots we (re)point, so re-acquire churn is unaffected.
+        // pack, DON'T let a pack take a sibling-episode slot that already serves a different,
+        // BETTER release: it would serve a worse file, and the scan loop's selection repoint would
+        // move the slot straight back. `provides` (set above) already covers the whole pack
+        // regardless of which slots we (re)point, so re-acquire churn is unaffected.
         let Some(id) = crate::vfs::tmdb_id_of(&req.metadata) else {
-            return;
+            return true;
         };
         match req.kind {
             MediaKind::Movie => {
@@ -868,21 +932,19 @@ impl AcquisitionEngine {
                             // this present pack, which supplies the episode.
                             None => true,
                             // A different, still-owned release holds this episode: overwrite only
-                            // when this pack is NOT a downgrade. Resolution first (a known
-                            // resolution stays a floor; untagged = 0 = the lowest), then a known
-                            // source beats an untagged one, then the scores decide; and with no
-                            // quality on either side nothing is provable → keep.
+                            // when this pack is NOT a downgrade, judged as the scan loop's
+                            // selection repoint judges a slot (`selection::takes_slot_from`), so
+                            // that pass never moves the slot back: the rank of the file each copy
+                            // serves (resolution, then source tier, then checked before unchecked;
+                            // an untagged axis is the lowest), a checked copy giving way to an
+                            // unchecked one only for a higher resolution; at equal rank the score
+                            // decides. With no quality on either side nothing is provable → keep.
                             Some(old) => {
-                                let key = |q: Option<&crate::release::QualitySummary>| {
-                                    let rank = crate::release::quality_rank(q);
-                                    (
-                                        rank.resolution,
-                                        rank.source_tier > 0,
-                                        q.map(|q| q.score).unwrap_or(i64::MIN),
-                                    )
-                                };
                                 (new_quality.is_some() || old.quality.is_some())
-                                    && key(new_quality.as_ref()) >= key(old.quality.as_ref())
+                                    && crate::selection::takes_slot_from(
+                                        (new_quality.as_ref(), path),
+                                        (old.quality.as_ref(), &existing.file_path),
+                                    )
                             }
                         },
                     };
@@ -901,13 +963,20 @@ impl AcquisitionEngine {
                 }
             }
         }
+        true
     }
 
     /// Called each scan tick with the current torrent list. Resolves optimistically-added Pending
     /// torrents (select files → pack-guard → title-validation → probe → Verified + provides +
     /// selection), reaps genuinely-dead/never-resolving ones after `dead_timeout`, and recovers by
-    /// re-scraping. No scraping on the happy path.
-    pub async fn observe(&self, torrents: &[crate::rd_client::Torrent]) {
+    /// re-scraping. No scraping on the happy path. Returns the lowercased hashes whose listed
+    /// torrents it deleted, so the caller can drop them from this tick's listing before anything
+    /// shows or adopts them (`torrents` is the listing from before the deletes).
+    pub async fn observe(
+        &self,
+        torrents: &[crate::rd_client::Torrent],
+    ) -> std::collections::HashSet<String> {
+        let mut deleted = std::collections::HashSet::new();
         let owned = self.store.all_owned().await;
         // Key by lowercased provider hash so it matches the lowercased candidate hashes we store.
         // When the listing contains DUPLICATE entries for a hash (a repair leak or an external
@@ -960,12 +1029,13 @@ impl AcquisitionEngine {
                 if rec.status == OwnedStatus::Pending {
                     let age = now_secs().saturating_sub(rec.added_at);
                     if age > self.dead_timeout.as_secs() && !listing_empty {
-                        self.fail_and_reacquire(
+                        self.reject(
                             hash,
                             &[],
                             &rec.request,
                             "NeverResolved",
                             &rec.provenance,
+                            &mut deleted,
                         )
                         .await;
                     } else {
@@ -998,8 +1068,15 @@ impl AcquisitionEngine {
                     "observe: tmdb {} hash {} provider status={:?} — dead",
                     rec.request.tmdb_id, hash, t.status
                 );
-                self.fail_and_reacquire(hash, ids, &rec.request, "Dead", &rec.provenance)
-                    .await;
+                self.reject(
+                    hash,
+                    ids,
+                    &rec.request,
+                    "Dead",
+                    &rec.provenance,
+                    &mut deleted,
+                )
+                .await;
                 continue;
             }
             if rec.status == OwnedStatus::Verified {
@@ -1023,12 +1100,13 @@ impl AcquisitionEngine {
                         *map.entry(t.id.clone()).or_insert_with(Instant::now)
                     };
                     if !listing_empty && first.elapsed() >= self.dead_timeout {
-                        self.fail_and_reacquire(
+                        self.reject(
                             hash,
                             ids,
                             &rec.request,
                             "InfoUnfetchable",
                             &rec.provenance,
+                            &mut deleted,
                         )
                         .await;
                     } else {
@@ -1047,12 +1125,13 @@ impl AcquisitionEngine {
             if !has_files {
                 let age = now_secs().saturating_sub(rec.added_at);
                 if age > self.dead_timeout.as_secs() {
-                    self.fail_and_reacquire(
+                    self.reject(
                         hash,
                         ids,
                         &rec.request,
                         "NeverResolved",
                         &rec.provenance,
+                        &mut deleted,
                     )
                     .await;
                 } else {
@@ -1076,12 +1155,13 @@ impl AcquisitionEngine {
                 // OUTAGE instead fails the get_torrent_info above and skips this branch, so this only
                 // fires on a stuck hash.
                 if now_secs().saturating_sub(rec.added_at) > self.dead_timeout.as_secs() {
-                    self.fail_and_reacquire(
+                    self.reject(
                         hash,
                         ids,
                         &rec.request,
                         "SelectStuck",
                         &rec.provenance,
+                        &mut deleted,
                     )
                     .await;
                     continue;
@@ -1105,8 +1185,15 @@ impl AcquisitionEngine {
             }
             // Movie-pack guard (deferred from acquire).
             if rec.request.kind == MediaKind::Movie && count_feature_videos(&info) > 1 {
-                self.fail_and_reacquire(hash, ids, &rec.request, "MoviePack", &rec.provenance)
-                    .await;
+                self.reject(
+                    hash,
+                    ids,
+                    &rec.request,
+                    "MoviePack",
+                    &rec.provenance,
+                    &mut deleted,
+                )
+                .await;
                 continue;
             }
             // Choose the representative file to validate + probe. Movie: the feature video.
@@ -1126,12 +1213,13 @@ impl AcquisitionEngine {
                 // treat it as a wrong/incomplete pick and re-acquire; otherwise wait (metadata may
                 // still be settling).
                 if now_secs().saturating_sub(rec.added_at) > self.dead_timeout.as_secs() {
-                    self.fail_and_reacquire(
+                    self.reject(
                         hash,
                         ids,
                         &rec.request,
                         "EpisodeMissing",
                         &rec.provenance,
+                        &mut deleted,
                     )
                     .await;
                 } else {
@@ -1148,8 +1236,15 @@ impl AcquisitionEngine {
                 // don't burn a TMDB lookup (and a 4 MB CDN probe) on EVERY scan tick for the whole
                 // download. A wrong-title torrent is still caught — just once it finishes.
                 if self.is_stalled(&t.id, t.progress).await {
-                    self.fail_and_reacquire(hash, ids, &rec.request, "Stalled", &rec.provenance)
-                        .await;
+                    self.reject(
+                        hash,
+                        ids,
+                        &rec.request,
+                        "Stalled",
+                        &rec.provenance,
+                        &mut deleted,
+                    )
+                    .await;
                 } else {
                     debug!(
                         "observe: tmdb {} hash {} downloading (status={:?}, progress={:.0}%) — waiting",
@@ -1216,8 +1311,10 @@ impl AcquisitionEngine {
                 } else {
                     // Only blacklist+delete after TWO CONSECUTIVE mismatches (a single-tick glitch —
                     // incl. the first observe after a restart — rides out); a genuine WrongTitle is
-                    // rejected on the next tick. The record stays Pending (invisible — no selection
-                    // written yet) meanwhile, so the one-tick delay is harmless.
+                    // rejected on the next tick. The record stays Pending meanwhile (a title with no
+                    // managed slot still shows it, through the VFS fallback; the scan loop drops a
+                    // torrent from the listing in the tick `observe` deletes it). The strike count
+                    // is kept until the delete succeeds, so a failed one is retried next tick.
                     let fails = {
                         let mut m = self.validate_fails.lock().await;
                         let c = m.entry(hash.to_string()).or_insert(0);
@@ -1225,15 +1322,19 @@ impl AcquisitionEngine {
                         *c
                     };
                     if fails >= 2 {
-                        self.validate_fails.lock().await.remove(hash);
-                        self.fail_and_reacquire(
-                            hash,
-                            ids,
-                            &rec.request,
-                            "WrongTitle",
-                            &rec.provenance,
-                        )
-                        .await;
+                        if self
+                            .reject(
+                                hash,
+                                ids,
+                                &rec.request,
+                                "WrongTitle",
+                                &rec.provenance,
+                                &mut deleted,
+                            )
+                            .await
+                        {
+                            self.validate_fails.lock().await.remove(hash);
+                        }
                     } else {
                         debug!(
                             "observe: tmdb {} hash {} title-validation mismatch ({}/2) — re-checking next tick",
@@ -1253,17 +1354,20 @@ impl AcquisitionEngine {
                     // not be looked up, see `fill_missing_languages`).
                     let unverified = matches!(verdict, VerifyResult::Accept)
                         || self.audio_unchecked(&rec.request);
-                    info!(
-                        "observe: tmdb {} hash {} verified ({}{}) — recording selection",
-                        rec.request.tmdb_id,
-                        hash,
-                        file_name,
-                        if unverified { ", tracks unchecked" } else { "" }
-                    );
-                    self.record_verified(hash, &rec.request, &info, &selected_path, unverified)
-                        .await;
-                    self.verify_attempts.lock().await.remove(hash);
-                    self.progress.lock().await.remove(&t.id);
+                    if self
+                        .record_verified(hash, &rec.request, &info, &selected_path, unverified)
+                        .await
+                    {
+                        info!(
+                            "observe: tmdb {} hash {} verified ({}{}) — selection recorded",
+                            rec.request.tmdb_id,
+                            hash,
+                            file_name,
+                            if unverified { ", tracks unchecked" } else { "" }
+                        );
+                        self.verify_attempts.lock().await.remove(hash);
+                        self.progress.lock().await.remove(&t.id);
+                    }
                 }
                 VerifyResult::Defer => {
                     // Record the deferred attempt + when we probed (drives the back-off gate above).
@@ -1291,12 +1395,13 @@ impl AcquisitionEngine {
                         && now.saturating_sub(rec.added_at) > VERIFY_DEADLINE_SECS
                         && now.saturating_sub(first_defer_at) >= VERIFY_DEADLINE_MIN_DEFER.as_secs()
                     {
-                        self.fail_and_reacquire(
+                        self.reject(
                             hash,
                             ids,
                             &rec.request,
                             "ProbeUnfetchable",
                             &rec.provenance,
+                            &mut deleted,
                         )
                         .await;
                     } else {
@@ -1307,8 +1412,15 @@ impl AcquisitionEngine {
                     }
                 }
                 VerifyResult::Reject(reason) => {
-                    self.fail_and_reacquire(hash, ids, &rec.request, reason, &rec.provenance)
-                        .await;
+                    self.reject(
+                        hash,
+                        ids,
+                        &rec.request,
+                        reason,
+                        &rec.provenance,
+                        &mut deleted,
+                    )
+                    .await;
                 }
             }
         }
@@ -1340,6 +1452,7 @@ impl AcquisitionEngine {
             .lock()
             .await
             .retain(|h, _| owned_hashes.contains(h.as_str()));
+        deleted
     }
 
     async fn is_stalled(&self, torrent_id: &str, progress: f64) -> bool {
@@ -1355,9 +1468,32 @@ impl AcquisitionEngine {
         }
     }
 
+    /// [`Self::fail_and_reacquire`] for `observe`, noting in `deleted` a hash whose listed torrents
+    /// it deleted. Returns whether the rejection went through (every delete succeeded).
+    async fn reject(
+        &self,
+        hash: &str,
+        torrent_ids: &[&str],
+        req: &AcquireRequest,
+        reason: &str,
+        provenance: &Provenance,
+        deleted: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        let removed = self
+            .fail_and_reacquire(hash, torrent_ids, req, reason, provenance)
+            .await;
+        if removed && !torrent_ids.is_empty() {
+            deleted.insert(hash.to_ascii_lowercase());
+        }
+        removed
+    }
+
     /// Reject the owned `hash`: delete it from the provider under every listing id in
     /// `torrent_ids` (empty = absent from the listing, nothing to delete), then blacklist it, drop
-    /// its records and re-acquire `req` with the failed record's (sticky) `provenance`.
+    /// its records and re-acquire `req` with the failed record's (sticky) `provenance`. Returns
+    /// `false` when a delete failed: then nothing else happens, and the state that led to the
+    /// rejection (the stall timer, the info-failure timer, the probe back-off) is kept, so the next
+    /// `observe` that sees the hash in that state rejects it again and retries the delete.
     async fn fail_and_reacquire(
         &self,
         hash: &str,
@@ -1365,74 +1501,77 @@ impl AcquisitionEngine {
         req: &AcquireRequest,
         reason: &str,
         provenance: &Provenance,
-    ) {
+    ) -> bool {
         warn!(
             "owned torrent {} failed ({}) — blacklist + re-acquire",
             hash, reason
         );
         // Delete the provider torrent BEFORE dropping the store records (the `execute_remove`
         // ordering), under every listing id of the hash (a retried add or a manual re-add can list
-        // it twice). If any delete fails, KEEP the records so the next `observe` tick retries the
-        // delete rather than leaving a present-but-untracked torrent behind; the kept record is what
-        // stops `record_mirror_owned` re-adopting it (the mirror never adopts an owned hash).
+        // it twice). If any delete fails, KEEP the records so a later `observe` retries the delete
+        // rather than leaving a present-but-untracked torrent behind; the kept record is what stops
+        // `record_mirror_owned` re-adopting it (the mirror never adopts an owned hash).
         let mut removed = true;
         for id in torrent_ids {
             if let Err(e) = self.provider.delete_torrent(id).await {
                 warn!(
-                    "observe: delete_torrent {} ({}) failed: {}; retrying next tick",
+                    "observe: delete_torrent {} ({}) failed: {}; the delete is retried on a later tick",
                     id, hash, e
                 );
                 removed = false;
             }
+        }
+        if !removed {
+            return false;
         }
         for id in torrent_ids {
             self.progress.lock().await.remove(*id);
             self.info_fail_since.lock().await.remove(*id);
         }
         self.verify_attempts.lock().await.remove(hash);
-        if removed {
-            // Blacklist only once the torrent is gone. The mirror pass later in this scan tick reaps
-            // every empty-provenance (account-mirror) record whose hash is blacklisted, so
-            // blacklisting before a failed delete would drop the record kept for the retry: the
-            // delete would never be retried and the title never replaced.
-            let _ = self
-                .store
-                .blacklist_add(req.kind, req.tmdb_id, hash.to_string(), reason, now_secs())
-                .await;
-            let _ = self.store.remove_owned(hash.to_string()).await;
-            let _ = self.store.remove_authoritative(hash.to_string()).await;
-            // Drop any selection slots this hash represented so the VFS stops showing the dead release.
-            for (slot, entry) in self.store.all_selection().await {
-                if entry.hash.eq_ignore_ascii_case(hash) {
-                    let _ = self.store.remove_selection(slot).await;
-                }
+        // Blacklist only once the torrent is gone: the entry records a completed removal, and until
+        // then the kept record (not the blacklist) is what stops the mirror re-adopting the torrent.
+        // A kept `Pending` record may also still settle `Verified` (a stalled download that resumes,
+        // a probe that recovers); for an empty-provenance one (a dead mirror movie's re-acquire
+        // passes its empty provenance on) a non-"Dead" entry written before the failed delete would
+        // let `record_mirror_owned`'s phantom reaper drop that present, playing copy.
+        let _ = self
+            .store
+            .blacklist_add(req.kind, req.tmdb_id, hash.to_string(), reason, now_secs())
+            .await;
+        let _ = self.store.remove_owned(hash.to_string()).await;
+        let _ = self.store.remove_authoritative(hash.to_string()).await;
+        // Drop any selection slots this hash represented so the VFS stops showing the dead release.
+        for (slot, entry) in self.store.all_selection().await {
+            if entry.hash.eq_ignore_ascii_case(hash) {
+                let _ = self.store.remove_selection(slot).await;
             }
-            // Re-acquire ONLY once the dead record was actually cleared. On a transient delete
-            // failure the record is deliberately KEPT for the next tick to retry the delete — so we
-            // must NOT also add a replacement now, or the dead hash stays present alongside a second
-            // torrent for the title and every subsequent stuck tick re-scrapes until the delete
-            // succeeds. The kept record's next observe tick performs the delete-then-re-acquire.
-            // Sticky provenance: re-acquire preserves the failed record's origin (Trigger B correctness).
-            //
-            // SCOPE for a multi-episode pack: `req` carries only the single originally-requested
-            // (season, episode), so this immediately restores that ONE episode. The pack's OTHER
-            // episodes (whose selection slots were cleared above) are left un-selected here — but the
-            // pack is only reaped when the provider actually lost it, so those episodes were already
-            // gone. `monitor_episodes` re-acquires the full missing set (owned-episode coverage via
-            // the `provides` union) on its next cycle, so the gap is bounded latency, not lost content.
-            // A show record naming no episode (an account-mirror season pack) is left to it entirely:
-            // there is no single episode to restore (see `acquire`).
-            if requests_no_episode(req) {
-                debug!(
-                    "observe: tmdb {} reaped {} names no episode; leaving re-acquisition to monitor_episodes",
-                    req.tmdb_id, hash
-                );
-                return;
-            }
-            let mut req = req.clone();
-            self.fill_missing_languages(&mut req).await;
-            let _ = self.acquire(req, provenance.clone()).await; // promotes the next candidate (bad hash now blacklisted)
         }
+        // Re-acquire ONLY once the dead record was actually cleared (a failed delete returned above
+        // with the record kept for the retry): adding a replacement then would leave the dead hash
+        // present alongside a second torrent for the title, re-scraped on every stuck tick until the
+        // delete succeeds. Sticky provenance: re-acquire preserves the failed record's origin
+        // (Trigger B correctness).
+        //
+        // SCOPE for a multi-episode pack: `req` carries only the single originally-requested
+        // (season, episode), so this immediately restores that ONE episode. The pack's OTHER
+        // episodes (whose selection slots were cleared above) are left un-selected here — but the
+        // pack is only reaped when the provider actually lost it, so those episodes were already
+        // gone. `monitor_episodes` re-acquires the full missing set (owned-episode coverage via the
+        // `provides` union) on its next cycle, so the gap is bounded latency, not lost content. A
+        // show record naming no episode (an account-mirror season pack) is left to it entirely:
+        // there is no single episode to restore (see `acquire`).
+        if requests_no_episode(req) {
+            debug!(
+                "observe: tmdb {} reaped {} names no episode; leaving re-acquisition to monitor_episodes",
+                req.tmdb_id, hash
+            );
+            return true;
+        }
+        let mut req = req.clone();
+        self.fill_missing_languages(&mut req).await;
+        let _ = self.acquire(req, provenance.clone()).await; // promotes the next candidate (bad hash now blacklisted)
+        true
     }
 
     /// Complete a stored request recorded without the title's TMDB languages (an account-mirror
@@ -1542,11 +1681,10 @@ mod tests {
     use crate::scraper::MockScraper;
     use crate::store::Provenance;
     use crate::vfs::{MediaMetadata, MediaType};
-    use redb::backends::InMemoryBackend;
 
     #[test]
     fn select_target_picks_largest_so_acquire_and_observe_agree() {
-        // B10: `acquire` and `observe` must select the SAME movie file. `select_target` takes no hint
+        // `acquire` and `observe` must select the SAME movie file. `select_target` takes no hint
         // and picks the largest video (the feature), so both paths agree by construction. A
         // hint/index-driven selector (the old behaviour) could pick a smaller SAMPLE, leaving the
         // largest — which observe records/probes — unselected → a broken locator → a stuck Pending.
@@ -2024,6 +2162,10 @@ mod tests {
             rec.quality.unwrap().cached,
             "cached candidate's quality recorded"
         );
+        assert!(
+            st.all_staging_intents().await.is_empty(),
+            "a recorded add leaves no staging intent"
+        );
         assert_eq!(
             st.authoritative_meta("h1".into())
                 .await
@@ -2221,83 +2363,140 @@ mod tests {
         assert!(added.lock().unwrap().is_empty(), "no duplicate is added");
     }
 
-    /// A redb backend whose writes fail once `fail` is set (a full disk, an I/O error), so a test can
-    /// make a `Store` write fail after the store was created.
-    #[derive(Debug)]
-    struct FailingWrites {
-        inner: InMemoryBackend,
-        fail: Arc<std::sync::atomic::AtomicBool>,
-    }
-    impl FailingWrites {
-        fn check(&self) -> Result<(), std::io::Error> {
-            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                Err(std::io::Error::other("injected write failure"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-    impl redb::StorageBackend for FailingWrites {
-        fn len(&self) -> Result<u64, std::io::Error> {
-            self.inner.len()
-        }
-        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
-            self.inner.read(offset, out)
-        }
-        fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
-            self.check()?;
-            self.inner.set_len(len)
-        }
-        fn sync_data(&self) -> Result<(), std::io::Error> {
-            self.check()?;
-            self.inner.sync_data()
-        }
-        fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
-            self.check()?;
-            self.inner.write(offset, data)
-        }
-    }
-
     #[tokio::test]
     async fn acquire_rolls_back_an_add_whose_owned_record_cannot_be_written() {
         // The add succeeded but the Pending record couldn't be written: the torrent would sit in the
         // account untracked — skipped by every later acquire as "already in the account", then
         // adopted by the account mirror with no provenance (never removed, never title-checked or
         // probed). Delete it (it was absent before the add, so the id is ours) and retry later.
-        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let db = redb::Database::builder()
-            .create_with_backend(FailingWrites {
-                inner: InMemoryBackend::new(),
-                fail: fail.clone(),
-            })
-            .unwrap();
-        let st = Store::from_database(Arc::new(db)).unwrap();
-        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            add_magnet: Some(AddMagnetResponse {
-                id: "tid_h1".into(),
-                uri: String::new(),
-            }),
-            deleted: deleted.clone(),
-            ..Default::default()
-        });
+        // The staging intent and its torrent id are written; every write after them fails.
+        for fail_delete in [false, true] {
+            let (st, switch) = crate::store::fail_writes::fail_after_arm_store();
+            let per_commit = crate::store::fail_writes::syncs_per_commit(&st, &switch).await;
+            let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+                add_magnet: Some(AddMagnetResponse {
+                    id: "tid_h1".into(),
+                    uri: String::new(),
+                }),
+                deleted: deleted.clone(),
+                fail_delete,
+                ..Default::default()
+            });
+            let eng = engine(
+                provider,
+                Arc::new(MockScraper {
+                    candidates: vec![cand("h1", true)],
+                }),
+                Arc::new(OkValidator(true)),
+                Arc::new(CannedProber(Ok(vec![]))),
+                st,
+            );
+            switch.arm_after(2, per_commit);
+            let out = eng.acquire(req(), Provenance::watchlist("alice")).await;
+            assert_eq!(out, AcquireOutcome::TemporarilyUnavailable);
+            assert_eq!(
+                *deleted.lock().unwrap(),
+                vec!["tid_h1".to_string()],
+                "the untracked add is deleted"
+            );
+            switch.disarm();
+            let st = switch.reopen();
+            assert!(st.get_owned("h1".into()).await.is_none());
+            if fail_delete {
+                // The torrent is still there, unchecked: its intent stays open, so the account
+                // mirror leaves it alone and the staging sweep deletes it.
+                assert_eq!(
+                    st.all_staging_intents().await,
+                    vec![(
+                        "h1".to_string(),
+                        crate::store::StagingIntent {
+                            torrent_id: Some("tid_h1".into()),
+                            started_at: st.all_staging_intents().await[0].1.started_at,
+                        }
+                    )]
+                );
+            }
+        }
+    }
+
+    /// A provider whose `add_magnet` never answers (the request is in flight when the job is cut
+    /// off); its listing is empty.
+    #[derive(Debug, Default)]
+    struct HangingAdd;
+    #[async_trait]
+    impl DebridProvider for HangingAdd {
+        fn name(&self) -> &'static str {
+            "hanging-add"
+        }
+        async fn get_torrents(&self) -> Result<Vec<crate::rd_client::Torrent>, reqwest::Error> {
+            Ok(vec![])
+        }
+        async fn get_torrent_info(&self, _id: &str) -> Result<TI, reqwest::Error> {
+            Ok(TI::default())
+        }
+        async fn add_magnet(&self, _magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+            std::future::pending().await
+        }
+        async fn select_files(&self, _t: &str, _f: &str) -> Result<(), reqwest::Error> {
+            Ok(())
+        }
+        async fn delete_torrent(&self, _t: &str) -> Result<(), reqwest::Error> {
+            Ok(())
+        }
+        async fn resolve_url(
+            &self,
+            _l: &crate::provider::FileLocator,
+        ) -> Result<String, crate::error::AppError> {
+            Err(crate::error::AppError::Unavailable)
+        }
+        async fn invalidate(&self, _l: &crate::provider::FileLocator) {}
+    }
+
+    /// An acquire cut off while its add is in flight (the job dropped on shutdown, a caught panic)
+    /// leaves a staging intent, so the account mirror never adopts the unchecked torrent if the add
+    /// landed, and the staging sweep deletes it once it is listed.
+    #[tokio::test]
+    async fn an_acquire_cut_off_mid_add_leaves_an_intent_the_sweep_resolves() {
+        let st = store();
         let eng = engine(
-            provider,
+            Arc::new(HangingAdd),
             Arc::new(MockScraper {
                 candidates: vec![cand("h1", true)],
             }),
             Arc::new(OkValidator(true)),
             Arc::new(CannedProber(Ok(vec![]))),
-            st,
+            st.clone(),
         );
-        fail.store(true, std::sync::atomic::Ordering::SeqCst);
-        let out = eng.acquire(req(), Provenance::watchlist("alice")).await;
-        assert_eq!(out, AcquireOutcome::TemporarilyUnavailable);
-        assert_eq!(
-            *deleted.lock().unwrap(),
-            vec!["tid_h1".to_string()],
-            "the untracked add is deleted"
-        );
+        let cut = tokio::time::timeout(
+            Duration::from_millis(300),
+            eng.acquire(req(), Provenance::watchlist("alice")),
+        )
+        .await;
+        assert!(cut.is_err(), "the add never answers, so acquire is cut off");
+        assert!(st.get_owned("h1".into()).await.is_none());
+        let intents = st.all_staging_intents().await;
+        assert_eq!(intents.len(), 1, "{intents:?}");
+        assert_eq!(intents[0].0, "h1");
+        assert_eq!(intents[0].1.torrent_id, None);
+
+        // The add did land: the mirror leaves it alone, and the next start's sweep deletes it.
+        let listing = vec![torrent("tid_h1", "h1", "downloaded", 100.0)];
+        let tmdb = crate::tmdb_client::TmdbClient::offline().await;
+        let info = downloaded_movie("tid_h1", "h1");
+        crate::tasks::record_mirror_owned(&st, &tmdb, &prefs(), &[(info, meta())]).await;
+        assert!(st.get_owned("h1".into()).await.is_none(), "not mirrored");
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = MockProvider {
+            deleted: deleted.clone(),
+            ..Default::default()
+        };
+        let later = now_secs() + 1;
+        let swept =
+            crate::upgrade::sweep_staging_intents(&st, &provider, &listing, later, later).await;
+        assert_eq!(swept, std::collections::HashSet::from(["h1".to_string()]));
+        assert_eq!(*deleted.lock().unwrap(), vec!["tid_h1".to_string()]);
+        assert!(st.all_staging_intents().await.is_empty());
     }
 
     #[tokio::test]
@@ -2365,6 +2564,10 @@ mod tests {
         assert!(
             st.get_owned("h1".into()).await.is_none(),
             "the failed candidate is not recorded owned"
+        );
+        assert!(
+            st.all_staging_intents().await.is_empty(),
+            "a failed add closes its staging intent, a recorded one too"
         );
     }
 
@@ -4064,9 +4267,10 @@ mod tests {
     #[tokio::test]
     async fn dead_mirror_delete_failure_survives_the_mirror_pass_and_is_retried() {
         // The delete of a dead mirror torrent fails: the records are kept for the next tick's
-        // retry. The same scan tick's mirror pass reaps every empty-provenance record whose hash is
-        // blacklisted, so the hash must not be blacklisted yet — else the kept record is reaped, the
-        // delete never retried, and the dead movie never replaced.
+        // retry, and the hash is blacklisted only once the delete succeeds. The same scan tick's
+        // mirror pass must leave the kept record alone (its phantom reaper ignores "Dead" entries
+        // and Pending records anyway), else the delete is never retried and the dead movie never
+        // replaced.
         let st = store();
         st.put_owned("h1".into(), mirror_movie_record(req()))
             .await
@@ -4192,7 +4396,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_delete_of_a_duplicate_keeps_the_records() {
-        // Every listing id of the hash must go before its records are dropped: one failed delete
+        // Every listing id of the hash must go before its records are dropped: a failed delete (every
+        // one fails here; `a_partly_failed_delete_retries_only_what_is_left` covers one of two)
         // keeps them (and the hash unblacklisted) for the next tick's retry, and adds no replacement.
         let st = store();
         st.put_owned("h1".into(), mirror_movie_record(req()))
@@ -4220,7 +4425,7 @@ mod tests {
             Arc::new(CannedProber(Ok(vec![]))),
             st.clone(),
         );
-        eng.observe(&listing).await;
+        let gone = eng.observe(&listing).await;
         let mut tried = deleted.lock().unwrap().clone();
         tried.sort();
         assert_eq!(tried, vec!["t1".to_string(), "t2".to_string()]);
@@ -4230,6 +4435,289 @@ mod tests {
                 .await
         );
         assert!(added.lock().unwrap().is_empty());
+        assert!(gone.is_empty(), "nothing was deleted: {gone:?}");
+    }
+
+    /// A [`MockProvider`] whose `delete_torrent` fails for the ids in `fail_ids` (changeable between
+    /// ticks), recording every attempted id in `deleted`.
+    #[derive(Debug)]
+    struct FailSomeDeletes {
+        inner: MockProvider,
+        fail_ids: std::sync::Mutex<std::collections::HashSet<String>>,
+        deleted: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl FailSomeDeletes {
+        fn new(inner: MockProvider, fail_ids: &[&str]) -> Self {
+            Self {
+                inner,
+                fail_ids: std::sync::Mutex::new(fail_ids.iter().map(|s| s.to_string()).collect()),
+                deleted: Arc::default(),
+            }
+        }
+        fn heal(&self) {
+            self.fail_ids.lock().unwrap().clear();
+        }
+        fn take_deleted(&self) -> Vec<String> {
+            let mut d = std::mem::take(&mut *self.deleted.lock().unwrap());
+            d.sort();
+            d
+        }
+    }
+    #[async_trait]
+    impl DebridProvider for FailSomeDeletes {
+        fn name(&self) -> &'static str {
+            "fail-some-deletes"
+        }
+        async fn get_torrents(&self) -> Result<Vec<crate::rd_client::Torrent>, reqwest::Error> {
+            self.inner.get_torrents().await
+        }
+        async fn get_torrent_info(&self, id: &str) -> Result<TI, reqwest::Error> {
+            self.inner.get_torrent_info(id).await
+        }
+        async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+            self.inner.add_magnet(magnet).await
+        }
+        async fn select_files(&self, t: &str, f: &str) -> Result<(), reqwest::Error> {
+            self.inner.select_files(t, f).await
+        }
+        async fn delete_torrent(&self, id: &str) -> Result<(), reqwest::Error> {
+            self.deleted.lock().unwrap().push(id.to_string());
+            if self.fail_ids.lock().unwrap().contains(id) {
+                return Err(crate::provider::synthetic_bad_gateway(b"delete failed"));
+            }
+            Ok(())
+        }
+        async fn resolve_url(
+            &self,
+            l: &crate::provider::FileLocator,
+        ) -> Result<String, crate::error::AppError> {
+            self.inner.resolve_url(l).await
+        }
+        async fn invalidate(&self, l: &crate::provider::FileLocator) {
+            self.inner.invalidate(l).await
+        }
+    }
+
+    /// One of a dead hash's two listing ids fails to delete: the records stay, the hash is not
+    /// blacklisted and nothing is added. The next tick lists only the remaining id, deletes it, then
+    /// blacklists the hash and re-acquires.
+    #[tokio::test]
+    async fn a_partly_failed_delete_retries_only_what_is_left() {
+        let st = store();
+        st.put_owned("h1".into(), mirror_movie_record(req()))
+            .await
+            .unwrap();
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(FailSomeDeletes::new(
+            MockProvider {
+                add_magnet: Some(AddMagnetResponse {
+                    id: "tid_h2".into(),
+                    uri: String::new(),
+                }),
+                added: added.clone(),
+                ..Default::default()
+            },
+            &["t2"],
+        ));
+        let eng = engine(
+            provider.clone(),
+            Arc::new(MockScraper {
+                candidates: vec![cand("h2", true)],
+            }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        let gone = eng
+            .observe(&[
+                torrent("t1", "h1", "dead", 0.0),
+                torrent("t2", "h1", "dead", 0.0),
+            ])
+            .await;
+        assert_eq!(provider.take_deleted(), vec!["t1", "t2"]);
+        assert!(gone.is_empty(), "{gone:?}");
+        assert!(st.get_owned("h1".into()).await.is_some());
+        assert!(
+            !st.is_blacklisted(MediaKind::Movie, 27205, "h1".into())
+                .await
+        );
+        assert!(added.lock().unwrap().is_empty());
+
+        provider.heal();
+        let gone = eng.observe(&[torrent("t2", "h1", "dead", 0.0)]).await;
+        assert_eq!(provider.take_deleted(), vec!["t2"]);
+        assert_eq!(gone, std::collections::HashSet::from(["h1".to_string()]));
+        assert!(st.get_owned("h1".into()).await.is_none());
+        assert!(
+            st.is_blacklisted(MediaKind::Movie, 27205, "h1".into())
+                .await
+        );
+        assert_eq!(*added.lock().unwrap(), vec!["h2".to_string()]);
+    }
+
+    /// A stalled download whose delete failed is rejected again on the very next tick: the stall
+    /// timer that tripped is kept, not restarted (which would wait out another `STALL_TIMEOUT_SECS`
+    /// with the dead download still in the account).
+    #[tokio::test]
+    async fn a_stalled_download_whose_delete_failed_is_retried_next_tick() {
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::watchlist("a"),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let provider = Arc::new(FailSomeDeletes::new(
+            MockProvider {
+                torrent_info: Some(TI {
+                    id: "tid_h1".into(),
+                    hash: "h1".into(),
+                    status: "downloading".into(),
+                    files: vec![TorrentFile {
+                        id: 0,
+                        path: "Movie.2023.1080p.x265.mkv".into(),
+                        bytes: 10,
+                        selected: 1,
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &["tid_h1"],
+        ));
+        let eng = AcquisitionEngine::new(
+            provider.clone(),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+            prefs(),
+            5,
+            Duration::from_millis(300),
+            Duration::from_secs(600),
+        );
+        let listing = [torrent("tid_h1", "h1", "downloading", 10.0)];
+        eng.observe(&listing).await; // starts the stall timer
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        eng.observe(&listing).await; // stalled: the delete fails
+        assert_eq!(provider.take_deleted(), vec!["tid_h1"]);
+        assert!(st.get_owned("h1".into()).await.is_some());
+
+        provider.heal();
+        let gone = eng.observe(&listing).await;
+        assert_eq!(provider.take_deleted(), vec!["tid_h1"], "retried at once");
+        assert_eq!(gone, std::collections::HashSet::from(["h1".to_string()]));
+        assert!(st.get_owned("h1".into()).await.is_none());
+        assert!(
+            st.is_blacklisted(MediaKind::Movie, 27205, "h1".into())
+                .await
+        );
+    }
+
+    /// `observe` reports the hashes whose listed torrents it deleted (a probe reject, a second
+    /// WrongTitle strike), so the scan loop drops them from the listing it shows that tick.
+    #[tokio::test]
+    async fn observe_returns_the_hashes_it_deleted() {
+        let pending = OwnedRecord {
+            request: req(),
+            provenance: Provenance::watchlist("a"),
+            added_at: now_secs(),
+            status: OwnedStatus::Pending,
+            provides: vec![],
+            quality: None,
+        };
+        let provider = || -> Arc<dyn DebridProvider> {
+            Arc::new(MockProvider {
+                torrent_info: Some(downloaded_movie("t1", "h1")),
+                resolved_url: Some("https://cdn/file".into()),
+                ..Default::default()
+            })
+        };
+        let listing = [torrent("t1", "H1", "downloaded", 100.0)];
+
+        // A probe reject.
+        let st = store();
+        st.put_owned("h1".into(), pending.clone()).await.unwrap();
+        let eng = engine(
+            provider(),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Err(ProbeError::Corrupt))),
+            st.clone(),
+        );
+        assert_eq!(
+            eng.observe(&listing).await,
+            std::collections::HashSet::from(["h1".to_string()])
+        );
+
+        // WrongTitle: nothing on the first strike, the hash on the second.
+        let st = store();
+        st.put_owned("h1".into(), pending).await.unwrap();
+        let eng = engine(
+            provider(),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(false)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        assert!(eng.observe(&listing).await.is_empty());
+        assert_eq!(
+            eng.observe(&listing).await,
+            std::collections::HashSet::from(["h1".to_string()])
+        );
+    }
+
+    /// A second WrongTitle strike whose delete fails keeps the strike, so the next tick (one more
+    /// mismatch) retries the delete instead of starting the two strikes over.
+    #[tokio::test]
+    async fn a_wrong_title_whose_delete_failed_keeps_its_strike() {
+        let st = store();
+        st.put_owned(
+            "h1".into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::watchlist("a"),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let provider = Arc::new(FailSomeDeletes::new(
+            MockProvider {
+                torrent_info: Some(downloaded_movie("t1", "h1")),
+                ..Default::default()
+            },
+            &["t1"],
+        ));
+        let eng = engine(
+            provider.clone(),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(false)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        let listing = [torrent("t1", "h1", "downloaded", 100.0)];
+        eng.observe(&listing).await; // strike 1
+        eng.observe(&listing).await; // strike 2: the delete fails
+        assert_eq!(provider.take_deleted(), vec!["t1"]);
+        assert!(st.get_owned("h1".into()).await.is_some());
+        provider.heal();
+        assert_eq!(
+            eng.observe(&listing).await,
+            std::collections::HashSet::from(["h1".to_string()])
+        );
+        assert_eq!(provider.take_deleted(), vec!["t1"]);
+        assert!(st.get_owned("h1".into()).await.is_none());
     }
 
     /// Removes `hash`'s owned record while probing it (a concurrent `execute_remove`), then passes.
@@ -5420,10 +5908,21 @@ mod tests {
         run_pack_gate_q(q(single_score), q(pack_score)).await
     }
 
-    /// [`run_pack_gate`] with explicit (possibly unknown) qualities for the single and the pack.
+    /// [`run_pack_gate`] with explicit (possibly unknown) qualities for the single and the pack. The
+    /// pack's probe passes, so it is recorded checked.
     async fn run_pack_gate_q(
         single_q: Option<crate::release::QualitySummary>,
         pack_q: Option<crate::release::QualitySummary>,
+    ) -> Store {
+        run_pack_gate_probed(single_q, pack_q, true).await
+    }
+
+    /// [`run_pack_gate_q`], the pack's probe passing (`checked`) or finding no tracks (an `Accept`,
+    /// so the pack is recorded unchecked).
+    async fn run_pack_gate_probed(
+        single_q: Option<crate::release::QualitySummary>,
+        pack_q: Option<crate::release::QualitySummary>,
+        checked: bool,
     ) -> Store {
         let st = store();
         let base = AcquireRequest {
@@ -5508,11 +6007,19 @@ mod tests {
             resolved_url: Some("https://cdn/e01".into()),
             ..Default::default()
         });
+        let tracks = if checked {
+            vec![Track {
+                kind: crate::probe::TrackKind::Audio,
+                language: Some("eng".into()),
+            }]
+        } else {
+            vec![]
+        };
         let eng = engine(
             provider,
             Arc::new(MockScraper { candidates: vec![] }),
             Arc::new(OkValidator(true)),
-            Arc::new(CannedProber(Ok(vec![]))),
+            Arc::new(CannedProber(Ok(tracks))),
             st.clone(),
         );
         eng.observe(&[
@@ -5521,6 +6028,83 @@ mod tests {
         ])
         .await;
         st
+    }
+
+    /// The gate ranks like the scan loop's selection repoint (quality first, the score only within
+    /// equal quality), so that pass never moves the slot straight back: a 1080p BluRay x265 pack
+    /// whose HEVC bonus out-scores a 1080p REMUX x264 single, or an unchecked pack of the single's
+    /// quality, never takes the single's slot.
+    #[tokio::test]
+    async fn observe_pack_slot_gate_ranks_quality_before_score() {
+        let q = |tier: i64, score: i64| {
+            Some(crate::release::QualitySummary {
+                cached: true,
+                source_tier: tier,
+                resolution: 1080,
+                score,
+                unverified: false,
+            })
+        };
+        let slot = |st: Store| async move {
+            st.get_selection(crate::store::episode_slot(27205, 1, 1))
+                .await
+                .unwrap()
+                .hash
+        };
+        let st = run_pack_gate_q(q(8_000, 1_000_000), q(6_000, 1_100_000)).await;
+        assert_eq!(slot(st.clone()).await, "hsingle");
+        assert_eq!(
+            st.get_selection(crate::store::episode_slot(27205, 1, 2))
+                .await
+                .unwrap()
+                .hash,
+            "hpack",
+            "the pack still claims the empty E02 slot"
+        );
+        let st = run_pack_gate_probed(q(8_000, 1_000_000), q(8_000, 2_000_000), false).await;
+        assert_eq!(slot(st.clone()).await, "hsingle", "an unchecked pack");
+        // Nothing for the repoint planner to move back.
+        let owned = st.all_owned().await;
+        let selection = st.all_selection().await;
+        let single = TI {
+            hash: "hsingle".into(),
+            files: vec![TorrentFile {
+                id: 0,
+                path: "E01.single.mkv".into(),
+                bytes: 1_000_000_000,
+                selected: 1,
+            }],
+            ..Default::default()
+        };
+        let pack = TI {
+            hash: "hpack".into(),
+            files: vec![
+                TorrentFile {
+                    id: 0,
+                    path: "Show.S01E01.mkv".into(),
+                    bytes: 1_000_000_000,
+                    selected: 1,
+                },
+                TorrentFile {
+                    id: 1,
+                    path: "Show.S01E02.mkv".into(),
+                    bytes: 1_000_000_000,
+                    selected: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        let plan = crate::selection::plan_selection_repoints(
+            &owned,
+            &selection,
+            &[&single, &pack],
+            crate::selection::RepointRules {
+                max_resolution: 1080,
+                allow_resolution_downgrade: false,
+            },
+            &prefs(),
+        );
+        assert!(plan.is_empty(), "{plan:?}");
     }
 
     #[tokio::test]

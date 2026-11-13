@@ -144,8 +144,12 @@ pub fn plan_selection_repoints(
         {
             continue;
         }
-        let cur_rank = served_rank(cur.quality.as_ref(), &entry.file_path);
         let group = by_title.get(&(is_movie, tmdb));
+        // A title held once has nothing to move to (skip the parses below).
+        if group.is_none_or(|g| g.iter().all(|(h, _)| *h == current)) {
+            continue;
+        }
+        let cur_rank = served_rank(cur.quality.as_ref(), &entry.file_path);
         // The title's audio requirement, resolved as acquisition resolves it: from the served
         // record's languages, else from any record of the title that has them (a mirror record
         // lacks them until the upgrade pass backfills them).
@@ -185,7 +189,7 @@ pub fn plan_selection_repoints(
         // an unchecked copy only for a strictly higher resolution. With downgrades allowed it moves
         // slots off copies above the ceiling, so no slot moves onto one.
         let allowed = |rank: crate::release::QualityRank| {
-            (rank.checked || !cur_rank.checked || rank.resolution > cur_rank.resolution)
+            unchecked_may_displace(rank, cur_rank)
                 && !(rules.allow_resolution_downgrade && rank.resolution > rules.max_resolution)
         };
         // A movie copy that is a multi-film collection never takes a slot: its largest film (the
@@ -198,9 +202,13 @@ pub fn plan_selection_repoints(
         let best = group
             .into_iter()
             .flatten()
+            // The record-rank test is exact and cheap, so it runs before the file lookup and the
+            // parse: `served_rank` only ever lowers a record's axes, so a copy whose record does not
+            // outrank the served file can't serve a file that does.
             .filter(|(h, r)| {
                 *h != current
                     && episode.is_none_or(|ep| r.provides.contains(&ep))
+                    && crate::release::quality_rank(r.quality.as_ref()) > cur_rank
                     && !(is_movie && collection(h))
             })
             .filter_map(|(h, r)| file_for(h, episode).map(|path| (*h, *r, path)))
@@ -240,8 +248,9 @@ pub fn plan_selection_repoints(
 /// keeps it, so an engine release with untagged episode files keeps its scraped quality), and the
 /// file counts as checked only when the record is and the file is MKV/MP4 (the containers the probe
 /// reads). Applied alike to the served copy and to every candidate, so a repoint still strictly
-/// raises the slot's rank and repeated passes converge.
-fn served_rank(
+/// raises the slot's rank and repeated passes converge. It never exceeds the record's rank on any
+/// axis, so never lexicographically either.
+pub(crate) fn served_rank(
     record: Option<&crate::release::QualitySummary>,
     file_path: &str,
 ) -> crate::release::QualityRank {
@@ -266,6 +275,34 @@ fn served_rank(
         },
         checked: rank.checked && file.container.is_verifiable(),
     }
+}
+
+/// Whether a copy of rank `new` may take a slot from one of rank `cur` as far as checking goes: a
+/// slot serving a checked copy moves onto an unchecked one only for a strictly higher resolution
+/// (the upgrade engine's unverified rule swaps an unchecked copy for a checked one of a possibly
+/// lower tier at the same resolution, which must not be undone).
+pub(crate) fn unchecked_may_displace(
+    new: crate::release::QualityRank,
+    cur: crate::release::QualityRank,
+) -> bool {
+    new.checked || !cur.checked || new.resolution > cur.resolution
+}
+
+/// Whether a copy may take an episode slot from the copy serving it, each given as its record's
+/// quality and the file it would serve: the [`served_rank`] of its file is higher (subject to
+/// [`unchecked_may_displace`]), or equal with a score at least as high. `observe`'s gate for a newly
+/// verified pack meeting a slot another owned release serves. [`plan_selection_repoints`] moves a
+/// slot only on a STRICTLY higher served rank under the same rules, so it never moves a slot back
+/// from what this gate chose.
+pub(crate) fn takes_slot_from(
+    new: (Option<&crate::release::QualitySummary>, &str),
+    cur: (Option<&crate::release::QualitySummary>, &str),
+) -> bool {
+    let new_rank = served_rank(new.0, new.1);
+    let cur_rank = served_rank(cur.0, cur.1);
+    let score = |q: Option<&crate::release::QualitySummary>| q.map(|q| q.score).unwrap_or(i64::MIN);
+    unchecked_may_displace(new_rank, cur_rank)
+        && (new_rank > cur_rank || (new_rank == cur_rank && score(new.0) >= score(cur.0)))
 }
 
 /// A parsed slot key ([`crate::store::movie_slot`] / [`crate::store::episode_slot`]).
@@ -457,6 +494,87 @@ mod tests {
 
     fn eps(season: u32, n: u32) -> Vec<(u32, u32)> {
         (1..=n).map(|e| (season, e)).collect()
+    }
+
+    /// The planner's cheap pre-filter (a copy whose record rank doesn't beat the served file's is
+    /// skipped before its file is looked up and parsed) is exact only because a file's served rank
+    /// never exceeds its record's rank.
+    #[test]
+    fn served_rank_never_exceeds_the_record_rank() {
+        let unverified = Some(QualitySummary {
+            unverified: true,
+            ..q(1080, 6_000, 5).unwrap()
+        });
+        let qualities = [
+            None,
+            q(1080, 6_000, 5),
+            q(720, 0, 5),
+            q(0, 8_000, 5),
+            q(2160, 8_000, 5), // over a 1080p ceiling
+            unverified,
+        ];
+        let files = [
+            "Show.S01E01.2160p.REMUX.mkv",
+            "Show.S01E01.480p.DVDRip.XviD.avi",
+            "Show.S01E01.mkv",
+            "Show.S01E01.avi",
+            "Movie.2020.1080p.WEB-DL.mp4",
+        ];
+        for quality in &qualities {
+            for file in files {
+                let served = served_rank(quality.as_ref(), file);
+                let record = crate::release::quality_rank(quality.as_ref());
+                assert!(
+                    served <= record,
+                    "{quality:?} {file}: {served:?} > {record:?}"
+                );
+            }
+        }
+    }
+
+    /// `observe`'s pack gate ranks like the planner: a higher-scoring pack of a lower source tier
+    /// (the HEVC bonus outweighs a tier step) or an unchecked one never takes a better single's
+    /// slot, so the planner never has to move the slot back.
+    #[test]
+    fn takes_slot_from_ranks_by_quality_before_score() {
+        let single = q(1080, 8_000, 1_000_000); // a REMUX x264 single
+        let bluray_hevc_pack = q(1080, 6_000, 1_100_000);
+        assert!(!takes_slot_from(
+            (
+                bluray_hevc_pack.as_ref(),
+                "P/Show.S01E01.1080p.BluRay.x265.mkv"
+            ),
+            (single.as_ref(), "Show.S01E01.1080p.REMUX.mkv"),
+        ));
+        let unchecked_pack = Some(QualitySummary {
+            unverified: true,
+            ..q(1080, 8_000, 2_000_000).unwrap()
+        });
+        assert!(!takes_slot_from(
+            (unchecked_pack.as_ref(), "P/Show.S01E01.mkv"),
+            (single.as_ref(), "Show.S01E01.mkv"),
+        ));
+        // A higher rank takes it; at equal rank the score decides (ties go to the newcomer).
+        assert!(takes_slot_from(
+            (q(2160, 3_000, 1).as_ref(), "P/Show.S01E01.mkv"),
+            (single.as_ref(), "Show.S01E01.mkv"),
+        ));
+        assert!(takes_slot_from(
+            (q(1080, 8_000, 1_000_000).as_ref(), "P/Show.S01E01.mkv"),
+            (single.as_ref(), "Show.S01E01.mkv"),
+        ));
+        assert!(!takes_slot_from(
+            (q(1080, 8_000, 999_999).as_ref(), "P/Show.S01E01.mkv"),
+            (single.as_ref(), "Show.S01E01.mkv"),
+        ));
+        // The file the pack would serve counts, not its best one.
+        assert!(!takes_slot_from(
+            (
+                q(1080, 8_000, 2_000_000).as_ref(),
+                "P/Show.S01E01.480p.DVDRip.XviD.avi"
+            ),
+            (single.as_ref(), "Show.S01E01.mkv"),
+        ));
     }
 
     /// The motivating case: every slot serves the S01–S02 BluRay pack, and a REMUX copy of S01

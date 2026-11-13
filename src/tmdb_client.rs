@@ -69,11 +69,11 @@ struct TmdbResponse {
 /// The outcome of a TMDB search. `Results` (possibly empty) is a genuine answer — an empty vec is a
 /// real "no such title on TMDB". `Unavailable` means the request itself failed: a transport error,
 /// a 429 or a 5xx after the retry budget (a TMDB outage), another 4xx at once (e.g. a rejected API
-/// key), or a body that doesn't decode. That is NOT the same as "no match": `identify_name` short-circuits its
-/// multi-stage fallback ladder on `Unavailable` so a single unidentifiable-during-outage torrent
-/// doesn't re-issue a full ~2.5-min retry cycle per stage (~10 min total), and makes no pick from
-/// what the other searches returned. Without the distinction every stage sees "empty" and retries
-/// the whole outage.
+/// key), or a body that doesn't decode. That is NOT the same as "no match": `identify_name`
+/// short-circuits its multi-stage fallback ladder on `Unavailable` so a single
+/// unidentifiable-during-outage torrent doesn't re-issue a full ~2.5-min retry cycle per stage
+/// (~10 min total), and makes no pick from what the other searches returned. Without the
+/// distinction every stage sees "empty" and retries the whole outage.
 #[derive(Debug)]
 pub enum SearchOutcome {
     Results(Vec<TmdbSearchResult>),
@@ -799,9 +799,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn fetch_with_retry_surfaces_real_5xx_status_after_exhaustion() {
-        // B8 lock-in: a persistent retryable 5xx must, on exhaustion, surface the REAL status
-        // (503) rather than the synthetic 502 fallback — otherwise a sustained TMDB outage would
-        // be misattributed as a bad gateway. `start_paused` auto-advances the backoff sleeps so the
+        // A persistent retryable 5xx must, on exhaustion, surface the REAL status (503) rather
+        // than the synthetic 502 fallback — otherwise a sustained TMDB outage would be
+        // misattributed as a bad gateway. `start_paused` auto-advances the backoff sleeps so the
         // 10 attempts complete instantly. Mirrors rd_client's analogous regression test.
         let (url, counter) = spawn_counting_status(503).await;
         let client = TmdbClient::new("k".into()).unwrap();

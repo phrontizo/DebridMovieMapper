@@ -2,8 +2,9 @@
 //! declares `mod common;`. Not every binary uses every helper, hence the `dead_code` allowance.
 #![allow(dead_code)]
 
-use debridmoviemapper::provider::DebridProvider;
-use debridmoviemapper::rd_client::TorrentInfo;
+use debridmoviemapper::error::AppError;
+use debridmoviemapper::provider::{DebridProvider, FileLocator};
+use debridmoviemapper::rd_client::{AddMagnetResponse, Torrent, TorrentInfo};
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::vfs::is_video_file;
 use futures_util::FutureExt;
@@ -32,6 +33,58 @@ pub fn token(var: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// A provider wrapper for live tests that must only READ the account: listings, lookups and file
+/// resolution reach the wrapped provider, while `add_magnet`, `select_files` and `delete_torrent`
+/// never do and return an error instead. Code under test that would change the account, such as the
+/// instant repair a failed read triggers (a re-add by hash; on Real-Debrid it then deletes the
+/// original), fails at that step and leaves the account as it was.
+#[derive(Debug)]
+pub struct ReadOnlyProvider(pub Arc<dyn DebridProvider>);
+
+impl ReadOnlyProvider {
+    /// The error every refused call returns: a `reqwest::Error` (the trait's error type) built
+    /// without any I/O. The refusal is logged on stderr so a failed read explains itself.
+    fn refuse(&self, call: &str) -> reqwest::Error {
+        eprintln!(
+            "read-only test provider: refused {call} on {} (this live test must not change the \
+             account)",
+            self.0.name()
+        );
+        reqwest::Client::new()
+            .get("http://[")
+            .build()
+            .expect_err("an unparseable URL can't build a request")
+    }
+}
+
+#[async_trait::async_trait]
+impl DebridProvider for ReadOnlyProvider {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+    async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
+        self.0.get_torrents().await
+    }
+    async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
+        self.0.get_torrent_info(id).await
+    }
+    async fn add_magnet(&self, _magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+        Err(self.refuse("add_magnet"))
+    }
+    async fn select_files(&self, torrent_id: &str, _file_ids: &str) -> Result<(), reqwest::Error> {
+        Err(self.refuse(&format!("select_files({torrent_id})")))
+    }
+    async fn delete_torrent(&self, torrent_id: &str) -> Result<(), reqwest::Error> {
+        Err(self.refuse(&format!("delete_torrent({torrent_id})")))
+    }
+    async fn resolve_url(&self, loc: &FileLocator) -> Result<String, AppError> {
+        self.0.resolve_url(loc).await
+    }
+    async fn invalidate(&self, loc: &FileLocator) {
+        self.0.invalidate(loc).await
+    }
 }
 
 /// A TMDB client from `TMDB_API_KEY`. A missing or blank key fails the test rather than skipping

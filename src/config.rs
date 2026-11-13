@@ -238,7 +238,8 @@ pub struct TraktConfig {
     /// every aired episode you haven't watched acquired (including ones that aired before your last
     /// watch), but only if you last watched it within this many seconds. `None` = all-time (the
     /// default) — every show you've ever watched with unwatched aired episodes qualifies.
-    /// Parsed from `TRAKT_CATCHUP_LOOKBACK` (e.g. `90d`, `12w`, `6mo`; `0`/unset = all-time).
+    /// Parsed from `TRAKT_CATCHUP_LOOKBACK` by [`parse_lookback`] (e.g. `90d`, `12w`, `6mo`/`6m`,
+    /// `1y`, `6 months`; `0`/unset = all-time).
     pub catchup_lookback_secs: Option<u64>,
     /// Extra hostnames the `/trakt` enrolment routes answer for, on top of the built-in
     /// local-network names (IP literals, `localhost`, single-label names, `.local`/`.lan`/
@@ -265,28 +266,34 @@ impl std::fmt::Debug for TraktConfig {
     }
 }
 
-/// Parse a catch-up lookback like `90d`, `12w`, `6mo` (or a bare number = days) into seconds.
-/// Empty / unset / `0` → `None` (all-time, no limit). An unparseable value warns and is treated as
-/// all-time rather than failing startup.
+/// Parse a catch-up lookback like `90d`, `12w`, `6mo`, `1y` (or a bare number = days) into seconds.
+/// The unit may follow the number after spaces and is case-insensitive: `d`/`day`/`days`,
+/// `w`/`wk`/`week`/`weeks`, `m`/`mo`/`mon`/`month`/`months` (30 days; `m` is a month, never a
+/// minute) and `y`/`yr`/`year`/`years` (365 days). Empty / unset / `0` → `None` (all-time, no
+/// limit). Any other value warns and is treated as all-time rather than failing startup.
 pub fn parse_lookback(raw: &str) -> Option<u64> {
+    const DAY: u64 = 86_400;
     let s = raw.trim().to_ascii_lowercase();
     if s.is_empty() {
         return None;
     }
-    let (num, unit_secs): (&str, u64) = if let Some(n) = s.strip_suffix("mo") {
-        (n, 30 * 86_400)
-    } else if let Some(n) = s.strip_suffix('w') {
-        (n, 7 * 86_400)
-    } else if let Some(n) = s.strip_suffix('d') {
-        (n, 86_400)
-    } else {
-        (s.as_str(), 86_400) // bare number → days
+    let digits_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(digits_end);
+    let unit_secs = match unit.trim_start() {
+        "" | "d" | "day" | "days" => Some(DAY), // bare number → days
+        "w" | "wk" | "week" | "weeks" => Some(7 * DAY),
+        "m" | "mo" | "mon" | "month" | "months" => Some(30 * DAY),
+        "y" | "yr" | "year" | "years" => Some(365 * DAY),
+        _ => None,
     };
-    match num.trim().parse::<u64>() {
-        Ok(0) => None,
-        Ok(n) => Some(n.saturating_mul(unit_secs)),
-        Err(_) => {
-            warn!("Invalid TRAKT_CATCHUP_LOOKBACK value '{raw}'; treating as all-time");
+    match (num.parse::<u64>(), unit_secs) {
+        (Ok(0), Some(_)) => None,
+        (Ok(n), Some(unit_secs)) => Some(n.saturating_mul(unit_secs)),
+        _ => {
+            warn!(
+                "Invalid TRAKT_CATCHUP_LOOKBACK value '{raw}'; treating as all-time. Use a number of \
+                 days, weeks, months or years, e.g. 90d, 12w, 6mo or 1y"
+            );
             None
         }
     }
@@ -1461,6 +1468,52 @@ mod tests {
     }
 
     #[test]
+    fn parse_lookback_accepts_the_common_unit_spellings() {
+        // An operator who sets the lookback means to BOUND catch-up, and the all-time fallback is
+        // the most expensive setting, so the natural spellings of a bounded window must parse.
+        const DAY: u64 = 86_400;
+        assert_eq!(parse_lookback("6m"), Some(6 * 30 * DAY)); // m = month, not minute
+        assert_eq!(parse_lookback("6 months"), Some(6 * 30 * DAY));
+        assert_eq!(parse_lookback("1month"), Some(30 * DAY));
+        assert_eq!(parse_lookback("2mon"), Some(2 * 30 * DAY));
+        assert_eq!(parse_lookback("1y"), Some(365 * DAY));
+        assert_eq!(parse_lookback("2yr"), Some(2 * 365 * DAY));
+        assert_eq!(parse_lookback("1 year"), Some(365 * DAY));
+        assert_eq!(parse_lookback("2Years"), Some(2 * 365 * DAY));
+        assert_eq!(parse_lookback("90days"), Some(90 * DAY));
+        assert_eq!(parse_lookback("1 day"), Some(DAY));
+        assert_eq!(parse_lookback("12 weeks"), Some(12 * 7 * DAY));
+        assert_eq!(parse_lookback("3wk"), Some(3 * 7 * DAY));
+        assert_eq!(parse_lookback("1week"), Some(7 * DAY));
+        assert_eq!(parse_lookback(" 90 d "), Some(90 * DAY));
+        assert_eq!(parse_lookback("0 months"), None); // 0 → all-time, whatever the unit
+
+        // A unit that is still unknown keeps the documented warn-and-all-time fallback.
+        assert_eq!(parse_lookback("6x"), None);
+        assert_eq!(parse_lookback("6 fortnights"), None);
+        assert_eq!(parse_lookback("months"), None);
+        assert_eq!(parse_lookback("1.5y"), None);
+    }
+
+    #[test]
+    fn parse_lookback_warning_lists_the_accepted_forms() {
+        let logs = captured_warnings(|| {
+            assert_eq!(parse_lookback("6x"), None);
+        });
+        assert!(
+            logs.contains("Invalid TRAKT_CATCHUP_LOOKBACK value '6x'")
+                && logs.contains("treating as all-time"),
+            "an unknown unit must warn, naming the variable: {logs:?}"
+        );
+        for form in ["90d", "12w", "6mo", "1y"] {
+            assert!(
+                logs.contains(form),
+                "the warning should list the accepted form {form}: {logs:?}"
+            );
+        }
+    }
+
+    #[test]
     fn trakt_catchup_lookback_parsed_into_config() {
         let t = TraktConfig::from_parts(
             Some("id".into()),
@@ -1778,5 +1831,81 @@ mod tests {
         assert_eq!(parse_cdn_first_read_bytes(Some("0".into())), mb(2));
         assert_eq!(parse_cdn_first_read_bytes(Some("1".into())), mb(2));
         assert_eq!(parse_cdn_first_read_bytes(Some("999".into())), mb(16));
+    }
+
+    /// In the container the app reads no `.env` (its working directory is `/data`), so compose.yml's
+    /// `environment:` list is the only way a setting reaches it. Every variable the service reads
+    /// must be there: a pass-through (`- NAME=${NAME:-}`; empty means the documented default) or,
+    /// for the stack's fixed paths, a literal. A knob left out (or commented out) is silently
+    /// ignored when set in `.env`, as `UPGRADE_INTERVAL_SECS=0` once was. PORT is the exception: it
+    /// sets only the published host port and must not reach the container.
+    #[test]
+    fn compose_passes_every_setting_through_to_the_container() {
+        let compose = include_str!("../compose.yml");
+        let service = compose
+            .split("\n  rclone:")
+            .next()
+            .expect("compose.yml lists the debridmoviemapper service first");
+        let sources = [
+            include_str!("config.rs"),
+            include_str!("main.rs"),
+            include_str!("jellyfin_client.rs"),
+        ];
+        let reads = regex::Regex::new(r#"(?:env::var|flag)\("([A-Z][A-Z0-9_]*)"\)"#).unwrap();
+        let mut names: Vec<&str> = sources
+            .iter()
+            .flat_map(|src| reads.captures_iter(src).map(|c| c.get(1).unwrap().as_str()))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert!(
+            [
+                "UPGRADE_INTERVAL_SECS",
+                "DEDUP_REMOVE_DUPLICATES",
+                "RUST_LOG",
+                "JELLYFIN_URL"
+            ]
+            .iter()
+            .all(|n| names.contains(n)),
+            "the scan should find the settings the service reads: {names:?}"
+        );
+
+        let entries: Vec<&str> = service
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("- "))
+            .collect();
+        let listed = |name: &str| entries.iter().any(|l| l.starts_with(&format!("- {name}=")));
+        let passed_through = |name: &str| {
+            entries
+                .iter()
+                .any(|l| l.starts_with(&format!("- {name}=${{{name}:")))
+        };
+        const FIXED: [&str; 3] = ["DB_PATH", "JELLYFIN_URL", "JELLYFIN_RCLONE_MOUNT_PATH"];
+        let mut missing = Vec::new();
+        for name in names {
+            match name {
+                "PORT" => assert!(
+                    !listed("PORT"),
+                    "PORT must not reach the container: it listens on 8080 for rclone and the \
+                     healthcheck, and PORT sets only the published host port"
+                ),
+                n if FIXED.contains(&n) => {
+                    if !listed(n) {
+                        missing.push(n);
+                    }
+                }
+                n => {
+                    if !passed_through(n) {
+                        missing.push(n);
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "compose.yml doesn't pass these settings through to the container, so a value set in \
+             .env is ignored; add `- NAME=${{NAME:-}}` for each: {missing:?}"
+        );
     }
 }

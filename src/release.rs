@@ -10,7 +10,7 @@ pub struct RawCandidate {
     pub info_hash: String,
     /// The addon-provided `fileIdx` (faithful parse output, asserted in `scraper` tests). It has NO
     /// production consumer — `release::parse` drops it, and `acquire`/`observe` select the largest
-    /// video so they always agree (B10), so a misleading addon index can't diverge them (see
+    /// video so they always agree, and a misleading addon index can't diverge them (see
     /// `acquire::select_target`). Retained deliberately as a parse-only capture that documents the
     /// Torrentio resolve-URL structure (guarded by the `hash_idx_from_url` tests), NOT dead flow to
     /// be wired into selection.
@@ -104,11 +104,13 @@ static RES_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(\d{3,4})p(?:\d{2,3})?|\b(4k|uhd)\b").unwrap());
 // Torrentio's size follows its `💾` (U+1F4BE) marker, as the seeders follow `👤`. `SIZE_RE` is the
 // fallback for a description without one: a bare `<number> <unit>` whose number doesn't start
-// inside a word or number, so a codec run (`x265.200MB`) is not read as 265.2 MB.
+// inside a word or number, so a codec run (`x265.200MB`) is not read as 265.2 MB. Both end the unit
+// at a word boundary, so a unit glued to more letters is a word, not a size (`DD5.1.TBS` is no 1 TB
+// release, `DD5.1.MBC` no 1 MB sample); `TB+` still matches, see the guard in `parse`.
 static SIZE_MARKED_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\u{1f4be}\s*([\d.]+)\s*(tb|gb|mb)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\u{1f4be}\s*([\d.]+)\s*(tb|gb|mb)\b").unwrap());
 static SIZE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)(?:^|[^a-z\d])([\d.]+)\s*(tb|gb|mb)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)(?:^|[^a-z\d])([\d.]+)\s*(tb|gb|mb)\b").unwrap());
 static SEED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{1f464}\s*(\d+)").unwrap());
 // The debrid-cached marker (`RD+`/`TB+`) matched as a WORD-BOUNDED token, not a raw substring, so a
 // release name that merely CONTAINS the letters (`Standard+`, `Hard+`, `Record+`) is not mis-flagged
@@ -170,11 +172,12 @@ fn tag_part(line: &str) -> &str {
 /// The part of one (lowercased) line in which the bare cam markers count. A show line names its
 /// episode after the episode code (`Show.S02E03.Nanny.Cam.720p.HDTV`, `Show - S01E05 - Hidden Cam
 /// WEBDL-1080p`), so there it starts at the first resolution/source/codec tag after the code. When
-/// no such tag follows (a pack's file line, `Show - S02E03 - Hidden Cam.mkv`), only the token right
-/// after the code counts (`Show.S01E01.CAM`), with its separators so the markers' boundaries still
-/// hold. Any other line: its [`tag_part`]. Telesync/cam releases of TV episodes are all but unheard
-/// of, and the unambiguous tags (`HDCAM`, `TELESYNC`, …) and a bracketed `[CAM]` still count
-/// anywhere.
+/// no such tag follows (a pack's file line, `Show - S02E03 - Hidden Cam.mkv`), the token after the
+/// code counts only when it is the line's last one, bar a container extension (`Show.S01E01.CAM`,
+/// `Show.S01E01.CAM.mkv`), with its separators so the markers' boundaries still hold: an episode
+/// title that merely starts with a cam word (`Show - S01E05 - Cam Girl.mkv`) is not a tag. Any
+/// other line: its [`tag_part`]. Telesync/cam releases of TV episodes are all but unheard of, and
+/// the unambiguous tags (`HDCAM`, `TELESYNC`, …) and a bracketed `[CAM]` still count anywhere.
 fn cam_word_part(line: &str) -> &str {
     let Some(code) = EPISODE_CODE_RE.find(line) else {
         return tag_part(line);
@@ -183,12 +186,22 @@ fn cam_word_part(line: &str) -> &str {
     if let Some(tag) = QUALITY_TAG_RE.find(rest) {
         return &rest[tag.start()..];
     }
-    let start = rest
+    // The text after the code without a trailing container extension (`.mkv`). `.ts` is one too, so
+    // a line ending `….ts` keeps reading as the container, as before.
+    let stem = crate::vfs::VIDEO_EXTENSIONS
+        .iter()
+        .find_map(|ext| rest.strip_suffix(ext))
+        .unwrap_or(rest);
+    let start = stem
         .find(|c: char| c.is_alphanumeric())
-        .unwrap_or(rest.len());
-    let end = rest[start..]
+        .unwrap_or(stem.len());
+    let end = stem[start..]
         .find(|c: char| !c.is_alphanumeric())
-        .map_or(rest.len(), |i| start + i);
+        .map_or(stem.len(), |i| start + i);
+    if stem[end..].contains(|c: char| c.is_alphanumeric()) {
+        // More than one token: an episode title, not a tag.
+        return "";
+    }
     // Keep one trailing separator: `TS_RE` needs it, and a token ending the line without one is a
     // `.ts` container extension, not a telesync tag.
     let end = rest[end..]
@@ -1754,6 +1767,11 @@ mod tests {
             "Some.Show.S02.1080p.WEB-DL.x264\nSeason 2/Some.Show.S02E03.Nanny.Cam.mkv",
             "Some.Show.S02E03.Nanny.Cam.mkv",
             "Some.Show.S02E03.Nanny.Cam",
+            // An episode title that STARTS with a cam word: the token after the code counts only
+            // when it is the line's only one (bar a container extension).
+            "Some.Show.S01.1080p.WEB-DL.x264\nSome Show - S01E05 - Cam Girl.mkv",
+            "Some.Show.S01E05.Cam.Girl.mkv",
+            "Some Show - S01E07 - Screener Day.mkv",
         ] {
             let c = raw(
                 "Torrentio\n1080p",
@@ -2368,12 +2386,25 @@ mod tests {
             ("Show.S01.720p.WEB-DL.x265.200MB", 200_000_000),
             ("Movie.2020.1080p.WEB.5.2GB", 5_200_000_000),
             ("4.7GB Movie.2020.1080p", 4_700_000_000),
+            (
+                "Show.S01E01.DDP5.1.TBS.WEB-DL.x264 2.3 GB",
+                (2.3 * 1_000_000_000.0) as u64,
+            ),
         ] {
             assert_eq!(
                 parse(&raw("x", desc, "a", None)).size_bytes,
                 Some(size),
                 "{desc}"
             );
+        }
+        // A unit glued to more letters is a word, not a size: the `TBS` network tag after an audio
+        // `5.1` is no 1 TB release, nor a `MBC` broadcaster tag a 1 MB sample.
+        for desc in [
+            "Show.S01E01.DDP5.1.TBS.WEB-DL.x264",
+            "Movie.2020.1080p.DD5.1.MBC.WEB",
+            "Show.S01E01.1080p.WEB.H.264.TBS",
+        ] {
+            assert_eq!(parse(&raw("x", desc, "a", None)).size_bytes, None, "{desc}");
         }
     }
 

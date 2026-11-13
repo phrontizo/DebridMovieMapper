@@ -41,6 +41,24 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      # THIRD-PARTY-NOTICES ships in the image and must match Cargo.lock (see CLAUDE.md), so a
+      # Dependabot cargo bump fails here until the regenerated file is pushed. The version is the
+      # one that generated the committed file, which keeps the output byte-identical: bump it here
+      # and in release.yml when the file is regenerated with a newer cargo-about.
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
+
+      - name: Check THIRD-PARTY-NOTICES matches Cargo.lock
+        run: |
+          cargo fetch --locked
+          cargo about generate --offline --locked -o "$RUNNER_TEMP/THIRD-PARTY-NOTICES" about.hbs
+          if ! diff -u THIRD-PARTY-NOTICES "$RUNNER_TEMP/THIRD-PARTY-NOTICES"; then
+            echo "::error file=THIRD-PARTY-NOTICES::THIRD-PARTY-NOTICES is out of date with Cargo.lock. Regenerate it with cargo-about 0.9.3: cargo about generate --offline --locked -o THIRD-PARTY-NOTICES about.hbs"
+            exit 1
+          fi
+
   test:
     needs: lint
     runs-on: ubuntu-latest

@@ -232,10 +232,18 @@ async fn run_acquire(kind: ProviderKind, provider_token: String, label: &str) {
         Ok(None) => panic!("[{label}] TMDB found no title for Sintel's IMDB id {imdb}"),
         Err(e) => panic!("[{label}] TMDB find_by_imdb({imdb}) failed: {e}"),
     };
+    // A failed lookup must fail the test, not fall back to empty details: an empty title and no
+    // original language would run acquisition and the probe with no audio-language requirement,
+    // a weaker path than production takes.
     let details = tmdb
         .details(tmdb_id, mtype.clone())
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| panic!("[{label}] TMDB details({tmdb_id}) failed: {e}"));
+    assert!(
+        details.original_language.is_some(),
+        "[{label}] TMDB details for Sintel carry no original_language, so the audio-language \
+         check would go untested"
+    );
     let req = debridmoviemapper::store::AcquireRequest {
         imdb_id: imdb.to_string(),
         tmdb_id,

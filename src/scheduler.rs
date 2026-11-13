@@ -42,19 +42,18 @@ where
         // already bails mid-work, so the periodic jobs must too. The job is CANCELLED, not drained:
         // dropping its future stops it at the await point it is parked on. The jobs are idempotent
         // and all persistence is via ACID redb writes, so a later tick redoes the work. What a
-        // cancelled tick can leave behind is a provider torrent it added but never recorded. An
-        // upgrade candidate cut off mid-staging keeps its staging intent open, so the account mirror
-        // never adopts the unchecked release and the scan loop's staging sweep deletes it
-        // (`upgrade::sweep_staging_intents`). An `acquire` cut off between its add and its `Pending`
-        // record (a provider call or two) leaves a torrent the account mirror adopts as a
-        // pre-existing copy.
+        // cancelled tick can leave behind is a provider torrent it added but never recorded. Both
+        // add paths open a staging intent before the add and close it once the hash is recorded:
+        // an upgrade candidate cut off mid-staging, and an `acquire` cut off between its add and its
+        // `Pending` record, keep theirs open, so the account mirror never adopts the unchecked
+        // release and the scan loop's staging sweep deletes it (`upgrade::sweep_staging_intents`).
         // Run the job under `catch_unwind` so a panic in ONE tick is logged and the schedule
         // continues, rather than unwinding `periodic` and silently disabling this subsystem for the
         // process lifetime (a `JoinError` would otherwise surface only at shutdown). `catch_unwind`
         // (not `tokio::spawn`) is used so the mid-tick cancellation below is preserved — spawning
         // would detach the task on shutdown instead of dropping it. A caught panic leaves at worst
-        // what a cancellation does (above): a staging intent the daily sweep picks up once it is
-        // older than `upgrade::STAGING_ABANDONED_AFTER_SECS`.
+        // what a cancellation does (above): a staging intent the scan loop's sweep picks up once it
+        // is older than `upgrade::STAGING_ABANDONED_AFTER_SECS`.
         // The `job()` invocation itself is wrapped in the caught async block (not evaluated eagerly as
         // `catch_unwind(job())` would), so a panic while *constructing* a tick's future is caught too,
         // not just a panic while polling it.

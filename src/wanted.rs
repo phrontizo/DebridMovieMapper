@@ -126,14 +126,23 @@ pub fn wants(r: &WantedRecord) -> bool {
 ///   ignored, see [`SPECIALS_SEASON`]). An `aired` set with no regular episodes makes the
 ///   "all aired watched" clause vacuously true, so an ended show with nothing aired is finished
 ///   (the episode monitor's `guard_removal_on_incomplete_aired` refuses removal on such a set).
+///   A show Trakt reports the user is behind on (`trakt_behind`: the catch-up source, including a
+///   show the sync assumed behind because it couldn't ask) is never finished, whatever TMDB's
+///   aired set says: TMDB can lack an episode Trakt counts as aired (no air date yet, a double
+///   episode Trakt splits, a finale whose UTC air time precedes TMDB's local date), and a show the
+///   user hasn't finished must not be finish-removed (nor its unwatched episode skipped).
 ///
 /// `aired` is the TMDB-sourced aired-episode list for shows and is IGNORED for movies;
 /// callers pass `&[]` for movies.
 pub fn user_finished(r: &WantedRecord, aired: &[(u32, u32)]) -> bool {
     match &r.watched_state {
         WatchedState::Movie { watched } => *watched,
-        WatchedState::Show { watched_episodes } => {
-            r.show_status == Some(ShowStatus::Ended)
+        WatchedState::Show {
+            watched_episodes,
+            trakt_behind,
+        } => {
+            !trakt_behind
+                && r.show_status == Some(ShowStatus::Ended)
                 && aired
                     .iter()
                     .filter(|e| is_regular_episode(e))
@@ -150,7 +159,10 @@ pub fn user_finished(r: &WantedRecord, aired: &[(u32, u32)]) -> bool {
 /// With no wanters, Trigger A never fires and (with no watchlist provenance) neither does Trigger B,
 /// so such a title is KEPT. Trigger A in practice reclaims a title still in `/sync/playback` while
 /// already watched (a paused re-watch), or a show that `REMOVE_FINISHED_SHOWS` folds back into the
-/// wanted set once it is finished and ended.
+/// wanted set once it is finished and ended. A catch-up show (one Trakt reports the user behind on,
+/// or that the sync assumed behind) never counts as finished ([`user_finished`]), so a show wanted
+/// only through catch-up is never finish-removed on TMDB's aired set alone: with
+/// `REMOVE_FINISHED_SHOWS` off, only a paused re-watch still in `/sync/playback` can be.
 ///
 /// A **watchlisted** title is an explicit "keep this available" signal and is NEVER finished-removed:
 /// re-adding a title you've already watched to your watchlist means you want to (re)watch it, so it
@@ -310,9 +322,9 @@ pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
                     // real catch-up wanter has already seen. Matches the "EVERY catch-up wanter" doc.
                     .filter(|r| wants(r))
                     .filter_map(|r| match &r.watched_state {
-                        WatchedState::Show { watched_episodes } => {
-                            Some(watched_episodes.iter().copied().collect())
-                        }
+                        WatchedState::Show {
+                            watched_episodes, ..
+                        } => Some(watched_episodes.iter().copied().collect()),
                         WatchedState::Movie { .. } => None,
                     })
                     .collect();
@@ -411,9 +423,26 @@ mod tests {
             },
             watched_state: WatchedState::Show {
                 watched_episodes: watched_eps,
+                trakt_behind: false,
             },
             show_status: Some(status),
             imdb_id: None,
+        }
+    }
+
+    /// [`show_record`] for a catch-up wanter Trakt reports behind on the show.
+    fn behind_show_record(
+        user: &str,
+        tmdb: u64,
+        watched_eps: Vec<(u32, u32)>,
+        status: ShowStatus,
+    ) -> WantedRecord {
+        WantedRecord {
+            watched_state: WatchedState::Show {
+                watched_episodes: watched_eps,
+                trakt_behind: true,
+            },
+            ..show_record(user, tmdb, false, true, vec![], status)
         }
     }
 
@@ -1028,6 +1057,60 @@ mod tests {
         );
     }
 
+    /// TMDB reads the Ended show as fully watched, but Trakt (the catch-up source) says the user is
+    /// behind — e.g. a finale TMDB lists without an air date yet. Trigger A must not remove it (with
+    /// `REMOVE_FINISHED_SHOWS` off nothing may be finish-removed), and the acquire-side guard must
+    /// not read it as finished either. The same record without the verdict — a show the
+    /// `REMOVE_FINISHED_SHOWS` finish-cleanup folds in — is still removed.
+    #[test]
+    fn a_show_trakt_reports_behind_is_never_finish_removed() {
+        let aired = vec![(1, 1), (1, 2)];
+        let engine_owned = || {
+            Some(owned(
+                "h",
+                Provenance::in_progress("alice"),
+                true,
+                aired.clone(),
+            ))
+        };
+        let behind = show_title(
+            40,
+            vec![behind_show_record(
+                "alice",
+                40,
+                aired.clone(),
+                ShowStatus::Ended,
+            )],
+            engine_owned(),
+            aired.clone(),
+        );
+        assert!(!user_finished(&behind.wanted[0], &aired));
+        assert!(!should_remove(&behind));
+        assert_eq!(reconcile_title(&behind), vec![], "kept, nothing to acquire");
+
+        let folded = show_title(
+            40,
+            vec![show_record(
+                "alice",
+                40,
+                false,
+                true,
+                aired.clone(),
+                ShowStatus::Ended,
+            )],
+            engine_owned(),
+            aired.clone(),
+        );
+        assert_eq!(
+            reconcile_title(&folded),
+            vec![Action::Remove {
+                tmdb_id: 40,
+                hash: "h".into(),
+                reason: RemoveReason::Finished,
+            }]
+        );
+    }
+
     // ── acquire ───────────────────────────────────────────────────────────────
 
     #[test]
@@ -1416,6 +1499,7 @@ mod tests {
             },
             watched_state: WatchedState::Show {
                 watched_episodes: vec![(1, 1)],
+                trakt_behind: false,
             }, // … but state is Show
             show_status: Some(ShowStatus::Ended),
             imdb_id: None,

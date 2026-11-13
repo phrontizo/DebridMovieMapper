@@ -16,6 +16,20 @@ pub(crate) fn synthetic_bad_gateway(detail: &'static [u8]) -> reqwest::Error {
     .expect_err("BAD_GATEWAY always yields an error status")
 }
 
+/// A 404 `reqwest::Error`, as TorBox's `mylist?id=` sometimes answers for a torrent that exists.
+/// Shared by the tests that script such a lookup.
+#[cfg(test)]
+pub(crate) fn not_found_error() -> reqwest::Error {
+    reqwest::Response::from(
+        hyper::Response::builder()
+            .status(reqwest::StatusCode::NOT_FOUND)
+            .body(hyper::body::Bytes::new())
+            .expect("an empty 404 response always builds"),
+    )
+    .error_for_status()
+    .expect_err("404 is an error status")
+}
+
 /// Per-request timeout for the synchronous on-read resolve calls (RD `unrestrict/link`, TorBox
 /// `requestdl`), overriding the clients' 60 s default. Both answer with a small JSON body in well
 /// under a second, so this only bites an endpoint that accepts the connection and then hangs — which
@@ -402,14 +416,7 @@ mod tests {
                 return Err(synthetic_bad_gateway(b"down"));
             }
             if n < self.misses {
-                return Err(reqwest::Response::from(
-                    hyper::Response::builder()
-                        .status(404)
-                        .body(hyper::body::Bytes::new())
-                        .unwrap(),
-                )
-                .error_for_status()
-                .unwrap_err());
+                return Err(not_found_error());
             }
             Ok(TorrentInfo::default())
         }

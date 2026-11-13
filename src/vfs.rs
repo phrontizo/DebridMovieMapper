@@ -16,9 +16,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub type SelectionMap = std::collections::HashMap<String, crate::store::SelectionEntry>;
 
 /// Parse ALL `(season, episode)` pairs a file name declares: a single `SxxEyy`, a contiguous
-/// MULTI-episode file (`S01E01E02`, `S01E01-E02`, `S01E01.E02`), or the dash-concatenated absolute
-/// code (`Show - 409 - Title` → `[(4, 9)]`). Empty when no episode code is found. The first element
-/// is the file's FIRST code (`parse_se`).
+/// MULTI-episode file (`S01E01E02`, `S01E01-E02`, `S01E01.E02`, Sonarr's "Extend" `S01E01-02`), or
+/// the dash-concatenated absolute code (`Show - 409 - Title` → `[(4, 9)]`). Empty when no episode
+/// code is found. The first element is the file's FIRST code (`parse_se`).
 ///
 /// The VFS build uses every code for its selection gate (a double-episode file stays visible while
 /// any episode it carries is not served by another copy), and the first one for season placement.
@@ -33,11 +33,14 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// The `SxxEyy` arm is deliberately NOT word-anchored (unlike `SEASON_RE`); a literal `e` must
 /// immediately follow the season digits, so a mid-token match is very unlikely in practice. Each
 /// continuation REQUIRES an explicit `e` before its number so a resolution/codec token can't be
-/// mis-parsed as an episode (`S01E01.1080p` → the `.1080` has no `e`, so it is NOT a continuation).
+/// mis-parsed as an episode (`S01E01.1080p` → the `.1080` has no `e`, so it is NOT a continuation),
+/// except a dash-only one directly after the code (`S01E01-02-03`), which counts only when it is a
+/// whole number naming the NEXT episode (so `S01E05-720p`, `S01E09-10bit` and `S01E05-5.1` don't).
 ///
-/// KNOWN LIMITATIONS: a RANGE form spanning more than two episodes (`S01E01-E03`) yields only the
-/// explicit endpoints `[(1,1),(1,3)]` (the middle one may be re-acquired as a duplicate; such
-/// single files are uncommon); and a 3-digit dash code is decoded as concatenated `SxxEyy`, so an
+/// KNOWN LIMITATIONS: a RANGE form spanning more than two episodes yields only the explicit
+/// endpoints (`S01E01-E03` → `[(1,1),(1,3)]`) or, without the `e`, only the first episode
+/// (`S01E01-03` → `[(1,1)]`), so the middle ones may be re-acquired as duplicates (such single
+/// files are uncommon); and a 3-digit dash code is decoded as concatenated `SxxEyy`, so an
 /// absolute (anime) number (`One Piece - 409 - …`) reads as a phantom `(4, 9)`, which can suppress
 /// re-acquiring the real S04E09 and write a wrong selection slot — accepted, since concatenated
 /// Western packs are far more common and an empty `provides` was worse. Exactly 3 digits (season
@@ -48,6 +51,7 @@ pub(crate) fn parse_se_all(name: &str) -> Vec<(u32, u32)> {
     static SE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})e(\d{1,3})((?:[-_. ]?e\d{1,3})*)").unwrap());
     static EP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)e(\d{1,3})").unwrap());
+    static DASH_NEXT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^-(\d{1,3})\b").unwrap());
     static DASH_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s-\s(\d{3})\s-\s").unwrap());
     if let Some(c) = SE.captures(name) {
         // The `\d{1,2}`/`\d{1,3}` captures always parse to `u32`, so this always returns when `SE`
@@ -65,6 +69,23 @@ pub(crate) fn parse_se_all(name: &str) -> Vec<(u32, u32)> {
                         }
                     }
                 }
+            }
+            // Sonarr's "Extend" style (`S01E01-02-03`): a dash-only continuation counts only when it
+            // names the NEXT episode, so a resolution/bit-depth/audio token after a dash
+            // (`-720p`, `-10bit`, `-5.1`) and a dash-number range (`S01E01-10`) are not read as one.
+            let mut tail = c.get(0).map_or("", |m| &name[m.end()..]);
+            while let Some(next) = DASH_NEXT.captures(tail) {
+                let (Some(whole), Some(e)) = (
+                    next.get(0),
+                    next.get(1).and_then(|m| m.as_str().parse::<u32>().ok()),
+                ) else {
+                    break;
+                };
+                if eps.last().is_none_or(|&(_, last)| e != last + 1) || eps.contains(&(s, e)) {
+                    break;
+                }
+                eps.push((s, e));
+                tail = &tail[whole.end()..];
             }
             return eps;
         }
@@ -277,9 +298,12 @@ static SEASON_RE: LazyLock<Regex> = LazyLock::new(|| {
     // as a season while `S05E01`/`S5` still are. The `season`/`part` arms accept any scene separator
     // (`[\s._-]*`), not just whitespace, so `Season.2`/`Part_2`/`Season-2` (the common dotted scene
     // form) resolve rather than mis-foldering to season 1. The `NxNN` arm is bounded to a 1-2 digit
-    // season so a "WIDTHxHEIGHT" pixel resolution (e.g. 1920x1080) is not mistaken for one.
+    // season so a "WIDTHxHEIGHT" pixel resolution (e.g. 1920x1080) is not mistaken for one. The
+    // `Part N` arm (group 4) is word-bounded with a 1-2 digit number, so a title word
+    // (`Counterpart.2017`) or a year is never read as a season; it is also the WEAKEST signal
+    // (`season_tokens`), since it is as often a two-part episode title as a season.
     Regex::new(
-        r"(?i)\bs(\d{1,2})(?:e|\b)|season[\s._-]*(\d+)|\b(\d{1,2})x\d{1,3}\b|part[\s._-]*(\d+)",
+        r"(?i)\bs(\d{1,2})(?:e|\b)|season[\s._-]*(\d+)|\b(\d{1,2})x\d{1,3}\b|\bpart[\s._-]*(\d{1,2})\b",
     )
     .unwrap()
 });
@@ -680,31 +704,15 @@ impl DebridVfs {
                                         // handles both SxxExx AND the dash-concatenated "Show - 409 -
                                         // Title" absolute-code form, so such a pack's episodes land
                                         // in the right Season folder (a double-episode file goes
-                                        // under its first episode's season). Fall back to SEASON_RE
-                                        // for the patterns `parse_se_all` doesn't cover ("1x09",
-                                        // "Season 4", "Part 2"), then default to season 1.
-                                        let season = se
-                                            .map(|(s, _)| s)
-                                            .or_else(|| season_from(filename))
-                                            // Only when the basename yields nothing: season packs
-                                            // often encode the season in the PARENT DIRECTORY
-                                            // ("Show/Season 04/09 - Title.mkv") rather than the
-                                            // filename. Filename precedence is preserved (this runs
-                                            // last), so a contradictory "1x05" in a "/Season 03/"
-                                            // path still prefers the filename. The NEAREST
-                                            // directory that names a season wins: a TorBox path
-                                            // includes the torrent's root folder, and a
-                                            // multi-season pack's root
-                                            // ("Show.S01-S03/Season 2/01.mkv") would otherwise put
-                                            // every season in the root's first one.
-                                            .or_else(|| {
-                                                let dir =
-                                                    &file.path[..file.path.len() - filename.len()];
-                                                dir.rsplit('/')
-                                                    .filter(|c| !c.is_empty())
-                                                    .find_map(season_from)
-                                            })
-                                            .unwrap_or(1);
+                                        // under its first episode's season). Otherwise SEASON_RE
+                                        // covers the patterns `parse_se_all` doesn't ("1x09",
+                                        // "Season 4", "Part 2") in the file name and then its
+                                        // directories, nearest first, with a `Part N` in the file
+                                        // name as the weakest signal (`season_of_codeless_file`),
+                                        // then season 1.
+                                        let season = se.map(|(s, _)| s).unwrap_or_else(|| {
+                                            season_of_codeless_file(&file.path, filename)
+                                        });
 
                                         let season_name = format!("Season {:02}", season);
                                         let season_dir = show_children
@@ -1217,20 +1225,50 @@ fn normalize_dir_component(component: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Extract a season number from an arbitrary string (a filename or one directory name) via
-/// SEASON_RE, returning the first populated capture group (`Sxx` / `Season N` / `NxNN` / `Part N`).
-/// Shared by the filename check and the parent-directory fallback in the show-emit loop, which tries
-/// the file's directories nearest first.
-fn season_from(s: &str) -> Option<u32> {
-    SEASON_RE
-        .captures(s)
-        .and_then(|cap| {
-            cap.get(1)
-                .or_else(|| cap.get(2))
-                .or_else(|| cap.get(3))
-                .or_else(|| cap.get(4))
+/// The season numbers an arbitrary string (a file name or one directory name) names via SEASON_RE,
+/// as `(strong, part)`: `strong` from its first `Sxx` / `Season N` / `NxNN` token, `part` from its
+/// first `Part N` token. Kept apart because `Part N` is the weaker signal (a two-part episode title
+/// as often as a season). Used by the season-folder placement in the show-emit loop.
+fn season_tokens(s: &str) -> (Option<u32>, Option<u32>) {
+    let (mut strong, mut part) = (None, None);
+    for cap in SEASON_RE.captures_iter(s) {
+        let number = |i| cap.get(i).and_then(|m| m.as_str().parse::<u32>().ok());
+        strong = strong.or_else(|| number(1).or_else(|| number(2)).or_else(|| number(3)));
+        part = part.or_else(|| number(4));
+        if strong.is_some() && part.is_some() {
+            break;
+        }
+    }
+    (strong, part)
+}
+
+/// The season folder of a show file with no `parse_se_all` episode code, from strongest signal to
+/// weakest: an `Sxx` / `Season N` / `NxNN` token in the file name; else the NEAREST directory that
+/// names a season (preferring such a strong token within one directory name over its `Part N`); else
+/// a `Part N` in the file name; else season 1.
+///
+/// The file name keeps precedence for a strong token, so a contradictory "1x05" in a "/Season 03/"
+/// path still prefers the file name. Season packs often name the season only in a directory
+/// ("Show/Season 04/09 - Title.mkv"), and the NEAREST one decides because a TorBox path includes the
+/// torrent's root folder: a multi-season pack's root ("Show.S01-S03/Season 2/01.mkv") would
+/// otherwise put every season in the root's first one. A `Part N` in the file name is usually a
+/// two-part episode title ("Season 3/05 - Title, Part 2.mkv"), so any directory season beats it. A
+/// `Part N` DIRECTORY, though, names a season (a show released in parts, "Show/Part 3/01.mkv"), and
+/// deliberately beats a season token in an outer directory too ("Show.S04/Part 2/01.mkv" lands in
+/// Season 02), since the root of such a pack often names a season RANGE ("Show.S01-S05/Part 3/")
+/// whose first season would be wrong.
+fn season_of_codeless_file(path: &str, filename: &str) -> u32 {
+    let (strong, part) = season_tokens(filename);
+    strong
+        .or_else(|| {
+            let dir = &path[..path.len() - filename.len()];
+            dir.rsplit('/').filter(|c| !c.is_empty()).find_map(|c| {
+                let (strong, part) = season_tokens(c);
+                strong.or(part)
+            })
         })
-        .and_then(|m| m.as_str().parse::<u32>().ok())
+        .or(part)
+        .unwrap_or(1)
 }
 
 fn xml_escape(s: &str) -> String {
@@ -2285,6 +2323,77 @@ mod tests {
         assert_eq!(files_in("Season 04"), ["01 - Title.mkv"]);
     }
 
+    /// `Part N` is the weakest season signal for a code-less file: a `Part N` in the BASENAME (a
+    /// two-part episode title) applies only when no directory names a season, and `part` must be a
+    /// whole word with a 1-2 digit number, so a title word (`Counterpart`) or a year is never read
+    /// as a season. A `Part N` DIRECTORY still names a season (a show released in parts) and, as
+    /// the nearest season-naming directory, wins over a root folder's season token: deliberately so
+    /// for `Show.S04/Part 2/` too, since a root often names a season RANGE (`Show.S01-S05/Part 3/`)
+    /// whose first season would be wrong.
+    #[test]
+    fn build_treats_part_n_as_the_weakest_season_signal() {
+        let season_of = |path: &str| -> Vec<String> {
+            let torrents = vec![(
+                TorrentInfo {
+                    id: "pack".to_string(),
+                    filename: "pack".to_string(),
+                    hash: "h1".to_string(),
+                    status: "downloaded".to_string(),
+                    added: "2024-01-01".to_string(),
+                    files: vec![TorrentFile {
+                        id: 1,
+                        path: path.to_string(),
+                        bytes: 3000,
+                        selected: 1,
+                    }],
+                    links: vec![],
+                    ..Default::default()
+                },
+                MediaMetadata {
+                    title: "Show".to_string(),
+                    year: None,
+                    media_type: MediaType::Show,
+                    external_id: Some("tmdb:1".to_string()),
+                },
+            )];
+            let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
+            let VfsNode::Directory { children } = &vfs.root else {
+                panic!("root is not a directory");
+            };
+            let Some(VfsNode::Directory { children: shows }) = children.get("Shows") else {
+                panic!("no Shows dir");
+            };
+            let Some(VfsNode::Directory { children: seasons }) = shows.values().next() else {
+                panic!("no show folder");
+            };
+            seasons
+                .keys()
+                .filter(|k| k.starts_with("Season "))
+                .cloned()
+                .collect()
+        };
+        // A two-part episode title in a per-season subfolder: the directory's season wins.
+        assert_eq!(
+            season_of("Show.S01-S03.1080p/Season 3/05 - Title, Part 2.mkv"),
+            ["Season 03"]
+        );
+        // `part` inside a title word followed by a year is not a season.
+        assert_eq!(
+            season_of("Counterpart.2017.S01.1080p/01 - Pilot.mkv"),
+            ["Season 01"]
+        );
+        // A `Part N` directory still names the season.
+        assert_eq!(season_of("Show/Part 3/01.mkv"), ["Season 03"]);
+        // With no directory season, the basename's `Part N` still applies.
+        assert_eq!(season_of("Show/01 - Title, Part 2.mkv"), ["Season 02"]);
+        // Deliberate: the nearest season-naming directory (`Part 2`) wins over the root's `S04`.
+        assert_eq!(season_of("Show.S04/Part 2/01.mkv"), ["Season 02"]);
+        // A strong basename code still beats a `Part N` directory.
+        assert_eq!(season_of("Show/Part 3/1x05 - Title.mkv"), ["Season 01"]);
+        // Within one name, a strong token beats an earlier `Part N`.
+        assert_eq!(season_of("Show/Part 2 - 3x05.mkv"), ["Season 03"]);
+    }
+
     #[test]
     fn test_show_same_tmdb_id_different_title_case() {
         // When two torrents have the same TMDB external_id but different title
@@ -2822,6 +2931,20 @@ mod tests {
         // A resolution/codec token after the episode must NOT be parsed as a further episode (the
         // continuation requires an explicit `e` before each number).
         assert_eq!(parse_se_all("Show.S01E07.720p.WEB.mkv"), vec![(1, 7)]);
+        // Sonarr's default "Extend" style: a dash-only continuation naming the NEXT episode.
+        assert_eq!(parse_se_all("Show.S01E01-02.mkv"), vec![(1, 1), (1, 2)]);
+        assert_eq!(
+            parse_se_all("Show.S01E01-02-03.mkv"),
+            vec![(1, 1), (1, 2), (1, 3)]
+        );
+        assert_eq!(
+            parse_se_all("Show.S01E01-E02-03.1080p.mkv"),
+            vec![(1, 1), (1, 2), (1, 3)]
+        );
+        // ...but a resolution, bit depth or audio token after a dash is not an episode.
+        assert_eq!(parse_se_all("Show.S01E05-720p.mkv"), vec![(1, 5)]);
+        assert_eq!(parse_se_all("Show.S01E09-10bit.mkv"), vec![(1, 9)]);
+        assert_eq!(parse_se_all("Show.S01E05-5.1.mkv"), vec![(1, 5)]);
     }
 
     #[test]
@@ -2834,6 +2957,9 @@ mod tests {
             parse_se_all("Show.S01E01-E03.1080p.mkv"),
             vec![(1, 1), (1, 3)]
         );
+        // KNOWN LIMITATION: a dash-only continuation counts only when it names the NEXT episode
+        // (Sonarr's "Extend" style), so a dash-number RANGE keeps only its first episode.
+        assert_eq!(parse_se_all("Show.S01E01-03.1080p.mkv"), vec![(1, 1)]);
 
         // KNOWN LIMITATION: the dash-concatenated code fallback requires SPACE-dash-SPACE, so a
         // DOT-separated Torrentio name is not matched and yields empty `provides`.
@@ -4102,6 +4228,10 @@ mod tests {
         assert_eq!(extract("Show.E05.DDP5.1.mkv"), None);
         // A 4-digit S-number (a stray S2024) must NOT be read as "season 2024" — seasons are 1-2 digit.
         assert_eq!(extract("Show.S2024E01.mkv"), None);
+        // Nor is a `part` inside a title word, or a `Part` followed by a year.
+        assert_eq!(extract("Counterpart.2017.S01.1080p"), Some(1));
+        assert_eq!(extract("Counterpart.2017.1080p"), None);
+        assert_eq!(extract("Show.Part.2019.mkv"), None);
         // Genuine markers still resolve.
         assert_eq!(extract("Show.S05E01.mkv"), Some(5));
         assert_eq!(extract("Show.S5.E01.mkv"), Some(5));

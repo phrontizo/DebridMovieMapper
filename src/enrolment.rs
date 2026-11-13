@@ -402,10 +402,11 @@ pub async fn poll_to_completion(
                 return Err(AppError::Config("Trakt device code expired".to_string()))
             }
             DeviceTokenPoll::Rejected(code) => {
-                let hint = if matches!(code, 401 | 403) {
-                    " (check TRAKT_CLIENT_ID / TRAKT_CLIENT_SECRET)"
-                } else {
-                    ""
+                let hint = match code {
+                    401 | 403 => " (check TRAKT_CLIENT_ID / TRAKT_CLIENT_SECRET)",
+                    404 => " (device code invalid: start a new enrolment)",
+                    409 => " (device code already used: start a new enrolment)",
+                    _ => "",
                 };
                 return Err(AppError::Upstream(format!(
                     "Trakt device-token poll returned HTTP {code}{hint}"
@@ -829,6 +830,70 @@ mod tests {
         assert!(store.all_trakt_tokens().await.is_empty());
     }
 
+    /// A transient `me()` failure right after Trakt authorised the device code must not throw away
+    /// the grant the operator just approved: `me()` is retried and the tokens are stored once it
+    /// answers.
+    #[tokio::test(start_paused = true)]
+    async fn poll_to_completion_retries_a_transient_me_failure_and_keeps_the_grant() {
+        let me_errors = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2));
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            poll: DeviceTokenPoll::Authorized(TraktTokenResponse {
+                access_token: "AT".into(),
+                refresh_token: "RT".into(),
+                expires_in: 50,
+                created_at: 1_000,
+            }),
+            user: TraktUser {
+                slug: "carol".into(),
+                username: "Carol".into(),
+            },
+            me_errors_before_ok: me_errors.clone(),
+            ..Default::default()
+        });
+        let store = mem_store();
+        let slug = poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
+            .await
+            .expect("a transient me() failure is retried");
+        assert_eq!(slug, "carol");
+        assert_eq!(me_errors.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let tok = store
+            .get_trakt_tokens("carol".into())
+            .await
+            .expect("tokens stored");
+        assert_eq!(tok.access, "AT");
+        assert_eq!(tok.refresh, "RT");
+    }
+
+    /// A `me()` that keeps failing after authorisation gives up after its bounded retries (all of
+    /// them used, not abandoned on the first error) and stores nothing.
+    #[tokio::test(start_paused = true)]
+    async fn poll_to_completion_gives_up_when_me_keeps_failing_and_stores_nothing() {
+        // MAX_ME_ATTEMPTS (5) failures: every attempt fails.
+        let me_errors = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(5));
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            poll: DeviceTokenPoll::Authorized(TraktTokenResponse {
+                access_token: "AT".into(),
+                ..Default::default()
+            }),
+            user: TraktUser {
+                slug: "carol".into(),
+                username: "Carol".into(),
+            },
+            me_errors_before_ok: me_errors.clone(),
+            ..Default::default()
+        });
+        let store = mem_store();
+        assert!(poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
+            .await
+            .is_err());
+        assert_eq!(
+            me_errors.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "every me() attempt was made before giving up"
+        );
+        assert!(store.all_trakt_tokens().await.is_empty());
+    }
+
     /// A `/users/me` answer with neither a slug nor a username would store the tokens under "",
     /// whose Refresh/Remove URLs (`/trakt/accounts//…`) the router can't match. Treat it like a
     /// failed `me()`: retry, then fail without storing anything.
@@ -879,6 +944,29 @@ mod tests {
         assert!(err.contains("TRAKT_CLIENT_SECRET"), "{err}");
         assert!(!err.contains("expired"), "{err}");
         assert!(store.all_trakt_tokens().await.is_empty());
+    }
+
+    /// A 404 (invalid device code) or 409 (code already used: e.g. the re-poll after a 200 whose
+    /// token body failed to read) names what happened and says to start over, never "expired".
+    #[tokio::test]
+    async fn poll_to_completion_invalid_or_used_code_says_so_and_stores_nothing() {
+        for (code, what) in [(404, "invalid"), (409, "already used")] {
+            let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+                poll: DeviceTokenPoll::Rejected(code),
+                ..Default::default()
+            });
+            let store = mem_store();
+            let err = poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&code.to_string()), "{err}");
+            assert!(err.contains(what), "{err}");
+            assert!(err.contains("start a new enrolment"), "{err}");
+            assert!(!err.contains("expired"), "{err}");
+            assert!(!err.contains("TRAKT_CLIENT_SECRET"), "{err}");
+            assert!(store.all_trakt_tokens().await.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -1168,10 +1256,9 @@ mod tests {
 
         let resp = svc.start_enrolment().await;
         assert_eq!(resp.status(), StatusCode::OK);
-        // The body is built from `enrol_html(&device_code)`, whose content is asserted above; here
-        // we confirm the rendered HTML for this device code carries both fields.
-        assert!(enrol_html(&dc).contains("WXYZ-9999"));
-        assert!(enrol_html(&dc).contains("https://trakt.tv/activate"));
+        let page = body_text(resp).await;
+        assert!(page.contains("WXYZ-9999"), "{page}");
+        assert!(page.contains("https://trakt.tv/activate"), "{page}");
     }
 
     #[tokio::test]

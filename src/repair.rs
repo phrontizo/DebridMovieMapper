@@ -54,9 +54,11 @@ pub enum RepairFailure {
     /// The re-added torrent is not cached yet — it is downloading. Not an error: `dav_fs` logs at
     /// info level and leaves it to the scan loop.
     NotCached(String),
-    /// A TRANSIENT deferral — the re-add succeeded but hasn't fully settled yet (e.g. the repaired
-    /// torrent is `downloaded` but its `files` list momentarily lacks our path, a ~500ms settle
-    /// blip). Not a genuine failure: the attempt budget was reset and a later read retries, so
+    /// A TRANSIENT outcome that gives no verdict on the file: the re-add failed (an add HTTP error,
+    /// or its file list not resolving in the poll window), or its result hadn't settled (the
+    /// repaired torrent's `files` list momentarily lacked our path, a ~500ms settle blip, or the
+    /// final info fetch failed), or the whole repair hit `INSTANT_REPAIR_TIMEOUT`. In each case the
+    /// torrent stays `Healthy`/visible with its attempt budget reset and a later read retries, so
     /// `dav_fs` logs this at info level (like `NotCached`), NOT warn.
     Deferred(String),
     /// An actual repair failure (rate-limited, max attempts exceeded, a provider info/listing error).
@@ -608,10 +610,23 @@ impl RepairManager {
     /// torrent by hash; if the replacement is immediately available, returns a fresh
     /// `FileLocator` for the SAME file (matched by `file_path`). Returns `Err` if the
     /// torrent needs downloading or the repair fails.
+    ///
+    /// When the locator's torrent was already replaced by an earlier new-id repair (a handle opened
+    /// before another handle's Real-Debrid repair still holds the old locator), the copy recorded
+    /// for that file ([`Self::redirect`]) is returned without repairing the deleted torrent again.
+    /// If that copy is itself broken, the next failure carries its id, which has no redirect, and
+    /// is repaired under the usual cooldown and attempt cap.
     pub async fn try_instant_repair(
         &self,
         locator: &crate::provider::FileLocator,
     ) -> Result<crate::provider::FileLocator, RepairFailure> {
+        if let Some(next) = self.redirect(locator).await {
+            info!(
+                "Instant repair: torrent {} was already repaired as {}; using the repaired copy",
+                locator.torrent_id, next.torrent_id
+            );
+            return Ok(next);
+        }
         let torrent_id = locator.torrent_id.as_str();
         let attempt_num = self.check_and_begin_repair(torrent_id).await?;
         info!(
@@ -2269,7 +2284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hidden_torrent_ids_returns_non_healthy() {
+    async fn hidden_torrent_ids_returns_broken_and_failed_only() {
         let manager = make_test_manager();
 
         {
@@ -2592,18 +2607,6 @@ mod tests {
         done()
     }
 
-    /// A 404 `reqwest::Error`, as TorBox's `mylist?id=` sometimes answers for a torrent that exists.
-    fn not_found_error() -> reqwest::Error {
-        reqwest::Response::from(
-            hyper::Response::builder()
-                .status(404)
-                .body(hyper::body::Bytes::new())
-                .unwrap(),
-        )
-        .error_for_status()
-        .unwrap_err()
-    }
-
     /// The torrent under repair, `tid`: one selected file, `/Movie.mkv`.
     fn old_movie_info() -> TorrentInfo {
         TorrentInfo {
@@ -2682,7 +2685,7 @@ mod tests {
                 return std::future::pending().await;
             }
             if self.flaky_lookups && n % 2 == 1 {
-                return Err(not_found_error());
+                return Err(crate::provider::not_found_error());
             }
             Ok(self.infos.get(id).cloned().unwrap_or_default())
         }
@@ -3017,6 +3020,57 @@ mod tests {
             .prune_health_status(&["new"].into_iter().collect())
             .await;
         assert!(manager.redirect(&e02).await.is_none());
+    }
+
+    /// A handle opened before another handle's new-id repair still holds the old torrent's locator.
+    /// When its read fails, the repair hands it the copy already recorded for that file instead of
+    /// re-repairing the deleted torrent (a fresh attempt whose lookup 404s, failing the read).
+    #[tokio::test(start_paused = true)]
+    async fn a_repair_of_an_already_repaired_torrent_uses_the_recorded_copy() {
+        let provider = Arc::new(ScriptedProvider {
+            infos: [
+                (
+                    "tid".to_string(),
+                    pack_info("tid", [1, 2, 3], &["old1", "old2"]),
+                ),
+                (
+                    "new".to_string(),
+                    pack_info("new", [5, 6, 7], &["new1", "new2"]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        let manager = RepairManager::new(provider.clone());
+        let e01 = pack_locator("tid", 1, "/Show.S01E01.mkv", "old1");
+        let e02 = pack_locator("tid", 3, "/Show.S01E02.mkv", "old2");
+        manager
+            .try_instant_repair(&e01)
+            .await
+            .expect("cached re-add");
+        let adds = provider.adds.load(std::sync::atomic::Ordering::SeqCst);
+        let lookups = provider.lookups_of("tid");
+
+        let repaired = manager
+            .try_instant_repair(&e02)
+            .await
+            .expect("the recorded copy of the sibling file");
+        assert_eq!(repaired, pack_locator("new", 7, "/Show.S01E02.mkv", "new2"));
+        assert_eq!(
+            provider.adds.load(std::sync::atomic::Ordering::SeqCst),
+            adds,
+            "no re-add"
+        );
+        assert_eq!(
+            provider.lookups_of("tid"),
+            lookups,
+            "no lookup of the deleted torrent"
+        );
+        assert!(
+            !manager.health_status.read().await.contains_key("tid"),
+            "no health entry for the deleted torrent"
+        );
     }
 
     /// A torrent repaired twice (a still-broken file on a storm of re-adds, each a new id) is

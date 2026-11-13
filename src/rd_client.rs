@@ -676,7 +676,30 @@ impl RealDebridClient {
 
                     match resp.error_for_status() {
                         Ok(resp) => {
-                            let text = resp.text().await?;
+                            // A body that breaks off mid-stream (a reset, a body cut short of its
+                            // Content-Length, the request timeout firing while it streams) is
+                            // retried like a statusless transport error, with the same small
+                            // backoff, so one blip on `unrestrict/link` doesn't fail the resolve
+                            // over to an instant repair. With the budget spent, the body error
+                            // itself is surfaced (via `last_error` after the loop). It is not a
+                            // decode failure, so it doesn't count toward that cap.
+                            let text = match resp.text().await {
+                                Ok(text) => text,
+                                Err(e) => {
+                                    warn!(
+                                        "RD API body read failed (attempt {}/{}): {}",
+                                        attempt, max_attempts, e
+                                    );
+                                    last_error = Some(e);
+                                    if attempt < max_attempts {
+                                        let backoff = Duration::from_millis(
+                                            (100 * attempt as u64).min(1_000),
+                                        );
+                                        tokio::time::sleep(backoff).await;
+                                    }
+                                    continue;
+                                }
+                            };
                             // 204 No Content: try deserializing from "[]". This succeeds for Vec<T>
                             // and serde_json::Value, allowing callers like select_files/delete_torrent
                             // (which get a 204) to work transparently.
@@ -1127,6 +1150,75 @@ mod tests {
             3,
             "the bounded budget (3) must be honored, not the default 10"
         );
+    }
+
+    /// Loopback server whose first `cut_first` connections get a `200 OK` that promises a longer
+    /// body (`Content-Length`) than it sends before closing — a body that breaks off mid-stream —
+    /// and whose later connections get `body` in full. Returns (base_url, connection count).
+    async fn spawn_cut_body(
+        cut_first: usize,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = count.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let seen = c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let (len, sent) = if seen < cut_first {
+                    (body.len() + 100, &body[..body.len() / 2])
+                } else {
+                    (body.len(), body)
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(sent.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{}/", addr), count)
+    }
+
+    #[tokio::test]
+    async fn fetch_with_retry_retries_a_body_cut_off_mid_stream() {
+        // A 200 whose body breaks off mid-stream is retried like a statusless transport error, so
+        // one blip on `unrestrict/link` doesn't fail the resolve (→ an instant repair that re-adds
+        // a healthy torrent under a new id and deletes the original).
+        let body =
+            r#"{"id":"x","link":"https://real-debrid.com/d/abc","download":"https://cdn/x"}"#;
+        let (url, count) = spawn_cut_body(1, body).await;
+        let client = RealDebridClient::new("fake".to_string()).unwrap();
+        let r: Result<serde_json::Value, _> = client
+            .fetch_with_retry_n(|| client.client.get(&url), &[], 3)
+            .await;
+        assert!(r.is_ok(), "the retry must recover the body: {r:?}");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_with_retry_body_cut_off_on_every_attempt_surfaces_the_read_error() {
+        // With the budget spent, the body error itself is returned (no HTTP status, so
+        // `resolve_url` maps it to Unavailable), not the synthetic decode-failure 502.
+        let body =
+            r#"{"id":"x","link":"https://real-debrid.com/d/abc","download":"https://cdn/x"}"#;
+        let (url, count) = spawn_cut_body(usize::MAX, body).await;
+        let client = RealDebridClient::new("fake".to_string()).unwrap();
+        let r: Result<serde_json::Value, _> = client
+            .fetch_with_retry_n(|| client.client.get(&url), &[], 3)
+            .await;
+        let err = r.expect_err("a body cut off on every attempt must surface as an error");
+        assert_eq!(
+            err.status(),
+            None,
+            "must be the body error, not a synthetic 502: {err}"
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

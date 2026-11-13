@@ -204,11 +204,20 @@ pub(crate) fn parse_pagination(headers: &reqwest::header::HeaderMap) -> Paginati
 }
 
 /// Check that page `requested` (≥ 2) of a list read is coherent with page 1. The list changing
-/// between page fetches (an item added/removed mid-read) shifts items across page boundaries, so a
-/// title could be missed on BOTH pages — for the watchlist that would read as "un-watchlisted" and
-/// could drive a Trigger-B removal. Detected via the headers changing (page/item count), or the
-/// server answering a different page than asked for; the read then fails and is retried next sync.
-/// A header absent on either side is not compared. PURE.
+/// between page fetches shifts items across page boundaries, so a title could be missed on BOTH
+/// pages — for the watchlist that would read as "un-watchlisted" and could drive a Trigger-B
+/// removal. This catches a change of the page count or item count (a net add or remove mid-read)
+/// and a page answered under the wrong number; the read then fails and is retried next sync. A
+/// header absent on either side is not compared. PURE.
+///
+/// A change that keeps both counts is invisible here. `authed_get_list` also fails a read in which
+/// one list-item `id` appears on two pages ([`repeated_list_item`]), which catches a reorder (an
+/// item moved onto an already-read page pushes another onto the next one). Still undetected: an
+/// item removed from an already-read page while another is added further on, between two page
+/// fetches. Every later item then slides back one place, and the first item of the next page is
+/// read on neither. Accepted residual risk: it needs a list over one page (100 items) and both
+/// changes inside the sub-second gap between page requests; the reconcile right after the sync may
+/// then remove the missed title's engine copies (Trigger B), and the next sync acquires it again.
 pub(crate) fn check_page_consistency(
     requested: u32,
     first: &Pagination,
@@ -230,6 +239,21 @@ pub(crate) fn check_page_consistency(
         }
     }
     Ok(())
+}
+
+/// The first Trakt list-item `id` on `page_items` that an earlier page of the same read already
+/// carried, if any. A list item (its `id` is the list entry's own key, e.g. a watchlist entry) can
+/// appear only once in a list, so seeing it on two pages means the list shifted between the page
+/// fetches, and with the item count unchanged some other item was then missed. Items without a
+/// numeric top-level `id` (the watched endpoints carry none) are not compared. PURE.
+pub(crate) fn repeated_list_item(
+    seen: &std::collections::HashSet<u64>,
+    page_items: &[serde_json::Value],
+) -> Option<u64> {
+    page_items
+        .iter()
+        .filter_map(|item| item.get("id").and_then(serde_json::Value::as_u64))
+        .find(|id| seen.contains(id))
 }
 
 pub struct TraktClientImpl {
@@ -383,8 +407,9 @@ impl TraktClientImpl {
     /// The page count comes from page 1's `X-Pagination-Page-Count`; a missing/garbled/zero value
     /// reads as a single page. SAFETY: any failure is an `Err` for the WHOLE read — a page's
     /// request/status/body failing, a non-array body, a page count above `MAX_PAGES`, or the list
-    /// changing mid-read (`check_page_consistency`) — so the caller keeps its previous state
-    /// rather than acting on a silently truncated list.
+    /// visibly changing mid-read (`check_page_consistency`, `repeated_list_item`; see the former
+    /// for the one shift neither can see) — so the caller keeps its previous state rather than
+    /// acting on a silently truncated list.
     async fn authed_get_list(
         &self,
         path: &str,
@@ -393,6 +418,7 @@ impl TraktClientImpl {
         limit: Option<u32>,
     ) -> Result<serde_json::Value, AppError> {
         let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut first = Pagination::default();
         let mut total_pages: u32 = 1;
         let mut page: u32 = 1;
@@ -426,6 +452,17 @@ impl TraktClientImpl {
                 )));
             };
             let page_len = page_items.len();
+            if let Some(id) = repeated_list_item(&seen_ids, &page_items) {
+                return Err(AppError::Upstream(format!(
+                    "Trakt {path} page {page}: list item {id} already read on an earlier page \
+                     (the list changed mid-read)"
+                )));
+            }
+            seen_ids.extend(
+                page_items
+                    .iter()
+                    .filter_map(|item| item.get("id").and_then(serde_json::Value::as_u64)),
+            );
             items.extend(page_items);
             if page == 1 {
                 first = info;
@@ -503,10 +540,12 @@ impl TraktClient for TraktClientImpl {
         }
         if status == reqwest::StatusCode::OK {
             // A 200 is the authorized response and MUST carry a token body. If the body fails to
-            // read (a transient mid-stream blip), bubble the error so `poll_to_completion` retries
-            // it as a transient poll error — NOT an Authorized with EMPTY tokens (`unwrap_or(Null)`
-            // → parse_token_response → ""), which would then fail `me("")` with a confusing 401 and
-            // abandon a grant that a retry would have completed.
+            // read (a transient mid-stream blip), bubble the error up rather than return an
+            // Authorized with EMPTY tokens (`unwrap_or(Null)` → parse_token_response → ""), which
+            // would then fail `me("")` with a confusing 401.
+            // `poll_to_completion` re-polls it as a transient error, but Trakt has already exchanged
+            // the code, so the re-poll most likely gets a 409 (code already used) and the operator
+            // is told to start a new enrolment: the lost grant can't be recovered.
             let v = resp
                 .json::<serde_json::Value>()
                 .await
@@ -733,15 +772,17 @@ pub(crate) fn parse_user(v: &serde_json::Value) -> TraktUser {
 /// Trakt device-token poll status semantics:
 ///   200 OK            -> authorized; the body carries the OAuth tokens.
 ///   400 Bad Request   -> "authorization pending" — user hasn't entered the code yet (keep polling).
-///   404 Not Found     -> the device_code is invalid/unknown (terminal → treat as expired).
-///   409 Conflict      -> the code was already used/approved (terminal → expired).
+///   404 Not Found     -> the device_code is invalid/unknown (terminal `Rejected(404)`).
+///   409 Conflict      -> the code was already used: Trakt already exchanged it for tokens
+///                        (terminal `Rejected(409)`).
 ///   410 Gone          -> the code expired.
 ///   418 I'm a teapot  -> the user explicitly denied the request.
 ///   429 Too Many Req  -> polling too fast; normally absorbed by the retry helper, mapped to
 ///                        Pending defensively so a stray 429 doesn't abort enrolment.
-/// Any other status (401/403 — typically a wrong client id/secret, since the secret is first sent
-/// on this poll — or anything unlisted) is terminal `Rejected(status)`, so the caller's poll loop
-/// can't spin forever and its error names the status instead of claiming the code expired.
+/// Any other status (404/409 above, 401/403 — typically a wrong client id/secret, since the secret
+/// is first sent on this poll — or anything unlisted) is terminal `Rejected(status)`, so the
+/// caller's poll loop can't spin forever and its error names the status instead of claiming the
+/// code expired.
 /// A 5xx never reaches this from `TraktClientImpl::poll_token`, which returns it as a retryable
 /// `Err` instead.
 pub fn interpret_device_token(
@@ -752,7 +793,7 @@ pub fn interpret_device_token(
         200 => DeviceTokenPoll::Authorized(parse_token_response(body)),
         400 | 429 => DeviceTokenPoll::Pending,
         418 => DeviceTokenPoll::Denied,
-        410 | 404 | 409 => DeviceTokenPoll::Expired,
+        410 => DeviceTokenPoll::Expired,
         other => DeviceTokenPoll::Rejected(other),
     }
 }
@@ -925,9 +966,10 @@ pub fn parse_show_progress(v: &serde_json::Value) -> ShowProgress {
 // --- Test-only mock -------------------------------------------------------------------------
 
 /// Test-only client returning canned values (mirrors `MockScraper`). The `fail_reads`/
-/// `fail_refresh`/`transient_refresh` flags and `poll_errors_before_ok` inject errors so callers
-/// (e.g. `sync_trakt`) can exercise their failure-handling paths; when none is set the canned
-/// values are returned unchanged.
+/// `fail_refresh`/`transient_refresh` flags and the `poll_errors_before_ok`/`me_errors_before_ok`
+/// counters inject errors so callers (e.g. `sync_trakt`, `enrolment::poll_to_completion`) can
+/// exercise their failure-handling paths; when none is set the canned values are returned
+/// unchanged.
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub struct MockTrakt {
@@ -951,6 +993,10 @@ pub struct MockTrakt {
     /// (decrements on each call). Default 0 = never errors. Lets tests exercise the transient-retry
     /// path in `enrolment::poll_to_completion`.
     pub poll_errors_before_ok: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Number of transient `me` errors to inject before returning the canned `user` (decrements on
+    /// each call). Default 0 = never errors. Lets tests exercise the `me()` retry after
+    /// authorisation in `enrolment::poll_to_completion`.
+    pub me_errors_before_ok: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// A `reqwest::Error` carrying `status`, built without any I/O.
@@ -997,8 +1043,13 @@ impl TraktClient for MockTrakt {
         Ok(self.token.clone())
     }
     async fn me(&self, _access_token: &str) -> Result<TraktUser, AppError> {
+        use std::sync::atomic::Ordering;
         if self.fail_reads {
             return Err(Self::read_error());
+        }
+        if self.me_errors_before_ok.load(Ordering::SeqCst) > 0 {
+            self.me_errors_before_ok.fetch_sub(1, Ordering::SeqCst);
+            return Err(AppError::Upstream("mock transient me error".to_string()));
         }
         Ok(self.user.clone())
     }
@@ -1263,14 +1314,15 @@ mod tests {
             interpret_device_token(StatusCode::GONE, &empty),
             DeviceTokenPoll::Expired
         );
-        // 404/409 → Expired (invalid/used code, terminal)
+        // 404 (invalid code) / 409 (code already used) → Rejected: terminal, but NOT an expiry, so
+        // the enrolment error names what happened instead of claiming the code expired.
         assert_eq!(
             interpret_device_token(StatusCode::NOT_FOUND, &empty),
-            DeviceTokenPoll::Expired
+            DeviceTokenPoll::Rejected(404)
         );
         assert_eq!(
             interpret_device_token(StatusCode::CONFLICT, &empty),
-            DeviceTokenPoll::Expired
+            DeviceTokenPoll::Rejected(409)
         );
         // 429 defensively → Pending (the retry helper normally absorbs this)
         assert_eq!(
@@ -1495,6 +1547,7 @@ mod tests {
             fail_refresh: false,
             transient_refresh: false,
             poll_errors_before_ok: Default::default(),
+            me_errors_before_ok: Default::default(),
         };
         let client: Arc<dyn TraktClient> = Arc::new(mock);
         assert_eq!(client.device_code().await.unwrap().user_code, "CODE");
@@ -2394,6 +2447,72 @@ mod pagination_tests {
             .await;
             assert!(client(&server.base_url).watched("at").await.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn a_list_item_seen_on_two_pages_is_an_err() {
+        // A reorder between the page fetches keeps every pagination header the same, but moves an
+        // item from page 2 onto the already-read page 1, pushing a page-1 item onto page 2: the
+        // moved title is on NEITHER page as read (it would read as un-watchlisted, a Trigger-B
+        // removal), and the pushed one is on both. Its list-item id appearing twice gives the shift
+        // away; the read fails and is retried next sync.
+        let page1 = r#"[
+            {"type":"movie","id":5000001,"rank":1,"movie":{"ids":{"tmdb":101,"trakt":1}}},
+            {"type":"movie","id":5000002,"rank":2,"movie":{"ids":{"tmdb":102,"trakt":2}}}
+        ]"#;
+        // After the reorder: item 5000003 (tmdb 103) moved to the top; 5000002 slid onto page 2.
+        let page2 = r#"[
+            {"type":"movie","id":5000002,"rank":3,"movie":{"ids":{"tmdb":102,"trakt":2}}}
+        ]"#;
+        let server = spawn(vec![
+            (
+                "/sync/watchlist/movies?page=1&limit=100",
+                Reply::page(page1, 1, 2, 3, 2),
+            ),
+            (
+                "/sync/watchlist/movies?page=2&limit=100",
+                Reply::page(page2, 2, 2, 3, 2),
+            ),
+            (
+                "/sync/watchlist/shows?page=1&limit=100",
+                Reply::page(WATCHLIST_SHOWS, 1, 1, 2, 100),
+            ),
+        ])
+        .await;
+        let err = client(&server.base_url)
+            .watchlist("at")
+            .await
+            .expect_err("a list item on two pages must fail the read");
+        assert!(err.to_string().contains("5000002"), "{err}");
+
+        // Items without a list-item id (the watched endpoints) are not compared, and distinct ids
+        // across pages read normally (see watchlist_follows_pagination_for_movies_and_shows).
+        let page2_ok = r#"[
+            {"type":"movie","id":5000003,"rank":3,"movie":{"ids":{"tmdb":103,"trakt":3}}}
+        ]"#;
+        let server = spawn(vec![
+            (
+                "/sync/watchlist/movies?page=1&limit=100",
+                Reply::page(page1, 1, 2, 3, 2),
+            ),
+            (
+                "/sync/watchlist/movies?page=2&limit=100",
+                Reply::page(page2_ok, 2, 2, 3, 2),
+            ),
+            (
+                "/sync/watchlist/shows?page=1&limit=100",
+                Reply::page(WATCHLIST_SHOWS, 1, 1, 2, 100),
+            ),
+        ])
+        .await;
+        let items = client(&server.base_url)
+            .watchlist("at")
+            .await
+            .expect("distinct ids read normally");
+        assert_eq!(
+            items.iter().map(|i| i.tmdb_id).collect::<Vec<_>>(),
+            vec![101, 102, 103, 911200, 910100]
+        );
     }
 
     #[tokio::test]

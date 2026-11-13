@@ -129,11 +129,12 @@ pub struct AcquireRequest {
     pub metadata: crate::vfs::MediaMetadata,
 }
 
-/// An upgrade candidate the engine is staging and has not checked yet (the `staging` table value,
-/// keyed by lowercased infohash). Written before the add and cleared once the candidate is recorded
-/// as owned or its torrent is deleted. A candidate cut off in between (a shutdown, a panic, an OOM
-/// kill) leaves its intent behind: the account mirror never adopts that hash, and
-/// `upgrade::sweep_staging_intents` deletes its torrent.
+/// A torrent being added that no owned record names yet (the `staging` table value, keyed by
+/// lowercased infohash): an upgrade candidate the engine is staging and has not checked yet, or an
+/// acquisition `AcquisitionEngine::acquire` is adding before it records it `Pending`. Written before
+/// the add and cleared once the hash is recorded as owned or its torrent is deleted. One cut off in
+/// between (a shutdown, a panic, an OOM kill) leaves its intent behind: the account mirror never
+/// adopts that hash, and `upgrade::sweep_staging_intents` deletes its torrent.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StagingIntent {
     /// The torrent id the add returned; `None` until it has returned.
@@ -248,8 +249,10 @@ pub struct OwnedRecord {
 }
 
 /// Persisted per-user Trakt OAuth tokens (the `trakt_tokens` table value; key = user slug).
-/// `needs_reenrolment` is set by the `sync_trakt` job when a token refresh or read fails (the
-/// account likely needs re-authorising); it is cleared on the next successful sync. Old records
+/// `needs_reenrolment` marks an account that likely needs re-authorising. It is set by `sync_trakt`
+/// on a non-transient token-refresh failure or a Trakt read failure, and by the accounts page's
+/// refresh (`enrolment::refresh_account`) on a non-transient refresh failure. A transient failure
+/// (429/5xx/transport) never sets it. The next successful sync or refresh clears it. Old records
 /// written before this field existed decode it as `false`.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TraktTokens {
@@ -286,8 +289,21 @@ pub struct WantedSources {
 /// when a title is fully watched and eligible for removal.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WatchedState {
-    Movie { watched: bool },
-    Show { watched_episodes: Vec<(u32, u32)> }, // (season, episode) pairs the user has watched
+    Movie {
+        watched: bool,
+    },
+    Show {
+        /// (season, episode) pairs the user has watched.
+        watched_episodes: Vec<(u32, u32)>,
+        /// Trakt's own per-show progress says the user is behind (an unwatched aired episode), or
+        /// the sync could not ask (`show_progress` failed, no Trakt id) and assumed so: the
+        /// catch-up source. It vetoes the finish verdict (`wanted::user_finished`), so a show is
+        /// never finish-removed while Trakt says the user has an aired episode left, whatever
+        /// TMDB's aired set says. `#[serde(default)]`: rows written before it existed read as
+        /// `false`, and the next sync rewrites them.
+        #[serde(default)]
+        trakt_behind: bool,
+    },
 }
 
 /// One (user, media_type, tmdb_id) row of the materialised wanted-set. Self-describing: it embeds
@@ -1175,6 +1191,46 @@ impl Store {
                 warn!("set_owned_status: no owned record for {hash}; status change skipped");
             }
             Ok(())
+        })
+        .await;
+        Self::flatten_join_app(result)
+    }
+
+    /// Mark the owned record for `hash` `Verified`, as one read-modify-write transaction: its
+    /// `provides` replaced by `provides` when given (a series), and its quality snapshot (if any)
+    /// marked cached with `unverified` stamped on it. Returns the record's quality as written, or
+    /// `None` when there is no record — so a record removed concurrently (dedup, Trigger A/B, a
+    /// reap) is never written back.
+    pub async fn mark_verified_if_present(
+        &self,
+        hash: String,
+        provides: Option<Vec<(u32, u32)>>,
+        unverified: bool,
+    ) -> Result<Option<Option<crate::release::QualitySummary>>, AppError> {
+        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
+        let db = self.db.clone();
+        type Written = Option<Option<crate::release::QualitySummary>>;
+        let result = tokio::task::spawn_blocking(move || -> Result<Written, AppError> {
+            let mut quality = None;
+            let outcome = Self::update_json::<OwnedRecord>(
+                &db,
+                OWNED_TABLE,
+                &hash,
+                "mark_verified_if_present",
+                |rec| {
+                    rec.status = OwnedStatus::Verified;
+                    if let Some(p) = provides {
+                        rec.provides = p;
+                    }
+                    if let Some(q) = rec.quality.as_mut() {
+                        q.mark_cached();
+                        q.unverified = unverified;
+                    }
+                    quality = rec.quality.clone();
+                    true
+                },
+            )?;
+            Ok(outcome.map(|_| quality))
         })
         .await;
         Self::flatten_join_app(result)
@@ -2083,6 +2139,150 @@ impl Store {
         })
         .await;
         Self::join_or_default("all_staging_intents", r)
+    }
+}
+
+/// A [`Store`] whose writes a test can make fail from a chosen commit on (a full disk, an I/O
+/// error), shared by every module's tests: [`fail_after_arm_store`] builds one, and its
+/// [`WriteFailSwitch`] arms it.
+#[cfg(test)]
+pub(crate) mod fail_writes {
+    use super::Store;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// The bytes of an in-memory redb file, shared so a second `Database` can be opened on what a
+    /// first one committed ([`WriteFailSwitch::reopen`]).
+    #[derive(Debug, Clone, Default)]
+    struct SharedMemory(Arc<std::sync::RwLock<Vec<u8>>>);
+    impl redb::StorageBackend for SharedMemory {
+        fn len(&self) -> Result<u64, std::io::Error> {
+            Ok(self.0.read().unwrap().len() as u64)
+        }
+        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+            let bytes = self.0.read().unwrap();
+            let start = offset as usize;
+            let src = bytes
+                .get(start..start + out.len())
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+            out.copy_from_slice(src);
+            Ok(())
+        }
+        fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+            self.0.write().unwrap().resize(len as usize, 0);
+            Ok(())
+        }
+        fn sync_data(&self) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+        fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+            let mut bytes = self.0.write().unwrap();
+            let start = offset as usize;
+            if bytes.len() < start + data.len() {
+                bytes.resize(start + data.len(), 0);
+            }
+            bytes[start..start + data.len()].copy_from_slice(data);
+            Ok(())
+        }
+    }
+
+    /// A redb backend over [`SharedMemory`] that fails every `write`/`set_len` once ARMED
+    /// ([`WriteFailSwitch`]), so a test can make a store commit return `Err` deterministically. Seed
+    /// the store BEFORE arming. redb is copy-on-write — a failed page write aborts the commit without
+    /// flipping the committed root — but it then treats the database as failed: a later read that
+    /// its page cache can't serve returns an error. So a test verifies the committed state through a
+    /// fresh database on the same bytes ([`WriteFailSwitch::reopen`]). Every commit ends in
+    /// `sync_data`, which this counts so a switch can let a given number of commits through first.
+    #[derive(Debug)]
+    struct ArmableFailBackend {
+        inner: SharedMemory,
+        switch: WriteFailSwitch,
+    }
+    impl redb::StorageBackend for ArmableFailBackend {
+        fn len(&self) -> Result<u64, std::io::Error> {
+            self.inner.len()
+        }
+        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+            self.inner.read(offset, out)
+        }
+        fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+            if self.switch.failing() {
+                return Err(std::io::Error::other("set_len blocked (armed)"));
+            }
+            self.inner.set_len(len)
+        }
+        fn sync_data(&self) -> Result<(), std::io::Error> {
+            self.switch.syncs.fetch_add(1, Ordering::SeqCst);
+            self.inner.sync_data()
+        }
+        fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+            if self.switch.failing() {
+                return Err(std::io::Error::other("write blocked (armed)"));
+            }
+            self.inner.write(offset, data)
+        }
+    }
+
+    /// Arms an [`ArmableFailBackend`]: writes fail once `syncs` reaches `fail_from`.
+    #[derive(Debug, Clone)]
+    pub(crate) struct WriteFailSwitch {
+        syncs: Arc<AtomicUsize>,
+        fail_from: Arc<AtomicUsize>,
+        memory: SharedMemory,
+    }
+    impl WriteFailSwitch {
+        /// A store on a fresh database over the bytes committed so far (the armed one may refuse
+        /// reads after its failed write). Disarm first.
+        pub(crate) fn reopen(&self) -> Store {
+            let db = redb::Database::builder()
+                .create_with_backend(self.memory.clone())
+                .unwrap();
+            Store::from_database(Arc::new(db)).unwrap()
+        }
+        fn failing(&self) -> bool {
+            self.syncs.load(Ordering::SeqCst) >= self.fail_from.load(Ordering::SeqCst)
+        }
+        /// Let the next `commits` commits (of `syncs_per_commit` syncs each) through, then fail every
+        /// write.
+        pub(crate) fn arm_after(&self, commits: usize, syncs_per_commit: usize) {
+            self.fail_from.store(
+                self.syncs.load(Ordering::SeqCst) + commits * syncs_per_commit,
+                Ordering::SeqCst,
+            );
+        }
+        pub(crate) fn disarm(&self) {
+            self.fail_from.store(usize::MAX, Ordering::SeqCst);
+        }
+    }
+
+    /// A store whose writes fail once its switch is armed.
+    pub(crate) fn fail_after_arm_store() -> (Store, WriteFailSwitch) {
+        let switch = WriteFailSwitch {
+            syncs: Arc::new(AtomicUsize::new(0)),
+            fail_from: Arc::new(AtomicUsize::new(usize::MAX)),
+            memory: SharedMemory::default(),
+        };
+        let backend = ArmableFailBackend {
+            inner: switch.memory.clone(),
+            switch: switch.clone(),
+        };
+        let db = redb::Database::builder()
+            .create_with_backend(backend)
+            .unwrap();
+        (Store::from_database(Arc::new(db)).unwrap(), switch)
+    }
+
+    /// How many `sync_data` calls one store commit makes on `store`'s backend (measured with a
+    /// harmless write), for [`WriteFailSwitch::arm_after`].
+    pub(crate) async fn syncs_per_commit(store: &Store, switch: &WriteFailSwitch) -> usize {
+        let before = switch.syncs.load(Ordering::SeqCst);
+        store
+            .set_upgrade_checked(&crate::vfs::MediaType::Movie, 424_242, 1)
+            .await
+            .unwrap();
+        let n = switch.syncs.load(Ordering::SeqCst) - before;
+        assert!(n > 0, "a commit syncs");
+        n
     }
 }
 
@@ -3198,6 +3398,7 @@ mod tests {
             },
             watched_state: WatchedState::Show {
                 watched_episodes: vec![(1, 1), (1, 2), (2, 1)],
+                trakt_behind: true,
             },
             show_status: Some(ShowStatus::Ended),
             imdb_id: None,
@@ -3411,7 +3612,8 @@ mod tests {
         assert_eq!(
             got_show.watched_state,
             WatchedState::Show {
-                watched_episodes: vec![(1, 1), (1, 2), (2, 1)]
+                watched_episodes: vec![(1, 1), (1, 2), (2, 1)],
+                trakt_behind: true,
             }
         );
         assert_eq!(got_show.show_status, Some(ShowStatus::Ended));
@@ -3430,6 +3632,21 @@ mod tests {
             .await
             .is_none());
         assert_eq!(store.all_wanted().await.len(), 1);
+    }
+
+    /// A show row written before `trakt_behind` existed reads as not behind (and an older build,
+    /// which ignores the unknown field, reads a new row).
+    #[test]
+    fn a_legacy_show_watched_state_reads_as_not_behind() {
+        let legacy: WatchedState =
+            serde_json::from_str(r#"{"Show":{"watched_episodes":[[1,1]]}}"#).unwrap();
+        assert_eq!(
+            legacy,
+            WatchedState::Show {
+                watched_episodes: vec![(1, 1)],
+                trakt_behind: false,
+            }
+        );
     }
 
     #[tokio::test]
@@ -4636,6 +4853,60 @@ mod tests {
         let got = store.get_owned("h1".to_string()).await.unwrap();
         assert_eq!(got.provides, vec![(1, 1), (1, 2)]);
         assert_eq!(got.quality.unwrap().source_tier, 6_000);
+    }
+
+    /// `mark_verified_if_present` settles a record in one transaction and never writes back one
+    /// removed meanwhile (dedup, Trigger A/B, a reap all remove records concurrently with `observe`).
+    #[tokio::test]
+    async fn mark_verified_if_present_never_resurrects_a_removed_record() {
+        let store = Store::in_memory();
+        let rec = OwnedRecord {
+            request: req("tt1", 1396),
+            provenance: Provenance::manual(),
+            added_at: 100,
+            status: OwnedStatus::Pending,
+            provides: vec![(1, 1)],
+            quality: Some(crate::release::QualitySummary {
+                cached: false,
+                source_tier: 6_000,
+                resolution: 1080,
+                score: 42,
+                unverified: false,
+            }),
+        };
+        store.put_owned("H1".into(), rec.clone()).await.unwrap();
+        let written = store
+            .mark_verified_if_present("h1".into(), Some(vec![(1, 1), (1, 2)]), true)
+            .await
+            .unwrap()
+            .expect("present");
+        let got = store.get_owned("h1".into()).await.unwrap();
+        assert_eq!(got.status, OwnedStatus::Verified);
+        assert_eq!(got.provides, vec![(1, 1), (1, 2)]);
+        let q = got.quality.unwrap();
+        assert!(q.cached && q.unverified, "{q:?}");
+        assert_eq!(written, Some(q));
+        // A movie keeps its `provides`.
+        store.put_owned("h2".into(), rec).await.unwrap();
+        store
+            .mark_verified_if_present("h2".into(), None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_owned("h2".into()).await.unwrap().provides,
+            vec![(1, 1)]
+        );
+
+        // Removed between `observe`'s read and its write: nothing comes back.
+        store.remove_owned("h1".into()).await.unwrap();
+        assert_eq!(
+            store
+                .mark_verified_if_present("h1".into(), Some(vec![(1, 1)]), false)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(store.get_owned("h1".into()).await.is_none());
     }
 
     /// An old OwnedRecord JSON (no `provides`/`quality` keys) decodes with empty/None defaults.

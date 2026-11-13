@@ -421,7 +421,9 @@ impl ProxiedMediaFile {
     /// provider, not merely an expired URL). The repair state machine's cooldown / attempt cap
     /// keeps repeated reads of the same broken file from storming re-adds. The swap fixes only this
     /// handle; later opens of the torrent's files find a new-id repair through
-    /// `RepairManager::redirect` (see `open`).
+    /// `RepairManager::redirect` (see `open`), and so does a handle opened before that repair whose
+    /// read then fails: `try_instant_repair` returns the recorded copy instead of repairing the
+    /// deleted torrent again.
     async fn attempt_instant_repair(&mut self) -> Result<String, FsError> {
         match self.repair_manager.try_instant_repair(&self.locator).await {
             Ok(new_locator) => {
@@ -555,9 +557,9 @@ impl ProxiedMediaFile {
     ///   again do NOT invalidate. Retry the same url; only when the FIRST fetch and that same-url
     ///   retry both 5xx escalate to instant repair (re-add by hash), once — a cached replacement
     ///   fixes playback inline, else the read fails (rather than the player retry-storming a 500
-    ///   forever). A 5xx after another kind of failure (a stale-url re-resolve, a connection or body
-    ///   error) is retried once on the same url, then fails the read; the next read can still
-    ///   escalate.
+    ///   forever). A 5xx that follows another failure (a stale-URL re-resolve, a connection or body
+    ///   error) is retried once on the same URL; if that retry 5xxs too, the read fails without a
+    ///   repair (no attempt is left for a repaired URL), and the next read can still escalate.
     ///
     /// - **Genuinely stale / non-compliant** (expired 403/410, a Range-ignoring 200 on a seek, an
     ///   oversized body, or a Content-Range mismatch): drop `cdn_url` + invalidate the resolution so
@@ -653,11 +655,11 @@ impl ProxiedMediaFile {
                 // escalate to instant repair (re-add by hash), once — a cached replacement fixes
                 // playback inline, else the read fails (instead of the player retry-storming a 500
                 // forever). A 5xx after a connection error, a body-read error or a stale URL is
-                // retried once on the same url and then fails the read, even when that retry 5xxs
-                // too: it lands on the last attempt, with no fetch left to use a repair. A repair
-                // refuses all other reads of the torrent while it runs and on Real-Debrid re-adds
-                // it, so it needs two 5xx in a row; the next read, starting on the same url, can
-                // still escalate. The repair cooldown bounds re-add attempts.
+                // retried once on the same url; if that retry 5xxs too, the read fails without a
+                // repair: the retry is the last attempt, with no fetch left for a repaired url. A
+                // repair refuses all other reads of the torrent while it runs and on Real-Debrid
+                // re-adds it, so it needs two 5xx in a row; the next read, starting on the same
+                // url, can still escalate. The repair cooldown bounds re-add attempts.
                 // (`oversized`/`range_mismatch` require a 2xx, so they never reach this
                 // `is_server_error` arm.)
                 if status.is_server_error() {
@@ -829,6 +831,69 @@ impl DavFile for ProxiedMediaFile {
     fn seek(&mut self, pos: std::io::SeekFrom) -> FsFuture<'_, u64> {
         async move {
             let new_pos = seek_within(pos, self.pos, self.file_size)?;
+            self.pos = new_pos;
+            Ok(new_pos)
+        }
+        .boxed()
+    }
+
+    fn flush(&mut self) -> FsFuture<'_, ()> {
+        async move { Ok(()) }.boxed()
+    }
+}
+
+/// Simple virtual file (NFO files, etc)
+#[derive(Debug)]
+struct VirtualFile {
+    content: Bytes,
+    pos: u64,
+    /// The real per-torrent mtime for this NFO, plumbed through `open` from `vfs.timestamps` — the
+    /// SAME value the file reports when listed via `read_dir`/`metadata`. Hardcoding `UNIX_EPOCH`
+    /// here (as it once did) made an opened NFO report a 1970 mtime while its directory listing
+    /// reported the real one, confusing media-server change detection — the identical bug the
+    /// `MediaFile` open path was already fixed for.
+    modified_time: SystemTime,
+}
+
+impl DavFile for VirtualFile {
+    fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
+        let meta = DebridMetaData {
+            is_directory: false,
+            size: self.content.len() as u64,
+            modified_time: self.modified_time,
+        };
+        async move { Ok(Box::new(meta) as Box<dyn DavMetaData>) }.boxed()
+    }
+
+    fn write_buf(&mut self, _buf: Box<dyn bytes::Buf + Send>) -> FsFuture<'_, ()> {
+        async move { Err(FsError::Forbidden) }.boxed()
+    }
+
+    fn write_bytes(&mut self, _buf: Bytes) -> FsFuture<'_, ()> {
+        async move { Err(FsError::Forbidden) }.boxed()
+    }
+
+    fn read_bytes(&mut self, len: usize) -> FsFuture<'_, Bytes> {
+        async move {
+            if self.pos >= self.content.len() as u64 {
+                return Ok(Bytes::new());
+            }
+
+            let start = self.pos as usize;
+            // `saturating_add` so a pathological `len` near `usize::MAX` can't overflow the add
+            // before the `min` clamps it (mirrors `ProxiedMediaFile`'s saturating range math).
+            let end = std::cmp::min(start.saturating_add(len), self.content.len());
+            let data = self.content.slice(start..end);
+
+            self.pos += data.len() as u64;
+            Ok(data)
+        }
+        .boxed()
+    }
+
+    fn seek(&mut self, pos: std::io::SeekFrom) -> FsFuture<'_, u64> {
+        async move {
+            let new_pos = seek_within(pos, self.pos, self.content.len() as u64)?;
             self.pos = new_pos;
             Ok(new_pos)
         }
@@ -1030,69 +1095,6 @@ mod tests {
         // SeekFrom::End(-10) on 2-byte file would be negative => error
         let result = file.seek(std::io::SeekFrom::End(-10)).await;
         assert!(result.is_err());
-    }
-}
-
-/// Simple virtual file (NFO files, etc)
-#[derive(Debug)]
-struct VirtualFile {
-    content: Bytes,
-    pos: u64,
-    /// The real per-torrent mtime for this NFO, plumbed through `open` from `vfs.timestamps` — the
-    /// SAME value the file reports when listed via `read_dir`/`metadata`. Hardcoding `UNIX_EPOCH`
-    /// here (as it once did) made an opened NFO report a 1970 mtime while its directory listing
-    /// reported the real one, confusing media-server change detection — the identical bug the
-    /// `MediaFile` open path was already fixed for.
-    modified_time: SystemTime,
-}
-
-impl DavFile for VirtualFile {
-    fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
-        let meta = DebridMetaData {
-            is_directory: false,
-            size: self.content.len() as u64,
-            modified_time: self.modified_time,
-        };
-        async move { Ok(Box::new(meta) as Box<dyn DavMetaData>) }.boxed()
-    }
-
-    fn write_buf(&mut self, _buf: Box<dyn bytes::Buf + Send>) -> FsFuture<'_, ()> {
-        async move { Err(FsError::Forbidden) }.boxed()
-    }
-
-    fn write_bytes(&mut self, _buf: Bytes) -> FsFuture<'_, ()> {
-        async move { Err(FsError::Forbidden) }.boxed()
-    }
-
-    fn read_bytes(&mut self, len: usize) -> FsFuture<'_, Bytes> {
-        async move {
-            if self.pos >= self.content.len() as u64 {
-                return Ok(Bytes::new());
-            }
-
-            let start = self.pos as usize;
-            // `saturating_add` so a pathological `len` near `usize::MAX` can't overflow the add
-            // before the `min` clamps it (mirrors `ProxiedMediaFile`'s saturating range math).
-            let end = std::cmp::min(start.saturating_add(len), self.content.len());
-            let data = self.content.slice(start..end);
-
-            self.pos += data.len() as u64;
-            Ok(data)
-        }
-        .boxed()
-    }
-
-    fn seek(&mut self, pos: std::io::SeekFrom) -> FsFuture<'_, u64> {
-        async move {
-            let new_pos = seek_within(pos, self.pos, self.content.len() as u64)?;
-            self.pos = new_pos;
-            Ok(new_pos)
-        }
-        .boxed()
-    }
-
-    fn flush(&mut self) -> FsFuture<'_, ()> {
-        async move { Ok(()) }.boxed()
     }
 }
 
@@ -2499,14 +2501,35 @@ mod provider_abstraction_tests {
     }
 
     #[tokio::test]
-    async fn default_first_read_is_buffer_size() {
-        // With the default field value (no enlargement), the cold first read uses BUFFER_SIZE — so a
-        // deployment that doesn't set CDN_FIRST_READ_MB behaves exactly as before.
+    async fn first_read_window_is_the_files_first_read_bytes() {
+        // A file whose `first_read_bytes` is BUFFER_SIZE (`DebridFileSystem::new`'s own default,
+        // kept when `with_first_read_bytes` isn't called) makes a BUFFER_SIZE cold fetch, i.e. no
+        // enlargement. Production always applies the configured CDN_FIRST_READ_MB (default 8 MB)
+        // through `with_first_read_bytes` in main.rs.
         let total = 100 * 1024 * 1024u64;
         let (url, _conns, ranges) = spawn_keepalive_206(total).await;
-        let mut f = proxied_for(url, 0, total); // proxied_for defaults first_read_bytes = BUFFER_SIZE
+        let mut f = proxied_for(url, 0, total); // proxied_for sets first_read_bytes = BUFFER_SIZE
         let _ = f.fetch_bytes(8).await.expect("cold read");
         let r = ranges.lock().unwrap().clone();
         assert_eq!(r[0], (0, BUFFER_SIZE as u64 - 1));
+    }
+
+    #[test]
+    fn with_first_read_bytes_clamps_to_buffer_size_and_max_fetch_size() {
+        assert_eq!(one_movie_fs().first_read_bytes, BUFFER_SIZE as u64);
+        let mib = 1024 * 1024u64;
+        for (configured, applied) in [
+            (0, BUFFER_SIZE as u64),
+            (8 * mib, 8 * mib),
+            (u64::MAX, MAX_FETCH_SIZE as u64),
+        ] {
+            assert_eq!(
+                one_movie_fs()
+                    .with_first_read_bytes(configured)
+                    .first_read_bytes,
+                applied,
+                "configured {configured}"
+            );
+        }
     }
 }

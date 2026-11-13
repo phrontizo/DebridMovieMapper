@@ -62,7 +62,7 @@ fn site_match_is_a_site(site: &str, rest: &str) -> bool {
 
 /// A leading `[Title] (YYYY)` — bracket(s) that are PART of the title (e.g. `[REC] (2007)`),
 /// confirmed by an immediately-following parenthesised year — is NOT a release-group tag, so
-/// `PREFIX_RE` must not strip it (which would leave a yearfragment like `2007)` as the "title"). A
+/// `PREFIX_RE` must not strip it (which would leave a year fragment like `2007)` as the "title"). A
 /// genuine leading tag is `[group] Title …`, never `[group] (year)`.
 static TITLE_BRACKET_YEAR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^\[[^\]]*\]\s*\((?:19|20)\d{2}\)").unwrap());
@@ -96,7 +96,9 @@ static STOP_RE: LazyLock<Regex> = LazyLock::new(|| {
     // as a leftmost-match truncation point, collapsing the title to its trailing year.
     // `web[\s-]?dl` (not just `web-dl`) so the dot form `WEB.DL` — which step-2 dot→space replacement
     // turns into `WEB DL` — also truncates, rather than leaking `WEB DL` into the TMDB query.
-    Regex::new(r"(?i)\b((?:360|480|540|576|720|1080|1440|2160)p(?:\d{2,3})?[a-z]*|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d{3,4}x\d{3,4}|episodes?\s*\d+|e\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web[\s-]?dl|h264|h265|x264|x265|remux|vff|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack|dvdrip|bdrip|brrip|xvid|divx)\b").unwrap()
+    // `ep\s*\d+` is the short episode marker (`Ep01`, `Ep.5` → `Ep 5`), so an episode title after it
+    // (`Show Name - Ep01 - Title`) never reaches the query; the leading `\b` keeps `Step 2` intact.
+    Regex::new(r"(?i)\b((?:360|480|540|576|720|1080|1440|2160)p(?:\d{2,3})?[a-z]*|4k|s\d+e\d+|s\d+|seasons?\s*\d+|\d+\s*seasons?|temporada\s*\d+|saison\s*\d+|\d{3,4}x\d{3,4}|episodes?\s*\d+|e\d+|ep\s*\d+|parts?\s*\d+|vol(ume)?\s*\d+|bluray|web[\s-]?dl|h264|h265|x264|x265|remux|vff|dts|dd5|dd\+5|ddp5|esub|webrip|hdtv|avc|hevc|aac|truehd|atmos|criterion|repack|dvdrip|bdrip|brrip|xvid|divx)\b").unwrap()
 });
 
 static YEAR_RANGE_RE: LazyLock<Regex> =
@@ -153,6 +155,16 @@ static GENERIC_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// precedes it; everything from the separator on is episode numbering/title.
 static EPISODE_NUM_DASH_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\s+-\s+\d{1,3}\s+-\s+").unwrap());
+
+/// A ` - NN` episode number that ENDS the name's title run: no second ` - ` follows it, only the
+/// end of the name or a bracket group (`[SubsPlease] Some Show - 12 (1080p) [hash]`, the common
+/// anime form; `Show.Name - 101`; `Some Show - Ep01 [720p]`), with an optional `Ep` prefix and
+/// `v2` version suffix. Two to four digits, so a single-digit sequel (`Some Film - 2`) is kept;
+/// `clean_name` also skips a 19xx/20xx year (`Dr.No - 1962`). Matched after the dot → space
+/// replacement.
+static TRAILING_EPISODE_NUM_DASH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\s+-\s+(?:ep\s*)?(\d{2,4})(?:v\d{1,2})?(?:\s*[\[(]|\s*$)").unwrap()
+});
 
 /// What [`identify_name`] concluded about a name.
 #[derive(Debug, Clone)]
@@ -768,6 +780,18 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
         if m.start() > 0 {
             title.truncate(m.start());
         }
+    }
+    // Likewise at a ` - NN` episode number that no second ` - ` follows (`Some Show - 12 (1080p)`):
+    // left in, TMDB finds nothing for the whole query, and the leading-word strip can end up
+    // searching the number alone. A year there is the release year (`Dr.No - 1962`), kept for
+    // step 4.
+    let episode_cut = TRAILING_EPISODE_NUM_DASH_RE
+        .captures_iter(&title)
+        .filter(|c| c.get(1).is_some_and(|n| !YEAR_RE.is_match(n.as_str())))
+        .find_map(|c| c.get(0))
+        .map(|m| m.start());
+    if let Some(start) = episode_cut.filter(|&start| start > 0) {
+        title.truncate(start);
     }
 
     // 4. Find year (19xx or 20xx). Use the LAST year token: scene names put the title first and the
@@ -1404,6 +1428,51 @@ mod tests {
     }
 
     #[test]
+    fn clean_name_truncates_at_a_trailing_dash_episode_number() {
+        // The common anime form ends the title at a ` - NN` episode number that no second ` - `
+        // follows. Left in the query, TMDB finds nothing, and the leading-word strip can end up
+        // searching the number alone (`12` → an unrelated film).
+        for (name, title) in [
+            (
+                "[SubsPlease] Some Show - 12 (1080p) [ABCD1234].mkv",
+                "Some Show",
+            ),
+            ("[Group] Some Show - 05v2 [1080p].mkv", "Some Show"),
+            ("[Group] Some Show - 1000 [1080p][HEVC].mkv", "Some Show"),
+            ("Show.Name - 101.mkv", "Show Name"),
+            ("Some.Show - Ep.5 - The End", "Some Show"),
+            ("Some Show - Ep01 [720p].mkv", "Some Show"),
+            ("Some Show - EP 07.mkv", "Some Show"),
+        ] {
+            assert_eq!(clean_name(name).0, title, "{name:?}");
+        }
+        // A year after the dash is the release year, not an episode number.
+        assert_eq!(
+            clean_name("Dr.No - 1962.mkv"),
+            ("Dr No".to_string(), Some("1962".to_string()))
+        );
+        assert_eq!(
+            clean_name("The Matrix - 1999 - 1080p"),
+            ("The Matrix".to_string(), Some("1999".to_string()))
+        );
+        assert_eq!(
+            clean_name("Some Film - 2049.mkv"),
+            ("Some Film".to_string(), Some("2049".to_string()))
+        );
+        // A single-digit sequel number and a hyphenated subtitle are title content.
+        assert_eq!(
+            clean_name("Some Film - 2 2019 1080p"),
+            ("Some Film - 2".to_string(), Some("2019".to_string()))
+        );
+        assert_eq!(
+            clean_name("Spider-Man - Far From Home 1080p").0,
+            "Spider-Man - Far From Home"
+        );
+        // A word merely starting with `ep` is not an episode marker.
+        assert_eq!(clean_name("Step Up 2 2008 1080p").0, "Step Up 2");
+    }
+
+    #[test]
     fn clean_name_truncates_at_framerate_suffixed_resolution() {
         // A framerate-glued quality tag ("2160p60"/"1080p50") is still metadata and must
         // truncate the title, not leak into the TMDB query (mirrors the RES_RE framerate fix).
@@ -1492,15 +1561,17 @@ mod tests {
         for name in [
             "Show.Name - Ep01 - Title",
             "Show.Name - 101.mkv",
-            "Show.Name - 101.Pilot.mkv",
             "Show.Name - Episode.5",
         ] {
-            assert!(
-                clean_name(name).0.starts_with("Show Name"),
-                "{name:?} cleaned to {:?}",
-                clean_name(name).0
-            );
+            assert_eq!(clean_name(name).0, "Show Name", "{name:?}");
         }
+        // KNOWN LIMITATION: a bare episode number followed by an episode title (no second ` - `)
+        // stays in the title; cutting before any trailing word would also cut a hyphenated film
+        // subtitle that starts with a number.
+        assert_eq!(
+            clean_name("Show.Name - 101.Pilot.mkv").0,
+            "Show Name - 101 Pilot"
+        );
         // A dotted title followed by more title words, with no release tag after it, is kept too:
         // a site prefix is followed by a release name (a year or a quality tag).
         assert!(

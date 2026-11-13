@@ -554,15 +554,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // anyway. We DO wait for the background scheduler to stop, but its jobs are not drained: the
     // periodic Trakt / episode / upgrade jobs are cancelled at the await point they are parked on as
     // soon as the shutdown signal flips (`scheduler::periodic`), and only the scan loop runs on to
-    // its own next shutdown check. An upgrade candidate cut off mid-staging keeps its staging intent,
-    // so the next start's staging sweep deletes it (`upgrade::sweep_staging_intents`).
+    // its own next shutdown check. An upgrade candidate cut off mid-staging, or an acquisition cut
+    // off between its add and its `Pending` record, keeps its staging intent, so the next start's
+    // staging sweep deletes it (`upgrade::sweep_staging_intents`).
     let _ = shutdown_tx.send(true);
     info!("Waiting for background tasks to finish...");
     // Bound the wait: the scan loop parked in a slow provider call (reqwest 30s timeout) or the shared
     // rate limiter's backpressure could otherwise delay shutdown past `docker stop`'s ~10s grace →
     // SIGKILL. The scheduler's operations are idempotent, so a task cut here is redone next start (a
-    // cut staging is swept, as above). Dropping the JoinHandle on timeout detaches the task; the
-    // runtime aborts it as `main` returns.
+    // cut staging or acquisition is swept, as above). Dropping the JoinHandle on timeout detaches the
+    // task; the runtime aborts it as `main` returns.
     const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
     match tokio::time::timeout(SHUTDOWN_GRACE, scheduler_handle).await {
         Ok(Ok(_)) => {}
