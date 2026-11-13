@@ -1152,6 +1152,47 @@ async fn await_downloaded(
     last
 }
 
+/// The waits before each retry of a 404 on the lookup of a torrent staging has just added.
+///
+/// TorBox's `mylist?id=` sometimes answers 404 ("No torrents found for this user") for a torrent
+/// that exists. On 2026-11-13 it did so 21 times in ten minutes: for torrents `createtorrent` had
+/// just returned, for torrents already in the account listing, and between two successful polls of
+/// the same torrent. The 15 that hit a staged torrent's first lookup each deferred an episode upgrade
+/// to its show's next turn, while the four in `await_downloaded`, which polls again a second later,
+/// did no harm. Five lookups in all, 15 s at most.
+const STAGED_INFO_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+];
+
+/// `get_torrent_info` for a torrent staging has just added, retrying a 404 after each wait in
+/// [`STAGED_INFO_BACKOFF`]. Any other error is returned at once: the provider clients already retry
+/// transport errors, 429s and transient 5xx.
+async fn staged_torrent_info(
+    provider: &dyn crate::provider::DebridProvider,
+    id: &str,
+) -> Result<crate::rd_client::TorrentInfo, reqwest::Error> {
+    let mut waits = STAGED_INFO_BACKOFF.iter();
+    loop {
+        match provider.get_torrent_info(id).await {
+            Err(e) if e.status() == Some(reqwest::StatusCode::NOT_FOUND) => {
+                let Some(wait) = waits.next() else {
+                    return Err(e);
+                };
+                debug!(
+                    "upgrade: staged torrent {} not found yet; looking again in {}s",
+                    id,
+                    wait.as_secs()
+                );
+                tokio::time::sleep(*wait).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Add the candidate, wait briefly for it to resolve (it should be cached), validate + record it
 /// Verified with sticky provenance, and return (hash, torrent_id, selected_file_path). On any
 /// failure the candidate is cleaned up and the current release is left untouched (non-destructive).
@@ -1167,7 +1208,7 @@ async fn stage_and_verify(
     // than NoChange (which would skip this title — with its real upgrade candidate — for a full wrap).
     // A candidate already in the account is never staged (NoChange → the next candidate).
     let added = add_staging_candidate(app, &hash).await?;
-    let info = match app.provider.get_torrent_info(&added.id).await {
+    let info = match staged_torrent_info(app.provider.as_ref(), &added.id).await {
         Ok(i) => i,
         Err(e) => {
             let _ = app.provider.delete_torrent(&added.id).await;
@@ -1532,7 +1573,7 @@ async fn stage_and_await_cached(
     hash: &str,
 ) -> Result<(String, crate::rd_client::TorrentInfo), UpgradeSkip> {
     let added = add_staging_candidate(app, hash).await?;
-    let info = match app.provider.get_torrent_info(&added.id).await {
+    let info = match staged_torrent_info(app.provider.as_ref(), &added.id).await {
         Ok(i) => i,
         Err(e) => {
             let _ = app.provider.delete_torrent(&added.id).await;
@@ -2726,7 +2767,7 @@ async fn consolidate_show_seasons(
             let Ok(added) = add_staging_candidate(app, &r.info_hash).await else {
                 continue;
             };
-            let Ok(info) = app.provider.get_torrent_info(&added.id).await else {
+            let Ok(info) = staged_torrent_info(app.provider.as_ref(), &added.id).await else {
                 let _ = app.provider.delete_torrent(&added.id).await;
                 continue;
             };
@@ -11454,5 +11495,209 @@ mod tests {
         for h in ["e1", "e2"] {
             assert!(store.get_owned(h.into()).await.is_some(), "{h} kept");
         }
+    }
+
+    // ── a staged torrent's first lookup can 404 (TorBox, 2026-11-13) ──────────────────────────
+
+    /// Answers `get_torrent_info` with a 404 for the first `misses` lookups of each torrent, as
+    /// TorBox sometimes does right after `createtorrent` ("No torrents found for this user"), then
+    /// delegates to `inner`. `lookups` counts every call.
+    #[derive(Debug)]
+    struct NotListedYet {
+        inner: Arc<dyn DebridProvider>,
+        misses: usize,
+        seen: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+        lookups: AtomicUsize,
+    }
+    impl NotListedYet {
+        fn wrap(inner: Arc<dyn DebridProvider>, misses: usize) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                misses,
+                seen: Default::default(),
+                lookups: AtomicUsize::new(0),
+            })
+        }
+    }
+    #[async_trait]
+    impl DebridProvider for NotListedYet {
+        fn name(&self) -> &'static str {
+            "not-listed-yet"
+        }
+        async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
+            self.inner.get_torrents().await
+        }
+        async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            let n = {
+                let mut seen = self.seen.lock().unwrap();
+                let n = seen.entry(id.to_string()).or_default();
+                *n += 1;
+                *n
+            };
+            if n <= self.misses {
+                return Err(http_status_error(404));
+            }
+            self.inner.get_torrent_info(id).await
+        }
+        async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+            self.inner.add_magnet(magnet).await
+        }
+        async fn select_files(&self, id: &str, file_ids: &str) -> Result<(), reqwest::Error> {
+            self.inner.select_files(id, file_ids).await
+        }
+        async fn delete_torrent(&self, id: &str) -> Result<(), reqwest::Error> {
+            self.inner.delete_torrent(id).await
+        }
+        async fn resolve_url(
+            &self,
+            loc: &crate::provider::FileLocator,
+        ) -> Result<String, crate::error::AppError> {
+            self.inner.resolve_url(loc).await
+        }
+        async fn invalidate(&self, loc: &crate::provider::FileLocator) {
+            self.inner.invalidate(loc).await
+        }
+    }
+
+    fn listed_info() -> Arc<dyn DebridProvider> {
+        Arc::new(MockProvider {
+            torrent_info: Some(TorrentInfo {
+                id: "t1".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_staged_lookup_that_404s_is_retried_with_backoff() {
+        let p = NotListedYet::wrap(listed_info(), 3);
+        let start = tokio::time::Instant::now();
+
+        let info = staged_torrent_info(p.as_ref(), "t1").await;
+
+        assert_eq!(info.expect("found on the fourth lookup").id, "t1");
+        assert_eq!(p.lookups.load(Ordering::SeqCst), 4);
+        assert_eq!(start.elapsed(), Duration::from_secs(1 + 2 + 4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_staged_lookup_gives_up_after_the_last_backoff() {
+        let p = NotListedYet::wrap(listed_info(), usize::MAX);
+        let start = tokio::time::Instant::now();
+
+        let err = staged_torrent_info(p.as_ref(), "t1").await.unwrap_err();
+
+        assert_eq!(err.status(), Some(reqwest::StatusCode::NOT_FOUND));
+        assert_eq!(p.lookups.load(Ordering::SeqCst), 5);
+        assert_eq!(start.elapsed(), Duration::from_secs(1 + 2 + 4 + 8));
+    }
+
+    /// The provider clients already retry transport errors, 429s and 5xx; only a 404 is retried here.
+    #[tokio::test(start_paused = true)]
+    async fn a_staged_lookup_does_not_retry_other_errors() {
+        let failing: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            fail_info_ids: ["t1".to_string()].into_iter().collect(),
+            ..Default::default()
+        });
+        let p = NotListedYet::wrap(failing, 0);
+        let start = tokio::time::Instant::now();
+
+        assert!(staged_torrent_info(p.as_ref(), "t1").await.is_err());
+
+        assert_eq!(p.lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_movie_swap_survives_a_404_on_the_staged_lookup() {
+        let store = mem_store();
+        let old = put_movie_copy(&store, 27205, "tt1", "hold").await;
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = remux_staging_provider(vec![old], deleted.clone());
+        let mut app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![remux_candidate()],
+            }),
+            provider,
+            store.clone(),
+        );
+        app.provider = NotListedYet::wrap(app.provider.clone(), 2);
+
+        run_upgrade_once(&app).await;
+
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hnew"
+        );
+        assert!(!deleted.lock().unwrap().contains(&"tnew".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_episode_swap_survives_a_404_on_the_staged_lookup() {
+        let h = show_harness_singleton_720_ep().await;
+        let mut app = h.app.clone();
+        app.provider = NotListedYet::wrap(app.provider.clone(), 2);
+
+        let deferred =
+            upgrade_show_episodes_and_packs(&app, h.tmdb, &h.group_hashes, Duration::from_secs(60))
+                .await;
+
+        assert!(!deferred);
+        assert_eq!(
+            app.store
+                .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            h.cand_1080_hash
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consolidation_survives_a_404_on_the_staged_lookup() {
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(pack_info()),
+            resolved_url: Some("https://cdn/p1".into()),
+            ..Default::default()
+        });
+        let mut app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![season_pack_candidate()],
+            }),
+            provider,
+            store.clone(),
+        );
+        app.provider = NotListedYet::wrap(app.provider.clone(), 2);
+
+        let res = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(300),
+        )
+        .await;
+
+        assert!(res.is_ok(), "{res:?}");
+        assert!(store.get_owned("hpack".into()).await.is_some());
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            "hpack"
+        );
     }
 }
