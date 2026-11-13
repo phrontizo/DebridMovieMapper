@@ -128,15 +128,15 @@ pub fn plan_selection_repoints(
 }
 
 /// A parsed slot key ([`crate::store::movie_slot`] / [`crate::store::episode_slot`]).
-struct SlotKey {
-    is_movie: bool,
-    tmdb: u64,
+pub(crate) struct SlotKey {
+    pub(crate) is_movie: bool,
+    pub(crate) tmdb: u64,
     /// `None` for a movie slot.
-    episode: Option<(u32, u32)>,
+    pub(crate) episode: Option<(u32, u32)>,
 }
 
 /// Parse a slot key, or `None` for anything else.
-fn parse_slot(slot: &str) -> Option<SlotKey> {
+pub(crate) fn parse_slot(slot: &str) -> Option<SlotKey> {
     let mut parts = slot.split('|');
     match (
         parts.next()?,

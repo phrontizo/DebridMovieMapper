@@ -126,33 +126,43 @@ where
                 .filter_map(|h| records.get(&h.to_ascii_lowercase())),
             ceiling,
         );
-        queue.push((last, attention, (id, media_type, hashes, rec)));
+        queue.push((last, attention, (attention, (id, media_type, hashes, rec))));
     }
     let queued = queue.len();
     let attention = queue.iter().filter(|(_, a, _)| *a).count();
     let batch = upgrade_batch(queue, budget);
     info!(
-        "upgrade: visiting {} of {} title(s), first the {} holding a copy of unknown or unchecked quality",
+        "upgrade: visiting {} of {} title(s); {} of the {} holding a copy of unknown or unchecked quality go first",
         batch.len(),
         queued,
+        batch.iter().filter(|(a, _)| *a).count(),
         attention
     );
+    // Within the start-up grace every swap would defer (no read history yet), so don't scrape
+    // anything. The scheduler waits the grace out before the first pass, so this is a guard.
+    if !app
+        .read_activity
+        .startup_grace_remaining(idle_window)
+        .is_zero()
+    {
+        debug!("upgrade: start-up grace still running; deferring the pass (cursors unchanged)");
+        return;
+    }
 
     let mut backfill = LanguageBackfill::new(fetch_details);
-    for (tmdb_id, media_type, hashes, mut rec) in batch {
-        // Library-wide idle gate BEFORE stamping the cursor. The actual swap/prune is idle-gated
-        // inside each handler, but stamping `upgrade_checked` for a title we then defer (library
-        // active) would advance the round-robin cursor past it — so on a frequently-streamed library
-        // a title could wait a full cursor wrap (library_size / budget ticks) before being
-        // reconsidered even once the library goes idle. Since the gate is library-wide, an active
-        // library blocks the whole remaining batch: break without stamping so no title is marked
-        // "checked" while it could not actually be upgraded. (The handlers keep their own idle
-        // re-check as the read-vs-prune race guard for activity that starts mid-tick.)
-        if !app.read_activity.all_idle(idle_window).await {
+    for (_, (tmdb_id, media_type, hashes, mut rec)) in batch {
+        // Skip a title a player is reading, BEFORE stamping the cursor (and before scraping): its
+        // swap would only defer, and stamping `upgrade_checked` for it would push it to the back of
+        // the queue. The pass carries on with the next title. Only this title's copies count, so a
+        // stream of another title, or Jellyfin probing a file an earlier swap this pass added, holds
+        // nothing else back. The handlers re-check the exact torrents each swap changes right
+        // before it, for a read that starts mid-title.
+        if being_read(app, &hashes, idle_window).await {
             debug!(
-                "upgrade: library active; deferring remaining titles this tick (cursor unchanged)"
+                "upgrade: tmdb {} has a copy being read; skipping it this pass (cursor unchanged)",
+                tmdb_id
             );
-            break;
+            continue;
         }
         // Legacy/mirror records predate `spoken_languages`: fetch the title's TMDB languages once
         // (before dispatch) so this visit's staging probes already accept its spoken languages under
@@ -187,8 +197,9 @@ where
                     .await
                     .ok();
             }
-            // NOT evaluated (library active mid-stage / provider unavailable): leave the cursor
-            // unstamped so this title is reconsidered next tick rather than skipped for a full wrap.
+            // NOT evaluated (a copy it would change is being read / provider unavailable): leave the
+            // cursor unstamped so this title is reconsidered next tick rather than skipped for a
+            // full wrap.
             Err(UpgradeSkip::Deferred(reason)) => {
                 debug!(
                     "upgrade: tmdb {} deferred: {} (cursor unchanged)",
@@ -197,6 +208,96 @@ where
             }
         }
     }
+}
+
+/// The torrents a player could be reading part of a title from: every owned copy of the title that
+/// supplies one of `episodes` (`None`: the whole title, which is how a movie is always asked), every
+/// copy whose episodes aren't known yet (no `provides`), and whatever the matching selection slots
+/// point at. Repointing a slot hides the copy it served, and an episode with no slot shows every
+/// copy, so these are the torrents a swap of those episodes takes a file away from. Lowercased and
+/// de-duplicated.
+async fn copies_serving(
+    app: &AppState,
+    kind: MediaKind,
+    tmdb_id: u64,
+    episodes: Option<&[(u32, u32)]>,
+) -> Vec<String> {
+    let mut out: Vec<String> = app
+        .store
+        .all_owned()
+        .await
+        .into_iter()
+        .filter(|(_, r)| r.request.tmdb_id == tmdb_id && r.request.kind == kind)
+        .filter(|(_, r)| {
+            r.provides.is_empty()
+                || episodes.is_none_or(|eps| r.provides.iter().any(|p| eps.contains(p)))
+        })
+        .map(|(h, _)| h.to_ascii_lowercase())
+        .collect();
+    match (kind, episodes) {
+        (MediaKind::Movie, _) => {
+            if let Some(e) = app.store.get_selection(movie_slot(tmdb_id)).await {
+                out.push(e.hash.to_ascii_lowercase());
+            }
+        }
+        (MediaKind::Series, Some(eps)) => {
+            for (s, e) in eps {
+                let slot = crate::store::episode_slot(tmdb_id, *s, *e);
+                if let Some(entry) = app.store.get_selection(slot).await {
+                    out.push(entry.hash.to_ascii_lowercase());
+                }
+            }
+        }
+        (MediaKind::Series, None) => {
+            let prefix = format!("e|{tmdb_id}|");
+            out.extend(
+                app.store
+                    .all_selection()
+                    .await
+                    .into_iter()
+                    .filter(|(slot, _)| slot.starts_with(&prefix))
+                    .map(|(_, e)| e.hash.to_ascii_lowercase()),
+            );
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// [`copies_serving`] for the titles behind a set of selection slots: what repointing them takes a
+/// file away from.
+async fn copies_behind_slots(app: &AppState, slots: &[(String, String)]) -> Vec<String> {
+    let mut titles: std::collections::BTreeMap<(bool, u64), Vec<(u32, u32)>> =
+        std::collections::BTreeMap::new();
+    for (slot, _) in slots {
+        if let Some(key) = crate::selection::parse_slot(slot) {
+            titles
+                .entry((key.is_movie, key.tmdb))
+                .or_default()
+                .extend(key.episode);
+        }
+    }
+    let mut out = Vec::new();
+    for ((is_movie, tmdb_id), eps) in titles {
+        let (kind, eps) = if is_movie {
+            (MediaKind::Movie, None)
+        } else {
+            (MediaKind::Series, Some(eps.as_slice()))
+        };
+        out.extend(copies_serving(app, kind, tmdb_id, eps).await);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether a player has read any of `hashes` within `idle_window`, or the start-up grace is still
+/// running. Every swap and prune the upgrade engine makes waits on this for the torrents it deletes
+/// or takes a file away from, so a read elsewhere in the library (another title's stream, or
+/// Jellyfin probing a file this pass has just added, as on 2026-11-12) doesn't hold it back.
+async fn being_read(app: &AppState, hashes: &[String], idle_window: Duration) -> bool {
+    !app.read_activity.torrents_idle(hashes, idle_window).await
 }
 
 /// Whether a title holds a settled (`Verified`) copy the upgrade pass should look at first: one with
@@ -562,6 +663,15 @@ enum PrunePlan {
 }
 
 impl PrunePlan {
+    /// Every hash this plan could prune, before the listing settles a pack prune: what the final
+    /// read check must cover.
+    fn candidates(&self) -> Vec<String> {
+        match self {
+            PrunePlan::Hashes(h) => h.clone(),
+            PrunePlan::Pack(p) => vec![p.hash.clone()],
+        }
+    }
+
     /// The hashes to prune, given the provider `listing` fetched for this swap.
     fn resolve(&self, listing: &[crate::rd_client::Torrent]) -> Vec<String> {
         match self {
@@ -629,12 +739,12 @@ impl PackPrune {
     }
 }
 
-/// Shared swap/prune tail used by the movie, per-episode, and pack-correction callers. Idle-gates,
-/// fetches the provider listing ONCE (before the final idle re-check, so there is no network
-/// round-trip between confirming idle and the destructive prune), repoints every slot to the staged
-/// release, then prunes what `prune` resolves to against that listing. Non-destructive rollback on
-/// defer: a mid-stage active read fully deletes the staged torrent + drops its records and leaves
-/// the current release intact.
+/// Shared swap/prune tail used by the movie, per-episode, and pack-correction callers. Fetches the
+/// provider listing ONCE (before the final read check, so there is no network round-trip between
+/// that check and the destructive prune), checks that no copy the swap changes is being read,
+/// repoints every slot to the staged release, then prunes what `prune` resolves to against that
+/// listing. Non-destructive rollback on defer: a mid-stage read of a changed copy fully deletes the
+/// staged torrent + drops its records and leaves the current release intact.
 async fn apply_upgrade(
     app: &AppState,
     staged: StagedUpgrade,
@@ -666,12 +776,16 @@ async fn apply_upgrade(
             ));
         }
     };
-    // Re-check idle IMMEDIATELY before the destructive swap+prune. Staging above can take many
-    // seconds (add + select + cached-poll + 4 MB probe), during which a playback read may have begun
-    // anywhere in the library. If it is no longer idle, fully roll back the freshly-staged candidate
-    // (delete it + drop its records — non-destructive: the current release is untouched) and retry
-    // later, so the prune below never interrupts an in-flight stream.
-    if !app.read_activity.all_idle(idle_window).await {
+    // Re-check IMMEDIATELY before the destructive swap+prune. Staging above can take many seconds
+    // (add + select + cached-poll + 4 MB probe), during which a player may have started reading a
+    // copy this swap changes: one it prunes, or one a repointed slot stops showing. If so, fully
+    // roll back the freshly-staged candidate (delete it + drop its records — non-destructive: the
+    // current release is untouched) and retry later, so the swap never interrupts a stream. A read
+    // of anything else doesn't count.
+    let mut changed = copies_behind_slots(app, &staged.slot_files).await;
+    changed.extend(prune.candidates().iter().map(|h| h.to_ascii_lowercase()));
+    changed.retain(|h| !h.eq_ignore_ascii_case(&staged.hash));
+    if being_read(app, &changed, idle_window).await {
         // Roll back by the KNOWN torrent id, not the listing snapshot: the just-staged torrent may
         // not have propagated into `listing` yet. Only drop the store records when the delete
         // SUCCEEDED — on a transient delete failure, KEEP them so a later tick retries rather than
@@ -687,7 +801,7 @@ async fn apply_upgrade(
             let _ = app.store.remove_authoritative(staged.hash.clone()).await;
         }
         return Err(UpgradeSkip::Deferred(
-            "library became active during staging; deferring".into(),
+            "a copy this swap changes started being read during staging; deferring".into(),
         ));
     }
     // Repoint every slot. If ANY selection write fails, do NOT prune (pruning behind a stale
@@ -963,6 +1077,8 @@ async fn try_upgrade_movie(
         }
     }
     let group_prov = merged_provenance(&group_owned);
+    // The swap prunes every copy and repoints the film's slot, so a read of any copy holds it back.
+    let copies = copies_serving(app, MediaKind::Movie, tmdb_id, None).await;
     // Try ranked candidates best-first until one is adopted (in-tick fall-through), mirroring the
     // pack-correction/consolidation loops.
     for (cand, imp) in ranked {
@@ -971,10 +1087,10 @@ async fn try_upgrade_movie(
         if !downgrade_allowed_or_log(app, tmdb_id, imp, old_hash, &current, &cand) {
             break;
         }
-        // Idle re-check before staging each candidate (mirrors correct_over_ceiling_packs).
-        if !app.read_activity.all_idle(idle_window).await {
+        // Read re-check before staging each candidate (mirrors correct_over_ceiling_packs).
+        if being_read(app, &copies, idle_window).await {
             return Err(UpgradeSkip::Deferred(
-                "library active; deferring upgrade".into(),
+                "a copy of the film is being read; deferring upgrade".into(),
             ));
         }
         match stage_and_verify(app, tmdb_id, &req, &cand, &group_prov).await {
@@ -1778,6 +1894,7 @@ async fn upgrade_episode_slot(
         baseline,
         supersede,
     } = target;
+    let copies = copies_serving(app, MediaKind::Series, tmdb_id, Some(&[(season, episode)])).await;
     for (cand, imp) in ranked {
         let cand_hash = cand.info_hash.to_ascii_lowercase();
         if tick.multi_episode.contains(&cand_hash)
@@ -1795,10 +1912,10 @@ async fn upgrade_episode_slot(
         if !downgrade_allowed_or_log(app, tmdb_id, imp, supersede.current_hash(), baseline, &cand) {
             break; // direction-homogeneous list → all remaining are gated downgrades
         }
-        if !app.read_activity.all_idle(idle_window).await {
+        if being_read(app, &copies, idle_window).await {
             debug!(
-                "upgrade: tmdb {} library active; deferring remaining show upgrade work",
-                tmdb_id
+                "upgrade: tmdb {} s{}e{} is being read; deferring remaining show upgrade work",
+                tmdb_id, season, episode
             );
             // Stop ALL further staging (remaining episodes + pack correction) this tick and
             // signal deferral so the caller leaves the cursor unstamped (unchanged behaviour).
@@ -1883,8 +2000,8 @@ async fn upgrade_episode_slot(
 /// torrent id, so the coverage-miss cleanup below would delete the adopted torrent out from under its
 /// record and selection.
 ///
-/// Returns `true` if it DEFERRED mid-tick — the library became active (a non-idle `all_idle`
-/// check) OR a post-stage `apply_upgrade` step failed (a provider-listing fetch or a `put_selection`
+/// Returns `true` if it DEFERRED mid-tick — a player is reading the pack ([`being_read`]) OR a
+/// post-stage `apply_upgrade` step failed (a provider-listing fetch or a `put_selection`
 /// write) — so the caller can leave the round-robin cursor unstamped and reconsider next tick;
 /// `false` on normal completion (whether or not a correction was applied).
 async fn correct_over_ceiling_packs(
@@ -1924,6 +2041,7 @@ async fn correct_over_ceiling_packs(
         // happens to also contain (an extra episode may have a better within-ceiling singleton whose
         // slot must not be dragged down to this pack; see the `provides`/`slot_files` filters below).
         let need_set: std::collections::HashSet<u32> = need.iter().copied().collect();
+        let copies = copies_serving(app, MediaKind::Series, tmdb_id, Some(&rec.provides)).await;
 
         let Ok(raws) = app
             .scraper
@@ -1945,8 +2063,8 @@ async fn correct_over_ceiling_packs(
             if !downgrade_allowed_or_log(app, tmdb_id, imp, pack_hash, &pack_q, &cand) {
                 break; // logged (dry-run); no candidate below would fare better — stop this pack
             }
-            if !app.read_activity.all_idle(idle_window).await {
-                return true; // library active; defer — leave the cursor unstamped, retry next tick
+            if being_read(app, &copies, idle_window).await {
+                return true; // the pack is being read; defer — leave the cursor unstamped, retry next tick
             }
 
             let (torrent_id, fresh) = match stage_and_await_cached(app, &cand.info_hash).await {
@@ -2101,9 +2219,9 @@ async fn correct_over_ceiling_packs(
 /// (Deferred/NoChange/staged) never aborts the rest of the group — every branch already classifies +
 /// logs its own outcome.
 ///
-/// Returns `true` if it DEFERRED mid-tick — the library became active (a non-idle `all_idle` check,
-/// in the per-episode loops or in `correct_over_ceiling_packs`) OR a post-stage `apply_upgrade` step
-/// failed (a provider-listing fetch or a `put_selection` write). The caller uses this to signal
+/// Returns `true` if it DEFERRED mid-tick — a player is reading a copy one of its swaps would change
+/// ([`being_read`], in the per-episode loops or in `correct_over_ceiling_packs`) OR a post-stage
+/// `apply_upgrade` step failed (a provider-listing fetch or a `put_selection` write). The caller uses this to signal
 /// `Deferred` so the round-robin cursor is NOT stamped and the skipped work is reconsidered next
 /// tick (rather than waiting a full cursor wrap). `false` on normal completion.
 async fn upgrade_show_episodes_and_packs(
@@ -2375,12 +2493,19 @@ async fn try_upgrade_show(
     idle_window: Duration,
 ) -> Result<(), UpgradeSkip> {
     let deferred = upgrade_show_episodes_and_packs(app, tmdb_id, group_hashes, idle_window).await;
-    // If the episode/pack phase deferred because the library went ACTIVE mid-tick, consolidation's
-    // own idle gate would discard its swap/prune — so skip its network calls (aired-episode lookup +
-    // per-season scrapes) entirely rather than issuing them just to throw the result away.
-    if deferred && !app.read_activity.all_idle(idle_window).await {
+    // If the episode/pack phase deferred because a copy of the show is being read, consolidation's
+    // own read check would most likely discard its swap/prune too — so skip its network calls
+    // (aired-episode lookup + per-season scrapes) rather than issuing them to throw the result away.
+    if deferred
+        && being_read(
+            app,
+            &copies_serving(app, MediaKind::Series, tmdb_id, None).await,
+            idle_window,
+        )
+        .await
+    {
         return Err(UpgradeSkip::Deferred(
-            "show per-episode/pack upgrade deferred mid-tick (library active); skipping consolidation"
+            "show per-episode/pack upgrade deferred mid-tick (a copy is being read); skipping consolidation"
                 .into(),
         ));
     }
@@ -2395,7 +2520,7 @@ async fn try_upgrade_show(
     let consolidated = try_consolidate_show(app, tmdb_id, &fresh_hashes, idle_window).await;
     if deferred {
         return Err(UpgradeSkip::Deferred(
-            "show per-episode/pack upgrade deferred mid-tick (library active)".into(),
+            "show per-episode/pack upgrade deferred mid-tick".into(),
         ));
     }
     consolidated
@@ -2535,6 +2660,17 @@ async fn consolidate_show_seasons(
         // Per-episode owned quality across ALL records that supply an episode of this season (the
         // prune below supersedes any of them); an unknown-quality contributor is the lowest.
         let season_owned_q = season_owned_quality(owned, season);
+        // The copies consolidating this season repoints or prunes: those of its aired and owned
+        // episodes.
+        let mut season_eps: Vec<(u32, u32)> = season_aired.iter().map(|e| (season, *e)).collect();
+        season_eps.extend(
+            owned
+                .iter()
+                .flat_map(|(_, r)| r.provides.iter().copied())
+                .filter(|(s, _)| *s == season),
+        );
+        let season_copies =
+            copies_serving(app, MediaKind::Series, tmdb_id, Some(&season_eps)).await;
 
         // Scrape the season (episode 1 query returns season packs too).
         let raws = match app
@@ -2574,13 +2710,14 @@ async fn consolidate_show_seasons(
                 continue;
             }
 
-            // Pre-stage idle gate (mirrors the movie / per-episode / pack-correction paths): don't
-            // add + select + probe (a 4 MB CDN fetch) a pack that the post-stage idle re-check would
-            // only roll back if the library went active. This also short-circuits the wasted staging
-            // when the per-episode phase already deferred this tick for the same reason.
-            if !app.read_activity.all_idle(idle_window).await {
+            // Pre-stage read check (mirrors the movie / per-episode / pack-correction paths): don't
+            // add + select + probe (a 4 MB CDN fetch) a pack that the post-stage re-check would only
+            // roll back because one of the season's copies is being read. This also short-circuits
+            // the wasted staging when the per-episode phase already deferred this tick for the same
+            // reason.
+            if being_read(app, &season_copies, idle_window).await {
                 return Err(UpgradeSkip::Deferred(
-                    "library active; skip consolidation staging".into(),
+                    "a copy of the season is being read; skip consolidation staging".into(),
                 ));
             }
 
@@ -2742,12 +2879,13 @@ async fn consolidate_show_seasons(
                     )));
                 }
             };
-            // Idle gate. If the library is active, drop the staged pack (no dangling stage) and
-            // retry on a later tick; consolidation re-stages cheaply (the pack is cached).
-            if !app.read_activity.all_idle(idle_window).await {
+            // Read check. If one of the season's copies is being read, drop the staged pack (no
+            // dangling stage) and retry on a later tick; consolidation re-stages cheaply (the pack
+            // is cached).
+            if being_read(app, &season_copies, idle_window).await {
                 let _ = app.provider.delete_torrent(&added.id).await;
                 return Err(UpgradeSkip::Deferred(format!(
-                    "s{season} library active; dropped staged pack"
+                    "s{season} copy being read; dropped staged pack"
                 )));
             }
             // Record the pack owned+verified with full-season provides + sticky provenance.
@@ -3854,8 +3992,9 @@ mod tests {
             }])
         }
         async fn get_torrent_info(&self, _id: &str) -> Result<TorrentInfo, reqwest::Error> {
-            // A read begins mid-stage → the 4b idle re-check must trip and force a full rollback.
-            self.ra.touch("Movies/something.mkv").await;
+            // A read of the copy the swap would delete begins mid-stage → the 4b idle re-check must
+            // trip and force a full rollback.
+            self.ra.touch("hold").await;
             Ok(TorrentInfo {
                 id: "tnew".into(),
                 hash: "hnew".into(),
@@ -5089,8 +5228,8 @@ mod tests {
             ..Default::default()
         });
         let app = app_with(scraper, provider, store.clone());
-        // The idle gate is library-wide: a recent read anywhere defers all swaps this tick.
-        app.read_activity.touch("Movies/anything.mkv").await;
+        // A player is reading the copy the swap would delete.
+        app.read_activity.touch("hold").await;
 
         run_upgrade_once(&app).await;
 
@@ -5115,6 +5254,140 @@ mod tests {
             0,
             "an idle-deferred title must keep its cursor unstamped"
         );
+    }
+
+    /// One owned, selected, present 1080p WEB copy of a movie: the upgrade baseline the REMUX
+    /// candidate beats. Returns the provider torrent listing it.
+    async fn put_movie_copy(store: &Store, tmdb_id: u64, imdb_id: &str, hash: &str) -> Torrent {
+        store
+            .put_owned(
+                hash.into(),
+                OwnedRecord {
+                    request: movie_req_for(tmdb_id, imdb_id),
+                    provenance: Provenance::watchlist("a"),
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: Some(QualitySummary {
+                        cached: true,
+                        source_tier: 3_000,
+                        resolution: 1080,
+                        score: 10,
+                        unverified: false,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                movie_slot(tmdb_id),
+                SelectionEntry {
+                    hash: hash.into(),
+                    file_path: "old.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        Torrent {
+            id: format!("t-{hash}"),
+            hash: hash.into(),
+            status: "downloaded".into(),
+            ..Default::default()
+        }
+    }
+
+    /// A provider whose add stages the cached REMUX `hnew` (torrent `tnew`) over `listing`.
+    fn remux_staging_provider(
+        listing: Vec<Torrent>,
+        deleted: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Arc<dyn DebridProvider> {
+        Arc::new(MockProvider {
+            torrents: listing,
+            add_magnet: Some(AddMagnetResponse {
+                id: "tnew".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tnew".into(),
+                hash: "hnew".into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "new.mkv".into(),
+                    bytes: 30_000_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/new".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/new".into()),
+            deleted,
+            ..Default::default()
+        })
+    }
+
+    /// 2026-11-12: a swap made Jellyfin probe the file it had just added, and that read held back
+    /// the rest of the pass. A read of a torrent the swap doesn't delete or take a slot from must not
+    /// defer it.
+    #[tokio::test]
+    async fn a_read_of_another_torrent_does_not_hold_back_a_movie_swap() {
+        let store = mem_store();
+        let old = put_movie_copy(&store, 27205, "tt1", "hold").await;
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = remux_staging_provider(vec![old], deleted.clone());
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![remux_candidate()],
+        });
+        let app = app_with(scraper, provider, store.clone());
+        app.read_activity.touch("hsomeotherfilm").await;
+
+        run_upgrade_once(&app).await;
+
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hnew",
+            "the swap goes ahead"
+        );
+        assert!(deleted.lock().unwrap().contains(&"t-hold".to_string()));
+        assert!(store.get_upgrade_checked(&MediaType::Movie, 27205).await > 0);
+    }
+
+    /// A title whose copy is being read is skipped (cursor unchanged, so the next pass retries it),
+    /// and the pass carries on with the other titles instead of stopping.
+    #[tokio::test]
+    async fn a_title_being_read_is_skipped_and_the_pass_moves_on() {
+        let store = mem_store();
+        let watched = put_movie_copy(&store, 27205, "tt1", "hwatched").await;
+        let other = put_movie_copy(&store, 27206, "tt2", "hother").await;
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = remux_staging_provider(vec![watched, other], deleted.clone());
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![remux_candidate()],
+        });
+        let app = app_with(scraper, provider, store.clone());
+        app.read_activity.touch("hwatched").await;
+
+        run_upgrade_once(&app).await;
+
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hwatched",
+            "the film being watched keeps its copy"
+        );
+        assert!(!deleted.lock().unwrap().contains(&"t-hwatched".to_string()));
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Movie, 27205).await,
+            0,
+            "and is retried on the next pass"
+        );
+        assert_eq!(
+            store.get_selection(movie_slot(27206)).await.unwrap().hash,
+            "hnew",
+            "the other film is still upgraded"
+        );
+        assert!(deleted.lock().unwrap().contains(&"t-hother".to_string()));
+        assert!(store.get_upgrade_checked(&MediaType::Movie, 27206).await > 0);
     }
 
     #[tokio::test]
@@ -7532,6 +7805,48 @@ mod tests {
         );
     }
 
+    /// A read of another title's torrent doesn't hold consolidation back.
+    #[tokio::test]
+    async fn show_consolidation_ignores_a_read_of_another_title() {
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![season_pack_candidate()],
+        });
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            add_magnet: Some(AddMagnetResponse {
+                id: "tpack".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(pack_info()),
+            resolved_url: Some("https://cdn/p1".into()),
+            ..Default::default()
+        });
+        let app = app_with(scraper, provider, store.clone());
+        app.read_activity.touch("hsomeotherfilm").await;
+
+        let res = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(res.is_ok(), "consolidation goes ahead: {res:?}");
+        assert!(store.get_owned("hpack".into()).await.is_some());
+        assert_eq!(
+            store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            "hpack"
+        );
+    }
+
     #[tokio::test]
     async fn show_consolidation_skips_staging_when_library_active() {
         // The library is active BEFORE staging, so the pre-stage idle gate defers immediately: the
@@ -7556,8 +7871,8 @@ mod tests {
             ..Default::default()
         });
         let app = app_with(scraper, provider, store.clone());
-        // A recent read anywhere in the library → the consolidation idle gate trips.
-        app.read_activity.touch("Shows/S/whatever.mkv").await;
+        // A player is reading one of the scattered episodes the pack would replace.
+        app.read_activity.touch("e2").await;
 
         let res = consolidate_show_seasons(
             &app,
@@ -8734,6 +9049,32 @@ mod tests {
         );
     }
 
+    /// Only a read of a copy the episode swap changes holds it back: a read elsewhere doesn't.
+    #[tokio::test]
+    async fn a_read_of_another_torrent_does_not_defer_an_episode_swap() {
+        let h = show_harness_singleton_720_ep().await;
+        h.app.read_activity.touch("hsomeotherfilm").await;
+
+        let deferred = upgrade_show_episodes_and_packs(
+            &h.app,
+            h.tmdb,
+            &h.group_hashes,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        assert!(!deferred);
+        assert_eq!(
+            h.app
+                .store
+                .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            h.cand_1080_hash
+        );
+    }
+
     #[tokio::test]
     async fn non_idle_library_defers_show_upgrade_leaving_state_unchanged() {
         // FIX 1: a singleton episode WITH a valid better cached candidate, but the library is
@@ -8745,8 +9086,9 @@ mod tests {
         // network dependency this file's show-test split exists to avoid — and the wrapper's
         // `if deferred { Err(Deferred) }` is trivial straight-line logic over this bool.
         let h = show_harness_singleton_720_ep().await;
-        // Mark the library active; a 60s window then reports it non-idle.
-        h.app.read_activity.touch("Shows/S/S01E01.mkv").await;
+        // A player is reading the episode copy the swap would replace (a 60s window then reports
+        // it in use).
+        h.app.read_activity.touch(&h.old_720_hash).await;
 
         let deferred = upgrade_show_episodes_and_packs(
             &h.app,
@@ -9882,6 +10224,35 @@ mod tests {
         assert!(
             f.calls.lock().unwrap().contains(&(Some(1), Some(4))),
             "E4 still scraped after the sample found an upgrade"
+        );
+    }
+
+    /// Someone is watching E4 from the pack. Moving E3 off the pack would neither prune it nor touch
+    /// E4's slot, but the swap still changes what the pack's torrent shows, so it waits.
+    #[tokio::test]
+    async fn pack_served_episode_waits_while_the_pack_is_being_read() {
+        let f = pack_fixture(
+            &[(1, q1080_web()), (2, q1080_web())],
+            &[1, 2, 3, 4],
+            &[3, 4],
+            q_sd_web_unverified(),
+            vec![(3, single_candidate(3, "hy3", "1080p", "1080p.WEB-DL"))],
+            false,
+        )
+        .await;
+        f.app.read_activity.touch(PACK).await;
+        let deferred = upgrade_show_episodes_and_packs(
+            &f.app,
+            SHOW_TMDB,
+            &f.group_hashes,
+            Duration::from_secs(60),
+        )
+        .await;
+        assert!(deferred, "the show is retried next pass");
+        assert_eq!(slot_hash(&f.store, 3).await, PACK, "E3 stays on the pack");
+        assert!(
+            f.store.get_owned("hy3".into()).await.is_none(),
+            "nothing staged"
         );
     }
 

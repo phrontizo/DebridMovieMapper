@@ -133,7 +133,6 @@ impl DavFileSystem for DebridFileSystem {
     ) -> FsFuture<'a, Box<dyn DavFile>> {
         async move {
             let rel = path.as_rel_ospath();
-            let vfs_path = rel.to_string_lossy().into_owned();
             // Timestamp lookup key, normalised exactly like the `metadata`/`read_dir` paths so an
             // opened file reports the SAME mtime it does when listed (see below — the open-file
             // metadata used to hardcode UNIX_EPOCH, confusing media-server change detection).
@@ -196,7 +195,6 @@ impl DavFileSystem for DebridFileSystem {
                     buffer: Bytes::new(),
                     buffer_start: 0,
                     read_activity: self.read_activity.clone(),
-                    vfs_path,
                     modified_time,
                     confirmed_read: false,
                     first_read_bytes: self.first_read_bytes,
@@ -337,7 +335,6 @@ struct ProxiedMediaFile {
     buffer: Bytes,
     buffer_start: u64,
     read_activity: Arc<crate::read_activity::ReadActivity>,
-    vfs_path: String,
     /// Real per-torrent mtime (from the VFS `timestamps`), captured at open so the opened-file
     /// metadata matches what `read_dir`/`metadata` report for the same path.
     modified_time: SystemTime,
@@ -779,7 +776,9 @@ impl DavFile for ProxiedMediaFile {
             {
                 return Err(FsError::GeneralFailure);
             }
-            self.read_activity.touch(&self.vfs_path).await;
+            // Stamp the TORRENT, not the path: the upgrade engine asks whether the torrents a swap
+            // would delete or take an episode away from are being read.
+            self.read_activity.touch(&self.locator.hash).await;
             self.fetch_bytes(len).await
         }
         .boxed()
@@ -825,7 +824,6 @@ mod tests {
             buffer: Bytes::new(),
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
             first_read_bytes: BUFFER_SIZE as u64,
@@ -1199,7 +1197,6 @@ mod provider_abstraction_tests {
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
             first_read_bytes: BUFFER_SIZE as u64,
@@ -1249,7 +1246,6 @@ mod provider_abstraction_tests {
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
             first_read_bytes: BUFFER_SIZE as u64,
@@ -1307,7 +1303,6 @@ mod provider_abstraction_tests {
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
             first_read_bytes: BUFFER_SIZE as u64,
@@ -1484,7 +1479,6 @@ mod provider_abstraction_tests {
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
             first_read_bytes: BUFFER_SIZE as u64,
@@ -1764,7 +1758,6 @@ mod provider_abstraction_tests {
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            vfs_path: String::new(),
             modified_time: ts,
             confirmed_read: false,
             first_read_bytes: BUFFER_SIZE as u64,
@@ -1789,6 +1782,7 @@ mod provider_abstraction_tests {
         let mut f = ProxiedMediaFile {
             name: "x.mkv".into(),
             locator: crate::provider::FileLocator {
+                hash: "abc123".into(),
                 torrent_id: "t".into(),
                 ..Default::default()
             },
@@ -1801,17 +1795,18 @@ mod provider_abstraction_tests {
             buffer: Bytes::new(),
             buffer_start: 0,
             read_activity: ra.clone(),
-            vfs_path: "Movies/X/x.mkv".into(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
             first_read_bytes: BUFFER_SIZE as u64,
         };
         // The CDN fetch will fail (unroutable URL), but the stamp happens before the fetch.
         let _ = f.read_bytes(4).await;
+        let window = std::time::Duration::from_secs(300);
         assert!(
-            !ra.is_idle("Movies/X/x.mkv", std::time::Duration::from_secs(300))
-                .await
+            !ra.torrents_idle(["abc123"], window).await,
+            "the read is recorded against the file's torrent"
         );
+        assert!(ra.torrents_idle(["other"], window).await);
     }
 
     #[tokio::test]
@@ -1867,7 +1862,6 @@ mod provider_abstraction_tests {
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
             first_read_bytes: BUFFER_SIZE as u64,
@@ -1937,7 +1931,6 @@ mod provider_abstraction_tests {
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
             first_read_bytes: BUFFER_SIZE as u64,
@@ -2007,7 +2000,6 @@ mod provider_abstraction_tests {
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
             read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
             first_read_bytes: BUFFER_SIZE as u64,
@@ -2098,7 +2090,6 @@ mod provider_abstraction_tests {
             buffer: bytes::Bytes::from_static(b"ABCDEFGHIJ"), // [100, 110)
             buffer_start: 100,
             read_activity: Arc::new(crate::read_activity::ReadActivity::without_startup_grace()),
-            vfs_path: String::new(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
             first_read_bytes: BUFFER_SIZE as u64,
@@ -2137,6 +2128,7 @@ mod provider_abstraction_tests {
         let mut f = ProxiedMediaFile {
             name: "x.mkv".to_string(),
             locator: crate::provider::FileLocator {
+                hash: "abc123".into(),
                 torrent_id: "t".into(),
                 ..Default::default()
             },
@@ -2149,7 +2141,6 @@ mod provider_abstraction_tests {
             buffer: bytes::Bytes::new(),
             buffer_start: 0,
             read_activity: ra.clone(),
-            vfs_path: "Movies/X/x.mkv".to_string(),
             modified_time: SystemTime::UNIX_EPOCH,
             confirmed_read: false,
             first_read_bytes: BUFFER_SIZE as u64,
@@ -2164,8 +2155,7 @@ mod provider_abstraction_tests {
             "no I/O (no invalidate) on a hidden torrent"
         );
         assert!(
-            ra.is_idle("Movies/X/x.mkv", std::time::Duration::from_secs(300))
-                .await,
+            ra.all_idle(std::time::Duration::from_secs(300)).await,
             "read-activity must NOT be stamped for a short-circuited read"
         );
     }
