@@ -67,11 +67,13 @@ struct TmdbResponse {
 }
 
 /// The outcome of a TMDB search. `Results` (possibly empty) is a genuine answer — an empty vec is a
-/// real "no such title on TMDB". `Unavailable` means the request itself failed after the retry
-/// budget (a transport error or sustained 5xx — a TMDB outage), which is NOT the same as "no match":
-/// `identify_name` short-circuits its multi-stage fallback ladder on `Unavailable` so a single
-/// unidentifiable-during-outage torrent doesn't re-issue a full ~2.5-min retry cycle per stage
-/// (~10 min total). Without the distinction every stage sees "empty" and retries the whole outage.
+/// real "no such title on TMDB". `Unavailable` means the request itself failed: a transport error,
+/// a 429 or a 5xx after the retry budget (a TMDB outage), another 4xx at once (e.g. a rejected API
+/// key), or a body that doesn't decode. That is NOT the same as "no match": `identify_name` short-circuits its
+/// multi-stage fallback ladder on `Unavailable` so a single unidentifiable-during-outage torrent
+/// doesn't re-issue a full ~2.5-min retry cycle per stage (~10 min total), and makes no pick from
+/// what the other searches returned. Without the distinction every stage sees "empty" and retries
+/// the whole outage.
 #[derive(Debug)]
 pub enum SearchOutcome {
     Results(Vec<TmdbSearchResult>),
@@ -714,13 +716,16 @@ mod tests {
     #[tokio::test]
     async fn find_by_imdb_rejects_a_malformed_id_without_a_request() {
         // A malformed id short-circuits to Ok(None) before any request — no path interpolation.
-        let c = TmdbClient::new("k".into()).unwrap();
+        // The client points at a loopback server, which must see no request at all.
+        let server = crate::trakt_client::test_http::spawn(Vec::new()).await;
+        let c = TmdbClient::with_base_url("k".into(), server.base_url.clone()).unwrap();
         assert_eq!(c.find_by_imdb("../evil").await.unwrap(), None);
         assert_eq!(c.find_by_imdb("").await.unwrap(), None);
         // Prefix but no digits.
         assert_eq!(c.find_by_imdb("tt").await.unwrap(), None);
         // Non-digit tail.
         assert_eq!(c.find_by_imdb("tt12a34").await.unwrap(), None);
+        assert_eq!(server.requests(), Vec::<String>::new(), "no TMDB request");
         // Well-formed ids pass the shape gate (this asserts the guard, not the network round-trip).
         assert!(is_well_formed_imdb_id("tt0111161"));
         assert!(is_well_formed_imdb_id("tt15239678"));

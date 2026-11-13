@@ -5,9 +5,10 @@
 //! operator link a Trakt account via OAuth device-flow, list linked accounts, and refresh or
 //! remove them. Tokens are keyed by the user's Trakt *slug* (stable per-user key).
 //!
-//! Two browser-side guards back that model up: a `Host` allowlist (only local-network names,
-//! plus `TRAKT_ENROL_ALLOWED_HOSTS`) refuses DNS-rebinding pages, and a same-origin check refuses
-//! cross-origin form POSTs.
+//! Three browser-side guards back that model up: a `Host` allowlist (only local-network names,
+//! plus `TRAKT_ENROL_ALLOWED_HOSTS`) refuses DNS-rebinding pages, a same-origin check refuses
+//! cross-origin form POSTs, and the pages refuse to be framed (`frame-ancestors 'none'`,
+//! `X-Frame-Options: DENY`), so a click on another site can't drive them (clickjacking).
 //!
 //! Responses are built as `dav_server::body::Body` (via `Body::from(String)`) so `main`'s
 //! per-connection service can return either these or `DavHandler::handle`'s response uniformly.
@@ -113,9 +114,10 @@ impl EnrolmentService {
                 // never matches the stored key and the button silently no-ops.
                 let slug = decode_path_segment(slug);
                 if let Err(e) = self.refresh_account(&slug).await {
-                    // refresh_account already logs + flags the account on a Trakt-refresh failure;
-                    // the only error surfaced here is a token-store write failure, which would
-                    // otherwise be lost silently (unlike the `remove` arm below).
+                    // refresh_account already logs a Trakt-refresh failure (flagging the account
+                    // only for a non-transient one); the only error surfaced here is a token-store
+                    // write failure, which would otherwise be lost silently (unlike the `remove`
+                    // arm below).
                     warn!("Trakt token refresh persist failed for '{}': {}", slug, e);
                 }
                 redirect("/trakt/accounts")
@@ -199,7 +201,10 @@ impl EnrolmentService {
     }
 
     /// Refresh one account's tokens. On success, rebuild + persist with the re-enrolment flag
-    /// cleared; on failure, set the flag so the accounts page surfaces it.
+    /// cleared. A transient failure (`trakt_client::refresh_error_is_transient`: a 429, a 5xx, a
+    /// transport error, `Upstream`) is logged and leaves the record alone. Any other failure sets
+    /// the flag (compare-and-swap, only while the stored refresh token is still the one tried) so
+    /// the accounts page surfaces it.
     pub(crate) async fn refresh_account(&self, slug: &str) -> Result<(), AppError> {
         let Some(tokens) = self.store.get_trakt_tokens(slug.to_string()).await else {
             return Ok(()); // nothing stored under this slug — no-op
@@ -338,6 +343,22 @@ pub async fn poll_to_completion(
                 let mut last_err: Option<AppError> = None;
                 for attempt in 1..=MAX_ME_ATTEMPTS {
                     match trakt.me(&tok.access_token).await {
+                        // Neither a slug nor a username: storing under "" would leave an account
+                        // the page can't refresh or remove (its `/trakt/accounts//…` URLs match no
+                        // route). Treat the incoherent answer like a failed `me()` attempt.
+                        Ok(user) if user.slug.is_empty() => {
+                            warn!(
+                                "Trakt me() after authorisation returned no slug or username \
+                                 (attempt {}/{})",
+                                attempt, MAX_ME_ATTEMPTS
+                            );
+                            last_err = Some(AppError::Upstream(
+                                "Trakt /users/me returned no slug or username".to_string(),
+                            ));
+                            if attempt < MAX_ME_ATTEMPTS {
+                                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                            }
+                        }
                         Ok(user) => {
                             let tokens = TraktTokens {
                                 access: tok.access_token,
@@ -684,7 +705,10 @@ fn confirm_remove_html(slug: &str, username: &str) -> String {
 /// Build an HTML response of the WebDAV body type. Output is already `esc`/`encode_path_segment`-safe;
 /// the hardening headers are defence-in-depth: `nosniff` stops a browser MIME-sniffing the page as
 /// something executable, and a `default-src 'none'` CSP (the pages use no scripts) neutralises any
-/// future escaping regression on these unauthenticated LAN pages.
+/// future escaping regression on these unauthenticated LAN pages. `frame-ancestors 'none'` (it
+/// does not fall back to `default-src`) plus `X-Frame-Options: DENY` for browsers without CSP 2
+/// refuse framing: a page on another site could otherwise overlay a framed Remove confirmation
+/// with its own button, and the click would submit a same-origin POST the CSRF guard lets through.
 fn html(status: StatusCode, body: String) -> Response<Body> {
     Response::builder()
         .status(status)
@@ -692,8 +716,9 @@ fn html(status: StatusCode, body: String) -> Response<Body> {
         .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(
             hyper::header::CONTENT_SECURITY_POLICY,
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
         )
+        .header(hyper::header::X_FRAME_OPTIONS, "DENY")
         .body(Body::from(body))
         .expect("building a static HTML response cannot fail")
 }
@@ -799,6 +824,26 @@ mod tests {
         });
         let store = mem_store();
         assert!(poll_to_completion(&trakt, &store, "dc".into(), 1, 300)
+            .await
+            .is_err());
+        assert!(store.all_trakt_tokens().await.is_empty());
+    }
+
+    /// A `/users/me` answer with neither a slug nor a username would store the tokens under "",
+    /// whose Refresh/Remove URLs (`/trakt/accounts//…`) the router can't match. Treat it like a
+    /// failed `me()`: retry, then fail without storing anything.
+    #[tokio::test(start_paused = true)]
+    async fn poll_to_completion_rejects_an_empty_slug() {
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            poll: DeviceTokenPoll::Authorized(TraktTokenResponse {
+                access_token: "AT".into(),
+                ..Default::default()
+            }),
+            user: TraktUser::default(),
+            ..Default::default()
+        });
+        let store = mem_store();
+        assert!(poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
             .await
             .is_err());
         assert!(store.all_trakt_tokens().await.is_empty());
@@ -1228,6 +1273,39 @@ mod tests {
             ))
             .await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Every enrolment page refuses to be framed, so a page on another site can't overlay its own
+    /// bait button on a framed Remove confirmation and have the click submit it (clickjacking): a
+    /// submit from inside the frame is same-origin, so the CSRF guard alone would let it through.
+    #[tokio::test]
+    async fn enrolment_pages_forbid_framing() {
+        let store = mem_store();
+        store
+            .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
+            .await
+            .unwrap();
+        let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), store);
+        for uri in [
+            "http://host.local/trakt/accounts",
+            "http://host.local/trakt/accounts/alice/remove",
+        ] {
+            let r = svc.handle(routed_req(Method::GET, uri, true)).await;
+            assert_eq!(r.status(), StatusCode::OK, "{uri}");
+            let csp = r
+                .headers()
+                .get(hyper::header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            assert!(csp.contains("frame-ancestors 'none'"), "{uri}: {csp}");
+            assert_eq!(
+                r.headers()
+                    .get(hyper::header::X_FRAME_OPTIONS)
+                    .and_then(|v| v.to_str().ok()),
+                Some("DENY"),
+                "{uri}"
+            );
+        }
     }
 
     #[test]

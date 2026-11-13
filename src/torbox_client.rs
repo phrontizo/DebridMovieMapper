@@ -475,9 +475,10 @@ impl TorBoxClient {
     }
 
     /// The single TorBox request loop behind `send_data_n` and `send_ok`: send with rate-limit
-    /// pacing; retry a statusless transport error, a 429, a transient 5xx, or a decode blip within
-    /// `max_attempts` (surfacing the REAL 429/5xx over the synthetic 502 on the final attempt); then
-    /// decode the body into an `Envelope<D>` and hand it to `verdict`. All URL/`detail` redaction —
+    /// pacing; retry a statusless transport error, a 429, a transient 5xx, a body that breaks off
+    /// mid-read, or a decode blip within `max_attempts` (surfacing the REAL 429/5xx over the
+    /// synthetic 502 on the final attempt); then decode the body into an `Envelope<D>` and hand it
+    /// to `verdict`. All URL/`detail` redaction —
     /// the `requestdl` URL and error bodies carry the token — lives here so neither caller can leak
     /// it. `verdict` decides what counts as success (data required vs `success` only).
     async fn send_enveloped<D, R, F, V>(
@@ -547,10 +548,23 @@ impl TorBoxClient {
                 warn!("TorBox {} error body: {:.300}", status, self.redact(&body));
                 return Err(e.without_url());
             }
-            // Scrub the URL from a body-read error: the `requestdl` URL carries the token, and
-            // send_data/send_ok promise never to surface it. (`error_for_status_ref` errors are
-            // already scrubbed above.)
-            let text = resp.text().await.map_err(|e| e.without_url())?;
+            // A body that breaks off mid-stream (a reset, a body cut short of its framing, the
+            // client timeout firing while a large mylist page streams) is retried like a statusless
+            // transport error; with the budget spent, the error itself is returned. Scrub the URL
+            // from it: the `requestdl` URL carries the token, and send_data/send_ok promise never to
+            // surface it. (`error_for_status_ref` errors are already scrubbed above.)
+            let text = match resp.text().await {
+                Ok(text) => text,
+                Err(e) => {
+                    let e = e.without_url();
+                    if attempt < max_attempts {
+                        warn!("TorBox body read error (attempt {}): {}", attempt, e);
+                        tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
             match serde_json::from_str::<Envelope<D>>(&text) {
                 Ok(env) => match verdict(env) {
                     EnvVerdict::Done(r) => {
@@ -584,13 +598,14 @@ impl TorBoxClient {
                         self.redact(&e.to_string()),
                         text.len()
                     );
-                    // A truncated/partial 200 body is transient — retry rather than discard the whole
-                    // call on a one-off hiccup (like the RD client, which also retries a decode blip;
-                    // without this a mid-body glitch fails the entire mylist tick). NOTE the deliberate
-                    // difference: this retries across the FULL budget, whereas RD's `unrestrict_link`
-                    // caps decode retries at 2 because it runs on the synchronous playback resolve path
-                    // and must fast-fail to repair. A persistent schema mismatch here simply exhausts
-                    // the budget and returns the synthetic 502 below.
+                    // A 200 body that was read in full but doesn't decode (garbled, or a proxy's
+                    // truncated-but-cleanly-framed reply) is transient too — retry rather than
+                    // discard the whole call on a one-off hiccup (like the RD client, which also
+                    // retries a decode blip; a body that fails mid-read is retried above). NOTE the
+                    // deliberate difference: this retries across the FULL budget, whereas RD's
+                    // `unrestrict_link` caps decode retries at 2 because it runs on the synchronous
+                    // playback resolve path and must fast-fail to repair. A persistent schema
+                    // mismatch here simply exhausts the budget and returns the synthetic 502 below.
                     if attempt < max_attempts {
                         tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
                         continue;
@@ -1747,6 +1762,81 @@ mod tests {
             !request_line.contains("token=x&y=z"),
             "raw reserved chars must not leak into the query, got: {request_line}"
         );
+    }
+
+    #[tokio::test]
+    async fn send_data_retries_a_body_cut_off_mid_stream() {
+        // A 200 whose body breaks off mid-stream (a reset, or here a connection closed short of its
+        // declared Content-Length) fails in `text()`, before any decode. It must be retried like a
+        // decode failure, not fail the whole call (one blip would otherwise skip a mylist tick).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = counter.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for i in 0..8 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"success":true,"data":"ok"}"#;
+                // The first response promises more bytes than it sends, then closes.
+                let declared = if i == 0 { body.len() + 100 } else { body.len() };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let url = format!("http://{addr}/");
+        let client = TorBoxClient::new("fake".to_string()).unwrap();
+        let r: Result<String, _> = client.send_data(|| client.client.get(&url)).await;
+        assert_eq!(
+            r.expect("a body cut off mid-stream is retried"),
+            "ok",
+            "the retry recovers"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly one retry after the cut-off body"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_data_body_cut_off_on_every_attempt_surfaces_the_read_error() {
+        // With the budget spent, the body-read error itself is returned (not the synthetic 502).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{\"success\":";
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let url = format!("http://{addr}/");
+        let client = TorBoxClient::new("fake".to_string()).unwrap();
+        let err = client
+            .send_data_n::<String, _>(|| client.client.get(&url), 2)
+            .await
+            .expect_err("every body is cut off");
+        assert!(
+            err.is_body() || err.is_decode(),
+            "a body-read error, got {err:?}"
+        );
+        assert_ne!(err.status(), Some(reqwest::StatusCode::BAD_GATEWAY));
     }
 
     #[tokio::test]

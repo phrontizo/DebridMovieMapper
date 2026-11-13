@@ -39,7 +39,10 @@ pub struct TorrentHealth {
     pub torrent_id: String,
     pub state: RepairState,
     pub repair_attempts: u32,
-    pub last_repair_trigger: Option<std::time::Instant>,
+    /// When the cooldown (`REPAIR_COOLDOWN_SECS`) started. A tokio `Instant` (the same as
+    /// `std::time::Instant` outside a paused test clock) so tests can run the cooldown against
+    /// `INSTANT_REPAIR_TIMEOUT` on tokio's clock.
+    pub last_repair_trigger: Option<tokio::time::Instant>,
 }
 
 /// Why an instant-repair attempt did not yield a usable cached replacement. Distinguishes the
@@ -88,19 +91,30 @@ pub struct RepairManager {
     /// Maps new_torrent_id -> old_torrent_id for successful repairs.
     /// The scan loop consumes this to reuse old TMDB identifications.
     repair_replacements: Arc<RwLock<HashMap<String, String>>>,
+    /// Old torrent id -> (file path -> that file's locator in the torrent that replaced it), for a
+    /// successful NEW-id (Real-Debrid) instant repair, which deletes the old torrent. The VFS keeps
+    /// the old torrent's locators until the next scan rebuilds it, so `dav_fs` opens a file through
+    /// [`RepairManager::redirect`]; otherwise every later open of any file of that torrent would
+    /// resolve the deleted torrent and fail. Dropped by `prune_health_status` once the listing no
+    /// longer has the old torrent.
+    repaired_locators: Arc<RwLock<HashMap<String, HashMap<String, crate::provider::FileLocator>>>>,
 }
+
+/// How many repairs in a row [`RepairManager::redirect`] follows (each Real-Debrid re-add is a new
+/// id, and a still-broken file is re-added at most `MAX_REPAIR_ATTEMPTS` times in a row).
+const MAX_REDIRECT_HOPS: usize = 8;
 
 /// RAII guard that makes the `Repairing` transition in `try_instant_repair` cancellation-safe.
 ///
 /// `check_and_begin_repair` transitions a torrent to `Repairing`. `try_instant_repair` is awaited
 /// INSIDE the WebDAV read future, so if the player/HTTP connection drops mid-repair the future is
 /// dropped at an intermediate await before any outcome arm resets the state — leaving the torrent
-/// stranded `Repairing`, which `should_hide_torrent`/`hidden_torrent_ids` treat as hidden. A hidden
-/// torrent can never re-trigger repair (reads short-circuit on `should_hide_torrent`) and is not
-/// pruned while it is still listed, so it would be trapped until process restart. On drop while
-/// still armed, the guard resets a *still-`Repairing`* torrent back to `Healthy` and resets its
-/// attempt budget (`repair_attempts` → 0) while keeping the cooldown, like
-/// `note_transient_repair_failure`: a repair that never finished is no evidence the file is broken,
+/// stranded `Repairing`, whose reads `should_hide_torrent` refuses. Such a torrent can never
+/// re-trigger repair (reads short-circuit on `should_hide_torrent`) and is not pruned while it is
+/// still listed, so it would be trapped until process restart. On drop while
+/// still armed, the guard resets a *still-`Repairing`* torrent back to `Healthy`, resets its
+/// attempt budget (`repair_attempts` → 0) and restarts the cooldown, like a timed-out repair
+/// (`note_abandoned_repair`): a repair that never finished is no evidence the file is broken,
 /// and counting it would let three cancellations (with no good read between them) trap the torrent
 /// `Failed`/hidden. A normal completion calls [`RepairInProgressGuard::disarm`], so on completion the
 /// guard is a no-op (every exit path already sets a terminal state) and it only fires on
@@ -147,8 +161,10 @@ impl Drop for RepairInProgressGuard {
                 if let Some(h) = map.get_mut(&torrent_id) {
                     if h.state == RepairState::Repairing {
                         h.state = RepairState::Healthy;
-                        // Keep `last_repair_trigger`: the cooldown still spaces the next attempt.
                         h.repair_attempts = 0;
+                        // Restart the cooldown now, so it spaces the next attempt from when this
+                        // one was abandoned (see `note_abandoned_repair`).
+                        h.last_repair_trigger = Some(tokio::time::Instant::now());
                     }
                 }
             });
@@ -213,7 +229,50 @@ impl RepairManager {
             health_status: Arc::new(RwLock::new(HashMap::new())),
             provider,
             repair_replacements: Arc::new(RwLock::new(HashMap::new())),
+            repaired_locators: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// The locator that now serves `locator`'s file when an instant repair replaced its torrent
+    /// under a new id (Real-Debrid) since the VFS was built, following repeated repairs to the
+    /// latest copy. `None` when the torrent wasn't replaced: the locator is still current.
+    pub async fn redirect(
+        &self,
+        locator: &crate::provider::FileLocator,
+    ) -> Option<crate::provider::FileLocator> {
+        let map = self.repaired_locators.read().await;
+        let mut current: Option<&crate::provider::FileLocator> = None;
+        let mut torrent_id = locator.torrent_id.as_str();
+        for _ in 0..MAX_REDIRECT_HOPS {
+            match map
+                .get(torrent_id)
+                .and_then(|files| files.get(&locator.file_path))
+            {
+                Some(next) => {
+                    torrent_id = next.torrent_id.as_str();
+                    current = Some(next);
+                }
+                None => break,
+            }
+        }
+        current.cloned()
+    }
+
+    /// Record that `new_info` (downloaded) replaced the torrent `old_torrent_id`, so
+    /// [`Self::redirect`] maps each of its selected files onto `new_info`.
+    async fn record_redirect(&self, old_torrent_id: &str, new_info: &TorrentInfo, hash: &str) {
+        let files: HashMap<String, crate::provider::FileLocator> = new_info
+            .files
+            .iter()
+            .filter(|f| f.selected == 1)
+            .filter_map(|f| {
+                Self::locator_for_file(new_info, hash, &f.path).map(|l| (f.path.clone(), l))
+            })
+            .collect();
+        self.repaired_locators
+            .write()
+            .await
+            .insert(old_torrent_id.to_string(), files);
     }
 
     /// Drains and returns the repair replacements map (new_id -> old_id).
@@ -301,6 +360,21 @@ impl RepairManager {
         }
     }
 
+    /// [`Self::note_transient_repair_failure`] for a repair cut short by `INSTANT_REPAIR_TIMEOUT`,
+    /// which also RESTARTS the cooldown. The trigger was stamped when the repair began, and the
+    /// timeout is as long as the cooldown, so keeping it would leave no cooldown at all: during an
+    /// outage each retry of the failed read (rclone retries a 500) would at once hold another full
+    /// timeout on the hung provider, and spend another re-add. The guard on a dropped read does the
+    /// same (`RepairInProgressGuard`).
+    async fn note_abandoned_repair(&self, torrent_id: &str) {
+        let mut health_map = self.health_status.write().await;
+        if let Some(health) = health_map.get_mut(torrent_id) {
+            health.state = RepairState::Healthy;
+            health.repair_attempts = 0;
+            health.last_repair_trigger = Some(tokio::time::Instant::now());
+        }
+    }
+
     /// Check pre-repair guards (Failed/Repairing/rate-limited) and transition to Repairing state.
     /// Returns the attempt number on success, or Err with the reason why repair cannot proceed.
     async fn check_and_begin_repair(&self, torrent_id: &str) -> Result<u32, String> {
@@ -365,7 +439,7 @@ impl RepairManager {
             }
             health.state = RepairState::Repairing;
             health.repair_attempts += 1;
-            health.last_repair_trigger = Some(std::time::Instant::now());
+            health.last_repair_trigger = Some(tokio::time::Instant::now());
             health.repair_attempts
         } else {
             health_map.insert(
@@ -374,7 +448,7 @@ impl RepairManager {
                     torrent_id: torrent_id.to_string(),
                     state: RepairState::Repairing,
                     repair_attempts: 1,
-                    last_repair_trigger: Some(std::time::Instant::now()),
+                    last_repair_trigger: Some(tokio::time::Instant::now()),
                 },
             );
             1
@@ -463,6 +537,13 @@ impl RepairManager {
             if let Err(e) = self.provider.delete_torrent(old_torrent_id).await {
                 warn!("Failed to delete old torrent {}: {}", old_torrent_id, e);
             }
+            // Record the replacement so the scan loop reuses the old TMDB identification. Recorded
+            // BEFORE the new id's health entry: while the scan loop hasn't taken it,
+            // `prune_health_status` keeps that entry even though its listing predates the new id.
+            self.repair_replacements
+                .write()
+                .await
+                .insert(new_torrent_id.to_string(), old_torrent_id.to_string());
         }
 
         let mut health_map = self.health_status.write().await;
@@ -490,18 +571,9 @@ impl RepairManager {
                 torrent_id: new_torrent_id.to_string(),
                 state: RepairState::Healthy,
                 repair_attempts: carried_attempts,
-                last_repair_trigger: Some(std::time::Instant::now()),
+                last_repair_trigger: Some(tokio::time::Instant::now()),
             },
         );
-        drop(health_map);
-
-        if !same {
-            // Record replacement so the scan loop reuses the old TMDB identification.
-            self.repair_replacements
-                .write()
-                .await
-                .insert(new_torrent_id.to_string(), old_torrent_id.to_string());
-        }
     }
 
     /// Build a `FileLocator` for the file at `file_path` within `info`. The per-file
@@ -564,9 +636,11 @@ impl RepairManager {
         // Bound the whole repair: the read that triggered it is waiting (see
         // `INSTANT_REPAIR_TIMEOUT`). On timeout the inner future is dropped at an await, which is
         // the same cancellation the guards cover: `_add_guard` deletes a new-id torrent added but not
-        // adopted when this function returns, and the attempt budget is reset here (keeping the
-        // cooldown), as the state guard does on a dropped read, so repeated timeouts during an
-        // outage can't climb to `MAX_REPAIR_ATTEMPTS` and trap the torrent `Failed`/hidden.
+        // adopted when this function returns, and the attempt budget is reset here, as the state
+        // guard does on a dropped read, so repeated timeouts during an outage can't climb to
+        // `MAX_REPAIR_ATTEMPTS` and trap the torrent `Failed`/hidden. The cooldown restarts too, so
+        // the next read waits a full `REPAIR_COOLDOWN_SECS` before trying again
+        // (`note_abandoned_repair`).
         let result = match tokio::time::timeout(
             INSTANT_REPAIR_TIMEOUT,
             self.instant_repair_inner(locator, torrent_id, &added),
@@ -580,7 +654,7 @@ impl RepairManager {
                 result
             }
             Err(_) => {
-                self.note_transient_repair_failure(torrent_id).await;
+                self.note_abandoned_repair(torrent_id).await;
                 Err(RepairFailure::Deferred(format!(
                     "instant repair timed out after {}s",
                     INSTANT_REPAIR_TIMEOUT.as_secs()
@@ -685,6 +759,11 @@ impl RepairManager {
                     // Adopting the add: from here a cut-short repair must not delete it, since
                     // `complete_repair` deletes the superseded torrent first.
                     take_unadopted(added);
+                    if !same_torrent {
+                        // Before the old torrent is deleted, so no open in between resolves it.
+                        self.record_redirect(torrent_id, &final_info, &locator.hash)
+                            .await;
+                    }
                     self.complete_repair(torrent_id, &new_torrent_id).await;
                     info!(
                         "Instant repair SUCCEEDED for torrent {} -> new ID {} (file {})",
@@ -788,19 +867,21 @@ impl RepairManager {
         }
     }
 
-    /// Return the set of torrent IDs that should be hidden from WebDAV.
-    /// This acquires the read lock once instead of per-torrent, which is
-    /// significantly faster when filtering hundreds of torrents during VFS updates.
+    /// Return the set of torrent IDs the VFS leaves out (`Broken` or `Failed`); the scan loop also
+    /// keeps them out of the selection repoint's candidates. This acquires the read lock once
+    /// instead of per-torrent, which is significantly faster when filtering hundreds of torrents
+    /// during VFS updates.
+    ///
+    /// Unlike [`Self::should_hide_torrent`], a torrent mid-repair (`Repairing`) is NOT included:
+    /// a repair takes a few seconds (up to `INSTANT_REPAIR_TIMEOUT`), and a scan tick landing inside
+    /// it would otherwise drop the torrent's files from the library until the next tick, telling
+    /// Jellyfin they were deleted, even when the repair succeeds a moment later. Its reads are still
+    /// refused while the repair runs (`should_hide_torrent`).
     pub async fn hidden_torrent_ids(&self) -> std::collections::HashSet<String> {
         let health_map = self.health_status.read().await;
         health_map
             .values()
-            .filter(|h| {
-                matches!(
-                    h.state,
-                    RepairState::Broken | RepairState::Repairing | RepairState::Failed
-                )
-            })
+            .filter(|h| matches!(h.state, RepairState::Broken | RepairState::Failed))
             .map(|h| h.torrent_id.clone())
             .collect()
     }
@@ -826,14 +907,34 @@ impl RepairManager {
 
     /// Remove health_status entries for torrent IDs that are no longer active.
     /// This prevents unbounded growth of the health_status map over time.
+    ///
+    /// `active_torrent_ids` is the listing the scan loop fetched at the start of its tick, so a
+    /// Real-Debrid repair that completed since then has a new id it lacks. That entry carries the
+    /// cooldown and the attempt budget across the re-add, so it is kept while its replacement is
+    /// still waiting for the scan loop (`take_repair_replacements`, which runs before the next
+    /// listing). The repair redirects of torrents the listing no longer has are dropped as well: the
+    /// VFS the scan loop just built from that listing no longer has their locators.
     pub async fn prune_health_status(&self, active_torrent_ids: &std::collections::HashSet<&str>) {
         let mut health_map = self.health_status.write().await;
         let before = health_map.len();
-        health_map.retain(|id, _| active_torrent_ids.contains(id.as_str()));
+        {
+            // Read under the health lock: `complete_repair` records the replacement before it
+            // inserts the new id's entry, so every entry this retain sees has its replacement
+            // recorded already. (Nothing holds the two locks the other way round.)
+            let pending = self.repair_replacements.read().await;
+            health_map.retain(|id, _| {
+                active_torrent_ids.contains(id.as_str()) || pending.contains_key(id)
+            });
+        }
         let pruned = before - health_map.len();
+        drop(health_map);
         if pruned > 0 {
             info!("Pruned {} stale entries from repair health_status", pruned);
         }
+        self.repaired_locators
+            .write()
+            .await
+            .retain(|old_id, _| active_torrent_ids.contains(old_id.as_str()));
     }
 
     /// Force a torrent into the `Broken` state (hidden from WebDAV until a replacement is
@@ -1209,8 +1310,8 @@ mod tests {
     /// The repair runs inline in a WebDAV read, so it must give up within `INSTANT_REPAIR_TIMEOUT`
     /// even when the provider hangs, rather than holding the read (and a connection permit) for the
     /// minutes its background retry budgets allow. A timed-out repair produced no replacement, so the
-    /// torrent stays visible with its attempt budget reset and its cooldown kept, exactly like the
-    /// other transient arms.
+    /// torrent stays visible with its attempt budget reset, like the other transient arms, and its
+    /// cooldown restarts at the timeout.
     #[tokio::test(start_paused = true)]
     async fn try_instant_repair_gives_up_when_the_provider_hangs() {
         let manager = RepairManager::new(Arc::new(HangingInfoProvider));
@@ -1222,7 +1323,9 @@ mod tests {
                     torrent_id: "tid".to_string(),
                     state: RepairState::Healthy,
                     repair_attempts: 2,
-                    last_repair_trigger: Some(std::time::Instant::now() - Duration::from_secs(31)),
+                    last_repair_trigger: Some(
+                        tokio::time::Instant::now() - Duration::from_secs(31),
+                    ),
                 },
             );
         }
@@ -1249,17 +1352,26 @@ mod tests {
             !manager.should_hide_torrent("tid").await,
             "a timed-out repair must leave the torrent visible"
         );
-        let hm = manager.health_status.read().await;
-        let h = hm.get("tid").expect("health entry present");
-        assert_eq!(h.state, RepairState::Healthy);
-        assert_eq!(
-            h.repair_attempts, 0,
-            "a timeout is not a broken-file signal, so it must not climb toward Failed"
-        );
+        {
+            let hm = manager.health_status.read().await;
+            let h = hm.get("tid").expect("health entry present");
+            assert_eq!(h.state, RepairState::Healthy);
+            assert_eq!(
+                h.repair_attempts, 0,
+                "a timeout is not a broken-file signal, so it must not climb toward Failed"
+            );
+        }
+        // The cooldown runs from when the repair was abandoned, not from when it began: the timeout
+        // is as long as the cooldown, so measured from the start it would already be over and the
+        // next read (e.g. rclone retrying the failed one) would hold another 30 s on the hung
+        // provider at once.
+        let retried = tokio::time::Instant::now();
+        let r = manager.try_instant_repair(&loc).await;
         assert!(
-            h.last_repair_trigger.is_some(),
-            "the cooldown is kept so the next read doesn't re-run the hanging repair at once"
+            matches!(&r, Err(RepairFailure::Failed(m)) if m == "Repair rate limited"),
+            "the next read right after a timed-out repair must be rate limited, got {r:?}"
         );
+        assert_eq!(retried.elapsed(), Duration::ZERO, "refused without waiting");
     }
 
     /// R2 regression: the write-side attempts-cap promotion must run AFTER the `Repairing` re-check,
@@ -1276,7 +1388,7 @@ mod tests {
                     torrent_id: "tid".to_string(),
                     state: RepairState::Repairing,
                     repair_attempts: MAX_REPAIR_ATTEMPTS,
-                    last_repair_trigger: Some(std::time::Instant::now()),
+                    last_repair_trigger: Some(tokio::time::Instant::now()),
                 },
             );
         }
@@ -1387,6 +1499,10 @@ mod tests {
             manager.take_repair_replacements().await.is_empty(),
             "a same-id repair has no replacement to record"
         );
+        assert!(
+            manager.redirect(&old).await.is_none(),
+            "a same-id repair leaves the VFS's locators valid, so it redirects nothing"
+        );
     }
 
     #[tokio::test]
@@ -1478,7 +1594,7 @@ mod tests {
                     state: RepairState::Healthy,
                     repair_attempts: 2,
                     last_repair_trigger: Some(
-                        std::time::Instant::now() - std::time::Duration::from_secs(31),
+                        tokio::time::Instant::now() - std::time::Duration::from_secs(31),
                     ),
                 },
             );
@@ -1632,7 +1748,7 @@ mod tests {
                     state: RepairState::Healthy,
                     repair_attempts: 2,
                     last_repair_trigger: Some(
-                        std::time::Instant::now() - std::time::Duration::from_secs(31),
+                        tokio::time::Instant::now() - std::time::Duration::from_secs(31),
                     ),
                 },
             );
@@ -1706,7 +1822,7 @@ mod tests {
                     torrent_id: "t".to_string(),
                     state: RepairState::Healthy,
                     repair_attempts: 2,
-                    last_repair_trigger: Some(std::time::Instant::now()),
+                    last_repair_trigger: Some(tokio::time::Instant::now()),
                 },
             );
         }
@@ -1738,7 +1854,7 @@ mod tests {
         // state/cooldown on another handle — doing so would let a third reader launch a redundant
         // re-add. The in-flight repair's completion path is responsible for resetting the budget.
         let manager = make_test_manager();
-        let trigger = std::time::Instant::now();
+        let trigger = tokio::time::Instant::now();
         {
             let mut hm = manager.health_status.write().await;
             hm.insert(
@@ -1785,7 +1901,7 @@ mod tests {
                         torrent_id: "t".to_string(),
                         state: state.clone(),
                         repair_attempts: 2,
-                        last_repair_trigger: Some(std::time::Instant::now()),
+                        last_repair_trigger: Some(tokio::time::Instant::now()),
                     },
                 );
             }
@@ -1849,7 +1965,7 @@ mod tests {
                     torrent_id: "torrent1".to_string(),
                     state: RepairState::Broken,
                     repair_attempts: 1,
-                    last_repair_trigger: Some(std::time::Instant::now()),
+                    last_repair_trigger: Some(tokio::time::Instant::now()),
                 },
             );
         }
@@ -2078,7 +2194,7 @@ mod tests {
                     torrent_id: "torrent_preserve".to_string(),
                     state: RepairState::Repairing,
                     repair_attempts: 2,
-                    last_repair_trigger: Some(std::time::Instant::now()),
+                    last_repair_trigger: Some(tokio::time::Instant::now()),
                 },
             );
         }
@@ -2199,8 +2315,8 @@ mod tests {
         let hidden = manager.hidden_torrent_ids().await;
         assert_eq!(
             hidden.len(),
-            3,
-            "Should have 3 hidden torrents (broken, repairing, failed)"
+            2,
+            "Should have 2 hidden torrents (broken, failed)"
         );
         assert!(
             !hidden.contains("healthy1"),
@@ -2211,8 +2327,8 @@ mod tests {
             "Broken torrent should be hidden"
         );
         assert!(
-            hidden.contains("repairing1"),
-            "Repairing torrent should be hidden"
+            !hidden.contains("repairing1"),
+            "a torrent mid-repair stays in the VFS (only its reads are refused)"
         );
         assert!(
             hidden.contains("failed1"),
@@ -2222,8 +2338,10 @@ mod tests {
 
     #[tokio::test]
     async fn hidden_torrent_ids_consistent_with_should_hide() {
-        // Verify that hidden_torrent_ids returns the same set as calling
-        // should_hide_torrent on each individual torrent.
+        // `hidden_torrent_ids` (what the VFS leaves out) and `should_hide_torrent` (what reads refuse)
+        // agree, except on a torrent mid-repair: it stays listed, so a scan tick landing inside a
+        // repair doesn't drop its files from the library (telling Jellyfin they were deleted) until
+        // the next tick, while its reads are still refused until the repair settles.
         let manager = make_test_manager();
 
         {
@@ -2247,7 +2365,7 @@ mod tests {
         }
 
         let hidden_set = manager.hidden_torrent_ids().await;
-        for id in ["a", "b", "c", "d"] {
+        for id in ["a", "b", "d"] {
             assert_eq!(
                 hidden_set.contains(id),
                 manager.should_hide_torrent(id).await,
@@ -2255,6 +2373,14 @@ mod tests {
                 id
             );
         }
+        assert!(
+            !hidden_set.contains("c"),
+            "a Repairing torrent stays in the VFS"
+        );
+        assert!(
+            manager.should_hide_torrent("c").await,
+            "reads of a Repairing torrent are still refused"
+        );
     }
 
     #[tokio::test]
@@ -2425,7 +2551,7 @@ mod tests {
         let manager = make_test_manager();
 
         // Simulate a torrent that was just repaired (has recent last_repair_trigger)
-        let recent_trigger = std::time::Instant::now();
+        let recent_trigger = tokio::time::Instant::now();
         {
             let mut health_map = manager.health_status.write().await;
             health_map.insert(
@@ -2588,8 +2714,8 @@ mod tests {
 
     /// A repair cut short by a dropped read reached no verdict on the file, so (like a timed-out
     /// one) it must not count toward `MAX_REPAIR_ATTEMPTS`; otherwise three cancellations with no
-    /// good read between them trap the torrent `Failed`/hidden until restart. The cooldown it set
-    /// is kept.
+    /// good read between them trap the torrent `Failed`/hidden until restart. The cooldown restarts
+    /// when the repair is abandoned.
     #[tokio::test(start_paused = true)]
     async fn cancelling_in_flight_repair_resets_the_attempt_budget() {
         // The clock is paused and the test task keeps yielding, so the repair parks mid-way with
@@ -2611,7 +2737,7 @@ mod tests {
                     state: RepairState::Healthy,
                     repair_attempts: MAX_REPAIR_ATTEMPTS - 1,
                     last_repair_trigger: Some(
-                        std::time::Instant::now() - Duration::from_secs(REPAIR_COOLDOWN_SECS + 1),
+                        tokio::time::Instant::now() - Duration::from_secs(REPAIR_COOLDOWN_SECS + 1),
                     ),
                 },
             );
@@ -2627,6 +2753,9 @@ mod tests {
             }
         }
         assert!(hidden, "the repair should have begun (Repairing = hidden)");
+        assert!(!handle.is_finished(), "the repair must still be in flight");
+        // The read gives up 20 s into the repair (short of `INSTANT_REPAIR_TIMEOUT`).
+        tokio::time::advance(Duration::from_secs(20)).await;
         assert!(!handle.is_finished(), "the repair must still be in flight");
         handle.abort();
         let mut visible = false;
@@ -2649,8 +2778,8 @@ mod tests {
             );
             assert!(
                 h.last_repair_trigger
-                    .is_some_and(|t| t.elapsed() < Duration::from_secs(REPAIR_COOLDOWN_SECS)),
-                "the cooldown the cancelled repair set is kept"
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(1)),
+                "the cooldown restarts when the repair is abandoned, not when it began"
             );
         }
         // Once the cooldown is over, the next read may repair again rather than hitting the cap.
@@ -2661,7 +2790,7 @@ mod tests {
             .get_mut("tid")
             .unwrap()
             .last_repair_trigger =
-            Some(std::time::Instant::now() - Duration::from_secs(REPAIR_COOLDOWN_SECS + 1));
+            Some(tokio::time::Instant::now() - Duration::from_secs(REPAIR_COOLDOWN_SECS + 1));
         assert!(manager.check_and_begin_repair("tid").await.is_ok());
     }
 
@@ -2787,5 +2916,166 @@ mod tests {
             "the post-add and the final lookup each 404 once, then find it"
         );
         assert_eq!(provider.deleted(), vec!["tid".to_string()]);
+    }
+
+    // ── what a new-id repair leaves for the next scan ───────────────────────────────────────────
+
+    /// A two-episode pack, `tid` before the repair and `new` (Real-Debrid's re-add) after it, with
+    /// an unselected sample between the episodes so the per-file links pair by position among the
+    /// SELECTED files.
+    fn pack_info(id: &str, ids: [u32; 3], links: &[&str]) -> TorrentInfo {
+        let file = |id: u32, path: &str, selected: u32| crate::rd_client::TorrentFile {
+            id,
+            path: path.to_string(),
+            bytes: 1000,
+            selected,
+        };
+        TorrentInfo {
+            id: id.to_string(),
+            hash: "H".to_string(),
+            status: "downloaded".to_string(),
+            files: vec![
+                file(ids[0], "/Show.S01E01.mkv", 1),
+                file(ids[1], "/Sample.mkv", 0),
+                file(ids[2], "/Show.S01E02.mkv", 1),
+            ],
+            links: links.iter().map(|l| l.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn pack_locator(torrent_id: &str, file_id: u32, path: &str, link: &str) -> FileLocator {
+        FileLocator {
+            hash: "H".to_string(),
+            torrent_id: torrent_id.to_string(),
+            file_id,
+            file_path: path.to_string(),
+            link: Some(link.to_string()),
+        }
+    }
+
+    /// Real-Debrid re-adds the hash under a new id and the repair deletes the old torrent, but the
+    /// VFS keeps the old torrent's locators until the next scan rebuilds it. Until then `redirect`
+    /// maps every selected file of the old torrent onto the repaired one (by path, each with its own
+    /// link), so a later open of the same file, or of a sibling episode, doesn't resolve the deleted
+    /// torrent and fail. Once a listing no longer has the old torrent (the VFS is rebuilt from that
+    /// listing) the redirect is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_id_repair_redirects_every_file_of_the_old_torrent() {
+        let provider = Arc::new(ScriptedProvider {
+            infos: [
+                (
+                    "tid".to_string(),
+                    pack_info("tid", [1, 2, 3], &["old1", "old2"]),
+                ),
+                (
+                    "new".to_string(),
+                    pack_info("new", [5, 6, 7], &["new1", "new2"]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        let manager = RepairManager::new(provider.clone());
+        let e01 = pack_locator("tid", 1, "/Show.S01E01.mkv", "old1");
+        let e02 = pack_locator("tid", 3, "/Show.S01E02.mkv", "old2");
+
+        assert!(
+            manager.redirect(&e01).await.is_none(),
+            "nothing repaired yet"
+        );
+        let repaired = manager
+            .try_instant_repair(&e01)
+            .await
+            .expect("cached re-add");
+        assert_eq!(repaired.torrent_id, "new");
+
+        assert_eq!(
+            manager.redirect(&e01).await,
+            Some(pack_locator("new", 5, "/Show.S01E01.mkv", "new1"))
+        );
+        assert_eq!(
+            manager.redirect(&e02).await,
+            Some(pack_locator("new", 7, "/Show.S01E02.mkv", "new2")),
+            "a sibling file of the repaired torrent is redirected too"
+        );
+        let other = FileLocator {
+            torrent_id: "other".to_string(),
+            ..e01.clone()
+        };
+        assert!(manager.redirect(&other).await.is_none());
+
+        // The scan tick whose listing predates the repair still lists `tid`: its VFS has the old
+        // locators, so the redirect is kept.
+        manager
+            .prune_health_status(&["tid"].into_iter().collect())
+            .await;
+        assert!(manager.redirect(&e02).await.is_some());
+        // A listing without `tid` rebuilds the VFS on the new torrent.
+        manager
+            .prune_health_status(&["new"].into_iter().collect())
+            .await;
+        assert!(manager.redirect(&e02).await.is_none());
+    }
+
+    /// A torrent repaired twice (a still-broken file on a storm of re-adds, each a new id) is
+    /// redirected to the latest copy, not to the deleted one in between.
+    #[tokio::test]
+    async fn redirect_follows_a_chain_of_repairs() {
+        let manager = make_test_manager();
+        manager
+            .record_redirect("a", &pack_info("b", [5, 6, 7], &["b1", "b2"]), "H")
+            .await;
+        manager
+            .record_redirect("b", &pack_info("c", [8, 9, 10], &["c1", "c2"]), "H")
+            .await;
+        assert_eq!(
+            manager
+                .redirect(&pack_locator("a", 3, "/Show.S01E02.mkv", "a2"))
+                .await,
+            Some(pack_locator("c", 10, "/Show.S01E02.mkv", "c2"))
+        );
+    }
+
+    /// The scan loop prunes the health map against the listing it fetched at the start of its tick.
+    /// A Real-Debrid repair that completes during the tick has a new id that listing lacks, and its
+    /// entry carries the cooldown and the attempt budget across the re-add, so it must survive the
+    /// prune until the scan loop has taken the replacement (the next tick's listing has the new id).
+    #[tokio::test]
+    async fn prune_health_status_keeps_a_repair_the_listing_predates() {
+        let manager = make_test_manager();
+        manager.health_status.write().await.insert(
+            "old".to_string(),
+            TorrentHealth {
+                torrent_id: "old".to_string(),
+                state: RepairState::Repairing,
+                repair_attempts: 2,
+                last_repair_trigger: Some(tokio::time::Instant::now()),
+            },
+        );
+        manager.complete_repair("old", "new").await;
+
+        manager
+            .prune_health_status(&["old"].into_iter().collect())
+            .await;
+        {
+            let hm = manager.health_status.read().await;
+            let h = hm
+                .get("new")
+                .expect("the repaired torrent's entry survives a listing that predates it");
+            assert_eq!(h.repair_attempts, 2, "the attempt budget is carried");
+            assert!(h.last_repair_trigger.is_some(), "the cooldown is carried");
+        }
+
+        // The next tick takes the replacement, then prunes against a listing with the new id.
+        assert_eq!(manager.take_repair_replacements().await.len(), 1);
+        manager
+            .prune_health_status(&["new"].into_iter().collect())
+            .await;
+        assert!(manager.health_status.read().await.contains_key("new"));
+        // A torrent gone from the listing after that is pruned as before.
+        manager.prune_health_status(&HashSet::new()).await;
+        assert!(manager.health_status.read().await.is_empty());
     }
 }

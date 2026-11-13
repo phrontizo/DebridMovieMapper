@@ -925,8 +925,9 @@ pub fn parse_show_progress(v: &serde_json::Value) -> ShowProgress {
 // --- Test-only mock -------------------------------------------------------------------------
 
 /// Test-only client returning canned values (mirrors `MockScraper`). The `fail_reads`/
-/// `fail_refresh` flags inject errors so callers (e.g. `sync_trakt`) can exercise their
-/// failure-handling paths; when both are false the canned values are returned unchanged.
+/// `fail_refresh`/`transient_refresh` flags and `poll_errors_before_ok` inject errors so callers
+/// (e.g. `sync_trakt`) can exercise their failure-handling paths; when none is set the canned
+/// values are returned unchanged.
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub struct MockTrakt {
@@ -1570,10 +1571,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn send_with_retry_recovers_from_a_transient_transport_error() {
-        // B12 lock-in: a transient transport error (connection reset before the response) must be
-        // retried with backoff rather than dropping the whole read — so a flaky network doesn't
-        // abort a Trakt sync tick that RD/TorBox would ride out. The server drops the first
-        // connection, then serves a valid `/users/me` body; `me()` must still succeed.
+        // A transient transport error (connection reset before the response) must be retried with
+        // backoff rather than dropping the whole read — so a flaky network doesn't abort a Trakt
+        // sync tick that RD/TorBox would ride out. The server drops the first connection, then
+        // serves a valid `/users/me` body; `me()` must still succeed.
         let (url, counter) =
             spawn_drop_then_json(1, r#"{"username":"Bob","ids":{"slug":"bob"}}"#).await;
         let client = TraktClientImpl::new("cid".into(), "secret".into(), reqwest::Client::new())
@@ -1710,7 +1711,8 @@ mod tests {
         assert!(refresh_error_is_transient(&AppError::Http(
             http_status_error(500)
         )));
-        // No HTTP status: a transport failure.
+        // No HTTP status: a request-builder error, standing in for a transport failure (both take
+        // the `status() == None` branch).
         let transport = reqwest::Client::new()
             .get("")
             .build()

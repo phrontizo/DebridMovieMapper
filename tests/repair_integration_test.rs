@@ -8,7 +8,10 @@
 
 mod common;
 
-use common::{cleanup_by_hash, find_ids_by_hash, with_cleanup, SINTEL_HASH};
+use common::{
+    cleanup_added, cleanup_by_hash, find_ids_by_hash, record_added_id, with_cleanup, AddedIds,
+    SINTEL_HASH,
+};
 use debridmoviemapper::acquire::locator_for;
 use debridmoviemapper::provider::DebridProvider;
 use debridmoviemapper::rd_client::RealDebridClient;
@@ -38,17 +41,18 @@ async fn test_instant_repair_of_sintel() {
         return;
     };
     // Delete any Sintel left by an interrupted run; afterwards delete the original and the
-    // replacement the repair adds (both carry the Sintel hash).
+    // replacement the repair adds (both carry the Sintel hash), by id first and then by hash.
     cleanup_by_hash(&provider, SINTEL_HASH).await;
+    let added = AddedIds::default();
     with_cleanup(
-        repair_sintel(&provider),
-        cleanup_by_hash(&provider, SINTEL_HASH),
+        repair_sintel(&provider, &added),
+        cleanup_added(&provider, &added, SINTEL_HASH),
     )
     .await;
 }
 
-async fn repair_sintel(provider: &Arc<dyn DebridProvider>) {
-    let info = common::add_sintel_downloaded(provider, "real-debrid").await;
+async fn repair_sintel(provider: &Arc<dyn DebridProvider>, added: &AddedIds) {
+    let info = common::add_sintel_downloaded(provider, added, "real-debrid").await;
     let video = info
         .files
         .iter()
@@ -68,6 +72,7 @@ async fn repair_sintel(provider: &Arc<dyn DebridProvider>) {
     println!("\n=== Instant Repair ===");
     match repair_manager.try_instant_repair(&locator).await {
         Ok(new_locator) => {
+            record_added_id(added, &new_locator.torrent_id);
             assert_eq!(
                 new_locator.file_path, locator.file_path,
                 "the repair should hand back a locator for the same file"

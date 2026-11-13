@@ -832,10 +832,10 @@ mod tests {
 
     #[test]
     fn manual_returning_show_acquires_unwatched_aired_episodes_it_never_owned() {
-        // W2 regression (pins the W1 doc): a MANUAL, Trakt-wanted (in-progress), non-finished
-        // (Returning) show still acquires its UNWATCHED aired episodes via the normal catch-up path —
-        // including ones the manual copy never owned. The owned_eps clause only ADDS already-watched
-        // owned episodes; it does NOT restrict the base catch-up set.
+        // A MANUAL, Trakt-wanted (in-progress), non-finished (Returning) show still acquires its
+        // UNWATCHED aired episodes via the normal catch-up path — including ones the manual copy
+        // never owned. The owned_eps clause only ADDS already-watched owned episodes; it does NOT
+        // restrict the base catch-up set.
         let aired = vec![(1, 1), (1, 2)];
         let t = show_title(
             31,

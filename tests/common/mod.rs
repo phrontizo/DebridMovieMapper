@@ -103,26 +103,143 @@ where
     ))
 }
 
-/// Best effort: delete every torrent whose hash is one of `hashes` (compared case-insensitively),
-/// from a single listing.
-pub async fn delete_by_hashes(provider: &Arc<dyn DebridProvider>, hashes: &[String]) {
-    if hashes.is_empty() {
-        return;
+/// How many listings a cleanup sweep makes at most, and how far apart.
+const SWEEP_LISTINGS: u32 = 3;
+const SWEEP_EVERY: Duration = Duration::from_secs(2);
+
+/// The ids of the torrents a live test's body added, shared with its cleanup, so the cleanup can
+/// delete them directly when the provider's listing lags the add (TorBox's can for 30 s and more).
+pub type AddedIds = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// Remember a torrent id the body added (each id once).
+pub fn record_added_id(added: &AddedIds, id: &str) {
+    let mut ids = added.lock().unwrap_or_else(|e| e.into_inner());
+    if !ids.iter().any(|known| known == id) {
+        ids.push(id.to_string());
     }
-    let Ok(torrents) = provider.get_torrents().await else {
-        return;
+}
+
+/// The ids recorded so far.
+pub fn added_ids(added: &AddedIds) -> Vec<String> {
+    added.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The cleanup core: `delete` each known id in `ids` first (an already-deleted one just fails,
+/// which is ignored), then sweep by `hashes`: up to `attempts` listings (`list` returns
+/// `(id, hash)` pairs), `every` apart, deleting every listed torrent that carries one of `hashes`
+/// (case-insensitively) or one of `ids`, until a listing shows none. `Err` says what it couldn't
+/// confirm gone: a torrent still listed, or, when no listing succeeded, every hash and id.
+pub async fn delete_ids_then_sweep_with<L, LFut, E, D, DFut>(
+    mut list: L,
+    mut delete: D,
+    ids: &[String],
+    hashes: &[String],
+    attempts: u32,
+    every: Duration,
+) -> Result<(), String>
+where
+    L: FnMut() -> LFut,
+    LFut: Future<Output = Result<Vec<(String, String)>, E>>,
+    E: std::fmt::Display,
+    D: FnMut(String) -> DFut,
+    DFut: Future<Output = ()>,
+{
+    if ids.is_empty() && hashes.is_empty() {
+        return Ok(());
+    }
+    for id in ids {
+        delete(id.clone()).await;
+    }
+    let mut still_listed: Option<Vec<(String, String)>> = None;
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(every).await;
+        }
+        match list().await {
+            Ok(torrents) => {
+                let ours: Vec<(String, String)> = torrents
+                    .into_iter()
+                    .filter(|(id, hash)| {
+                        ids.contains(id) || hashes.iter().any(|h| hash.eq_ignore_ascii_case(h))
+                    })
+                    .collect();
+                if ours.is_empty() {
+                    return Ok(());
+                }
+                for (id, _) in &ours {
+                    delete(id.clone()).await;
+                }
+                still_listed = Some(ours);
+            }
+            Err(e) => last_error = Some(e.to_string()),
+        }
+    }
+    let what = match still_listed {
+        Some(ours) => format!(
+            "still listed: {}",
+            ours.iter()
+                .map(|(id, hash)| format!("id {id} (hash {hash})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => format!("no listing succeeded; hashes {hashes:?}, ids {ids:?}"),
     };
-    for t in torrents
-        .iter()
-        .filter(|t| hashes.iter().any(|h| t.hash.eq_ignore_ascii_case(h)))
-    {
-        let _ = provider.delete_torrent(&t.id).await;
+    let last = last_error
+        .map(|e| format!("; last listing error: {e}"))
+        .unwrap_or_default();
+    Err(format!(
+        "could not confirm the cleanup after {attempts} listings {}s apart, {what}{last}",
+        every.as_secs()
+    ))
+}
+
+/// Best effort: delete the torrents with the known `ids`, then every torrent whose hash is one of
+/// `hashes` (compared case-insensitively), re-listing a few times. Warns on stderr, naming them,
+/// when it can't confirm they are gone, since a leftover stays in an account a production
+/// deployment may share.
+pub async fn delete_ids_then_sweep(
+    provider: &Arc<dyn DebridProvider>,
+    ids: &[String],
+    hashes: &[String],
+) {
+    let outcome = delete_ids_then_sweep_with(
+        || async {
+            provider.get_torrents().await.map(|torrents| {
+                torrents
+                    .into_iter()
+                    .map(|t| (t.id, t.hash))
+                    .collect::<Vec<_>>()
+            })
+        },
+        |id: String| async move {
+            let _ = provider.delete_torrent(&id).await;
+        },
+        ids,
+        hashes,
+        SWEEP_LISTINGS,
+        SWEEP_EVERY,
+    )
+    .await;
+    if let Err(why) = outcome {
+        eprintln!("WARNING: live-test cleanup may have left a torrent behind: {why}");
     }
+}
+
+/// Best effort: delete every torrent whose hash is one of `hashes` (see [`delete_ids_then_sweep`]).
+pub async fn delete_by_hashes(provider: &Arc<dyn DebridProvider>, hashes: &[String]) {
+    delete_ids_then_sweep(provider, &[], hashes).await;
 }
 
 /// Best effort: delete every torrent whose hash is `hash`, e.g. a copy left by an interrupted run.
 pub async fn cleanup_by_hash(provider: &Arc<dyn DebridProvider>, hash: &str) {
     delete_by_hashes(provider, &[hash.to_string()]).await;
+}
+
+/// Best effort: delete the torrents the body recorded in `added`, then every torrent whose hash is
+/// `hash` (see [`delete_ids_then_sweep`]).
+pub async fn cleanup_added(provider: &Arc<dyn DebridProvider>, added: &AddedIds, hash: &str) {
+    delete_ids_then_sweep(provider, &added_ids(added), &[hash.to_string()]).await;
 }
 
 /// Run `body`, then run `cleanup` whether or not `body` panicked, and only then re-raise the panic.
@@ -140,17 +257,24 @@ pub async fn with_cleanup<T>(
     }
 }
 
-/// Add Sintel by magnet, select only its video file(s), and wait until it is `downloaded`.
+/// Add Sintel by magnet, select only its video file(s), and wait until it is `downloaded`. The new
+/// torrent's id goes into `added` right after the add, so the cleanup can delete it even when this
+/// panics before the listing shows it.
 ///
 /// Real-Debrid converts the magnet before it lists files; TorBox lists them at once. Selecting
 /// non-video files (subtitles, poster) makes Real-Debrid return a link array that doesn't line up
 /// with the selected files, and production torrents select just the video.
-pub async fn add_sintel_downloaded(provider: &Arc<dyn DebridProvider>, label: &str) -> TorrentInfo {
+pub async fn add_sintel_downloaded(
+    provider: &Arc<dyn DebridProvider>,
+    added: &AddedIds,
+    label: &str,
+) -> TorrentInfo {
     let id = provider
         .add_magnet(&sintel_magnet())
         .await
         .expect("add_magnet")
         .id;
+    record_added_id(added, &id);
     println!("[{label}] add_magnet -> id={id}");
 
     let mut pre = None;

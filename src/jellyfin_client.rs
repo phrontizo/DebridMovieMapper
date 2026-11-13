@@ -687,7 +687,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn notify_changes_retries_forever_up_to_the_attempt_cap() {
+    async fn notify_changes_stops_after_max_send_attempts_on_a_persistent_503() {
         // A persistently-transient upstream (always 503) must be retried EXACTLY MAX_SEND_ATTEMPTS
         // times and then stop — guarding the loop bound against an off-by-one or an early return in
         // the Retry arm that would change the total request count.

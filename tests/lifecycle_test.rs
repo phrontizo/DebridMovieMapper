@@ -12,7 +12,9 @@
 
 mod common;
 
-use common::{cleanup_by_hash, find_ids_by_hash, with_cleanup, SINTEL_HASH};
+use common::{
+    cleanup_added, cleanup_by_hash, find_ids_by_hash, with_cleanup, AddedIds, SINTEL_HASH,
+};
 use debridmoviemapper::identification::identify_torrent;
 use debridmoviemapper::provider::{DebridProvider, ProviderKind};
 use debridmoviemapper::rd_client::RealDebridClient;
@@ -59,16 +61,24 @@ fn has_media_from(node: &VfsNode, hash: &str) -> bool {
 async fn run_lifecycle(provider: Arc<dyn DebridProvider>, tmdb: Arc<TmdbClient>, label: &str) {
     // Delete any leftover Sintel from a prior interrupted run.
     cleanup_by_hash(&provider, SINTEL_HASH).await;
+    // The cleanup deletes the added torrent by its id too: after the "should appear in
+    // get_torrents()" failure the listing is lagging, so a sweep by hash alone could miss it.
+    let added = AddedIds::default();
     with_cleanup(
-        lifecycle_steps(&provider, &tmdb, label),
-        cleanup_by_hash(&provider, SINTEL_HASH),
+        lifecycle_steps(&provider, &tmdb, &added, label),
+        cleanup_added(&provider, &added, SINTEL_HASH),
     )
     .await;
 }
 
-async fn lifecycle_steps(provider: &Arc<dyn DebridProvider>, tmdb: &Arc<TmdbClient>, label: &str) {
+async fn lifecycle_steps(
+    provider: &Arc<dyn DebridProvider>,
+    tmdb: &Arc<TmdbClient>,
+    added: &AddedIds,
+    label: &str,
+) {
     // 1-3. Add by magnet, select the video file(s), wait until downloaded.
-    let info = common::add_sintel_downloaded(provider, label).await;
+    let info = common::add_sintel_downloaded(provider, added, label).await;
     let id = info.id.clone();
 
     // 4. Appears in the provider's list. TorBox's listing can lag an add that already reports
@@ -246,6 +256,10 @@ async fn run_acquire(kind: ProviderKind, provider_token: String, label: &str) {
         .with_test_writer()
         .try_init();
 
+    // The ids of the owned torrents the body sees listed. The engine's add doesn't hand back an id,
+    // so the listings are where they come from; the cleanup deletes them directly, so a later
+    // listing that lags or errors can't leave one behind.
+    let added = AddedIds::default();
     let body = async {
         // Optimistic acquire: returns Pending quickly (or Acquired if the cached check is instant).
         let hash = match engine
@@ -263,6 +277,7 @@ async fn run_acquire(kind: ProviderKind, provider_token: String, label: &str) {
         let mut verified = false;
         for _ in 0..20 {
             let torrents = provider.get_torrents().await.expect("get_torrents");
+            record_owned_ids(&store, &torrents, &added).await;
             engine.observe(&torrents).await;
             if matches!(
                 store.get_owned(hash.clone()).await.map(|r| r.status),
@@ -293,6 +308,7 @@ async fn run_acquire(kind: ProviderKind, provider_token: String, label: &str) {
             .get_torrents()
             .await
             .expect("get_torrents for VFS build");
+        record_owned_ids(&store, &torrents, &added).await;
         let mut acquired = Vec::new();
         for t in torrents
             .iter()
@@ -320,8 +336,8 @@ async fn run_acquire(kind: ProviderKind, provider_token: String, label: &str) {
         eprintln!("[{label}] Sintel appears in Movies/ via VFS ✓");
     };
 
-    // Cleanup, also after a failed assertion: delete every torrent the engine recorded as owned,
-    // then the temp store.
+    // Cleanup, also after a failed assertion: delete the owned torrents the body saw listed by id,
+    // then every torrent the engine recorded as owned by hash, then the temp store.
     let cleanup = async {
         let owned: Vec<String> = store
             .all_owned()
@@ -329,11 +345,26 @@ async fn run_acquire(kind: ProviderKind, provider_token: String, label: &str) {
             .into_iter()
             .map(|(h, _)| h)
             .collect();
-        common::delete_by_hashes(&provider, &owned).await;
+        common::delete_ids_then_sweep(&provider, &common::added_ids(&added), &owned).await;
         let _ = std::fs::remove_file(&dbp);
         let _ = std::fs::remove_file(format!("{}.corrupt", dbp.to_str().unwrap()));
     };
     with_cleanup(body, cleanup).await;
+}
+
+/// Record in `added` the id of every listed torrent whose hash the test's own (fresh) store owns.
+async fn record_owned_ids(
+    store: &debridmoviemapper::store::Store,
+    torrents: &[debridmoviemapper::rd_client::Torrent],
+    added: &AddedIds,
+) {
+    let owned = store.all_owned().await;
+    for t in torrents
+        .iter()
+        .filter(|t| owned.iter().any(|(h, _)| t.hash.eq_ignore_ascii_case(h)))
+    {
+        common::record_added_id(added, &t.id);
+    }
 }
 
 // --- Offline checks of the helpers above and in `common` (no network; plain `cargo test`) ---
@@ -509,4 +540,150 @@ async fn with_cleanup_runs_cleanup_and_returns_the_body_value() {
     let value = with_cleanup(async { 7 }, async { cleaned.store(true, Ordering::SeqCst) }).await;
     assert_eq!(value, 7);
     assert!(cleaned.load(Ordering::SeqCst));
+}
+
+// --- Offline checks of `common::delete_ids_then_sweep_with` (the cleanup core) ---
+
+/// One scripted listing per call (the last one repeats), each `Ok(vec![(id, hash)])` or an error.
+type Listing = Result<Vec<(String, String)>, String>;
+
+fn listed(entries: &[(&str, &str)]) -> Listing {
+    Ok(entries
+        .iter()
+        .map(|(id, hash)| (id.to_string(), hash.to_string()))
+        .collect())
+}
+
+/// Run the cleanup core against scripted listings; returns its outcome, the ids it deleted (in
+/// order) and how many listings it made.
+async fn sweep(
+    listings: Vec<Listing>,
+    ids: &[&str],
+    hashes: &[&str],
+) -> (Result<(), String>, Vec<String>, usize) {
+    let calls = std::cell::Cell::new(0usize);
+    let deleted = std::cell::RefCell::new(Vec::new());
+    let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+    let hashes: Vec<String> = hashes.iter().map(|s| s.to_string()).collect();
+    let outcome = common::delete_ids_then_sweep_with(
+        || {
+            let n = calls.get();
+            calls.set(n + 1);
+            let listing = listings[n.min(listings.len() - 1)].clone();
+            async move { listing }
+        },
+        |id: String| {
+            deleted.borrow_mut().push(id);
+            async {}
+        },
+        &ids,
+        &hashes,
+        3,
+        Duration::from_secs(2),
+    )
+    .await;
+    (outcome, deleted.into_inner(), calls.get())
+}
+
+const OTHER_HASH: &str = "1111111111111111111111111111111111111111";
+
+#[tokio::test(start_paused = true)]
+async fn cleanup_deletes_a_known_id_the_lagging_listing_leaves_out() {
+    // TorBox's listing can lag an add: the torrent the body added isn't listed yet. Cleanup must
+    // still delete it by the id `add_magnet` returned, not trust the listing alone.
+    let (outcome, deleted, listings) = sweep(vec![listed(&[])], &["42"], &[SINTEL_HASH]).await;
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(deleted, vec!["42".to_string()]);
+    assert_eq!(listings, 1, "a clean listing ends the sweep");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cleanup_deletes_what_the_listing_shows_and_rechecks() {
+    let upper = SINTEL_HASH.to_ascii_uppercase();
+    let (outcome, deleted, listings) = sweep(
+        vec![
+            listed(&[("1", OTHER_HASH), ("7", upper.as_str())]),
+            listed(&[("1", OTHER_HASH)]),
+        ],
+        &[],
+        &[SINTEL_HASH],
+    )
+    .await;
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(
+        deleted,
+        vec!["7".to_string()],
+        "only the matching hash (case-insensitively), never another torrent"
+    );
+    assert_eq!(listings, 2, "a second listing confirms the delete");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cleanup_warns_when_every_listing_errors() {
+    let (outcome, deleted, listings) =
+        sweep(vec![Err("HTTP 503".to_string())], &["42"], &[SINTEL_HASH]).await;
+    let why = outcome.unwrap_err();
+    assert!(why.contains(SINTEL_HASH), "{why}");
+    assert!(why.contains("42"), "{why}");
+    assert!(why.contains("HTTP 503"), "{why}");
+    assert_eq!(
+        deleted,
+        vec!["42".to_string()],
+        "the known id is deleted even though no listing succeeds"
+    );
+    assert_eq!(listings, 3, "it retries the listing");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cleanup_warns_when_the_torrent_stays_listed() {
+    let (outcome, deleted, listings) =
+        sweep(vec![listed(&[("7", SINTEL_HASH)])], &[], &[SINTEL_HASH]).await;
+    let why = outcome.unwrap_err();
+    assert!(why.contains("still listed"), "{why}");
+    assert!(why.contains('7') && why.contains(SINTEL_HASH), "{why}");
+    assert_eq!(deleted, vec!["7".to_string(); 3], "each listing retries it");
+    assert_eq!(listings, 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cleanup_recovers_from_an_erroring_listing() {
+    let (outcome, _, listings) = sweep(
+        vec![Err("HTTP 502".to_string()), listed(&[])],
+        &[],
+        &[SINTEL_HASH],
+    )
+    .await;
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(listings, 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cleanup_with_nothing_to_clean_lists_nothing() {
+    let (outcome, deleted, listings) = sweep(vec![listed(&[])], &[], &[]).await;
+    assert_eq!(outcome, Ok(()));
+    assert!(deleted.is_empty());
+    assert_eq!(listings, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cleanup_sweeps_at_most_its_window() {
+    let start = tokio::time::Instant::now();
+    let _ = sweep(vec![Err("HTTP 503".to_string())], &[], &[SINTEL_HASH]).await;
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_secs(4),
+        "3 listings, 2 s apart"
+    );
+}
+
+#[test]
+fn record_added_id_keeps_each_id_once() {
+    let added = common::AddedIds::default();
+    common::record_added_id(&added, "42");
+    common::record_added_id(&added, "42");
+    common::record_added_id(&added, "43");
+    assert_eq!(
+        common::added_ids(&added),
+        vec!["42".to_string(), "43".to_string()]
+    );
 }

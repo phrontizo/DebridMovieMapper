@@ -42,7 +42,8 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// re-acquiring the real S04E09 and write a wrong selection slot — accepted, since concatenated
 /// Western packs are far more common and an empty `provides` was worse. Exactly 3 digits (season
 /// 1–9) are accepted, so a 4-digit year/date token (`Show - 2024 - Title`) never decodes, and an
-/// episode-00 decode is rejected.
+/// episode-00 decode is rejected. The dash code needs SPACE-dash-SPACE on both sides, so a dotted
+/// scene form (`Show.-.409.-.Title`) yields no code at all (an empty `provides` for such a file).
 pub(crate) fn parse_se_all(name: &str) -> Vec<(u32, u32)> {
     static SE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})e(\d{1,3})((?:[-_. ]?e\d{1,3})*)").unwrap());
@@ -690,11 +691,18 @@ impl DebridVfs {
                                             // ("Show/Season 04/09 - Title.mkv") rather than the
                                             // filename. Filename precedence is preserved (this runs
                                             // last), so a contradictory "1x05" in a "/Season 03/"
-                                            // path still prefers the filename.
+                                            // path still prefers the filename. The NEAREST
+                                            // directory that names a season wins: a TorBox path
+                                            // includes the torrent's root folder, and a
+                                            // multi-season pack's root
+                                            // ("Show.S01-S03/Season 2/01.mkv") would otherwise put
+                                            // every season in the root's first one.
                                             .or_else(|| {
                                                 let dir =
                                                     &file.path[..file.path.len() - filename.len()];
-                                                season_from(dir)
+                                                dir.rsplit('/')
+                                                    .filter(|c| !c.is_empty())
+                                                    .find_map(season_from)
                                             })
                                             .unwrap_or(1);
 
@@ -1209,9 +1217,10 @@ fn normalize_dir_component(component: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Extract a season number from an arbitrary string (filename or directory portion) via SEASON_RE,
-/// returning the first populated capture group (`Sxx` / `Season N` / `NxNN` / `Part N`). Shared by
-/// the filename check and the parent-directory fallback in the show-emit loop.
+/// Extract a season number from an arbitrary string (a filename or one directory name) via
+/// SEASON_RE, returning the first populated capture group (`Sxx` / `Season N` / `NxNN` / `Part N`).
+/// Shared by the filename check and the parent-directory fallback in the show-emit loop, which tries
+/// the file's directories nearest first.
 fn season_from(s: &str) -> Option<u32> {
     SEASON_RE
         .captures(s)
@@ -2207,6 +2216,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A multi-season pack whose ROOT folder names a season range (`Show.S01-S03…`) and whose
+    /// per-season subfolders hold code-less file names: the NEAREST directory that names a season
+    /// decides, not the first season token in the whole path (the root's `S01`), so each season's
+    /// files land in their own folder and a basename repeated across seasons (`Episode 01.mkv`) is
+    /// not dropped as a duplicate. A season named only by the root still applies.
+    #[test]
+    fn build_uses_the_nearest_directory_season_in_a_multi_season_pack() {
+        let paths = [
+            "Show.S01-S03.1080p/Season 1/01 - Pilot.mkv",
+            "Show.S01-S03.1080p/Season 2/01 - Return.mkv",
+            "Show.S01-S03.1080p/Season 1/Episode 01.mkv",
+            "Show.S01-S03.1080p/Season.2/Episode 01.mkv",
+            "[Grp] Show (Season 1-3) [1080p]/Season 3/Episode 01.mkv",
+            "Show.S04.1080p/01 - Title.mkv",
+        ];
+        let torrents = vec![(
+            TorrentInfo {
+                id: "pack".to_string(),
+                filename: "Show.S01-S03.1080p".to_string(),
+                hash: "h1".to_string(),
+                status: "downloaded".to_string(),
+                added: "2024-01-01".to_string(),
+                files: paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| TorrentFile {
+                        id: i as u32 + 1,
+                        path: p.to_string(),
+                        bytes: 3000,
+                        selected: 1,
+                    })
+                    .collect(),
+                // TorBox: no per-file links, every file is addressed by (torrent_id, file_id).
+                links: vec![],
+                ..Default::default()
+            },
+            MediaMetadata {
+                title: "Show".to_string(),
+                year: None,
+                media_type: MediaType::Show,
+                external_id: Some("tmdb:1".to_string()),
+            },
+        )];
+
+        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
+
+        let VfsNode::Directory { children } = &vfs.root else {
+            panic!("root is not a directory");
+        };
+        let Some(VfsNode::Directory { children: shows }) = children.get("Shows") else {
+            panic!("no Shows dir");
+        };
+        let Some(VfsNode::Directory { children: seasons }) = shows.values().next() else {
+            panic!("no show folder");
+        };
+        let files_in = |season: &str| -> Vec<String> {
+            match seasons.get(season) {
+                Some(VfsNode::Directory { children }) => children.keys().cloned().collect(),
+                _ => Vec::new(),
+            }
+        };
+        assert_eq!(files_in("Season 01"), ["01 - Pilot.mkv", "Episode 01.mkv"]);
+        assert_eq!(files_in("Season 02"), ["01 - Return.mkv", "Episode 01.mkv"]);
+        assert_eq!(files_in("Season 03"), ["Episode 01.mkv"]);
+        assert_eq!(files_in("Season 04"), ["01 - Title.mkv"]);
     }
 
     #[test]

@@ -22,9 +22,10 @@ const MAX_SCRAPER_MIN_INTERVAL_MS: u64 = 60_000;
 /// Resolve the WebDAV listen port from a raw `PORT` value, identically for the server
 /// (`Config::from_parts`) and the `--healthcheck` probe (`main`) so the probe can never target a
 /// different port than the one the server actually bound. Trims, treats blank as unset, and rejects
-/// `0` (binds a random ephemeral port → the healthcheck would connect to 127.0.0.1:0 → restart
-/// loop). Returns the resolved port plus whether a NON-EMPTY value was invalid/zero and fell back to
-/// the default (so the server can warn; the healthcheck ignores the flag).
+/// `0` (it would bind a random ephemeral port, so the healthcheck, which connects to 127.0.0.1:0,
+/// fails: the container reports unhealthy and rclone, gated on `service_healthy`, never mounts).
+/// Returns the resolved port plus whether a NON-EMPTY value was invalid/zero and fell back to the
+/// default (so the server can warn; the healthcheck ignores the flag).
 pub fn resolve_port(raw: Option<&str>) -> (u16, bool) {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => match s.parse::<u16>().ok().filter(|&p| p != 0) {
@@ -223,7 +224,8 @@ impl QualityPrefs {
 /// Trakt sync configuration (SP2). Held by `Config` as `Option<TraktConfig>`.
 ///
 /// Present only when both `TRAKT_CLIENT_ID` and `TRAKT_CLIENT_SECRET` are set;
-/// absent means Trakt sync is disabled and the service runs as before.
+/// absent means Trakt sync is disabled: the Trakt cycle and episode monitor aren't spawned, while
+/// the scan loop and the upgrade job still run.
 #[derive(Clone, PartialEq, Eq)]
 pub struct TraktConfig {
     pub client_id: String,
@@ -232,9 +234,10 @@ pub struct TraktConfig {
     pub sync_interval_secs: u64,
     /// How often (seconds) to check for new episodes of tracked shows. Default 3600, min 300.
     pub episode_check_interval_secs: u64,
-    /// Catch-up lookback window (seconds): a show you've watched is auto-acquired (to catch up on
-    /// episodes aired since) only if you last watched it within this many seconds. `None` = all-time
-    /// (the default) — every show you've ever watched with unwatched aired episodes qualifies.
+    /// Catch-up lookback window (seconds): a show you've watched that Trakt reports as behind gets
+    /// every aired episode you haven't watched acquired (including ones that aired before your last
+    /// watch), but only if you last watched it within this many seconds. `None` = all-time (the
+    /// default) — every show you've ever watched with unwatched aired episodes qualifies.
     /// Parsed from `TRAKT_CATCHUP_LOOKBACK` (e.g. `90d`, `12w`, `6mo`; `0`/unset = all-time).
     pub catchup_lookback_secs: Option<u64>,
     /// Extra hostnames the `/trakt` enrolment routes answer for, on top of the built-in
@@ -322,11 +325,27 @@ pub fn parse_allowed_hosts(raw: Option<String>) -> Vec<String> {
     out
 }
 
+/// `Some((present, missing))` env-var names when exactly one of `TRAKT_CLIENT_ID` /
+/// `TRAKT_CLIENT_SECRET` is non-blank after trimming: Trakt sync is then disabled, which the
+/// operator almost certainly didn't intend. `None` when both or neither are set.
+fn trakt_half_configured(
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
+) -> Option<(&'static str, &'static str)> {
+    let set = |v: Option<&str>| v.is_some_and(|s| !s.trim().is_empty());
+    match (set(client_id), set(client_secret)) {
+        (true, false) => Some(("TRAKT_CLIENT_ID", "TRAKT_CLIENT_SECRET")),
+        (false, true) => Some(("TRAKT_CLIENT_SECRET", "TRAKT_CLIENT_ID")),
+        _ => None,
+    }
+}
+
 impl TraktConfig {
     /// Pure construction from raw optional values (env-independent, for tests).
     ///
     /// Returns `None` unless both `client_id` and `client_secret` are present and
-    /// non-empty after trimming. Interval values default and clamp as documented.
+    /// non-empty after trimming; when only one of them is, it warns naming the missing variable.
+    /// Interval values default and clamp as documented.
     pub fn from_parts(
         client_id: Option<String>,
         client_secret: Option<String>,
@@ -335,6 +354,11 @@ impl TraktConfig {
         catchup_lookback: Option<String>,
         enrol_allowed_hosts: Option<String>,
     ) -> Option<TraktConfig> {
+        if let Some((present, missing)) =
+            trakt_half_configured(client_id.as_deref(), client_secret.as_deref())
+        {
+            warn!("{present} is set but {missing} is not; Trakt sync is disabled");
+        }
         let client_id = client_id
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())?;
@@ -737,7 +761,7 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
-    /// Build from the process environment (reads the same variables as before).
+    /// Build from the process environment.
     pub fn from_env() -> Result<Self, AppError> {
         let mut cfg = Self::from_parts(
             std::env::var("RD_API_TOKEN").ok(),
@@ -1017,7 +1041,8 @@ mod tests {
             8080
         );
         // PORT=0 is a footgun (binds a random ephemeral port; the healthcheck then connects to
-        // 127.0.0.1:0 and fails → restart loop). Treat it like the unparseable case → default 8080.
+        // 127.0.0.1:0 and fails, so the container reports unhealthy and rclone, gated on
+        // `service_healthy`, never mounts). Treat it like the unparseable case → default 8080.
         assert_eq!(
             parts(Some("rd"), None, Some("t"), None, None, Some("0"))
                 .unwrap()
@@ -1522,6 +1547,55 @@ mod tests {
     #[test]
     fn trakt_empty_secret_gives_none() {
         assert!(trakt(Some("id"), Some(""), None, None).is_none());
+    }
+
+    #[test]
+    fn trakt_half_configured_names_the_present_and_missing_variables() {
+        assert_eq!(
+            trakt_half_configured(Some("id"), None),
+            Some(("TRAKT_CLIENT_ID", "TRAKT_CLIENT_SECRET"))
+        );
+        assert_eq!(
+            trakt_half_configured(None, Some("secret")),
+            Some(("TRAKT_CLIENT_SECRET", "TRAKT_CLIENT_ID"))
+        );
+        // Blank counts as unset (compose passes `${TRAKT_CLIENT_SECRET:-}` as an empty value).
+        assert_eq!(
+            trakt_half_configured(Some("id"), Some("  ")),
+            Some(("TRAKT_CLIENT_ID", "TRAKT_CLIENT_SECRET"))
+        );
+        assert_eq!(trakt_half_configured(Some("id"), Some("secret")), None);
+        assert_eq!(trakt_half_configured(None, None), None);
+        assert_eq!(trakt_half_configured(Some(" "), Some("")), None);
+    }
+
+    #[test]
+    fn trakt_half_configured_warns_and_stays_disabled() {
+        // A missing or typo'd secret must be visible, not just the generic "Trakt sync disabled"
+        // info line, while the operator believes Trakt is on.
+        let logs = captured_warnings(|| {
+            assert!(trakt(Some("id"), None, None, None).is_none());
+        });
+        assert!(
+            logs.contains(
+                "TRAKT_CLIENT_ID is set but TRAKT_CLIENT_SECRET is not; Trakt sync is disabled"
+            ),
+            "a half-configured Trakt must warn, naming both variables: {logs:?}"
+        );
+        let logs = captured_warnings(|| {
+            assert!(trakt(None, Some("secret"), None, None).is_none());
+        });
+        assert!(
+            logs.contains("TRAKT_CLIENT_SECRET is set but TRAKT_CLIENT_ID is not"),
+            "{logs:?}"
+        );
+        // Neither set (or both blank, compose's default) is the normal Trakt-off deployment: silent.
+        let logs = captured_warnings(|| {
+            assert!(trakt(None, None, None, None).is_none());
+            assert!(trakt(Some(""), Some("  "), None, None).is_none());
+            assert!(trakt(Some("id"), Some("secret"), None, None).is_some());
+        });
+        assert!(logs.is_empty(), "must not warn: {logs:?}");
     }
 
     #[test]

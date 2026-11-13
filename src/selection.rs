@@ -5,7 +5,9 @@
 //! (`observe`) or swaps in an upgrade, and nothing else ever moved one, so a better copy that
 //! arrived any other way — an account-mirror copy (pre-existing, or re-added by hand) never gets a
 //! slot of its own — stayed hidden behind the worse copy the slot already named. The scan loop runs
-//! [`repoint_to_better_copies`] after dedup, so every slot ends up serving the best present copy.
+//! [`repoint_to_better_copies`] after dedup, so every slot ends up serving the best present copy,
+//! judged by the file it would serve (a mixed-quality pack is not ranked by its best file). Movie
+//! slots never move onto or off a multi-film collection.
 
 use crate::rd_client::TorrentInfo;
 use crate::read_activity::ReadActivity;
@@ -39,21 +41,30 @@ pub struct SlotRepoint {
 /// it lists the episode in `provides` and has an emittable video file whose FIRST episode code
 /// (`vfs::episode_of_file`) is that episode, so a multi-episode file is not a target for its later
 /// episodes (conservative: the VFS keeps such a file visible while any slot selects it); for a
-/// movie, it has an emittable video file — and plan a repoint when that copy's
-/// [`crate::release::quality_rank`] is STRICTLY higher (resolution, then source tier, then checked
-/// before unverified; score ignored, so equal-quality copies never churn a slot). Among several
-/// better copies the highest rank wins, then score, then the smallest hash. A slot whose served copy
-/// is absent, unsettled or unowned is left alone (the VFS already falls back for a stale slot), and
-/// a slot is never created. `present` is the provider listing's identified torrents with their files.
+/// movie, it has an emittable video file — and plan a repoint when the rank of the file that copy
+/// would serve is STRICTLY higher than the rank of the file the slot serves now. Both are ranked
+/// per served file (`served_rank`): the record's [`crate::release::quality_rank`] (resolution,
+/// then source tier, then checked before unverified; score ignored, so equal-quality copies never
+/// churn a slot), capped by the resolution and source tier the file's own name tags and counted
+/// checked only for an MKV/MP4 file, so a mixed-quality pack whose record reflects its best file
+/// never takes a slot with a worse one. Among several better copies the highest rank wins, then
+/// score, then the smallest hash. A slot whose served copy is absent, unsettled or unowned is left
+/// alone (the VFS already falls back for a stale slot), and a slot is never created. `present` is
+/// the provider listing's identified torrents with their files.
 /// Two exceptions keep the planner from undoing the upgrade engine (`rules`): a slot serving a
 /// checked copy moves onto an unchecked one only for a strictly higher resolution, and with
-/// `ALLOW_RESOLUTION_DOWNGRADE` no slot moves onto a copy above `MAX_RESOLUTION`. And a copy tagged
-/// only with other audio languages never takes a slot: `release::wrong_audio_language` on the
-/// copy's torrent + file name, under `prefs` with `AUDIO_LANGUAGE` resolved against the title's
-/// recorded languages (the served record's, else any owned record of the title's) — the test the
-/// upgrade engine applies before it stages a release. Mirror copies are never probed, so a
-/// better-ranked wrong-language copy would otherwise take every slot it provides; with no language
-/// recorded for the title the test is inert, as it is for acquisition.
+/// `ALLOW_RESOLUTION_DOWNGRADE` no slot moves onto a copy above `MAX_RESOLUTION`. A movie slot
+/// never moves onto a multi-film collection (`tasks::is_multi_feature_collection`), and one that
+/// serves a collection stays: the VFS shows every selected film of the slot's torrent, so moving it
+/// off would hide the collection's other films — dedup and the upgrade engine leave such titles
+/// alone too. And a copy tagged only with other audio languages never takes a slot:
+/// `release::wrong_audio_language` on the copy's torrent + file name, under `prefs` with
+/// `AUDIO_LANGUAGE` resolved against the title's recorded languages (the served record's, else any
+/// owned record of the title's) — the test the upgrade engine applies before it stages a release.
+/// Mirror copies are never probed, so a better-ranked wrong-language copy would otherwise take
+/// every slot it provides. Under the default `AUDIO_LANGUAGE=original` the test is inert for a title
+/// with no recorded language, as it is for acquisition; an explicit `AUDIO_LANGUAGE` applies it to
+/// every title.
 /// Every repoint moves a slot strictly up in rank, so repeated passes converge.
 pub fn plan_selection_repoints(
     owned: &[(String, OwnedRecord)],
@@ -62,7 +73,6 @@ pub fn plan_selection_repoints(
     rules: RepointRules,
     prefs: &crate::config::QualityPrefs,
 ) -> Vec<SlotRepoint> {
-    use crate::release::quality_rank;
     use crate::scraper::MediaKind;
     use std::collections::HashMap;
 
@@ -124,7 +134,17 @@ pub fn plan_selection_repoints(
         if (cur.request.kind == MediaKind::Movie) != is_movie || cur.request.tmdb_id != tmdb {
             continue;
         }
-        let cur_rank = quality_rank(cur.quality.as_ref());
+        // A movie slot serving a multi-film collection stays: the VFS shows every selected film of
+        // the slot's torrent, so moving it off would hide the collection's other films (dedup and
+        // the upgrade engine leave such a title alone for the same reason).
+        if is_movie
+            && present_by_hash
+                .get(&current)
+                .is_some_and(|t| crate::tasks::is_multi_feature_collection(t))
+        {
+            continue;
+        }
+        let cur_rank = served_rank(cur.quality.as_ref(), &entry.file_path);
         let group = by_title.get(&(is_movie, tmdb));
         // The title's audio requirement, resolved as acquisition resolves it: from the served
         // record's languages, else from any record of the title that has them (a mirror record
@@ -168,29 +188,35 @@ pub fn plan_selection_repoints(
             (rank.checked || !cur_rank.checked || rank.resolution > cur_rank.resolution)
                 && !(rules.allow_resolution_downgrade && rank.resolution > rules.max_resolution)
         };
+        // A movie copy that is a multi-film collection never takes a slot: its largest film (the
+        // file it would serve) need not be this film, and the VFS would show all its films here.
+        let collection = |hash: &str| {
+            present_by_hash
+                .get(hash)
+                .is_some_and(|t| crate::tasks::is_multi_feature_collection(t))
+        };
         let best = group
             .into_iter()
             .flatten()
             .filter(|(h, r)| {
-                let rank = quality_rank(r.quality.as_ref());
                 *h != current
-                    && rank > cur_rank
-                    && allowed(rank)
                     && episode.is_none_or(|ep| r.provides.contains(&ep))
+                    && !(is_movie && collection(h))
             })
             .filter_map(|(h, r)| file_for(h, episode).map(|path| (*h, *r, path)))
-            .filter(|(h, _, path)| !wrong_language(h, path))
-            .max_by(|(ha, ra, _), (hb, rb, _)| {
-                let key = |r: &OwnedRecord| {
-                    (
-                        quality_rank(r.quality.as_ref()),
-                        r.quality.as_ref().map(|q| q.score).unwrap_or(i64::MIN),
-                    )
-                };
+            .map(|(h, r, path)| (h, r, served_rank(r.quality.as_ref(), &path), path))
+            .filter(|(h, _, rank, path)| {
+                *rank > cur_rank && allowed(*rank) && !wrong_language(h, path)
+            })
+            .max_by(|(ha, ra, rank_a, _), (hb, rb, rank_b, _)| {
+                let score =
+                    |r: &OwnedRecord| r.quality.as_ref().map(|q| q.score).unwrap_or(i64::MIN);
                 // Highest rank, then score; on a full tie the SMALLER hash wins.
-                key(ra).cmp(&key(rb)).then_with(|| hb.cmp(ha))
+                (rank_a, score(ra))
+                    .cmp(&(rank_b, score(rb)))
+                    .then_with(|| hb.cmp(ha))
             });
-        if let Some((hash, _, path)) = best {
+        if let Some((hash, _, _, path)) = best {
             out.push(SlotRepoint {
                 slot: slot.clone(),
                 from: entry.clone(),
@@ -203,6 +229,43 @@ pub fn plan_selection_repoints(
     }
     out.sort_by(|a, b| a.slot.cmp(&b.slot));
     out
+}
+
+/// The [`QualityRank`](crate::release::QualityRank) of the file a copy serves for a slot: its
+/// record's [`crate::release::quality_rank`], lowered on each axis to what the file's own name
+/// shows. A record holds ONE quality for the whole torrent (an account-mirror record's comes from
+/// its largest file, `tasks::mirror_quality`), so a mixed-quality pack — a "complete series" with
+/// 1080p BluRay MKVs and a 480p DVDRip `.avi` — would otherwise serve every episode at its best
+/// file's rank. A resolution or source tier the file name tags caps the record's (an untagged one
+/// keeps it, so an engine release with untagged episode files keeps its scraped quality), and the
+/// file counts as checked only when the record is and the file is MKV/MP4 (the containers the probe
+/// reads). Applied alike to the served copy and to every candidate, so a repoint still strictly
+/// raises the slot's rank and repeated passes converge.
+fn served_rank(
+    record: Option<&crate::release::QualitySummary>,
+    file_path: &str,
+) -> crate::release::QualityRank {
+    use crate::release::{quality_rank, QualityRank, Source};
+    let rank = quality_rank(record);
+    let base = file_path.rsplit('/').next().unwrap_or(file_path);
+    let file = crate::release::parse(&crate::release::RawCandidate {
+        name: base.to_string(),
+        description: String::new(),
+        info_hash: String::new(),
+        file_idx: None,
+        file_name: Some(base.to_string()),
+    });
+    QualityRank {
+        resolution: file
+            .resolution
+            .map_or(rank.resolution, |r| r.min(rank.resolution)),
+        source_tier: if file.source == Source::Other {
+            rank.source_tier
+        } else {
+            file.source.tier_score().min(rank.source_tier)
+        },
+        checked: rank.checked && file.container.is_verifiable(),
+    }
 }
 
 /// A parsed slot key ([`crate::store::movie_slot`] / [`crate::store::episode_slot`]).
@@ -645,16 +708,9 @@ mod tests {
         );
     }
 
-    fn mem_store() -> Store {
-        let db = redb::Database::builder()
-            .create_with_backend(redb::backends::InMemoryBackend::new())
-            .unwrap();
-        Store::from_database(std::sync::Arc::new(db)).unwrap()
-    }
-
     /// A two-copy show where the better copy holds no slot, as the executor tests' fixture.
     async fn better_copy_fixture() -> (Store, Vec<(TorrentInfo, MediaMetadata)>) {
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_owned(
                 "pack".into(),
@@ -863,7 +919,8 @@ mod tests {
     /// title's resolved `AUDIO_LANGUAGE`): mirror copies are never probed, so the tag is all there
     /// is.
     /// A copy that also carries the title's language, or no language tag, still takes the slot, and
-    /// with no language recorded for the title the check is inert.
+    /// under the default `AUDIO_LANGUAGE=original` with no language recorded for the title the check
+    /// is inert.
     #[test]
     fn a_wrong_language_copy_takes_no_slot() {
         let english = |mut r: OwnedRecord| {
@@ -936,6 +993,188 @@ mod tests {
         assert!(
             plan_selection_repoints(&group, &selection, &[&web, &rus], OFF, &prefs()).is_empty(),
             "the title's language is taken from any record of the group"
+        );
+    }
+
+    /// An explicit `AUDIO_LANGUAGE` is not resolved against the title, so the language test applies
+    /// even when no language is recorded for the title (only the default `original` is inert then).
+    #[test]
+    fn an_explicit_audio_language_applies_to_a_title_with_no_recorded_language() {
+        let owned = vec![
+            (
+                "web".to_string(),
+                rec(MediaKind::Series, 7, eps(1, 1), q(1080, 3_000, 9)),
+            ),
+            (
+                "bluray".to_string(),
+                rec(MediaKind::Series, 7, eps(1, 1), q(1080, 6_000, 9)),
+            ),
+        ];
+        let web = info("web", &[("W/Show.S01E01.1080p.WEB.mkv", 4)]);
+        let mut rus = info("bluray", &[("B/Show.S01E01.1080p.BluRay.mkv", 8)]);
+        rus.filename = "Show.S01.1080p.BluRay.RUS".into();
+        let selection = vec![(
+            episode_slot(7, 1, 1),
+            sel("web", "W/Show.S01E01.1080p.WEB.mkv"),
+        )];
+        let english = crate::config::QualityPrefs {
+            audio: crate::config::AudioReq::Lang("en".into()),
+            ..prefs()
+        };
+        assert!(
+            plan_selection_repoints(&owned, &selection, &[&web, &rus], OFF, &english).is_empty(),
+            "AUDIO_LANGUAGE=en keeps a Russian-only copy off the slot"
+        );
+        assert_eq!(
+            plan_selection_repoints(&owned, &selection, &[&web, &rus], OFF, &prefs()).len(),
+            1,
+            "control: under AUDIO_LANGUAGE=original with nothing recorded the test is inert"
+        );
+    }
+
+    /// A mixed-quality pack (an account-mirror "complete series" whose record quality comes from its
+    /// largest file) is ranked by the file it would serve, not by that record: its 480p DVDRip `.avi`
+    /// S01E01 never takes the slot from a 1080p WEB single, and an unchecked `.avi` at the same
+    /// resolution never takes a checked slot through the pack's MKV-derived `checked` flag.
+    #[test]
+    fn a_mixed_quality_pack_is_ranked_by_the_file_it_would_serve() {
+        let pack_with = |s01e01: &str| {
+            info(
+                "pack",
+                &[
+                    ("Pack/Show.S05E10.1080p.BluRay.mkv", 9),
+                    (&format!("Pack/{s01e01}"), 2),
+                ],
+            )
+        };
+        let owned = vec![
+            (
+                "single".to_string(),
+                rec(MediaKind::Series, 7, eps(1, 1), q(1080, 3_000, 9)),
+            ),
+            (
+                "pack".to_string(),
+                rec(
+                    MediaKind::Series,
+                    7,
+                    vec![(1, 1), (5, 10)],
+                    q(1080, 6_000, 9),
+                ),
+            ),
+        ];
+        let single = info("single", &[("Show.S01E01.1080p.WEB-DL.mkv", 4)]);
+        let selection = vec![(
+            episode_slot(7, 1, 1),
+            sel("single", "Show.S01E01.1080p.WEB-DL.mkv"),
+        )];
+
+        // Control: a pack whose S01E01 file matches its record takes the slot.
+        let good = pack_with("Show.S01E01.1080p.BluRay.mkv");
+        assert_eq!(
+            plan_selection_repoints(&owned, &selection, &[&single, &good], OFF, &prefs()).len(),
+            1,
+            "control: a BluRay MKV episode file beats the WEB single"
+        );
+
+        let dvd = pack_with("Show.S01E01.480p.DVDRip.XviD.avi");
+        assert!(
+            plan_selection_repoints(&owned, &selection, &[&single, &dvd], OFF, &prefs()).is_empty(),
+            "the pack's 480p .avi must not take the slot from a 1080p single"
+        );
+
+        let avi = pack_with("Show.S01E01.1080p.BluRay.avi");
+        assert!(
+            plan_selection_repoints(&owned, &selection, &[&single, &avi], OFF, &prefs()).is_empty(),
+            "an unchecked .avi at the same resolution must not take a checked slot"
+        );
+
+        // A slot already serving the pack's 480p file moves to the 1080p single.
+        let on_dvd = vec![(
+            episode_slot(7, 1, 1),
+            sel("pack", "Pack/Show.S01E01.480p.DVDRip.XviD.avi"),
+        )];
+        let plan = plan_selection_repoints(&owned, &on_dvd, &[&single, &dvd], OFF, &prefs());
+        assert_eq!(
+            plan,
+            vec![SlotRepoint {
+                slot: episode_slot(7, 1, 1),
+                from: sel("pack", "Pack/Show.S01E01.480p.DVDRip.XviD.avi"),
+                to: sel("single", "Show.S01E01.1080p.WEB-DL.mkv"),
+            }]
+        );
+        // ...and stays there (converges).
+        let moved = vec![(episode_slot(7, 1, 1), plan[0].to.clone())];
+        assert!(
+            plan_selection_repoints(&owned, &moved, &[&single, &dvd], OFF, &prefs()).is_empty()
+        );
+    }
+
+    /// A feature-sized video, as a multi-film collection holds several of.
+    const FEATURE: u64 = 4_000_000_000;
+
+    /// The VFS shows every selected film of a movie slot's torrent, so a movie slot is never moved
+    /// onto a multi-film collection (its largest film may not even be this film), and a slot already
+    /// on one stays there: moving it off would hide the collection's other films. The upgrade engine
+    /// and dedup leave such titles alone for the same reason.
+    #[test]
+    fn a_movie_slot_never_moves_onto_or_off_a_multi_film_collection() {
+        let collection = |second_selected: u32| {
+            let mut t = info(
+                "coll",
+                &[
+                    ("Coll/Film.One.1999.1080p.BluRay.mkv", FEATURE + 1),
+                    ("Coll/Film.Two.2003.1080p.BluRay.mkv", FEATURE),
+                ],
+            );
+            t.files[1].selected = second_selected;
+            t
+        };
+        let owned = vec![
+            (
+                "web".to_string(),
+                rec(MediaKind::Movie, 603, vec![], q(1080, 3_000, 1)),
+            ),
+            (
+                "coll".to_string(),
+                rec(MediaKind::Movie, 603, vec![], q(1080, 6_000, 1)),
+            ),
+        ];
+        let web = info("web", &[("Film.One.1999.1080p.WEB.mkv", FEATURE)]);
+        let on_web = vec![(movie_slot(603), sel("web", "Film.One.1999.1080p.WEB.mkv"))];
+
+        // Control: with one film selected it is a single-film copy and takes the slot.
+        assert_eq!(
+            plan_selection_repoints(&owned, &on_web, &[&web, &collection(0)], OFF, &prefs()).len(),
+            1,
+            "control: a single-film copy takes the slot"
+        );
+        assert!(
+            plan_selection_repoints(&owned, &on_web, &[&web, &collection(1)], OFF, &prefs())
+                .is_empty(),
+            "a collection never takes a movie slot"
+        );
+
+        // A slot on the collection stays there, even against a better single-film copy.
+        let mut with_remux = owned.clone();
+        with_remux.push((
+            "remux".to_string(),
+            rec(MediaKind::Movie, 603, vec![], q(1080, 8_000, 1)),
+        ));
+        let remux = info("remux", &[("Film.One.1999.1080p.REMUX.mkv", FEATURE)]);
+        let on_coll = vec![(
+            movie_slot(603),
+            sel("coll", "Coll/Film.One.1999.1080p.BluRay.mkv"),
+        )];
+        assert!(
+            plan_selection_repoints(
+                &with_remux,
+                &on_coll,
+                &[&web, &collection(1), &remux],
+                OFF,
+                &prefs()
+            )
+            .is_empty(),
+            "moving the slot off a collection would hide its other films"
         );
     }
 }

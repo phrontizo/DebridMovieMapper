@@ -104,6 +104,10 @@ const SELECTION_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("sele
 /// (Since v6 the key carries a media-type discriminator — not the bare tmdb_id — which is why the
 /// v5→v6 migration clears the table.)
 const UPGRADE_CHECKS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("upgrade_checks");
+/// Upgrade staging intents: lowercased infohash -> serde_json(StagingIntent). Rebuildable: losing it
+/// only forgets candidates cut off mid-staging (see [`StagingIntent`]). Added without a schema bump:
+/// `ensure_schema` creates it on every open, and an older build never opens it.
+const STAGING_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("staging");
 
 /// The persisted "what to acquire" spec (also used by `acquire.rs`). Stored in `owned_hashes`
 /// so `observe` can re-acquire a title after a stall/failure without external context.
@@ -123,6 +127,19 @@ pub struct AcquireRequest {
     #[serde(default)]
     pub spoken_languages: Option<Vec<String>>,
     pub metadata: crate::vfs::MediaMetadata,
+}
+
+/// An upgrade candidate the engine is staging and has not checked yet (the `staging` table value,
+/// keyed by lowercased infohash). Written before the add and cleared once the candidate is recorded
+/// as owned or its torrent is deleted. A candidate cut off in between (a shutdown, a panic, an OOM
+/// kill) leaves its intent behind: the account mirror never adopts that hash, and
+/// `upgrade::sweep_staging_intents` deletes its torrent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StagingIntent {
+    /// The torrent id the add returned; `None` until it has returned.
+    pub torrent_id: Option<String>,
+    /// When staging began (unix secs).
+    pub started_at: u64,
 }
 
 /// The live representative for one VFS slot (movie or episode): which hash + which file path.
@@ -200,8 +217,9 @@ impl Provenance {
         }
     }
     /// True if at least one entry is `Manual`. A title with any manual origin must never be
-    /// auto-removed by the reconciler, regardless of Trakt state. (Provenance built via the
-    /// constructors is always non-empty; `entries` is `pub` only for multi-entry construction.)
+    /// auto-removed by the reconciler, regardless of Trakt state. (The constructors always build a
+    /// non-empty provenance. `entries` is `pub` for multi-entry construction and for the EMPTY
+    /// provenance that marks every account-mirror record.)
     pub fn has_manual_entry(&self) -> bool {
         self.entries
             .iter()
@@ -221,7 +239,10 @@ pub struct OwnedRecord {
     /// across a show's hashes is the show's owned-episode set (kills season-pack churn).
     #[serde(default)]
     pub provides: Vec<(u32, u32)>,
-    /// Quality snapshot of the chosen release, for upgrade comparison. `None` on pre-SP3 records.
+    /// Quality snapshot of the chosen release, for upgrade comparison. `None` on pre-SP3 records, on
+    /// account-mirror records written before quality capture or for an over-ceiling file (both
+    /// re-derived by `tasks::backfill_owned_quality`), and on a mirror record whose torrent lists no
+    /// video file (unknown-lowest).
     #[serde(default)]
     pub quality: Option<crate::release::QualitySummary>,
 }
@@ -296,7 +317,8 @@ enum OpenFailure {
     /// The file is genuinely damaged/unreadable (bad magic, truncated, redb repair aborted) — safe
     /// to move aside and recreate. NOT lossless: the old file is kept as `<path>.corrupt`, but the
     /// recreated DB starts without the Trakt enrolments, provenance, selections and blacklist (only
-    /// the `matches` cache regenerates). Forward migrations bring an older OUR-schema DB up to date
+    /// the `matches` cache and the `upgrade_checks` cursor regenerate, and `wanted` once the accounts
+    /// are re-enrolled). Forward migrations bring an older OUR-schema DB up to date
     /// instead of discarding it.
     Corrupt(String),
     /// A transient/operational failure: another instance holds the lock, the path is not writable,
@@ -540,6 +562,7 @@ impl Store {
             write_txn.open_table(WANTED_TABLE)?; // create if absent
             write_txn.open_table(SELECTION_TABLE)?; // create if absent
             write_txn.open_table(UPGRADE_CHECKS_TABLE)?; // create if absent
+            write_txn.open_table(STAGING_TABLE)?; // create if absent
             let mut meta = write_txn.open_table(META_TABLE)?; // create if absent
 
             // Only (re)stamp when the version actually advanced (fresh DB reads version 0, or a
@@ -1385,6 +1408,39 @@ impl Store {
         Self::join_or_default("all_blacklisted_hashes", r)
     }
 
+    /// For every blacklisted infohash (lowercased, across all titles as in
+    /// [`Self::all_blacklisted_hashes`]), the newest `at` among its entries whose reason is not in
+    /// `ignore_reasons`. A hash whose every entry carries an ignored reason is absent; an entry with
+    /// no `at` counts as 0. One read of the table.
+    pub async fn blacklist_newest_at_by_hash(
+        &self,
+        ignore_reasons: &'static [&'static str],
+    ) -> HashMap<String, u64> {
+        let db = self.db.clone();
+        let r = tokio::task::spawn_blocking(move || {
+            let mut out: HashMap<String, u64> = HashMap::new();
+            Self::scan_rows(&db, BLACKLIST_TABLE, "blacklist", |k, v| {
+                // key = "<m|s>|tmdb_id|hash" → the hash is everything after the LAST '|'.
+                let Some((_, hash)) = k.rsplit_once('|') else {
+                    return;
+                };
+                let entry = serde_json::from_slice::<serde_json::Value>(v).ok();
+                let field = |name: &str| entry.as_ref().and_then(|j| j.get(name).cloned());
+                let reason = field("reason");
+                if ignore_reasons.contains(&reason.as_ref().and_then(|r| r.as_str()).unwrap_or(""))
+                {
+                    return;
+                }
+                let at = field("at").and_then(|a| a.as_u64()).unwrap_or(0);
+                let newest = out.entry(hash.to_ascii_lowercase()).or_insert(at);
+                *newest = (*newest).max(at);
+            });
+            out
+        })
+        .await;
+        Self::join_or_default("blacklist_newest_at_by_hash", r)
+    }
+
     /// Remove blacklist entries stamped (`at`) strictly before `cutoff_at` (Unix seconds). The
     /// blacklist is otherwise append-only, so without a TTL prune it grows for the deployment's
     /// lifetime (library churn leaves dead rows behind) and the O(total) read paths
@@ -1781,8 +1837,9 @@ impl Store {
 
     pub async fn all_selection(&self) -> Vec<(String, SelectionEntry)> {
         let db = self.db.clone();
-        // Authoritative table: a swallowed row would silently revert that slot to the largest-bytes
-        // VFS fallback.
+        // Authoritative table: a swallowed row would silently revert that slot to the VFS's
+        // unmanaged fallback (a movie's largest streamable torrent; every distinct file name for an
+        // episode).
         let r = tokio::task::spawn_blocking(move || {
             Self::scan_json::<SelectionEntry>(&db, SELECTION_TABLE, "selection")
         })
@@ -1965,6 +2022,67 @@ impl Store {
         })
         .await;
         Self::join_or_default("prune_upgrade_checks_not_owned", r)
+    }
+
+    // ── staging intents (see `StagingIntent`) ─────────────────────────────────
+
+    /// Open a staging intent for `hash` (no torrent id yet), replacing any earlier one.
+    pub async fn put_staging_intent(&self, hash: String, started_at: u64) -> Result<(), AppError> {
+        let intent = StagingIntent {
+            torrent_id: None,
+            started_at,
+        };
+        self.put_json(
+            STAGING_TABLE,
+            hash.to_ascii_lowercase(),
+            &intent,
+            "StagingIntent",
+        )
+        .await
+    }
+
+    /// Record the torrent id the add returned on `hash`'s open intent. A hash with no intent is left
+    /// without one (`Ok`): nothing is resurrected.
+    pub async fn set_staging_torrent_id(
+        &self,
+        hash: String,
+        torrent_id: String,
+    ) -> Result<(), AppError> {
+        let key = hash.to_ascii_lowercase();
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            Self::update_json::<StagingIntent>(
+                &db,
+                STAGING_TABLE,
+                &key,
+                "set_staging_torrent_id",
+                |intent| {
+                    let changed = intent.torrent_id.as_deref() != Some(torrent_id.as_str());
+                    intent.torrent_id = Some(torrent_id);
+                    changed
+                },
+            )
+            .map(|_| ())
+        })
+        .await;
+        Self::flatten_join_app(result)
+    }
+
+    /// Close `hash`'s staging intent (a missing one is a no-op).
+    pub async fn clear_staging_intent(&self, hash: String) -> Result<(), AppError> {
+        self.remove_key(STAGING_TABLE, hash.to_ascii_lowercase())
+            .await
+    }
+
+    /// Every open staging intent, keyed by lowercased infohash. A read failure is logged and reads
+    /// as no intents.
+    pub async fn all_staging_intents(&self) -> Vec<(String, StagingIntent)> {
+        let db = self.db.clone();
+        let r = tokio::task::spawn_blocking(move || {
+            Self::scan_json::<StagingIntent>(&db, STAGING_TABLE, "staging")
+        })
+        .await;
+        Self::join_or_default("all_staging_intents", r)
     }
 }
 
@@ -2908,6 +3026,82 @@ mod tests {
         assert!(store.is_blacklisted(m, 27205, upper.clone()).await);
         // `all_blacklisted_hashes` returns the lowercased form.
         assert!(store.all_blacklisted_hashes().await.contains(&lower));
+    }
+
+    #[tokio::test]
+    async fn blacklist_newest_at_by_hash_takes_the_newest_entry_and_skips_ignored_reasons() {
+        let store = Store::in_memory();
+        let (m, s) = (MediaKind::Movie, MediaKind::Series);
+        // Two titles blacklisted the same hash (in different cases): the newest `at` wins.
+        store
+            .blacklist_add(m, 1, "AA".into(), "WrongTitle", 100)
+            .await
+            .unwrap();
+        store
+            .blacklist_add(s, 2, "aa".into(), "AudioMismatch", 300)
+            .await
+            .unwrap();
+        // An ignored reason does not count, even when it is the newest entry.
+        store
+            .blacklist_add(m, 3, "aa".into(), "Dead", 900)
+            .await
+            .unwrap();
+        // A hash with only ignored entries is absent.
+        store
+            .blacklist_add(m, 4, "bb".into(), "Dead", 50)
+            .await
+            .unwrap();
+        let newest = store.blacklist_newest_at_by_hash(&["Dead"]).await;
+        assert_eq!(newest.get("aa"), Some(&300));
+        assert!(!newest.contains_key("bb"), "{newest:?}");
+        // With nothing ignored, every entry counts.
+        let all = store.blacklist_newest_at_by_hash(&[]).await;
+        assert_eq!(all.get("aa"), Some(&900));
+        assert_eq!(all.get("bb"), Some(&50));
+    }
+
+    #[tokio::test]
+    async fn staging_intents_round_trip() {
+        let store = Store::in_memory();
+        assert!(store.all_staging_intents().await.is_empty());
+        store.put_staging_intent("ABC".into(), 100).await.unwrap();
+        assert_eq!(
+            store.all_staging_intents().await,
+            vec![(
+                "abc".to_string(),
+                StagingIntent {
+                    torrent_id: None,
+                    started_at: 100
+                }
+            )]
+        );
+        store
+            .set_staging_torrent_id("abc".into(), "T1".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.all_staging_intents().await[0].1.torrent_id.as_deref(),
+            Some("T1")
+        );
+        // Setting an id on a hash with no intent writes nothing.
+        store
+            .set_staging_torrent_id("other".into(), "T2".into())
+            .await
+            .unwrap();
+        assert_eq!(store.all_staging_intents().await.len(), 1);
+        // Re-opening replaces the intent (the id is reset until the new add returns).
+        store.put_staging_intent("abc".into(), 200).await.unwrap();
+        assert_eq!(
+            store.all_staging_intents().await[0].1,
+            StagingIntent {
+                torrent_id: None,
+                started_at: 200
+            }
+        );
+        store.clear_staging_intent("ABC".into()).await.unwrap();
+        assert!(store.all_staging_intents().await.is_empty());
+        // Clearing a missing intent is a no-op.
+        store.clear_staging_intent("abc".into()).await.unwrap();
     }
 
     #[tokio::test]

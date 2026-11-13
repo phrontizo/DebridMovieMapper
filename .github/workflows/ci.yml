@@ -8,6 +8,15 @@ on:
 
 permissions: {}
 
+# Every push to main / v2 publishes the same rolling tag (`:edge` / `:v2edge`), so two pushes close
+# together would race and the run that finishes last would win, even an older one. A newer run on
+# the same ref cancels the older one. Kept at workflow level (not on build-and-push): groups follow
+# workflow start order there, whereas a job-level group would let an older run whose tests finish
+# later cancel the newer publish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   GHCR_IMAGE: ghcr.io/phrontizo/debridmoviemapper
   DOCKERHUB_IMAGE: phrontizo/debridmoviemapper

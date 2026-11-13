@@ -10,11 +10,11 @@ static CAMEL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([a-z])([A-Z])"
 
 // Leading release-group / site garbage to strip: a bracket tag `[...]`, a parenthesised tag, a
 // parenthesised release-year (so a leading "(2020) Title" strips), or a `site.tld - ` prefix
-// (the `site` group). A dot-separated show name in front of a ` - ` separator looks just like a
-// site ("Some.Show - S01E01 - Pilot", "The.Office.UK - S01E01 - …"), and stripping it would leave
-// the episode title as the TMDB query, so `clean_name` keeps a `site` match that is followed
-// straight by an episode code (`SITE_FOLLOWED_BY_EPISODE_RE`): a site prefix is followed by a
-// release name, never by an episode code.
+// (the `site` group). Any dotted name in front of a ` - ` separator fits the `site` pattern: a show
+// name ("Some.Show - S01E01 - Pilot", "The.Office.UK - S01E01 - …"), a title ("Dr.No - 1962") or
+// a whole release name ("Show.Name.S01E01.720p.HDTV - Group"), and stripping one of those leaves
+// an episode title, a year or a group name as the TMDB query. So `clean_name` strips a `site`
+// match only when `site_match_is_a_site` says it is one.
 // A parenthesised TAG must look like a site/URL tag — its content carries a letter AND a `.`/space
 // (e.g. `(www.site.com)`) — so a single parenthesised title WORD like `(Untitled)` (the 2009 film)
 // is kept as title content, and a NON-year numeric title-paren like `(500)` — "(500) Days of
@@ -26,12 +26,39 @@ static PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// What follows a `site.tld - ` that is really a show name: an episode code (`S01E01`, `S01`,
-/// `E05`, `1x01`, a bare ` - NNN - ` number, `Season 2`, `Episode 5`). Matched against the text
-/// after the [`PREFIX_RE`] `site` match (the `regex` crate has no lookahead).
+/// What follows a `site.tld - ` that is really a show or film name: an episode code (`S01E01`,
+/// `S01`, `E05`, `Ep01`, `1x01`, `Season 2`, `Episode.5`), a year (`Dr.No - 1962`) or a bare number
+/// (`Show.Name - 101`). Matched against the text after the [`PREFIX_RE`] `site` match (the `regex`
+/// crate has no lookahead).
 static SITE_FOLLOWED_BY_EPISODE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(?:s\d{1,3}\.?e\d{1,4}|s\d{1,3}\b|e\d{1,4}\b|\d{1,2}x\d{2,3}\b|\d{1,3}\s+-\s|seasons?\s*\d+|episodes?\s*\d+)").unwrap()
+    Regex::new(r"(?i)^(?:s\d{1,3}\.?e\d{1,4}|s\d{1,3}\b|e\d{1,4}\b|ep\.?\s*\d+|\d{1,2}x\d{2,3}\b|seasons?[\s.]*\d+|episodes?[\s.]*\d+|(?:19|20)\d{2}\b|\d{1,4}(?:[\s._]|$))").unwrap()
 });
+
+/// A release-name token: a year, a resolution, an SxxEyy code or a source/codec tag. A release name
+/// nearly always carries one and a site name never does (see [`site_match_is_a_site`]).
+static RELEASE_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:(?:19|20)\d{2}|(?:360|480|540|576|720|1080|1440|2160)p|4k|bluray|web[\s.-]?dl|webrip|hdtv|bdrip|brrip|dvdrip|remux|[xh]\.?26[45]|hevc|xvid|divx)\b|\bs\d{1,3}\.?e\d{1,4}").unwrap()
+});
+
+/// Whether a [`PREFIX_RE`] `site` match (`site`, with its ` - `) in front of `rest` is a real
+/// `site.tld - ` prefix rather than a dotted show, film or release name. A `www.` name always is.
+/// Any other is kept as title content when it carries a release token itself
+/// (`Show.Name.S01E01.720p.HDTV - Group`), when an episode code, a year or a bare number follows it
+/// (`Some.Show - S01E01`, `Dr.No - 1962`, `Show.Name - 101`), or when no release name follows it
+/// (`Mr.Bean - The Movie`): a site prefix is followed by a release name, which carries a release
+/// token. Keeping a real site costs little, since `identify_name`'s leading-word strip recovers
+/// the title, while stripping a title leaves an unrelated query.
+fn site_match_is_a_site(site: &str, rest: &str) -> bool {
+    if site
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case("www."))
+    {
+        return true;
+    }
+    !RELEASE_TOKEN_RE.is_match(site)
+        && !SITE_FOLLOWED_BY_EPISODE_RE.is_match(rest)
+        && RELEASE_TOKEN_RE.is_match(rest)
+}
 
 /// A leading `[Title] (YYYY)` — bracket(s) that are PART of the title (e.g. `[REC] (2007)`),
 /// confirmed by an immediately-following parenthesised year — is NOT a release-group tag, so
@@ -142,33 +169,13 @@ pub enum Identification {
     Unavailable,
 }
 
-/// The [`Identification`] for a search that selected `selected` (if anything), given whether any of
-/// its TMDB requests failed. A failed search makes it [`Identification::Unavailable`] even when
-/// something was selected: with one half of a joined search missing, the other half's best result
-/// can be an unrelated title (a show file picked up as a movie).
-fn conclude(selected: Option<MediaMetadata>, tmdb_unavailable: bool) -> Identification {
-    if tmdb_unavailable {
-        Identification::Unavailable
-    } else if let Some(m) = selected {
-        Identification::Identified(m)
-    } else {
-        Identification::NoMatch
-    }
-}
-
 /// Identify a torrent: its largest video file's name first, then the torrent name. Falls back to a
 /// title cleaned from the names (`external_id: None`) when neither matches. Once a search comes
 /// back [`Identification::Unavailable`] the torrent-name retry is skipped: it would spend another
 /// full retry cycle (~2.5 min) on the same outage. A caller that must tell such an outage fallback
 /// from a genuine no-match wraps this in [`crate::tmdb_client::track_search_failures`].
 pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) -> MediaMetadata {
-    let representative_name = info
-        .files
-        .iter()
-        .filter(|f| is_video_file(&f.path))
-        .max_by_key(|f| f.bytes)
-        .map(|f| f.path.split('/').next_back().unwrap_or(&f.path))
-        .unwrap_or(&info.filename);
+    let representative_name = representative_name(info);
 
     // Set once a search comes back `Unavailable`: the fallback below is then provisional (for want
     // of an answer, not because the torrent is unidentifiable).
@@ -202,12 +209,31 @@ pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) 
             info.filename, representative_name
         );
     }
+    fallback_metadata(info)
+}
+
+/// The name a torrent is identified by first: its largest video file's name (without the folder),
+/// else the torrent name.
+fn representative_name(info: &rd_client::TorrentInfo) -> &str {
+    info.files
+        .iter()
+        .filter(|f| is_video_file(&f.path))
+        .max_by_key(|f| f.bytes)
+        .map(|f| f.path.split('/').next_back().unwrap_or(&f.path))
+        .unwrap_or(&info.filename)
+}
+
+/// The TMDB-free identification [`identify_torrent`] falls back to when nothing matched: the
+/// [`fallback_title`] of the torrent and representative file names, a movie or show by its file
+/// structure, and no `external_id`. A caller showing a torrent it could not ask TMDB about yet
+/// uses it too, so the title doesn't change when TMDB later answers with no match.
+pub fn fallback_metadata(info: &rd_client::TorrentInfo) -> MediaMetadata {
+    let representative_name = representative_name(info);
     let (title, year) = fallback_title(
         clean_name(&info.filename),
         clean_name(representative_name),
         representative_name,
     );
-
     MediaMetadata {
         title,
         year,
@@ -597,13 +623,15 @@ pub async fn identify_name(
         movie_results.extend(movie_no_year.into_results(&mut tmdb_unavailable));
     }
 
-    // A pick from what a failed search left over is no verdict (see `conclude`), so don't make one.
+    // A failed search is no verdict, even when the rest matched something: with one half of a
+    // joined search missing, the other half's best result can be an unrelated title (a show file
+    // picked up as a movie). So don't make a pick. Past this point every search answered.
     if tmdb_unavailable {
         debug!(
             "A TMDB search failed while identifying '{}'; no verdict",
             cleaned_name
         );
-        return conclude(None, tmdb_unavailable);
+        return Identification::Unavailable;
     }
 
     // Score all results and pick the best TV and movie matches.
@@ -634,18 +662,15 @@ pub async fn identify_name(
             "Identified {} ({:?}) as {:?} via TMDB (ID: {})",
             title, year_val, mtype, id
         );
-        return conclude(
-            Some(MediaMetadata {
-                title,
-                year: year_val,
-                media_type: mtype,
-                external_id: Some(format!("tmdb:{}", id)),
-            }),
-            tmdb_unavailable,
-        );
+        return Identification::Identified(MediaMetadata {
+            title,
+            year: year_val,
+            media_type: mtype,
+            external_id: Some(format!("tmdb:{}", id)),
+        });
     }
 
-    conclude(None, tmdb_unavailable)
+    Identification::NoMatch
 }
 
 /// A title is "short" (≤3 characters) if it has at most 3 Unicode scalar values.
@@ -694,7 +719,7 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
 
     // 1. Remove common site prefixes and garbage at the start
     // Patterns like "[ site ] ", "( site )", "www.site.org - ", "d3us-", "m-", "Bond.50" (a
-    // `site.tld - ` followed straight by an episode code is kept: it is a show's name, see PREFIX_RE).
+    // dotted name before " - " that isn't a site is kept, see `site_match_is_a_site`).
     // EXCEPT a leading "[Title] (YYYY)" whose brackets are part of the title (e.g. "[REC] (2007)").
     // Loop so a RUN of consecutive leading tags ("[Group][BD] Title") is fully stripped — a single
     // pass removes only the first group and would leave the next tag's label glued on
@@ -706,9 +731,11 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
             break;
         };
         let end = caps.get(0).map_or(0, |m| m.end());
-        // A "site" followed straight by an episode code is the show's name (see PREFIX_RE).
-        if caps.name("site").is_some() && SITE_FOLLOWED_BY_EPISODE_RE.is_match(&title[end..]) {
-            break;
+        // A dotted show, film or release name is title content, not a site (see PREFIX_RE).
+        if let Some(site) = caps.name("site") {
+            if !site_match_is_a_site(site.as_str(), &title[end..]) {
+                break;
+            }
         }
         title = title[end..].to_string();
         stripped_any_prefix = true;
@@ -751,6 +778,17 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
         .find_iter(&title)
         .last()
         .map(|m| m.as_str().to_string());
+
+    // 4b. Truncate at an `NxM` episode code (1x01), as step 5 does at an SxxEyy one, so the episode
+    //     title after it never reaches the TMDB query (where the leading-word strip could match it
+    //     alone). Not at position 0: a title that IS an `NxM` token ("10x10") is kept. After step 4,
+    //     so a year after the code is still found, as for SxxEyy. `NXM_RE` never matches a
+    //     resolution (1920x1080) or an aspect ratio (16x9).
+    if let Some(m) = NXM_RE.find(&title) {
+        if m.start() > 0 {
+            title.truncate(m.start());
+        }
+    }
 
     // 5. Handle stop words (technical metadata, quality, codecs, season info)
     let title_before_stopwords = title.clone();
@@ -958,16 +996,17 @@ mod tests {
     #[tokio::test]
     async fn identify_name_bails_on_a_title_that_normalizes_to_empty() {
         // "()" survives `clean_name` (stays non-empty) and is not generic, but `normalize_title`
-        // keeps only alphanumerics so it collapses to "". Such a title must return None rather than
-        // fall through to universal partial-match scoring (an empty needle matches every candidate),
-        // which would confidently mis-identify it. The guard returns before any TMDB call, so this
-        // needs no network.
+        // keeps only alphanumerics so it collapses to "". Such a title must return NoMatch rather
+        // than fall through to universal partial-match scoring (an empty needle matches every
+        // candidate), which would confidently mis-identify it. The guard returns before any TMDB
+        // call: the loopback server must see no request.
         let (cleaned, _year) = clean_name("()");
         assert!(
             !cleaned.is_empty() && normalize_title(&cleaned).is_empty(),
             "precondition: '()' must clean non-empty yet normalize to empty (got cleaned={cleaned:?})"
         );
-        let tmdb = TmdbClient::new("test-key".into()).unwrap();
+        let server = crate::trakt_client::test_http::spawn(Vec::new()).await;
+        let tmdb = TmdbClient::with_base_url("k".into(), server.base_url.clone()).unwrap();
         assert!(
             matches!(
                 identify_name("()", &[], &tmdb).await,
@@ -975,30 +1014,39 @@ mod tests {
             ),
             "a title that normalizes to empty must not be identified"
         );
+        assert_eq!(server.requests(), Vec::<String>::new(), "no TMDB request");
     }
 
-    #[test]
-    fn a_failed_tmdb_search_is_unavailable_matched_or_not() {
-        let meta = || MediaMetadata {
-            title: "Some Movie".into(),
-            year: Some("2020".into()),
-            media_type: MediaType::Movie,
-            external_id: Some("tmdb:1".into()),
-        };
+    /// The unmatched half of the verdicts; `a_match_picked_after_a_failed_search_is_no_verdict`
+    /// covers a match with and without a failed search.
+    #[tokio::test]
+    async fn a_failed_tmdb_search_is_unavailable_matched_or_not() {
+        use crate::trakt_client::test_http::{spawn, Reply};
         // Nothing matched and every search answered: a genuine "no such title".
-        assert!(matches!(conclude(None, false), Identification::NoMatch));
-        // Nothing matched but a search failed (outage, rejected key): no verdict, so the caller can
-        // retry later instead of caching the fallback or blacklisting the release.
-        assert!(matches!(conclude(None, true), Identification::Unavailable));
-        // Nor is a pick made while another search failed: the failed half could have held the
-        // real match.
+        let empty = spawn(vec![
+            (
+                "/search/movie?api_key=k&query=Zzqx",
+                Reply::json(r#"{"results":[]}"#),
+            ),
+            (
+                "/search/tv?api_key=k&query=Zzqx",
+                Reply::json(r#"{"results":[]}"#),
+            ),
+        ])
+        .await;
+        let tmdb = TmdbClient::with_base_url("k".into(), empty.base_url.clone()).unwrap();
         assert!(matches!(
-            conclude(Some(meta()), true),
-            Identification::Unavailable
+            identify_name("Zzqx.mkv", &[], &tmdb).await,
+            Identification::NoMatch
         ));
+        // Nothing matched but the searches failed (here a 404, as for a rejected key): no verdict,
+        // so the caller can retry later instead of caching the fallback or blacklisting the
+        // release.
+        let failing = spawn(Vec::new()).await;
+        let tmdb = TmdbClient::with_base_url("k".into(), failing.base_url.clone()).unwrap();
         assert!(matches!(
-            conclude(Some(meta()), false),
-            Identification::Identified(_)
+            identify_name("Zzqx.mkv", &[], &tmdb).await,
+            Identification::Unavailable
         ));
     }
 
@@ -1231,6 +1279,40 @@ mod tests {
     }
 
     #[test]
+    fn fallback_metadata_skips_a_generic_torrent_name_for_the_representative_file() {
+        // A torrent named after its season folder falls back to its largest video file's name, so
+        // a caller showing it before (or without) TMDB never lists it as a "Season 1" show.
+        let mut info = single_file_torrent("Season 1");
+        info.files = vec![
+            TorrentFile {
+                id: 1,
+                path: "Season 1/Some.Show.S01E01.720p.mkv".to_string(),
+                bytes: 900_000_000,
+                selected: 1,
+            },
+            TorrentFile {
+                id: 2,
+                path: "Season 1/Some.Show.S01E01.720p.nfo".to_string(),
+                bytes: 2_000_000_000,
+                selected: 1,
+            },
+        ];
+        let m = fallback_metadata(&info);
+        assert_eq!(m.title, "Some Show");
+        assert_eq!(m.media_type, MediaType::Show);
+        assert_eq!(m.external_id, None);
+
+        // A real torrent name is used as-is, with its year, as a movie by its file structure.
+        let m = fallback_metadata(&single_file_torrent("Some.Movie.2020.1080p.mkv"));
+        assert_eq!(
+            (m.title.as_str(), m.year.as_deref()),
+            ("Some Movie", Some("2020"))
+        );
+        assert_eq!(m.media_type, MediaType::Movie);
+        assert_eq!(m.external_id, None);
+    }
+
+    #[test]
     fn test_is_generic_title() {
         assert!(is_generic_title("00000"));
         assert!(is_generic_title("1"));
@@ -1378,15 +1460,55 @@ mod tests {
             clean_name("Shameless.UK - S01E01 - Pilot.mkv").0,
             "Shameless UK"
         );
-        assert!(
-            clean_name("The.Net - 1x01 - Pilot.mkv")
-                .0
-                .starts_with("The Net"),
+        assert_eq!(
+            clean_name("The.Net - 1x01 - Pilot.mkv").0,
+            "The Net",
             "an NxM episode code after the separator keeps the show name"
         );
         assert_eq!(
             clean_name("Some.Show.NZ - 101 - Pilot.mkv").0,
             "Some Show NZ"
+        );
+        // A dotted RELEASE name in front of a ` - Group` suffix is no site either: its year,
+        // SxxEyy or quality tags are what identify it.
+        assert_eq!(
+            clean_name("Show.Name.S01E01.720p.HDTV - Group.mkv").0,
+            "Show Name"
+        );
+        assert_eq!(
+            clean_name("Some.Movie.2019.1080p.BluRay - Group.mkv"),
+            ("Some Movie".to_string(), Some("2019".to_string()))
+        );
+        // Nor is a dotted title followed by a year, a bare episode number or another episode form.
+        assert_eq!(
+            clean_name("The.Matrix - 1999 - 1080p"),
+            ("The Matrix".to_string(), Some("1999".to_string()))
+        );
+        assert_eq!(
+            clean_name("Dr.No - 1962.mkv"),
+            ("Dr No".to_string(), Some("1962".to_string()))
+        );
+        assert_eq!(clean_name("Show.Name - Season.1").0, "Show Name");
+        for name in [
+            "Show.Name - Ep01 - Title",
+            "Show.Name - 101.mkv",
+            "Show.Name - 101.Pilot.mkv",
+            "Show.Name - Episode.5",
+        ] {
+            assert!(
+                clean_name(name).0.starts_with("Show Name"),
+                "{name:?} cleaned to {:?}",
+                clean_name(name).0
+            );
+        }
+        // A dotted title followed by more title words, with no release tag after it, is kept too:
+        // a site prefix is followed by a release name (a year or a quality tag).
+        assert!(
+            clean_name("Mr.Bean - The Movie.mkv")
+                .0
+                .starts_with("Mr Bean"),
+            "got {:?}",
+            clean_name("Mr.Bean - The Movie.mkv").0
         );
         assert_eq!(
             clean_name("Some.Show.Net - Season 2 - 1080p.mkv").0,
@@ -1401,6 +1523,48 @@ mod tests {
             clean_name("Some-Site.lat - Other Movie 2019 1080p.mkv").0,
             "Other Movie"
         );
+        // A `www.` prefix is always a site, even before a year-less release name.
+        assert_eq!(
+            clean_name("www.Some-Site.org - Other Movie.mkv").0,
+            "Other Movie"
+        );
+        // A site followed by a dotted release name (an episode code inside it, not at its start).
+        assert_eq!(
+            clean_name("Torrent9.ws - Some.Show.S02E05.720p.mkv").0,
+            "Some Show"
+        );
+    }
+
+    #[test]
+    fn clean_name_truncates_at_an_nxm_episode_code() {
+        // An `NxM` episode code ends the title like an SxxEyy one: the episode title after it must
+        // not reach the TMDB query, where the leading-word strip could match it on its own.
+        assert_eq!(
+            clean_name("Show.Name.1x01.Pilot.720p.HDTV.x264.mkv").0,
+            "Show Name"
+        );
+        assert_eq!(
+            clean_name("Some.Show.3x14.The.Long.Goodbye.HDTV.XviD").0,
+            "Some Show"
+        );
+        // A year before the code is still the year, and dropped from the title.
+        assert_eq!(
+            clean_name("Show.Name.2005.1x01.Pilot.mkv"),
+            ("Show Name".to_string(), Some("2005".to_string()))
+        );
+        // A title that IS an `NxM` token is kept, and a resolution or aspect ratio is no code.
+        assert_eq!(
+            clean_name("10x10.2018.1080p.WEB.mkv"),
+            ("10x10".to_string(), Some("2018".to_string()))
+        );
+        assert_eq!(clean_name("10x10.2018.1080p.mkv").0, "10x10");
+        assert_eq!(clean_name("Movie.1920x1080.mkv").0, "Movie");
+        assert_eq!(clean_name("Some.Movie.16x9.mkv").0, "Some Movie 16x9");
+        // The cleaned name no longer carries the code, yet the file still reads as an episode.
+        assert!(filename_has_show_marker(
+            "Show.Name.1x01.Pilot.720p.HDTV.x264.mkv"
+        ));
+        assert!(!filename_has_show_marker("10x10.2018.1080p.mkv"));
     }
 
     #[test]

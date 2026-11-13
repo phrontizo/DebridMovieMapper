@@ -13,7 +13,10 @@
 
 mod common;
 
-use common::{cleanup_by_hash, sintel_magnet, with_cleanup, SINTEL_HASH};
+use common::{
+    cleanup_added, cleanup_by_hash, record_added_id, sintel_magnet, with_cleanup, AddedIds,
+    SINTEL_HASH,
+};
 use debridmoviemapper::acquire::locator_for;
 use debridmoviemapper::probe::{probe_tracks, ProbeError, Track};
 use debridmoviemapper::provider::DebridProvider;
@@ -27,9 +30,11 @@ use std::time::Duration;
 /// (also when Sintel never resolves).
 async fn run_probe(provider: Arc<dyn DebridProvider>, label: &str) {
     cleanup_by_hash(&provider, SINTEL_HASH).await;
+    // The cleanup deletes the added torrent by its id first, so a lagging listing can't hide it.
+    let added = AddedIds::default();
     let outcome = with_cleanup(
-        probe_sintel(&provider, label),
-        cleanup_by_hash(&provider, SINTEL_HASH),
+        probe_sintel(&provider, &added, label),
+        cleanup_added(&provider, &added, SINTEL_HASH),
     )
     .await;
     assert!(
@@ -48,6 +53,7 @@ async fn run_probe(provider: Arc<dyn DebridProvider>, label: &str) {
 /// Add Sintel, wait until its video file resolves to a CDN url, and probe that url.
 async fn probe_sintel(
     provider: &Arc<dyn DebridProvider>,
+    added: &AddedIds,
     label: &str,
 ) -> Result<Vec<Track>, ProbeError> {
     let id = provider
@@ -55,6 +61,7 @@ async fn probe_sintel(
         .await
         .expect("add_magnet")
         .id;
+    record_added_id(added, &id);
     println!("[{label}] add_magnet -> id={id}");
 
     // Poll until the file list resolves, the torrent is downloaded, and the locator resolves to a

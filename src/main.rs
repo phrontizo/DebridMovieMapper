@@ -551,15 +551,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // tasks are aborted, so any active stream is cut mid-transfer. This is the intended behaviour for a
     // media proxy under `docker stop`: a player simply re-requests the byte range on restart, and a
     // bounded-grace drain would only delay shutdown for connections that are about to be re-opened
-    // anyway. We DO drain the background scheduler (account sync / acquisition / Trakt / upgrade), whose
-    // mid-flight provider mutations are worth finishing cleanly.
+    // anyway. We DO wait for the background scheduler to stop, but its jobs are not drained: the
+    // periodic Trakt / episode / upgrade jobs are cancelled at the await point they are parked on as
+    // soon as the shutdown signal flips (`scheduler::periodic`), and only the scan loop runs on to
+    // its own next shutdown check. An upgrade candidate cut off mid-staging keeps its staging intent,
+    // so the next start's staging sweep deletes it (`upgrade::sweep_staging_intents`).
     let _ = shutdown_tx.send(true);
     info!("Waiting for background tasks to finish...");
-    // Bound the drain: a job parked in a slow provider call (reqwest 30s timeout) or the shared
+    // Bound the wait: the scan loop parked in a slow provider call (reqwest 30s timeout) or the shared
     // rate limiter's backpressure could otherwise delay shutdown past `docker stop`'s ~10s grace →
-    // SIGKILL. The scheduler's operations are idempotent, so a task cut here is safely redone next
-    // start. Dropping the JoinHandle on timeout detaches the task; the runtime aborts it as `main`
-    // returns.
+    // SIGKILL. The scheduler's operations are idempotent, so a task cut here is redone next start (a
+    // cut staging is swept, as above). Dropping the JoinHandle on timeout detaches the task; the
+    // runtime aborts it as `main` returns.
     const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
     match tokio::time::timeout(SHUTDOWN_GRACE, scheduler_handle).await {
         Ok(Ok(_)) => {}

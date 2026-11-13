@@ -950,7 +950,16 @@ pub async fn probe_tracks(http: &reqwest::Client, cdn_url: &str) -> Result<Vec<T
                         if bigger.len() < front.len() {
                             return Err(ProbeError::Transient);
                         }
-                        parse_mkv_tracks(&bigger)
+                        // A full window that still defers has `Tracks` past the cap (a second large
+                        // pre-`Tracks` block, or `Tracks` straddling the 8 MB mark): every re-probe
+                        // would repeat these two fetches, so accept as unknown rather than churn. A
+                        // shorter body stays `Transient` (an under-fetch, or a file under 8 MB).
+                        match parse_mkv_tracks(&bigger) {
+                            Err(ProbeError::Transient) if bigger.len() >= MAX_PROBE_FETCH => {
+                                Err(ProbeError::TracksNotFound)
+                            }
+                            r => r,
+                        }
                     }
                     Some(_) => Err(ProbeError::TracksNotFound), // overrun > cap → accept, don't churn
                     None => Err(ProbeError::Transient),
@@ -1766,6 +1775,37 @@ mod tests {
                 .iter()
                 .any(|t| matches!(t.kind, TrackKind::Audio) && t.language.as_deref() == Some("eng")),
             "the recovered probe must report the eng audio track, got {tracks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_tracks_mkv_recovery_still_past_the_cap_accepts_not_defers() {
+        // The first overrunning pre-`Tracks` Void ends within the 8 MB recovery window, but a second
+        // one runs past it, so `Tracks` is still out of reach after the recovery fetch. Every
+        // re-probe would repeat the same two fetches, so this must accept as unknown
+        // (`TracksNotFound`) rather than defer (`Transient`) until the verify deadline replaces a
+        // possibly valid release.
+        let mut audio = ebml_elem(0x83, &[2]);
+        audio.extend(ebml_elem(0x22B59C, b"eng"));
+        let mut seg = ebml_elem(0xEC, &vec![0u8; 5_000_000]);
+        seg.extend(ebml_elem(0xEC, &vec![0u8; 4_000_000]));
+        seg.extend(ebml_elem(0x1654AE6B, &ebml_elem(0xAE, &audio)));
+        let mut file = ebml_elem(0x1A45DFA3, &[]);
+        file.extend(ebml_elem(0x18538067, &seg));
+        assert!(file.len() > MAX_PROBE_FETCH);
+        let (url, log) = serve_ranges_logged(file).await;
+        let result = probe_tracks(&reqwest::Client::new(), &url).await;
+        assert!(
+            matches!(result, Err(ProbeError::TracksNotFound)),
+            "Tracks past the full recovery window must accept as unknown, got {result:?}"
+        );
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            [
+                format!("bytes=0-{}", 4 * 1024 * 1024 - 1),
+                format!("bytes=0-{}", MAX_PROBE_FETCH - 1),
+            ],
+            "the front read, then one recovery read of the full window"
         );
     }
 

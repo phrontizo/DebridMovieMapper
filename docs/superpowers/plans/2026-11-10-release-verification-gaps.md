@@ -65,7 +65,7 @@
 - `parse` keeps de-duplicating codes. `mul` is pushed only when a `MULTI_RE` match is NOT immediately followed by `sub` (Torrentio's `Multi Subs`).
 
 - [ ] **Step 1: Write failing tests** (release tests module, `raw(name, desc, hash, file)` helper):
-  - `parse_tags_language_abbreviations`: `Show.s01e04.WEBRip.XviD.Rus.RuDub.tv.avi` → languages contain `rus`; `Film.2026.MULTi.VFF.1080p.WEBRip` → contain `fre` and `mul`; `Film (2026) [Bluray 1080p][Esp]` → contain `spa`; `Danza.con.il.diavolo.ITA.ENG.1080p` → contain `ita` and `eng`.
+  - `parse_tags_language_abbreviations`: `Show.s01e04.WEBRip.XviD.Rus.RuDub.tv.avi` → languages contain `rus`; `Film.2026.MULTi.VFF.1080p.WEBRip` → contain `fre` and `mul`; `Film (2026) [Bluray 1080p][Esp]` → contain `spa`; `Film.ITA.ENG.1080p` → contain `ita` and `eng`.
   - `parse_maps_torrentio_flags_to_languages`: desc `"👤 9 💾 1.7 GB ⚙️ EXT\n🇷🇺"` → `rus`; desc `"…\n🇬🇧 / 🇮🇹"` → `eng` + `ita`.
   - `multi_subs_marker_is_not_multi_audio`: desc `"Multi Subs / 🇷🇺"` → no `mul`, has `rus`; desc `"Multi Audio / 🇬🇧 / 🇫🇷"` → has `mul`.
   - `subtitle_only_markers_do_not_tag_audio`: `Show S01E04 - Saison 1 VOSTFR HDTV 2026` (no flag) → languages empty.

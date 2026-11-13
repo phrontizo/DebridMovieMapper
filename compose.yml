@@ -66,16 +66,18 @@ services:
 
       # ── Trakt sync (SP2) ──────────────────────────────────────────────────────
       # Set BOTH id + secret (from a Trakt API app) to drive the library from users'
-      # watchlists/history. Absent, nothing is acquired, but the account mirror, dedup and the
-      # upgrade engine still work on what is already in the account (UPGRADE_INTERVAL_SECS=0
-      # stops the upgrade engine replacing and deleting existing copies).
+      # watchlists/history. Absent, nothing is acquired from watchlists or watch history, but the
+      # account mirror, dedup and the upgrade engine still work on what is already in the account
+      # (UPGRADE_INTERVAL_SECS=0 stops the upgrade engine replacing and deleting existing copies).
       # Then link accounts at the /trakt/accounts page on the published port.
       - TRAKT_CLIENT_ID=${TRAKT_CLIENT_ID:-}
       - TRAKT_CLIENT_SECRET=${TRAKT_CLIENT_SECRET:-}
       # - TRAKT_SYNC_INTERVAL_SECS=900            # sync + reconcile cadence (min 60)
       # - TRAKT_EPISODE_CHECK_INTERVAL_SECS=3600  # episode-monitor cadence (min 300)
-      # Catch-up: auto-acquire episodes aired since you last watched a show. Lookback window —
-      # 90d / 12w / 6mo (or a bare number = days); unset/0 = all-time (default).
+      # Catch-up: a show you've watched that Trakt reports as behind, last watched within this
+      # window, gets every aired episode you haven't watched (including ones that aired before
+      # your last watch). Window: 90d / 12w / 6mo (or a bare number = days); unset/0 = all-time
+      # (default), which can mean many torrents for a large watch history.
       - TRAKT_CATCHUP_LOOKBACK=${TRAKT_CATCHUP_LOOKBACK:-}
       # Extra host names (comma-separated, no scheme or port) the /trakt pages answer for, e.g. a
       # reverse proxy's FQDN. IP addresses, localhost, single-label names (debridmoviemapper) and

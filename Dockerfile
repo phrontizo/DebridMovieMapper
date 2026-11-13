@@ -2,9 +2,10 @@
 # Use BUILDPLATFORM so the builder always runs natively (no QEMU emulation).
 # Pin the toolchain minor version (not floating `rust:slim`) so the build image is reproducible over
 # time — a new stable Rust / clippy / libc can otherwise change build output or newly fail without any
-# source change. This tag and `rust-version` in Cargo.toml must be bumped together: CI lints and tests
-# on the latest stable, and `rust-version` is what makes its clippy run flag (incompatible_msrv) a std
-# API newer than this image's compiler.
+# source change. This tag, `rust-version` in Cargo.toml and the `msrv` job's
+# `dtolnay/rust-toolchain@<version>` in .github/workflows/ci.yml must be bumped together: CI lints and
+# tests on the latest stable, `rust-version` is what makes its clippy run flag (incompatible_msrv) a
+# std API newer than this image's compiler, and the `msrv` job builds on this exact version.
 FROM --platform=$BUILDPLATFORM rust:1.96-slim AS builder
 
 # Install build dependencies including cross-compilation toolchain for arm64

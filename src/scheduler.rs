@@ -39,16 +39,22 @@ where
         // Run the job, but cancel it promptly if shutdown fires MID-tick. A long tick (e.g. an
         // upgrade budget staging many candidates, each polling the provider for seconds) must not
         // delay graceful shutdown past the container's stop grace (→ SIGKILL) — the scan loop
-        // already bails mid-work, so the periodic jobs must too. Dropping the job future at an await
-        // point is safe: the jobs are idempotent and all persistence is via ACID redb writes, so the
-        // worst case is an added-but-unrecorded provider torrent, which the account-mirror/dedup pass
-        // reclaims on the next run.
+        // already bails mid-work, so the periodic jobs must too. The job is CANCELLED, not drained:
+        // dropping its future stops it at the await point it is parked on. The jobs are idempotent
+        // and all persistence is via ACID redb writes, so a later tick redoes the work. What a
+        // cancelled tick can leave behind is a provider torrent it added but never recorded. An
+        // upgrade candidate cut off mid-staging keeps its staging intent open, so the account mirror
+        // never adopts the unchecked release and the scan loop's staging sweep deletes it
+        // (`upgrade::sweep_staging_intents`). An `acquire` cut off between its add and its `Pending`
+        // record (a provider call or two) leaves a torrent the account mirror adopts as a
+        // pre-existing copy.
         // Run the job under `catch_unwind` so a panic in ONE tick is logged and the schedule
         // continues, rather than unwinding `periodic` and silently disabling this subsystem for the
         // process lifetime (a `JoinError` would otherwise surface only at shutdown). `catch_unwind`
         // (not `tokio::spawn`) is used so the mid-tick cancellation below is preserved — spawning
-        // would detach the task on shutdown instead of dropping it. A caught panic leaves at worst an
-        // added-but-unrecorded provider torrent (same as the drop-on-shutdown case), reclaimed next run.
+        // would detach the task on shutdown instead of dropping it. A caught panic leaves at worst
+        // what a cancellation does (above): a staging intent the daily sweep picks up once it is
+        // older than `upgrade::STAGING_ABANDONED_AFTER_SECS`.
         // The `job()` invocation itself is wrapped in the caught async block (not evaluated eagerly as
         // `catch_unwind(job())` would), so a panic while *constructing* a tick's future is caught too,
         // not just a panic while polling it.
@@ -164,6 +170,9 @@ where
 /// Spawn all background jobs over `app`, returning when all have stopped (after shutdown).
 pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
     let mut handles = Vec::new();
+    // Before any job can stage an upgrade candidate: a staging intent opened at or before this was
+    // left by an earlier process (see `ScanConfig::started_at`).
+    let started_at = crate::now_unix_secs();
 
     // Scan task (account sync + acquisition verification, both inlined in run_scan_loop) —
     // unchanged behaviour, own internal cadence.
@@ -180,6 +189,7 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
             run_scan_loop(
                 ScanConfig {
                     app: scan_app.clone(),
+                    started_at,
                 },
                 scan_shutdown.clone(),
             )

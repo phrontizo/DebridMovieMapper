@@ -102,7 +102,13 @@ pub struct ReleaseInfo {
 // `regex` crate has no lookahead, so this boundary-free form is the portable fix.
 static RES_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(\d{3,4})p(?:\d{2,3})?|\b(4k|uhd)\b").unwrap());
-static SIZE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)([\d.]+)\s*(gb|mb)").unwrap());
+// Torrentio's size follows its `💾` (U+1F4BE) marker, as the seeders follow `👤`. `SIZE_RE` is the
+// fallback for a description without one: a bare `<number> <unit>` whose number doesn't start
+// inside a word or number, so a codec run (`x265.200MB`) is not read as 265.2 MB.
+static SIZE_MARKED_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\u{1f4be}\s*([\d.]+)\s*(tb|gb|mb)").unwrap());
+static SIZE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(?:^|[^a-z\d])([\d.]+)\s*(tb|gb|mb)").unwrap());
 static SEED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{1f464}\s*(\d+)").unwrap());
 // The debrid-cached marker (`RD+`/`TB+`) matched as a WORD-BOUNDED token, not a raw substring, so a
 // release name that merely CONTAINS the letters (`Standard+`, `Hard+`, `Record+`) is not mis-flagged
@@ -163,18 +169,33 @@ fn tag_part(line: &str) -> &str {
 
 /// The part of one (lowercased) line in which the bare cam markers count. A show line names its
 /// episode after the episode code (`Show.S02E03.Nanny.Cam.720p.HDTV`, `Show - S01E05 - Hidden Cam
-/// WEBDL-1080p`), so there it starts at the first resolution/source/codec tag after the code (right
-/// after the code when no such tag follows). Any other line: its [`tag_part`]. Telesync/cam
-/// releases of TV episodes are all but unheard of, and the unambiguous tags (`HDCAM`, `TELESYNC`, …)
-/// and a bracketed `[CAM]` still count anywhere.
+/// WEBDL-1080p`), so there it starts at the first resolution/source/codec tag after the code. When
+/// no such tag follows (a pack's file line, `Show - S02E03 - Hidden Cam.mkv`), only the token right
+/// after the code counts (`Show.S01E01.CAM`), with its separators so the markers' boundaries still
+/// hold. Any other line: its [`tag_part`]. Telesync/cam releases of TV episodes are all but unheard
+/// of, and the unambiguous tags (`HDCAM`, `TELESYNC`, …) and a bracketed `[CAM]` still count
+/// anywhere.
 fn cam_word_part(line: &str) -> &str {
     let Some(code) = EPISODE_CODE_RE.find(line) else {
         return tag_part(line);
     };
     let rest = &line[code.end()..];
-    QUALITY_TAG_RE
-        .find(rest)
-        .map_or(rest, |tag| &rest[tag.start()..])
+    if let Some(tag) = QUALITY_TAG_RE.find(rest) {
+        return &rest[tag.start()..];
+    }
+    let start = rest
+        .find(|c: char| c.is_alphanumeric())
+        .unwrap_or(rest.len());
+    let end = rest[start..]
+        .find(|c: char| !c.is_alphanumeric())
+        .map_or(rest.len(), |i| start + i);
+    // Keep one trailing separator: `TS_RE` needs it, and a token ending the line without one is a
+    // `.ts` container extension, not a telesync tag.
+    let end = rest[end..]
+        .chars()
+        .next()
+        .map_or(end, |c| end + c.len_utf8());
+    &rest[..end]
 }
 
 /// Whether the (lowercased) name/description marks a cam / telesync / screener source.
@@ -330,19 +351,30 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
 
     let cached = CACHED_RE.is_match(&text) || text.contains('\u{26a1}');
 
-    // Take the FIRST `<number><gb|mb>` whose number actually parses, rather than the first regex
-    // match: `[\d.]+` can capture a non-numeric run like `1.2.3` (which fails `parse::<f64>`), and
-    // without iterating we'd silently drop the size instead of trying the next candidate.
-    let size_bytes = SIZE_RE.captures_iter(&text).find_map(|cap| {
-        let n: f64 = cap.get(1)?.as_str().parse().ok()?;
+    // The `💾` size wins: the description starts with the release title, so a per-episode size in a
+    // pack's name (`[150MB/ep]`) would otherwise come first. Either way take the FIRST
+    // `<number><unit>` whose number actually parses, rather than the first regex match: `[\d.]+` can
+    // capture a non-numeric run like `1.2.3` (which fails `parse::<f64>`), and without iterating we'd
+    // silently drop the size instead of trying the next candidate.
+    let size_of = |cap: regex::Captures| {
+        let whole = cap.get(0)?;
         let unit = cap.get(2)?.as_str().to_ascii_lowercase();
-        let mult = if unit == "gb" {
-            1_000_000_000.0
-        } else {
-            1_000_000.0
+        // `TB+` is the debrid-cached marker, not a size (`x264 TB+`).
+        if unit == "tb" && text[whole.end()..].starts_with('+') {
+            return None;
+        }
+        let n: f64 = cap.get(1)?.as_str().parse().ok()?;
+        let mult = match unit.as_str() {
+            "tb" => 1_000_000_000_000.0,
+            "gb" => 1_000_000_000.0,
+            _ => 1_000_000.0,
         };
         Some((n * mult) as u64)
-    });
+    };
+    let size_bytes = SIZE_MARKED_RE
+        .captures_iter(&text)
+        .find_map(size_of)
+        .or_else(|| SIZE_RE.captures_iter(&text).find_map(size_of));
 
     let seeders = SEED_RE
         .captures(&text)
@@ -1271,7 +1303,7 @@ mod tests {
         assert!(vff.contains(&"mul".to_string()), "{vff:?}");
         let esp = langs("t", "Film (2026) [Bluray 1080p][Esp]");
         assert!(esp.contains(&"spa".to_string()), "{esp:?}");
-        let ita_eng = langs("t", "Danza.con.il.diavolo.ITA.ENG.1080p");
+        let ita_eng = langs("t", "Film.ITA.ENG.1080p");
         assert!(ita_eng.contains(&"ita".to_string()), "{ita_eng:?}");
         assert!(ita_eng.contains(&"eng".to_string()), "{ita_eng:?}");
         // Still separator-bounded: an abbreviation embedded in a longer word tags nothing.
@@ -1420,11 +1452,11 @@ mod tests {
         }
         // A `Sub` that introduces a following language belongs to THAT language, so the one before
         // it stays audio (`iTA-ENG.Sub.ITA` = Italian + English audio, Italian subs) …
-        let dual = langs("t", "Danza.con.il.diavolo.2020.iTA-ENG.Sub.ITA.1080p");
+        let dual = langs("t", "Film.2020.iTA-ENG.Sub.ITA.1080p");
         assert_eq!(dual, vec!["ita".to_string(), "eng".to_string()]);
         // … and a prefix run lists only subtitles (`ITA.Sub.ITA.ENG` = Italian audio; Italian +
         // English subs), so the English after it isn't an audio tag either.
-        let run = langs("t", "Danza.con.il.diavolo.2020.ITA.AC3.Sub.ITA.ENG.1080p");
+        let run = langs("t", "Film.2020.ITA.AC3.Sub.ITA.ENG.1080p");
         assert_eq!(run, vec!["ita".to_string()]);
         // A word that merely starts with `sub` is not a subtitle marker.
         let suburbia = langs("t", "Movie.2020.ENG.Suburbia.1080p");
@@ -1715,14 +1747,38 @@ mod tests {
             Some("x.mkv"),
         );
         assert_ne!(parse(&pack).source, Source::Cam);
+        // So is one whose listed file name carries no quality tag after the episode title (pack
+        // files often don't), including one behind a `Season N/` folder.
+        for desc in [
+            "Some.Show.S02.1080p.WEB-DL.x264\nSome Show - S02E03 - Hidden Cam.mkv",
+            "Some.Show.S02.1080p.WEB-DL.x264\nSeason 2/Some.Show.S02E03.Nanny.Cam.mkv",
+            "Some.Show.S02E03.Nanny.Cam.mkv",
+            "Some.Show.S02E03.Nanny.Cam",
+        ] {
+            let c = raw(
+                "Torrentio\n1080p",
+                &format!("{desc}\nRD+"),
+                "h",
+                Some("x.mkv"),
+            );
+            let r = parse(&c);
+            assert_ne!(
+                r.source,
+                Source::Cam,
+                "{desc}: the episode title is no cam tag"
+            );
+            assert!(score(&r, &prefs()).is_some(), "{desc} must be acquirable");
+        }
         // Real cam tags on a show line are still caught: an unambiguous tag anywhere, a bracketed
-        // one, and a bare one after the quality tags.
+        // one, and a bare one after the quality tags or right after the episode code.
         for desc in [
             "Some.Show.S01E01.720p.HDCAM",
             "Some.Show.S01E01.[CAM].mkv",
             "Some.Show.S01E01.1080p.CAM.x264",
             "Some.Show.S01E01.1080p.TS.x264",
             "Some.Show.S01E01.CAM",
+            "Some.Show.S01E01.CAM.mkv",
+            "Some Show - S01E01 - TS.mkv",
         ] {
             let c = raw(
                 "Torrentio\n1080p",
@@ -2281,18 +2337,76 @@ mod tests {
         // (`1.2.3 GB`) yet fails `parse::<f64>()`; the size parse must `find_map`-skip it and use the
         // next well-formed `<n> GB` token rather than silently dropping the size. The bad run is a
         // real match here (unit-suffixed), so this exercises the parse-fail-then-continue branch —
-        // a single-`captures()` implementation would return None and fail this test.
-        let c = raw(
-            "x",
-            "Bad 1.2.3 GB then\n\u{1f4be} 7.5 GB \u{1f464} 10",
-            "a",
-            None,
-        );
+        // a single-`captures()` implementation would return None and fail this test. (No `💾`
+        // marker: a marked size would be taken first, bypassing the bare-token scan.)
+        let c = raw("x", "Bad 1.2.3 GB then\n7.5 GB \u{1f464} 10", "a", None);
         assert_eq!(
             parse(&c).size_bytes,
             Some((7.5 * 1_000_000_000.0) as u64),
             "a malformed but unit-suffixed numeric run must be skipped, not drop the real size"
         );
+    }
+
+    #[test]
+    fn parse_size_prefers_the_floppy_marked_size_over_a_size_in_the_release_name() {
+        // Torrentio's description starts with the release title, so a per-episode size marker in a
+        // pack's name (`…x265.200MB`, `[150MB/ep]`) comes before the real `💾` size. The marked size
+        // wins; a bare token is only the fallback when there is no `💾` size.
+        for desc in [
+            "Show.S01.720p.WEB-DL.x265.200MB\n\u{1f4be} 5.2 GB \u{1f464} 10",
+            "Show S01 [150MB/ep] 720p WEB-DL\n\u{1f464} 10 \u{1f4be} 5.2 GB",
+        ] {
+            assert_eq!(
+                parse(&raw("x", desc, "a", None)).size_bytes,
+                Some((5.2 * 1_000_000_000.0) as u64),
+                "{desc}"
+            );
+        }
+        // No marked size: the first bare size token is the fallback, and its number doesn't run on
+        // from a codec tag before it (`x265.200MB` once read as 265.2 MB).
+        for (desc, size) in [
+            ("Show.S01.720p.WEB-DL.x265.200MB", 200_000_000),
+            ("Movie.2020.1080p.WEB.5.2GB", 5_200_000_000),
+            ("4.7GB Movie.2020.1080p", 4_700_000_000),
+        ] {
+            assert_eq!(
+                parse(&raw("x", desc, "a", None)).size_bytes,
+                Some(size),
+                "{desc}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_size_reads_terabytes() {
+        // A pack over 1 TB is listed in TB. Without the unit its size was unknown, so it escaped the
+        // >80 GB penalty.
+        let c = raw(
+            "x",
+            "Show.S01-S10.1080p.BluRay\n\u{1f4be} 1.2 TB \u{1f464} 3",
+            "a",
+            None,
+        );
+        let r = parse(&c);
+        assert_eq!(r.size_bytes, Some((1.2 * 1_000_000_000_000.0) as u64));
+        let no_size = parse(&raw(
+            "x",
+            "Show.S01-S10.1080p.BluRay\n\u{1f464} 3",
+            "a",
+            None,
+        ));
+        assert!(
+            score(&r, &prefs()).unwrap() < score(&no_size, &prefs()).unwrap(),
+            "a 1.2 TB release takes the absurd-size penalty"
+        );
+        // The debrid-cached marker is not a size: `x264 TB+` is no 264 TB release.
+        let cached = parse(&raw(
+            "Torrentio\n1080p",
+            "Movie.2020.1080p.WEB.x264 TB+",
+            "a",
+            None,
+        ));
+        assert_eq!(cached.size_bytes, None);
     }
 
     #[test]
