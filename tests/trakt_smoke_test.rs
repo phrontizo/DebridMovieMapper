@@ -13,23 +13,18 @@
 //! Run with: `cargo test --test trakt_smoke_test -- --ignored`
 //! (needs `TRAKT_CLIENT_ID`, optionally `TRAKT_CLIENT_SECRET` + `TRAKT_ACCESS_TOKEN`, in `.env`.)
 
+mod common;
+
 use debridmoviemapper::trakt_client::{TraktClient, TraktClientImpl};
 
 #[tokio::test]
 #[ignore]
 async fn trakt_device_code_and_watchlist_smoke() {
-    dotenvy::dotenv().ok();
-
-    let client_id = match std::env::var("TRAKT_CLIENT_ID") {
-        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => {
-            eprintln!("skipping trakt_device_code_and_watchlist_smoke: TRAKT_CLIENT_ID unset");
-            return;
-        }
+    let Some(client_id) = common::token("TRAKT_CLIENT_ID") else {
+        eprintln!("skipping trakt_device_code_and_watchlist_smoke: TRAKT_CLIENT_ID unset");
+        return;
     };
-    let client_secret = std::env::var("TRAKT_CLIENT_SECRET")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    let client_secret = common::token("TRAKT_CLIENT_SECRET").unwrap_or_default();
 
     let trakt = TraktClientImpl::new(client_id, client_secret, reqwest::Client::new());
 
@@ -47,11 +42,8 @@ async fn trakt_device_code_and_watchlist_smoke() {
     );
 
     // The watchlist pull is only possible with a pre-authorised token — exercise it if provided.
-    if let Ok(token) = std::env::var("TRAKT_ACCESS_TOKEN") {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            let wl = trakt.watchlist(&token).await.expect("watchlist");
-            eprintln!("watchlist returned {} items", wl.len());
-        }
+    if let Some(token) = common::token("TRAKT_ACCESS_TOKEN") {
+        let wl = trakt.watchlist(&token).await.expect("watchlist");
+        eprintln!("watchlist returned {} items", wl.len());
     }
 }

@@ -1,14 +1,12 @@
+mod common;
+
 use debridmoviemapper::identification::identify_torrent;
 use debridmoviemapper::rd_client::{TorrentFile, TorrentInfo};
-use debridmoviemapper::tmdb_client::TmdbClient;
 
 #[tokio::test]
 #[ignore]
 async fn test_short_title_identification() {
-    dotenvy::dotenv().ok();
-
-    let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
-    let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
+    let tmdb_client = common::tmdb_client();
 
     println!("\n========================================");
     println!("TESTING SHORT TITLE IDENTIFICATION");

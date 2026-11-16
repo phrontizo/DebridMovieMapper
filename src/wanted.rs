@@ -1,16 +1,18 @@
 //! Pure reconcile-core for the SP2 Trakt wanted-set lifecycle.
 //!
 //! These functions contain ZERO I/O: no store, no provider, no network, no async. They take
-//! plain data assembled by the caller (`tasks::plan_reconcile_ops` — movies plus show Trigger B —
-//! and `tasks::plan_episode_actions` — show episodes plus Trigger A — each build a [`TitleView`] per
-//! title from the store + provider availability) and return the lifecycle decisions — acquire and
-//! removal [`Action`]s.
+//! plain data assembled by the caller from the store + provider availability and return the
+//! lifecycle decisions — acquire and removal [`Action`]s. `tasks::plan_episode_actions` (show
+//! episodes plus Trigger A) builds a [`TitleView`] per show for [`reconcile_title`];
+//! `tasks::plan_reconcile_ops` builds one per movie, and applies Trigger B to shows directly
+//! through [`abandoned_removable`], the same test `reconcile_title` applies.
 //!
 //! Keeping the correctness-critical lifecycle rules pure makes them exhaustively unit-testable
 //! without fixtures. The two removal triggers are:
 //!   - **Trigger A** (finished): every user who currently wants the title has finished it — never
-//!     while any user watchlists it. "Currently wants" means it is still in their Trakt watchlist or
-//!     `/sync/playback`; see [`trigger_a_finished`] for what that leaves out.
+//!     while any user watchlists it. "Currently wants" means a row of their wanted set (their Trakt
+//!     watchlist, `/sync/playback`, a catch-up show or a `REMOVE_FINISHED_SHOWS` fold); see
+//!     [`trigger_a_finished`] for what that leaves out.
 //!   - **Trigger B** (abandoned): the watchlist that added it was abandoned and nobody wants it.
 //!
 //! A title with any **manual** provenance is never auto-removed, regardless of Trakt state.
@@ -69,8 +71,8 @@ pub struct TitleView {
 /// - `Finished` (Trigger A): the title is fully watched + ended (and not watchlisted). It removes
 ///   EVERY owned hash — including pre-existing account-mirror copies — ONLY for a **show** under
 ///   `REMOVE_FINISHED_SHOWS` (the opt-in "incl. shows already in the library" cleanup). For a movie,
-///   or a show with the flag off, it removes only the ENGINE-acquired hashes, so a genuine
-///   in-progress re-watch never deletes the user's pre-existing library.
+///   or a show with the flag off, it removes only the ENGINE-acquired hashes, so a finish removal
+///   never deletes the user's pre-existing library.
 /// - `Abandoned` (Trigger B): a watchlist was un-watchlisted and nobody wants the title. This always
 ///   removes only the ENGINE-acquired hashes and KEEPs pre-existing mirror copies (un-watchlisting a
 ///   Trakt title must never delete content the user added to the account themselves).
@@ -132,6 +134,9 @@ pub fn wants(r: &WantedRecord) -> bool {
 ///   episode Trakt splits, a finale whose UTC air time precedes TMDB's local date), and a show the
 ///   user hasn't finished must not be finish-removed (nor its unwatched episode skipped).
 ///
+/// The sync never writes a title still in `/sync/playback` as finished (`tasks::build_wanted`: a
+/// movie as not watched, a show as `trakt_behind`): the user is partway through it.
+///
 /// `aired` is the TMDB-sourced aired-episode list for shows and is IGNORED for movies;
 /// callers pass `&[]` for movies.
 pub fn user_finished(r: &WantedRecord, aired: &[(u32, u32)]) -> bool {
@@ -157,12 +162,11 @@ pub fn user_finished(r: &WantedRecord, aired: &[(u32, u32)]) -> bool {
 /// What that leaves out: Trakt drops a title from `/sync/playback` once it has been watched through,
 /// so a title acquired only from in-progress usually stops being wanted by the time it is finished.
 /// With no wanters, Trigger A never fires and (with no watchlist provenance) neither does Trigger B,
-/// so such a title is KEPT. Trigger A in practice reclaims a title still in `/sync/playback` while
-/// already watched (a paused re-watch), or a show that `REMOVE_FINISHED_SHOWS` folds back into the
-/// wanted set once it is finished and ended. A catch-up show (one Trakt reports the user behind on,
-/// or that the sync assumed behind) never counts as finished ([`user_finished`]), so a show wanted
-/// only through catch-up is never finish-removed on TMDB's aired set alone: with
-/// `REMOVE_FINISHED_SHOWS` off, only a paused re-watch still in `/sync/playback` can be.
+/// so such a title is KEPT. A title still in `/sync/playback` is someone's paused (re-)watch and
+/// never reads as finished, and neither does a catch-up show (one Trakt reports the user behind on,
+/// or that the sync assumed behind, [`user_finished`]). So in practice Trigger A fires only for a
+/// show that `REMOVE_FINISHED_SHOWS` folds back into the wanted set once it is finished and ended:
+/// with that option off, nothing the sync writes is finish-removed.
 ///
 /// A **watchlisted** title is an explicit "keep this available" signal and is NEVER finished-removed:
 /// re-adding a title you've already watched to your watchlist means you want to (re)watch it, so it
@@ -198,12 +202,19 @@ pub fn trigger_b_abandoned(wanted: &[WantedRecord], provenance: &Provenance) -> 
     entered_via_watchlist && !wanted.iter().any(wants)
 }
 
+/// Trigger B as a removal: the title is abandoned ([`trigger_b_abandoned`]) and has no manual
+/// provenance (never auto-removed). Half of [`removable`], and what `tasks::plan_reconcile_ops`
+/// applies to shows (whose Trigger A is the episode monitor's).
+pub fn abandoned_removable(wanted: &[WantedRecord], provenance: &Provenance) -> bool {
+    !provenance.has_manual_entry() && trigger_b_abandoned(wanted, provenance)
+}
+
 /// The removal predicate `reconcile_title` applies to an owned title: a title with manual
 /// provenance is never removable; otherwise either trigger removes it. `finished` is Trigger A,
 /// which the caller computes once per title.
 fn removable(owned: &Owned, finished: bool, wanted: &[WantedRecord]) -> bool {
-    !owned.provenance.has_manual_entry()
-        && (finished || trigger_b_abandoned(wanted, &owned.provenance))
+    (!owned.provenance.has_manual_entry() && finished)
+        || abandoned_removable(wanted, &owned.provenance)
 }
 
 /// Whether the reconciler would remove this title: owned, and [`removable`]. Test-only shorthand
@@ -730,8 +741,8 @@ mod tests {
     #[test]
     fn finished_ended_in_progress_show_is_not_acquired() {
         // An in-progress record Trakt did not report behind (`trakt_behind: false`) is what sync
-        // writes for a `/sync/playback` show or a REMOVE_FINISHED_SHOWS finish fold, never for a
-        // catch-up show, which is always `trakt_behind`. Fully watched and Ended, it reads as
+        // writes for a REMOVE_FINISHED_SHOWS finish fold, never for a catch-up or `/sync/playback`
+        // show, which is always `trakt_behind`. Fully watched and Ended, it reads as
         // finished, so the symmetry guard acquires nothing. For example, after a fold's removal the
         // row lasts until the next sync, and without the guard the episode monitor would re-acquire
         // the show it just removed.
@@ -1131,9 +1142,9 @@ mod tests {
         // Symmetry with Trigger-A removal (mirrors the Show branch guard): a not-watchlisted movie
         // that every in-progress wanter has watched is reclaimed by Trigger A. Once removed it is no
         // longer owned; the acquire path must NOT re-add it, or it flip-flops acquire↔remove every
-        // reconcile tick (Trigger A removes a re-watched-and-paused movie that's still in Trakt
-        // /sync/playback AND /sync/watched). The intended end state is "reclaimed" — re-watch via the
-        // watchlist, which short-circuits Trigger A.
+        // reconcile tick. The sync never writes this state for a movie still in `/sync/playback`
+        // (a paused re-watch is written as not watched, see `tasks::build_wanted`), so this pins the
+        // pure core's consistency only.
         let t = movie_title(
             20,
             vec![movie_record(
@@ -1640,11 +1651,9 @@ mod tests {
         // never chases one (Trakt would never report it watched → re-acquired forever).
         let t = show_title(
             8,
-            vec![show_record(
+            vec![behind_show_record(
                 "alice",
                 8,
-                false,
-                true,
                 vec![(1, 1)],
                 ShowStatus::Returning,
             )],

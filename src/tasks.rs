@@ -97,10 +97,6 @@ async fn identify_new_torrent(
     Ok((info, metadata, tmdb_failed))
 }
 
-pub struct ScanConfig {
-    pub app: AppState,
-}
-
 /// Blacklist entries older than this are pruned (the table is otherwise append-only). A rejected
 /// hash becomes eligible to retry again after the TTL — long enough that a wrong-title/corrupt hash
 /// isn't re-tried constantly, short enough to bound the table and let a later better release through.
@@ -150,11 +146,7 @@ async fn sleep_until_next_scan(
     }
 }
 
-pub async fn run_scan_loop(
-    scan_config: ScanConfig,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
-    let app = scan_config.app;
+pub async fn run_scan_loop(app: AppState, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     // Load persisted matches from DB on startup
     let persisted: HashMap<String, (crate::rd_client::TorrentInfo, MediaMetadata)> =
         app.store.load_all_matches().await;
@@ -252,17 +244,19 @@ impl ScanState {
 enum TickEnd {
     /// Shutdown was requested during identification (the progress so far was saved).
     Shutdown,
-    /// The listing failed, or was a suspect wholesale-empty one: only `observe` ran.
+    /// The listing failed (nothing after it ran), or was a suspect wholesale-empty one (only
+    /// `observe` ran).
     Skipped,
     /// The library was refreshed from this tick's listing: what the VFS was built from.
     #[cfg_attr(not(test), allow(dead_code))]
     Done(Vec<(crate::rd_client::TorrentInfo, MediaMetadata)>),
 }
 
-/// The hashes among `open` (staging intents still open after the sweep, lowercased) that are not yet
-/// recorded as owned with an authoritative identification: the torrents the scan loop keeps out of
-/// its library until they are (see `scan_tick`). An intent whose hash is recorded only lost its
-/// clear, so that torrent is shown as usual.
+/// The hashes among `open` (staging intents open when the tick started or still open after the
+/// sweep, lowercased) that are not yet recorded as owned with an authoritative identification: the
+/// torrents the scan loop keeps out of its library until they are (see `scan_tick`). An intent
+/// whose hash is recorded only lost its clear (or was closed by `record_staged` meanwhile), so that
+/// torrent is shown as usual.
 async fn staging_unrecorded(
     store: &Store,
     open: &std::collections::HashSet<String>,
@@ -334,7 +328,10 @@ async fn scan_tick(
         }
     }
     state.tick = state.tick.saturating_add(1);
-    // Consume repair replacements (new_id → old_id) before processing torrents
+    // Consume repair replacements (new_id → old_id) before the listing: `prune_health_status` keeps
+    // a repaired torrent's health entry only while its replacement is waiting here, so a repair that
+    // completes during this tick must still be waiting for the next one. A skipped tick puts them
+    // back.
     let repair_replacements = repair_manager.take_repair_replacements().await;
     if !repair_replacements.is_empty() {
         info!(
@@ -342,12 +339,26 @@ async fn scan_tick(
             repair_replacements.len()
         );
     }
+    // The staging intents open before the listing (lowercased hashes). A candidate's intent is
+    // opened before its add, so a listed candidate is in this set or still open at the sweep below
+    // even when the upgrade job discards it (deleting the torrent, closing the intent) while
+    // `observe` runs. Only a whole staging that starts after this read and ends before the sweep
+    // escapes both.
+    let staging_before: std::collections::HashSet<String> = store
+        .all_staging_intents()
+        .await
+        .into_iter()
+        .map(|(h, _)| h.to_ascii_lowercase())
+        .collect();
 
     info!("Refreshing torrent list...");
     let torrents = match provider.get_torrents().await {
         Ok(torrents) => torrents,
         Err(e) => {
             error!("Failed to get torrents: {}", e);
+            repair_manager
+                .restore_repair_replacements(repair_replacements)
+                .await;
             return TickEnd::Skipped;
         }
     };
@@ -389,6 +400,9 @@ async fn scan_tick(
             empty_for.as_secs(),
             MIN_EMPTY_DURATION.as_secs()
         );
+        repair_manager
+            .restore_repair_replacements(repair_replacements)
+            .await;
         return TickEnd::Skipped;
     }
     let torrents = drop_hashes(torrents, &observed_deleted);
@@ -405,13 +419,20 @@ async fn scan_tick(
     )
     .await;
     let torrents = drop_hashes(torrents, &swept.deleted);
-    // A torrent whose staging intent is still open is a candidate being staged or acquired (or one
-    // whose rejection delete failed), not yet recorded: nothing has checked it, and no
-    // authoritative identification names it yet. Keep it out of this tick's library so it is never
-    // shown (in place of the copy it may replace) or identified from its file name and cached for
-    // good; the tick after it is recorded identifies it through the authoritative entry. Observe,
-    // dedup and the mirror keep seeing the full listing.
-    let staging = staging_unrecorded(store, &swept.open).await;
+    // A torrent whose staging intent is open is a candidate being staged or acquired (or one whose
+    // rejection delete failed), not yet recorded: nothing has checked it, and no authoritative
+    // identification names it yet. Keep it out of this tick's VFS, identification and mirror so it
+    // is never shown (in place of the copy it may replace) or identified from its file name and
+    // cached for good; the tick after it is recorded identifies it through the authoritative entry.
+    // An intent open before the listing counts even if it has been closed since: a candidate
+    // discarded while `observe` ran is deleted, and showing it would let a read re-add it through
+    // instant repair. Observe and dedup still see the full listing.
+    let staging_candidates: std::collections::HashSet<String> = staging_before
+        .union(&swept.open)
+        .filter(|h| !swept.deleted.contains(*h))
+        .cloned()
+        .collect();
+    let staging = staging_unrecorded(store, &staging_candidates).await;
 
     // Deduplicate torrents by hash — keep the newest "downloaded" entry per hash.
     // Duplicates arise when repair's add_magnet leaks a torrent, or when
@@ -848,6 +869,11 @@ const REFRESH_BUFFER_SECS: u64 = 3_600;
 /// `watched_state` reflects `watched.movies`; a show's reflects the matching
 /// `WatchedShow.watched_episodes` (else empty) and `show_status` is taken from the map (`None` when
 /// absent). `media_type` and the `WatchedState` variant always agree.
+/// A title in `in_progress` (`/sync/playback`) is one the user is partway through, so it is never
+/// written as finished: a movie as not watched, a show as `trakt_behind`. Trakt drops a title from
+/// `/sync/playback` once it has been watched through, so the only playback title the watch history
+/// reads as finished is a paused re-watch. Trigger A would delete it from under the viewer and then
+/// refuse to re-acquire it while the pause lasts.
 /// `catchup_cutoff`: a Unix timestamp (seconds) bounding the **catch-up** source — a show you've
 /// watched is auto-wanted (so the reconciler acquires every aired episode you haven't watched,
 /// including ones that aired before your last watch) only if you last watched it at/after this
@@ -876,6 +902,8 @@ pub(crate) fn build_wanted(
         media_type: MediaType,
         watchlist: bool,
         in_progress: bool,
+        /// In the user's `/sync/playback`: partway through it (see the doc above).
+        playback: bool,
         /// First non-empty IMDB id seen for this title across its source rows.
         imdb_id: Option<String>,
     }
@@ -891,6 +919,7 @@ pub(crate) fn build_wanted(
                 media_type: item.media_type.clone(),
                 watchlist: false,
                 in_progress: false,
+                playback: false,
                 imdb_id: None,
             });
         a.watchlist = true;
@@ -905,9 +934,11 @@ pub(crate) fn build_wanted(
                 media_type: item.media_type.clone(),
                 watchlist: false,
                 in_progress: false,
+                playback: false,
                 imdb_id: None,
             });
         a.in_progress = true;
+        a.playback = true;
         if a.imdb_id.is_none() {
             a.imdb_id = item.imdb_id.clone();
         }
@@ -939,6 +970,7 @@ pub(crate) fn build_wanted(
                 media_type: MediaType::Show,
                 watchlist: false,
                 in_progress: false,
+                playback: false,
                 imdb_id: None,
             });
         // Carry Trakt's IMDB id so a catch-up-ONLY show (not watchlisted/in-progress, so no
@@ -969,7 +1001,7 @@ pub(crate) fn build_wanted(
             let (watched_state, status) = match a.media_type {
                 MediaType::Movie => (
                     WatchedState::Movie {
-                        watched: watched_movie_ids.contains(&tmdb_id),
+                        watched: !a.playback && watched_movie_ids.contains(&tmdb_id),
                     },
                     None,
                 ),
@@ -981,7 +1013,8 @@ pub(crate) fn build_wanted(
                     (
                         WatchedState::Show {
                             watched_episodes,
-                            trakt_behind: false,
+                            // `mark_trakt_behind` adds the catch-up shows Trakt reports behind.
+                            trakt_behind: a.playback,
                         },
                         show_status.get(&tmdb_id).copied(),
                     )
@@ -1008,7 +1041,9 @@ pub(crate) fn build_wanted(
 /// failed, no Trakt id — and assumed one) gets `trakt_behind`, so `wanted::user_finished` never
 /// reads it as finished on TMDB's aired set alone (TMDB can lack an episode Trakt counts as aired).
 /// A show the `REMOVE_FINISHED_SHOWS` finish-cleanup folds in is not in `behind` (Trakt reported it
-/// caught up), nor is a watchlist or playback show (never asked). PURE.
+/// caught up), nor is a watchlist or playback show (never asked). `build_wanted` already marks a
+/// playback show behind (the user is partway through it), and a watchlisted show is never
+/// finished anyway. PURE.
 fn mark_trakt_behind(
     wanted: &mut [crate::store::WantedRecord],
     behind: &std::collections::HashSet<u64>,
@@ -1634,6 +1669,62 @@ pub(crate) async fn backfill_owned_quality(
     filled
 }
 
+/// Re-derive the episodes of owned show records whose `provides` is EMPTY from their torrent's
+/// selected video files ([`crate::acquire::episode_files`]), for every record whose torrent is in
+/// `infos`. The account mirror writes a show's `provides` once, from the files it could decode then,
+/// and never rewrites an existing record, so a record mirrored before its files were selected, or
+/// from file names the episode parser could not read at the time, would otherwise cover nothing for
+/// good: the episode monitor then plans every aired episode it holds again on every run (each one a
+/// scrape and a provider listing that `acquire` answers with the very same pack). Only `Verified`
+/// show records are touched (a `Pending` one's `provides` is `observe`'s to settle), and only while
+/// the store still has an empty `provides` ([`Store::set_provides_if_empty`] — atomic, never
+/// overwrites). Run by the scan loop's account-mirror pass. Returns how many were filled.
+pub(crate) async fn backfill_owned_provides(
+    store: &Store,
+    owned: &[(String, OwnedRecord)],
+    infos: &[&crate::rd_client::TorrentInfo],
+) -> usize {
+    let missing: std::collections::HashSet<String> = owned
+        .iter()
+        .filter(|(_, r)| {
+            r.request.kind == MediaKind::Series
+                && r.status == OwnedStatus::Verified
+                && r.provides.is_empty()
+        })
+        .map(|(h, _)| h.to_ascii_lowercase())
+        .collect();
+    if missing.is_empty() {
+        return 0;
+    }
+    let mut filled = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for info in infos {
+        let hash = info.hash.to_ascii_lowercase();
+        if !missing.contains(&hash) || !seen.insert(hash.clone()) {
+            continue;
+        }
+        let provides: Vec<(u32, u32)> = crate::acquire::episode_files(info)
+            .into_iter()
+            .map(|(s, e, _)| (s, e))
+            .collect();
+        if provides.is_empty() {
+            continue; // still nothing decodable → coverage stays unknown
+        }
+        match store.set_provides_if_empty(hash.clone(), provides).await {
+            Ok(true) => filled += 1,
+            Ok(false) => {}
+            Err(e) => warn!("provides backfill for {} failed: {}", hash, e),
+        }
+    }
+    if filled > 0 {
+        info!(
+            "provides: derived the episodes of {} owned show record(s) from their file names",
+            filled
+        );
+    }
+    filled
+}
+
 /// Owned-record hashes whose torrent looks gone from the provider: a `Verified`, EMPTY-provenance
 /// (account-mirror) record whose lowercased hash is absent from `present` (the current provider
 /// listing). Engine/provenance-bearing records are left to the acquire/reconcile lifecycle. Returns
@@ -1706,12 +1797,13 @@ async fn reap_absent_mirror_owned(
     for h in &to_reap {
         // Only count a record as reaped once its owned row is ACTUALLY gone — log (don't swallow via
         // `let _`) a transient store error so a reported reap count can't overstate what happened.
-        // The record survives and is retried on the next daily prune tick.
+        // The record survives: the next daily prune tick notes it again, and the trusted listing
+        // after that confirms it.
         match store.remove_owned(h.clone()).await {
             Ok(()) => reaped += 1,
             Err(e) => {
                 warn!(
-                    "reap: failed to remove absent-mirror owned record {} ({}); will retry next tick",
+                    "reap: failed to remove absent-mirror owned record {} ({}); retried after the next daily prune tick",
                     h, e
                 );
                 continue;
@@ -1992,6 +2084,9 @@ pub(crate) async fn record_mirror_owned(
     // that follows this one in the scan tick ranks them by what they really are.
     let infos: Vec<&crate::rd_client::TorrentInfo> = current_data.iter().map(|(i, _)| i).collect();
     backfill_owned_quality(store, prefs, &all_owned, &infos).await;
+    // Likewise a show record with an empty `provides` whose files now decode to episodes, so the
+    // episode monitor counts them as covered.
+    backfill_owned_provides(store, &all_owned, &infos).await;
     let mut recorded = 0usize;
     for (info, metadata) in current_data {
         let Some(tmdb_id) = crate::vfs::tmdb_id_of(metadata) else {
@@ -2317,9 +2412,10 @@ pub(crate) async fn group_owned_by_tmdb(
 ///   folds such shows into the wanted-set so this trigger fires; the mirror copy IS the thing to
 ///   reclaim, so a blanket `engine_hashes` here would make it a no-op.
 /// - `Finished` otherwise (a **movie**, which `REMOVE_FINISHED_SHOWS` never folds; or a **show with
-///   the flag off**): only the engine-acquired hashes. A genuine in-progress re-watch (the title is
-///   in Trakt `/sync/playback` AND already watched) must NOT delete the user's pre-existing library
-///   — that destroys content the engine never acquired.
+///   the flag off**): only the engine-acquired hashes. The sync never writes a title still in Trakt
+///   `/sync/playback` as finished (`build_wanted`), so this is a backstop: whatever reads as
+///   finished there must NOT delete the user's pre-existing library, content the engine never
+///   acquired.
 /// - `Abandoned` (Trigger B): only the engine-acquired hashes — un-watchlisting a Trakt title must
 ///   never delete content the user added to their debrid account themselves (the mirror "kept"
 ///   guarantee). A mirror copy of an earlier season survives abandonment of a later-season watchlist.
@@ -2781,7 +2877,7 @@ pub(crate) async fn group_wanted_by_tmdb(
 /// `wanted::reconcile_title`. Shows get ONLY Trigger-B removal here (abandoned watchlist, no air
 /// dates needed); show-episode acquisition and Trigger-A finish removal are `monitor_episodes`'.
 pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> Vec<ReconcileOp> {
-    use crate::wanted::{reconcile_title, trigger_b_abandoned, Action, Owned, TitleView};
+    use crate::wanted::{abandoned_removable, reconcile_title, Action, Owned, TitleView};
     use std::collections::{BTreeSet, HashSet};
 
     // Group wanted rows by tmdb_id.
@@ -2863,9 +2959,9 @@ pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> V
                         } => {
                             if let Some(g) = owned_group {
                                 // Movies are never folded by `REMOVE_FINISHED_SHOWS`, so a movie
-                                // mirror copy is never finish-reclaimed (pass `false`): a genuine
-                                // in-progress re-watch must not delete the user's pre-existing
-                                // library. `removal_hashes` enforces this via the group's media_type.
+                                // mirror copy is never finish-reclaimed (pass `false`): a removal
+                                // must not delete the user's pre-existing library. `removal_hashes`
+                                // enforces this via the group's media_type.
                                 let hashes = removal_hashes(g, reason, false);
                                 // A mirror-only movie resolves to zero hashes — don't emit a no-op
                                 // Remove every tick (it would just churn an empty op + a full
@@ -2882,9 +2978,7 @@ pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> V
             MediaType::Show => {
                 // Shows: REMOVAL via Trigger B only here (abandoned watchlist; no air dates).
                 if let Some(g) = owned_group {
-                    if !g.provenance.has_manual_entry()
-                        && trigger_b_abandoned(&wanted, &g.provenance)
-                    {
+                    if abandoned_removable(&wanted, &g.provenance) {
                         // Only the engine-acquired hashes — a pre-existing mirror copy of an earlier
                         // season must survive abandonment of a watchlist that acquired later episodes.
                         // Route through `removal_hashes` (single source of truth for trigger→hashes)
@@ -3009,7 +3103,8 @@ async fn execute_remove(
 /// Execute an `Acquire`: build the request from TMDB (preferring Trakt's `imdb_hint`), then drive
 /// the acquisition engine (SP3 optimistic-add), recording the supplied provenance. A title with no
 /// IMDB id anywhere is skipped quietly (it can't be scraped). Its request building is tested
-/// offline ([`build_acquire_request`]); the engine drive itself is `acquire.rs`'s.
+/// offline ([`build_acquire_request`]); the engine drive itself is `acquire.rs`'s. Returns the
+/// engine's outcome, `None` when the engine wasn't asked.
 #[allow(clippy::too_many_arguments)]
 async fn execute_acquire(
     engine: &AcquisitionEngine,
@@ -3020,20 +3115,27 @@ async fn execute_acquire(
     episode: Option<u32>,
     provenance: Provenance,
     imdb_hint: Option<String>,
-) {
+) -> Option<crate::acquire::AcquireOutcome> {
     match build_acquire_request(tmdb, tmdb_id, kind, season, episode, imdb_hint).await {
         Ok(Some(req)) => {
             let outcome = engine.acquire(req, provenance).await;
             info!("reconcile: acquire tmdb {} -> {:?}", tmdb_id, outcome);
+            Some(outcome)
         }
-        Ok(None) => debug!(
-            "reconcile: skip tmdb {} — no IMDB id from Trakt or TMDB (unacquirable via IMDB-keyed scraper)",
-            tmdb_id
-        ),
-        Err(e) => warn!(
-            "reconcile: build_acquire_request for tmdb {} failed: {}",
-            tmdb_id, e
-        ),
+        Ok(None) => {
+            debug!(
+                "reconcile: skip tmdb {} — no IMDB id from Trakt or TMDB (unacquirable via IMDB-keyed scraper)",
+                tmdb_id
+            );
+            None
+        }
+        Err(e) => {
+            warn!(
+                "reconcile: build_acquire_request for tmdb {} failed: {}",
+                tmdb_id, e
+            );
+            None
+        }
     }
 }
 
@@ -3111,7 +3213,7 @@ pub async fn reconcile_wanted(
                 execute_acquire(
                     engine, tmdb, tmdb_id, kind, season, episode, provenance, imdb_id,
                 )
-                .await
+                .await;
             }
         }
     }
@@ -3213,6 +3315,90 @@ pub(crate) fn guard_removal_on_incomplete_aired(
         .collect()
 }
 
+/// The episodes `acquire` found already supplied by a present, settled show copy of unknown coverage
+/// (a `Verified` record whose `provides` is empty: file names the episode parser can't decode). Such
+/// a record covers nothing in [`group_owned_by_tmdb`], so the episode monitor plans every aired
+/// episode it holds, while `acquire` assumes it supplies any episode Torrentio lists it under and
+/// answers `Acquired` with that same pack, adding nothing. Remembering those answers (lowercased
+/// hash → episodes) lets the next runs count the episodes as covered instead of spending a scrape
+/// and a provider listing on each one every run. In memory: a restart asks once again. An entry
+/// goes once its copy is no longer a present `Verified` show record with an empty `provides`
+/// ([`Self::retain_valid`]).
+#[derive(Debug, Default)]
+pub struct AssumedCoverage {
+    by_hash: std::sync::Mutex<HashMap<String, std::collections::BTreeSet<(u32, u32)>>>,
+}
+
+impl AssumedCoverage {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, std::collections::BTreeSet<(u32, u32)>>> {
+        self.by_hash
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Remember that the copy `hash` was found to supply `episode`.
+    fn note(&self, hash: &str, episode: (u32, u32)) {
+        self.lock()
+            .entry(hash.to_ascii_lowercase())
+            .or_default()
+            .insert(episode);
+    }
+
+    /// Drop every entry whose copy is absent from `present` (unless the listing is `suspect`, which
+    /// proves nothing), or whose record is gone, unsettled or now lists its episodes.
+    async fn retain_valid(
+        &self,
+        store: &Store,
+        present: &std::collections::HashSet<String>,
+        suspect: bool,
+    ) {
+        let hashes: Vec<String> = self.lock().keys().cloned().collect();
+        let mut stale = Vec::new();
+        for hash in hashes {
+            let valid = (suspect || present.contains(&hash))
+                && store.get_owned(hash.clone()).await.is_some_and(|r| {
+                    r.request.kind == MediaKind::Series
+                        && r.status == OwnedStatus::Verified
+                        && r.provides.is_empty()
+                });
+            if !valid {
+                stale.push(hash);
+            }
+        }
+        let mut map = self.lock();
+        for hash in stale {
+            map.remove(&hash);
+        }
+    }
+
+    /// Count the remembered episodes as supplied by their copy in its show's group (`coverage` and
+    /// `owned_episodes`).
+    fn apply(&self, owned_by: &mut std::collections::BTreeMap<(MediaType, u64), OwnedGroup>) {
+        let map = self.lock();
+        if map.is_empty() {
+            return;
+        }
+        for g in owned_by.values_mut() {
+            let mut added = false;
+            for c in &mut g.coverage {
+                if let Some(eps) = map.get(&c.hash) {
+                    c.episodes.extend(eps.iter().copied());
+                    c.episodes.sort_unstable();
+                    c.episodes.dedup();
+                    g.owned_episodes.extend(eps.iter().copied());
+                    added = true;
+                }
+            }
+            if added {
+                g.owned_episodes.sort_unstable();
+                g.owned_episodes.dedup();
+            }
+        }
+    }
+}
+
 /// Assemble the episode-monitor's per-show action list — PURE (no I/O), so the `TitleView`
 /// assembly, `reconcile_title`, and incomplete-aired removal-guard wiring is unit-testable without a
 /// live TMDB (which `monitor_episodes` otherwise needs to fetch the aired set). `monitor_episodes`
@@ -3310,7 +3496,10 @@ pub(crate) fn season_aired(aired: &[(u32, u32)], season: u32) -> Vec<u32> {
 ///
 /// AVAILABILITY is per episode (see [`plan_episode_actions`]): an episode is covered only while a
 /// record that supplies it is present or still `Pending`, so an episode whose only copy left the
-/// account is re-acquired even while the rest of the show is present.
+/// account is re-acquired even while the rest of the show is present. `assumed` carries, from one
+/// run to the next, the episodes `acquire` answered with a present pack of unknown coverage (see
+/// [`AssumedCoverage`]); they count as covered by that pack.
+#[allow(clippy::too_many_arguments)]
 pub async fn monitor_episodes(
     engine: &AcquisitionEngine,
     provider: &Arc<dyn DebridProvider>,
@@ -3319,6 +3508,7 @@ pub async fn monitor_episodes(
     read_activity: &Arc<crate::read_activity::ReadActivity>,
     idle_window: Duration,
     remove_finished_shows: bool,
+    assumed: &AssumedCoverage,
 ) {
     use crate::wanted::Action;
     use std::collections::HashSet;
@@ -3343,7 +3533,7 @@ pub async fn monitor_episodes(
     let wanted_by = group_wanted_by_tmdb(store).await;
 
     // Same owned-grouping + availability logic as plan_reconcile_ops (shared helper).
-    let owned_by = group_owned_by_tmdb(store).await;
+    let mut owned_by = group_owned_by_tmdb(store).await;
     let present: HashSet<String> = torrents
         .iter()
         .map(|t| t.hash.to_ascii_lowercase())
@@ -3354,6 +3544,8 @@ pub async fn monitor_episodes(
             "monitor_episodes: the provider listing is empty but the library is not; treating it as suspect (no re-acquire of owned episodes, no removal) this tick"
         );
     }
+    assumed.retain_valid(store, &present, listing_suspect).await;
+    assumed.apply(&mut owned_by);
 
     // Only Show titles. (Owned-but-unwanted shows are handled by reconcile_wanted's Trigger-B path;
     // monitor_episodes is the wanted-set's air-date driver.)
@@ -3414,7 +3606,7 @@ pub async fn monitor_episodes(
                     if let Some(g) = owned_group {
                         prov.merge(&g.provenance);
                     }
-                    execute_acquire(
+                    let outcome = execute_acquire(
                         engine,
                         tmdb,
                         tmdb_id,
@@ -3425,13 +3617,30 @@ pub async fn monitor_episodes(
                         imdb_hint_from_wanted(wanted),
                     )
                     .await;
+                    // `Acquired` names an owned copy that is present and assumed to supply the
+                    // episode. A settled one whose `provides` is empty covers nothing in the
+                    // grouping, so remember the answer instead of asking again next run.
+                    if let Some(crate::acquire::AcquireOutcome::Acquired(hash)) = outcome {
+                        let unknown_coverage =
+                            store.get_owned(hash.clone()).await.is_some_and(|r| {
+                                r.status == OwnedStatus::Verified && r.provides.is_empty()
+                            });
+                        if unknown_coverage {
+                            debug!(
+                                "monitor_episodes: tmdb {} S{:02}E{:02} counted as supplied by {} (its episodes are unknown)",
+                                tmdb_id, season, episode, hash
+                            );
+                            assumed.note(&hash, (season, episode));
+                        }
+                    }
                 }
                 // Trigger A (Finished) reclaims pre-existing mirror copies (empty-provenance records
                 // for a show already in the library) ONLY when `REMOVE_FINISHED_SHOWS` is on — the
-                // opt-in finish-cleanup folds such shows in for exactly this. With the flag off, a
-                // Trigger-A removal can only come from a genuine in-progress re-watch, so it removes
-                // only the engine-acquired hashes and keeps the user's own library. Trigger B
-                // (Abandoned) always keeps mirror copies. (`hash` is a representative.)
+                // opt-in finish-cleanup folds such shows in for exactly this. With the flag off it
+                // removes only the engine-acquired hashes and keeps the user's own library (the sync
+                // marks a playback or catch-up show behind, so nothing it writes reads as finished
+                // then, but a removal must never reach the user's copies). Trigger B (Abandoned)
+                // always keeps mirror copies. (`hash` is a representative.)
                 Action::Remove {
                     tmdb_id, reason, ..
                 } => {
@@ -4013,6 +4222,116 @@ mod tests {
             .expect("backfilled");
         assert_eq!(q.resolution, 2160);
         assert!(!crate::release::is_unknown_quality(&q, 1080));
+    }
+
+    /// A show record whose `provides` is empty (mirrored before its files were selected, or from
+    /// file names the episode parser could not decode then) gets its `provides` re-derived from the
+    /// listed torrent's files by the mirror pass, so the episode monitor counts its episodes as
+    /// covered instead of re-planning them every run. A `Pending` record (`observe` settles its
+    /// `provides`) and a record that already lists episodes are left alone.
+    #[tokio::test]
+    async fn record_mirror_owned_backfills_an_empty_provides_of_an_existing_show_record() {
+        use crate::scraper::MediaKind;
+        let store = Store::in_memory();
+        let base = dedup_rec(MediaKind::Series, 1396, vec![], Some(1));
+        for (h, status, provides) in [
+            ("hempty", OwnedStatus::Verified, vec![]),
+            ("hpending", OwnedStatus::Pending, vec![]),
+            ("hknown", OwnedStatus::Verified, vec![(1, 1)]),
+        ] {
+            store
+                .put_owned(
+                    h.into(),
+                    OwnedRecord {
+                        status,
+                        provides,
+                        ..base.clone()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let show = MediaMetadata {
+            title: "Show".into(),
+            year: None,
+            media_type: MediaType::Show,
+            external_id: Some("tmdb:1396".into()),
+        };
+        let pack = |hash: &str| crate::rd_client::TorrentInfo {
+            hash: hash.to_ascii_uppercase(),
+            files: ["Show.S01E01.1080p.WEB.mkv", "Show.S01E02.1080p.WEB.mkv"]
+                .iter()
+                .enumerate()
+                .map(|(i, path)| crate::rd_client::TorrentFile {
+                    id: i as u32,
+                    path: format!("Show.S01/{path}"),
+                    bytes: 1_000_000_000,
+                    selected: 1,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let data: Vec<_> = ["hempty", "hpending", "hknown"]
+            .iter()
+            .map(|h| (pack(h), show.clone()))
+            .collect();
+        let tmdb = TmdbClient::offline().await; // never called: every hash is already owned
+        let prefs = crate::config::AcquisitionConfig::default().prefs;
+        record_mirror_owned(&store, &tmdb, &prefs, &data).await;
+        let provides = |h: &str| {
+            let store = store.clone();
+            let h = h.to_string();
+            async move { store.get_owned(h).await.unwrap().provides }
+        };
+        assert_eq!(provides("hempty").await, vec![(1, 1), (1, 2)]);
+        assert!(provides("hpending").await.is_empty(), "observe settles it");
+        assert_eq!(provides("hknown").await, vec![(1, 1)], "never overwritten");
+    }
+
+    /// A pack mirrored while the episode parser could not read its `NxM` file names
+    /// (`Show - 2x05 - Title.mkv`) was recorded with an empty `provides`; now that `parse_se_all`
+    /// reads that form, the mirror pass heals it from the listed files.
+    #[tokio::test]
+    async fn record_mirror_owned_heals_a_pack_mirrored_with_nxm_file_names() {
+        use crate::scraper::MediaKind;
+        let store = Store::in_memory();
+        store
+            .put_owned(
+                "hnxm".into(),
+                dedup_rec(MediaKind::Series, 1396, vec![], Some(1)),
+            )
+            .await
+            .unwrap();
+        let info = crate::rd_client::TorrentInfo {
+            hash: "HNXM".into(),
+            files: [
+                "Show - 2x05 - First Title.mkv",
+                "Show - 2x06 - Second Title.mkv",
+            ]
+            .iter()
+            .enumerate()
+            .map(|(i, path)| crate::rd_client::TorrentFile {
+                id: i as u32,
+                path: format!("Show Season 2/{path}"),
+                bytes: 1_000_000_000,
+                selected: 1,
+            })
+            .collect(),
+            ..Default::default()
+        };
+        let show = MediaMetadata {
+            title: "Show".into(),
+            year: None,
+            media_type: MediaType::Show,
+            external_id: Some("tmdb:1396".into()),
+        };
+        let tmdb = TmdbClient::offline().await; // never called: the hash is already owned
+        let prefs = crate::config::AcquisitionConfig::default().prefs;
+        record_mirror_owned(&store, &tmdb, &prefs, &[(info, show)]).await;
+        assert_eq!(
+            store.get_owned("hnxm".into()).await.unwrap().provides,
+            vec![(2, 5), (2, 6)]
+        );
     }
 
     #[test]
@@ -6570,7 +6889,8 @@ mod trakt_sync_tests {
                 },
                 watched_state: WatchedState::Show {
                     watched_episodes: vec![],
-                    trakt_behind: false,
+                    // In `/sync/playback`: partway through, never read as finished.
+                    trakt_behind: true,
                 },
                 show_status: None,
                 imdb_id: None,
@@ -7841,19 +8161,19 @@ mod trakt_sync_tests {
                 },
                 complete: true,
             };
-            let present: HashSet<String> = ["adol".to_string()].into_iter().collect();
+            let present: HashSet<String> = ["hmini".to_string()].into_iter().collect();
             plan_episode_actions(tmdb_id, &wanted, owned, &present, &aired, false)
         };
 
         // Example Miniseries: a pre-existing (account-mirror, EMPTY provenance) copy, present.
         let miniseries = OwnedGroup {
-            hashes: vec!["adol".to_string()],
+            hashes: vec!["hmini".to_string()],
             engine_hashes: vec![],
             provenance: Provenance { entries: vec![] },
             owned_episodes: (1..=4).map(|e| (1, e)).collect(),
             media_type: MediaType::Show,
             coverage: vec![RecordCoverage {
-                hash: "adol".to_string(),
+                hash: "hmini".to_string(),
                 pending: false,
                 episodes: (1..=4).map(|e| (1, e)).collect(),
             }],
@@ -7862,14 +8182,14 @@ mod trakt_sync_tests {
             plan(&watched, MINISERIES, Some(&miniseries)),
             vec![Action::Remove {
                 tmdb_id: MINISERIES,
-                hash: "adol".to_string(),
+                hash: "hmini".to_string(),
                 reason: RemoveReason::Finished
             }],
             "a fully-watched Ended in-progress show is now a Trigger-A finish removal"
         );
         assert_eq!(
             removal_hashes(&miniseries, RemoveReason::Finished, true),
-            vec!["adol".to_string()],
+            vec!["hmini".to_string()],
             "REMOVE_FINISHED_SHOWS reclaims the library copy"
         );
         // Example Drama (not owned): catch-up acquires ONLY the two unwatched aired episodes.
@@ -8372,6 +8692,79 @@ mod reconcile_wanted_tests {
         );
     }
 
+    /// A present mirror pack whose `provides` is empty covers nothing on its own. The episodes
+    /// `acquire` was found to answer with it count as covered once remembered, so only the rest is
+    /// planned; an entry for a copy that has left the listing, or whose record now lists its
+    /// episodes, is dropped.
+    #[tokio::test]
+    async fn plan_episode_actions_counts_episodes_assumed_supplied_by_a_pack_of_unknown_coverage() {
+        use crate::wanted::Action;
+        let store = mem_store();
+        store
+            .put_owned(
+                "hpack".into(),
+                OwnedRecord {
+                    status: OwnedStatus::Verified,
+                    ..owned_record(100, MediaKind::Series, Provenance { entries: vec![] })
+                },
+            )
+            .await
+            .unwrap();
+        let wanted = vec![wanted_show("alice", 100, true, false)];
+        let present: std::collections::HashSet<String> =
+            ["hpack".to_string()].into_iter().collect();
+        let aired = AiredEpisodes {
+            pairs: vec![(1, 1), (1, 2), (1, 3)],
+            complete: true,
+        };
+        let acquires = |owned_by: &std::collections::BTreeMap<(MediaType, u64), OwnedGroup>| {
+            plan_episode_actions(
+                100,
+                &wanted,
+                owned_by.get(&(MediaType::Show, 100)),
+                &present,
+                &aired,
+                false,
+            )
+        };
+        assert_eq!(
+            acquires(&group_owned_by_tmdb(&store).await).len(),
+            3,
+            "on its own the pack covers nothing"
+        );
+
+        let assumed = AssumedCoverage::default();
+        assumed.note("HPACK", (1, 1));
+        assumed.note("hpack", (1, 2));
+        assumed.retain_valid(&store, &present, false).await;
+        let mut owned_by = group_owned_by_tmdb(&store).await;
+        assumed.apply(&mut owned_by);
+        assert_eq!(
+            acquires(&owned_by),
+            vec![Action::AcquireEpisode {
+                tmdb_id: 100,
+                season: 1,
+                episode: 3
+            }]
+        );
+
+        // Gone from the listing: forgotten (a suspect empty listing proves nothing, though).
+        let empty = std::collections::HashSet::new();
+        assumed.retain_valid(&store, &empty, true).await;
+        assert_eq!(assumed.lock().len(), 1, "kept on a suspect listing");
+        assumed.retain_valid(&store, &empty, false).await;
+        assert!(assumed.lock().is_empty());
+
+        // Its episodes now known: the record speaks for itself.
+        assumed.note("hpack", (1, 1));
+        store
+            .set_provides_if_empty("hpack".into(), vec![(1, 1), (1, 2)])
+            .await
+            .unwrap();
+        assumed.retain_valid(&store, &present, false).await;
+        assert!(assumed.lock().is_empty());
+    }
+
     #[test]
     fn an_empty_listing_is_suspect_until_seen_three_times_in_a_row_over_ten_minutes() {
         let long = MIN_EMPTY_DURATION;
@@ -8555,11 +8948,112 @@ mod reconcile_wanted_tests {
         );
     }
 
+    /// A movie still in `/sync/playback` is one the user is partway through. One they have watched
+    /// before is a paused re-watch, which the sync writes as not watched: its engine copy is kept
+    /// (no Trigger A), and with no copy it is acquired.
+    #[tokio::test]
+    async fn a_paused_rewatch_of_a_movie_is_kept_and_acquired() {
+        use crate::trakt_client::{TraktItem, WatchedData};
+        let playback = [TraktItem {
+            media_type: MediaType::Movie,
+            tmdb_id: 27205,
+            imdb_id: None,
+        }];
+        let watched = WatchedData {
+            movies: vec![27205],
+            shows: vec![],
+        };
+        let rows = build_wanted(
+            "alice",
+            &[],
+            &playback,
+            &watched,
+            &HashMap::new(),
+            None,
+            None,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].watched_state,
+            WatchedState::Movie { watched: false }
+        );
+
+        let store = mem_store();
+        store.put_wanted(rows[0].clone()).await.unwrap();
+        assert_eq!(
+            plan_reconcile_ops(&store, &[]).await,
+            vec![ReconcileOp::Acquire {
+                tmdb_id: 27205,
+                kind: MediaKind::Movie,
+                season: None,
+                episode: None,
+                provenance: Provenance::in_progress("alice"),
+                imdb_id: None,
+            }],
+            "not owned: acquired for the re-watch"
+        );
+        store
+            .put_owned(
+                "abc".into(),
+                OwnedRecord {
+                    status: OwnedStatus::Verified,
+                    ..owned_record(27205, MediaKind::Movie, Provenance::in_progress("alice"))
+                },
+            )
+            .await
+            .unwrap();
+        let ops = plan_reconcile_ops(&store, &[torrent("t1", "abc")]).await;
+        assert!(ops.is_empty(), "the engine copy is kept: {ops:?}");
+    }
+
+    /// The same for a show: a fully watched Ended show still in `/sync/playback` (a paused re-watch
+    /// begun without resetting Trakt progress) is written as behind, so its engine-acquired episodes
+    /// are not finish-removed while it is paused.
+    #[test]
+    fn a_paused_rewatch_of_an_ended_show_is_not_finish_removed() {
+        use crate::trakt_client::{TraktItem, WatchedData, WatchedShow};
+        let playback = [TraktItem {
+            media_type: MediaType::Show,
+            tmdb_id: 100,
+            imdb_id: None,
+        }];
+        let watched = WatchedData {
+            movies: vec![],
+            shows: vec![WatchedShow {
+                tmdb_id: 100,
+                trakt_id: Some(1),
+                imdb_id: None,
+                watched_episodes: vec![(1, 1), (1, 2)],
+                last_watched_at: Some(1_000),
+            }],
+        };
+        let status = HashMap::from([(100u64, ShowStatus::Ended)]);
+        let rows = build_wanted("alice", &[], &playback, &watched, &status, None, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].watched_state,
+            WatchedState::Show {
+                watched_episodes: vec![(1, 1), (1, 2)],
+                trakt_behind: true,
+            }
+        );
+        let owned = owned_group_show(&["h1"], &[(1, 1), (1, 2)], Provenance::in_progress("alice"));
+        let present: std::collections::HashSet<String> = ["h1".to_string()].into_iter().collect();
+        let aired = AiredEpisodes {
+            pairs: vec![(1, 1), (1, 2)],
+            complete: true,
+        };
+        let actions = plan_episode_actions(100, &rows, Some(&owned), &present, &aired, false);
+        assert!(actions.is_empty(), "{actions:?}");
+    }
+
     #[tokio::test]
     async fn plan_finished_mirror_only_movie_emits_no_remove_op() {
-        // A movie the user already had in their library (mirror copy, EMPTY provenance) that they
-        // re-watch (in-progress + watched on Trakt) triggers Trigger-A, but `removal_hashes` protects
-        // the mirror copy (movies are never folded). The planner must NOT emit a no-op empty Remove
+        // A movie the user already had in their library (mirror copy, EMPTY provenance) whose wanted
+        // row reads finished (in-progress + watched: a state the sync no longer writes for a movie in
+        // `/sync/playback`, but the planner must stay safe on) triggers Trigger-A, but
+        // `removal_hashes` protects the mirror copy (movies are never folded). The planner must NOT
+        // emit a no-op empty Remove
         // op each tick — it would churn an empty op and a full selection-table read in execute_remove.
         let store = mem_store();
         store
@@ -9446,8 +9940,8 @@ mod reconcile_wanted_tests {
         // An engine-owned (watchlist-provenance) show, present in the listing, with an EMPTY `wanted`
         // set — the state left transiently by the v4→v5 migration clearing `wanted`. With an
         // untrustworthy set (no sync confirmed it), Trigger-B removal must be SUPPRESSED; once a sync
-        // confirms the (still-empty) set, the same reconcile removes it. Guards finding 7.1: a failed
-        // first post-migration sync must not delete engine-acquired content.
+        // confirms the (still-empty) set, the same reconcile removes it: a failed first
+        // post-migration sync must not delete engine-acquired content.
         let store = mem_store();
         store
             .put_owned(
@@ -9884,6 +10378,7 @@ mod monitor_episodes_tests {
                 &activity,
                 Duration::from_secs(300),
                 enabled,
+                &AssumedCoverage::default(),
             )
             .await;
 
@@ -9898,6 +10393,158 @@ mod monitor_episodes_tests {
                 assert!(store.get_owned("mirror".into()).await.is_some());
             }
         }
+    }
+
+    /// A watchlisted show held only as a present account-mirror pack whose file names decode no
+    /// episode (`provides` empty): the first run plans every aired episode, and `acquire` answers
+    /// each with that pack (scraping and listing the provider for each, adding nothing). The next
+    /// run remembers those answers and plans nothing, so it costs one listing, not one scrape and
+    /// one listing per episode every hour.
+    #[tokio::test]
+    async fn monitor_episodes_does_not_re_plan_episodes_a_pack_of_unknown_coverage_was_found_to_supply(
+    ) {
+        use crate::provider::MockProvider;
+        use crate::store::{OwnedRecord, OwnedStatus, Provenance, WantedRecord, WantedSources};
+        use crate::trakt_client::test_http::{spawn, Reply};
+        use std::sync::atomic::Ordering;
+        let server = spawn(vec![
+            (
+                "/tv/60?api_key=k",
+                Reply::json(r#"{"name":"Sixty","seasons":[{"season_number":1}]}"#),
+            ),
+            (
+                "/tv/60/season/1?api_key=k",
+                Reply::json(
+                    r#"{"episodes":[{"episode_number":1,"air_date":"2020-01-01"},{"episode_number":2,"air_date":"2020-01-08"},{"episode_number":3,"air_date":"2020-01-15"}]}"#,
+                ),
+            ),
+        ])
+        .await;
+        let tmdb =
+            Arc::new(TmdbClient::with_base_url("k".into(), server.base_url.clone()).unwrap());
+        let store = Store::in_memory();
+        store
+            .put_wanted(WantedRecord {
+                user: "alice".into(),
+                tmdb_id: 60,
+                media_type: MediaType::Show,
+                sources: WantedSources {
+                    watchlist: true,
+                    in_progress: false,
+                },
+                watched_state: crate::store::WatchedState::Show {
+                    watched_episodes: vec![],
+                    trakt_behind: false,
+                },
+                show_status: Some(crate::tmdb_client::ShowStatus::Returning),
+                imdb_id: Some("tt0000060".into()),
+            })
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "hpack".into(),
+                OwnedRecord {
+                    request: crate::store::AcquireRequest {
+                        imdb_id: "tt0000060".into(),
+                        tmdb_id: 60,
+                        kind: MediaKind::Series,
+                        season: None,
+                        episode: None,
+                        original_language: None,
+                        spoken_languages: None,
+                        metadata: MediaMetadata {
+                            title: "Sixty".into(),
+                            year: None,
+                            media_type: MediaType::Show,
+                            external_id: Some("tmdb:60".into()),
+                        },
+                    },
+                    provenance: Provenance { entries: vec![] },
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                },
+            )
+            .await
+            .unwrap();
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent {
+                id: "tpack".into(),
+                hash: "hpack".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            added: added.clone(),
+            get_torrents_calls: listings.clone(),
+            ..Default::default()
+        });
+        // Torrentio lists the pack under every episode of the season.
+        let scraper: Arc<dyn crate::scraper::Scraper> = Arc::new(crate::scraper::MockScraper {
+            candidates: vec![crate::release::RawCandidate {
+                name: "Torrentio\n1080p".into(),
+                description: "Sixty.S01.1080p.BluRay.x265\nRD+".into(),
+                info_hash: "hpack".into(),
+                file_idx: Some(0),
+                file_name: Some("Sixty.1x01.1080p.BluRay.x265.mkv".into()),
+            }],
+        });
+        let validator: Arc<dyn crate::acquire::TitleValidator> =
+            Arc::new(crate::acquire::TmdbTitleValidator { tmdb: tmdb.clone() });
+        let prober: Arc<dyn crate::acquire::Prober> = Arc::new(crate::acquire::HttpProber {
+            http: reqwest::Client::new(),
+        });
+        let engine = AcquisitionEngine::new(
+            provider.clone(),
+            scraper,
+            validator,
+            prober,
+            store.clone(),
+            crate::config::AcquisitionConfig::default().prefs,
+            5,
+            Duration::from_secs(1800),
+            Duration::from_secs(600),
+        );
+        let activity = Arc::new(crate::read_activity::ReadActivity::without_startup_grace());
+        let assumed = AssumedCoverage::default();
+        let run = || {
+            monitor_episodes(
+                &engine,
+                &provider,
+                &tmdb,
+                &store,
+                &activity,
+                Duration::from_secs(300),
+                false,
+                &assumed,
+            )
+        };
+
+        run().await;
+        let first = listings.load(Ordering::SeqCst);
+        assert!(
+            first > 1,
+            "the first run asks acquire about each episode ({first} listings)"
+        );
+        run().await;
+        assert_eq!(
+            listings.load(Ordering::SeqCst) - first,
+            1,
+            "the second run lists the provider once and acquires nothing"
+        );
+        assert!(added.lock().unwrap().is_empty(), "nothing is ever added");
+        assert!(
+            store
+                .get_owned("hpack".into())
+                .await
+                .unwrap()
+                .provides
+                .is_empty(),
+            "the record itself is untouched"
+        );
     }
 }
 
@@ -10782,6 +11429,143 @@ mod scan_tick_tests {
             .find(|(i, _)| i.id == "tstage")
             .expect("shown once recorded");
         assert_eq!(staged.1, movie_meta(27205));
+    }
+
+    /// A provider whose listing is `inner`'s, after which the upgrade job discards the candidate
+    /// `hash` (deletes its torrent and closes its staging intent), as it can while `observe` runs.
+    struct DiscardedAfterListing {
+        inner: MockProvider,
+        store: Store,
+        hash: String,
+    }
+    impl std::fmt::Debug for DiscardedAfterListing {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("DiscardedAfterListing")
+                .field("hash", &self.hash)
+                .finish_non_exhaustive()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DebridProvider for DiscardedAfterListing {
+        fn name(&self) -> &'static str {
+            "discarded-after-listing"
+        }
+        async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
+            let listing = self.inner.get_torrents().await;
+            self.store
+                .clear_staging_intent(self.hash.clone())
+                .await
+                .unwrap();
+            listing
+        }
+        async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
+            self.inner.get_torrent_info(id).await
+        }
+        async fn add_magnet(
+            &self,
+            magnet: &str,
+        ) -> Result<crate::rd_client::AddMagnetResponse, reqwest::Error> {
+            self.inner.add_magnet(magnet).await
+        }
+        async fn select_files(&self, t: &str, f: &str) -> Result<(), reqwest::Error> {
+            self.inner.select_files(t, f).await
+        }
+        async fn delete_torrent(&self, id: &str) -> Result<(), reqwest::Error> {
+            self.inner.delete_torrent(id).await
+        }
+        async fn resolve_url(
+            &self,
+            l: &crate::provider::FileLocator,
+        ) -> Result<String, crate::error::AppError> {
+            self.inner.resolve_url(l).await
+        }
+        async fn invalidate(&self, l: &crate::provider::FileLocator) {
+            self.inner.invalidate(l).await
+        }
+    }
+
+    /// A candidate in the listing whose staging is abandoned (torrent deleted, intent closed) after
+    /// the listing but before the staging sweep reads the intents is still kept out of the tick: not
+    /// shown, not identified, not mirrored. Its intent was open when the tick started.
+    #[tokio::test]
+    async fn a_candidate_discarded_after_the_listing_is_kept_out_of_the_tick() {
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let store = Store::in_memory();
+        store
+            .put_staging_intent("hstage".into(), crate::now_unix_secs())
+            .await
+            .unwrap();
+        let infos = [
+            info("tstage", "hstage", &[("Some.Other.Name.2001.mkv", 1)]),
+            info("tkeep", "hkeep", &[("Film.Keep.2001.mkv", 1)]),
+        ];
+        store
+            .put_authoritative("hkeep".into(), movie_meta(8))
+            .await
+            .unwrap();
+        let provider: Arc<dyn DebridProvider> = Arc::new(DiscardedAfterListing {
+            inner: MockProvider {
+                torrents: vec![listed("tstage", "hstage"), listed("tkeep", "hkeep")],
+                torrent_info_by_id: infos.iter().map(|i| (i.id.clone(), i.clone())).collect(),
+                ..Default::default()
+            },
+            store: store.clone(),
+            hash: "hstage".into(),
+        });
+        let app = app(store.clone(), provider, None, false).await;
+        let mut state = ScanState::new(HashMap::new(), 60);
+
+        let data = done(scan_tick(&app, &mut state, &mut shutdown).await);
+        assert!(store.all_staging_intents().await.is_empty(), "closed");
+        assert_eq!(ids(&data), vec!["tkeep"]);
+        assert!(!state.seen_torrents.contains_key("tstage"));
+        assert!(!state.tmdb_retry.contains_key("tstage"));
+        assert!(store.get_match("tstage".into()).await.is_none());
+        assert!(store.get_owned("hstage".into()).await.is_none());
+    }
+
+    /// The repair replacements a tick takes are put back when its listing fails, so the next tick
+    /// still reuses the repaired torrent's identification (without asking TMDB) instead of
+    /// re-identifying the replacement from its file names.
+    #[tokio::test]
+    async fn a_failed_listing_keeps_the_repair_replacements_for_the_next_tick() {
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let store = Store::in_memory();
+        let seen = HashMap::from([(
+            "told".to_string(),
+            (
+                info("told", "hrep", &[("Film.Repaired.2001.mkv", 1)]),
+                movie_meta(5),
+            ),
+        )]);
+        let provider: Arc<dyn DebridProvider> = Arc::new(ListingSeq {
+            inner: MockProvider {
+                torrents: vec![listed("tnew", "hrep")],
+                torrent_info_by_id: HashMap::from([(
+                    "tnew".to_string(),
+                    info("tnew", "hrep", &[("Film.Repaired.2001.mkv", 1)]),
+                )]),
+                ..Default::default()
+            },
+            listings: Mutex::new(VecDeque::from([Err(())])),
+        });
+        let app = app(store.clone(), provider, None, false).await;
+        app.repair_manager
+            .restore_repair_replacements(HashMap::from([("tnew".to_string(), "told".to_string())]))
+            .await;
+        let mut state = ScanState::new(seen, 60);
+        assert!(matches!(
+            scan_tick(&app, &mut state, &mut shutdown).await,
+            TickEnd::Skipped
+        ));
+        let data = done(scan_tick(&app, &mut state, &mut shutdown).await);
+        assert_eq!(ids(&data), vec!["tnew"]);
+        assert_eq!(data[0].1, movie_meta(5), "the old identification is reused");
+        assert_eq!(
+            store.get_match("tnew".into()).await.map(|(_, m)| m),
+            Some(movie_meta(5))
+        );
+        assert!(!state.tmdb_retry.contains_key("tnew"));
     }
 
     /// A release `observe` rejects on a tick after the one it was first shown in (a second

@@ -36,6 +36,40 @@ pub fn resolve_port(raw: Option<&str>) -> (u16, bool) {
     }
 }
 
+/// What to report when loading `.env` failed, or `None` when it loaded or there is no `.env` (a
+/// container, or a native run configured by exported variables). dotenvy stops at the first line it
+/// can't parse, e.g. an unquoted value containing a space, and leaves every later line unset, so a
+/// malformed file would otherwise start the service with those settings silently at their defaults
+/// (an `UPGRADE_INTERVAL_SECS=0` lost that way turns the upgrade engine back on). The message never
+/// repeats the offending text: dotenvy's error carries the line or its value, which can be a token.
+fn dotenv_failure(result: &Result<std::path::PathBuf, dotenvy::Error>) -> Option<String> {
+    match result {
+        Ok(_) => None,
+        Err(e) if e.not_found() => None,
+        Err(dotenvy::Error::LineParse(..)) => Some(
+            "Configuration error: a line of .env could not be parsed, and it and every setting \
+             after it would be ignored. Quote a value that contains spaces (e.g. \
+             TRAKT_CATCHUP_LOOKBACK=\"6 months\"), and check for an unclosed quote or a stray \
+             backslash. The line is not shown, since it may hold a token."
+                .to_string(),
+        ),
+        Err(dotenvy::Error::Io(e)) => {
+            Some(format!("Configuration error: could not read .env: {e}"))
+        }
+        Err(_) => Some("Configuration error: could not load .env".to_string()),
+    }
+}
+
+/// Load `.env` (the first one found from the working directory up) into the process environment,
+/// leaving a variable that is already set alone. `Ok` when it loaded or there is none; `Err` with a
+/// token-free message ([`dotenv_failure`]) when it exists but could not be loaded, since dotenvy
+/// then applied only the lines before the bad one. The service exits on `Err` (`main`), and so do
+/// the live test binaries (`tests/common`'s `load_env`): a test whose provider token sat below the
+/// bad line would read it as unset and skip, passing the pre-commit gate having tested nothing.
+pub fn load_dotenv() -> Result<(), String> {
+    dotenv_failure(&dotenvy::dotenv()).map_or(Ok(()), Err)
+}
+
 /// Parse a numeric env knob. Unset or blank → `default`; a value that doesn't parse as `T` warns
 /// (`Invalid NAME value '…', falling back to N`) and falls back to `default`; the result, the
 /// default included, is then clamped to `[min, max]` (`max: None` = no upper bound), so lowering a
@@ -101,30 +135,60 @@ pub enum AudioReq {
     Original,
 }
 
-/// A plausible ISO-639 language code: 2 (ISO 639-1) or 3 (ISO 639-2) ASCII letters. Anything else —
-/// a full name ("english"), a locale ("pt-BR"), a typo — never matches the codes `probe` extracts, so
-/// accepting it would silently penalise every candidate and quietly stall acquisition. Such values
-/// are rejected back to the knob's default (with a warning) rather than taken verbatim.
-fn is_iso_lang_code(v: &str) -> bool {
-    matches!(v.len(), 2 | 3) && v.bytes().all(|b| b.is_ascii_alphabetic())
+/// Three-letter words that are not ISO 639-2 codes but that an operator may write to mean "no
+/// requirement". `SUBTITLE_LANGUAGE` takes `off` as `none`; otherwise they are rejected, since taken
+/// as written they would match no track.
+const NOT_LANGUAGE_CODES: [&str; 3] = ["off", "any", "all"];
+
+/// Read a trimmed, non-keyword `AUDIO_LANGUAGE` / `SUBTITLE_LANGUAGE` value (`name`) as a language
+/// code, lowercased, or `None` when it is no language code; the caller then falls back to its
+/// default, the keyword `fallback`, which the warnings name along with what it does
+/// (`fallback_means`). The probe compares this code with every track's language, so a value that
+/// names no language matches no track: every release is rejected and its hash blacklisted for 30
+/// days. Hence:
+/// - 2 letters: kept only if `probe::is_known_language_code` knows it. Its ISO 639-1 table is
+///   complete, so anything else (`xy`) is a typo and is rejected with a warning. `no` is kept as
+///   Norwegian, with a warning, since it reads like "no requirement".
+/// - 3 letters: kept. A code the probe doesn't know is warned about, since that is what a misspelt
+///   code (`egn`) looks like, but rare valid ISO 639-2 codes (`haw`) aren't in its tables either.
+///   The words in [`NOT_LANGUAGE_CODES`] are rejected.
+/// - anything else (a full name like `english`, a locale like `pt-BR`): rejected with a warning.
+fn parse_lang_code(name: &str, v: &str, fallback: &str, fallback_means: &str) -> Option<String> {
+    let code = v.to_ascii_lowercase();
+    let letters = matches!(code.len(), 2 | 3) && code.bytes().all(|b| b.is_ascii_alphabetic());
+    let known = crate::probe::is_known_language_code(&code);
+    if !letters || (code.len() == 2 && !known) || NOT_LANGUAGE_CODES.contains(&code.as_str()) {
+        warn!(
+            "Invalid {name} '{v}' (expected an ISO 639 language code such as 'en' or 'eng', or \
+             '{fallback}'); falling back to '{fallback}' ({fallback_means})"
+        );
+        return None;
+    }
+    if code == "no" {
+        warn!(
+            "{name} '{v}' is Norwegian, so a release with no Norwegian track is rejected. Use \
+             '{fallback}' for {fallback_means}; to keep Norwegian without this warning, write 'nor'"
+        );
+    } else if !known {
+        warn!(
+            "{name} '{v}' is not a language code this build knows; using it as written. If it is \
+             misspelt, no track matches it and every release is rejected and blacklisted for 30 \
+             days"
+        );
+    }
+    Some(code)
 }
 
 impl AudioReq {
-    /// `None`/empty/"original" → Original; a valid 2-/3-letter ISO code → that language; any other
+    /// `None`/empty/"original" → Original; a language code → that language, lowercased
+    /// ([`parse_lang_code`], which warns about an unknown 3-letter code and about `no`); any other
     /// non-empty value is invalid (warned) and falls back to Original.
     pub fn parse(s: Option<String>) -> Self {
         match s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
             None => AudioReq::Original,
             Some(v) if v.eq_ignore_ascii_case("original") => AudioReq::Original,
-            Some(v) if is_iso_lang_code(&v) => AudioReq::Lang(v.to_ascii_lowercase()),
-            Some(v) => {
-                warn!(
-                    "Invalid AUDIO_LANGUAGE '{}' (expected a 2-/3-letter ISO code or 'original'); \
-                     falling back to 'original'",
-                    v
-                );
-                AudioReq::Original
-            }
+            Some(v) => parse_lang_code("AUDIO_LANGUAGE", &v, "original", "the title's languages")
+                .map_or(AudioReq::Original, AudioReq::Lang),
         }
     }
 }
@@ -137,21 +201,17 @@ pub enum SubReq {
 }
 
 impl SubReq {
-    /// `None`/empty/"none" → None (skip); a valid 2-/3-letter ISO code → that language; any other
+    /// `None`/empty/"none"/"off" → None (skip); a language code → that language, lowercased
+    /// ([`parse_lang_code`], which warns about an unknown 3-letter code and about `no`); any other
     /// non-empty value is invalid (warned) and falls back to None (skip the check).
     pub fn parse(s: Option<String>) -> Self {
         match s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
             None => SubReq::None,
-            Some(v) if v.eq_ignore_ascii_case("none") => SubReq::None,
-            Some(v) if is_iso_lang_code(&v) => SubReq::Lang(v.to_ascii_lowercase()),
-            Some(v) => {
-                warn!(
-                    "Invalid SUBTITLE_LANGUAGE '{}' (expected a 2-/3-letter ISO code or 'none'); \
-                     skipping the subtitle check",
-                    v
-                );
+            Some(v) if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") => {
                 SubReq::None
             }
+            Some(v) => parse_lang_code("SUBTITLE_LANGUAGE", &v, "none", "no subtitle check")
+                .map_or(SubReq::None, SubReq::Lang),
         }
     }
 }
@@ -1319,9 +1379,133 @@ mod tests {
     }
 
     #[test]
+    fn language_reqs_reject_an_unknown_two_letter_code_to_the_default() {
+        // `probe::to_iso639_2` holds the complete ISO 639-1 table, so a 2-letter value it doesn't
+        // know is a typo. Taken as written it would match no track, and every release would be
+        // rejected and blacklisted for 30 days.
+        let logs = captured_warnings(|| {
+            assert_eq!(AudioReq::parse(Some("xy".into())), AudioReq::Original);
+            assert_eq!(SubReq::parse(Some("xy".into())), SubReq::None);
+        });
+        assert!(
+            logs.contains("Invalid AUDIO_LANGUAGE 'xy'")
+                && logs.contains("Invalid SUBTITLE_LANGUAGE 'xy'"),
+            "an unknown 2-letter code must be rejected with a warning: {logs:?}"
+        );
+        // Known codes, TMDB's non-ISO `cn` and a /T form are kept, silently.
+        let logs = captured_warnings(|| {
+            for code in ["en", "eng", "deu", "cn", "yue", "zxx", "cmn", "mul"] {
+                assert_eq!(
+                    AudioReq::parse(Some(code.into())),
+                    AudioReq::Lang(code.into()),
+                    "{code}"
+                );
+                assert_eq!(
+                    SubReq::parse(Some(code.into())),
+                    SubReq::Lang(code.into()),
+                    "{code}"
+                );
+            }
+        });
+        assert!(logs.is_empty(), "a known code must not warn: {logs:?}");
+    }
+
+    #[test]
+    fn language_reqs_keep_an_unknown_three_letter_code_with_a_warning() {
+        // A transposed 3-letter code (`egn`) is the commonest typo, but rare valid ISO 639-2 codes
+        // (`haw`, Hawaiian) aren't in the probe's tables either, so it is kept and warned about.
+        let logs = captured_warnings(|| {
+            assert_eq!(
+                AudioReq::parse(Some("EGN".into())),
+                AudioReq::Lang("egn".into())
+            );
+            assert_eq!(
+                SubReq::parse(Some("egn".into())),
+                SubReq::Lang("egn".into())
+            );
+        });
+        assert!(
+            logs.contains("AUDIO_LANGUAGE 'EGN' is not a language code")
+                && logs.contains("SUBTITLE_LANGUAGE 'egn' is not a language code"),
+            "an unknown 3-letter code must warn, naming the variable: {logs:?}"
+        );
+        assert!(
+            logs.contains("blacklisted"),
+            "the warning says what a misspelt code does: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn language_reqs_read_words_that_are_not_codes_as_the_default() {
+        // `off` is the boolean knobs' word for "no", so SUBTITLE_LANGUAGE takes it as `none`,
+        // silently. `any` / `all` are three letters but no ISO 639-2 code: taken as written they
+        // would match no track, so they fall back to the default with a warning.
+        let logs = captured_warnings(|| {
+            assert_eq!(SubReq::parse(Some("off".into())), SubReq::None);
+            assert_eq!(SubReq::parse(Some(" OFF ".into())), SubReq::None);
+        });
+        assert!(logs.is_empty(), "`off` is an alias of `none`: {logs:?}");
+        let logs = captured_warnings(|| {
+            for word in ["any", "ALL"] {
+                assert_eq!(SubReq::parse(Some(word.into())), SubReq::None, "{word}");
+            }
+            for word in ["off", "any", "All"] {
+                assert_eq!(
+                    AudioReq::parse(Some(word.into())),
+                    AudioReq::Original,
+                    "{word}"
+                );
+            }
+        });
+        for warned in [
+            "Invalid SUBTITLE_LANGUAGE 'any'",
+            "Invalid SUBTITLE_LANGUAGE 'ALL'",
+            "Invalid AUDIO_LANGUAGE 'off'",
+            "Invalid AUDIO_LANGUAGE 'any'",
+            "Invalid AUDIO_LANGUAGE 'All'",
+        ] {
+            assert!(logs.contains(warned), "{warned}: {logs:?}");
+        }
+    }
+
+    #[test]
+    fn language_reqs_keep_no_as_norwegian_with_a_warning() {
+        // `no` is Norwegian's ISO 639-1 code, so it is kept, but it reads like "no requirement";
+        // the warning names the keyword that skips the check and a spelling that keeps Norwegian.
+        let logs = captured_warnings(|| {
+            assert_eq!(SubReq::parse(Some("no".into())), SubReq::Lang("no".into()));
+            assert_eq!(
+                AudioReq::parse(Some("NO".into())),
+                AudioReq::Lang("no".into())
+            );
+        });
+        assert!(
+            logs.contains("SUBTITLE_LANGUAGE 'no' is Norwegian")
+                && logs.contains("AUDIO_LANGUAGE 'NO' is Norwegian"),
+            "{logs:?}"
+        );
+        assert!(
+            logs.contains("'none'") && logs.contains("'nor'"),
+            "{logs:?}"
+        );
+        // The 3-letter spellings are plain Norwegian, with no warning.
+        let logs = captured_warnings(|| {
+            assert_eq!(
+                SubReq::parse(Some("nor".into())),
+                SubReq::Lang("nor".into())
+            );
+            assert_eq!(
+                AudioReq::parse(Some("nob".into())),
+                AudioReq::Lang("nob".into())
+            );
+        });
+        assert!(logs.is_empty(), "{logs:?}");
+    }
+
+    #[test]
     fn language_reqs_reject_non_iso_values_to_the_default() {
-        // A full language name / locale / typo is not a 2-/3-letter ISO code, so it never matches
-        // the codes `probe` extracts. Accepting it verbatim would silently penalise every candidate
+        // A full language name or a locale is not a 2-/3-letter ISO code, so it never matches the
+        // codes `probe` extracts. Accepting it verbatim would silently penalise every candidate
         // and quietly stop acquisition — instead we fall back to the default (Original / skip).
         assert_eq!(
             AudioReq::parse(Some("english".into())),
@@ -1831,6 +2015,100 @@ mod tests {
         assert_eq!(parse_cdn_first_read_bytes(Some("0".into())), mb(2));
         assert_eq!(parse_cdn_first_read_bytes(Some("1".into())), mb(2));
         assert_eq!(parse_cdn_first_read_bytes(Some("999".into())), mb(16));
+    }
+
+    // The `dotenv_failure` tests build dotenvy's results without touching the process environment.
+    // Never call `load_dotenv` from a unit test: it searches from the working directory up, so it
+    // would load the developer's own `.env`, live tokens included.
+
+    #[test]
+    fn dotenv_failure_ignores_a_loaded_or_missing_file() {
+        assert_eq!(dotenv_failure(&Ok(std::path::PathBuf::from(".env"))), None);
+        // No .env at all (a container, or a native run configured by exported variables).
+        let missing = dotenvy::Error::Io(std::io::ErrorKind::NotFound.into());
+        assert_eq!(dotenv_failure(&Err(missing)), None);
+    }
+
+    #[test]
+    fn dotenv_failure_reports_a_malformed_line_without_echoing_it() {
+        // dotenvy stops at the first line it can't parse (an unquoted value with a space), so every
+        // later setting would silently fall back to its default. Built through `from_read_iter`, which
+        // parses without touching the process environment.
+        let err = dotenvy::from_read_iter("RD_API_TOKEN=SECRET token".as_bytes())
+            .next()
+            .expect("one line")
+            .expect_err("an unquoted space is a parse error");
+        let msg = dotenv_failure(&Err(err)).expect("a malformed .env must be reported");
+        assert!(msg.contains("quote"), "{msg}");
+        // The offending text can be a token, so it is never repeated.
+        assert!(!msg.contains("SECRET"), "{msg}");
+    }
+
+    #[test]
+    fn dotenv_failure_reports_an_unreadable_file() {
+        let denied = dotenvy::Error::Io(std::io::ErrorKind::PermissionDenied.into());
+        let msg = dotenv_failure(&Err(denied)).expect("an unreadable .env must be reported");
+        assert!(msg.contains(".env"), "{msg}");
+    }
+
+    /// A live test binary that loaded `.env` itself and discarded the error (`dotenvy::dotenv().ok()`)
+    /// would, on a line dotenvy can't parse, read every setting after it as unset: a provider token
+    /// there makes each live test skip and report `ok`, so the pre-commit gate passes having tested
+    /// nothing, on a file the service refuses to start with. So they load it only through
+    /// `tests/common`'s `load_env`, which panics on that error (`load_dotenv`). The library's own
+    /// live tests (`#[ignore]`, e.g. identification's TMDB regressions) call `load_dotenv` directly,
+    /// so their panic names the bad `.env` rather than a missing key.
+    #[test]
+    fn live_tests_load_env_only_through_load_dotenv() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let src_offenders: Vec<String> = std::fs::read_dir(&src)
+            .expect("read src/")
+            .map(|entry| entry.expect("src/ entry").path())
+            // This file owns `load_dotenv`, the one place `.env` is loaded.
+            .filter(|p| p.extension().is_some_and(|e| e == "rs") && !p.ends_with("config.rs"))
+            .filter(|p| {
+                std::fs::read_to_string(p)
+                    .expect("read a library source")
+                    .contains("dotenvy::dotenv")
+            })
+            .map(|p| p.display().to_string())
+            .collect();
+        assert!(
+            src_offenders.is_empty(),
+            "these load .env themselves; call `crate::config::load_dotenv()` instead: \
+             {src_offenders:?}"
+        );
+        let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+        let mut files = vec![tests.join("common").join("mod.rs")];
+        for entry in std::fs::read_dir(&tests).expect("read tests/") {
+            let path = entry.expect("tests/ entry").path();
+            if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+        assert!(
+            files.len() > 5,
+            "the scan should find the test binaries: {files:?}"
+        );
+        let offenders: Vec<String> = files
+            .iter()
+            .filter(|p| {
+                std::fs::read_to_string(p)
+                    .expect("read a test source")
+                    .contains("dotenvy::dotenv")
+            })
+            .map(|p| p.display().to_string())
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these load .env themselves; call `common::load_env()` (or `common::token`) instead: \
+             {offenders:?}"
+        );
+        let common = std::fs::read_to_string(&files[0]).expect("read tests/common/mod.rs");
+        assert!(
+            common.contains("config::load_dotenv"),
+            "tests/common must load .env through config::load_dotenv"
+        );
     }
 
     /// In the container the app reads no `.env` (its working directory is `/data`), so compose.yml's

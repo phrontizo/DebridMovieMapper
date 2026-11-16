@@ -11,8 +11,10 @@ use std::time::{Duration, Instant};
 /// `select` which file ids to select, retrying until `select` returns something or `max_wait`
 /// elapses. `settle == 0` means a single immediate attempt (no polling). On success it selects the
 /// files and returns `(new_torrent_id, post_add_info)`. On any failure after the add — including the
-/// file list never resolving within `max_wait` — the leaked torrent is deleted before returning
-/// `Err` (so nothing leaks). The caller decides cached-vs-not by re-fetching final info.
+/// file list never resolving within `max_wait` — the added torrent is deleted before returning
+/// `Err`. A delete that fails (after the client's own retries) is logged at error with the torrent
+/// id and the torrent is left in the account. The caller decides cached-vs-not by re-fetching final
+/// info.
 ///
 /// The instant-repair path, its only caller, passes `settle == max_wait`: a single poll, since the
 /// re-added hash is known-good and its metadata should already be there. The multi-poll loop is
@@ -72,7 +74,7 @@ pub async fn materialise(
             Ok(i) => i,
             Err(e) => {
                 if cleanup_ok {
-                    let _ = provider.delete_torrent(&new_id).await;
+                    delete_added(provider, &new_id).await;
                 }
                 return Err(AppError::Http(e));
             }
@@ -86,7 +88,7 @@ pub async fn materialise(
 
     if ids.is_empty() {
         if cleanup_ok {
-            let _ = provider.delete_torrent(&new_id).await;
+            delete_added(provider, &new_id).await;
         }
         return Err(AppError::Repair(format!(
             "no matching files to select in torrent {}",
@@ -100,11 +102,25 @@ pub async fn materialise(
         .join(",");
     if let Err(e) = provider.select_files(&new_id, &ids_str).await {
         if cleanup_ok {
-            let _ = provider.delete_torrent(&new_id).await;
+            delete_added(provider, &new_id).await;
         }
         return Err(AppError::Http(e));
     }
     Ok((new_id, info))
+}
+
+/// Delete the torrent a failed [`materialise`] added. A failed delete leaves it in the account (on
+/// Real-Debrid un-selected, in `waiting_files_selection` for good), and the instant repair settles
+/// its `added` slot once `materialise` returns, so nothing deletes it later: log it with its id, as
+/// the repair's own leaked-torrent cleanup does.
+async fn delete_added(provider: &dyn DebridProvider, id: &str) {
+    if let Err(e) = provider.delete_torrent(id).await {
+        tracing::error!(
+            "Failed to delete torrent {} added by a failed re-add: {}",
+            id,
+            e
+        );
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +420,67 @@ mod tests {
             *provider.deleted.lock().unwrap(),
             vec!["tid".to_string()],
             "an unprotected failed materialise must delete the leaked torrent"
+        );
+    }
+
+    /// Everything logged at `ERROR` while `fut` runs.
+    async fn captured_errors<T>(fut: impl std::future::Future<Output = T>) -> (T, String) {
+        use tracing::instrument::WithSubscriber;
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let out = fut.with_subscriber(subscriber).await;
+        let bytes = buf.0.lock().unwrap().clone();
+        (out, String::from_utf8(bytes).unwrap())
+    }
+
+    /// A cleanup delete that fails leaves the added torrent in the account (on Real-Debrid
+    /// un-selected, in `waiting_files_selection` for good, and nothing else deletes it), so it must
+    /// be logged with the torrent's id rather than dropped silently.
+    #[tokio::test]
+    async fn materialise_logs_a_failed_cleanup_delete() {
+        let provider = MockProvider {
+            add_magnet: Some(AddMagnetResponse {
+                id: "added-42".into(),
+                uri: String::new(),
+            }),
+            fail_delete: true,
+            ..mock("downloaded")
+        };
+        let (r, logs) = captured_errors(materialise(
+            &provider,
+            "H",
+            Duration::ZERO,
+            Duration::ZERO,
+            None,
+            None,
+            |_| Vec::<u32>::new(),
+        ))
+        .await;
+        assert!(r.is_err(), "no matching files → Err");
+        assert_eq!(
+            *provider.deleted.lock().unwrap(),
+            vec!["added-42".to_string()],
+            "the cleanup delete is attempted once"
+        );
+        assert!(
+            logs.contains("ERROR") && logs.contains("added-42"),
+            "a failed cleanup delete must be logged with the torrent id, got: {logs:?}"
         );
     }
 }

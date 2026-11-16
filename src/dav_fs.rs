@@ -595,14 +595,19 @@ impl ProxiedMediaFile {
                     // `e.without_url()` strips the signed CDN URL from the error's Display —
                     // `reqwest::Error` embeds the request URL otherwise, leaking the sensitive
                     // capability link into the logs (matches the scrubbing probe.rs already does).
+                    if attempt == 0 {
+                        tracing::warn!(
+                            "CDN fetch failed for {}: {} — retrying with same URL",
+                            self.name,
+                            e.without_url()
+                        );
+                        continue;
+                    }
                     tracing::warn!(
-                        "CDN fetch failed for {}: {} — retrying with same URL",
+                        "CDN fetch failed for {}: {} — giving up",
                         self.name,
                         e.without_url()
                     );
-                    if attempt == 0 {
-                        continue;
-                    }
                     return Err(FsError::GeneralFailure);
                 }
             };
@@ -741,14 +746,19 @@ impl ProxiedMediaFile {
                         // the same transient failure as the send-error arm above, so retry once on
                         // the SAME url without invalidating, discarding the partial body. Strip the
                         // signed CDN URL from the error Display (see above).
+                        if attempt == 0 {
+                            tracing::warn!(
+                                "CDN body read failed for {}: {} — retrying with same URL",
+                                self.name,
+                                e.without_url()
+                            );
+                            continue 'attempts;
+                        }
                         tracing::warn!(
-                            "CDN body read failed for {}: {}",
+                            "CDN body read failed for {}: {} — giving up",
                             self.name,
                             e.without_url()
                         );
-                        if attempt == 0 {
-                            continue 'attempts;
-                        }
                         return Err(FsError::GeneralFailure);
                     }
                 }

@@ -196,15 +196,19 @@ impl JellyfinClient {
                         }
                     }
                 }
-                Err(e) if e.is_connect() || e.is_timeout() => {
-                    // Connect failures (not started yet) AND timeouts (slow/overloaded Jellyfin)
-                    // are both transient — retry. Only genuinely non-transient errors give up.
+                Err(e) if e.is_connect() || e.is_timeout() || e.is_request() => {
+                    // Connect failures (not started yet), timeouts (slow/overloaded Jellyfin) and a
+                    // connection that drops after the request was sent (Jellyfin restarting
+                    // mid-request: a reset, or closed before any response) are all transient, so
+                    // retry. Any other error (e.g. building the request) gives up.
                     tracing::warn!(
                         "Transient Jellyfin error ({}), attempt {}/{}",
                         if e.is_timeout() {
                             "timeout"
-                        } else {
+                        } else if e.is_connect() {
                             "cannot connect"
+                        } else {
+                            "connection dropped"
                         },
                         attempt + 1,
                         MAX_SEND_ATTEMPTS
@@ -754,6 +758,56 @@ mod tests {
             counter.load(Ordering::SeqCst) >= 2,
             "a transient timeout must be retried (>=2 connections), got {}",
             counter.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Loopback that, on the first `drop_n` connections, reads the request then closes the socket
+    /// without answering (Jellyfin restarting mid-request), then serves 200. Counts every accepted
+    /// connection.
+    async fn spawn_drop_then_200(
+        drop_n: usize,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c2 = counter.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut seen = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                c2.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                if seen < drop_n {
+                    seen += 1;
+                    // Close without a response: the connection ends before any response arrives,
+                    // a request error that is neither a connect error nor a timeout.
+                    drop(sock);
+                    continue;
+                }
+                let head = "HTTP/1.1 200 STATUS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{}", addr), counter)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notify_changes_retries_a_connection_dropped_mid_request() {
+        // Jellyfin restarting after it accepted the connection and read the request closes the
+        // connection with no response. Each scan tick sends its change set once, so only a retry
+        // delivers it.
+        use std::sync::atomic::Ordering;
+        let (url, counter) = spawn_drop_then_200(1).await;
+        let client = JellyfinClient::new(url, "key".to_string(), "/media".to_string()).unwrap();
+        client.notify_changes(&one_change()).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "a dropped connection then a 200 = two requests"
         );
     }
 }

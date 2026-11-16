@@ -188,7 +188,8 @@ pub enum Identification {
     Unavailable,
 }
 
-/// Identify a torrent: its largest video file's name first, then the torrent name. Falls back to a
+/// Identify a torrent: its largest selected video file's name first (unselected files are ignored
+/// here and in the show guess, see [`served_files`]), then the torrent name. Falls back to a
 /// title cleaned from the names (`external_id: None`) when neither matches. Once a search comes
 /// back [`Identification::Unavailable`] the torrent-name retry is skipped: it would spend another
 /// full retry cycle (~2.5 min) on the same outage. A caller that must tell such an outage fallback
@@ -231,11 +232,23 @@ pub async fn identify_torrent(info: &rd_client::TorrentInfo, tmdb: &TmdbClient) 
     fallback_metadata(info)
 }
 
-/// The name a torrent is identified by first: its largest video file's name (without the folder),
-/// else the torrent name.
-fn representative_name(info: &rd_client::TorrentInfo) -> &str {
-    info.files
+/// The files a torrent is identified by: the selected ones, or every file when none is selected
+/// (a Real-Debrid torrent still waiting for its file selection). Real-Debrid lists unselected files
+/// too, and the VFS never shows one, so a partly selected collection is not named after a film it
+/// doesn't serve. TorBox marks every file selected.
+fn served_files(
+    files: &[rd_client::TorrentFile],
+) -> impl Iterator<Item = &rd_client::TorrentFile> + '_ {
+    let any_selected = files.iter().any(|f| f.selected != 0);
+    files
         .iter()
+        .filter(move |f| !any_selected || f.selected != 0)
+}
+
+/// The name a torrent is identified by first: its largest selected video file's name (without the
+/// folder, see [`served_files`]), else the torrent name.
+fn representative_name(info: &rd_client::TorrentInfo) -> &str {
+    served_files(&info.files)
         .filter(|f| is_video_file(&f.path))
         .max_by_key(|f| f.bytes)
         .map(|f| f.path.split('/').next_back().unwrap_or(&f.path))
@@ -898,8 +911,9 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
 }
 
 pub fn is_show_guess(files: &[rd_client::TorrentFile]) -> bool {
-    // An episode marker (SxxExx, NxM, "Season N", …) in any filename → definitely a show.
-    if files.iter().any(|f| {
+    // An episode marker (SxxExx, NxM, "Season N", …) in any served file name → definitely a show.
+    // An unselected file is never shown, so its marker doesn't count (see `served_files`).
+    if served_files(files).any(|f| {
         let filename = f.path.split('/').next_back().unwrap_or(&f.path);
         filename_has_show_marker(filename)
     }) {
@@ -1183,7 +1197,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_repro_00000_issue() {
-        dotenvy::dotenv().ok();
+        crate::config::load_dotenv().expect("load .env");
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
@@ -1219,7 +1233,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_2012_is_not_generic() {
-        dotenvy::dotenv().ok();
+        crate::config::load_dotenv().expect("load .env");
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
@@ -1252,7 +1266,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_peaky_blinders_identification() {
-        dotenvy::dotenv().ok();
+        crate::config::load_dotenv().expect("load .env");
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
@@ -1347,6 +1361,52 @@ mod tests {
         );
         assert_eq!(m.media_type, MediaType::Movie);
         assert_eq!(m.external_id, None);
+    }
+
+    /// A Real-Debrid collection where the user selected only one film lists the other films too,
+    /// with `selected: 0`. The VFS never shows an unselected file, so the torrent must be named
+    /// after the selected film, not the largest one in the list.
+    #[test]
+    fn identification_takes_its_name_from_the_selected_files() {
+        let mut info = single_file_torrent("Volume 1");
+        info.files = vec![
+            TorrentFile {
+                id: 1,
+                path: "Volume 1/Film.One.2001.1080p.mkv".to_string(),
+                bytes: 5_000_000_000,
+                selected: 0,
+            },
+            TorrentFile {
+                id: 2,
+                path: "Volume 1/Film.Two.2005.1080p.mkv".to_string(),
+                bytes: 4_000_000_000,
+                selected: 1,
+            },
+            TorrentFile {
+                id: 3,
+                path: "Volume 1/Film.Three.2010.1080p.mkv".to_string(),
+                bytes: 8_000_000_000,
+                selected: 0,
+            },
+        ];
+        assert_eq!(representative_name(&info), "Film.Two.2005.1080p.mkv");
+        let m = fallback_metadata(&info);
+        assert_eq!(
+            (m.title.as_str(), m.year.as_deref(), m.media_type),
+            ("Film Two", Some("2005"), MediaType::Movie)
+        );
+
+        // With nothing selected (a Real-Debrid torrent still waiting for its file selection)
+        // every file counts, so the largest video names it as before.
+        for f in &mut info.files {
+            f.selected = 0;
+        }
+        assert_eq!(representative_name(&info), "Film.Three.2010.1080p.mkv");
+        let m = fallback_metadata(&info);
+        assert_eq!(
+            (m.title.as_str(), m.year.as_deref()),
+            ("Film Three", Some("2010"))
+        );
     }
 
     #[test]
@@ -1905,7 +1965,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_short_name_no_random_match() {
-        dotenvy::dotenv().ok();
+        crate::config::load_dotenv().expect("load .env");
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
@@ -1944,7 +2004,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_flow_2024_prefers_popular() {
-        dotenvy::dotenv().ok();
+        crate::config::load_dotenv().expect("load .env");
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
@@ -1982,7 +2042,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_sherwood_s02_disambiguation() {
-        dotenvy::dotenv().ok();
+        crate::config::load_dotenv().expect("load .env");
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
@@ -2017,7 +2077,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_dune_2000_identification() {
-        dotenvy::dotenv().ok();
+        crate::config::load_dotenv().expect("load .env");
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
@@ -2055,7 +2115,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_don_2022_tamil_identification() {
-        dotenvy::dotenv().ok();
+        crate::config::load_dotenv().expect("load .env");
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
@@ -2097,7 +2157,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_bond_collection_prefix_stripped_generically() {
-        dotenvy::dotenv().ok();
+        crate::config::load_dotenv().expect("load .env");
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
@@ -2134,7 +2194,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_short_title_ted_identified() {
-        dotenvy::dotenv().ok();
+        crate::config::load_dotenv().expect("load .env");
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
@@ -2176,7 +2236,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_rick_and_morty_absolute_episode_pack() {
-        dotenvy::dotenv().ok();
+        crate::config::load_dotenv().expect("load .env");
         let tmdb_api_key = std::env::var("TMDB_API_KEY").expect("TMDB_API_KEY must be set");
         let tmdb_client = TmdbClient::new(tmdb_api_key).unwrap();
 
@@ -2668,6 +2728,34 @@ mod tests {
             !is_show_guess(&files),
             "Movie with unselected extras should not be guessed as show"
         );
+    }
+
+    #[test]
+    fn is_show_guess_ignores_an_unselected_episode_coded_file() {
+        // An unselected file is never shown, so its episode code must not make the one selected
+        // film a show.
+        let mut files = vec![
+            TorrentFile {
+                id: 1,
+                path: "/Movie.2023.1080p.mkv".to_string(),
+                bytes: 4_000_000_000,
+                selected: 1,
+            },
+            TorrentFile {
+                id: 2,
+                path: "/Extras/Extras.S01E01.mkv".to_string(),
+                bytes: 300_000_000,
+                selected: 0,
+            },
+        ];
+        assert!(
+            !is_show_guess(&files),
+            "an unselected episode-coded extra must not make a selected film a show"
+        );
+
+        // With nothing selected yet every file counts, so the episode code still registers.
+        files[0].selected = 0;
+        assert!(is_show_guess(&files));
     }
 
     #[test]

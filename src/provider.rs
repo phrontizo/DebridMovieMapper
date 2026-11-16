@@ -178,7 +178,9 @@ pub trait DebridProvider: Send + Sync + std::fmt::Debug {
 /// TorBox's `mylist?id=` sometimes answers 404 ("No torrents found for this user") for a torrent that
 /// exists, including one `createtorrent` has just returned. On Real-Debrid a 404 means the torrent is
 /// gone, so a caller on a latency-sensitive path keeps `waits` short.
-pub(crate) async fn torrent_info_retrying_not_found(
+///
+/// Public because the live `integration_test` looks torrents up through it too.
+pub async fn torrent_info_retrying_not_found(
     provider: &dyn DebridProvider,
     id: &str,
     waits: &[std::time::Duration],
@@ -606,7 +608,7 @@ mod tests {
             provider.resolve_url(&loc).await.unwrap(),
             "https://cdn/file"
         );
-        provider.invalidate(&loc).await; // no-op, must not panic
+        provider.invalidate(&loc).await; // records the call; must not panic
     }
 
     #[tokio::test]

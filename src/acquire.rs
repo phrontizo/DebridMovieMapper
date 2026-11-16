@@ -224,8 +224,9 @@ pub struct AcquisitionEngine {
 /// always does. A show copy does when it lists the requested episode in `provides`, when it is still
 /// `Pending` (its `provides` is settled only once `observe` verifies it, so an in-flight pack lists
 /// just the episode it was added for), or when its `provides` is empty (file names `parse_se_all`
-/// can't decode, e.g. `1x06`: the VFS still emits those files, so the coverage is unknown and
-/// assumed — adding a singleton for every episode would duplicate them all).
+/// can't decode, e.g. absolute numbering such as `Show - 041 [1080p]`, or an account-mirror record
+/// written before `parse_se_all` read the `NxM` form: the VFS still emits those files, so the
+/// coverage is unknown and assumed — adding a singleton for every episode would duplicate them all).
 fn supplies_request(rec: &OwnedRecord, req: &AcquireRequest) -> bool {
     match (req.kind, req.season, req.episode) {
         (MediaKind::Series, Some(s), Some(e)) => {
@@ -2069,6 +2070,52 @@ mod tests {
             self.0.clone()
         }
     }
+    /// Records every URL it probes, then passes.
+    #[derive(Default)]
+    struct RecordingProber {
+        urls: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Prober for RecordingProber {
+        async fn probe(&self, url: &str) -> Result<Vec<Track>, ProbeError> {
+            self.urls.lock().unwrap().push(url.to_string());
+            Ok(vec![])
+        }
+    }
+    /// A `MockProvider` whose `resolve_url` returns the locator's own link, so a test can tell which
+    /// file was resolved (the mock's flat `resolved_url` is the same for every file of a torrent).
+    #[derive(Debug)]
+    struct LinkResolvingProvider(MockProvider);
+    #[async_trait]
+    impl DebridProvider for LinkResolvingProvider {
+        fn name(&self) -> &'static str {
+            "link-resolving"
+        }
+        async fn get_torrents(&self) -> Result<Vec<crate::rd_client::Torrent>, reqwest::Error> {
+            self.0.get_torrents().await
+        }
+        async fn get_torrent_info(&self, id: &str) -> Result<TI, reqwest::Error> {
+            self.0.get_torrent_info(id).await
+        }
+        async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+            self.0.add_magnet(magnet).await
+        }
+        async fn select_files(&self, t: &str, f: &str) -> Result<(), reqwest::Error> {
+            self.0.select_files(t, f).await
+        }
+        async fn delete_torrent(&self, id: &str) -> Result<(), reqwest::Error> {
+            self.0.delete_torrent(id).await
+        }
+        async fn resolve_url(
+            &self,
+            l: &crate::provider::FileLocator,
+        ) -> Result<String, crate::error::AppError> {
+            l.link.clone().ok_or(crate::error::AppError::Unavailable)
+        }
+        async fn invalidate(&self, l: &crate::provider::FileLocator) {
+            self.0.invalidate(l).await
+        }
+    }
 
     /// Hash-aware provider for end-to-end re-acquire tests: `add_magnet` derives the torrent id from
     /// the magnet's infohash and `get_torrent_info` returns a downloaded single-file movie for that
@@ -3755,6 +3802,18 @@ mod tests {
         };
         assert_eq!(show(2), TitleCheck::Match);
         assert_eq!(show(3), TitleCheck::Mismatch);
+        // ...in any form `parse_se_all` reads, the `NxM` one included.
+        assert_eq!(
+            title_check(
+                &identified(27205),
+                "Show - 2x05 - Title.mkv",
+                27205,
+                MediaKind::Series,
+                Some(2),
+                Some(5),
+            ),
+            TitleCheck::Match
+        );
     }
 
     #[tokio::test]
@@ -5862,7 +5921,8 @@ mod tests {
             bytes: 1_000_000_000,
             selected: 1,
         };
-        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+        // Each file resolves to its own link, so the probed URL names the probed file.
+        let provider: Arc<dyn DebridProvider> = Arc::new(LinkResolvingProvider(MockProvider {
             torrent_info: Some(TI {
                 id: "tid_hp".into(),
                 hash: "hp".into(),
@@ -5871,14 +5931,14 @@ mod tests {
                 links: vec!["https://cdn/a".into(), "https://cdn/b".into()],
                 ..Default::default()
             }),
-            resolved_url: Some("https://cdn/a".into()),
             ..Default::default()
-        });
+        }));
+        let prober = Arc::new(RecordingProber::default());
         let eng = engine(
             provider,
             Arc::new(MockScraper { candidates: vec![] }),
             Arc::new(OkValidator(true)),
-            Arc::new(CannedProber(Ok(vec![]))),
+            prober.clone(),
             st.clone(),
         );
         eng.observe(&[torrent("tid_hp", "hp", "downloaded", 100.0)])
@@ -5886,6 +5946,11 @@ mod tests {
         let rec = st.get_owned("hp".into()).await.unwrap();
         assert_eq!(rec.status, OwnedStatus::Verified);
         assert_eq!(rec.provides, vec![(1, 1)]);
+        assert_eq!(
+            *prober.urls.lock().unwrap(),
+            vec!["https://cdn/a".to_string()],
+            "observe probes the first copy"
+        );
         let tmdb = crate::vfs::tmdb_id_of(&rec.request.metadata).unwrap();
         assert_eq!(
             st.get_selection(crate::store::episode_slot(tmdb, 1, 1))
@@ -5894,6 +5959,85 @@ mod tests {
                 .file_path,
             "A/Show.S01E01.mkv",
             "the slot serves the file observe probed"
+        );
+    }
+
+    /// A pack whose files carry `NxM` codes (`Show - 2x05 - Title.mkv`) supplies the episode it was
+    /// added for: `observe` verifies it with every episode it holds and slots the requested one,
+    /// rather than rejecting a correct release as EpisodeMissing once the dead timeout has passed.
+    #[tokio::test]
+    async fn observe_verifies_a_pack_whose_files_use_nxm_episode_codes() {
+        let st = store();
+        let mut request = series_req_for(5);
+        request.season = Some(2);
+        st.put_owned(
+            "hp".into(),
+            OwnedRecord {
+                request,
+                provenance: Provenance::watchlist("alice"),
+                // Past the 600 s dead timeout, where a file-less episode is rejected.
+                added_at: now_secs() - 3_600,
+                status: OwnedStatus::Pending,
+                provides: vec![(2, 5)],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let file = |id, path: &str| TorrentFile {
+            id,
+            path: path.into(),
+            bytes: 1_000_000_000,
+            selected: 1,
+        };
+        let provider = Arc::new(LinkResolvingProvider(MockProvider {
+            torrent_info: Some(TI {
+                id: "tid_hp".into(),
+                hash: "hp".into(),
+                status: "downloaded".into(),
+                files: vec![
+                    file(0, "Show S02/Show - 2x04 - First.mkv"),
+                    file(1, "Show S02/Show - 2x05 - Second.mkv"),
+                    file(2, "Show S02/Show - 2x06 - Third.mkv"),
+                ],
+                links: vec![
+                    "https://cdn/e04".into(),
+                    "https://cdn/e05".into(),
+                    "https://cdn/e06".into(),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let prober = Arc::new(RecordingProber::default());
+        let eng = engine(
+            provider.clone(),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            prober.clone(),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_hp", "hp", "downloaded", 100.0)])
+            .await;
+        let rec = st
+            .get_owned("hp".into())
+            .await
+            .expect("the pack is kept, not rejected as EpisodeMissing");
+        assert_eq!(rec.status, OwnedStatus::Verified);
+        assert_eq!(rec.provides, vec![(2, 4), (2, 5), (2, 6)]);
+        assert!(provider.0.deleted.lock().unwrap().is_empty());
+        assert_eq!(
+            *prober.urls.lock().unwrap(),
+            vec!["https://cdn/e05".to_string()],
+            "the requested episode's file is probed"
+        );
+        let tmdb = crate::vfs::tmdb_id_of(&rec.request.metadata).unwrap();
+        assert_eq!(
+            st.get_selection(crate::store::episode_slot(tmdb, 2, 5))
+                .await
+                .unwrap()
+                .file_path,
+            "Show S02/Show - 2x05 - Second.mkv"
         );
     }
 

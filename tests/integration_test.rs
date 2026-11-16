@@ -13,7 +13,9 @@ mod common;
 
 use debridmoviemapper::error::AppError;
 use debridmoviemapper::identification::identify_torrent;
-use debridmoviemapper::provider::{DebridProvider, FileLocator, ProviderKind};
+use debridmoviemapper::provider::{
+    torrent_info_retrying_not_found, DebridProvider, FileLocator, ProviderKind,
+};
 use debridmoviemapper::rd_client::{
     AddMagnetResponse, RealDebridClient, Torrent, TorrentFile, TorrentInfo,
 };
@@ -122,32 +124,6 @@ const INFO_NOT_FOUND_BACKOFF: [Duration; 3] = [
     Duration::from_secs(2),
     Duration::from_secs(4),
 ];
-
-/// `provider.get_torrent_info(id)`, retrying a 404 after each wait in `waits`. Other errors return
-/// at once: the clients already retry transport errors, 429s and 5xx. A copy of the service's
-/// `provider::torrent_info_retrying_not_found`, which isn't public.
-async fn torrent_info_retrying_not_found(
-    provider: &dyn DebridProvider,
-    id: &str,
-    waits: &[Duration],
-) -> Result<TorrentInfo, reqwest::Error> {
-    let mut waits = waits.iter();
-    loop {
-        match provider.get_torrent_info(id).await {
-            Err(e) if e.status() == Some(reqwest::StatusCode::NOT_FOUND) => {
-                let Some(wait) = waits.next() else {
-                    return Err(e);
-                };
-                println!(
-                    "Torrent {id} not found; looking again in {}s",
-                    wait.as_secs()
-                );
-                tokio::time::sleep(*wait).await;
-            }
-            result => return result,
-        }
-    }
-}
 
 /// Fetch the downloaded torrents (the first `limit` when set) and identify them with `identify`,
 /// which returns the metadata and whether a TMDB search failed, using the store's identification
@@ -520,9 +496,14 @@ fn check_completeness(data: &[(TorrentInfo, MediaMetadata)], root: &VfsNode) -> 
 }
 
 /// The torrent's selected video files, split into the ones the VFS can stream and the ones it
-/// can't, mirroring the build (`vfs::emittable_video_files`, which isn't public): a file is
-/// streamable when the torrent has no links at all (TorBox resolves by id) or has a link at the
-/// file's position among the SELECTED files (Real-Debrid pairs them by position).
+/// can't: a file is streamable when the torrent has no links at all (TorBox resolves by id) or has
+/// a link at the file's position among the SELECTED files (Real-Debrid pairs them by position).
+///
+/// This restates the build's rule (`vfs::emittable_video_files`) on purpose rather than calling
+/// it: it is the oracle the completeness check measures the build against, so a bug in the build's
+/// rule shows up as a `missing` file instead of being shared by the check. The offline
+/// `completeness_*` tests below run it against the real build on a sample library, so a change
+/// to the build's rule that the sample exercises fails them under plain `cargo test`.
 fn split_by_link(info: &TorrentInfo) -> (Vec<&TorrentFile>, Vec<&TorrentFile>) {
     let (mut linked, mut no_link) = (Vec::new(), Vec::new());
     for (position, file) in info.files.iter().filter(|f| f.selected == 1).enumerate() {
@@ -855,38 +836,6 @@ async fn fetch_and_identify_retries_a_404_lookup() {
     let _ = std::fs::remove_file(&path);
     assert_eq!(data.len(), 1);
     assert_eq!(account.lookups.load(Ordering::SeqCst), 3);
-}
-
-#[tokio::test(start_paused = true)]
-async fn torrent_lookup_retries_a_404_after_each_wait() {
-    let account = FakeAccount {
-        misses: 3,
-        ..FakeAccount::new(vec![rd_torrent("1", 1_000, &["/Some.Film.2010.mkv"])])
-    };
-    let start = tokio::time::Instant::now();
-
-    let info = torrent_info_retrying_not_found(&account, "1", &INFO_NOT_FOUND_BACKOFF)
-        .await
-        .expect("the fourth lookup finds it");
-
-    assert_eq!(info.id, "1");
-    assert_eq!(account.lookups.load(Ordering::SeqCst), 4);
-    assert_eq!(start.elapsed(), Duration::from_secs(7));
-}
-
-#[tokio::test(start_paused = true)]
-async fn torrent_lookup_returns_the_404_once_the_waits_are_used_up() {
-    let account = FakeAccount {
-        misses: usize::MAX,
-        ..FakeAccount::new(vec![rd_torrent("1", 1_000, &["/Some.Film.2010.mkv"])])
-    };
-
-    let err = torrent_info_retrying_not_found(&account, "1", &INFO_NOT_FOUND_BACKOFF)
-        .await
-        .unwrap_err();
-
-    assert_eq!(err.status(), Some(reqwest::StatusCode::NOT_FOUND));
-    assert_eq!(account.lookups.load(Ordering::SeqCst), 4);
 }
 
 /// Test 4: VFS timestamps are populated from the provider's added dates and stable across

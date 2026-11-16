@@ -25,10 +25,24 @@ pub fn sintel_magnet() -> String {
     )
 }
 
-/// A trimmed, non-empty env var (after loading `.env`), or `None` when it is unset or blank, so a
-/// live test can skip when its provider token isn't configured.
+/// Load `.env` once per test binary, through the service's own loader (`config::load_dotenv`), and
+/// panic with its message (which never repeats the offending line) when the file exists but can't
+/// be loaded. dotenvy stops at the first line it can't parse and leaves every later one unset, so
+/// discarding that error made a live test whose token sat below a bad line skip and report `ok`:
+/// the gate passed having tested nothing, on a file the service refuses to start with. Every live
+/// test loads `.env` through this (`config::tests::live_tests_load_env_only_through_load_dotenv`).
+pub fn load_env() {
+    static LOADED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    if let Err(message) = LOADED.get_or_init(debridmoviemapper::config::load_dotenv) {
+        panic!("{message}");
+    }
+}
+
+/// A trimmed, non-empty env var (after loading `.env`, [`load_env`]), or `None` when it is unset or
+/// blank, so a live test can skip when its provider token isn't configured. Trimmed like the
+/// service trims its tokens (`provider::choose_provider`).
 pub fn token(var: &str) -> Option<String> {
-    dotenvy::dotenv().ok();
+    load_env();
     std::env::var(var)
         .ok()
         .map(|s| s.trim().to_string())

@@ -498,10 +498,12 @@ impl Store {
         })
     }
 
-    /// Build from an already-open database (e.g. an in-memory backend). Ensures the
-    /// schema is present and current. Used by tests and callers that manage the
-    /// `Database` themselves.
-    pub fn from_database(db: Arc<Database>) -> Result<Self, AppError> {
+    /// The test constructor behind [`Store::in_memory`] and the `fail_writes` helpers: a store over
+    /// an already-open (in-memory or failure-injecting) database. Ensures the schema is present and
+    /// current, and refuses a newer-than-supported schema the way `try_open` does. Production opens
+    /// through [`Store::open`], which adds the corruption recovery this skips.
+    #[cfg(test)]
+    pub(crate) fn from_database(db: Arc<Database>) -> Result<Self, AppError> {
         let version = Self::read_version(&db).map_err(AppError::Db)?;
         if version > SCHEMA_VERSION {
             return Err(AppError::Config(format!(
@@ -551,8 +553,8 @@ impl Store {
             // (owned/wanted/trakt_tokens/selection). Moving it aside would silently discard that —
             // exactly the loss the `UpgradeRequired` (older redb on-disk format) path already refuses
             // — so treat it as transient and FAIL STARTUP, letting the operator roll the binary
-            // forward or restore, rather than recreate an empty DB. Mirrors `from_database`, which
-            // also refuses a newer-than-supported schema.
+            // forward or restore, rather than recreate an empty DB. The test constructor
+            // `from_database` applies the same refusal.
             return Err(OpenFailure::Transient(format!(
                 "schema v{version} is newer than supported v{SCHEMA_VERSION}: the database was \
                  written by a newer build of this app. Refusing to discard it — run a build at \
@@ -1324,6 +1326,47 @@ impl Store {
                 |rec| {
                     if rec.request.imdb_id.is_empty() {
                         rec.request.imdb_id = imdb_id;
+                        true
+                    } else {
+                        false
+                    }
+                },
+            )?;
+            Ok(outcome == Some(true))
+        })
+        .await;
+        Self::flatten_join_app(result)
+    }
+
+    /// Set `provides` of the owned record for `hash` to `provides` ONLY while the record is a
+    /// `Verified` show record whose `provides` is empty, as one read-modify-write transaction that
+    /// touches no other field. The account mirror writes a show's `provides` once, from the file
+    /// names it could decode then, and never rewrites an existing record: the scan loop's provides
+    /// backfill uses this to heal a record whose files now decode, without overwriting a recorded set
+    /// or a `Pending` record's (`observe` settles that one). Returns `true` if it wrote; `false` for
+    /// an empty `provides`, any other record, or a missing one (never resurrected).
+    pub async fn set_provides_if_empty(
+        &self,
+        hash: String,
+        provides: Vec<(u32, u32)>,
+    ) -> Result<bool, AppError> {
+        if provides.is_empty() {
+            return Ok(false);
+        }
+        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, AppError> {
+            let outcome = Self::update_json::<OwnedRecord>(
+                &db,
+                OWNED_TABLE,
+                &hash,
+                "set_provides_if_empty",
+                |rec| {
+                    if rec.request.kind == crate::scraper::MediaKind::Series
+                        && rec.status == OwnedStatus::Verified
+                        && rec.provides.is_empty()
+                    {
+                        rec.provides = provides;
                         true
                     } else {
                         false
@@ -4789,6 +4832,100 @@ mod tests {
             .await
             .unwrap());
         assert!(store.get_owned("hgone".into()).await.is_none());
+    }
+
+    /// The provides backfill (re-deriving an empty `provides` from a show torrent's file names) sets
+    /// `provides` ONLY on a `Verified` show record whose `provides` is still empty, in one write
+    /// transaction touching nothing else: a recorded set is never overwritten, a `Pending` record
+    /// (whose `provides` `observe` settles) or a movie is left alone, and a missing record is never
+    /// resurrected.
+    #[tokio::test]
+    async fn set_provides_if_empty_fills_only_an_empty_verified_show_record() {
+        let store = Store::in_memory();
+        let show = OwnedRecord {
+            request: AcquireRequest {
+                kind: MediaKind::Series,
+                ..req("tt1", 1396)
+            },
+            provenance: Provenance { entries: vec![] },
+            added_at: 100,
+            status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: None,
+        };
+        store
+            .put_owned("hempty".into(), show.clone())
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "hset".into(),
+                OwnedRecord {
+                    provides: vec![(1, 1)],
+                    ..show.clone()
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "hpending".into(),
+                OwnedRecord {
+                    status: OwnedStatus::Pending,
+                    ..show.clone()
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_owned(
+                "hmovie".into(),
+                OwnedRecord {
+                    request: req("tt2", 27205),
+                    ..show.clone()
+                },
+            )
+            .await
+            .unwrap();
+        let derived = vec![(1, 1), (1, 2)];
+        assert!(store
+            .set_provides_if_empty("HEMPTY".into(), derived.clone())
+            .await
+            .unwrap());
+        let got = store.get_owned("hempty".into()).await.unwrap();
+        assert_eq!(got.provides, derived);
+        assert_eq!(got.added_at, 100, "other fields intact");
+        assert_eq!(got.status, OwnedStatus::Verified);
+        for (hash, expected) in [
+            ("hset", vec![(1, 1)]),
+            ("hpending", vec![]),
+            ("hmovie", vec![]),
+        ] {
+            assert!(
+                !store
+                    .set_provides_if_empty(hash.into(), derived.clone())
+                    .await
+                    .unwrap(),
+                "{hash} must not be written"
+            );
+            assert_eq!(
+                store.get_owned(hash.into()).await.unwrap().provides,
+                expected,
+                "{hash} keeps its provides"
+            );
+        }
+        assert!(!store
+            .set_provides_if_empty("hgone".into(), derived.clone())
+            .await
+            .unwrap());
+        assert!(store.get_owned("hgone".into()).await.is_none());
+        assert!(
+            !store
+                .set_provides_if_empty("hempty2".into(), vec![])
+                .await
+                .unwrap(),
+            "an empty set is never written"
+        );
     }
 
     /// A new-format record with multi-user provenance must survive a put→get round-trip

@@ -6,6 +6,8 @@
 //! if any is unset. RUN WITH --nocapture so the prompt is visible:
 //!   cargo test --test trakt_integration_test -- --ignored --nocapture
 
+mod common;
+
 use debridmoviemapper::enrolment::poll_to_completion;
 use debridmoviemapper::store::Store;
 use debridmoviemapper::tasks::sync_trakt;
@@ -82,28 +84,13 @@ fn token_db_dir_is_private_and_outside_the_shared_temp_dir() {
 #[tokio::test]
 #[ignore]
 async fn trakt_live_device_flow_and_sync() {
-    dotenvy::dotenv().ok();
-
-    let client_id = match std::env::var("TRAKT_CLIENT_ID") {
-        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => {
-            eprintln!("skipping: set TRAKT_CLIENT_ID, TRAKT_CLIENT_SECRET, TMDB_API_KEY to run");
-            return;
-        }
-    };
-    let client_secret = match std::env::var("TRAKT_CLIENT_SECRET") {
-        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => {
-            eprintln!("skipping: set TRAKT_CLIENT_ID, TRAKT_CLIENT_SECRET, TMDB_API_KEY to run");
-            return;
-        }
-    };
-    let tmdb_key = match std::env::var("TMDB_API_KEY") {
-        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => {
-            eprintln!("skipping: set TRAKT_CLIENT_ID, TRAKT_CLIENT_SECRET, TMDB_API_KEY to run");
-            return;
-        }
+    let (Some(client_id), Some(client_secret), Some(tmdb_key)) = (
+        common::token("TRAKT_CLIENT_ID"),
+        common::token("TRAKT_CLIENT_SECRET"),
+        common::token("TMDB_API_KEY"),
+    ) else {
+        eprintln!("skipping: set TRAKT_CLIENT_ID, TRAKT_CLIENT_SECRET, TMDB_API_KEY to run");
+        return;
     };
 
     let trakt: Arc<dyn TraktClient> = Arc::new(TraktClientImpl::new(

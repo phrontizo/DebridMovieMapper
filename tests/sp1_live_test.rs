@@ -1,27 +1,17 @@
 //! SP1 live smoke tests. `#[ignore]`; require real tokens in `.env`.
+mod common;
+
 use debridmoviemapper::provider::ProviderKind;
 use debridmoviemapper::scraper::{build_http_client, MediaKind, Scraper, TorrentioScraper};
 
-/// A single provider token (RD preferred) for tests that only need to template the Torrentio URL —
-/// unlike `provider::choose_provider`, this works even when BOTH tokens are set (as in a
-/// cross-provider `.env`), where `choose_provider` deliberately errors.
+/// A single provider token (RD preferred), trimmed as `provider::choose_provider` trims it, for
+/// tests that only need to template the Torrentio URL. Unlike `choose_provider`, this works even
+/// when BOTH tokens are set (as in a cross-provider `.env`), where `choose_provider` deliberately
+/// errors.
 fn single_provider_from_env() -> Option<(ProviderKind, String)> {
-    dotenvy::dotenv().ok();
-    let non_empty = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
-    if let Some(t) = non_empty("RD_API_TOKEN") {
-        Some((ProviderKind::RealDebrid, t))
-    } else {
-        non_empty("TORBOX_API_KEY").map(|t| (ProviderKind::TorBox, t))
-    }
-}
-
-/// `SCRAPER_ADDON_URL` the way the service reads it (`AcquisitionConfig::from_env`): trimmed, with
-/// a blank value (`SCRAPER_ADDON_URL=` in `.env`) counting as unset.
-fn addon_url() -> Option<String> {
-    std::env::var("SCRAPER_ADDON_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    common::token("RD_API_TOKEN")
+        .map(|t| (ProviderKind::RealDebrid, t))
+        .or_else(|| common::token("TORBOX_API_KEY").map(|t| (ProviderKind::TorBox, t)))
 }
 
 #[tokio::test]
@@ -35,7 +25,7 @@ async fn scraper_live_returns_parseable_streams() {
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap();
-    let scraper = TorrentioScraper::new(addon_url(), kind, &token, http);
+    let scraper = TorrentioScraper::new(common::token("SCRAPER_ADDON_URL"), kind, &token, http);
     // Sintel (Creative Commons): tt1727587
     let cands = scraper
         .find("tt1727587", MediaKind::Movie, None, None)
@@ -112,10 +102,7 @@ async fn scraper_live_through_http_proxy() {
 
     // (2) Real proxy — from SCRAPER_PROXY_URL (.env), kept out of the repo. Skip cleanly if unset
     // or not routable from here. The URL is never echoed (no leak into logs).
-    let Some(proxy_url) = std::env::var("SCRAPER_PROXY_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    else {
+    let Some(proxy_url) = common::token("SCRAPER_PROXY_URL") else {
         eprintln!("skipping positive case: SCRAPER_PROXY_URL not set (put it in .env to run this)");
         return;
     };
@@ -125,7 +112,7 @@ async fn scraper_live_through_http_proxy() {
     }
     let proxied = build_http_client(Some(&proxy_url))
         .unwrap_or_else(|e| panic!("build client for the configured proxy: {e}"));
-    let cands = TorrentioScraper::new(addon_url(), kind, &token, proxied)
+    let cands = TorrentioScraper::new(common::token("SCRAPER_ADDON_URL"), kind, &token, proxied)
         .find("tt1727587", MediaKind::Movie, None, None)
         .await
         .unwrap_or_else(|e| panic!("scrape Sintel through the configured proxy: {e}"));

@@ -17,7 +17,7 @@
 //! scan task and (unless `UPGRADE_INTERVAL_SECS=0`) the upgrade task still run.
 
 use crate::app_state::AppState;
-use crate::tasks::{monitor_episodes, reconcile_wanted, run_scan_loop, sync_trakt, ScanConfig};
+use crate::tasks::{monitor_episodes, reconcile_wanted, run_scan_loop, sync_trakt};
 use crate::upgrade::run_upgrade_once;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -182,12 +182,7 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
     let scan_shutdown = shutdown.clone();
     handles.push(tokio::spawn(async move {
         supervise(scan_shutdown.clone(), SCAN_RESTART_BACKOFF, move || {
-            run_scan_loop(
-                ScanConfig {
-                    app: scan_app.clone(),
-                },
-                scan_shutdown.clone(),
-            )
+            run_scan_loop(scan_app.clone(), scan_shutdown.clone())
         })
         .await;
     }));
@@ -244,13 +239,16 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
                 },
             )));
 
-            // Episode monitor.
+            // Episode monitor. `assumed` outlives its ticks: the episodes a present pack of unknown
+            // coverage was found to supply, so they aren't scraped again every tick.
             let monitor_app = app.clone();
+            let assumed = std::sync::Arc::new(crate::tasks::AssumedCoverage::default());
             handles.push(tokio::spawn(periodic(
                 Duration::from_secs(episode_secs),
                 shutdown.clone(),
                 move || {
                     let app = monitor_app.clone();
+                    let assumed = assumed.clone();
                     async move {
                         monitor_episodes(
                             app.engine.as_ref(),
@@ -260,6 +258,7 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
                             &app.read_activity,
                             Duration::from_secs(app.config.upgrade.idle_secs),
                             app.config.remove_finished_shows,
+                            &assumed,
                         )
                         .await;
                     }

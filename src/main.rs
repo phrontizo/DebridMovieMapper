@@ -58,30 +58,6 @@ fn set_tcp_keepalive(stream: &TcpStream) {
     }
 }
 
-/// What to report when loading `.env` failed, or `None` when it loaded or there is no `.env` (a
-/// container, or a native run configured by exported variables). dotenvy stops at the first line it
-/// can't parse, e.g. an unquoted value containing a space, and leaves every later line unset, so a
-/// malformed file would otherwise start the service with those settings silently at their defaults
-/// (an `UPGRADE_INTERVAL_SECS=0` lost that way turns the upgrade engine back on). The message never
-/// repeats the offending text: dotenvy's error carries the line or its value, which can be a token.
-fn dotenv_failure(result: &Result<std::path::PathBuf, dotenvy::Error>) -> Option<String> {
-    match result {
-        Ok(_) => None,
-        Err(e) if e.not_found() => None,
-        Err(dotenvy::Error::LineParse(..)) => Some(
-            "Configuration error: a line of .env could not be parsed, and it and every setting \
-             after it would be ignored. Quote a value that contains spaces (e.g. \
-             TRAKT_CATCHUP_LOOKBACK=\"6 months\"), and check for an unclosed quote or a stray \
-             backslash. The line is not shown, since it may hold a token."
-                .to_string(),
-        ),
-        Err(dotenvy::Error::Io(e)) => {
-            Some(format!("Configuration error: could not read .env: {e}"))
-        }
-        Err(_) => Some("Configuration error: could not load .env".to_string()),
-    }
-}
-
 /// The log-filter directive: `RUST_LOG` when set to something non-empty, else `info` (the prior
 /// default, so logging is unchanged when the var is unset). Parsing/validation of the directive is
 /// left to `EnvFilter` at the call site (a malformed value falls back to `info`).
@@ -135,10 +111,40 @@ fn is_benign_connection_error(err: &hyper::Error) -> bool {
 
 /// Whether a request path is routed to the Trakt enrolment service rather than WebDAV. Matches the
 /// exact `/trakt` collection plus anything under `/trakt/` — but NOT an unrelated sibling such as
-/// `/traktor` (a bare `starts_with("/trakt")` would misroute it). Extracted so it is unit-testable
-/// (the routing closure that uses it lives inline in `serve_connection`).
+/// `/traktor` (a bare `starts_with("/trakt")` would misroute it). Extracted so it is unit-testable;
+/// `route` uses it.
 fn is_trakt_path(p: &str) -> bool {
     p == "/trakt" || p.starts_with("/trakt/")
+}
+
+/// Route one request: the local-network Trakt enrolment paths (`is_trakt_path`) to `enrolment`, or
+/// a 404 when enrolment is off (Trakt is not configured), and everything else to WebDAV. Generic
+/// over the request body, as both handlers are, so a test can route a `Request<Body>`.
+async fn route<B>(
+    req: Request<B>,
+    dav: &DavHandler,
+    enrolment: Option<&EnrolmentService>,
+) -> hyper::Response<dav_server::body::Body>
+where
+    B: hyper::body::Body,
+    B::Data: bytes::Buf + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    if !is_trakt_path(req.uri().path()) {
+        return dav.handle(req).await;
+    }
+    match enrolment {
+        Some(enrolment) => enrolment.handle(req).await,
+        None => {
+            // Built infallibly (Response::new + status_mut), so the per-request path carries no
+            // panic site.
+            let mut resp = hyper::Response::new(dav_server::body::Body::from(
+                "Trakt enrolment is not enabled".to_string(),
+            ));
+            *resp.status_mut() = hyper::StatusCode::NOT_FOUND;
+            resp
+        }
+    }
 }
 
 /// The shared HTTP/1 server-connection builder. Extracted so a test can drive a real
@@ -201,6 +207,147 @@ fn healthcheck(port: u16) -> bool {
     buf[..filled].starts_with(b"HTTP/")
 }
 
+/// Bounds the number of concurrent fire-and-forget 503-rejecter tasks (see `serve`) so a reconnect
+/// storm against an already-saturated pool can't spawn unbounded short-lived tasks — the very
+/// amplification the connection cap exists to prevent. When this is also exhausted, the excess
+/// connection is simply dropped (closed) without a 503. The bound is set to MAX_CONNECTIONS so the
+/// 503-rejecter pool is at least as large as the connection pool: that preserves the
+/// healthcheck-503 guarantee (a transiently-saturated server still answers the `--healthcheck`
+/// probe with 503 rather than a bare drop → it reads HEALTHY) for any realistic load, while
+/// still capping the absolute worst case — each rejecter is a tiny ≤1s task, so this ceiling is
+/// cheap and is only approached under a pathological multi-hundred-connection burst.
+const MAX_REJECTERS: usize = MAX_CONNECTIONS;
+
+/// A minimal 503 sent to a connection rejected for pool saturation. Sending a real HTTP response
+/// (rather than a bare TCP drop) means a transiently-saturated-but-alive server still answers the
+/// `--healthcheck` probe's `OPTIONS /` with an `HTTP/` status line — so it reports HEALTHY (busy,
+/// not wedged) rather than UNHEALTHY, which an orchestrator acting on health would answer with a
+/// restart that kills every in-flight stream. (Plain Docker / Compose don't restart an unhealthy
+/// container; see `healthcheck`.)
+const REJECT_503: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+/// The accept loop: serve every connection on `listener` with `handler` until `shutdown`
+/// completes. At most `max_connections` are served at once (production: `MAX_CONNECTIONS`), each
+/// holding a permit until it closes. A connection beyond that is answered `REJECT_503` by a
+/// short-lived task, at most `max_rejecters` of them at a time (`MAX_REJECTERS`), and dropped
+/// without an answer once those are busy too. The healthcheck's contract rests on this: a full
+/// pool still reads HEALTHY, and only an exhausted rejecter pool reads unhealthy. Connections
+/// still open when it returns are not drained (see `main`).
+async fn serve<H, Fut>(
+    listener: TcpListener,
+    max_connections: usize,
+    max_rejecters: usize,
+    handler: H,
+    shutdown: impl std::future::Future<Output = ()>,
+) where
+    H: Fn(Request<hyper::body::Incoming>) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = hyper::Response<dav_server::body::Body>> + Send + 'static,
+{
+    let semaphore = Arc::new(Semaphore::new(max_connections));
+    let reject_semaphore = Arc::new(Semaphore::new(max_rejecters));
+    // Throttle the saturation WARN so a reconnect storm can't spam the log (the accept()-error path
+    // backs off; this path must not block legitimate accepts, so it rate-limits the log instead).
+    let mut last_reject_log: Option<std::time::Instant> = None;
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _addr) = match result {
+                    Ok(pair) => {
+                        // Bound how long a mid-stream dead peer can pin its permit (see
+                        // set_tcp_keepalive) — applied before the permit is acquired so it also
+                        // covers a connection that then races into the 503-reject path.
+                        set_tcp_keepalive(&pair.0);
+                        pair
+                    }
+                    Err(e) => {
+                        // A transient accept() error — fd exhaustion (EMFILE/ENFILE), a peer
+                        // that aborted before we accepted (ECONNABORTED), or EINTR — must NOT
+                        // tear down the whole listener (which would also skip graceful
+                        // shutdown in `main`). Log, briefly back off so we don't hot-spin while
+                        // the process is out of descriptors, and keep accepting.
+                        tracing::warn!("accept() failed: {e} — continuing to accept");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        let now = std::time::Instant::now();
+                        if last_reject_log
+                            .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(1))
+                        {
+                            tracing::warn!(
+                                "Max connections ({}) reached — rejecting with 503",
+                                max_connections
+                            );
+                            last_reject_log = Some(now);
+                        }
+                        // Fire-and-forget a 503 (bounded by a short write timeout so a slow/dead peer
+                        // can't stall the accept loop), but only if a rejecter slot is free — so the
+                        // rejecter tasks themselves stay bounded under a storm. No connection permit is
+                        // held; this is a tiny one-shot write. If no rejecter slot is free, drop the
+                        // connection (close on `stream` going out of scope).
+                        if let Ok(reject_permit) = reject_semaphore.clone().try_acquire_owned() {
+                            tokio::task::spawn(async move {
+                                let _reject_permit = reject_permit; // released when the write finishes
+                                use tokio::io::AsyncWriteExt;
+                                let mut stream = stream;
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(1),
+                                    async {
+                                        let _ = stream.write_all(REJECT_503).await;
+                                        let _ = stream.shutdown().await;
+                                    },
+                                )
+                                .await;
+                            });
+                        }
+                        continue;
+                    }
+                };
+                let io = TokioIo::new(stream);
+                let handler = handler.clone();
+
+                tokio::task::spawn(async move {
+                    let _permit = permit; // Hold permit until connection closes
+                    if let Err(err) = http1_builder()
+                        .serve_connection(
+                            io,
+                            service_fn(move |req: Request<hyper::body::Incoming>| {
+                                let response = handler(req);
+                                async move { Ok::<_, hyper::Error>(response.await) }
+                            }),
+                        )
+                        .await
+                    {
+                        // Benign client-side disconnects + our own idle keep-alive header timeout.
+                        if is_benign_connection_error(&err) {
+                            return;
+                        }
+                        let dbg = format!("{:?}", err);
+                        // A `User(Body)` error is our response-body stream failing (e.g. a CDN fetch
+                        // returning `GeneralFailure`). The body-producing layer (`dav_fs`) already
+                        // logs the concrete cause at WARN, so logging it again here at ERROR is just
+                        // duplicate noise — and a broken file the player retries would spam it. Demote.
+                        if dbg.contains("User(Body)") {
+                            tracing::debug!("Connection body error (cause logged upstream): {}", dbg);
+                            return;
+                        }
+                        tracing::error!("Error serving connection: {:?}", err);
+                    }
+                });
+            }
+            _ = &mut shutdown => {
+                break;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env FIRST so the healthcheck resolves PORT identically to the server (which loads
@@ -208,9 +355,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // surrounding whitespace from quoted compose YAML — made the healthcheck probe 8080 while the
     // server listened elsewhere, reporting a healthy container as unhealthy.
     // A .env that exists but can't be loaded stops startup, the healthcheck included: dotenvy would
-    // have applied only the lines before the bad one (`dotenv_failure`). A missing .env is fine.
-    // eprintln!, as the tracing subscriber isn't up yet.
-    if let Some(message) = dotenv_failure(&dotenvy::dotenv()) {
+    // have applied only the lines before the bad one (`config::load_dotenv`). A missing .env is
+    // fine. eprintln!, as the tracing subscriber isn't up yet.
+    if let Err(message) = debridmoviemapper::config::load_dotenv() {
         eprintln!("{message}");
         std::process::exit(1);
     }
@@ -394,19 +541,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     info!("WebDAV server listening on http://{}", addr);
 
-    let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    // Bounds the number of concurrent fire-and-forget 503-rejecter tasks (below) so a reconnect
-    // storm against an already-saturated pool can't spawn unbounded short-lived tasks — the very
-    // amplification the connection cap exists to prevent. When this is also exhausted, the excess
-    // connection is simply dropped (closed) without a 503. The bound is set to MAX_CONNECTIONS so the
-    // 503-rejecter pool is at least as large as the connection pool: that preserves the
-    // healthcheck-503 guarantee (a transiently-saturated server still answers the `--healthcheck`
-    // probe with 503 rather than a bare drop → it reads HEALTHY) for any realistic load, while
-    // still capping the absolute worst case — each rejecter is a tiny ≤1s task, so this ceiling is
-    // cheap and is only approached under a pathological multi-hundred-connection burst.
-    const MAX_REJECTERS: usize = MAX_CONNECTIONS;
-    let reject_semaphore = Arc::new(Semaphore::new(MAX_REJECTERS));
-
     // Unified shutdown future: triggers on SIGINT (ctrl+c) or SIGTERM (Docker stop)
     let shutdown_signal = async {
         let ctrl_c = tokio::signal::ctrl_c();
@@ -437,147 +571,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Received SIGINT, shutting down...");
         }
     };
-    tokio::pin!(shutdown_signal);
 
-    // A minimal 503 sent to a connection rejected for pool saturation. Sending a real HTTP response
-    // (rather than a bare TCP drop) means a transiently-saturated-but-alive server still answers the
-    // `--healthcheck` probe's `OPTIONS /` with an `HTTP/` status line — so it reports HEALTHY (busy,
-    // not wedged) rather than UNHEALTHY, which an orchestrator acting on health would answer with a
-    // restart that kills every in-flight stream. (Plain Docker / Compose don't restart an unhealthy
-    // container; see `healthcheck`.)
-    const REJECT_503: &[u8] =
-        b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-    // Throttle the saturation WARN so a reconnect storm can't spam the log (the accept()-error path
-    // backs off; this path must not block legitimate accepts, so it rate-limits the log instead).
-    let mut last_reject_log: Option<std::time::Instant> = None;
-
-    loop {
-        tokio::select! {
-            result = listener.accept() => {
-                let (stream, _addr) = match result {
-                    Ok(pair) => {
-                        // Bound how long a mid-stream dead peer can pin its permit (see
-                        // set_tcp_keepalive) — applied before the permit is acquired so it also
-                        // covers a connection that then races into the 503-reject path.
-                        set_tcp_keepalive(&pair.0);
-                        pair
-                    }
-                    Err(e) => {
-                        // A transient accept() error — fd exhaustion (EMFILE/ENFILE), a peer
-                        // that aborted before we accepted (ECONNABORTED), or EINTR — must NOT
-                        // tear down the whole listener (which would also skip graceful
-                        // shutdown below). Log, briefly back off so we don't hot-spin while
-                        // the process is out of descriptors, and keep accepting.
-                        tracing::warn!("accept() failed: {e} — continuing to accept");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        continue;
-                    }
-                };
-                let permit = match semaphore.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        let now = std::time::Instant::now();
-                        if last_reject_log
-                            .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(1))
-                        {
-                            tracing::warn!(
-                                "Max connections ({}) reached — rejecting with 503",
-                                MAX_CONNECTIONS
-                            );
-                            last_reject_log = Some(now);
-                        }
-                        // Fire-and-forget a 503 (bounded by a short write timeout so a slow/dead peer
-                        // can't stall the accept loop), but only if a rejecter slot is free — so the
-                        // rejecter tasks themselves stay bounded under a storm. No connection permit is
-                        // held; this is a tiny one-shot write. If no rejecter slot is free, drop the
-                        // connection (close on `stream` going out of scope).
-                        if let Ok(reject_permit) = reject_semaphore.clone().try_acquire_owned() {
-                            tokio::task::spawn(async move {
-                                let _reject_permit = reject_permit; // released when the write finishes
-                                use tokio::io::AsyncWriteExt;
-                                let mut stream = stream;
-                                let _ = tokio::time::timeout(
-                                    std::time::Duration::from_secs(1),
-                                    async {
-                                        let _ = stream.write_all(REJECT_503).await;
-                                        let _ = stream.shutdown().await;
-                                    },
-                                )
-                                .await;
-                            });
-                        }
-                        continue;
-                    }
-                };
-                let io = TokioIo::new(stream);
-                let dav_handler = dav_handler.clone();
-                let enrolment = enrolment.clone();
-
-                tokio::task::spawn(async move {
-                    let _permit = permit; // Hold permit until connection closes
-                    if let Err(err) = http1_builder()
-                        .serve_connection(
-                            io,
-                            service_fn(move |req: Request<hyper::body::Incoming>| {
-                                let dav_handler = dav_handler.clone();
-                                let enrolment = enrolment.clone();
-                                async move {
-                                    // Route the local-network Trakt enrolment paths to the
-                                    // enrolment service; everything else is WebDAV. Both arms
-                                    // produce a `Response<dav_server::body::Body>`.
-                                    if is_trakt_path(req.uri().path()) {
-                                        match &enrolment {
-                                            Some(enr) => Ok::<_, hyper::Error>(enr.handle(req).await),
-                                            None => {
-                                                // Build infallibly (Response::new + status_mut) so the
-                                                // per-request path carries no panic site — the old
-                                                // `.expect("static 404 response")` was infallible but
-                                                // still an `expect` on the hot path.
-                                                let mut resp = hyper::Response::new(
-                                                    dav_server::body::Body::from(
-                                                        "Trakt enrolment is not enabled".to_string(),
-                                                    ),
-                                                );
-                                                *resp.status_mut() =
-                                                    hyper::StatusCode::NOT_FOUND;
-                                                Ok::<_, hyper::Error>(resp)
-                                            }
-                                        }
-                                    } else {
-                                        Ok::<_, hyper::Error>(dav_handler.handle(req).await)
-                                    }
-                                }
-                            }),
-                        )
-                        .await
-                    {
-                        // Benign client-side disconnects + our own idle keep-alive header timeout.
-                        if is_benign_connection_error(&err) {
-                            return;
-                        }
-                        let dbg = format!("{:?}", err);
-                        // A `User(Body)` error is our response-body stream failing (e.g. a CDN fetch
-                        // returning `GeneralFailure`). The body-producing layer (`dav_fs`) already
-                        // logs the concrete cause at WARN, so logging it again here at ERROR is just
-                        // duplicate noise — and a broken file the player retries would spam it. Demote.
-                        if dbg.contains("User(Body)") {
-                            tracing::debug!("Connection body error (cause logged upstream): {}", dbg);
-                            return;
-                        }
-                        tracing::error!("Error serving connection: {:?}", err);
-                    }
-                });
-            }
-            _ = &mut shutdown_signal => {
-                break;
-            }
-        }
-    }
+    // Every request is routed by `route`: the `/trakt*` paths to the enrolment service (or a 404
+    // when Trakt isn't configured), everything else to WebDAV.
+    let handler = move |req: Request<hyper::body::Incoming>| {
+        let dav_handler = dav_handler.clone();
+        let enrolment = enrolment.clone();
+        async move { route(req, &dav_handler, enrolment.as_deref()).await }
+    };
+    serve(
+        listener,
+        MAX_CONNECTIONS,
+        MAX_REJECTERS,
+        handler,
+        shutdown_signal,
+    )
+    .await;
 
     // Signal the background tasks to stop and wait for them to finish.
     //
-    // NOTE: in-flight WebDAV connection tasks are detached (`tokio::task::spawn` above, each holding
-    // a connection permit) and are NOT drained here — when `main` returns the runtime drops and those
+    // NOTE: in-flight WebDAV connection tasks are detached (`tokio::task::spawn` in `serve`, each
+    // holding a connection permit) and are NOT drained here — when `main` returns the runtime drops and those
     // tasks are aborted, so any active stream is cut mid-transfer. This is the intended behaviour for a
     // media proxy under `docker stop`: a player simply re-requests the byte range on restart, and a
     // bounded-grace drain would only delay shutdown for connections that are about to be re-opened
@@ -611,10 +625,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dbg_is_ignorable_disconnect, dotenv_failure, healthcheck, http1_builder,
-        is_benign_connection_error, is_trakt_path, log_directive, set_tcp_keepalive,
+        dbg_is_ignorable_disconnect, healthcheck, http1_builder, is_benign_connection_error,
+        is_trakt_path, log_directive, route, serve, set_tcp_keepalive,
     };
+    use dav_server::DavHandler;
+    use hyper::Request;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Notify;
 
     #[tokio::test]
     async fn set_tcp_keepalive_enables_keepalive_on_accepted_socket() {
@@ -840,34 +860,173 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dotenv_failure_ignores_a_loaded_or_missing_file() {
-        assert_eq!(dotenv_failure(&Ok(std::path::PathBuf::from(".env"))), None);
-        // No .env at all (a container, or a native run configured by exported variables).
-        let missing = dotenvy::Error::Io(std::io::ErrorKind::NotFound.into());
-        assert_eq!(dotenv_failure(&Err(missing)), None);
+    /// A running accept loop (`serve`) on a loopback port. Its handler answers `/hold` only once
+    /// `release` is notified (signalling `entered` when the request arrives), so a test can keep a
+    /// connection, and its permit, busy; any other path is answered `200` at once.
+    struct TestServer {
+        port: u16,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<()>,
     }
 
-    #[test]
-    fn dotenv_failure_reports_a_malformed_line_without_echoing_it() {
-        // dotenvy stops at the first line it can't parse (an unquoted value with a space), so every
-        // later setting would silently fall back to its default. Built through `from_read_iter`, which
-        // parses without touching the process environment.
-        let err = dotenvy::from_read_iter("RD_API_TOKEN=SECRET token".as_bytes())
-            .next()
-            .expect("one line")
-            .expect_err("an unquoted space is a parse error");
-        let msg = dotenv_failure(&Err(err)).expect("a malformed .env must be reported");
-        assert!(msg.contains("quote"), "{msg}");
-        // The offending text can be a token, so it is never repeated.
-        assert!(!msg.contains("SECRET"), "{msg}");
+    async fn start_server(max_connections: usize, max_rejecters: usize) -> TestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let handler = {
+            let (entered, release) = (entered.clone(), release.clone());
+            move |req: Request<hyper::body::Incoming>| {
+                let (entered, release) = (entered.clone(), release.clone());
+                async move {
+                    if req.uri().path() == "/hold" {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    hyper::Response::new(dav_server::body::Body::from("ok".to_string()))
+                }
+            }
+        };
+        let (shutdown, stop) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(serve(
+            listener,
+            max_connections,
+            max_rejecters,
+            handler,
+            async {
+                let _ = stop.await;
+            },
+        ));
+        TestServer {
+            port,
+            entered,
+            release,
+            shutdown,
+            task,
+        }
     }
 
-    #[test]
-    fn dotenv_failure_reports_an_unreadable_file() {
-        let denied = dotenvy::Error::Io(std::io::ErrorKind::PermissionDenied.into());
-        let msg = dotenv_failure(&Err(denied)).expect("an unreadable .env must be reported");
-        assert!(msg.contains(".env"), "{msg}");
+    impl TestServer {
+        /// Hold the server's only connection permit: a `/hold` request whose answer the returned
+        /// task yields once `release` is notified.
+        async fn hold(&self) -> tokio::task::JoinHandle<String> {
+            let held = tokio::spawn(exchange(self.port, "/hold"));
+            tokio::time::timeout(Duration::from_secs(5), self.entered.notified())
+                .await
+                .expect("the held request should reach the handler");
+            held
+        }
+
+        /// Signal shutdown and check that the accept loop returns.
+        async fn stop(self) {
+            let _ = self.shutdown.send(());
+            tokio::time::timeout(Duration::from_secs(5), self.task)
+                .await
+                .expect("serve should return once shutdown completes")
+                .unwrap();
+        }
+    }
+
+    /// Send one request and read whatever arrives before the server closes (or resets) the
+    /// connection: a full response, a bare 503, or nothing when the connection is dropped.
+    async fn exchange(port: u16, path: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let _ = stream.write_all(request.as_bytes()).await;
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut buf)).await;
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Whether a request is answered with a status line starting `status` within about a second.
+    /// A permit is released a moment after its connection closes, so the next connection can
+    /// arrive first and be rejected; this retries until it doesn't.
+    async fn answered_eventually(port: u16, status: &str) -> bool {
+        for _ in 0..50 {
+            if exchange(port, "/").await.starts_with(status) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_full_connection_pool_answers_503_and_reads_healthy() {
+        // The healthcheck's contract: a saturated pool is busy, not wedged, so the accept loop
+        // answers the probe's connection with a 503 status line and it reads HEALTHY.
+        let server = start_server(1, 1).await;
+        let port = server.port;
+        let held = server.hold().await;
+        assert!(
+            tokio::task::spawn_blocking(move || healthcheck(port))
+                .await
+                .unwrap(),
+            "a full pool must still answer the healthcheck"
+        );
+        // The rejecter holds no connection permit and gives its own back once it has written, so
+        // with one rejecter slot every later excess connection still gets its 503.
+        for _ in 0..3 {
+            assert!(
+                answered_eventually(port, "HTTP/1.1 503").await,
+                "an excess connection must be answered 503"
+            );
+        }
+        // Releasing the held connection frees its permit, and the next connection is served.
+        server.release.notify_one();
+        let answer = held.await.unwrap();
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer:?}");
+        assert!(
+            answered_eventually(port, "HTTP/1.1 200").await,
+            "a connection must be served once a permit is free"
+        );
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_full_pool_with_no_free_rejecter_drops_the_connection_and_reads_unhealthy() {
+        let server = start_server(1, 0).await;
+        let port = server.port;
+        let held = server.hold().await;
+        let excess = exchange(port, "/").await;
+        assert!(
+            excess.is_empty(),
+            "with no rejecter slot free the connection is dropped: {excess:?}"
+        );
+        assert!(
+            !tokio::task::spawn_blocking(move || healthcheck(port))
+                .await
+                .unwrap(),
+            "a dropped connection must read unhealthy"
+        );
+        // The loop survives the drops and serves again once the permit is free.
+        server.release.notify_one();
+        assert!(held.await.unwrap().starts_with("HTTP/1.1 200"));
+        assert!(answered_eventually(port, "HTTP/1.1 200").await);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn route_answers_404_on_the_trakt_paths_when_enrolment_is_off() {
+        // A DavHandler with no filesystem answers every non-OPTIONS request 405, so anything but
+        // a 404 shows the request reached WebDAV.
+        let dav = DavHandler::builder().build_handler();
+        let request = |path: &str| {
+            Request::builder()
+                .uri(path)
+                .body(dav_server::body::Body::empty())
+                .unwrap()
+        };
+        for path in ["/trakt", "/trakt/accounts"] {
+            let resp = route(request(path), &dav, None).await;
+            assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND, "{path}");
+        }
+        for path in ["/", "/Movies/x.mkv", "/traktor"] {
+            let resp = route(request(path), &dav, None).await;
+            assert_ne!(resp.status(), hyper::StatusCode::NOT_FOUND, "{path}");
+        }
     }
 
     #[test]

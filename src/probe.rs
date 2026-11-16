@@ -52,243 +52,249 @@ pub struct LangReq {
     pub spoken_languages: Vec<String>,
 }
 
+/// ISO 639-2/T (terminological) → /B (bibliographic) for the 20 languages whose B and T codes
+/// differ. The rest of the pipeline (`ISO_639_1`, TMDB `original_language`) speaks /B; muxers like
+/// ffmpeg emit /T (e.g. `deu`/`fra`/`zho`/`nld`), so without this a correct German/French/… release
+/// is wrongly blacklisted by the probe. B==T codes (jpn, rus, spa, …) need no entry.
+const ISO_639_2_T_TO_B: &[(&str, &str)] = &[
+    ("sqi", "alb"),
+    ("hye", "arm"),
+    ("eus", "baq"),
+    ("mya", "bur"),
+    ("zho", "chi"),
+    ("ces", "cze"),
+    ("nld", "dut"),
+    ("fra", "fre"),
+    ("kat", "geo"),
+    ("deu", "ger"),
+    ("ell", "gre"),
+    ("isl", "ice"),
+    ("mkd", "mac"),
+    ("mri", "mao"),
+    ("msa", "may"),
+    ("fas", "per"),
+    ("ron", "rum"),
+    ("slk", "slo"),
+    ("bod", "tib"),
+    ("cym", "wel"),
+];
+
+/// The complete ISO 639-1 → 639-2/B table. For the 20 languages whose /B and /T differ, this uses
+/// the /B form (the /T 3-letter form is folded to /B by `ISO_639_2_T_TO_B`), so all three
+/// representations of a language compare equal.
+const ISO_639_1: &[(&str, &str)] = &[
+    ("aa", "aar"),
+    ("ab", "abk"),
+    ("ae", "ave"),
+    ("af", "afr"),
+    ("ak", "aka"),
+    ("am", "amh"),
+    ("an", "arg"),
+    ("ar", "ara"),
+    ("as", "asm"),
+    ("av", "ava"),
+    ("ay", "aym"),
+    ("az", "aze"),
+    ("ba", "bak"),
+    ("be", "bel"),
+    ("bg", "bul"),
+    ("bh", "bih"),
+    ("bi", "bis"),
+    ("bm", "bam"),
+    ("bn", "ben"),
+    ("bo", "tib"),
+    ("br", "bre"),
+    ("bs", "bos"),
+    ("ca", "cat"),
+    ("ce", "che"),
+    ("ch", "cha"),
+    ("co", "cos"),
+    ("cr", "cre"),
+    ("cs", "cze"),
+    ("cu", "chu"),
+    ("cv", "chv"),
+    ("cy", "wel"),
+    ("da", "dan"),
+    ("de", "ger"),
+    ("dv", "div"),
+    ("dz", "dzo"),
+    ("ee", "ewe"),
+    ("el", "gre"),
+    ("en", "eng"),
+    ("eo", "epo"),
+    ("es", "spa"),
+    ("et", "est"),
+    ("eu", "baq"),
+    ("fa", "per"),
+    ("ff", "ful"),
+    ("fi", "fin"),
+    ("fj", "fij"),
+    ("fo", "fao"),
+    ("fr", "fre"),
+    ("fy", "fry"),
+    ("ga", "gle"),
+    ("gd", "gla"),
+    ("gl", "glg"),
+    ("gn", "grn"),
+    ("gu", "guj"),
+    ("gv", "glv"),
+    ("ha", "hau"),
+    ("he", "heb"),
+    ("hi", "hin"),
+    ("ho", "hmo"),
+    ("hr", "hrv"),
+    ("ht", "hat"),
+    ("hu", "hun"),
+    ("hy", "arm"),
+    ("hz", "her"),
+    ("ia", "ina"),
+    ("id", "ind"),
+    ("ie", "ile"),
+    ("ig", "ibo"),
+    ("ii", "iii"),
+    ("ik", "ipk"),
+    ("io", "ido"),
+    ("is", "ice"),
+    ("it", "ita"),
+    ("iu", "iku"),
+    ("ja", "jpn"),
+    ("jv", "jav"),
+    ("ka", "geo"),
+    ("kg", "kon"),
+    ("ki", "kik"),
+    ("kj", "kua"),
+    ("kk", "kaz"),
+    ("kl", "kal"),
+    ("km", "khm"),
+    ("kn", "kan"),
+    ("ko", "kor"),
+    ("kr", "kau"),
+    ("ks", "kas"),
+    ("ku", "kur"),
+    ("kv", "kom"),
+    ("kw", "cor"),
+    ("ky", "kir"),
+    ("la", "lat"),
+    ("lb", "ltz"),
+    ("lg", "lug"),
+    ("li", "lim"),
+    ("ln", "lin"),
+    ("lo", "lao"),
+    ("lt", "lit"),
+    ("lu", "lub"),
+    ("lv", "lav"),
+    ("mg", "mlg"),
+    ("mh", "mah"),
+    ("mi", "mao"),
+    ("mk", "mac"),
+    ("ml", "mal"),
+    ("mn", "mon"),
+    ("mr", "mar"),
+    ("ms", "may"),
+    ("mt", "mlt"),
+    ("my", "bur"),
+    ("na", "nau"),
+    ("nb", "nob"),
+    ("nd", "nde"),
+    ("ne", "nep"),
+    ("ng", "ndo"),
+    ("nl", "dut"),
+    ("nn", "nno"),
+    ("no", "nor"),
+    ("nr", "nbl"),
+    ("nv", "nav"),
+    ("ny", "nya"),
+    ("oc", "oci"),
+    ("oj", "oji"),
+    ("om", "orm"),
+    ("or", "ori"),
+    ("os", "oss"),
+    ("pa", "pan"),
+    ("pi", "pli"),
+    ("pl", "pol"),
+    ("ps", "pus"),
+    ("pt", "por"),
+    ("qu", "que"),
+    ("rm", "roh"),
+    ("rn", "run"),
+    ("ro", "rum"),
+    ("ru", "rus"),
+    ("rw", "kin"),
+    ("sa", "san"),
+    ("sc", "srd"),
+    ("sd", "snd"),
+    ("se", "sme"),
+    ("sg", "sag"),
+    ("si", "sin"),
+    ("sk", "slo"),
+    ("sl", "slv"),
+    ("sm", "smo"),
+    ("sn", "sna"),
+    ("so", "som"),
+    ("sq", "alb"),
+    ("sr", "srp"),
+    ("ss", "ssw"),
+    ("st", "sot"),
+    ("su", "sun"),
+    ("sv", "swe"),
+    ("sw", "swa"),
+    ("ta", "tam"),
+    ("te", "tel"),
+    ("tg", "tgk"),
+    ("th", "tha"),
+    ("ti", "tir"),
+    ("tk", "tuk"),
+    ("tl", "tgl"),
+    ("tn", "tsn"),
+    ("to", "ton"),
+    ("tr", "tur"),
+    ("ts", "tso"),
+    ("tt", "tat"),
+    ("tw", "twi"),
+    ("ty", "tah"),
+    ("ug", "uig"),
+    ("uk", "ukr"),
+    ("ur", "urd"),
+    ("uz", "uzb"),
+    ("ve", "ven"),
+    ("vi", "vie"),
+    ("vo", "vol"),
+    ("wa", "wln"),
+    ("wo", "wol"),
+    ("xh", "xho"),
+    ("yi", "yid"),
+    ("yo", "yor"),
+    ("za", "zha"),
+    ("zh", "chi"),
+    ("zu", "zul"),
+    // Not ISO 639-1, but used by TMDB's `original_language`/`spoken_languages`: Cantonese
+    // (most Hong Kong films), "No Language" (a silent or dialogue-free title: ISO 639-2 "no
+    // linguistic content") and the deprecated Serbo-Croatian (the ISO 639-3 macrolanguage;
+    // see `MACROLANGUAGES`).
+    ("cn", "yue"),
+    ("xx", "zxx"),
+    ("sh", "hbs"),
+];
+
 /// Normalise a language code to ISO 639-2/B (bibliographic). Maps the COMPLETE ISO 639-1 (2-letter)
-/// set to /B — TMDB's `original_language` is 2-letter and the default `AudioReq::Original` compares
-/// it against a 3-letter track tag, so an incomplete map would FailAudio-blacklist correctly-tagged
-/// foreign releases — and canonicalises the 20 ISO 639-2/T (terminological) 3-letter codes to their
-/// /B equivalents so a /T-tagged track unifies with a /B want. Also maps the non-ISO codes TMDB
-/// writes (`cn` Cantonese, `xx` No Language) and the deprecated `sh` (Serbo-Croatian), which has no
-/// ISO 639-2 code. Unknown/already-/B 3-letter and unknown 2-letter codes pass through unchanged.
+/// set to /B (`ISO_639_1`) — TMDB's `original_language` is 2-letter and the default
+/// `AudioReq::Original` compares it against a 3-letter track tag, so an incomplete map would
+/// FailAudio-blacklist correctly-tagged foreign releases — and canonicalises the 20 ISO 639-2/T
+/// (terminological) 3-letter codes to their /B equivalents (`ISO_639_2_T_TO_B`) so a /T-tagged
+/// track unifies with a /B want. Also maps the non-ISO codes TMDB writes (`cn` Cantonese, `xx` No
+/// Language) and the deprecated `sh` (Serbo-Croatian), which has no ISO 639-2 code. A 3-letter code
+/// already in /B form, and any code neither table knows, passes through unchanged.
 pub fn to_iso639_2(code: &str) -> String {
     let c = code.trim().to_ascii_lowercase();
-    if c.len() == 3 {
-        // ISO 639-2/T → /B for the 20 languages whose B and T codes differ. The rest of the
-        // pipeline (the 639-1 map below, TMDB original_language) speaks /B; muxers like ffmpeg emit
-        // /T (e.g. `deu`/`fra`/`zho`/`nld`), so without this a correct German/French/… release is
-        // wrongly blacklisted by the probe. B==T codes (jpn, rus, spa, …) need no entry.
-        return match c.as_str() {
-            "sqi" => "alb",
-            "hye" => "arm",
-            "eus" => "baq",
-            "mya" => "bur",
-            "zho" => "chi",
-            "ces" => "cze",
-            "nld" => "dut",
-            "fra" => "fre",
-            "kat" => "geo",
-            "deu" => "ger",
-            "ell" => "gre",
-            "isl" => "ice",
-            "mkd" => "mac",
-            "mri" => "mao",
-            "msa" => "may",
-            "fas" => "per",
-            "ron" => "rum",
-            "slk" => "slo",
-            "bod" => "tib",
-            "cym" => "wel",
-            _ => return c, // already /B, or an unknown 3-letter code
-        }
-        .to_string();
+    let table = if c.len() == 3 {
+        ISO_639_2_T_TO_B
+    } else {
+        ISO_639_1
+    };
+    match table.iter().find(|(from, _)| *from == c) {
+        Some((_, to)) => (*to).to_string(),
+        None => c, // already /B, or an unknown code
     }
-    // Complete ISO 639-1 → 639-2/B table. For the 20 languages whose /B and /T differ, this uses
-    // the /B form (the /T 3-letter form is folded to /B by the block above), so all three
-    // representations of a language compare equal.
-    match c.as_str() {
-        "aa" => "aar",
-        "ab" => "abk",
-        "ae" => "ave",
-        "af" => "afr",
-        "ak" => "aka",
-        "am" => "amh",
-        "an" => "arg",
-        "ar" => "ara",
-        "as" => "asm",
-        "av" => "ava",
-        "ay" => "aym",
-        "az" => "aze",
-        "ba" => "bak",
-        "be" => "bel",
-        "bg" => "bul",
-        "bh" => "bih",
-        "bi" => "bis",
-        "bm" => "bam",
-        "bn" => "ben",
-        "bo" => "tib",
-        "br" => "bre",
-        "bs" => "bos",
-        "ca" => "cat",
-        "ce" => "che",
-        "ch" => "cha",
-        "co" => "cos",
-        "cr" => "cre",
-        "cs" => "cze",
-        "cu" => "chu",
-        "cv" => "chv",
-        "cy" => "wel",
-        "da" => "dan",
-        "de" => "ger",
-        "dv" => "div",
-        "dz" => "dzo",
-        "ee" => "ewe",
-        "el" => "gre",
-        "en" => "eng",
-        "eo" => "epo",
-        "es" => "spa",
-        "et" => "est",
-        "eu" => "baq",
-        "fa" => "per",
-        "ff" => "ful",
-        "fi" => "fin",
-        "fj" => "fij",
-        "fo" => "fao",
-        "fr" => "fre",
-        "fy" => "fry",
-        "ga" => "gle",
-        "gd" => "gla",
-        "gl" => "glg",
-        "gn" => "grn",
-        "gu" => "guj",
-        "gv" => "glv",
-        "ha" => "hau",
-        "he" => "heb",
-        "hi" => "hin",
-        "ho" => "hmo",
-        "hr" => "hrv",
-        "ht" => "hat",
-        "hu" => "hun",
-        "hy" => "arm",
-        "hz" => "her",
-        "ia" => "ina",
-        "id" => "ind",
-        "ie" => "ile",
-        "ig" => "ibo",
-        "ii" => "iii",
-        "ik" => "ipk",
-        "io" => "ido",
-        "is" => "ice",
-        "it" => "ita",
-        "iu" => "iku",
-        "ja" => "jpn",
-        "jv" => "jav",
-        "ka" => "geo",
-        "kg" => "kon",
-        "ki" => "kik",
-        "kj" => "kua",
-        "kk" => "kaz",
-        "kl" => "kal",
-        "km" => "khm",
-        "kn" => "kan",
-        "ko" => "kor",
-        "kr" => "kau",
-        "ks" => "kas",
-        "ku" => "kur",
-        "kv" => "kom",
-        "kw" => "cor",
-        "ky" => "kir",
-        "la" => "lat",
-        "lb" => "ltz",
-        "lg" => "lug",
-        "li" => "lim",
-        "ln" => "lin",
-        "lo" => "lao",
-        "lt" => "lit",
-        "lu" => "lub",
-        "lv" => "lav",
-        "mg" => "mlg",
-        "mh" => "mah",
-        "mi" => "mao",
-        "mk" => "mac",
-        "ml" => "mal",
-        "mn" => "mon",
-        "mr" => "mar",
-        "ms" => "may",
-        "mt" => "mlt",
-        "my" => "bur",
-        "na" => "nau",
-        "nb" => "nob",
-        "nd" => "nde",
-        "ne" => "nep",
-        "ng" => "ndo",
-        "nl" => "dut",
-        "nn" => "nno",
-        "no" => "nor",
-        "nr" => "nbl",
-        "nv" => "nav",
-        "ny" => "nya",
-        "oc" => "oci",
-        "oj" => "oji",
-        "om" => "orm",
-        "or" => "ori",
-        "os" => "oss",
-        "pa" => "pan",
-        "pi" => "pli",
-        "pl" => "pol",
-        "ps" => "pus",
-        "pt" => "por",
-        "qu" => "que",
-        "rm" => "roh",
-        "rn" => "run",
-        "ro" => "rum",
-        "ru" => "rus",
-        "rw" => "kin",
-        "sa" => "san",
-        "sc" => "srd",
-        "sd" => "snd",
-        "se" => "sme",
-        "sg" => "sag",
-        "si" => "sin",
-        "sk" => "slo",
-        "sl" => "slv",
-        "sm" => "smo",
-        "sn" => "sna",
-        "so" => "som",
-        "sq" => "alb",
-        "sr" => "srp",
-        "ss" => "ssw",
-        "st" => "sot",
-        "su" => "sun",
-        "sv" => "swe",
-        "sw" => "swa",
-        "ta" => "tam",
-        "te" => "tel",
-        "tg" => "tgk",
-        "th" => "tha",
-        "ti" => "tir",
-        "tk" => "tuk",
-        "tl" => "tgl",
-        "tn" => "tsn",
-        "to" => "ton",
-        "tr" => "tur",
-        "ts" => "tso",
-        "tt" => "tat",
-        "tw" => "twi",
-        "ty" => "tah",
-        "ug" => "uig",
-        "uk" => "ukr",
-        "ur" => "urd",
-        "uz" => "uzb",
-        "ve" => "ven",
-        "vi" => "vie",
-        "vo" => "vol",
-        "wa" => "wln",
-        "wo" => "wol",
-        "xh" => "xho",
-        "yi" => "yid",
-        "yo" => "yor",
-        "za" => "zha",
-        "zh" => "chi",
-        "zu" => "zul",
-        // Not ISO 639-1, but used by TMDB's `original_language`/`spoken_languages`: Cantonese
-        // (most Hong Kong films), "No Language" (a silent or dialogue-free title: ISO 639-2 "no
-        // linguistic content") and the deprecated Serbo-Croatian (the ISO 639-3 macrolanguage;
-        // see `MACROLANGUAGES`).
-        "cn" => "yue",
-        "xx" => "zxx",
-        "sh" => "hbs",
-        _ => return c,
-    }
-    .to_string()
 }
 
 /// Macrolanguages whose tracks may carry a member language's code instead (all as `to_iso639_2`
@@ -299,6 +305,29 @@ const MACROLANGUAGES: &[(&str, &[&str])] = &[
     ("hbs", &["hrv", "srp", "bos", "cnr"]),
     ("nor", &["nob", "nno"]),
 ];
+
+/// Whether `code` (any case, surrounding whitespace ignored) is a language code the probe knows: a
+/// 2-letter code in `ISO_639_1` (every ISO 639-1 code, plus TMDB's `cn`/`xx`/`sh`), or a 3-letter
+/// code that table maps to, a /T form, a macrolanguage or one of its members (`MACROLANGUAGES`),
+/// `mul` (multiple languages) or `und` (undetermined). The 2-letter set is complete, so `false` for
+/// one means it is no language. Rare ISO 639-2 codes with no 2-letter form (`haw`, Hawaiian) aren't
+/// listed, so for a 3-letter code `false` means only that it is not one of these. `config` uses it
+/// to vet `AUDIO_LANGUAGE` / `SUBTITLE_LANGUAGE`.
+pub fn is_known_language_code(code: &str) -> bool {
+    let c = code.trim().to_ascii_lowercase();
+    match c.len() {
+        2 => ISO_639_1.iter().any(|(two, _)| *two == c),
+        3 => {
+            ISO_639_1.iter().any(|(_, b)| *b == c)
+                || ISO_639_2_T_TO_B.iter().any(|(t, _)| *t == c)
+                || MACROLANGUAGES
+                    .iter()
+                    .any(|(m, members)| *m == c || members.contains(&c.as_str()))
+                || ["mul", "und"].contains(&c.as_str())
+        }
+        _ => false,
+    }
+}
 
 /// Whether two language codes name the same language, in any of the forms `to_iso639_2` unifies.
 /// A macrolanguage also matches each of its members (a `yue` track satisfies a `zh` want, a
@@ -2662,5 +2691,31 @@ mod tests {
             language: Some("deu".into()),
         }];
         assert_eq!(verify(&ger, &req), Verify::FailAudio);
+    }
+
+    #[test]
+    fn is_known_language_code_knows_the_codes_the_tables_name_and_nothing_else_with_two_letters() {
+        // `config` rejects a 2-letter AUDIO_LANGUAGE / SUBTITLE_LANGUAGE this doesn't know, so it
+        // must know every ISO 639-1 code (the table is complete) and TMDB's `cn`/`xx`/`sh`.
+        for (two, b) in ISO_639_1 {
+            assert!(is_known_language_code(two), "639-1 {two}");
+            assert!(is_known_language_code(b), "639-2/B {b}");
+        }
+        for (t, b) in ISO_639_2_T_TO_B {
+            assert!(is_known_language_code(t), "/T {t}");
+            // Every /T form folds to a /B code the 639-1 table produces too.
+            assert!(ISO_639_1.iter().any(|(_, x)| x == b), "/B {b}");
+        }
+        // The other codes the probe compares: macrolanguage members, multiple, undetermined.
+        for code in [
+            "cmn", "cnr", "yue", "nob", "nno", "zxx", "hbs", "mul", "und",
+        ] {
+            assert!(is_known_language_code(code), "{code}");
+        }
+        // Case and surrounding whitespace don't matter, as in `to_iso639_2`.
+        assert!(is_known_language_code(" DEU ") && is_known_language_code("En"));
+        for code in ["xy", "zz", "egn", "off", "any", "e", "", "english", "en-US"] {
+            assert!(!is_known_language_code(code), "{code}");
+        }
     }
 }

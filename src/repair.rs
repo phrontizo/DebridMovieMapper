@@ -97,8 +97,10 @@ pub struct RepairManager {
     /// successful NEW-id (Real-Debrid) instant repair, which deletes the old torrent. The VFS keeps
     /// the old torrent's locators until the next scan rebuilds it, so `dav_fs` opens a file through
     /// [`RepairManager::redirect`]; otherwise every later open of any file of that torrent would
-    /// resolve the deleted torrent and fail. Dropped by `prune_health_status` once the listing no
-    /// longer has the old torrent.
+    /// resolve the deleted torrent and fail. A handle opened before the repair keeps the old locator
+    /// past that rebuild, so `try_instant_repair` consults the redirect too. Dropped by
+    /// `prune_health_status` once the listing has neither the old torrent nor the copy its chain of
+    /// redirects ends at, and that copy isn't a replacement still waiting for the scan loop.
     repaired_locators: Arc<RwLock<HashMap<String, HashMap<String, crate::provider::FileLocator>>>>,
 }
 
@@ -282,6 +284,19 @@ impl RepairManager {
     pub async fn take_repair_replacements(&self) -> HashMap<String, String> {
         let mut map = self.repair_replacements.write().await;
         std::mem::take(&mut *map)
+    }
+
+    /// Put back replacements [`Self::take_repair_replacements`] returned to a scan tick that then
+    /// used none of them (its listing failed, or was a suspect empty one), so the next tick still
+    /// reuses each old identification. An entry recorded for the same new id since the take wins.
+    pub async fn restore_repair_replacements(&self, taken: HashMap<String, String>) {
+        if taken.is_empty() {
+            return;
+        }
+        let mut map = self.repair_replacements.write().await;
+        for (new_id, old_id) in taken {
+            map.entry(new_id).or_insert(old_id);
+        }
     }
 
     /// Delete a torrent that was created by add_magnet but whose repair failed.
@@ -952,12 +967,15 @@ impl RepairManager {
     /// Real-Debrid repair that completed since then has a new id it lacks. That entry carries the
     /// cooldown and the attempt budget across the re-add, so it is kept while its replacement is
     /// still waiting for the scan loop (`take_repair_replacements`, which runs before the next
-    /// listing). The repair redirects of torrents the listing no longer has are dropped as well: the
-    /// VFS the scan loop just built from that listing no longer has their locators.
+    /// listing). A repair redirect is dropped once the listing has neither its old torrent nor the
+    /// copy its chain of redirects ends at, and that copy isn't a replacement still waiting for the
+    /// scan loop. The VFS the scan loop builds from the listing no longer has the old locators, but
+    /// a handle opened before the repair (one long stream of a season pack's episode) still does,
+    /// and must reach the replacement for as long as it exists.
     pub async fn prune_health_status(&self, active_torrent_ids: &std::collections::HashSet<&str>) {
         let mut health_map = self.health_status.write().await;
         let before = health_map.len();
-        {
+        let pending: std::collections::HashSet<String> = {
             // Read under the health lock: `complete_repair` records the replacement before it
             // inserts the new id's entry, so every entry this retain sees has its replacement
             // recorded already. (Nothing holds the two locks the other way round.)
@@ -965,16 +983,37 @@ impl RepairManager {
             health_map.retain(|id, _| {
                 active_torrent_ids.contains(id.as_str()) || pending.contains_key(id)
             });
-        }
+            pending.keys().cloned().collect()
+        };
         let pruned = before - health_map.len();
         drop(health_map);
         if pruned > 0 {
             info!("Pruned {} stale entries from repair health_status", pruned);
         }
-        self.repaired_locators
-            .write()
-            .await
-            .retain(|old_id, _| active_torrent_ids.contains(old_id.as_str()));
+        let mut locators = self.repaired_locators.write().await;
+        let keep: std::collections::HashSet<String> = locators
+            .iter()
+            .filter(|(old_id, files)| {
+                if active_torrent_ids.contains(old_id.as_str()) {
+                    return true;
+                }
+                // Every locator of an entry points at the same replacement torrent: follow the
+                // chain to its last copy, as `redirect` does.
+                let Some(first) = files.values().next() else {
+                    return false;
+                };
+                let mut target = first.torrent_id.as_str();
+                for _ in 1..MAX_REDIRECT_HOPS {
+                    match locators.get(target).and_then(|f| f.values().next()) {
+                        Some(next) => target = next.torrent_id.as_str(),
+                        None => break,
+                    }
+                }
+                active_torrent_ids.contains(target) || pending.contains(target)
+            })
+            .map(|(old_id, _)| old_id.clone())
+            .collect();
+        locators.retain(|old_id, _| keep.contains(old_id));
     }
 
     /// Force a torrent into the `Broken` state (hidden from WebDAV until a replacement is
@@ -3111,10 +3150,21 @@ mod tests {
             .prune_health_status(&["tid"].into_iter().collect())
             .await;
         assert!(manager.redirect(&e02).await.is_some());
-        // A listing without `tid` rebuilds the VFS on the new torrent.
+        // The next tick takes the replacement, and its listing lacks `tid` (deleted, or left out
+        // as a same-hash duplicate of the newer copy): the VFS is rebuilt on the new torrent, but a
+        // handle opened before the repair still holds the old locator, so the redirect lives as
+        // long as the copy it points at is listed.
+        assert_eq!(manager.take_repair_replacements().await.len(), 1);
         manager
             .prune_health_status(&["new"].into_iter().collect())
             .await;
+        assert_eq!(
+            manager.redirect(&e02).await,
+            Some(pack_locator("new", 7, "/Show.S01E02.mkv", "new2")),
+            "kept while the replacement is listed"
+        );
+        // Once neither torrent is listed it goes.
+        manager.prune_health_status(&HashSet::new()).await;
         assert!(manager.redirect(&e02).await.is_none());
     }
 
@@ -3186,6 +3236,80 @@ mod tests {
                 .await,
             Some(pack_locator("c", 10, "/Show.S01E02.mkv", "c2"))
         );
+    }
+
+    /// A chain of redirects is kept while its LAST copy is listed (a handle opened on the first
+    /// torrent still reaches it), and dropped as a whole once nothing in it is listed.
+    #[tokio::test]
+    async fn a_redirect_chain_is_kept_while_its_last_copy_is_listed() {
+        let manager = make_test_manager();
+        manager
+            .record_redirect("a", &pack_info("b", [5, 6, 7], &["b1", "b2"]), "H")
+            .await;
+        manager
+            .record_redirect("b", &pack_info("c", [8, 9, 10], &["c1", "c2"]), "H")
+            .await;
+        let a2 = pack_locator("a", 3, "/Show.S01E02.mkv", "a2");
+        manager
+            .prune_health_status(&["c"].into_iter().collect())
+            .await;
+        assert_eq!(
+            manager.redirect(&a2).await,
+            Some(pack_locator("c", 10, "/Show.S01E02.mkv", "c2")),
+            "the whole chain survives while `c` is listed"
+        );
+        manager.prune_health_status(&HashSet::new()).await;
+        assert!(manager.redirect(&a2).await.is_none());
+        assert!(manager.repaired_locators.read().await.is_empty());
+    }
+
+    /// A redirect whose replacement the scan loop hasn't taken yet is kept even by a listing that
+    /// lacks both torrents (one fetched before the add and after the old torrent's delete).
+    #[tokio::test]
+    async fn a_redirect_to_a_replacement_still_waiting_for_the_scan_loop_is_kept() {
+        let manager = make_test_manager();
+        manager
+            .record_redirect("old", &pack_info("new", [5, 6, 7], &["n1", "n2"]), "H")
+            .await;
+        manager
+            .repair_replacements
+            .write()
+            .await
+            .insert("new".to_string(), "old".to_string());
+        manager.prune_health_status(&HashSet::new()).await;
+        assert!(manager
+            .redirect(&pack_locator("old", 3, "/Show.S01E02.mkv", "o2"))
+            .await
+            .is_some());
+    }
+
+    /// Replacements the scan loop took for a tick it then skipped (a failed or suspect listing) are
+    /// put back for the next tick; one recorded since the take wins over the restored entry.
+    #[tokio::test]
+    async fn restored_repair_replacements_are_taken_again_without_overwriting_newer_ones() {
+        let manager = make_test_manager();
+        manager
+            .repair_replacements
+            .write()
+            .await
+            .insert("new1".to_string(), "old1".to_string());
+        let taken = manager.take_repair_replacements().await;
+        // A repair recorded meanwhile for the same new id (cannot really happen, but it must win).
+        manager
+            .repair_replacements
+            .write()
+            .await
+            .insert("new1".to_string(), "newer".to_string());
+        manager
+            .repair_replacements
+            .write()
+            .await
+            .insert("new2".to_string(), "old2".to_string());
+        manager.restore_repair_replacements(taken).await;
+        let again = manager.take_repair_replacements().await;
+        assert_eq!(again.len(), 2);
+        assert_eq!(again.get("new1").map(String::as_str), Some("newer"));
+        assert_eq!(again.get("new2").map(String::as_str), Some("old2"));
     }
 
     /// The scan loop prunes the health map against the listing it fetched at the start of its tick.

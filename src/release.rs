@@ -389,7 +389,7 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
         {
             return None;
         }
-        // `TB+` is the debrid-cached marker, not a size (`x264 TB+`).
+        // `TB+` is the debrid-cached marker, not a size (`H.264 TB+`).
         if unit == "tb" && after_unit.starts_with('+') {
             return None;
         }
@@ -2468,7 +2468,21 @@ mod tests {
             score(&r, &prefs()).unwrap() < score(&no_size, &prefs()).unwrap(),
             "a 1.2 TB release takes the absurd-size penalty"
         );
-        // The debrid-cached marker is not a size: `x264 TB+` is no 264 TB release.
+        // The debrid-cached marker is not a size: `H.264 TB+` is no 264 TB release, nor
+        // `DD5.1 TB+` a 1 TB one. Both numbers follow a separator, so only the `TB+` guard in
+        // `parse` keeps them from being read as sizes.
+        for description in [
+            "Movie.2020.1080p.WEB.H.264 TB+",
+            "Movie.2020.1080p.WEB.DD5.1 TB+",
+        ] {
+            let cached = parse(&raw("Torrentio\n1080p", description, "a", None));
+            assert!(
+                cached.cached,
+                "{description}: the marker still flags it cached"
+            );
+            assert_eq!(cached.size_bytes, None, "{description}");
+        }
+        // `x264 TB+` never reaches that guard: `264` follows a letter, so `SIZE_RE` reads no size.
         let cached = parse(&raw(
             "Torrentio\n1080p",
             "Movie.2020.1080p.WEB.x264 TB+",
