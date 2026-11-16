@@ -164,6 +164,28 @@ where
         debug!("upgrade: start-up grace still running; deferring the pass (cursors unchanged)");
         return;
     }
+    // One provider listing for the pass: only owned copies still in the account count as a title's
+    // copies. A record outlives its torrent (the user deleted it, or its cache lapsed) until the
+    // mirror reaper or the lifecycle drops it, and upgrading such a title would add a release back
+    // to an account the copy was removed from. Without a trustworthy listing (a failure, or a
+    // suspect wholesale-empty one) nothing can be told apart, so the pass does nothing.
+    let listing = match app.provider.get_torrents().await {
+        Ok(listing) => listing,
+        Err(e) => {
+            warn!("upgrade: provider listing failed ({e}); skipping the pass (cursors unchanged)");
+            return;
+        }
+    };
+    if crate::tasks::listing_is_suspect(&app.store, &listing).await {
+        warn!(
+            "upgrade: provider listing is empty while torrents are known; skipping the pass (cursors unchanged)"
+        );
+        return;
+    }
+    let listed: std::collections::HashSet<String> = listing
+        .iter()
+        .map(|t| t.hash.to_ascii_lowercase())
+        .collect();
 
     let mut backfill = LanguageBackfill::new(fetch_details);
     for (_, (tmdb_id, media_type, hashes, mut rec)) in batch {
@@ -180,6 +202,31 @@ where
             );
             continue;
         }
+        // The title's copies are those in this pass's listing, plus a `Pending` one (an acquisition
+        // `observe` owns, which a lagging listing may not show yet; the handlers wait for it to
+        // settle). A title with none is skipped before any scrape or TMDB call. For a title with
+        // some copies present and some absent, the handlers baseline, swap and prune among the
+        // present ones only: an absent record is left to the mirror reaper and the reconciler
+        // (which re-acquires a wanted title whose copy lapsed), and its hash is never staged again
+        // (`rank_changes` and the pack rankers skip every owned hash).
+        let (present, absent): (Vec<String>, Vec<String>) = hashes.iter().cloned().partition(|h| {
+            let h = h.to_ascii_lowercase();
+            listed.contains(&h)
+                || records
+                    .get(&h)
+                    .is_some_and(|r| r.status == OwnedStatus::Pending)
+        });
+        if present.is_empty() {
+            debug!(
+                "upgrade: tmdb {} has no owned copy in the provider account; not upgrading it",
+                tmdb_id
+            );
+            app.store
+                .set_upgrade_checked(&media_type, tmdb_id, now_secs())
+                .await
+                .ok();
+            continue;
+        }
         // Legacy/mirror records predate `spoken_languages`: fetch the title's TMDB languages once
         // (before dispatch) so this visit's staging probes already accept its spoken languages under
         // AUDIO_LANGUAGE=original. A transient TMDB failure defers the title instead of probing it
@@ -189,12 +236,20 @@ where
             .await;
         let outcome = match backfilled {
             Err(skip) => Err(skip),
+            // Still no language to check a candidate's audio against (TMDB refused the backfill
+            // for this id, or its write failed): under AUDIO_LANGUAGE=original every staging probe
+            // would pass any audio, so nothing is staged. `NoChange` stamps the cursor (the title
+            // isn't parked at the head of the queue), and the next visit backfills again.
+            Ok(()) if audio_unchecked_in_group(app, &present, &rec).await => Err(
+                UpgradeSkip::NoChange("title languages unknown; audio can't be checked".into()),
+            ),
             Ok(()) => match media_type {
                 MediaType::Movie => {
-                    try_upgrade_movie(app, tmdb_id, &hashes, &rec, idle_window, &collections).await
+                    try_upgrade_movie(app, tmdb_id, &present, &rec, idle_window, &collections).await
                 }
                 MediaType::Show => {
-                    try_upgrade_show(app, tmdb_id, &hashes, idle_window, &fetch_aired).await
+                    try_upgrade_show(app, tmdb_id, &present, &absent, idle_window, &fetch_aired)
+                        .await
                 }
             },
         };
@@ -395,8 +450,9 @@ where
 
     /// Backfill the group's TMDB languages if any of its records has never had them fetched, before
     /// the title is dispatched. `Ok(())` = proceed (nothing to do, filled, or a permanent TMDB
-    /// refusal — see [`crate::tmdb_client::error_is_permanent`]). `Err(Deferred)` = a transient
-    /// TMDB failure (now or earlier this tick): nothing is written and the title is NOT dispatched,
+    /// refusal such as an unknown id — see [`crate::tmdb_client::error_is_permanent`]).
+    /// `Err(Deferred)` = a transient TMDB failure, a rejected key (401/403) included (now or
+    /// earlier this tick): nothing is written and the title is NOT dispatched,
     /// so no staging probe runs with the original-only rule (which could blacklist correct
     /// spoken-language releases for the blacklist TTL); its cursor stays unstamped and it is
     /// retried next tick.
@@ -432,8 +488,9 @@ where
                 .await;
                 Ok(())
             }
-            // Waiting won't fix it, and deferring would park the title at the head of the
-            // round-robin forever: proceed with the recorded languages (the pre-backfill rule).
+            // A per-title refusal (an unknown id): waiting won't fix it, and deferring would park
+            // the title at the head of the round-robin forever, so proceed with the recorded
+            // languages (the pre-backfill rule). A rejected key is not permanent: it defers below.
             Err(e) if crate::tmdb_client::error_is_permanent(&e) => {
                 debug!(
                     "upgrade: tmdb {} language backfill refused ({}); proceeding with the recorded languages",
@@ -448,6 +505,44 @@ where
                 )))
             }
         }
+    }
+}
+
+/// Whether a staging probe for the in-hand representative `rec`, or for ANY owned record in
+/// `hashes` (the show paths probe with each record's own request), would check no audio language
+/// ([`crate::acquire::AcquisitionEngine::audio_unchecked`]).
+async fn audio_unchecked_in_group(app: &AppState, hashes: &[String], rec: &OwnedRecord) -> bool {
+    if app.engine.audio_unchecked(&rec.request) {
+        return true;
+    }
+    for h in hashes {
+        if let Some(r) = app.store.get_owned(h.clone()).await {
+            if app.engine.audio_unchecked(&r.request) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The probe every upgrade staging site adopts on: [`crate::acquire::AcquisitionEngine::probe_file`],
+/// except that a `Pass` which checked no audio language
+/// ([`crate::acquire::AcquisitionEngine::audio_unchecked`]: no language known for the title under
+/// `AUDIO_LANGUAGE=original`) counts as `Accept`. Nothing checked its audio, so the upgrade must not
+/// adopt it as a checked copy and prune the one it replaces; like any `Accept` it is discarded
+/// without blacklisting.
+async fn staging_probe(
+    app: &AppState,
+    info: &crate::rd_client::TorrentInfo,
+    hash: &str,
+    file_path: &str,
+    req: &crate::store::AcquireRequest,
+) -> crate::acquire::VerifyResult {
+    match app.engine.probe_file(info, hash, file_path, req).await {
+        crate::acquire::VerifyResult::Pass if app.engine.audio_unchecked(req) => {
+            crate::acquire::VerifyResult::Accept
+        }
+        verdict => verdict,
     }
 }
 
@@ -836,8 +931,9 @@ async fn apply_upgrade(
         // SUCCEEDED — on a transient delete failure, KEEP them, so the torrent stays tracked rather
         // than being re-adopted by `record_mirror_owned` as a DUPLICATE (the
         // `execute_remove`/`prune_owned_hash_in` keep-on-failure discipline). Nothing retries the
-        // delete: the copy is left owned with no slot, for the selection repoint or an enabled
-        // `DEDUP_REMOVE_DUPLICATES` to tidy up.
+        // delete: the staged copy is left owned with no slot. `selection::repoint_to_better_copies`
+        // may later move the slot onto it (it is a better copy), which then leaves the old copy in
+        // place with no slot, for an enabled `DEDUP_REMOVE_DUPLICATES` to remove.
         if app
             .provider
             .delete_torrent(&staged.torrent_id)
@@ -857,6 +953,18 @@ async fn apply_upgrade(
     // slots may already point at it) and the old copy stays in place. Only
     // `selection::repoint_to_better_copies` (for the slots) or an enabled `DEDUP_REMOVE_DUPLICATES`
     // tidies the pair up afterwards.
+    //
+    // First make sure the staged copy is still owned: a concurrent removal of it (dedup, once the
+    // fresh-title skip has passed) during the listing fetch and the read re-check above would
+    // otherwise have every slot repointed at a hash nobody owns, which nothing repoints back.
+    // Defer with the slots untouched. `prune_behind_staged` checks again for a removal that lands
+    // between the slot writes and the prune.
+    if app.store.get_owned(staged.hash.clone()).await.is_none() {
+        return Err(UpgradeSkip::Deferred(format!(
+            "staged {} no longer owned; not pruning what it supersedes",
+            staged.hash
+        )));
+    }
     for (slot, file_path) in &staged.slot_files {
         if let Err(e) = app
             .store
@@ -979,6 +1087,12 @@ async fn rank_changes(
             continue;
         }
         if release::score(&r, prefs).is_none() {
+            continue;
+        }
+        // Nor any other owned hash: one of this title's copies that has left the account (the
+        // caller passes only the present ones as `owned_hashes`), which must not be added back, or
+        // a copy recorded under another title, whose record staging would overwrite.
+        if app.store.get_owned(r.info_hash.clone()).await.is_some() {
             continue;
         }
         let q = QualitySummary::of(&r, prefs);
@@ -1391,11 +1505,7 @@ async fn stage_and_verify(
     // Unlike acquisition, an upgrade adopts ONLY a `Pass`: an `Accept` (tracks couldn't be checked —
     // unreadable container / no tracks) is dropped WITHOUT blacklisting (nothing is known to be wrong
     // with it), so an upgrade never swaps a checked copy for an unchecked one.
-    match app
-        .engine
-        .probe_file(&fresh, &hash, &selected_path, base_req)
-        .await
-    {
+    match staging_probe(app, &fresh, &hash, &selected_path, base_req).await {
         crate::acquire::VerifyResult::Pass => {}
         crate::acquire::VerifyResult::Accept => {
             discard_staged(app, &hash, &added.id).await;
@@ -1571,11 +1681,13 @@ pub(crate) const STAGING_ABANDONED_AFTER_SECS: u64 = 3_600;
 /// delete a torrent of the hash the user adds later.
 pub(crate) const STAGING_LISTING_LAG_SECS: u64 = 600;
 
-/// Delete the torrents of abandoned staging intents ([`crate::store::StagingIntent`]: opened at or
-/// before `cutoff`) and close them. The scan loop runs it on every trusted listing, with `cutoff`
-/// covering every intent an earlier process left and this process's intents older than
-/// [`STAGING_ABANDONED_AFTER_SECS`] (a tick cancelled mid-staging); with no such intent it is one
-/// store read.
+/// Delete the torrents of abandoned staging intents ([`crate::store::StagingIntent`]) and close
+/// them. The scan loop runs it on every trusted listing. An intent is abandoned when an earlier
+/// process left it (this process holds no local note of it, [`crate::store::Store::local_staging_age`])
+/// or when this process opened it at least [`STAGING_ABANDONED_AFTER_SECS`] ago by the monotonic
+/// clock (a tick cancelled mid-staging). Ownership is decided in-process, never by comparing
+/// wall-clock seconds, so a clock step (or an intent opened in the process's first second) never
+/// sweeps a staging or acquisition still in flight. With no abandoned intent it is one store read.
 ///
 /// An intent whose hash is owned only lost its clear (the hash was recorded), so it is just closed.
 /// Otherwise every torrent `listing` holds with that hash is deleted, and the intent is closed once
@@ -1583,21 +1695,30 @@ pub(crate) const STAGING_LISTING_LAG_SECS: u64 = 600;
 /// returned is deleted instead, and the intent is closed once that delete succeeded or the intent
 /// is [`STAGING_LISTING_LAG_SECS`] old (`now` is the current unix time): until then an add cut off
 /// before it returned its id (or whose delete failed) may still show up in a lagging listing, and
-/// the open intent keeps the account mirror from adopting it meanwhile. Not idle-gated: the torrent
-/// is a candidate nothing ever checked, which no slot serves. Returns the lowercased hashes whose
-/// listed torrents were deleted, so the caller can drop them from this tick's listing.
+/// the open intent keeps the account mirror from adopting it meanwhile. (For an intent this process
+/// opened, its monotonic age stands in for `now - started_at`.) Not idle-gated: the torrent is a
+/// candidate nothing ever checked, which no slot serves. Returns the lowercased hashes whose listed
+/// torrents were deleted, so the caller can drop them from this tick's listing, and those whose
+/// intents it left open (still being staged or acquired, or waiting out the listing lag).
 pub(crate) async fn sweep_staging_intents(
     store: &crate::store::Store,
     provider: &dyn crate::provider::DebridProvider,
     listing: &[crate::rd_client::Torrent],
-    cutoff: u64,
     now: u64,
-) -> std::collections::HashSet<String> {
+) -> StagingSweep {
     let mut deleted = std::collections::HashSet::new();
+    let mut open = std::collections::HashSet::new();
     for (hash, intent) in store.all_staging_intents().await {
-        if intent.started_at > cutoff {
-            continue;
-        }
+        let age_secs = match store.local_staging_age(&hash) {
+            // This process's own, and young enough to be live: leave it alone.
+            Some(age) if age < Duration::from_secs(STAGING_ABANDONED_AFTER_SECS) => {
+                open.insert(hash);
+                continue;
+            }
+            Some(age) => age.as_secs(),
+            // Left by an earlier process: abandoned now.
+            None => now.saturating_sub(intent.started_at),
+        };
         if store.get_owned(hash.clone()).await.is_some() {
             let _ = store.clear_staging_intent(hash).await;
             continue;
@@ -1616,8 +1737,7 @@ pub(crate) async fn sweep_staging_intents(
                 Some(id) => provider.delete_torrent(id).await.is_ok(),
                 None => false,
             };
-            gone =
-                deleted_by_id || now.saturating_sub(intent.started_at) >= STAGING_LISTING_LAG_SECS;
+            gone = deleted_by_id || age_secs >= STAGING_LISTING_LAG_SECS;
         } else {
             for t in &listed {
                 if let Err(e) = provider.delete_torrent(&t.id).await {
@@ -1638,9 +1758,19 @@ pub(crate) async fn sweep_staging_intents(
                 deleted.insert(hash.clone());
             }
             let _ = store.clear_staging_intent(hash).await;
+        } else {
+            open.insert(hash);
         }
     }
-    deleted
+    StagingSweep { deleted, open }
+}
+
+/// What [`sweep_staging_intents`] did: the lowercased hashes whose listed torrents it deleted, and
+/// those whose staging intents are still open after it (lowercased).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct StagingSweep {
+    pub(crate) deleted: std::collections::HashSet<String>,
+    pub(crate) open: std::collections::HashSet<String>,
 }
 
 /// Delete a torrent (owned-only) and drop its owned record + authoritative id, against an
@@ -1651,8 +1781,10 @@ async fn prune_owned_hash_in(app: &AppState, hash: &str, torrents: &[crate::rd_c
     // gone (deleted now, or already absent from the listing). On a transient delete failure, KEEP
     // the records, so the torrent stays tracked rather than being re-adopted by
     // `record_mirror_owned` as a duplicate of the just-superseded release (mirrors
-    // `execute_remove`). Nothing retries the delete: the copy is left owned with no slot, for the
-    // selection repoint or an enabled `DEDUP_REMOVE_DUPLICATES` to tidy up.
+    // `execute_remove`). Nothing retries the delete: the superseded copy stays owned with no slot
+    // (the selection repoint never deletes and has nothing to move, since the slot is already on the
+    // better copy). Only an enabled `DEDUP_REMOVE_DUPLICATES` removes it, or, for a movie, the next
+    // adopted upgrade, which prunes every within-ceiling copy through `supersede_hashes`.
     let mut all_gone = true;
     for t in torrents
         .iter()
@@ -2048,11 +2180,7 @@ async fn stage_episode_candidate(
     };
     // Adopt only a probe `Pass` (see `stage_and_verify`): an unverifiable `Accept` is dropped
     // without blacklisting.
-    match app
-        .engine
-        .probe_file(&fresh, &hash, &file_path, &probe_req)
-        .await
-    {
+    match staging_probe(app, &fresh, &hash, &file_path, &probe_req).await {
         crate::acquire::VerifyResult::Pass => {}
         crate::acquire::VerifyResult::Accept => {
             discard_staged(app, &hash, &torrent_id).await;
@@ -2255,8 +2383,9 @@ enum EpisodeUpgrade {
     Unchanged,
     /// A player is reading a copy the swap changes, or a post-stage `apply_upgrade` step deferred
     /// (a listing failure or a mid-stage read rolls the staged copy back; a failed selection write
-    /// keeps it owned, possibly with some slots repointed, and leaves the old copy in place): stop
-    /// ALL further show work this tick and signal deferral.
+    /// keeps it owned, possibly with some slots repointed, and leaves the old copy in place; a
+    /// staged copy that is no longer owned leaves every slot and copy as it was, nothing pruned):
+    /// stop ALL further show work this tick and signal deferral.
     Deferred,
 }
 
@@ -2352,9 +2481,10 @@ async fn upgrade_episode_slot(
                     }
                     // A post-stage defer: a listing failure or a mid-stage read rolled the staged
                     // copy back, a failed selection write kept it owned (possibly with some slots
-                    // repointed; the old copy stays). Either must propagate so the caller leaves
-                    // the round-robin cursor unstamped and this work is reconsidered next tick —
-                    // NOT swallowed as a false "swapped".
+                    // repointed; the old copy stays), or the staged copy was no longer owned
+                    // (nothing pruned). Each must propagate so the caller leaves the round-robin
+                    // cursor unstamped and this work is reconsidered next tick — NOT swallowed as
+                    // a false "swapped".
                     Err(_) => return EpisodeUpgrade::Deferred,
                 }
             }
@@ -2396,9 +2526,10 @@ async fn upgrade_episode_slot(
 ///
 /// Returns `true` if it DEFERRED mid-tick — a player is reading the pack ([`being_read`]), the
 /// replacement's title check had no verdict (TMDB unreachable) or its record write failed, OR a
-/// post-stage `apply_upgrade` step failed (a provider-listing fetch or a `put_selection` write) —
-/// so the caller can leave the round-robin cursor unstamped and reconsider next tick; `false` on
-/// normal completion (whether or not a correction was applied).
+/// post-stage `apply_upgrade` step failed (a provider-listing fetch, a `put_selection` write, or
+/// the staged copy no longer owned, nothing pruned) — so the caller can leave the round-robin
+/// cursor unstamped and reconsider next tick; `false` on normal completion (whether or not a
+/// correction was applied).
 async fn correct_over_ceiling_packs(
     app: &AppState,
     tmdb_id: u64,
@@ -2514,11 +2645,7 @@ async fn correct_over_ceiling_packs(
             };
             // Adopt only a probe `Pass` (see `stage_and_verify`): an unverifiable `Accept` is
             // dropped without blacklisting and the next candidate is tried.
-            match app
-                .engine
-                .probe_file(&fresh, &cand.info_hash, rpath, &probe_req)
-                .await
-            {
+            match staging_probe(app, &fresh, &cand.info_hash, rpath, &probe_req).await {
                 crate::acquire::VerifyResult::Pass => {}
                 crate::acquire::VerifyResult::Accept => {
                     discard_staged(app, &cand.info_hash, &torrent_id).await;
@@ -2612,9 +2739,9 @@ async fn correct_over_ceiling_packs(
                 }
                 // A post-stage defer: a listing failure or a mid-stage read rolled the staged pack
                 // back, a failed selection write kept it owned (possibly with some slots repointed;
-                // the old pack stays). Either must propagate so the caller leaves the round-robin
-                // cursor unstamped and this pack is reconsidered next tick — NOT swallowed as a
-                // false "pack corrected".
+                // the old pack stays), or the staged pack was no longer owned (nothing pruned).
+                // Each must propagate so the caller leaves the round-robin cursor unstamped and
+                // this pack is reconsidered next tick — NOT swallowed as a false "pack corrected".
                 Err(_) => return true,
             }
         }
@@ -2630,7 +2757,8 @@ async fn correct_over_ceiling_packs(
 /// a deferred probe) moves on to the next episode; but a DEFERRAL — a player reading a copy one of
 /// its swaps would change ([`being_read`], in the per-episode loops or in
 /// `correct_over_ceiling_packs`), or a post-stage `apply_upgrade` step failing (a provider-listing
-/// fetch or a `put_selection` write) — stops all further show work this tick.
+/// fetch, a `put_selection` write, or the staged copy no longer owned) — stops all further show
+/// work this tick.
 ///
 /// Returns `true` on such a deferral. The caller then signals `Deferred` so the round-robin cursor is
 /// NOT stamped and the skipped work is reconsidered next tick (rather than waiting a full cursor
@@ -2918,6 +3046,7 @@ async fn try_upgrade_show<A, AFut>(
     app: &AppState,
     tmdb_id: u64,
     group_hashes: &[String],
+    absent: &[String],
     idle_window: Duration,
     fetch_aired: &A,
 ) -> Result<(), UpgradeSkip>
@@ -2950,8 +3079,15 @@ where
     // by dedup). Feeding consolidation the fresh set makes `season_owned_quality` see the upgraded
     // episode, so the no-regression gate correctly rejects a lower-quality pack.
     let fresh_hashes = current_show_hashes(app, tmdb_id).await;
-    let consolidated =
-        try_consolidate_show(app, tmdb_id, &fresh_hashes, idle_window, fetch_aired).await;
+    let consolidated = try_consolidate_show(
+        app,
+        tmdb_id,
+        &fresh_hashes,
+        absent,
+        idle_window,
+        fetch_aired,
+    )
+    .await;
     if deferred {
         return Err(UpgradeSkip::Deferred(
             "show per-episode/pack upgrade deferred mid-tick".into(),
@@ -2980,11 +3116,13 @@ async fn current_show_hashes(app: &AppState, tmdb_id: u64) -> Vec<String> {
 /// keep their selection untouched. The idle gate drops the staged pack on defer (no dangling stage).
 /// `fetch_aired` yields the show's aired `(season, episode)` set and whether the lookup was complete
 /// (`tasks::aired_episodes` in production); it is called only when a season is held as scattered
-/// singles.
+/// singles. `absent` are the show's copies the pass's listing lacked: never consolidated, pruned or
+/// counted, though, as part of `group_hashes`, never staged either.
 async fn try_consolidate_show<A, AFut>(
     app: &AppState,
     tmdb_id: u64,
     group_hashes: &[String],
+    absent: &[String],
     idle_window: Duration,
     fetch_aired: &A,
 ) -> Result<(), UpgradeSkip>
@@ -2992,9 +3130,12 @@ where
     A: Fn(u64) -> AFut,
     AFut: Future<Output = crate::tasks::AiredEpisodes>,
 {
-    // Owned per-episode records for this show: hash -> OwnedRecord.
+    // Owned per-episode records for this show that are in the account: hash -> OwnedRecord.
     let mut owned: Vec<(String, OwnedRecord)> = Vec::new();
     for h in group_hashes {
+        if absent.iter().any(|a| a.eq_ignore_ascii_case(h)) {
+            continue;
+        }
         if let Some(r) = app.store.get_owned(h.clone()).await {
             owned.push((h.clone(), r));
         }
@@ -3283,11 +3424,7 @@ async fn consolidate_show_seasons(
             };
             // Adopt only a probe `Pass` (see `stage_and_verify`): an unverifiable `Accept` is
             // dropped without blacklisting and the next candidate pack is tried.
-            match app
-                .engine
-                .probe_file(&fresh, &r.info_hash, path, &probe_req)
-                .await
-            {
+            match staging_probe(app, &fresh, &r.info_hash, path, &probe_req).await {
                 crate::acquire::VerifyResult::Pass => {}
                 crate::acquire::VerifyResult::Accept => {
                     discard_staged(app, &r.info_hash, &torrent_id).await;
@@ -3397,6 +3534,8 @@ async fn consolidate_show_seasons(
             // short-circuits this season on subsequent ticks, so consolidation does NOT re-run the
             // failed repoint; recovery of the now-redundant scattered records is via the
             // duplicate-dedup pass. (A put_selection failure is a rare redb-write/disk error.)
+            // Unlike `apply_upgrade`, no "pack still owned?" check is needed before the repoint:
+            // `record_staged` wrote the pack's record just above with no network call in between.
             let mut repoint_ok = true;
             for (s, e, path) in &eps {
                 if *s != season {
@@ -3466,12 +3605,21 @@ mod tests {
     use tokio::sync::RwLock;
 
     fn mem_store() -> Store {
-        Store::from_database(Arc::new(
-            redb::Database::builder()
-                .create_with_backend(redb::backends::InMemoryBackend::new())
-                .unwrap(),
-        ))
-        .unwrap()
+        Store::in_memory()
+    }
+
+    /// A provider listing holding a `downloaded` torrent `t<hash>` for each of `hashes`: the upgrade
+    /// pass counts only listed copies as a title's.
+    fn listing_of(hashes: &[&str]) -> Vec<Torrent> {
+        hashes
+            .iter()
+            .map(|h| Torrent {
+                id: format!("t{h}"),
+                hash: (*h).into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            })
+            .collect()
     }
 
     fn movie_meta() -> MediaMetadata {
@@ -4147,7 +4295,7 @@ mod tests {
             deleted: deleted.clone(),
             ..Default::default()
         };
-        // Abandoned (opened at or before the cutoff) and unowned: its torrent goes.
+        // Abandoned (left by an earlier process) and unowned: its torrent goes.
         store
             .put_staging_intent("horphan".into(), 100)
             .await
@@ -4178,17 +4326,23 @@ mod tests {
             .set_staging_torrent_id("hgone".into(), "t-gone".into())
             .await
             .unwrap();
-        // Opened after the cutoff: may still be staging, so it is left alone.
+        // Everything so far was left by an earlier process.
+        store.forget_local_staging_intents();
+        // Opened by this process just now: may still be staging, so it is left alone.
         store
             .put_staging_intent("hlive".into(), 5_000)
             .await
             .unwrap();
 
-        let swept = sweep_staging_intents(&store, &provider, &listing, 1_000, 200).await;
+        let swept = sweep_staging_intents(&store, &provider, &listing, 200).await;
 
         assert_eq!(
-            swept,
+            swept.deleted,
             std::collections::HashSet::from(["horphan".to_string()])
+        );
+        assert_eq!(
+            swept.open,
+            std::collections::HashSet::from(["hlive".to_string()])
         );
         let mut d = deleted.lock().unwrap().clone();
         d.sort();
@@ -4211,8 +4365,10 @@ mod tests {
             .put_staging_intent("horphan".into(), 100)
             .await
             .unwrap();
-        let swept = sweep_staging_intents(&store, &failing, &listing, 1_000, 200).await;
-        assert!(swept.is_empty(), "{swept:?}");
+        store.forget_local_staging_intents();
+        let swept = sweep_staging_intents(&store, &failing, &listing, 200).await;
+        assert!(swept.deleted.is_empty(), "{swept:?}");
+        assert!(swept.open.contains("horphan"), "{swept:?}");
         assert!(store
             .all_staging_intents()
             .await
@@ -4243,13 +4399,15 @@ mod tests {
         // (1) Cut off before the add returned (no id), opened just now: kept.
         let store = mem_store();
         store.put_staging_intent("hnoid".into(), now).await.unwrap();
-        assert!(sweep_staging_intents(&store, &ok, &[], now, now)
+        store.forget_local_staging_intents();
+        assert!(sweep_staging_intents(&store, &ok, &[], now)
             .await
+            .deleted
             .is_empty());
         assert_eq!(open(store.clone()).await, vec!["hnoid".to_string()]);
         // … and closed once older than the listing lag.
         let later = now + STAGING_LISTING_LAG_SECS;
-        sweep_staging_intents(&store, &ok, &[], later, later).await;
+        sweep_staging_intents(&store, &ok, &[], later).await;
         assert!(open(store).await.is_empty());
 
         // (2) The delete by id fails, opened just now: kept.
@@ -4259,7 +4417,8 @@ mod tests {
             .set_staging_torrent_id("hfail".into(), "t-fail".into())
             .await
             .unwrap();
-        sweep_staging_intents(&store, &failing, &[], now, now).await;
+        store.forget_local_staging_intents();
+        sweep_staging_intents(&store, &failing, &[], now).await;
         assert_eq!(open(store.clone()).await, vec!["hfail".to_string()]);
         // The torrent then shows up in a later listing: deleted, and the intent closed.
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -4273,9 +4432,9 @@ mod tests {
             status: "downloaded".into(),
             ..Default::default()
         }];
-        let swept = sweep_staging_intents(&store, &recovered, &listing, now + 60, now + 60).await;
+        let swept = sweep_staging_intents(&store, &recovered, &listing, now + 60).await;
         assert_eq!(
-            swept,
+            swept.deleted,
             std::collections::HashSet::from(["hfail".to_string()])
         );
         assert_eq!(*deleted.lock().unwrap(), vec!["t-fail".to_string()]);
@@ -4284,8 +4443,73 @@ mod tests {
         // (3) No id, older than the listing lag: closed.
         let store = mem_store();
         store.put_staging_intent("hold".into(), 100).await.unwrap();
-        sweep_staging_intents(&store, &ok, &[], now, now).await;
+        store.forget_local_staging_intents();
+        sweep_staging_intents(&store, &ok, &[], now).await;
         assert!(open(store).await.is_empty());
+    }
+
+    /// The sweep decides whether an intent is this process's in-process, never from its wall-clock
+    /// `started_at`: one this process opened is left alone however its timestamp compares with the
+    /// clock (a clock stepped back past the start, or forward by hours), and is swept only once it
+    /// has been open `STAGING_ABANDONED_AFTER_SECS` by the monotonic clock. One left by an earlier
+    /// process (a restart, simulated by forgetting the local notes) is swept at once.
+    #[tokio::test(start_paused = true)]
+    async fn the_staging_sweep_never_takes_a_live_intent_of_this_process_by_its_timestamp() {
+        let listing = vec![Torrent {
+            id: "t-live".into(),
+            hash: "hlive".into(),
+            status: "downloaded".into(),
+            ..Default::default()
+        }];
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = MockProvider {
+            deleted: deleted.clone(),
+            ..Default::default()
+        };
+        for stamp in [0, u64::MAX / 2] {
+            let store = mem_store();
+            store
+                .put_staging_intent("hlive".into(), stamp)
+                .await
+                .unwrap();
+            let swept = sweep_staging_intents(&store, &provider, &listing, 1_000_000).await;
+            assert!(swept.deleted.is_empty(), "stamp {stamp}: {swept:?}");
+            assert!(swept.open.contains("hlive"));
+            assert!(deleted.lock().unwrap().is_empty(), "stamp {stamp}");
+            assert_eq!(store.all_staging_intents().await.len(), 1);
+        }
+
+        // Still open an hour later (monotonic): abandoned, so its torrent goes.
+        let store = mem_store();
+        store.put_staging_intent("hlive".into(), 0).await.unwrap();
+        tokio::time::advance(Duration::from_secs(STAGING_ABANDONED_AFTER_SECS - 1)).await;
+        assert!(sweep_staging_intents(&store, &provider, &listing, 0)
+            .await
+            .deleted
+            .is_empty());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let swept = sweep_staging_intents(&store, &provider, &listing, 0).await;
+        assert_eq!(
+            swept.deleted,
+            std::collections::HashSet::from(["hlive".to_string()])
+        );
+        assert_eq!(*deleted.lock().unwrap(), vec!["t-live".to_string()]);
+        assert!(store.all_staging_intents().await.is_empty());
+
+        // Left by an earlier process: swept at once, whatever its timestamp.
+        deleted.lock().unwrap().clear();
+        let store = mem_store();
+        store
+            .put_staging_intent("hlive".into(), u64::MAX / 2)
+            .await
+            .unwrap();
+        store.forget_local_staging_intents();
+        let swept = sweep_staging_intents(&store, &provider, &listing, 0).await;
+        assert_eq!(
+            swept.deleted,
+            std::collections::HashSet::from(["hlive".to_string()])
+        );
+        assert_eq!(*deleted.lock().unwrap(), vec!["t-live".to_string()]);
     }
 
     /// Start-up grace: an upgrade tick run right after the process starts (a fresh tracker, nothing
@@ -4757,9 +4981,16 @@ mod tests {
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
-            // The first get_torrents is the pre-add presence check (`add_staging_candidate`); the
-            // second is the post-stage prune listing → fail it there.
-            fail_get_torrents_after: Some(1),
+            torrents: vec![Torrent {
+                id: "told".into(),
+                hash: "hold".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            // The first get_torrents is the pass's own listing, the second the pre-add presence
+            // check (`add_staging_candidate`); the third is the post-stage prune listing → fail it
+            // there.
+            fail_get_torrents_after: Some(2),
             add_magnet: Some(AddMagnetResponse {
                 id: "tnew".into(),
                 uri: String::new(),
@@ -4811,8 +5042,9 @@ mod tests {
     #[tokio::test]
     async fn movie_upgrade_keeps_old_record_when_prune_delete_fails() {
         // The swap succeeds (selection → new hash), but pruning the old torrent's delete FAILS. The
-        // old owned record must be KEPT (not dropped) so a later tick retries — otherwise a
-        // present-but-untracked old torrent would be re-adopted by record_mirror_owned as a DUPLICATE.
+        // old owned record must be KEPT (not dropped) so the still-present torrent stays tracked:
+        // a present-but-untracked old torrent would be re-adopted by record_mirror_owned as a
+        // DUPLICATE. Nothing retries the delete.
         let store = mem_store();
         store
             .put_owned(
@@ -4891,7 +5123,7 @@ mod tests {
         );
         assert!(
             store.get_owned("hold".into()).await.is_some(),
-            "on a failed delete the old owned record is KEPT for retry (no orphan re-adoption)"
+            "on a failed delete the old owned record is kept (no orphan re-adoption)"
         );
     }
 
@@ -5149,6 +5381,11 @@ mod tests {
         assert!(
             store.get_owned("hold".into()).await.is_some(),
             "the old copy's record is kept"
+        );
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hold",
+            "the slot is not repointed at a staged copy nobody owns"
         );
 
         let (store, app, deleted) = swap_with_staged_record(true).await;
@@ -6000,9 +6237,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn language_backfill_rejected_key_defers_like_an_outage() {
+        // A rejected TMDB_API_KEY (401/403) fails every request until the key is fixed, so it is no
+        // verdict about the title: defer it (cursor unchanged) and don't fetch again this tick.
+        for status in [401, 403] {
+            let store = mem_store();
+            store
+                .put_owned("hb".into(), legacy_episode(1, 2))
+                .await
+                .unwrap();
+            let app = empty_app(store.clone());
+            let mut rec = store.get_owned("hb".into()).await.unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut backfill = LanguageBackfill::new(canned_details(calls.clone(), move || {
+                Err(http_status_error(status))
+            }));
+            for id in [900001, 999] {
+                let out = backfill
+                    .run(&app, id, &MediaType::Show, &["hb".into()], &mut rec)
+                    .await;
+                assert!(
+                    matches!(out, Err(UpgradeSkip::Deferred(_))),
+                    "{status}: {out:?}"
+                );
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "{status}: one fetch per tick"
+            );
+            assert_eq!(rec.request.spoken_languages, None);
+        }
+    }
+
+    #[tokio::test]
     async fn language_backfill_permanent_failure_proceeds_without_writing() {
-        // A non-429 4xx (bad key, unknown id) won't fix itself by waiting: deferring would park the
-        // title at the head of the round-robin forever, blocking all its upgrades. Proceed with the
+        // A per-title 4xx refusal (an unknown id) won't fix itself by waiting: deferring would park
+        // the title at the head of the round-robin forever, blocking all its upgrades. Proceed with the
         // recorded languages (the pre-backfill rule), write nothing, and keep TMDB usable for the
         // rest of the tick.
         let store = mem_store();
@@ -6037,37 +6308,6 @@ mod tests {
                 .spoken_languages,
             None
         );
-    }
-
-    #[tokio::test]
-    async fn tmdb_error_permanence_classification() {
-        assert!(crate::tmdb_client::error_is_permanent(&http_status_error(
-            404
-        )));
-        assert!(crate::tmdb_client::error_is_permanent(&http_status_error(
-            401
-        )));
-        assert!(!crate::tmdb_client::error_is_permanent(&http_status_error(
-            429
-        )));
-        assert!(!crate::tmdb_client::error_is_permanent(&http_status_error(
-            502
-        )));
-        assert!(!crate::tmdb_client::error_is_permanent(&http_status_error(
-            500
-        )));
-        // No HTTP status (transport / decode failure) → transient.
-        let decode = reqwest::Response::from(
-            hyper::Response::builder()
-                .status(200)
-                .body(hyper::body::Bytes::from_static(b"not json"))
-                .unwrap(),
-        )
-        .json::<serde_json::Value>()
-        .await
-        .unwrap_err();
-        assert!(decode.status().is_none());
-        assert!(!crate::tmdb_client::error_is_permanent(&decode));
     }
 
     /// A legacy `fi`-original movie (mostly English; spoken languages never fetched) owned as a
@@ -6215,6 +6455,107 @@ mod tests {
             0,
             "deferred: cursor unchanged"
         );
+    }
+
+    /// The legacy `fi` film app with its owned copy turned into an account-mirror record: no
+    /// languages recorded at all (`original_language` and `spoken_languages` both `None`).
+    async fn mirror_film_without_languages_app(store: &Store) -> AppState {
+        let app = legacy_fi_film_app(store).await;
+        let mut hold = store.get_owned("hold".into()).await.unwrap();
+        hold.request.original_language = None;
+        hold.provenance = Provenance { entries: vec![] };
+        store.put_owned("hold".into(), hold).await.unwrap();
+        app
+    }
+
+    /// Under `AUDIO_LANGUAGE=original`, a title whose languages stay unknown (TMDB refused the
+    /// backfill for this id) has nothing to check a candidate's audio against: the probe would pass
+    /// any audio, and the swap would replace the user's copy with a release recorded as checked.
+    /// The title is skipped (cursor stamped, so it isn't parked at the head of the queue), and once
+    /// TMDB names its languages the same upgrade goes through.
+    #[tokio::test]
+    async fn upgrade_tick_skips_a_title_whose_audio_cannot_be_checked() {
+        let store = mem_store();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = mirror_film_without_languages_app(&store).await;
+        run_upgrade_once_with(
+            &app,
+            canned_details(calls.clone(), || Err(http_status_error(404))),
+            |_| async { crate::tasks::AiredEpisodes::default() },
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hold",
+            "nothing staged or swapped"
+        );
+        assert!(store.get_owned("hnew".into()).await.is_none());
+        assert!(store.get_owned("hold".into()).await.is_some());
+        assert!(
+            store.get_upgrade_checked(&MediaType::Movie, 27205).await > 0,
+            "evaluated: cursor stamped"
+        );
+
+        // Control: TMDB names the original language, and the upgrade is adopted.
+        let store = mem_store();
+        let app = mirror_film_without_languages_app(&store).await;
+        run_upgrade_once_with(
+            &app,
+            canned_details(calls.clone(), || {
+                Ok(TitleDetails {
+                    original_language: Some("en".into()),
+                    spoken_languages: vec!["en".into()],
+                    ..fi_film_details()
+                })
+            }),
+            |_| async { crate::tasks::AiredEpisodes::default() },
+        )
+        .await;
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hnew"
+        );
+    }
+
+    /// Defence in depth at the staging site itself: a probe `Pass` that checked no audio language
+    /// (the request carries no language at all) is not adopted, like an unverifiable `Accept`.
+    #[tokio::test]
+    async fn staging_never_adopts_a_pass_that_checked_no_audio() {
+        let store = mem_store();
+        let app = mirror_film_without_languages_app(&store).await;
+        let mut req = movie_req();
+        req.original_language = None;
+        req.spoken_languages = None;
+        let r = stage_and_verify(
+            &app,
+            27205,
+            &req,
+            &release::parse(&remux_candidate()),
+            &Provenance { entries: vec![] },
+        )
+        .await;
+        assert!(matches!(r, Err(UpgradeSkip::NoChange(_))), "{r:?}");
+        assert!(store.get_owned("hnew".into()).await.is_none());
+        assert!(
+            !store
+                .is_blacklisted(MediaKind::Movie, 27205, "hnew".into())
+                .await,
+            "nothing is known to be wrong with it"
+        );
+
+        // With a language to check, the same candidate is adopted.
+        let store = mem_store();
+        let app = mirror_film_without_languages_app(&store).await;
+        let r = stage_and_verify(
+            &app,
+            27205,
+            &movie_req(),
+            &release::parse(&remux_candidate()),
+            &Provenance { entries: vec![] },
+        )
+        .await;
+        assert!(r.is_ok(), "{r:?}");
     }
 
     #[tokio::test]
@@ -6845,7 +7186,10 @@ mod tests {
                 .unwrap();
         }
         let scraper = Arc::new(MockScraper { candidates: vec![] });
-        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: listing_of(&["h101", "h202", "h303"]),
+            ..Default::default()
+        });
         let mut app = app_with(scraper, provider, store.clone());
         Arc::get_mut(&mut app.config)
             .unwrap()
@@ -6896,7 +7240,10 @@ mod tests {
                 .unwrap();
         }
         let scraper = Arc::new(MockScraper { candidates: vec![] });
-        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: listing_of(&["h101", "h202", "h303"]),
+            ..Default::default()
+        });
         let mut app = app_with(scraper, provider, store.clone());
         Arc::get_mut(&mut app.config)
             .unwrap()
@@ -7191,6 +7538,7 @@ mod tests {
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: listing_of(&["hold"]),
             deleted: deleted.clone(),
             ..Default::default()
         });
@@ -7261,6 +7609,7 @@ mod tests {
         });
         let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: listing_of(&["hold"]),
             deleted: deleted.clone(),
             ..Default::default()
         });
@@ -8288,7 +8637,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let (app, added, deleted) =
+            let (mut app, added, deleted) =
                 unknown_movie_app(&store, vec![remux_candidate(), web_1080_candidate()]);
 
             run_upgrade_once(&app).await;
@@ -8309,7 +8658,14 @@ mod tests {
             assert_eq!(*added.lock().unwrap(), vec!["hnew".to_string()]);
 
             // Second visit: the adopted copy is known; the WEB release is no improvement on it and the
-            // REMUX is owned → nothing is staged, nothing changes.
+            // REMUX is owned → nothing is staged, nothing changes. The account now lists the adopted
+            // copy (and not the pruned one).
+            app.provider = Arc::new(MockProvider {
+                torrents: listing_of(&["hnew"]),
+                added: added.clone(),
+                deleted: deleted.clone(),
+                ..Default::default()
+            });
             run_upgrade_once(&app).await;
             assert_eq!(
                 *added.lock().unwrap(),
@@ -12719,6 +13075,7 @@ mod tests {
             app,
             SHOW_TMDB,
             &hashes,
+            &[],
             Duration::from_secs(0),
             &canned_aired(aired, Arc::new(AtomicUsize::new(0))),
         )
@@ -12764,14 +13121,22 @@ mod tests {
                 })
             }
         };
-        let r = try_consolidate_show(&app, SHOW_TMDB, &group_two(), Duration::ZERO, &lookup(true))
-            .await;
+        let r = try_consolidate_show(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &[],
+            Duration::ZERO,
+            &lookup(true),
+        )
+        .await;
         assert!(matches!(r, Err(UpgradeSkip::NoChange(_))), "{r:?}");
         // A failed lookup (incomplete, nothing known) still defers.
         let r = try_consolidate_show(
             &app,
             SHOW_TMDB,
             &group_two(),
+            &[],
             Duration::ZERO,
             &lookup(false),
         )
@@ -13735,7 +14100,7 @@ mod tests {
         );
     }
 
-    // ── iteration 2: provenance, Pending, single-episode streams, the show dispatch ──────────
+    // ── provenance, Pending, single-episode streams, the show dispatch ──────────
 
     /// A show the user already held part of (a mirror singleton, empty provenance) with the rest
     /// acquired for a watchlist: upgrading the mirror episode gives the replacement the MIRROR
@@ -14325,6 +14690,7 @@ mod tests {
             &app,
             SHOW_TMDB,
             &["e1".to_string(), "e2".to_string(), "e3".to_string()],
+            &[],
             Duration::from_secs(0),
             &canned_aired(&[(1, 1), (1, 2), (1, 3)], Arc::new(AtomicUsize::new(0))),
         )
@@ -14364,6 +14730,7 @@ mod tests {
             &h.app,
             SHOW_TMDB,
             &["e2".to_string(), "e720".to_string()],
+            &[],
             Duration::from_secs(300),
             &canned_aired(&[(1, 1), (1, 2)], calls.clone()),
         )
@@ -14371,5 +14738,254 @@ mod tests {
         assert!(matches!(r, Err(UpgradeSkip::Deferred(_))));
         assert_eq!(calls.load(Ordering::SeqCst), 0, "consolidation skipped");
         assert!(h.added.lock().unwrap().is_empty(), "nothing staged");
+    }
+
+    // ── presence: only owned copies still in the account are upgraded ──────────────────────
+
+    /// A cached WEB 1080p movie copy `hold` whose torrent the provider account no longer lists (the
+    /// user deleted it): its record stays until the mirror reaper or the lifecycle drops it, but
+    /// the upgrade pass must not add a better release back for it. Nothing is staged or deleted,
+    /// and the title counts as visited. The control (the copy listed) upgrades as before.
+    #[tokio::test]
+    async fn the_upgrade_pass_leaves_a_title_whose_copies_left_the_account() {
+        for listed in [false, true] {
+            let store = mem_store();
+            store
+                .put_owned(
+                    "hold".into(),
+                    OwnedRecord {
+                        request: movie_req(),
+                        provenance: Provenance { entries: vec![] },
+                        added_at: 1,
+                        status: OwnedStatus::Verified,
+                        provides: vec![],
+                        quality: Some(q1080_web()),
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .put_selection(
+                    movie_slot(27205),
+                    SelectionEntry {
+                        hash: "hold".into(),
+                        file_path: "old.mkv".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let (mut app, added, deleted) = unknown_movie_app(&store, vec![remux_candidate()]);
+            if !listed {
+                app.provider = Arc::new(MockProvider {
+                    torrents: listing_of(&["hother"]),
+                    added: added.clone(),
+                    deleted: deleted.clone(),
+                    ..Default::default()
+                });
+            }
+            run_upgrade_once(&app).await;
+            if listed {
+                assert_eq!(*added.lock().unwrap(), vec!["hnew".to_string()]);
+                assert_eq!(
+                    store.get_selection(movie_slot(27205)).await.unwrap().hash,
+                    "hnew"
+                );
+            } else {
+                assert!(added.lock().unwrap().is_empty(), "nothing staged");
+                assert!(deleted.lock().unwrap().is_empty(), "nothing deleted");
+                assert!(store.get_owned("hold".into()).await.is_some());
+                assert!(store.get_owned("hnew".into()).await.is_none());
+                assert_eq!(
+                    store.get_selection(movie_slot(27205)).await.unwrap().hash,
+                    "hold"
+                );
+                assert!(
+                    store.get_upgrade_checked(&MediaType::Movie, 27205).await > 0,
+                    "visited: cursor stamped"
+                );
+            }
+        }
+    }
+
+    /// A title with one copy present and one gone from the account: the pass baselines and prunes
+    /// among the present copy only, and never stages the gone copy's hash again, even when it is
+    /// the best release on offer. Its record is left for the reaper and the reconciler.
+    #[tokio::test]
+    async fn the_upgrade_pass_never_adds_back_a_copy_that_left_the_account() {
+        let store = mem_store();
+        // `hgone` (a REMUX) was deleted from the account; `hold` (WEB) is still there.
+        for (hash, q) in [
+            ("hold", q1080_web()),
+            (
+                "hgone",
+                QualitySummary {
+                    source_tier: 8_000,
+                    ..q1080_web()
+                },
+            ),
+        ] {
+            store
+                .put_owned(
+                    hash.into(),
+                    OwnedRecord {
+                        request: movie_req(),
+                        provenance: Provenance { entries: vec![] },
+                        added_at: 1,
+                        status: OwnedStatus::Verified,
+                        provides: vec![],
+                        quality: Some(q),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .put_selection(
+                movie_slot(27205),
+                SelectionEntry {
+                    hash: "hold".into(),
+                    file_path: "old.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let gone_remux = RawCandidate {
+            info_hash: "hgone".into(),
+            ..remux_candidate()
+        };
+        let (app, added, deleted) = unknown_movie_app(&store, vec![gone_remux]);
+        run_upgrade_once(&app).await;
+        assert!(
+            added.lock().unwrap().is_empty(),
+            "the gone copy is not added back: {:?}",
+            added.lock().unwrap()
+        );
+        assert!(deleted.lock().unwrap().is_empty());
+        assert!(
+            store.get_owned("hgone".into()).await.is_some(),
+            "left to the reaper"
+        );
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hold"
+        );
+
+        // A better release that was never owned upgrades the present copy and prunes only it.
+        let store = mem_store();
+        for (hash, q) in [("hold", q1080_web()), ("hgone", q1080_web())] {
+            store
+                .put_owned(
+                    hash.into(),
+                    OwnedRecord {
+                        request: movie_req(),
+                        provenance: Provenance { entries: vec![] },
+                        added_at: 1,
+                        status: OwnedStatus::Verified,
+                        provides: vec![],
+                        quality: Some(q),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let (app, added, deleted) = unknown_movie_app(&store, vec![remux_candidate()]);
+        run_upgrade_once(&app).await;
+        assert_eq!(*added.lock().unwrap(), vec!["hnew".to_string()]);
+        assert_eq!(*deleted.lock().unwrap(), vec!["told".to_string()]);
+        assert!(store.get_owned("hold".into()).await.is_none());
+        assert!(
+            store.get_owned("hgone".into()).await.is_some(),
+            "an absent record is left to the reaper and the reconciler"
+        );
+    }
+
+    /// A show singleton whose torrent left the account is not upgraded (the episode's copy is gone;
+    /// the reconciler re-acquires it if someone still wants it).
+    #[tokio::test]
+    async fn the_upgrade_pass_leaves_a_show_episode_whose_copy_left_the_account() {
+        for listed in [false, true] {
+            let mut h = show_harness_singleton_720_ep().await;
+            if !listed {
+                h.app.provider = Arc::new(MockProvider {
+                    torrents: listing_of(&["hother"]),
+                    added: h.added.clone(),
+                    deleted: h.deleted.clone(),
+                    ..Default::default()
+                });
+            }
+            run_upgrade_once_with(
+                &h.app,
+                canned_details(Arc::new(AtomicUsize::new(0)), || Ok(fi_film_details())),
+                |_| async { crate::tasks::AiredEpisodes::default() },
+            )
+            .await;
+            let slot = h
+                .app
+                .store
+                .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+                .await
+                .unwrap();
+            if listed {
+                assert_eq!(*h.added.lock().unwrap(), vec![h.cand_1080_hash.clone()]);
+                assert_eq!(slot.hash, h.cand_1080_hash);
+            } else {
+                assert!(h.added.lock().unwrap().is_empty(), "nothing staged");
+                assert!(h.deleted.lock().unwrap().is_empty(), "nothing deleted");
+                assert_eq!(slot.hash, h.old_720_hash);
+            }
+        }
+    }
+
+    /// A wholesale-empty listing while identifications are known can't tell a present copy from a
+    /// gone one: the pass does nothing and leaves every cursor as it was. So does a failed listing.
+    #[tokio::test]
+    async fn the_upgrade_pass_does_nothing_on_a_suspect_or_failed_listing() {
+        for fail in [false, true] {
+            let store = mem_store();
+            store
+                .put_owned(
+                    "hold".into(),
+                    OwnedRecord {
+                        request: movie_req(),
+                        provenance: Provenance { entries: vec![] },
+                        added_at: 1,
+                        status: OwnedStatus::Verified,
+                        provides: vec![],
+                        quality: Some(q1080_web()),
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .put_matches(vec![(
+                    "told".into(),
+                    TorrentInfo {
+                        id: "told".into(),
+                        hash: "hold".into(),
+                        ..Default::default()
+                    },
+                    movie_meta(),
+                )])
+                .await
+                .unwrap();
+            let (mut app, added, deleted) = unknown_movie_app(&store, vec![remux_candidate()]);
+            app.provider = Arc::new(MockProvider {
+                fail_get_torrents: fail,
+                added: added.clone(),
+                deleted: deleted.clone(),
+                ..Default::default()
+            });
+            run_upgrade_once(&app).await;
+            assert!(
+                added.lock().unwrap().is_empty(),
+                "fail={fail}: nothing staged"
+            );
+            assert!(deleted.lock().unwrap().is_empty());
+            assert_eq!(
+                store.get_upgrade_checked(&MediaType::Movie, 27205).await,
+                0,
+                "fail={fail}: cursor unchanged"
+            );
+        }
     }
 }

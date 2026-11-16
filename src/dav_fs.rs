@@ -905,6 +905,36 @@ impl DavFile for VirtualFile {
     }
 }
 
+/// One movie, `Movies/Test Movie [tmdbid-123]/{Test.mkv, movie.nfo}`, whose torrent was added
+/// 2023-01-01 and whose media file is 1000 bytes.
+#[cfg(test)]
+fn one_movie_torrents() -> Vec<(crate::rd_client::TorrentInfo, crate::vfs::MediaMetadata)> {
+    vec![(
+        crate::rd_client::TorrentInfo {
+            id: "t1".to_string(),
+            filename: "Test.mkv".to_string(),
+            hash: "h".to_string(),
+            bytes: 1000,
+            status: "downloaded".to_string(),
+            added: "2023-01-01".to_string(),
+            files: vec![crate::rd_client::TorrentFile {
+                id: 1,
+                path: "/Test.mkv".to_string(),
+                bytes: 1000,
+                selected: 1,
+            }],
+            links: vec!["http://link".to_string()],
+            ..Default::default()
+        },
+        crate::vfs::MediaMetadata {
+            title: "Test Movie".to_string(),
+            year: None,
+            media_type: crate::vfs::MediaType::Movie,
+            external_id: Some("tmdb:123".to_string()),
+        },
+    )]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,37 +1019,7 @@ mod tests {
     #[test]
     fn find_node_in_resolves_deep_path() {
         // Build a VFS with a known movie file and verify it can be found
-        let torrents = vec![(
-            crate::rd_client::TorrentInfo {
-                id: "t1".to_string(),
-                filename: "Test.mkv".to_string(),
-                original_filename: "Test.mkv".to_string(),
-                hash: "h".to_string(),
-                bytes: 1000,
-                original_bytes: 1000,
-                host: "h".to_string(),
-                split: 1,
-                progress: 100.0,
-                status: "downloaded".to_string(),
-                added: "2023-01-01".to_string(),
-                files: vec![crate::rd_client::TorrentFile {
-                    id: 1,
-                    path: "/Test.mkv".to_string(),
-                    bytes: 1000,
-                    selected: 1,
-                }],
-                links: vec!["http://link".to_string()],
-                ended: None,
-            },
-            crate::vfs::MediaMetadata {
-                title: "Test Movie".to_string(),
-                year: None,
-                media_type: crate::vfs::MediaType::Movie,
-                external_id: Some("tmdb:123".to_string()),
-            },
-        )];
-
-        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
+        let vfs = DebridVfs::build(one_movie_torrents(), &crate::vfs::SelectionMap::new());
         let path = DavPath::new("/Movies/Test Movie [tmdbid-123]/Test.mkv").unwrap();
         let result = DebridFileSystem::find_node_in(&vfs, &path);
         assert!(result.is_some(), "Deep path to media file should resolve");
@@ -1107,39 +1107,9 @@ mod provider_abstraction_tests {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    /// A filesystem over one movie, `Movies/Test Movie [tmdbid-123]/{Test.mkv, movie.nfo}`, whose
-    /// torrent was added 2023-01-01 and whose media file is 1000 bytes.
+    /// A filesystem over `one_movie_torrents()`.
     fn one_movie_fs() -> DebridFileSystem {
-        let torrents = vec![(
-            crate::rd_client::TorrentInfo {
-                id: "t1".to_string(),
-                filename: "Test.mkv".to_string(),
-                original_filename: "Test.mkv".to_string(),
-                hash: "h".to_string(),
-                bytes: 1000,
-                original_bytes: 1000,
-                host: "h".to_string(),
-                split: 1,
-                progress: 100.0,
-                status: "downloaded".to_string(),
-                added: "2023-01-01".to_string(),
-                files: vec![crate::rd_client::TorrentFile {
-                    id: 1,
-                    path: "/Test.mkv".to_string(),
-                    bytes: 1000,
-                    selected: 1,
-                }],
-                links: vec!["http://link".to_string()],
-                ended: None,
-            },
-            crate::vfs::MediaMetadata {
-                title: "Test Movie".to_string(),
-                year: None,
-                media_type: crate::vfs::MediaType::Movie,
-                external_id: Some("tmdb:123".to_string()),
-            },
-        )];
-        let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
+        let vfs = DebridVfs::build(one_movie_torrents(), &crate::vfs::SelectionMap::new());
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
         let repair = Arc::new(RepairManager::new(provider.clone()));
         let ra = Arc::new(crate::read_activity::ReadActivity::without_startup_grace());

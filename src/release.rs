@@ -104,13 +104,15 @@ static RES_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(\d{3,4})p(?:\d{2,3})?|\b(4k|uhd)\b").unwrap());
 // Torrentio's size follows its `💾` (U+1F4BE) marker, as the seeders follow `👤`. `SIZE_RE` is the
 // fallback for a description without one: a bare `<number> <unit>` whose number doesn't start
-// inside a word or number, so a codec run (`x265.200MB`) is not read as 265.2 MB. Both end the unit
-// at a word boundary, so a unit glued to more letters is a word, not a size (`DD5.1.TBS` is no 1 TB
-// release, `DD5.1.MBC` no 1 MB sample); `TB+` still matches, see the guard in `parse`.
+// inside a word or number, so a codec run (`x265.200MB`) is not read as 265.2 MB. `parse` likewise
+// rejects a unit glued to a following letter or digit, so a unit that runs on into a word is no size
+// (`DD5.1.TBS` is no 1 TB release, `DD5.1.MBC` no 1 MB sample), while `_`, `.`, `-` and spaces end
+// it on both sides (`Movie_2020_4.7GB_x264`); `TB+` still matches, see the guard in `parse`. (Not a
+// trailing `\b`: that counts `_` as a word character.)
 static SIZE_MARKED_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\u{1f4be}\s*([\d.]+)\s*(tb|gb|mb)\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\u{1f4be}\s*([\d.]+)\s*(tb|gb|mb)").unwrap());
 static SIZE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)(?:^|[^a-z\d])([\d.]+)\s*(tb|gb|mb)\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)(?:^|[^a-z\d])([\d.]+)\s*(tb|gb|mb)").unwrap());
 static SEED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{1f464}\s*(\d+)").unwrap());
 // The debrid-cached marker (`RD+`/`TB+`) matched as a WORD-BOUNDED token, not a raw substring, so a
 // release name that merely CONTAINS the letters (`Standard+`, `Hard+`, `Record+`) is not mis-flagged
@@ -243,9 +245,14 @@ static TS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[ .\-_\n])ts[
 // (`webrip` is handled explicitly; `spiderweb` won't match). Without this, a bare-`WEB` release falls
 // to `Source::Other` (tier 0) — scoring BELOW HDTV and blocking a legitimate HDTV→WEB upgrade. Like
 // the bare cam words it is matched only in a line's `tag_part`, so the title word in
-// `Charlotte's.Web.2006.720p.HDTV` doesn't make an HDTV release WEB.
+// `Charlotte's.Web.2006.720p.HDTV` doesn't make an HDTV release WEB. A show line's tag part still
+// holds its episode title (`S01E05.Web.of.Lies.720p.HDTV`), as does a pack's file line
+// (`05 - Web of Lies.mkv`), so the bare token also counts only when the text names no other source
+// (`NON_WEB_SOURCE_TAGS`): a release is never both HDTV and WEB.
 static WEB_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|[ ._\n-])web(?:[ ._\n-]|$)").unwrap());
+// Source tags a bare `web` token never sits beside on a real WEB release (BluRay/REMUX win earlier).
+const NON_WEB_SOURCE_TAGS: [&str; 5] = ["hdtv", "pdtv", "sdtv", "tvrip", "dvdrip"];
 
 // A separator-bounded `multi` (multi-language) token — see the language-parsing loop in `parse`.
 static MULTI_RE: LazyLock<Regex> =
@@ -303,7 +310,8 @@ fn detect_source(lower: &str) -> Source {
         || lower.contains("pcok")
         || lower.contains("pmtp")
         || lower.contains("itunes")
-        || lower.lines().any(|line| WEB_RE.is_match(tag_part(line)))
+        || (lower.lines().any(|line| WEB_RE.is_match(tag_part(line)))
+            && !NON_WEB_SOURCE_TAGS.iter().any(|tag| lower.contains(tag)))
     {
         Source::Web
     } else if lower.contains("hdtv") {
@@ -370,10 +378,19 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
     // capture a non-numeric run like `1.2.3` (which fails `parse::<f64>`), and without iterating we'd
     // silently drop the size instead of trying the next candidate.
     let size_of = |cap: regex::Captures| {
-        let whole = cap.get(0)?;
-        let unit = cap.get(2)?.as_str().to_ascii_lowercase();
+        let unit_match = cap.get(2)?;
+        let unit = unit_match.as_str().to_ascii_lowercase();
+        let after_unit = &text[unit_match.end()..];
+        // A unit running on into a word or number is part of it (`DD5.1.TBS`), not a size.
+        if after_unit
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        {
+            return None;
+        }
         // `TB+` is the debrid-cached marker, not a size (`x264 TB+`).
-        if unit == "tb" && text[whole.end()..].starts_with('+') {
+        if unit == "tb" && after_unit.starts_with('+') {
             return None;
         }
         let n: f64 = cap.get(1)?.as_str().parse().ok()?;
@@ -1818,6 +1835,25 @@ mod tests {
         assert_eq!(parse(&dvdrip).source, Source::Other);
         let show = raw("t", "Web.Therapy.S01E01.720p.HDTV.x264", "h", None);
         assert_eq!(parse(&show).source, Source::Hdtv);
+        // An episode title after the code sits inside the tag part, so a `Web` in it must not
+        // outrank the line's own source tag.
+        let episode = raw(
+            "t",
+            "Some.Show.S01E05.Web.of.Lies.720p.HDTV.x264",
+            "h",
+            None,
+        );
+        assert_eq!(parse(&episode).source, Source::Hdtv);
+        let episode = raw("t", "Some.Show.S01E05.Tangled.Web.DVDRip.x264", "h", None);
+        assert_eq!(parse(&episode).source, Source::Other);
+        // Nor on a pack's file line, whose source tag is on the torrent's line.
+        let pack = raw(
+            "t",
+            "Some.Show.S01.720p.HDTV.x264-GRP\n05 - Web of Lies.mkv",
+            "h",
+            None,
+        );
+        assert_eq!(parse(&pack).source, Source::Hdtv);
         // A real WEB tag after the year/episode, or on a year-less line, still counts.
         for name in [
             "Movie.2024.1080p.WEB.H264-GRP",
@@ -2386,6 +2422,8 @@ mod tests {
             ("Show.S01.720p.WEB-DL.x265.200MB", 200_000_000),
             ("Movie.2020.1080p.WEB.5.2GB", 5_200_000_000),
             ("4.7GB Movie.2020.1080p", 4_700_000_000),
+            // `_` separates a size from the next tag as it does before the number.
+            ("Movie_2020_1080p_4.7GB_x264", 4_700_000_000),
             (
                 "Show.S01E01.DDP5.1.TBS.WEB-DL.x264 2.3 GB",
                 (2.3 * 1_000_000_000.0) as u64,

@@ -1458,7 +1458,7 @@ mod tests {
         assert_eq!(parse_lookback("3MO"), Some(3 * 30 * 86_400)); // case-insensitive
         assert_eq!(parse_lookback("garbage"), None); // unparseable → all-time
 
-        // A bare unit with no number (strip_suffix → "") is unparseable → all-time, not a panic.
+        // A bare unit with no number (an empty digit run) is unparseable → all-time, not a panic.
         assert_eq!(parse_lookback("d"), None);
         assert_eq!(parse_lookback("w"), None);
         assert_eq!(parse_lookback("mo"), None);

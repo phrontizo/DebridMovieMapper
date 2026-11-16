@@ -121,12 +121,20 @@ pub(crate) fn is_well_formed_imdb_id(id: &str) -> bool {
     matches!(id.strip_prefix("tt"), Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Whether a TMDB request error is PERMANENT for that request (a 4xx other than 429: a bad key, an
-/// unknown id), as opposed to transient (a 429, a 5xx after the retry budget, a transport error)
-/// and so worth retrying later.
+/// Whether a TMDB request error is PERMANENT for that request: a per-request verdict such as an
+/// unknown id (a 4xx other than 401, 403 and 429). Everything else is transient and worth retrying
+/// later: a 429, a 5xx after the retry budget, a transport error, and a rejected key (401/403),
+/// which fails every request alike and clears once `TMDB_API_KEY` is fixed, so it says nothing
+/// about the title (identification likewise treats it as no verdict).
 pub(crate) fn error_is_permanent(e: &reqwest::Error) -> bool {
-    e.status()
-        .is_some_and(|s| s.is_client_error() && s != reqwest::StatusCode::TOO_MANY_REQUESTS)
+    use reqwest::StatusCode;
+    e.status().is_some_and(|s| {
+        s.is_client_error()
+            && !matches!(
+                s,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            )
+    })
 }
 
 /// Minimum interval between TMDB requests (TMDB allows ~40 req/s; 100ms is conservative).
@@ -1144,5 +1152,42 @@ mod tests {
             ]
         });
         assert_eq!(parse_season_numbers(&v), vec![1, 3]);
+    }
+
+    fn http_status_error(status: u16) -> reqwest::Error {
+        reqwest::Response::from(
+            hyper::Response::builder()
+                .status(status)
+                .body(hyper::body::Bytes::new())
+                .unwrap(),
+        )
+        .error_for_status()
+        .unwrap_err()
+    }
+
+    /// A per-request refusal (an unknown id) is permanent. A rejected key (401/403) is not: it fails
+    /// every request until `TMDB_API_KEY` is fixed, so it says nothing about the title.
+    #[tokio::test]
+    async fn tmdb_error_permanence_classification() {
+        assert!(error_is_permanent(&http_status_error(404)));
+        assert!(error_is_permanent(&http_status_error(400)));
+        for transient in [401, 403, 429, 500, 502] {
+            assert!(
+                !error_is_permanent(&http_status_error(transient)),
+                "{transient} must be transient"
+            );
+        }
+        // No HTTP status (transport / decode failure) → transient.
+        let decode = reqwest::Response::from(
+            hyper::Response::builder()
+                .status(200)
+                .body(hyper::body::Bytes::from_static(b"not json"))
+                .unwrap(),
+        )
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_err();
+        assert!(decode.status().is_none());
+        assert!(!error_is_permanent(&decode));
     }
 }

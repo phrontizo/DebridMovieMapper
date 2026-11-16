@@ -211,8 +211,10 @@ pub(crate) fn parse_pagination(headers: &reqwest::header::HeaderMap) -> Paginati
 /// header absent on either side is not compared. PURE.
 ///
 /// A change that keeps both counts is invisible here. `authed_get_list` also fails a read in which
-/// one list-item `id` appears on two pages ([`repeated_list_item`]), which catches a reorder (an
-/// item moved onto an already-read page pushes another onto the next one). Still undetected: an
+/// one item appears on two pages ([`repeated_list_item`]: the same list-item `id`, or on the
+/// watched lists, which carry none, the same movie or show), which catches a reorder (an item moved
+/// onto an already-read page pushes another onto the next one; on the watched lists, which come
+/// back newest `last_watched_at` first, a watch moves its title to the top). Still undetected: an
 /// item removed from an already-read page while another is added further on, between two page
 /// fetches. Every later item then slides back one place, and the first item of the next page is
 /// read on neither. Accepted residual risk: it needs a list over one page (100 items) and both
@@ -241,19 +243,58 @@ pub(crate) fn check_page_consistency(
     Ok(())
 }
 
-/// The first Trakt list-item `id` on `page_items` that an earlier page of the same read already
-/// carried, if any. A list item (its `id` is the list entry's own key, e.g. a watchlist entry) can
-/// appear only once in a list, so seeing it on two pages means the list shifted between the page
-/// fetches, and with the item count unchanged some other item was then missed. Items without a
-/// numeric top-level `id` (the watched endpoints carry none) are not compared. PURE.
+/// The first item key ([`list_item_key`]) on `page_items` that an earlier page of the same read
+/// already carried, if any. A list entry (keyed by its own `id`, e.g. a watchlist entry) can appear
+/// only once in a list, and so can a movie or show in a watched list (keyed by its Trakt id, since
+/// watched items carry no `id`). Seeing one on two pages means the list shifted between the page
+/// fetches, and with the item count unchanged some other item was then missed. An item with no key
+/// is not compared. PURE.
 pub(crate) fn repeated_list_item(
-    seen: &std::collections::HashSet<u64>,
+    seen: &std::collections::HashSet<ListItemKey>,
     page_items: &[serde_json::Value],
-) -> Option<u64> {
+) -> Option<ListItemKey> {
     page_items
         .iter()
-        .filter_map(|item| item.get("id").and_then(serde_json::Value::as_u64))
-        .find(|id| seen.contains(id))
+        .filter_map(list_item_key)
+        .find(|key| seen.contains(key))
+}
+
+/// What identifies one item of a Trakt list read, for [`repeated_list_item`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ListItemKey {
+    /// The list entry's own `id` (watchlist and playback items).
+    Entry(u64),
+    /// A watched movie's Trakt id.
+    Movie(u64),
+    /// A watched show's Trakt id.
+    Show(u64),
+}
+
+impl std::fmt::Display for ListItemKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Entry(id) => write!(f, "list item {id}"),
+            Self::Movie(id) => write!(f, "movie {id}"),
+            Self::Show(id) => write!(f, "show {id}"),
+        }
+    }
+}
+
+/// The key of one list item: its numeric top-level `id` when it has one, otherwise (a watched
+/// movie or show) its `movie.ids.trakt` / `show.ids.trakt`. The entry id comes first because
+/// playback entries carry one each while several of them share a show. An item with neither, or
+/// one carrying an `episode` (a playback entry, keyed only by its own `id`), has no key. PURE.
+pub(crate) fn list_item_key(item: &serde_json::Value) -> Option<ListItemKey> {
+    if let Some(id) = item.get("id").and_then(serde_json::Value::as_u64) {
+        return Some(ListItemKey::Entry(id));
+    }
+    if item.get("episode").is_some() {
+        return None;
+    }
+    let trakt_id = |kind: &str| item.get(kind)?.get("ids")?.get("trakt")?.as_u64();
+    trakt_id("movie")
+        .map(ListItemKey::Movie)
+        .or_else(|| trakt_id("show").map(ListItemKey::Show))
 }
 
 pub struct TraktClientImpl {
@@ -418,7 +459,8 @@ impl TraktClientImpl {
         limit: Option<u32>,
     ) -> Result<serde_json::Value, AppError> {
         let mut items: Vec<serde_json::Value> = Vec::new();
-        let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut seen_keys: std::collections::HashSet<ListItemKey> =
+            std::collections::HashSet::new();
         let mut first = Pagination::default();
         let mut total_pages: u32 = 1;
         let mut page: u32 = 1;
@@ -452,17 +494,13 @@ impl TraktClientImpl {
                 )));
             };
             let page_len = page_items.len();
-            if let Some(id) = repeated_list_item(&seen_ids, &page_items) {
+            if let Some(key) = repeated_list_item(&seen_keys, &page_items) {
                 return Err(AppError::Upstream(format!(
-                    "Trakt {path} page {page}: list item {id} already read on an earlier page \
+                    "Trakt {path} page {page}: {key} already read on an earlier page \
                      (the list changed mid-read)"
                 )));
             }
-            seen_ids.extend(
-                page_items
-                    .iter()
-                    .filter_map(|item| item.get("id").and_then(serde_json::Value::as_u64)),
-            );
+            seen_keys.extend(page_items.iter().filter_map(list_item_key));
             items.extend(page_items);
             if page == 1 {
                 first = info;
@@ -779,10 +817,9 @@ pub(crate) fn parse_user(v: &serde_json::Value) -> TraktUser {
 ///   418 I'm a teapot  -> the user explicitly denied the request.
 ///   429 Too Many Req  -> polling too fast; normally absorbed by the retry helper, mapped to
 ///                        Pending defensively so a stray 429 doesn't abort enrolment.
-/// Any other status (404/409 above, 401/403 — typically a wrong client id/secret, since the secret
-/// is first sent on this poll — or anything unlisted) is terminal `Rejected(status)`, so the
-/// caller's poll loop can't spin forever and its error names the status instead of claiming the
-/// code expired.
+/// 404, 409, 401/403 (typically a wrong client id/secret, since the secret is first sent on this
+/// poll) and any unlisted status are terminal `Rejected(status)`, so the caller's poll loop can't
+/// spin forever and its error names the status instead of claiming the code expired.
 /// A 5xx never reaches this from `TraktClientImpl::poll_token`, which returns it as a retryable
 /// `Err` instead.
 pub fn interpret_device_token(
@@ -2485,8 +2522,9 @@ mod pagination_tests {
             .expect_err("a list item on two pages must fail the read");
         assert!(err.to_string().contains("5000002"), "{err}");
 
-        // Items without a list-item id (the watched endpoints) are not compared, and distinct ids
-        // across pages read normally (see watchlist_follows_pagination_for_movies_and_shows).
+        // Distinct ids across pages read normally (see also
+        // watchlist_follows_pagination_for_movies_and_shows). Watched items, which carry no
+        // list-item id, are compared by their movie or show Trakt id (the tests below).
         let page2_ok = r#"[
             {"type":"movie","id":5000003,"rank":3,"movie":{"ids":{"tmdb":103,"trakt":3}}}
         ]"#;
@@ -2512,6 +2550,97 @@ mod pagination_tests {
         assert_eq!(
             items.iter().map(|i| i.tmdb_id).collect::<Vec<_>>(),
             vec![101, 102, 103, 911200, 910100]
+        );
+    }
+
+    /// Page 2 of a watched list after a title on it moved to the top between the page fetches: it
+    /// pushed page 1's last item onto page 2 and is itself read on neither page. Both counts are
+    /// unchanged. The watched endpoints come back newest `last_watched_at` first, so this is what
+    /// watching (or re-watching) a title past position 100 does mid-read.
+    fn page2_after_a_move_to_the_top(p1: &str, p2: &str) -> String {
+        let p1 = json(p1);
+        let p2 = json(p2);
+        let pushed = p1.as_array().unwrap().last().unwrap().clone();
+        let rest = p2.as_array().unwrap()[1..].to_vec();
+        serde_json::Value::Array(std::iter::once(pushed).chain(rest).collect()).to_string()
+    }
+
+    #[tokio::test]
+    async fn a_watched_show_seen_on_two_pages_is_an_err() {
+        // Watched items carry no list-item `id`; a show appears only once in the list, so its Trakt
+        // id on two pages gives the shift away. Read as-is, the moved show (810900) would drop out
+        // of the wanted set for a cycle: a catch-up-only show loses its row, and one with Watchlist
+        // provenance becomes a Trigger-B removal.
+        let page2 = page2_after_a_move_to_the_top(WATCHED_SHOWS_P1, WATCHED_SHOWS_P2);
+        let routes: Vec<(&str, Reply)> = watched_routes()
+            .into_iter()
+            .map(|(t, r)| {
+                if t == "/sync/watched/shows?extended=progress&page=2&limit=100" {
+                    (t, Reply::page(&page2, 2, 2, 4, 100))
+                } else {
+                    (t, r)
+                }
+            })
+            .collect();
+        let server = spawn(routes).await;
+        let err = client(&server.base_url)
+            .watched("at")
+            .await
+            .expect_err("a watched show on two pages must fail the read");
+        assert!(err.to_string().contains("show 811300"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_watched_movie_seen_on_two_pages_is_an_err() {
+        let page2 = page2_after_a_move_to_the_top(WATCHED_MOVIES_P1, WATCHED_MOVIES_P2);
+        let routes: Vec<(&str, Reply)> = watched_routes()
+            .into_iter()
+            .map(|(t, r)| {
+                if t == "/sync/watched/movies?page=2&limit=100" {
+                    (t, Reply::page(&page2, 2, 2, 5, 100))
+                } else {
+                    (t, r)
+                }
+            })
+            .collect();
+        let server = spawn(routes).await;
+        let err = client(&server.base_url)
+            .watched("at")
+            .await
+            .expect_err("a watched movie on two pages must fail the read");
+        assert!(err.to_string().contains("movie 811500"), "{err}");
+    }
+
+    #[test]
+    fn repeated_list_item_keys_on_the_entry_id_before_the_title_id() {
+        // Playback entries are paused episodes: several share one show, each under its own `id`.
+        // Keyed by entry id they never collide; keyed by show they would fail every paginated read.
+        let page1 = json(
+            r#"[{"type":"episode","id":5000070,"episode":{"ids":{"trakt":810800}},
+                 "show":{"ids":{"trakt":810200,"tmdb":910200}}}]"#,
+        );
+        let page2 = json(
+            r#"[{"type":"episode","id":5000071,"episode":{"ids":{"trakt":810801}},
+                 "show":{"ids":{"trakt":810200,"tmdb":910200}}}]"#,
+        );
+        let mut seen = std::collections::HashSet::new();
+        seen.extend(page1.as_array().unwrap().iter().filter_map(list_item_key));
+        assert_eq!(repeated_list_item(&seen, page2.as_array().unwrap()), None);
+
+        // Without an `id`, an episode entry is not keyed by its show (it isn't compared), while a
+        // watched movie or show is keyed by its Trakt id, tagged by kind so a movie and a show
+        // sharing a numeric id don't collide.
+        let ep = json(r#"{"episode":{"ids":{"trakt":1}},"show":{"ids":{"trakt":7}}}"#);
+        assert_eq!(list_item_key(&ep), None);
+        let movie = json(r#"{"movie":{"ids":{"trakt":7}}}"#);
+        let show = json(r#"{"show":{"ids":{"trakt":7}}}"#);
+        assert_ne!(list_item_key(&movie), list_item_key(&show));
+        let seen: std::collections::HashSet<ListItemKey> =
+            list_item_key(&movie).into_iter().collect();
+        assert_eq!(repeated_list_item(&seen, &[show]), None);
+        assert_eq!(
+            repeated_list_item(&seen, &[movie]),
+            Some(ListItemKey::Movie(7))
         );
     }
 

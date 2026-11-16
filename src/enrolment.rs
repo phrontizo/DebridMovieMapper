@@ -333,12 +333,10 @@ pub async fn poll_to_completion(
         };
         match poll {
             DeviceTokenPoll::Authorized(tok) => {
-                // The grant succeeded and Trakt has issued (and rotated to) this token pair. Do NOT
-                // throw it away if the immediately-following `me()` (slug lookup) blips — that would
-                // force the operator to redo the whole device-flow approval for a transient hiccup.
-                // Retry `me()` several times on the poll cadence before giving up, so a brief Trakt
-                // hiccup right after approval (~20s at a 5s cadence) doesn't discard a valid grant
-                // and force the operator to redo the whole device-flow approval.
+                // The grant succeeded and Trakt has issued (and rotated to) this token pair. Retry
+                // `me()` (the slug lookup) several times on the poll cadence before giving up, so a
+                // brief Trakt hiccup right after approval (~20s at a 5s cadence) doesn't discard a
+                // valid grant and force the operator to redo the whole device-flow approval.
                 const MAX_ME_ATTEMPTS: u32 = 5;
                 let mut last_err: Option<AppError> = None;
                 for attempt in 1..=MAX_ME_ATTEMPTS {
@@ -633,9 +631,9 @@ fn enrol_html(dc: &DeviceCode) -> String {
 
 /// Shown next to a flagged account. The flag is set by a failed sync (any read failure, even a
 /// transient one, or a refresh failure that `trakt_client::refresh_error_is_transient` doesn't
-/// excuse) and cleared by the next successful one, so it says what to do if it
-/// persists — and that Remove is the wrong fix: it drops the account's wanted rows, so the next
-/// Trakt cycle deletes the content only it wanted.
+/// excuse) and cleared by the next successful one, so it says what to do if it persists — and
+/// that Remove is the wrong fix: it drops the account's wanted rows, so the next Trakt cycle
+/// deletes the content only it wanted.
 const REENROL_HINT: &str = " <strong>&#9888; the last sync failed</strong> \
      (this clears by itself after the next successful sync). If it persists, click \
      <em>Enrol a new account</em> and approve as the same Trakt user: that replaces the \
@@ -737,15 +735,6 @@ fn redirect(location: &str) -> Response<Body> {
 mod tests {
     use super::*;
     use crate::trakt_client::{MockTrakt, TraktTokenResponse, TraktUser};
-    use redb::backends::InMemoryBackend;
-    use redb::Database;
-
-    fn mem_store() -> Store {
-        let db = Database::builder()
-            .create_with_backend(InMemoryBackend::new())
-            .unwrap();
-        Store::from_database(Arc::new(db)).unwrap()
-    }
 
     fn tokens_fixture(access: &str, username: &str) -> TraktTokens {
         TraktTokens {
@@ -772,7 +761,7 @@ mod tests {
             },
             ..Default::default()
         });
-        let store = mem_store();
+        let store = Store::in_memory();
 
         // Authorized on the first poll → no real sleep occurs.
         let slug = poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
@@ -808,7 +797,7 @@ mod tests {
             poll_errors_before_ok: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2)),
             ..Default::default()
         });
-        let store = mem_store();
+        let store = Store::in_memory();
         let slug = poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
             .await
             .unwrap();
@@ -823,7 +812,7 @@ mod tests {
             poll_errors_before_ok: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(100)),
             ..Default::default()
         });
-        let store = mem_store();
+        let store = Store::in_memory();
         assert!(poll_to_completion(&trakt, &store, "dc".into(), 1, 300)
             .await
             .is_err());
@@ -850,7 +839,7 @@ mod tests {
             me_errors_before_ok: me_errors.clone(),
             ..Default::default()
         });
-        let store = mem_store();
+        let store = Store::in_memory();
         let slug = poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
             .await
             .expect("a transient me() failure is retried");
@@ -882,7 +871,7 @@ mod tests {
             me_errors_before_ok: me_errors.clone(),
             ..Default::default()
         });
-        let store = mem_store();
+        let store = Store::in_memory();
         assert!(poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
             .await
             .is_err());
@@ -907,7 +896,7 @@ mod tests {
             user: TraktUser::default(),
             ..Default::default()
         });
-        let store = mem_store();
+        let store = Store::in_memory();
         assert!(poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
             .await
             .is_err());
@@ -920,7 +909,7 @@ mod tests {
             poll: DeviceTokenPoll::Expired,
             ..Default::default()
         });
-        let store = mem_store();
+        let store = Store::in_memory();
         assert!(poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
             .await
             .is_err());
@@ -935,7 +924,7 @@ mod tests {
             poll: DeviceTokenPoll::Rejected(401),
             ..Default::default()
         });
-        let store = mem_store();
+        let store = Store::in_memory();
         let err = poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
             .await
             .unwrap_err()
@@ -955,7 +944,7 @@ mod tests {
                 poll: DeviceTokenPoll::Rejected(code),
                 ..Default::default()
             });
-            let store = mem_store();
+            let store = Store::in_memory();
             let err = poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
                 .await
                 .unwrap_err()
@@ -975,7 +964,7 @@ mod tests {
             poll: DeviceTokenPoll::Denied,
             ..Default::default()
         });
-        let store = mem_store();
+        let store = Store::in_memory();
         assert!(poll_to_completion(&trakt, &store, "dc".into(), 1, 30)
             .await
             .is_err());
@@ -984,7 +973,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_enrolment_caps_concurrent_polls_to_the_bound() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), store);
         // Exhaust the pool: hold all MAX_CONCURRENT_ENROLMENTS permits to simulate that many
         // enrolments already in flight.
@@ -1014,7 +1003,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_account_deletes_only_that_slug() {
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
             .await
@@ -1039,7 +1028,7 @@ mod tests {
         // ever process the removed slug again.
         use crate::store::{WantedRecord, WantedSources, WatchedState};
         use crate::vfs::MediaType;
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
             .await
@@ -1080,7 +1069,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_account_updates_tokens_and_clears_flag() {
-        let store = mem_store();
+        let store = Store::in_memory();
         let mut stale = tokens_fixture("OLD", "Alice");
         stale.needs_reenrolment = true;
         store.put_trakt_tokens("alice".into(), stale).await.unwrap();
@@ -1106,7 +1095,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_account_flags_on_error() {
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_trakt_tokens("alice".into(), tokens_fixture("OLD", "Alice"))
             .await
@@ -1130,7 +1119,7 @@ mod tests {
     /// A 5xx (or transport failure) on refresh is transient: the account is not flagged.
     #[tokio::test]
     async fn refresh_account_does_not_flag_a_transient_failure() {
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_trakt_tokens("alice".into(), tokens_fixture("OLD", "Alice"))
             .await
@@ -1195,7 +1184,7 @@ mod tests {
                 unreachable!()
             }
         }
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_trakt_tokens("alice".into(), tokens_fixture("OLD", "Alice"))
             .await
@@ -1252,7 +1241,7 @@ mod tests {
             },
             ..Default::default()
         });
-        let svc = EnrolmentService::new(trakt, mem_store());
+        let svc = EnrolmentService::new(trakt, Store::in_memory());
 
         let resp = svc.start_enrolment().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1307,7 +1296,7 @@ mod tests {
     /// deletes, and carries the POST form that does remove. An unknown slug is a 404.
     #[tokio::test]
     async fn remove_confirmation_page_warns_and_changes_nothing() {
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
             .await
@@ -1367,7 +1356,7 @@ mod tests {
     /// submit from inside the frame is same-origin, so the CSRF guard alone would let it through.
     #[tokio::test]
     async fn enrolment_pages_forbid_framing() {
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
             .await
@@ -1593,7 +1582,7 @@ mod tests {
     async fn handle_routes_and_enforces_csrf_and_decodes_slug() {
         // Exercises the router end-to-end: the CSRF guard precedes routing, each method+path arm
         // dispatches, an unknown path 404s, and a percent-encoded slug is decoded before dispatch.
-        let store = mem_store();
+        let store = Store::in_memory();
         let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), store.clone());
 
         // Cross-origin POST → 403 (guard fires before the route match).
@@ -1673,7 +1662,7 @@ mod tests {
         // DNS rebinding: an attacker page on rebind.attacker.example:8080, its name rebound to this
         // server's IP, sends Host and Origin that match, so the CSRF guard passes. The Host
         // allowlist must refuse it before any route runs, reads or writes included.
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
             .await
@@ -1707,7 +1696,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_network_hosts_are_accepted() {
-        let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), mem_store());
+        let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), Store::in_memory());
         for host in [
             "192.168.1.10:8080",
             "127.0.0.1",
@@ -1745,7 +1734,7 @@ mod tests {
 
     #[tokio::test]
     async fn configured_extra_host_is_accepted_case_insensitively() {
-        let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), mem_store())
+        let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), Store::in_memory())
             .with_allowed_hosts(vec!["media.example.com".to_string()]);
         for host in ["media.example.com", "Media.Example.COM:443"] {
             let r = svc
@@ -1835,7 +1824,7 @@ mod tests {
         // A second concurrent /refresh rotates the stored token; our refresh then fails against the
         // now-stale token. That false-alarm failure must NOT set needs_reenrolment over the freshly
         // good record (the accounts page would then ask the operator to re-enrol a healthy account).
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
             .await
@@ -1862,7 +1851,7 @@ mod tests {
     async fn refresh_failure_on_the_current_token_does_flag_reenrolment() {
         // The genuine-failure counterpart: refresh fails against the CURRENT token (no concurrent
         // rotation) → the account IS flagged for re-enrolment.
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
             .await
@@ -1927,7 +1916,7 @@ mod tests {
         // A persistent 429 during refresh is transient throttling, not an auth failure — the single-
         // use grant was never processed. It must NOT flag re-enrolment (a spurious accounts-page
         // marker prompting a needless re-enrolment), unlike the genuine-failure case above.
-        let store = mem_store();
+        let store = Store::in_memory();
         store
             .put_trakt_tokens("alice".into(), tokens_fixture("AT", "Alice"))
             .await

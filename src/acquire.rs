@@ -26,8 +26,9 @@ pub enum AcquireOutcome {
     /// under another title, or a present copy of the show that doesn't provide the episode), the
     /// `max_attempts` add attempts all failed, or the request names no episode for a show.
     NoAcceptableRelease,
-    /// The scraper or the provider listing was unreachable, or an added candidate couldn't be
-    /// recorded (the add was deleted again); retry later.
+    /// Retry later: the scraper or the provider listing was unreachable, the staging intent could
+    /// not be written (nothing was added), or an added candidate couldn't be recorded (the add was
+    /// deleted again, or left for the staging sweep when that delete failed).
     TemporarilyUnavailable,
 }
 
@@ -202,12 +203,12 @@ pub struct AcquisitionEngine {
     /// hash -> deferred-probe state (count + last-probe time): bounds the initial fast re-probe
     /// burst then backs off. A transient-deferring probe is never accepted unverified.
     verify_attempts: Arc<Mutex<HashMap<String, DeferState>>>,
-    /// hash -> consecutive title-validation mismatches. A TMDB outage comes back
-    /// `TitleCheck::Unavailable` and counts no strike; a `Mismatch` still needs two CONSECUTIVE
+    /// hash -> consecutive title-validation mismatches. A TMDB outage, or any failed search, comes
+    /// back `TitleCheck::Unavailable` and counts no strike; a `Mismatch` still needs two CONSECUTIVE
     /// results (≥2 scan ticks apart) before the release is rejected as WrongTitle, so a one-tick
-    /// glitch that still reads as a mismatch (one of the concurrent movie/TV searches failing while
-    /// the other returns a different title) rides out. A genuine mismatch is rejected one tick
-    /// later. In-memory (best-effort).
+    /// mismatch glitch (an identification that briefly resolves to another title, e.g. while TMDB's
+    /// search results shift) rides out. A genuine mismatch is rejected one tick later. In-memory
+    /// (best-effort).
     validate_fails: Arc<Mutex<HashMap<String, u32>>>,
     /// torrent_id -> when `get_torrent_info` FIRST started failing consecutively for a listed Pending
     /// torrent. Every other Pending arm in `observe` has a `dead_timeout` escape; the info-fetch arm
@@ -277,7 +278,13 @@ fn select_ids_for(kind: MediaKind, info: &TorrentInfo) -> Vec<u32> {
 
 /// Map a torrent's SELECTED video files to (season, episode, file_path) by parsing SxxExx.
 /// `pub(crate)` so the upgrade engine can reuse it for consolidation.
+///
+/// Each episode appears once, from the FIRST file (in provider file order) that carries it: a pack
+/// holding one episode twice (per-language folders, two resolutions) is title-checked and probed on
+/// that file by `observe`, so its slot must serve that file and `provides` must list the episode
+/// once (a single-episode torrent with two versions is not a pack).
 pub(crate) fn episode_files(info: &TorrentInfo) -> Vec<(u32, u32, String)> {
+    let mut seen = std::collections::HashSet::new();
     info.files
         .iter()
         .filter(|f| f.selected == 1 && crate::vfs::is_video_file(&f.path))
@@ -289,6 +296,7 @@ pub(crate) fn episode_files(info: &TorrentInfo) -> Vec<(u32, u32, String)> {
                 .into_iter()
                 .map(move |(s, e)| (s, e, f.path.clone()))
         })
+        .filter(|(s, e, _)| seen.insert((*s, *e)))
         .collect()
 }
 
@@ -1359,7 +1367,7 @@ impl AcquisitionEngine {
                         .await
                     {
                         info!(
-                            "observe: tmdb {} hash {} verified ({}{}) — selection recorded",
+                            "observe: tmdb {} hash {} verified ({}{})",
                             rec.request.tmdb_id,
                             hash,
                             file_name,
@@ -1606,8 +1614,9 @@ impl AcquisitionEngine {
     /// Whether a probe of a file for `req` checked no audio language at all: under
     /// `AUDIO_LANGUAGE=original`, with the title's languages never fetched and no original language
     /// recorded, the wanted set is empty and `probe::verify` skips the audio check, so its `Pass`
-    /// proves nothing about the audio.
-    fn audio_unchecked(&self, req: &AcquireRequest) -> bool {
+    /// proves nothing about the audio. The upgrade engine asks the same before it stages or adopts
+    /// anything (`upgrade::staging_probe`).
+    pub(crate) fn audio_unchecked(&self, req: &AcquireRequest) -> bool {
         self.prefs.audio == crate::config::AudioReq::Original
             && req.spoken_languages.is_none()
             && crate::config::original_audio_languages(req.original_language.as_deref(), &[])
@@ -1816,6 +1825,37 @@ mod tests {
     }
 
     #[test]
+    fn episode_files_keeps_the_first_file_of_each_episode() {
+        // A pack holding one episode twice (language folders, two resolutions) yields it once, from
+        // its first file: the one `observe` title-checks and probes. A multi-episode file still
+        // yields every episode it carries.
+        let file = |id, path: &str| TorrentFile {
+            id,
+            path: path.into(),
+            bytes: 2_000_000_000,
+            selected: 1,
+        };
+        let info = TI {
+            hash: "h".into(),
+            files: vec![
+                file(0, "A/Show.S01E01.mkv"),
+                file(1, "B/Show.S01E01.mkv"),
+                file(2, "A/Show.S01E02E03.mkv"),
+                file(3, "B/Show.S01E03.mkv"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            episode_files(&info),
+            vec![
+                (1, 1, "A/Show.S01E01.mkv".to_string()),
+                (1, 2, "A/Show.S01E02E03.mkv".to_string()),
+                (1, 3, "A/Show.S01E02E03.mkv".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn locator_for_pairs_link_by_selected_position() {
         // The per-file CDN link is paired by position among the SELECTED files only — an unselected
         // file must NOT advance the link index, or playback resolves the wrong file's bytes.
@@ -1980,7 +2020,7 @@ mod tests {
         }
     }
     /// Validator that returns `Mismatch` for its first `fail_first` calls, then `Match` — a one-tick
-    /// glitch that still reads as a mismatch, then recovers (B5).
+    /// mismatch glitch, then recovery.
     struct FailThenPassValidator {
         fail_first: u32,
         calls: std::sync::atomic::AtomicU32,
@@ -2491,10 +2531,14 @@ mod tests {
             deleted: deleted.clone(),
             ..Default::default()
         };
-        let later = now_secs() + 1;
+        // The next start: this process's note of the intent is gone.
+        st.forget_local_staging_intents();
         let swept =
-            crate::upgrade::sweep_staging_intents(&st, &provider, &listing, later, later).await;
-        assert_eq!(swept, std::collections::HashSet::from(["h1".to_string()]));
+            crate::upgrade::sweep_staging_intents(&st, &provider, &listing, now_secs() + 1).await;
+        assert_eq!(
+            swept.deleted,
+            std::collections::HashSet::from(["h1".to_string()])
+        );
         assert_eq!(*deleted.lock().unwrap(), vec!["tid_h1".to_string()]);
         assert!(st.all_staging_intents().await.is_empty());
     }
@@ -3490,10 +3534,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observe_transient_validate_failure_recovers_without_blacklist() {
-        // B5: validation fails on the first tick (transient TMDB outage) then passes on the second.
-        // The record must NOT be blacklisted — it recovers and verifies. This is the restart window
-        // (in-memory defer state lost → re-validate) made safe by the two-consecutive-failures rule.
+    async fn observe_one_tick_mismatch_recovers_without_blacklist() {
+        // The title check reads as a Mismatch on the first tick (a one-tick glitch; a TMDB outage
+        // would be `Unavailable` and count no strike) then matches on the second. The record must
+        // NOT be blacklisted — it recovers and verifies. This is the restart window (in-memory defer
+        // state lost → re-validate) made safe by the two-consecutive-mismatches rule.
         let st = store();
         st.put_owned(
             "h1".into(),
@@ -5789,6 +5834,66 @@ mod tests {
             st.is_blacklisted(crate::scraper::MediaKind::Movie, 27205, "h1".into())
                 .await,
             "movie-pack hash must be blacklisted"
+        );
+    }
+
+    /// A torrent holding the requested episode twice (two language folders) is probed on its first
+    /// copy, and that is the file its slot serves: never the second, unchecked one. `provides` lists
+    /// the episode once, so a single-episode torrent is not mistaken for a pack.
+    #[tokio::test]
+    async fn observe_slots_the_episode_file_it_probed_when_a_pack_holds_it_twice() {
+        let st = store();
+        st.put_owned(
+            "hp".into(),
+            OwnedRecord {
+                request: series_req_for(1),
+                provenance: Provenance::watchlist("alice"),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![(1, 1)],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let file = |id, path: &str| TorrentFile {
+            id,
+            path: path.into(),
+            bytes: 1_000_000_000,
+            selected: 1,
+        };
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrent_info: Some(TI {
+                id: "tid_hp".into(),
+                hash: "hp".into(),
+                status: "downloaded".into(),
+                files: vec![file(0, "A/Show.S01E01.mkv"), file(1, "B/Show.S01E01.mkv")],
+                links: vec!["https://cdn/a".into(), "https://cdn/b".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/a".into()),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider,
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_hp", "hp", "downloaded", 100.0)])
+            .await;
+        let rec = st.get_owned("hp".into()).await.unwrap();
+        assert_eq!(rec.status, OwnedStatus::Verified);
+        assert_eq!(rec.provides, vec![(1, 1)]);
+        let tmdb = crate::vfs::tmdb_id_of(&rec.request.metadata).unwrap();
+        assert_eq!(
+            st.get_selection(crate::store::episode_slot(tmdb, 1, 1))
+                .await
+                .unwrap()
+                .file_path,
+            "A/Show.S01E01.mkv",
+            "the slot serves the file observe probed"
         );
     }
 

@@ -52,9 +52,10 @@ chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 urlencoding = "2"
-# test-util enables tokio's paused-clock harness — genuinely dev-only (the edition-2021 feature
-# resolver keeps it out of release builds). io-util is NOT listed here: it's a production dependency
-# declared on the main `tokio` entry above, which the loopback-server test helpers reuse.
+# test-util enables tokio's paused-clock harness — genuinely dev-only (resolver 3, set above, keeps
+# resolver 2's rule that dev-dependency features stay out of release builds). io-util is NOT listed
+# here: it's a production dependency declared on the main `tokio` entry above, which the
+# loopback-server test helpers reuse.
 tokio = { version = "1", features = ["test-util"] }
 
 [lib]

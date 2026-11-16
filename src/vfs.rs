@@ -35,7 +35,9 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// continuation REQUIRES an explicit `e` before its number so a resolution/codec token can't be
 /// mis-parsed as an episode (`S01E01.1080p` → the `.1080` has no `e`, so it is NOT a continuation),
 /// except a dash-only one directly after the code (`S01E01-02-03`), which counts only when it is a
-/// whole number naming the NEXT episode (so `S01E05-720p`, `S01E09-10bit` and `S01E05-5.1` don't).
+/// whole number naming the NEXT episode (so `S01E05-720p` and `S01E09-10bit` don't) and is not the
+/// whole part of a channel layout: a single digit followed by `.` and one more digit (`S01E04-5.1`,
+/// `S01E01-2.0`), while `S01E01-02.1080p` still counts.
 ///
 /// KNOWN LIMITATIONS: a RANGE form spanning more than two episodes yields only the explicit
 /// endpoints (`S01E01-E03` → `[(1,1),(1,3)]`) or, without the `e`, only the first episode
@@ -71,17 +73,27 @@ pub(crate) fn parse_se_all(name: &str) -> Vec<(u32, u32)> {
                 }
             }
             // Sonarr's "Extend" style (`S01E01-02-03`): a dash-only continuation counts only when it
-            // names the NEXT episode, so a resolution/bit-depth/audio token after a dash
-            // (`-720p`, `-10bit`, `-5.1`) and a dash-number range (`S01E01-10`) are not read as one.
+            // names the NEXT episode, so a resolution or bit-depth token after a dash (`-720p`,
+            // `-10bit`) and a dash-number range (`S01E01-10`) are not read as one. Nor is a channel
+            // layout whose whole part is the next episode (`S01E04-5.1`, `S01E01-2.0`): a single
+            // digit followed by `.` and exactly one more digit.
             let mut tail = c.get(0).map_or("", |m| &name[m.end()..]);
             while let Some(next) = DASH_NEXT.captures(tail) {
-                let (Some(whole), Some(e)) = (
-                    next.get(0),
-                    next.get(1).and_then(|m| m.as_str().parse::<u32>().ok()),
-                ) else {
+                let (Some(whole), Some(number)) = (next.get(0), next.get(1)) else {
                     break;
                 };
-                if eps.last().is_none_or(|&(_, last)| e != last + 1) || eps.contains(&(s, e)) {
+                let Ok(e) = number.as_str().parse::<u32>() else {
+                    break;
+                };
+                let after = &tail.as_bytes()[whole.end()..];
+                let channel_layout = number.len() == 1
+                    && after.first() == Some(&b'.')
+                    && after.get(1).is_some_and(u8::is_ascii_digit)
+                    && !after.get(2).is_some_and(u8::is_ascii_digit);
+                if channel_layout
+                    || eps.last().is_none_or(|&(_, last)| e != last + 1)
+                    || eps.contains(&(s, e))
+                {
                     break;
                 }
                 eps.push((s, e));
@@ -293,17 +305,22 @@ pub fn parse_rd_date(s: &str) -> SystemTime {
 }
 
 static SEASON_RE: LazyLock<Regex> = LazyLock::new(|| {
-    // The `Sxx` arm is word-anchored (`\bs`) and bounded to 1-2 digits followed by `e` or a word
-    // boundary, so a codec token (`DTS5`/`DDP5` — `s` mid-token) or a 4-digit `S2024` can't be read
-    // as a season while `S05E01`/`S5` still are. The `season`/`part` arms accept any scene separator
-    // (`[\s._-]*`), not just whitespace, so `Season.2`/`Part_2`/`Season-2` (the common dotted scene
-    // form) resolve rather than mis-foldering to season 1. The `NxNN` arm is bounded to a 1-2 digit
-    // season so a "WIDTHxHEIGHT" pixel resolution (e.g. 1920x1080) is not mistaken for one. The
-    // `Part N` arm (group 4) is word-bounded with a 1-2 digit number, so a title word
-    // (`Counterpart.2017`) or a year is never read as a season; it is also the WEAKEST signal
-    // (`season_tokens`), since it is as often a two-part episode title as a season.
+    // The `Sxx`, `NxNN` and `Part N` arms are bounded by a non-alphanumeric character (or the start
+    // or end of the string) on both sides, so `_` separates them like `.`, ` ` and `-` do
+    // (`Show_S02_1080p`, `Show_Part_2`); a `\b` would not, since the regex crate counts `_` as a
+    // word character. The regex crate has no look-around, so these boundaries consume a character,
+    // and `season_tokens` resumes each search on a match's trailing separator. The `Sxx` arm takes
+    // 1-2 digits followed by `e` or such a boundary, so a codec token (`DTS5`/`DDP5`, `s`
+    // mid-token) or a 4-digit `S2024` can't be read as a season while `S05E01`/`S5` still are. The
+    // `season`/`part` arms accept any scene separator (`[\s._-]*`) before the number, not just
+    // whitespace, so `Season.2`/`Part_2`/`Season-2` (the common dotted scene form) resolve rather
+    // than mis-foldering to season 1. The `NxNN` arm is bounded to a 1-2 digit season so a
+    // "WIDTHxHEIGHT" pixel resolution (e.g. 1920x1080) is not mistaken for one. The `Part N` arm
+    // (group 4) takes a 1-2 digit number, so a title word (`Counterpart.2017`) or a year
+    // (`Part.2019`) is never read as a season; it is also the WEAKEST signal (`season_tokens`),
+    // since it is as often a two-part episode title as a season.
     Regex::new(
-        r"(?i)\bs(\d{1,2})(?:e|\b)|season[\s._-]*(\d+)|\b(\d{1,2})x\d{1,3}\b|\bpart[\s._-]*(\d{1,2})\b",
+        r"(?i)(?:^|[^a-z0-9])s(\d{1,2})(?:e|[^a-z0-9]|$)|season[\s._-]*(\d+)|(?:^|[^a-z0-9])(\d{1,2})x\d{1,3}(?:[^a-z0-9]|$)|(?:^|[^a-z0-9])part[\s._-]*(\d{1,2})(?:[^a-z0-9]|$)",
     )
     .unwrap()
 });
@@ -551,18 +568,21 @@ impl DebridVfs {
                     // actually yields a streamable video file, so a movie whose top choice is
                     // archive-only (RAR/ZIP) doesn't vanish when a smaller streamable copy exists.
                     //
-                    // ASYMMETRY (B11): unlike the episode path, this matches the selection by HASH only
-                    // and then emits ALL selected streamable video files of that torrent (exactly one,
-                    // for a single-feature movie) — it does NOT enforce the stored
-                    // `SelectionEntry.file_path`. That is safe because a movie torrent the engine adds
-                    // holds a single feature (the acquisition + upgrade pack-guards reject multi-feature
-                    // packs), so the hash uniquely identifies the file. An account-mirror copy can be a
-                    // multi-film collection: emitting every selected file then shows each film, and
-                    // dedup and the upgrade engine never remove such a copy
-                    // (`tasks::multi_feature_hashes`). The stored `file_path` is forward-compat only.
-                    // Enforcing it here (without the episode path's largest-bytes self-heal on a
-                    // path mismatch) would risk HIDING a movie after a re-acquire shifted the path, so
-                    // the hash-only match is deliberate.
+                    // Unlike the episode path, this matches the selection by HASH only and then emits
+                    // ALL selected streamable video files of that torrent (exactly one, for a
+                    // single-feature movie): the VFS does NOT enforce the stored
+                    // `SelectionEntry.file_path` for a movie. That is safe because a movie torrent the
+                    // engine adds holds a single feature (the acquisition + upgrade pack-guards reject
+                    // multi-feature packs), so the hash uniquely identifies the file. An account-mirror
+                    // copy can be a multi-film collection: emitting every selected file then shows each
+                    // film, and dedup and the upgrade engine never remove such a copy
+                    // (`tasks::multi_feature_hashes`). The stored `file_path` still matters elsewhere:
+                    // `selection::plan_selection_repoints` ranks the served copy by it (`served_rank`)
+                    // and writes the movie's largest emittable file there. A stale episode selection
+                    // falls back to every distinct file name, same-named copies resolving to the
+                    // largest torrent; a movie has no such fallback within its selected torrent, so
+                    // enforcing the path here would risk HIDING the movie after a re-acquire shifted
+                    // the path. The hash-only match is deliberate.
                     let selected_hash = tmdb_id_of(&metadata)
                         .and_then(|id| selection.get(&crate::store::movie_slot(id)))
                         .map(|sel| sel.hash.clone());
@@ -1231,13 +1251,22 @@ fn normalize_dir_component(component: &str) -> std::borrow::Cow<'_, str> {
 /// as often as a season). Used by the season-folder placement in the show-emit loop.
 fn season_tokens(s: &str) -> (Option<u32>, Option<u32>) {
     let (mut strong, mut part) = (None, None);
-    for cap in SEASON_RE.captures_iter(s) {
+    let mut at = 0;
+    while let Some(cap) = SEASON_RE.captures_at(s, at) {
         let number = |i| cap.get(i).and_then(|m| m.as_str().parse::<u32>().ok());
         strong = strong.or_else(|| number(1).or_else(|| number(2)).or_else(|| number(3)));
         part = part.or_else(|| number(4));
         if strong.is_some() && part.is_some() {
             break;
         }
+        // A token's trailing separator can be the next token's leading one (`Part_2_S03`), so the
+        // next search starts on it. A match is at least two characters long before that separator,
+        // so the search always moves forward.
+        let Some(whole) = cap.get(0) else { break };
+        at = match whole.as_str().chars().next_back() {
+            Some(c) if !c.is_ascii_alphanumeric() => whole.end() - c.len_utf8(),
+            _ => whole.end(),
+        };
     }
     (strong, part)
 }
@@ -1425,8 +1454,129 @@ fn find_deepest_new_dir(path: &str, children: &BTreeMap<String, VfsNode>) -> Str
     }
 }
 
+/// Torrent fixtures and tree walks shared by the VFS unit tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{DebridVfs, VfsNode};
+    use crate::provider::FileLocator;
+    use crate::rd_client::{TorrentFile, TorrentInfo};
+    use std::collections::BTreeMap;
+
+    /// A Real-Debrid-style movie torrent: one selected `Movie.2023.1080p.mkv` of `bytes` bytes, with
+    /// its restricted link.
+    pub(crate) fn movie_torrent(id: &str, hash: &str, bytes: u64) -> TorrentInfo {
+        TorrentInfo {
+            id: id.into(),
+            hash: hash.into(),
+            bytes,
+            status: "downloaded".into(),
+            files: vec![TorrentFile {
+                id: 0,
+                path: "Movie.2023.1080p.mkv".into(),
+                bytes,
+                selected: 1,
+            }],
+            links: vec!["https://cdn/movie".into()],
+            ..Default::default()
+        }
+    }
+
+    /// A TorBox-style (link-less) show torrent whose selected files are all videos.
+    pub(crate) fn show_torrent(id: &str, hash: &str, bytes: u64, paths: &[&str]) -> TorrentInfo {
+        TorrentInfo {
+            id: id.into(),
+            hash: hash.into(),
+            bytes,
+            status: "downloaded".into(),
+            files: paths
+                .iter()
+                .enumerate()
+                .map(|(i, p)| TorrentFile {
+                    id: i as u32,
+                    path: (*p).into(),
+                    bytes: bytes / paths.len() as u64,
+                    selected: 1,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The children of the directory at `path` below `node` (`/`-separated; `""` is `node`
+    /// itself). Panics naming the first segment that is missing or not a directory, so a test that
+    /// walks the tree fails when the tree's shape changes instead of passing without asserting.
+    pub(crate) fn dir<'a>(node: &'a VfsNode, path: &str) -> &'a BTreeMap<String, VfsNode> {
+        let VfsNode::Directory { children } = node else {
+            panic!("the walk from `{path}` must start at a directory");
+        };
+        let mut children = children;
+        let mut walked = String::new();
+        for segment in path.split('/').filter(|s| !s.is_empty()) {
+            match children.get(segment) {
+                Some(VfsNode::Directory { children: next }) => children = next,
+                Some(_) => panic!("`{segment}` under `{walked}/` is not a directory"),
+                None => panic!(
+                    "no `{segment}` under `{walked}/`; it holds {:?}",
+                    children.keys().collect::<Vec<_>>()
+                ),
+            }
+            walked = format!("{walked}/{segment}");
+        }
+        children
+    }
+
+    /// The media file at `path` below `node`: its size and locator. Panics like [`dir`] when the
+    /// path is missing or names something else.
+    pub(crate) fn media_file<'a>(node: &'a VfsNode, path: &str) -> (u64, &'a FileLocator) {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        let files = dir(node, parent);
+        match files.get(name) {
+            Some(VfsNode::MediaFile { file_size, locator }) => (*file_size, locator),
+            Some(_) => panic!("`{path}` is not a media file"),
+            None => panic!(
+                "no `{name}` in `{parent}/`; it holds {:?}",
+                files.keys().collect::<Vec<_>>()
+            ),
+        }
+    }
+
+    /// The children of the only show folder under `Shows/`. Panics unless there is exactly one.
+    pub(crate) fn only_show(vfs: &DebridVfs) -> &BTreeMap<String, VfsNode> {
+        let shows = dir(&vfs.root, "Shows");
+        let [(name, _)] = shows.iter().collect::<Vec<_>>()[..] else {
+            panic!(
+                "expected exactly one show folder, got {:?}",
+                shows.keys().collect::<Vec<_>>()
+            );
+        };
+        dir(&vfs.root, &format!("Shows/{name}"))
+    }
+
+    /// The sorted media-file names under `Shows/<every show>/<season>`.
+    pub(crate) fn season_file_names(vfs: &DebridVfs, season: &str) -> Vec<String> {
+        let mut names: Vec<String> = dir(&vfs.root, "Shows")
+            .values()
+            .filter_map(|show| match show {
+                VfsNode::Directory { children: seasons } => seasons.get(season),
+                _ => None,
+            })
+            .flat_map(|s| match s {
+                VfsNode::Directory { children: eps } => eps
+                    .iter()
+                    .filter(|(_, n)| matches!(n, VfsNode::MediaFile { .. }))
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect();
+        names.sort();
+        names
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{dir, media_file, only_show};
     use super::*;
     use crate::rd_client::{TorrentFile, TorrentInfo};
 
@@ -1440,13 +1590,8 @@ mod tests {
             TorrentInfo {
                 id: "tid".to_string(),
                 filename: "Movie.2023.mkv".to_string(),
-                original_filename: "Movie.2023.mkv".to_string(),
                 hash: "deadbeef".to_string(),
                 bytes: 1000,
-                original_bytes: 1000,
-                host: "h".to_string(),
-                split: 1,
-                progress: 100.0,
                 status: "downloaded".to_string(),
                 added: "2023-01-01".to_string(),
                 files: vec![TorrentFile {
@@ -1456,7 +1601,7 @@ mod tests {
                     selected: 1,
                 }],
                 links: vec!["https://rd/restricted".to_string()],
-                ended: None,
+                ..Default::default()
             },
             MediaMetadata {
                 title: "Movie".to_string(),
@@ -1466,25 +1611,13 @@ mod tests {
             },
         )];
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
-        if let VfsNode::Directory { children } = &vfs.root {
-            let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory { children: mc } = movies {
-                let folder = mc.get("Movie").unwrap();
-                if let VfsNode::Directory { children: files } = folder {
-                    let file = files.get("Movie.2023.mkv").expect("media file missing");
-                    if let VfsNode::MediaFile { locator, file_size } = file {
-                        assert_eq!(*file_size, 1000);
-                        assert_eq!(locator.hash, "deadbeef");
-                        assert_eq!(locator.torrent_id, "tid");
-                        assert_eq!(locator.file_id, 7);
-                        assert_eq!(locator.file_path, "/Movie.2023.mkv");
-                        assert_eq!(locator.link.as_deref(), Some("https://rd/restricted"));
-                    } else {
-                        panic!("expected MediaFile");
-                    }
-                }
-            }
-        }
+        let (file_size, locator) = media_file(&vfs.root, "Movies/Movie/Movie.2023.mkv");
+        assert_eq!(file_size, 1000);
+        assert_eq!(locator.hash, "deadbeef");
+        assert_eq!(locator.torrent_id, "tid");
+        assert_eq!(locator.file_id, 7);
+        assert_eq!(locator.file_path, "/Movie.2023.mkv");
+        assert_eq!(locator.link.as_deref(), Some("https://rd/restricted"));
     }
 
     #[test]
@@ -1497,14 +1630,8 @@ mod tests {
                 id: "mi".to_string(),
                 filename: "Mission.Impossible.Rogue.Nation.2015.1080p.BluRay.x264-RARBG"
                     .to_string(),
-                original_filename: "Mission.Impossible.Rogue.Nation.2015.1080p.BluRay.x264-RARBG"
-                    .to_string(),
                 hash: "h".to_string(),
                 bytes: 2_000_000_000,
-                original_bytes: 2_000_000_000,
-                host: "h".to_string(),
-                split: 1,
-                progress: 100.0,
                 status: "downloaded".to_string(),
                 added: "2015-01-01".to_string(),
                 files: vec![
@@ -1527,7 +1654,7 @@ mod tests {
                     "http://link_movie".to_string(),
                     "http://link_promo".to_string(),
                 ],
-                ended: Some("2015-01-01".to_string()),
+                ..Default::default()
             },
             MediaMetadata {
                 title: "Mission: Impossible - Rogue Nation".to_string(),
@@ -1538,32 +1665,19 @@ mod tests {
         )];
 
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
-        if let VfsNode::Directory { children } = &vfs.root {
-            let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory { children: mc } = movies {
-                let folder = mc
-                    .get("Mission - Impossible - Rogue Nation [tmdbid-177677]")
-                    .expect("movie folder missing");
-                if let VfsNode::Directory { children: files } = folder {
-                    assert!(
-                        !files.contains_key("RARBG.com.mp4"),
-                        "promo clip must be excluded, got: {:?}",
-                        files.keys().collect::<Vec<_>>()
-                    );
-                    let movie = files
-                        .get("Mission.Impossible.Rogue.Nation.2015.1080p.BluRay.x264-RARBG.mkv")
-                        .expect("real movie file missing");
-                    // The real film must still pair with its own (first) link, not the promo's.
-                    if let VfsNode::MediaFile { locator, .. } = movie {
-                        assert_eq!(locator.link.as_deref(), Some("http://link_movie"));
-                    } else {
-                        panic!("expected MediaFile");
-                    }
-                } else {
-                    panic!("expected folder dir");
-                }
-            }
-        }
+        let folder = "Movies/Mission - Impossible - Rogue Nation [tmdbid-177677]";
+        let files = dir(&vfs.root, folder);
+        assert!(
+            !files.contains_key("RARBG.com.mp4"),
+            "promo clip must be excluded, got: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
+        // The real film must still pair with its own (first) link, not the promo's.
+        let (_, locator) = media_file(
+            &vfs.root,
+            &format!("{folder}/Mission.Impossible.Rogue.Nation.2015.1080p.BluRay.x264-RARBG.mkv"),
+        );
+        assert_eq!(locator.link.as_deref(), Some("http://link_movie"));
     }
 
     #[test]
@@ -1619,14 +1733,7 @@ mod tests {
         );
         // Archive-only listed first (it is the larger of the two).
         let vfs = DebridVfs::build(vec![archive, streamable], &crate::vfs::SelectionMap::new());
-        let VfsNode::Directory { children } = &vfs.root else {
-            panic!("root is a directory");
-        };
-        let VfsNode::Directory { children: movies } = children.get("Movies").expect("Movies dir")
-        else {
-            panic!("Movies is a directory");
-        };
-        let (_, folder) = movies
+        let (_, folder) = dir(&vfs.root, "Movies")
             .iter()
             .next()
             .expect("the movie folder must exist (not vanish to the archive-only torrent)");
@@ -1667,29 +1774,12 @@ mod tests {
             },
         )];
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
-        if let VfsNode::Directory { children } = &vfs.root {
-            let movies = children.get("Movies").expect("Movies dir");
-            if let VfsNode::Directory { children: mc } = movies {
-                let folder = mc
-                    .get("Sintel")
-                    .expect("movie folder should exist even without links");
-                if let VfsNode::Directory { children: files } = folder {
-                    let f = files
-                        .get("Sintel.mp4")
-                        .expect("media file should appear even without a link");
-                    if let VfsNode::MediaFile { locator, .. } = f {
-                        assert_eq!(locator.link, None);
-                        assert_eq!(locator.torrent_id, "99");
-                        assert_eq!(locator.file_id, 10);
-                        assert_eq!(locator.hash, "deadbeef");
-                    } else {
-                        panic!("expected MediaFile");
-                    }
-                } else {
-                    panic!("expected folder dir");
-                }
-            }
-        }
+        // The movie folder and its media file appear even without a link.
+        let (_, locator) = media_file(&vfs.root, "Movies/Sintel/Sintel.mp4");
+        assert_eq!(locator.link, None);
+        assert_eq!(locator.torrent_id, "99");
+        assert_eq!(locator.file_id, 10);
+        assert_eq!(locator.hash, "deadbeef");
     }
 
     #[test]
@@ -1699,13 +1789,8 @@ mod tests {
                 TorrentInfo {
                     id: "1".to_string(),
                     filename: "Movie.2023.1080p.mkv".to_string(),
-                    original_filename: "Movie.2023.1080p.mkv".to_string(),
                     hash: "hash1".to_string(),
                     bytes: 1000,
-                    original_bytes: 1000,
-                    host: "host1".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2023-01-01".to_string(),
                     files: vec![TorrentFile {
@@ -1715,7 +1800,7 @@ mod tests {
                         selected: 1,
                     }],
                     links: vec!["http://link1".to_string()],
-                    ended: Some("2023-01-01".to_string()),
+                    ..Default::default()
                 },
                 MediaMetadata {
                     title: "Movie".to_string(),
@@ -1728,13 +1813,8 @@ mod tests {
                 TorrentInfo {
                     id: "2".to_string(),
                     filename: "Show.S01E01.mkv".to_string(),
-                    original_filename: "Show.S01E01.mkv".to_string(),
                     hash: "hash2".to_string(),
                     bytes: 500,
-                    original_bytes: 500,
-                    host: "host2".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2023-01-01".to_string(),
                     files: vec![TorrentFile {
@@ -1744,7 +1824,7 @@ mod tests {
                         selected: 1,
                     }],
                     links: vec!["http://link2".to_string()],
-                    ended: Some("2023-01-01".to_string()),
+                    ..Default::default()
                 },
                 MediaMetadata {
                     title: "Show".to_string(),
@@ -1757,44 +1837,16 @@ mod tests {
 
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
-        if let VfsNode::Directory { children } = &vfs.root {
-            let movies = children.get("Movies").expect("Movies directory missing");
-            let shows = children.get("Shows").expect("Shows directory missing");
+        let files = dir(&vfs.root, "Movies/Movie");
+        assert!(
+            files.contains_key("Movie.2023.1080p.mkv"),
+            "Movie media file not found"
+        );
+        assert!(files.contains_key("movie.nfo"), "movie.nfo not found");
 
-            if let VfsNode::Directory {
-                children: movie_children,
-            } = movies
-            {
-                assert!(
-                    movie_children.contains_key("Movie"),
-                    "Movie folder not found"
-                );
-                let movie_dir = movie_children.get("Movie").unwrap();
-                if let VfsNode::Directory { children: files } = movie_dir {
-                    assert!(
-                        files.contains_key("Movie.2023.1080p.mkv"),
-                        "Movie media file not found"
-                    );
-                    assert!(files.contains_key("movie.nfo"), "movie.nfo not found");
-                }
-            } else {
-                panic!("Movies should be a directory");
-            }
-
-            if let VfsNode::Directory {
-                children: show_children,
-            } = shows
-            {
-                assert!(show_children.contains_key("Show"), "Show folder not found");
-                let show_dir = show_children.get("Show").unwrap();
-                if let VfsNode::Directory { children: seasons } = show_dir {
-                    assert!(seasons.contains_key("Season 01"), "Season 01 not found");
-                    assert!(seasons.contains_key("tvshow.nfo"), "tvshow.nfo not found");
-                }
-            } else {
-                panic!("Shows should be a directory");
-            }
-        }
+        let seasons = dir(&vfs.root, "Shows/Show");
+        assert!(seasons.contains_key("Season 01"), "Season 01 not found");
+        assert!(seasons.contains_key("tvshow.nfo"), "tvshow.nfo not found");
     }
 
     #[test]
@@ -1854,13 +1906,8 @@ mod tests {
             TorrentInfo {
                 id: "1".to_string(),
                 filename: "Movie.mkv".to_string(),
-                original_filename: "Movie.mkv".to_string(),
                 hash: "h".to_string(),
                 bytes: 1000,
-                original_bytes: 1000,
-                host: "h".to_string(),
-                split: 1,
-                progress: 100.0,
                 status: "downloaded".to_string(),
                 added: "2023-01-01".to_string(),
                 files: vec![TorrentFile {
@@ -1870,7 +1917,7 @@ mod tests {
                     selected: 1,
                 }],
                 links: vec!["http://link1".to_string()],
-                ended: Some("2023-01-01".to_string()),
+                ..Default::default()
             },
             MediaMetadata {
                 title: "Movie".to_string(),
@@ -1880,19 +1927,15 @@ mod tests {
             },
         )];
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
-        if let VfsNode::Directory { children } = &vfs.root {
-            if let Some(VfsNode::Directory {
-                children: movie_children,
-            }) = children.get("Movies")
-            {
-                let key = movie_children.keys().next().expect("a movie folder");
-                assert!(
-                    !key.contains('/'),
-                    "folder name must not contain '/': {key}"
-                );
-                assert_eq!(key, "Movie [tmdbid-12-34]");
-            }
-        }
+        let key = dir(&vfs.root, "Movies")
+            .keys()
+            .next()
+            .expect("a movie folder");
+        assert!(
+            !key.contains('/'),
+            "folder name must not contain '/': {key}"
+        );
+        assert_eq!(key, "Movie [tmdbid-12-34]");
     }
 
     #[test]
@@ -1905,13 +1948,8 @@ mod tests {
                 TorrentInfo {
                     id: id.to_string(),
                     filename: "Movie.mkv".to_string(),
-                    original_filename: "Movie.mkv".to_string(),
                     hash: hash.to_string(),
                     bytes: 1000,
-                    original_bytes: 1000,
-                    host: "h".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2023-01-01".to_string(),
                     files: vec![TorrentFile {
@@ -1921,7 +1959,7 @@ mod tests {
                         selected: 1,
                     }],
                     links: vec!["http://link".to_string()],
-                    ended: Some("2023-01-01".to_string()),
+                    ..Default::default()
                 },
                 MediaMetadata {
                     title: title.to_string(),
@@ -1937,25 +1975,15 @@ mod tests {
             mk("2", "h2", "Movie [tmdbid-5]", None),
         ];
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
-        if let VfsNode::Directory { children } = &vfs.root {
-            if let Some(VfsNode::Directory {
-                children: movie_children,
-            }) = children.get("Movies")
-            {
-                assert_eq!(
-                    movie_children.len(),
-                    2,
-                    "both groups must survive the folder-name collision, got keys: {:?}",
-                    movie_children.keys().collect::<Vec<_>>()
-                );
-                assert!(movie_children.contains_key("Movie [tmdbid-5]"));
-                assert!(movie_children.contains_key("Movie [tmdbid-5] (1)"));
-            } else {
-                panic!("Movies directory missing");
-            }
-        } else {
-            panic!("root is not a directory");
-        }
+        let movie_children = dir(&vfs.root, "Movies");
+        assert_eq!(
+            movie_children.len(),
+            2,
+            "both groups must survive the folder-name collision, got keys: {:?}",
+            movie_children.keys().collect::<Vec<_>>()
+        );
+        assert!(movie_children.contains_key("Movie [tmdbid-5]"));
+        assert!(movie_children.contains_key("Movie [tmdbid-5] (1)"));
     }
 
     #[test]
@@ -1965,13 +1993,8 @@ mod tests {
                 TorrentInfo {
                     id: "1".to_string(),
                     filename: "Movie.2023.mkv".to_string(),
-                    original_filename: "Movie.2023.mkv".to_string(),
                     hash: "h1".to_string(),
                     bytes: 1000,
-                    original_bytes: 1000,
-                    host: "h1".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2023-01-01".to_string(),
                     files: vec![TorrentFile {
@@ -1981,7 +2004,7 @@ mod tests {
                         selected: 1,
                     }],
                     links: vec!["http://l1".to_string()],
-                    ended: Some("2023".to_string()),
+                    ..Default::default()
                 },
                 MediaMetadata {
                     title: "Same Title".to_string(),
@@ -1994,13 +2017,8 @@ mod tests {
                 TorrentInfo {
                     id: "2".to_string(),
                     filename: "Movie.2024.mkv".to_string(),
-                    original_filename: "Movie.2024.mkv".to_string(),
                     hash: "h2".to_string(),
                     bytes: 1000,
-                    original_bytes: 1000,
-                    host: "h2".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2023-01-01".to_string(),
                     files: vec![TorrentFile {
@@ -2010,7 +2028,7 @@ mod tests {
                         selected: 1,
                     }],
                     links: vec!["http://l2".to_string()],
-                    ended: Some("2024".to_string()),
+                    ..Default::default()
                 },
                 MediaMetadata {
                     title: "Same Title".to_string(),
@@ -2023,16 +2041,9 @@ mod tests {
 
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
-        if let VfsNode::Directory { children } = &vfs.root {
-            let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory {
-                children: movie_children,
-            } = movies
-            {
-                assert!(movie_children.contains_key("Same Title [tmdbid-1]"));
-                assert!(movie_children.contains_key("Same Title [tmdbid-2]"));
-            }
-        }
+        let movie_children = dir(&vfs.root, "Movies");
+        assert!(movie_children.contains_key("Same Title [tmdbid-1]"));
+        assert!(movie_children.contains_key("Same Title [tmdbid-2]"));
     }
 
     #[test]
@@ -2044,13 +2055,8 @@ mod tests {
                 TorrentInfo {
                     id: "s1".to_string(),
                     filename: "Ted.S01E01.Just.Say.Yes.1080p.mkv".to_string(),
-                    original_filename: "Ted.S01E01.Just.Say.Yes.1080p.mkv".to_string(),
                     hash: "h_s1".to_string(),
                     bytes: 2000,
-                    original_bytes: 2000,
-                    host: "host".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2024-01-01".to_string(),
                     files: vec![TorrentFile {
@@ -2060,7 +2066,7 @@ mod tests {
                         selected: 1,
                     }],
                     links: vec!["http://link_s1".to_string()],
-                    ended: Some("2024-01-01".to_string()),
+                    ..Default::default()
                 },
                 MediaMetadata {
                     title: "Ted".to_string(),
@@ -2073,13 +2079,8 @@ mod tests {
                 TorrentInfo {
                     id: "s2".to_string(),
                     filename: "ted.S02E01.Talk.Dirty.to.Me.1080p.mkv".to_string(),
-                    original_filename: "ted.S02E01.Talk.Dirty.to.Me.1080p.mkv".to_string(),
                     hash: "h_s2".to_string(),
                     bytes: 2500,
-                    original_bytes: 2500,
-                    host: "host".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2024-06-01".to_string(),
                     files: vec![TorrentFile {
@@ -2089,7 +2090,7 @@ mod tests {
                         selected: 1,
                     }],
                     links: vec!["http://link_s2".to_string()],
-                    ended: Some("2024-06-01".to_string()),
+                    ..Default::default()
                 },
                 MediaMetadata {
                     title: "ted".to_string(),
@@ -2102,36 +2103,18 @@ mod tests {
 
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
-        if let VfsNode::Directory { children } = &vfs.root {
-            let shows = children.get("Shows").unwrap();
-            if let VfsNode::Directory {
-                children: show_children,
-            } = shows
-            {
-                // Should be exactly ONE show folder, not two
-                assert_eq!(
-                    show_children.len(),
-                    1,
-                    "Expected 1 show folder but got {}: {:?}",
-                    show_children.len(),
-                    show_children.keys().collect::<Vec<_>>()
-                );
-                // That single folder should contain both seasons
-                let show_dir = show_children.values().next().unwrap();
-                if let VfsNode::Directory { children: seasons } = show_dir {
-                    assert!(
-                        seasons.contains_key("Season 01"),
-                        "Season 01 missing: {:?}",
-                        seasons.keys().collect::<Vec<_>>()
-                    );
-                    assert!(
-                        seasons.contains_key("Season 02"),
-                        "Season 02 missing: {:?}",
-                        seasons.keys().collect::<Vec<_>>()
-                    );
-                }
-            }
-        }
+        // Exactly ONE show folder, not two, and it holds both seasons.
+        let seasons = only_show(&vfs);
+        assert!(
+            seasons.contains_key("Season 01"),
+            "Season 01 missing: {:?}",
+            seasons.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            seasons.contains_key("Season 02"),
+            "Season 02 missing: {:?}",
+            seasons.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2143,13 +2126,8 @@ mod tests {
             TorrentInfo {
                 id: "s1".to_string(),
                 filename: "Rick and Morty - 409 - Childrick of Mort.mkv".to_string(),
-                original_filename: "Rick and Morty - 409 - Childrick of Mort.mkv".to_string(),
                 hash: "h1".to_string(),
                 bytes: 3000,
-                original_bytes: 3000,
-                host: "host".to_string(),
-                split: 1,
-                progress: 100.0,
                 status: "downloaded".to_string(),
                 added: "2024-01-01".to_string(),
                 files: vec![TorrentFile {
@@ -2159,7 +2137,7 @@ mod tests {
                     selected: 1,
                 }],
                 links: vec!["http://link1".to_string()],
-                ended: Some("2024-01-01".to_string()),
+                ..Default::default()
             },
             MediaMetadata {
                 title: "Rick and Morty".to_string(),
@@ -2171,28 +2149,16 @@ mod tests {
 
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
-        if let VfsNode::Directory { children } = &vfs.root {
-            let shows = children.get("Shows").expect("Shows dir");
-            if let VfsNode::Directory {
-                children: show_children,
-            } = shows
-            {
-                let show_dir = show_children.values().next().expect("one show folder");
-                if let VfsNode::Directory { children: seasons } = show_dir {
-                    assert!(
-                        seasons.contains_key("Season 04"),
-                        "expected Season 04, got {:?}",
-                        seasons.keys().collect::<Vec<_>>()
-                    );
-                    assert!(
-                        !seasons.contains_key("Season 01"),
-                        "dash-coded episode must NOT fall back to Season 01"
-                    );
-                } else {
-                    panic!("show dir is not a directory");
-                }
-            }
-        }
+        let seasons = only_show(&vfs);
+        assert!(
+            seasons.contains_key("Season 04"),
+            "expected Season 04, got {:?}",
+            seasons.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !seasons.contains_key("Season 01"),
+            "dash-coded episode must NOT fall back to Season 01"
+        );
     }
 
     #[test]
@@ -2204,13 +2170,8 @@ mod tests {
             TorrentInfo {
                 id: "s1".to_string(),
                 filename: "02 - Cats in the Bag.mkv".to_string(),
-                original_filename: "02 - Cats in the Bag.mkv".to_string(),
                 hash: "h1".to_string(),
                 bytes: 3000,
-                original_bytes: 3000,
-                host: "host".to_string(),
-                split: 1,
-                progress: 100.0,
                 status: "downloaded".to_string(),
                 added: "2024-01-01".to_string(),
                 files: vec![TorrentFile {
@@ -2220,7 +2181,7 @@ mod tests {
                     selected: 1,
                 }],
                 links: vec!["http://link1".to_string()],
-                ended: Some("2024-01-01".to_string()),
+                ..Default::default()
             },
             MediaMetadata {
                 title: "Breaking Bad".to_string(),
@@ -2232,28 +2193,16 @@ mod tests {
 
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
-        if let VfsNode::Directory { children } = &vfs.root {
-            let shows = children.get("Shows").expect("Shows dir");
-            if let VfsNode::Directory {
-                children: show_children,
-            } = shows
-            {
-                let show_dir = show_children.values().next().expect("one show folder");
-                if let VfsNode::Directory { children: seasons } = show_dir {
-                    assert!(
-                        seasons.contains_key("Season 02"),
-                        "expected Season 02 from the directory, got {:?}",
-                        seasons.keys().collect::<Vec<_>>()
-                    );
-                    assert!(
-                        !seasons.contains_key("Season 01"),
-                        "directory-coded season must NOT fall back to Season 01"
-                    );
-                } else {
-                    panic!("show dir is not a directory");
-                }
-            }
-        }
+        let seasons = only_show(&vfs);
+        assert!(
+            seasons.contains_key("Season 02"),
+            "expected Season 02 from the directory, got {:?}",
+            seasons.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !seasons.contains_key("Season 01"),
+            "directory-coded season must NOT fall back to Season 01"
+        );
     }
 
     /// A multi-season pack whose ROOT folder names a season range (`Show.S01-S03…`) and whose
@@ -2302,15 +2251,7 @@ mod tests {
 
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
-        let VfsNode::Directory { children } = &vfs.root else {
-            panic!("root is not a directory");
-        };
-        let Some(VfsNode::Directory { children: shows }) = children.get("Shows") else {
-            panic!("no Shows dir");
-        };
-        let Some(VfsNode::Directory { children: seasons }) = shows.values().next() else {
-            panic!("no show folder");
-        };
+        let seasons = only_show(&vfs);
         let files_in = |season: &str| -> Vec<String> {
             match seasons.get(season) {
                 Some(VfsNode::Directory { children }) => children.keys().cloned().collect(),
@@ -2357,16 +2298,7 @@ mod tests {
                 },
             )];
             let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
-            let VfsNode::Directory { children } = &vfs.root else {
-                panic!("root is not a directory");
-            };
-            let Some(VfsNode::Directory { children: shows }) = children.get("Shows") else {
-                panic!("no Shows dir");
-            };
-            let Some(VfsNode::Directory { children: seasons }) = shows.values().next() else {
-                panic!("no show folder");
-            };
-            seasons
+            only_show(&vfs)
                 .keys()
                 .filter(|k| k.starts_with("Season "))
                 .cloned()
@@ -2392,6 +2324,11 @@ mod tests {
         assert_eq!(season_of("Show/Part 3/1x05 - Title.mkv"), ["Season 01"]);
         // Within one name, a strong token beats an earlier `Part N`.
         assert_eq!(season_of("Show/Part 2 - 3x05.mkv"), ["Season 03"]);
+        // `_` separates every token, like `.`, ` ` and `-`.
+        assert_eq!(season_of("Show_Part_2/01.mkv"), ["Season 02"]);
+        assert_eq!(season_of("Show/Part_2_Title.mkv"), ["Season 02"]);
+        assert_eq!(season_of("Show_S02_1080p/01.mkv"), ["Season 02"]);
+        assert_eq!(season_of("Show_3x05_Title/01.mkv"), ["Season 03"]);
     }
 
     #[test]
@@ -2404,13 +2341,8 @@ mod tests {
                 TorrentInfo {
                     id: "t1".to_string(),
                     filename: "Ted.S01E01.mkv".to_string(),
-                    original_filename: "Ted.S01E01.mkv".to_string(),
                     hash: "ht1".to_string(),
                     bytes: 2000,
-                    original_bytes: 2000,
-                    host: "host".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2024-01-01".to_string(),
                     files: vec![TorrentFile {
@@ -2420,7 +2352,7 @@ mod tests {
                         selected: 1,
                     }],
                     links: vec!["http://link_t1".to_string()],
-                    ended: Some("2024-01-01".to_string()),
+                    ..Default::default()
                 },
                 MediaMetadata {
                     title: "Ted".to_string(),
@@ -2433,13 +2365,8 @@ mod tests {
                 TorrentInfo {
                     id: "t2".to_string(),
                     filename: "ted.S02E01.mkv".to_string(),
-                    original_filename: "ted.S02E01.mkv".to_string(),
                     hash: "ht2".to_string(),
                     bytes: 2500,
-                    original_bytes: 2500,
-                    host: "host".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2024-06-01".to_string(),
                     files: vec![TorrentFile {
@@ -2449,7 +2376,7 @@ mod tests {
                         selected: 1,
                     }],
                     links: vec!["http://link_t2".to_string()],
-                    ended: Some("2024-06-01".to_string()),
+                    ..Default::default()
                 },
                 MediaMetadata {
                     title: "ted".to_string(),
@@ -2462,21 +2389,14 @@ mod tests {
 
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
-        if let VfsNode::Directory { children } = &vfs.root {
-            let shows = children.get("Shows").unwrap();
-            if let VfsNode::Directory {
-                children: show_children,
-            } = shows
-            {
-                assert_eq!(
-                    show_children.len(),
-                    1,
-                    "Same TMDB ID should produce 1 folder, got {}: {:?}",
-                    show_children.len(),
-                    show_children.keys().collect::<Vec<_>>()
-                );
-            }
-        }
+        let show_children = dir(&vfs.root, "Shows");
+        assert_eq!(
+            show_children.len(),
+            1,
+            "Same TMDB ID should produce 1 folder, got {}: {:?}",
+            show_children.len(),
+            show_children.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2507,15 +2427,7 @@ mod tests {
         let a = (torrent("1", "Foo.S01E01.mkv"), meta("Foo"));
         let b = (torrent("2", "Foo.Bar.S01E02.mkv"), meta("Foo Bar"));
 
-        let shows_of = |vfs: &DebridVfs| -> BTreeMap<String, VfsNode> {
-            let VfsNode::Directory { children } = &vfs.root else {
-                panic!("root is a directory");
-            };
-            let Some(VfsNode::Directory { children: shows }) = children.get("Shows") else {
-                panic!("Shows is a directory");
-            };
-            shows.clone()
-        };
+        let shows_of = |vfs: &DebridVfs| dir(&vfs.root, "Shows").clone();
         let forward = shows_of(&DebridVfs::build(
             vec![a.clone(), b.clone()],
             &SelectionMap::new(),
@@ -2610,13 +2522,8 @@ mod tests {
                 TorrentInfo {
                     id: "small".to_string(),
                     filename: "Movie.small.mkv".to_string(),
-                    original_filename: "Movie.small.mkv".to_string(),
                     hash: "h1".to_string(),
                     bytes: 1000,
-                    original_bytes: 1000,
-                    host: "h1".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2023-01-01".to_string(),
                     files: vec![TorrentFile {
@@ -2626,7 +2533,7 @@ mod tests {
                         selected: 1,
                     }],
                     links: vec!["http://small".to_string()],
-                    ended: Some("2023".to_string()),
+                    ..Default::default()
                 },
                 metadata.clone(),
             ),
@@ -2634,13 +2541,8 @@ mod tests {
                 TorrentInfo {
                     id: "large".to_string(),
                     filename: "Movie.large.mkv".to_string(),
-                    original_filename: "Movie.large.mkv".to_string(),
                     hash: "h2".to_string(),
                     bytes: 5000,
-                    original_bytes: 5000,
-                    host: "h2".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2023-01-01".to_string(),
                     files: vec![TorrentFile {
@@ -2650,7 +2552,7 @@ mod tests {
                         selected: 1,
                     }],
                     links: vec!["http://large".to_string()],
-                    ended: Some("2023".to_string()),
+                    ..Default::default()
                 },
                 metadata,
             ),
@@ -2658,28 +2560,11 @@ mod tests {
 
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
-        if let VfsNode::Directory { children } = &vfs.root {
-            let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory {
-                children: movie_children,
-            } = movies
-            {
-                let folder = movie_children
-                    .get("Duplicate Movie [tmdbid-123]")
-                    .expect("Folder missing");
-                if let VfsNode::Directory { children: files } = folder {
-                    let file = files.get("Movie.mkv").expect("Media file missing");
-                    if let VfsNode::MediaFile { locator, .. } = file {
-                        assert_eq!(
-                            locator.torrent_id, "large",
-                            "Should have picked the large torrent"
-                        );
-                    } else {
-                        panic!("Should be a MediaFile");
-                    }
-                }
-            }
-        }
+        let (_, locator) = media_file(&vfs.root, "Movies/Duplicate Movie [tmdbid-123]/Movie.mkv");
+        assert_eq!(
+            locator.torrent_id, "large",
+            "Should have picked the large torrent"
+        );
     }
 
     #[test]
@@ -2945,6 +2830,21 @@ mod tests {
         assert_eq!(parse_se_all("Show.S01E05-720p.mkv"), vec![(1, 5)]);
         assert_eq!(parse_se_all("Show.S01E09-10bit.mkv"), vec![(1, 9)]);
         assert_eq!(parse_se_all("Show.S01E05-5.1.mkv"), vec![(1, 5)]);
+        // A channel layout whose whole part happens to be the next episode is still audio.
+        assert_eq!(parse_se_all("Show.S01E04-5.1.mkv"), vec![(1, 4)]);
+        assert_eq!(parse_se_all("Show.S01E01-2.0.mkv"), vec![(1, 1)]);
+        assert_eq!(parse_se_all("Show.S01E06-7.1.mkv"), vec![(1, 6)]);
+        assert_eq!(parse_se_all("Show.S01E06-7.1.2.Atmos.mkv"), vec![(1, 6)]);
+        // ...while a real double followed by a resolution still counts.
+        assert_eq!(
+            parse_se_all("Show.S01E01-02.1080p.mkv"),
+            vec![(1, 1), (1, 2)]
+        );
+        assert_eq!(
+            parse_se_all("Show.S01E01-2.1080p.mkv"),
+            vec![(1, 1), (1, 2)]
+        );
+        assert_eq!(parse_se_all("Show.S01E04-5.mkv"), vec![(1, 4), (1, 5)]);
     }
 
     #[test]
@@ -3043,13 +2943,8 @@ mod tests {
             TorrentInfo {
                 id: "1".to_string(),
                 filename: "Alex.October.mkv".to_string(),
-                original_filename: "Alex.October.mkv".to_string(),
                 hash: "h".to_string(),
                 bytes: 1000,
-                original_bytes: 1000,
-                host: "h".to_string(),
-                split: 1,
-                progress: 100.0,
                 status: "downloaded".to_string(),
                 added: "2023-01-01".to_string(),
                 files: vec![TorrentFile {
@@ -3059,7 +2954,7 @@ mod tests {
                     selected: 1,
                 }],
                 links: vec!["http://link1".to_string()],
-                ended: Some("2023-01-01".to_string()),
+                ..Default::default()
             },
             MediaMetadata {
                 title: "Alex/October".to_string(),
@@ -3070,19 +2965,12 @@ mod tests {
         )];
 
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
-        if let VfsNode::Directory { children } = &vfs.root {
-            let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory {
-                children: movie_children,
-            } = movies
-            {
-                assert!(
-                    movie_children.contains_key("Alex-October [tmdbid-856721]"),
-                    "Expected sanitized folder name, got: {:?}",
-                    movie_children.keys().collect::<Vec<_>>()
-                );
-            }
-        }
+        let movie_children = dir(&vfs.root, "Movies");
+        assert!(
+            movie_children.contains_key("Alex-October [tmdbid-856721]"),
+            "Expected sanitized folder name, got: {:?}",
+            movie_children.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -3092,13 +2980,8 @@ mod tests {
                 TorrentInfo {
                     id: "1".to_string(),
                     filename: "Movie.2023.1080p.mkv".to_string(),
-                    original_filename: "Movie.2023.1080p.mkv".to_string(),
                     hash: "".to_string(),
                     bytes: 1000,
-                    original_bytes: 1000,
-                    host: "".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2023-06-15T14:30:45.000Z".to_string(),
                     files: vec![TorrentFile {
@@ -3108,7 +2991,7 @@ mod tests {
                         selected: 1,
                     }],
                     links: vec!["http://link1".to_string()],
-                    ended: None,
+                    ..Default::default()
                 },
                 MediaMetadata {
                     title: "Movie".to_string(),
@@ -3121,13 +3004,8 @@ mod tests {
                 TorrentInfo {
                     id: "2".to_string(),
                     filename: "Show.S01E01.mkv".to_string(),
-                    original_filename: "Show.S01E01.mkv".to_string(),
                     hash: "".to_string(),
                     bytes: 500,
-                    original_bytes: 500,
-                    host: "".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2024-03-10T08:00:00.000Z".to_string(),
                     files: vec![TorrentFile {
@@ -3137,7 +3015,7 @@ mod tests {
                         selected: 1,
                     }],
                     links: vec!["http://link2".to_string()],
-                    ended: None,
+                    ..Default::default()
                 },
                 MediaMetadata {
                     title: "Show".to_string(),
@@ -3193,13 +3071,8 @@ mod tests {
                 TorrentInfo {
                     id: "old_torrent".to_string(),
                     filename: "Mr.Mercedes.S03".to_string(),
-                    original_filename: "Mr.Mercedes.S03".to_string(),
                     hash: "h1".to_string(),
                     bytes: 5000,
-                    original_bytes: 5000,
-                    host: "h".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2023-01-01".to_string(),
                     files: vec![
@@ -3220,7 +3093,7 @@ mod tests {
                         "http://old_link1".to_string(),
                         "http://old_link2".to_string(),
                     ],
-                    ended: Some("2023".to_string()),
+                    ..Default::default()
                 },
                 metadata.clone(),
             ),
@@ -3228,13 +3101,8 @@ mod tests {
                 TorrentInfo {
                     id: "new_torrent".to_string(),
                     filename: "Mr.Mercedes.S03".to_string(),
-                    original_filename: "Mr.Mercedes.S03".to_string(),
                     hash: "h1".to_string(),
                     bytes: 5000,
-                    original_bytes: 5000,
-                    host: "h".to_string(),
-                    split: 1,
-                    progress: 100.0,
                     status: "downloaded".to_string(),
                     added: "2023-01-02".to_string(),
                     files: vec![
@@ -3255,7 +3123,7 @@ mod tests {
                         "http://new_link1".to_string(),
                         "http://new_link2".to_string(),
                     ],
-                    ended: Some("2023".to_string()),
+                    ..Default::default()
                 },
                 metadata,
             ),
@@ -3263,43 +3131,17 @@ mod tests {
 
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
-        if let VfsNode::Directory { children } = &vfs.root {
-            let shows = children.get("Shows").unwrap();
-            if let VfsNode::Directory {
-                children: show_children,
-            } = shows
-            {
-                let show_folder = show_children
-                    .get("Mr. Mercedes [tmdbid-70485]")
-                    .expect("Show folder missing");
-                if let VfsNode::Directory {
-                    children: show_dirs,
-                } = show_folder
-                {
-                    let season = show_dirs.get("Season 03").expect("Season 03 missing");
-                    if let VfsNode::Directory { children: episodes } = season {
-                        // Should have exactly 2 episodes, no (1)/(2) duplicates
-                        assert_eq!(
-                            episodes.len(),
-                            2,
-                            "Expected 2 episodes but got {}: {:?}",
-                            episodes.len(),
-                            episodes.keys().collect::<Vec<_>>()
-                        );
-                        assert!(episodes.contains_key("Mr.Mercedes.S03E01.mkv"));
-                        assert!(episodes.contains_key("Mr.Mercedes.S03E02.mkv"));
-                    } else {
-                        panic!("Season 03 should be a directory");
-                    }
-                } else {
-                    panic!("Show folder should be a directory");
-                }
-            } else {
-                panic!("Shows should be a directory");
-            }
-        } else {
-            panic!("Root should be a directory");
-        }
+        let episodes = dir(&vfs.root, "Shows/Mr. Mercedes [tmdbid-70485]/Season 03");
+        // Should have exactly 2 episodes, no (1)/(2) duplicates
+        assert_eq!(
+            episodes.len(),
+            2,
+            "Expected 2 episodes but got {}: {:?}",
+            episodes.len(),
+            episodes.keys().collect::<Vec<_>>()
+        );
+        assert!(episodes.contains_key("Mr.Mercedes.S03E01.mkv"));
+        assert!(episodes.contains_key("Mr.Mercedes.S03E02.mkv"));
     }
 
     #[test]
@@ -3768,13 +3610,8 @@ mod tests {
             TorrentInfo {
                 id: "t1".to_string(),
                 filename: "Movie.2023".to_string(),
-                original_filename: "Movie.2023".to_string(),
                 hash: "h1".to_string(),
                 bytes: 3000,
-                original_bytes: 3000,
-                host: "h".to_string(),
-                split: 1,
-                progress: 100.0,
                 status: "downloaded".to_string(),
                 added: "2023-01-01".to_string(),
                 files: vec![
@@ -3804,7 +3641,7 @@ mod tests {
                     "http://link_for_srt".to_string(),
                     "http://link_for_movie".to_string(),
                 ],
-                ended: Some("2023-01-01".to_string()),
+                ..Default::default()
             },
             MediaMetadata {
                 title: "Link Index Test".to_string(),
@@ -3816,32 +3653,12 @@ mod tests {
 
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
-        if let VfsNode::Directory { children } = &vfs.root {
-            let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory {
-                children: movie_children,
-            } = movies
-            {
-                let folder = movie_children
-                    .get("Link Index Test [tmdbid-999]")
-                    .expect("Movie folder missing");
-                if let VfsNode::Directory { children: files } = folder {
-                    let media = files.get("Movie.mkv").expect("Media file missing");
-                    if let VfsNode::MediaFile { locator, .. } = media {
-                        assert_eq!(
-                            locator.link.as_deref(),
-                            Some("http://link_for_movie"),
-                            "Video file should use link index 1 (after non-video selected file), \
-                             not link index 0"
-                        );
-                    } else {
-                        panic!("Should be a MediaFile");
-                    }
-                } else {
-                    panic!("Should be a Directory");
-                }
-            }
-        }
+        let (_, locator) = media_file(&vfs.root, "Movies/Link Index Test [tmdbid-999]/Movie.mkv");
+        assert_eq!(
+            locator.link.as_deref(),
+            Some("http://link_for_movie"),
+            "Video file should use link index 1 (after non-video selected file), not link index 0"
+        );
     }
 
     /// Same link_idx logic for shows -- non-video selected files must be skipped.
@@ -3851,13 +3668,8 @@ mod tests {
             TorrentInfo {
                 id: "t1".to_string(),
                 filename: "Show.S01".to_string(),
-                original_filename: "Show.S01".to_string(),
                 hash: "h1".to_string(),
                 bytes: 3000,
-                original_bytes: 3000,
-                host: "h".to_string(),
-                split: 1,
-                progress: 100.0,
                 status: "downloaded".to_string(),
                 added: "2023-01-01".to_string(),
                 files: vec![
@@ -3888,7 +3700,7 @@ mod tests {
                     "http://link_ep1".to_string(),
                     "http://link_ep2".to_string(),
                 ],
-                ended: Some("2023-01-01".to_string()),
+                ..Default::default()
             },
             MediaMetadata {
                 title: "Show Link Test".to_string(),
@@ -3900,39 +3712,19 @@ mod tests {
 
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
-        if let VfsNode::Directory { children } = &vfs.root {
-            let shows = children.get("Shows").unwrap();
-            if let VfsNode::Directory {
-                children: show_children,
-            } = shows
-            {
-                let show_folder = show_children
-                    .get("Show Link Test [tmdbid-888]")
-                    .expect("Show folder missing");
-                if let VfsNode::Directory { children: seasons } = show_folder {
-                    let season = seasons.get("Season 01").expect("Season 01 missing");
-                    if let VfsNode::Directory { children: episodes } = season {
-                        let ep1 = episodes.get("Show.S01E01.mkv").expect("Ep1 missing");
-                        let ep2 = episodes.get("Show.S01E02.mkv").expect("Ep2 missing");
-
-                        if let VfsNode::MediaFile { locator, .. } = ep1 {
-                            assert_eq!(
-                                locator.link.as_deref(),
-                                Some("http://link_ep1"),
-                                "Episode 1 should use link index 1 (after non-video selected file)"
-                            );
-                        }
-                        if let VfsNode::MediaFile { locator, .. } = ep2 {
-                            assert_eq!(
-                                locator.link.as_deref(),
-                                Some("http://link_ep2"),
-                                "Episode 2 should use link index 2"
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        let season = "Shows/Show Link Test [tmdbid-888]/Season 01";
+        let (_, ep1) = media_file(&vfs.root, &format!("{season}/Show.S01E01.mkv"));
+        assert_eq!(
+            ep1.link.as_deref(),
+            Some("http://link_ep1"),
+            "Episode 1 should use link index 1 (after non-video selected file)"
+        );
+        let (_, ep2) = media_file(&vfs.root, &format!("{season}/Show.S01E02.mkv"));
+        assert_eq!(
+            ep2.link.as_deref(),
+            Some("http://link_ep2"),
+            "Episode 2 should use link index 2"
+        );
     }
 
     /// Movie VFS build should not include unselected files.
@@ -3942,13 +3734,8 @@ mod tests {
             TorrentInfo {
                 id: "t1".to_string(),
                 filename: "Movie.2023".to_string(),
-                original_filename: "Movie.2023".to_string(),
                 hash: "h1".to_string(),
                 bytes: 3000,
-                original_bytes: 3000,
-                host: "h".to_string(),
-                split: 1,
-                progress: 100.0,
                 status: "downloaded".to_string(),
                 added: "2023-01-01".to_string(),
                 files: vec![
@@ -3966,7 +3753,7 @@ mod tests {
                     },
                 ],
                 links: vec!["http://link_movie".to_string()],
-                ended: Some("2023-01-01".to_string()),
+                ..Default::default()
             },
             MediaMetadata {
                 title: "Unselected Test".to_string(),
@@ -3978,25 +3765,13 @@ mod tests {
 
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
-        if let VfsNode::Directory { children } = &vfs.root {
-            let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory {
-                children: movie_children,
-            } = movies
-            {
-                let folder = movie_children
-                    .get("Unselected Test")
-                    .expect("Movie folder missing");
-                if let VfsNode::Directory { children: files } = folder {
-                    // Only Movie.mkv should be present (Deleted.Scenes.mkv is not selected
-                    // and also would be filtered by is_video_file's "extras" check... but
-                    // the point is unselected=0 files never consume a link index either)
-                    assert_eq!(files.len(), 2, "Should have 1 media + 1 nfo");
-                    assert!(files.contains_key("Movie.mkv"));
-                    assert!(files.contains_key("movie.nfo"));
-                }
-            }
-        }
+        let files = dir(&vfs.root, "Movies/Unselected Test");
+        // Only Movie.mkv should be present (Deleted.Scenes.mkv is not selected
+        // and also would be filtered by is_video_file's "extras" check... but
+        // the point is unselected=0 files never consume a link index either)
+        assert_eq!(files.len(), 2, "Should have 1 media + 1 nfo");
+        assert!(files.contains_key("Movie.mkv"));
+        assert!(files.contains_key("movie.nfo"));
     }
 
     /// When a torrent has more selected files than links (mismatch), the VFS
@@ -4007,13 +3782,8 @@ mod tests {
             TorrentInfo {
                 id: "t1".to_string(),
                 filename: "Mismatched".to_string(),
-                original_filename: "Mismatched".to_string(),
                 hash: "h1".to_string(),
                 bytes: 3000,
-                original_bytes: 3000,
-                host: "h".to_string(),
-                split: 1,
-                progress: 100.0,
                 status: "downloaded".to_string(),
                 added: "2023-01-01".to_string(),
                 files: vec![
@@ -4038,7 +3808,7 @@ mod tests {
                 ],
                 // Only 2 links for 3 selected files
                 links: vec!["http://link1".to_string(), "http://link2".to_string()],
-                ended: Some("2023-01-01".to_string()),
+                ..Default::default()
             },
             MediaMetadata {
                 title: "Mismatch Test".to_string(),
@@ -4051,40 +3821,28 @@ mod tests {
         // Should not panic
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
-        if let VfsNode::Directory { children } = &vfs.root {
-            let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory {
-                children: movie_children,
-            } = movies
-            {
-                let folder = movie_children
-                    .get("Mismatch Test")
-                    .expect("Movie folder missing");
-                if let VfsNode::Directory { children: files } = folder {
-                    // Only File1 and File2 should be present (File3 has no link)
-                    let media_count = files
-                        .values()
-                        .filter(|n| matches!(n, VfsNode::MediaFile { .. }))
-                        .count();
-                    assert_eq!(
-                        media_count, 2,
-                        "Only files with links should be added to VFS"
-                    );
-                    // A missing link must SKIP the file, never insert a broken-link
-                    // placeholder node (behavioural replacement for the former source-text check).
-                    assert!(
-                        files.keys().all(|name| {
-                            !name.contains("Error") && !name.to_lowercase().contains("unrestrict")
-                        }),
-                        "missing links must be skipped, not placeholdered: {:?}",
-                        files.keys().collect::<Vec<_>>()
-                    );
-                }
-            }
-        }
+        let files = dir(&vfs.root, "Movies/Mismatch Test");
+        // Only File1 and File2 should be present (File3 has no link)
+        let media_count = files
+            .values()
+            .filter(|n| matches!(n, VfsNode::MediaFile { .. }))
+            .count();
+        assert_eq!(
+            media_count, 2,
+            "Only files with links should be added to VFS"
+        );
+        // A missing link must SKIP the file, never insert a broken-link
+        // placeholder node (behavioural replacement for the former source-text check).
+        assert!(
+            files.keys().all(|name| {
+                !name.contains("Error") && !name.to_lowercase().contains("unrestrict")
+            }),
+            "missing links must be skipped, not placeholdered: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
     }
 
-    // --- M4: is_archive_part expects pre-lowercased input ---
+    // --- is_archive_part expects pre-lowercased input ---
 
     #[test]
     fn is_archive_part_works_with_pre_lowercased_input() {
@@ -4100,7 +3858,7 @@ mod tests {
         assert!(is_archive_file("MOVIE.R00"));
     }
 
-    // --- L3: is_video_file excludes files in extras directories ---
+    // --- is_video_file excludes files in extras directories ---
 
     #[test]
     fn is_video_file_rejects_extras_directories() {
@@ -4128,141 +3886,75 @@ mod tests {
         assert!(is_video_file("/path/The.Movie.2020/feature.mkv"));
     }
 
-    // --- L4: SEASON_RE handles "Part N" numbering ---
+    // --- season_tokens: the (strong, part) season numbers SEASON_RE finds in one name ---
 
     #[test]
-    fn season_re_extracts_part_numbering() {
-        // "Part 1" should be treated as season 1
-        let cap = SEASON_RE.captures("Show.Part1.E01.mkv").unwrap();
-        let season = cap
-            .get(1)
-            .or_else(|| cap.get(2))
-            .or_else(|| cap.get(3))
-            .or_else(|| cap.get(4))
-            .unwrap()
-            .as_str()
-            .parse::<u32>()
-            .unwrap();
-        assert_eq!(season, 1);
-
-        // "Part 2" with space
-        let cap = SEASON_RE.captures("Show.Part 2.E01.mkv").unwrap();
-        let season = cap
-            .get(1)
-            .or_else(|| cap.get(2))
-            .or_else(|| cap.get(3))
-            .or_else(|| cap.get(4))
-            .unwrap()
-            .as_str()
-            .parse::<u32>()
-            .unwrap();
-        assert_eq!(season, 2);
-
-        // "part 3" lowercase
-        let cap = SEASON_RE.captures("show.part3.e01.mkv").unwrap();
-        let season = cap
-            .get(1)
-            .or_else(|| cap.get(2))
-            .or_else(|| cap.get(3))
-            .or_else(|| cap.get(4))
-            .unwrap()
-            .as_str()
-            .parse::<u32>()
-            .unwrap();
-        assert_eq!(season, 3);
-
-        // S01 still works (not broken by the addition)
-        let cap = SEASON_RE.captures("Show.S05E01.mkv").unwrap();
-        let season = cap
-            .get(1)
-            .or_else(|| cap.get(2))
-            .or_else(|| cap.get(3))
-            .or_else(|| cap.get(4))
-            .unwrap()
-            .as_str()
-            .parse::<u32>()
-            .unwrap();
-        assert_eq!(season, 5);
+    fn season_tokens_reads_part_numbering_as_the_part_signal() {
+        assert_eq!(season_tokens("Show.Part1.E01.mkv"), (None, Some(1)));
+        assert_eq!(season_tokens("Show.Part 2.E01.mkv"), (None, Some(2)));
+        assert_eq!(season_tokens("show.part3.e01.mkv"), (None, Some(3)));
+        // An `Sxx` code is a strong token, not a part.
+        assert_eq!(season_tokens("Show.S05E01.mkv"), (Some(5), None));
+        // Every match is scanned, so a strong token after a `Part N` is kept apart from it.
+        assert_eq!(season_tokens("Part 2 - 3x05"), (Some(3), Some(2)));
     }
 
     #[test]
-    fn season_re_ignores_pixel_resolution() {
-        // Extract the season number exactly as the build path does.
-        let extract = |name: &str| -> Option<u32> {
-            SEASON_RE
-                .captures(name)
-                .and_then(|cap| {
-                    cap.get(1)
-                        .or_else(|| cap.get(2))
-                        .or_else(|| cap.get(3))
-                        .or_else(|| cap.get(4))
-                })
-                .and_then(|m| m.as_str().parse::<u32>().ok())
-        };
+    fn season_tokens_ignores_pixel_resolution() {
         // A "WIDTHxHEIGHT" pixel resolution must NOT be read as a season number.
-        assert_eq!(extract("Show.Episode.5.1920x1080.mkv"), None);
-        assert_eq!(extract("Show.720x480.mkv"), None);
+        assert_eq!(season_tokens("Show.Episode.5.1920x1080.mkv"), (None, None));
+        assert_eq!(season_tokens("Show.720x480.mkv"), (None, None));
         // The "NxNN" episode-numbering convention is still detected.
-        assert_eq!(extract("Show.1x05.mkv"), Some(1));
-        assert_eq!(extract("Show.12x05.mkv"), Some(12));
+        assert_eq!(season_tokens("Show.1x05.mkv"), (Some(1), None));
+        assert_eq!(season_tokens("Show.12x05.mkv"), (Some(12), None));
         // An explicit SxxExx marker still wins even when a resolution is present.
-        assert_eq!(extract("Show.S03E05.1920x1080.mkv"), Some(3));
+        assert_eq!(season_tokens("Show.S03E05.1920x1080.mkv"), (Some(3), None));
     }
 
     #[test]
-    fn season_re_ignores_mid_token_s_and_oversized_season_number() {
-        let extract = |name: &str| -> Option<u32> {
-            SEASON_RE
-                .captures(name)
-                .and_then(|cap| {
-                    cap.get(1)
-                        .or_else(|| cap.get(2))
-                        .or_else(|| cap.get(3))
-                        .or_else(|| cap.get(4))
-                })
-                .and_then(|m| m.as_str().parse::<u32>().ok())
-        };
-        // A codec token like DTS5 / DDP5 must NOT be read as "season 5" — the `s`/digit is mid-token,
+    fn season_tokens_ignores_mid_token_s_and_oversized_season_number() {
+        // A codec token like DTS5 / DDP5 must NOT be read as "season 5": the `s`/digit is mid-token,
         // not a season marker. (Previously `s(\d+)` matched the `s5` inside `DTS5` → bogus Season 05.)
-        assert_eq!(extract("Show.E05.DTS5.1.1080p.mkv"), None);
-        assert_eq!(extract("Show.E05.DDP5.1.mkv"), None);
-        // A 4-digit S-number (a stray S2024) must NOT be read as "season 2024" — seasons are 1-2 digit.
-        assert_eq!(extract("Show.S2024E01.mkv"), None);
+        assert_eq!(season_tokens("Show.E05.DTS5.1.1080p.mkv"), (None, None));
+        assert_eq!(season_tokens("Show.E05.DDP5.1.mkv"), (None, None));
+        // A 4-digit S-number (a stray S2024) must NOT be read as "season 2024": seasons are 1-2 digit.
+        assert_eq!(season_tokens("Show.S2024E01.mkv"), (None, None));
         // Nor is a `part` inside a title word, or a `Part` followed by a year.
-        assert_eq!(extract("Counterpart.2017.S01.1080p"), Some(1));
-        assert_eq!(extract("Counterpart.2017.1080p"), None);
-        assert_eq!(extract("Show.Part.2019.mkv"), None);
+        assert_eq!(season_tokens("Counterpart.2017.S01.1080p"), (Some(1), None));
+        assert_eq!(season_tokens("Counterpart.2017.1080p"), (None, None));
+        assert_eq!(season_tokens("Show.Part.2019.mkv"), (None, None));
         // Genuine markers still resolve.
-        assert_eq!(extract("Show.S05E01.mkv"), Some(5));
-        assert_eq!(extract("Show.S5.E01.mkv"), Some(5));
-        assert_eq!(extract("Show.Part2.E01.mkv"), Some(2));
-        assert_eq!(extract("Show.1x05.mkv"), Some(1));
+        assert_eq!(season_tokens("Show.S05E01.mkv"), (Some(5), None));
+        assert_eq!(season_tokens("Show.S5.E01.mkv"), (Some(5), None));
+        assert_eq!(season_tokens("Show.Part2.E01.mkv"), (None, Some(2)));
+        assert_eq!(season_tokens("Show.1x05.mkv"), (Some(1), None));
     }
 
     #[test]
-    fn season_re_accepts_dotted_and_underscore_separators_for_spelled_out_forms() {
-        let extract = |name: &str| -> Option<u32> {
-            SEASON_RE
-                .captures(name)
-                .and_then(|cap| {
-                    cap.get(1)
-                        .or_else(|| cap.get(2))
-                        .or_else(|| cap.get(3))
-                        .or_else(|| cap.get(4))
-                })
-                .and_then(|m| m.as_str().parse::<u32>().ok())
-        };
+    fn season_tokens_accepts_dotted_and_underscore_separators() {
         // Scene names separate the spelled-out "Season"/"Part" from the number with a dot/underscore/
-        // dash, not just a space — these must resolve, not mis-fold to season 1.
-        assert_eq!(extract("Show.Season.2.E05.mkv"), Some(2));
-        assert_eq!(extract("Show.Season_2.E05.mkv"), Some(2));
-        assert_eq!(extract("Show.Season-2.E05.mkv"), Some(2));
-        assert_eq!(extract("Show.Part.3.E01.mkv"), Some(3));
+        // dash, not just a space; these must resolve, not mis-fold to season 1.
+        assert_eq!(season_tokens("Show.Season.2.E05.mkv"), (Some(2), None));
+        assert_eq!(season_tokens("Show.Season_2.E05.mkv"), (Some(2), None));
+        assert_eq!(season_tokens("Show.Season-2.E05.mkv"), (Some(2), None));
+        assert_eq!(season_tokens("Show.Part.3.E01.mkv"), (None, Some(3)));
         // The space/no-separator forms still work.
-        assert_eq!(extract("Show.Season 4.E01.mkv"), Some(4));
-        assert_eq!(extract("Show.Season5.E01.mkv"), Some(5));
-        // A keyword with no following digit ("Seasonal", "Departure") must NOT match.
-        assert_eq!(extract("Seasonal.Documentary.mkv"), None);
+        assert_eq!(season_tokens("Show.Season 4.E01.mkv"), (Some(4), None));
+        assert_eq!(season_tokens("Show.Season5.E01.mkv"), (Some(5), None));
+        // `_` also bounds the `Part N`, `Sxx` and `NxNN` tokens (the regex crate's `\b` treats it as
+        // a word character, so a word-bounded arm missed these).
+        assert_eq!(season_tokens("Show_Part_2_E01.mkv"), (None, Some(2)));
+        assert_eq!(season_tokens("Show_Part_2"), (None, Some(2)));
+        assert_eq!(season_tokens("Part_2_Title.mkv"), (None, Some(2)));
+        assert_eq!(season_tokens("Show_S02_1080p"), (Some(2), None));
+        assert_eq!(season_tokens("Show_1x05_Title.mkv"), (Some(1), None));
+        // A separator shared by two tokens bounds both of them.
+        assert_eq!(season_tokens("Part_2_S03"), (Some(3), Some(2)));
+        assert_eq!(season_tokens("Show.S02.Part.3"), (Some(2), Some(3)));
+        // A keyword with no following digit ("Seasonal"), or `part` inside a word ("Departure"),
+        // must NOT match.
+        assert_eq!(season_tokens("Seasonal.Documentary.mkv"), (None, None));
+        assert_eq!(season_tokens("Departure.2.mkv"), (None, None));
     }
 
     /// Test that archive-only torrents produce an empty movie folder (no media files).
@@ -4272,13 +3964,8 @@ mod tests {
             TorrentInfo {
                 id: "t1".to_string(),
                 filename: "Archive.Movie".to_string(),
-                original_filename: "Archive.Movie".to_string(),
                 hash: "h1".to_string(),
                 bytes: 5000,
-                original_bytes: 5000,
-                host: "h".to_string(),
-                split: 1,
-                progress: 100.0,
                 status: "downloaded".to_string(),
                 added: "2023-01-01".to_string(),
                 files: vec![
@@ -4296,7 +3983,7 @@ mod tests {
                     },
                 ],
                 links: vec!["http://link1".to_string(), "http://link2".to_string()],
-                ended: Some("2023-01-01".to_string()),
+                ..Default::default()
             },
             MediaMetadata {
                 title: "Archive Movie".to_string(),
@@ -4309,23 +3996,16 @@ mod tests {
         let vfs = DebridVfs::build(torrents, &crate::vfs::SelectionMap::new());
 
         // Archive-only torrents should produce no folder (no video files = no entry)
-        if let VfsNode::Directory { children } = &vfs.root {
-            let movies = children.get("Movies").unwrap();
-            if let VfsNode::Directory {
-                children: movie_children,
-            } = movies
-            {
-                assert!(
-                    !movie_children.contains_key("Archive Movie"),
-                    "Archive-only torrent should not produce a folder in VFS"
-                );
-            }
-        }
+        assert!(
+            !dir(&vfs.root, "Movies").contains_key("Archive Movie"),
+            "Archive-only torrent should not produce a folder in VFS"
+        );
     }
 }
 
 #[cfg(test)]
 mod selection_tests {
+    use super::test_support::{dir, movie_torrent, season_file_names, show_torrent};
     use super::*;
     use crate::rd_client::{TorrentFile, TorrentInfo};
     use crate::store::{episode_slot, movie_slot, SelectionEntry};
@@ -4346,23 +4026,6 @@ mod selection_tests {
             external_id: Some(format!("tmdb:{}", tmdb)),
         }
     }
-    fn movie_torrent(id: &str, hash: &str, bytes: u64) -> TorrentInfo {
-        TorrentInfo {
-            id: id.into(),
-            hash: hash.into(),
-            bytes,
-            status: "downloaded".into(),
-            files: vec![TorrentFile {
-                id: 0,
-                path: "Movie.2023.1080p.mkv".into(),
-                bytes,
-                selected: 1,
-            }],
-            links: vec!["https://cdn/movie".into()],
-            ..Default::default()
-        }
-    }
-
     fn movie_file_locators(vfs: &DebridVfs) -> Vec<FileLocator> {
         // Collect every MediaFile locator under Movies/.
         fn walk(n: &VfsNode, out: &mut Vec<FileLocator>) {
@@ -4377,10 +4040,8 @@ mod selection_tests {
             }
         }
         let mut out = Vec::new();
-        if let VfsNode::Directory { children } = &vfs.root {
-            if let Some(m) = children.get("Movies") {
-                walk(m, &mut out);
-            }
+        for folder in dir(&vfs.root, "Movies").values() {
+            walk(folder, &mut out);
         }
         out
     }
@@ -4527,29 +4188,15 @@ mod selection_tests {
             vec![(single, show_meta(1396)), (pack, show_meta(1396))],
             &sel,
         );
-        // Find the S01E01 media file's locator.
-        let mut found: Option<FileLocator> = None;
-        if let VfsNode::Directory { children } = &vfs.root {
-            if let Some(VfsNode::Directory { children: shows }) = children.get("Shows") {
-                for show in shows.values() {
-                    if let VfsNode::Directory { children: seasons } = show {
-                        if let Some(VfsNode::Directory { children: eps }) = seasons.get("Season 01")
-                        {
-                            for n in eps.values() {
-                                if let VfsNode::MediaFile { locator, .. } = n {
-                                    found = Some(locator.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert_eq!(
-            found.expect("S01E01 present").hash,
-            "h_pack",
-            "per-episode selection wins"
-        );
+        // S01E01 is present once, from the selected hash.
+        let hashes: Vec<&str> = dir(&vfs.root, "Shows/Show [tmdbid-1396]/Season 01")
+            .values()
+            .filter_map(|n| match n {
+                VfsNode::MediaFile { locator, .. } => Some(locator.hash.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hashes, ["h_pack"], "per-episode selection wins");
     }
 
     #[test]
@@ -4580,23 +4227,9 @@ mod selection_tests {
         );
         let vfs = DebridVfs::build(vec![(torrent, show_meta(1396))], &sel);
         // Episode S01E01 must still be present under Shows/<show>/Season 01.
-        let mut found = false;
-        if let VfsNode::Directory { children } = &vfs.root {
-            if let Some(VfsNode::Directory { children: shows }) = children.get("Shows") {
-                for show in shows.values() {
-                    if let VfsNode::Directory { children: seasons } = show {
-                        if let Some(VfsNode::Directory { children: eps }) = seasons.get("Season 01")
-                        {
-                            if eps.values().any(|n| matches!(n, VfsNode::MediaFile { .. })) {
-                                found = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert!(
-            found,
+        assert_eq!(
+            season_file_names(&vfs, "Season 01"),
+            ["Show.S01E01.1080p.mkv"],
             "stale selection (absent hash) must not hide the episode"
         );
     }
@@ -4631,23 +4264,9 @@ mod selection_tests {
             },
         );
         let vfs = DebridVfs::build(vec![(torrent, show_meta(1396))], &sel);
-        let mut found = false;
-        if let VfsNode::Directory { children } = &vfs.root {
-            if let Some(VfsNode::Directory { children: shows }) = children.get("Shows") {
-                for show in shows.values() {
-                    if let VfsNode::Directory { children: seasons } = show {
-                        if let Some(VfsNode::Directory { children: eps }) = seasons.get("Season 01")
-                        {
-                            if eps.values().any(|n| matches!(n, VfsNode::MediaFile { .. })) {
-                                found = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert!(
-            found,
+        assert_eq!(
+            season_file_names(&vfs, "Season 01"),
+            ["Show.S01E01.1080p.mkv"],
             "a selection with a present hash but mismatched file_path must not hide the episode"
         );
     }
@@ -4707,74 +4326,12 @@ mod selection_tests {
         let vfs = DebridVfs::build(vec![(a, show_meta(1396)), (b, show_meta(1396))], &sel);
         // Season 01 must hold BOTH episodes: S01E01 (from A, emittable) and S01E02 (self-healed to
         // B, since A's copy is link-less). Before the fix only S01E01 survived.
-        let mut media_count = 0;
-        if let VfsNode::Directory { children } = &vfs.root {
-            if let Some(VfsNode::Directory { children: shows }) = children.get("Shows") {
-                for show in shows.values() {
-                    if let VfsNode::Directory { children: seasons } = show {
-                        if let Some(VfsNode::Directory { children: eps }) = seasons.get("Season 01")
-                        {
-                            media_count = eps
-                                .values()
-                                .filter(|n| matches!(n, VfsNode::MediaFile { .. }))
-                                .count();
-                        }
-                    }
-                }
-            }
-        }
+        let names = season_file_names(&vfs, "Season 01");
         assert_eq!(
-            media_count, 2,
-            "S01E02 must be self-healed to the emittable copy, not vanished (got {media_count})"
+            names,
+            ["Show.S01E01.1080p.mkv", "Show.S01E02.1080p.mkv"],
+            "S01E02 must be self-healed to the emittable copy, not vanished"
         );
-    }
-
-    /// A TorBox-style (link-less) show torrent whose selected files are all videos.
-    fn show_torrent(id: &str, hash: &str, bytes: u64, paths: &[&str]) -> TorrentInfo {
-        TorrentInfo {
-            id: id.into(),
-            hash: hash.into(),
-            bytes,
-            status: "downloaded".into(),
-            files: paths
-                .iter()
-                .enumerate()
-                .map(|(i, p)| TorrentFile {
-                    id: i as u32,
-                    path: (*p).into(),
-                    bytes: bytes / paths.len() as u64,
-                    selected: 1,
-                })
-                .collect(),
-            ..Default::default()
-        }
-    }
-
-    /// The sorted media-file names under `Shows/<the only show>/<season>`.
-    fn season_file_names(vfs: &DebridVfs, season: &str) -> Vec<String> {
-        let VfsNode::Directory { children } = &vfs.root else {
-            panic!("root is a directory");
-        };
-        let Some(VfsNode::Directory { children: shows }) = children.get("Shows") else {
-            panic!("Shows is a directory");
-        };
-        let mut names: Vec<String> = shows
-            .values()
-            .filter_map(|show| match show {
-                VfsNode::Directory { children: seasons } => seasons.get(season),
-                _ => None,
-            })
-            .flat_map(|s| match s {
-                VfsNode::Directory { children: eps } => eps
-                    .iter()
-                    .filter(|(_, n)| matches!(n, VfsNode::MediaFile { .. }))
-                    .map(|(name, _)| name.clone())
-                    .collect::<Vec<_>>(),
-                _ => Vec::new(),
-            })
-            .collect();
-        names.sort();
-        names
     }
 
     fn sel_entry(hash: &str, file_path: &str) -> SelectionEntry {
@@ -4904,21 +4461,13 @@ mod selection_tests {
         };
         let vfs = DebridVfs::build(vec![(torrent, movie_meta(27205))], &SelectionMap::new());
 
-        // Collect the media-file leaf names + their links under Movies/.
+        // Collect the media-file leaf names + their links in the movie's folder.
         let mut names: Vec<String> = Vec::new();
         let mut links: Vec<String> = Vec::new();
-        if let VfsNode::Directory { children } = &vfs.root {
-            if let Some(VfsNode::Directory { children: movies }) = children.get("Movies") {
-                for folder in movies.values() {
-                    if let VfsNode::Directory { children: files } = folder {
-                        for (name, node) in files {
-                            if let VfsNode::MediaFile { locator, .. } = node {
-                                names.push(name.clone());
-                                links.push(locator.link.clone().unwrap_or_default());
-                            }
-                        }
-                    }
-                }
+        for (name, node) in dir(&vfs.root, "Movies/Movie [tmdbid-27205]") {
+            if let VfsNode::MediaFile { locator, .. } = node {
+                names.push(name.clone());
+                links.push(locator.link.clone().unwrap_or_default());
             }
         }
         names.sort();

@@ -1,12 +1,13 @@
 # Keep dependencies patched. The GitHub Actions in ci.yml/release.yml are referenced by floating
 # major-version tags (e.g. actions/checkout@v7); those jobs hold registry credentials
 # (packages: write, and contents: write in release.yml), so a compromised upstream tag could
-# exfiltrate them. Dependabot opens update PRs (and surfaces advisories) for the actions and the
-# Cargo tree, so drift/vulnerabilities are caught rather than silently carried.
+# exfiltrate them. Dependabot opens update PRs for the actions and the Cargo tree, so drift is
+# caught rather than silently carried.
 #
-# Dependabot reads this file only from the default branch (main), and without `target-branch` it
-# opens PRs only against main. The `v2` entries cover the development line; they take effect once
-# this file is on main.
+# Dependabot reads this file only from the default branch (main), so none of it runs, for any
+# branch, until it is merged there. Without `target-branch` it opens PRs only against main; the `v2`
+# entries cover the development line. Dependabot alerts (advisories) follow only main's Cargo.lock
+# either way: .github/workflows/audit.yml is the RustSec advisory check for v2's.
 version: 2
 updates:
   - package-ecosystem: "github-actions"

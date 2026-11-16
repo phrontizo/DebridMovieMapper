@@ -160,11 +160,18 @@ static EPISODE_NUM_DASH_RE: LazyLock<Regex> =
 /// end of the name or a bracket group (`[SubsPlease] Some Show - 12 (1080p) [hash]`, the common
 /// anime form; `Show.Name - 101`; `Some Show - Ep01 [720p]`), with an optional `Ep` prefix and
 /// `v2` version suffix. Two to four digits, so a single-digit sequel (`Some Film - 2`) is kept;
-/// `clean_name` also skips a 19xx/20xx year (`Dr.No - 1962`). Matched after the dot → space
-/// replacement.
+/// `clean_name` also skips a 19xx/20xx year (`Dr.No - 1962`) and a number whose bracket group is
+/// a release year (`Prefix - 21 (2008)`, [`BRACKETED_YEAR_RE`]): that is a numeric film title,
+/// while an episode number is followed by a quality, CRC or version group. Matched after the
+/// dot → space replacement.
 static TRAILING_EPISODE_NUM_DASH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\s+-\s+(?:ep\s*)?(\d{2,4})(?:v\d{1,2})?(?:\s*[\[(]|\s*$)").unwrap()
 });
+
+/// A release year closing the bracket group that [`TRAILING_EPISODE_NUM_DASH_RE`] has just
+/// opened (`2008)` / `2007]`), matched against the text after that match.
+static BRACKETED_YEAR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(?:19|20)\d{2}\s*[)\]]").unwrap());
 
 /// What [`identify_name`] concluded about a name.
 #[derive(Debug, Clone)]
@@ -784,10 +791,16 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     // Likewise at a ` - NN` episode number that no second ` - ` follows (`Some Show - 12 (1080p)`):
     // left in, TMDB finds nothing for the whole query, and the leading-word strip can end up
     // searching the number alone. A year there is the release year (`Dr.No - 1962`), kept for
-    // step 4.
+    // step 4, and a number followed by a bracketed year is a numeric film title (`21 (2008)`,
+    // e.g. behind a kept site prefix), kept with its year.
     let episode_cut = TRAILING_EPISODE_NUM_DASH_RE
         .captures_iter(&title)
-        .filter(|c| c.get(1).is_some_and(|n| !YEAR_RE.is_match(n.as_str())))
+        .filter(|c| {
+            c.get(1).is_some_and(|n| !YEAR_RE.is_match(n.as_str()))
+                && !c
+                    .get(0)
+                    .is_some_and(|m| BRACKETED_YEAR_RE.is_match(&title[m.end()..]))
+        })
         .find_map(|c| c.get(0))
         .map(|m| m.start());
     if let Some(start) = episode_cut.filter(|&start| start > 0) {
@@ -1458,6 +1471,26 @@ mod tests {
         assert_eq!(
             clean_name("Some Film - 2049.mkv"),
             ("Some Film".to_string(), Some("2049".to_string()))
+        );
+        // A number followed by a bracketed release year is a numeric film title (`21`, `300`),
+        // here behind a kept site/collection prefix: cutting it would take the year with it.
+        assert_eq!(
+            clean_name("Torrent9.to - 21 (2008) 1080p BluRay.mkv"),
+            ("Torrent9 to - 21".to_string(), Some("2008".to_string()))
+        );
+        assert_eq!(
+            clean_name("Some.Collection - 300 (2006) 1080p.mkv"),
+            (
+                "Some Collection - 300".to_string(),
+                Some("2006".to_string())
+            )
+        );
+        assert_eq!(
+            clean_name("Some.Collection - 1408 [2007] 1080p.mkv"),
+            (
+                "Some Collection - 1408".to_string(),
+                Some("2007".to_string())
+            )
         );
         // A single-digit sequel number and a hyphenated subtitle are title content.
         assert_eq!(

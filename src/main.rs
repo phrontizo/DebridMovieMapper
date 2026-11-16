@@ -58,6 +58,30 @@ fn set_tcp_keepalive(stream: &TcpStream) {
     }
 }
 
+/// What to report when loading `.env` failed, or `None` when it loaded or there is no `.env` (a
+/// container, or a native run configured by exported variables). dotenvy stops at the first line it
+/// can't parse, e.g. an unquoted value containing a space, and leaves every later line unset, so a
+/// malformed file would otherwise start the service with those settings silently at their defaults
+/// (an `UPGRADE_INTERVAL_SECS=0` lost that way turns the upgrade engine back on). The message never
+/// repeats the offending text: dotenvy's error carries the line or its value, which can be a token.
+fn dotenv_failure(result: &Result<std::path::PathBuf, dotenvy::Error>) -> Option<String> {
+    match result {
+        Ok(_) => None,
+        Err(e) if e.not_found() => None,
+        Err(dotenvy::Error::LineParse(..)) => Some(
+            "Configuration error: a line of .env could not be parsed, and it and every setting \
+             after it would be ignored. Quote a value that contains spaces (e.g. \
+             TRAKT_CATCHUP_LOOKBACK=\"6 months\"), and check for an unclosed quote or a stray \
+             backslash. The line is not shown, since it may hold a token."
+                .to_string(),
+        ),
+        Err(dotenvy::Error::Io(e)) => {
+            Some(format!("Configuration error: could not read .env: {e}"))
+        }
+        Err(_) => Some("Configuration error: could not load .env".to_string()),
+    }
+}
+
 /// The log-filter directive: `RUST_LOG` when set to something non-empty, else `info` (the prior
 /// default, so logging is unchanged when the var is unset). Parsing/validation of the directive is
 /// left to `EnvFilter` at the call site (a malformed value falls back to `info`).
@@ -183,7 +207,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // .env then trim-parses PORT via Config). Without this, a PORT set only in .env — or one with
     // surrounding whitespace from quoted compose YAML — made the healthcheck probe 8080 while the
     // server listened elsewhere, reporting a healthy container as unhealthy.
-    dotenvy::dotenv().ok();
+    // A .env that exists but can't be loaded stops startup, the healthcheck included: dotenvy would
+    // have applied only the lines before the bad one (`dotenv_failure`). A missing .env is fine.
+    // eprintln!, as the tracing subscriber isn't up yet.
+    if let Some(message) = dotenv_failure(&dotenvy::dotenv()) {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
 
     // Healthcheck mode: exercise the request/handler path, then exit.
     if std::env::args().any(|a| a == "--healthcheck") {
@@ -559,11 +589,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // staging sweep deletes it (`upgrade::sweep_staging_intents`).
     let _ = shutdown_tx.send(true);
     info!("Waiting for background tasks to finish...");
-    // Bound the wait: the scan loop parked in a slow provider call (reqwest 30s timeout) or the shared
-    // rate limiter's backpressure could otherwise delay shutdown past `docker stop`'s ~10s grace →
-    // SIGKILL. The scheduler's operations are idempotent, so a task cut here is redone next start (a
-    // cut staging or acquisition is swept, as above). Dropping the JoinHandle on timeout detaches the
-    // task; the runtime aborts it as `main` returns.
+    // Bound the wait: the scan loop parked in a slow provider call (the provider clients' 60 s request
+    // timeout) or the shared rate limiter's backpressure could otherwise delay shutdown past `docker
+    // stop`'s ~10s grace → SIGKILL. The scheduler's operations are idempotent, so a task cut here is
+    // redone next start (a cut staging or acquisition is swept, as above). Dropping the JoinHandle on
+    // timeout detaches the task; the runtime aborts it as `main` returns.
     const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
     match tokio::time::timeout(SHUTDOWN_GRACE, scheduler_handle).await {
         Ok(Ok(_)) => {}
@@ -581,8 +611,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dbg_is_ignorable_disconnect, healthcheck, http1_builder, is_benign_connection_error,
-        is_trakt_path, log_directive, set_tcp_keepalive,
+        dbg_is_ignorable_disconnect, dotenv_failure, healthcheck, http1_builder,
+        is_benign_connection_error, is_trakt_path, log_directive, set_tcp_keepalive,
     };
     use tokio::net::{TcpListener, TcpStream};
 
@@ -808,6 +838,36 @@ mod tests {
             log_directive(Some("  debridmoviemapper=debug  ".into())),
             "debridmoviemapper=debug"
         );
+    }
+
+    #[test]
+    fn dotenv_failure_ignores_a_loaded_or_missing_file() {
+        assert_eq!(dotenv_failure(&Ok(std::path::PathBuf::from(".env"))), None);
+        // No .env at all (a container, or a native run configured by exported variables).
+        let missing = dotenvy::Error::Io(std::io::ErrorKind::NotFound.into());
+        assert_eq!(dotenv_failure(&Err(missing)), None);
+    }
+
+    #[test]
+    fn dotenv_failure_reports_a_malformed_line_without_echoing_it() {
+        // dotenvy stops at the first line it can't parse (an unquoted value with a space), so every
+        // later setting would silently fall back to its default. Built through `from_read_iter`, which
+        // parses without touching the process environment.
+        let err = dotenvy::from_read_iter("RD_API_TOKEN=SECRET token".as_bytes())
+            .next()
+            .expect("one line")
+            .expect_err("an unquoted space is a parse error");
+        let msg = dotenv_failure(&Err(err)).expect("a malformed .env must be reported");
+        assert!(msg.contains("quote"), "{msg}");
+        // The offending text can be a token, so it is never repeated.
+        assert!(!msg.contains("SECRET"), "{msg}");
+    }
+
+    #[test]
+    fn dotenv_failure_reports_an_unreadable_file() {
+        let denied = dotenvy::Error::Io(std::io::ErrorKind::PermissionDenied.into());
+        let msg = dotenv_failure(&Err(denied)).expect("an unreadable .env must be reported");
+        assert!(msg.contains(".env"), "{msg}");
     }
 
     #[test]

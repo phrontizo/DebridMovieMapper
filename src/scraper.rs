@@ -106,13 +106,15 @@ impl TorrentioScraper {
     /// Override (trimmed) wins; else Torrentio templated as `<provider>=<token>` (further options
     /// are `|`-separated). The live scraper test guards the syntax. An override pasted as the
     /// addon's manifest URL (`<base>/manifest.json`, what a Stremio configure page hands out) has
-    /// the suffix dropped: kept, every stream URL would 404, which reads as "no streams".
+    /// the suffix dropped: kept, every stream URL would 404, which reads as "no streams". A blank
+    /// override counts as none, as `Config` treats a blank `SCRAPER_ADDON_URL`, so a caller that
+    /// passes the variable through unfiltered never gets an empty base URL.
     pub fn build_base_url(
         override_url: Option<String>,
         provider: ProviderKind,
         token: &str,
     ) -> String {
-        if let Some(u) = override_url {
+        if let Some(u) = override_url.filter(|u| !u.trim().is_empty()) {
             const MANIFEST: &str = "/manifest.json";
             let mut base = u.trim().trim_end_matches('/');
             let cut = base.len().saturating_sub(MANIFEST.len());
@@ -434,6 +436,17 @@ mod tests {
     }
 
     #[test]
+    fn blank_override_url_falls_back_to_the_templated_torrentio_url() {
+        // A blank override (`SCRAPER_ADDON_URL=` passed through unfiltered) would otherwise give an
+        // empty base, and every scrape would request a relative URL and fail.
+        for blank in ["", "   ", "\t\n"] {
+            let base =
+                TorrentioScraper::build_base_url(Some(blank.into()), ProviderKind::TorBox, "tok");
+            assert_eq!(base, "https://torrentio.strem.fun/torbox=tok", "{blank:?}");
+        }
+    }
+
+    #[test]
     fn override_url_pasted_as_a_manifest_url_yields_the_addon_base() {
         // A Stremio addon's configure page hands out `<base>/manifest.json`; with the suffix kept,
         // every stream URL is `<base>/manifest.json/stream/…`, which 404s (= "no streams").
@@ -570,14 +583,14 @@ mod tests {
         let json = serde_json::json!({
             "streams": [
                 { "name": "x", "title": "y", "infoHash": "aabbcc",
-                  "url": "https://torrentio.strem.fun/resolve/torbox/TBKEY/64877b5490208c3015c0f5121287949d62622e54/null/0/Movie.mkv" }
+                  "url": "https://torrentio.strem.fun/resolve/torbox/TBKEY/fedcba9876543210fedcba9876543210fedcba98/null/0/Movie.mkv" }
             ]
         });
         let cands = parse_streams(&json);
         assert_eq!(cands.len(), 1);
         assert_eq!(
             cands[0].info_hash,
-            "64877b5490208c3015c0f5121287949d62622e54"
+            "fedcba9876543210fedcba9876543210fedcba98"
         );
     }
 
@@ -589,7 +602,7 @@ mod tests {
                 {
                     "name": "[RD+] Torrentio\n1080p",
                     "title": "Movie.2023.1080p.x265-GRP\n\u{1f464} 5 \u{1f4be} 8 GB",
-                    "url": "https://torrentio.strem.fun/resolve/realdebrid/MixedCaseTOKEN123/64877b5490208c3015c0f5121287949d62622e54/null/0/Movie.2023.1080p.x265-GRP.mkv",
+                    "url": "https://torrentio.strem.fun/resolve/realdebrid/MixedCaseTOKEN123/fedcba9876543210fedcba9876543210fedcba98/null/0/Movie.2023.1080p.x265-GRP.mkv",
                     "behaviorHints": {"filename": "Movie.2023.1080p.x265-GRP.mkv"}
                 }
             ]
@@ -598,7 +611,7 @@ mod tests {
         assert_eq!(cands.len(), 1);
         assert_eq!(
             cands[0].info_hash,
-            "64877b5490208c3015c0f5121287949d62622e54"
+            "fedcba9876543210fedcba9876543210fedcba98"
         );
         assert_eq!(cands[0].file_idx, Some(0));
         assert_eq!(
@@ -636,7 +649,7 @@ mod tests {
         // BOTH a movie (`null`) AND a series (`1:2`) — the series segment is the tricky case: `(\d+)`
         // would otherwise match the `1` prefix of `1:2` and capture the TOKEN as the hash.
         let token = "0000000000000000000000000000000000000000";
-        let real = "64877b5490208c3015c0f5121287949d62622e54";
+        let real = "fedcba9876543210fedcba9876543210fedcba98";
         for (seg, idx) in [("null", 0usize), ("1:2", 3usize)] {
             let url = format!(
                 "https://torrentio.strem.fun/resolve/realdebrid/{token}/{real}/{seg}/{idx}/X.mkv"

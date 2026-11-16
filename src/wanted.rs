@@ -605,11 +605,9 @@ mod tests {
         let aired = vec![(1, 1), (1, 2), (1, 3)];
         let t = show_title(
             5,
-            vec![show_record(
+            vec![behind_show_record(
                 "alice",
                 5,
-                /*watchlisted*/ false,
-                /*in_progress*/ true,
                 vec![(1, 1), (1, 2)],
                 ShowStatus::Returning,
             )],
@@ -636,22 +634,8 @@ mod tests {
         let t = show_title(
             9,
             vec![
-                show_record(
-                    "alice",
-                    9,
-                    /*watchlisted*/ false,
-                    /*in_progress*/ true,
-                    vec![(1, 1), (1, 2)],
-                    ShowStatus::Returning,
-                ),
-                show_record(
-                    "bob",
-                    9,
-                    /*watchlisted*/ false,
-                    /*in_progress*/ true,
-                    vec![(1, 1)],
-                    ShowStatus::Returning,
-                ),
+                behind_show_record("alice", 9, vec![(1, 1), (1, 2)], ShowStatus::Returning),
+                behind_show_record("bob", 9, vec![(1, 1)], ShowStatus::Returning),
             ],
             None,
             aired,
@@ -684,14 +668,7 @@ mod tests {
         let t = show_title(
             11,
             vec![
-                show_record(
-                    "alice",
-                    11,
-                    /*watchlisted*/ false,
-                    /*in_progress*/ true,
-                    vec![(1, 1), (1, 2)],
-                    ShowStatus::Returning,
-                ),
+                behind_show_record("alice", 11, vec![(1, 1), (1, 2)], ShowStatus::Returning),
                 show_record(
                     "carol",
                     11,
@@ -751,9 +728,13 @@ mod tests {
     }
 
     #[test]
-    fn catchup_finished_ended_show_is_not_acquired() {
-        // A fully-watched ENDED show surfaced only via catch-up is finished → don't acquire it (the
-        // symmetry guard), so it can't oscillate acquire/remove.
+    fn finished_ended_in_progress_show_is_not_acquired() {
+        // An in-progress record Trakt did not report behind (`trakt_behind: false`) is what sync
+        // writes for a `/sync/playback` show or a REMOVE_FINISHED_SHOWS finish fold, never for a
+        // catch-up show, which is always `trakt_behind`. Fully watched and Ended, it reads as
+        // finished, so the symmetry guard acquires nothing. For example, after a fold's removal the
+        // row lasts until the next sync, and without the guard the episode monitor would re-acquire
+        // the show it just removed.
         let aired = vec![(1, 1), (1, 2)];
         let t = show_title(
             7,

@@ -204,7 +204,8 @@ async fn run_acquire(kind: ProviderKind, provider_token: String, label: &str) {
     let store = debridmoviemapper::store::Store::open(dbp.to_str().unwrap()).unwrap();
     let scraper: Arc<dyn debridmoviemapper::scraper::Scraper> =
         Arc::new(debridmoviemapper::scraper::TorrentioScraper::new(
-            std::env::var("SCRAPER_ADDON_URL").ok(),
+            // Trimmed and blank-as-unset, as the service reads it.
+            common::token("SCRAPER_ADDON_URL"),
             kind,
             &provider_token,
             http.clone(),

@@ -182,9 +182,9 @@ impl Drop for RepairInProgressGuard {
 ///
 /// `materialise` fills `slot` with the new id as soon as the add returns (never a same-id TorBox
 /// re-add, which IS the torrent under repair). The repair takes the id back out of `slot` before it
-/// adopts the add (before deleting the superseded torrent), so a timeout during that delete can't
-/// remove both copies; a repair that runs to completion empties the slot too, having settled the
-/// add itself.
+/// adopts the add (records it as the replacement and has the superseded torrent deleted), so a
+/// repair cut short after that point can't remove both copies; a repair that runs to completion
+/// empties the slot too, having settled the add itself.
 struct UnadoptedAddGuard {
     provider: Arc<dyn DebridProvider>,
     slot: Arc<std::sync::Mutex<Option<String>>>,
@@ -519,8 +519,9 @@ impl RepairManager {
         }
     }
 
-    /// Finalise a successful repair: (for a genuinely new torrent) delete the old one and record the
-    /// replacement, and update the health map to track the repaired torrent.
+    /// Finalise a successful repair: (for a genuinely new torrent) record the replacement, update the
+    /// health map to track the repaired torrent, then delete the old one off the timed repair
+    /// ([`Self::delete_superseded`]).
     ///
     /// `old == new` when the provider's re-add-by-hash returns the SAME torrent id — TorBox's
     /// `createtorrent` recovers the existing entry by infohash, so a repaired-in-place torrent keeps
@@ -536,9 +537,6 @@ impl RepairManager {
     async fn complete_repair(&self, old_torrent_id: &str, new_torrent_id: &str) {
         let same = old_torrent_id == new_torrent_id;
         if !same {
-            if let Err(e) = self.provider.delete_torrent(old_torrent_id).await {
-                warn!("Failed to delete old torrent {}: {}", old_torrent_id, e);
-            }
             // Record the replacement so the scan loop reuses the old TMDB identification. Recorded
             // BEFORE the new id's health entry: while the scan loop hasn't taken it,
             // `prune_health_status` keeps that entry even though its listing predates the new id.
@@ -576,6 +574,27 @@ impl RepairManager {
                 last_repair_trigger: Some(tokio::time::Instant::now()),
             },
         );
+        drop(health_map);
+        if !same {
+            self.delete_superseded(old_torrent_id);
+        }
+    }
+
+    /// Delete the torrent a new-id (Real-Debrid) repair replaced, from a detached task, once the
+    /// repair has recorded the replacement and settled the health map. Awaiting the delete inside
+    /// the repair would put it under `INSTANT_REPAIR_TIMEOUT`, and Real-Debrid's delete runs the
+    /// full background retry budget: a slow or 5xx-ing delete could then cut off a repair that had
+    /// already adopted its add, losing the replacement record and the attempt budget carried to the
+    /// new id, and failing a read the new copy could serve. A failed delete only logs, as it did
+    /// when the repair awaited it.
+    fn delete_superseded(&self, old_torrent_id: &str) {
+        let provider = Arc::clone(&self.provider);
+        let old = old_torrent_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = provider.delete_torrent(&old).await {
+                warn!("Failed to delete old torrent {}: {}", old, e);
+            }
+        });
     }
 
     /// Build a `FileLocator` for the file at `file_path` within `info`. The per-file
@@ -772,7 +791,8 @@ impl RepairManager {
             match Self::locator_for_file(&final_info, &locator.hash, &locator.file_path) {
                 Some(new_locator) => {
                     // Adopting the add: from here a cut-short repair must not delete it, since
-                    // `complete_repair` deletes the superseded torrent first.
+                    // `complete_repair` records it as the replacement and has the superseded
+                    // torrent deleted.
                     take_unadopted(added);
                     if !same_torrent {
                         // Before the old torrent is deleted, so no open in between resolves it.
@@ -830,11 +850,8 @@ impl RepairManager {
             // old broken torrent and records a replacement for the scan loop.
             if !same_torrent {
                 // The add becomes the replacement left to download: a cut-short repair must not
-                // delete it as well as the superseded torrent being deleted here.
+                // delete it as well as the superseded torrent deleted below.
                 take_unadopted(added);
-                if let Err(e) = self.provider.delete_torrent(torrent_id).await {
-                    warn!("Failed to delete old torrent {}: {}", torrent_id, e);
-                }
                 self.repair_replacements
                     .write()
                     .await
@@ -860,6 +877,14 @@ impl RepairManager {
                     // picks up the recorded replacement).
                     health.state = RepairState::Broken;
                 }
+            }
+            drop(health_map);
+            if !same_torrent {
+                // Only now, with the replacement recorded and the old torrent Broken, and off the
+                // timed repair (see `delete_superseded`): a timeout during an awaited delete would
+                // have lost the replacement and flipped the old torrent back to Healthy
+                // (`note_abandoned_repair`).
+                self.delete_superseded(torrent_id);
             }
 
             Err(RepairFailure::NotCached(format!(
@@ -1195,7 +1220,11 @@ mod tests {
         assert_eq!(new.hash, "H");
         // The destructive half of the RD new-id success path: only the superseded OLD torrent is
         // deleted (never the replacement now serving the file), and new→old is recorded so the scan
-        // loop reuses the old identification for the replacement.
+        // loop reuses the old identification for the replacement. The delete runs detached.
+        assert!(
+            yield_until(|| !deleted.lock().unwrap().is_empty()).await,
+            "the superseded torrent's delete is issued"
+        );
         assert_eq!(
             *deleted.lock().unwrap(),
             vec!["old_tid".to_string()],
@@ -2859,11 +2888,13 @@ mod tests {
         assert_eq!(provider.deleted(), vec!["new".to_string()]);
     }
 
-    /// Once the repair has adopted its add (here: the not-cached path, which deletes the superseded
-    /// torrent and leaves the new one to download), a timeout must NOT delete the add as well, or
-    /// both copies would be gone.
+    /// Once the repair has adopted its add (here: the not-cached path, which leaves the new torrent
+    /// to download in place of the superseded one), a delete of the superseded torrent that hangs
+    /// past `INSTANT_REPAIR_TIMEOUT` must neither delete the add as well (both copies would be gone)
+    /// nor cut the repair's bookkeeping short: the delete runs off the timed repair, so the
+    /// replacement is recorded for the scan loop and the superseded torrent is hidden.
     #[tokio::test(start_paused = true)]
-    async fn a_repair_cut_short_after_adopting_its_add_keeps_it() {
+    async fn a_slow_delete_of_the_superseded_torrent_keeps_the_uncached_replacement() {
         let provider = Arc::new(ScriptedProvider {
             infos: [
                 ("tid".to_string(), old_movie_info()),
@@ -2871,7 +2902,6 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            // Deleting the superseded torrent hangs, so the timeout fires after the adoption.
             hang_delete: ["tid".to_string()].into_iter().collect(),
             ..Default::default()
         });
@@ -2879,12 +2909,77 @@ mod tests {
 
         let r = manager.try_instant_repair(&tid_locator()).await;
 
-        assert!(matches!(r, Err(RepairFailure::Deferred(_))), "got {r:?}");
-        yield_until(|| false).await; // let any detached cleanup run
+        assert!(matches!(r, Err(RepairFailure::NotCached(_))), "got {r:?}");
+        assert!(
+            yield_until(|| !provider.deleted().is_empty()).await,
+            "the superseded torrent's delete is still issued"
+        );
+        yield_until(|| false).await; // let any other detached cleanup run
         assert_eq!(
             provider.deleted(),
             vec!["tid".to_string()],
             "the adopted add must survive (only the superseded torrent's delete was attempted)"
+        );
+        assert_eq!(
+            manager.take_repair_replacements().await,
+            HashMap::from([("new".to_string(), "tid".to_string())]),
+            "the replacement is recorded for the scan loop"
+        );
+        assert!(
+            manager.hidden_torrent_ids().await.contains("tid"),
+            "the superseded torrent stays hidden (Broken) until the scan loop swaps the new one in"
+        );
+    }
+
+    /// The cached twin: a cached re-add serves the read, and a hanging delete of the superseded
+    /// torrent doesn't turn that into a deferral that loses the replacement record and the attempt
+    /// budget carried to the new id (whose cooldown bounds a re-add storm on a still-broken file).
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_delete_of_the_superseded_torrent_keeps_the_cached_replacement() {
+        let provider = Arc::new(ScriptedProvider {
+            infos: [
+                ("tid".to_string(), old_movie_info()),
+                ("new".to_string(), new_movie_info("downloaded")),
+            ]
+            .into_iter()
+            .collect(),
+            hang_delete: ["tid".to_string()].into_iter().collect(),
+            ..Default::default()
+        });
+        let manager = RepairManager::new(provider.clone());
+
+        let new = manager
+            .try_instant_repair(&tid_locator())
+            .await
+            .expect("the cached re-add serves the read");
+
+        assert_eq!(new.torrent_id, "new");
+        assert!(
+            yield_until(|| !provider.deleted().is_empty()).await,
+            "the superseded torrent's delete is still issued"
+        );
+        assert_eq!(provider.deleted(), vec!["tid".to_string()]);
+        assert_eq!(
+            manager.take_repair_replacements().await,
+            HashMap::from([("new".to_string(), "tid".to_string())]),
+            "the replacement is recorded for the scan loop"
+        );
+        {
+            let hm = manager.health_status.read().await;
+            let h = hm.get("new").expect("the new id carries a health entry");
+            assert_eq!(h.state, RepairState::Healthy);
+            assert_eq!(
+                h.repair_attempts, 1,
+                "the attempt budget is carried forward"
+            );
+            assert!(!hm.contains_key("tid"), "the superseded id's entry is gone");
+        }
+        assert!(
+            matches!(
+                manager.try_instant_repair(&new).await,
+                Err(RepairFailure::Failed(_))
+            ),
+            "a repair of the new id inside the carried cooldown is refused"
         );
     }
 
@@ -2918,6 +3013,7 @@ mod tests {
             4,
             "the post-add and the final lookup each 404 once, then find it"
         );
+        assert!(yield_until(|| !provider.deleted().is_empty()).await);
         assert_eq!(provider.deleted(), vec!["tid".to_string()]);
     }
 

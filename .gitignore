@@ -20,3 +20,7 @@ rclone/
 # Review-loop tooling scratch output (per-iteration transcripts / stderr)
 iter-*.jsonl
 iter-*.err
+# A local compose override (e.g. `build: .` to run this checkout instead of the published image);
+# compose merges it into compose.yml automatically, so it stays per-machine.
+compose.override.yml
+compose.override.yaml

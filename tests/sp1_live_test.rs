@@ -15,6 +15,15 @@ fn single_provider_from_env() -> Option<(ProviderKind, String)> {
     }
 }
 
+/// `SCRAPER_ADDON_URL` the way the service reads it (`AcquisitionConfig::from_env`): trimmed, with
+/// a blank value (`SCRAPER_ADDON_URL=` in `.env`) counting as unset.
+fn addon_url() -> Option<String> {
+    std::env::var("SCRAPER_ADDON_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[tokio::test]
 #[ignore]
 async fn scraper_live_returns_parseable_streams() {
@@ -26,8 +35,7 @@ async fn scraper_live_returns_parseable_streams() {
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap();
-    let scraper =
-        TorrentioScraper::new(std::env::var("SCRAPER_ADDON_URL").ok(), kind, &token, http);
+    let scraper = TorrentioScraper::new(addon_url(), kind, &token, http);
     // Sintel (Creative Commons): tt1727587
     let cands = scraper
         .find("tt1727587", MediaKind::Movie, None, None)
@@ -117,15 +125,10 @@ async fn scraper_live_through_http_proxy() {
     }
     let proxied = build_http_client(Some(&proxy_url))
         .unwrap_or_else(|e| panic!("build client for the configured proxy: {e}"));
-    let cands = TorrentioScraper::new(
-        std::env::var("SCRAPER_ADDON_URL").ok(),
-        kind,
-        &token,
-        proxied,
-    )
-    .find("tt1727587", MediaKind::Movie, None, None)
-    .await
-    .unwrap_or_else(|e| panic!("scrape Sintel through the configured proxy: {e}"));
+    let cands = TorrentioScraper::new(addon_url(), kind, &token, proxied)
+        .find("tt1727587", MediaKind::Movie, None, None)
+        .await
+        .unwrap_or_else(|e| panic!("scrape Sintel through the configured proxy: {e}"));
     assert!(
         !cands.is_empty(),
         "expected >=1 stream for Sintel through the configured proxy"

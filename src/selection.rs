@@ -281,7 +281,7 @@ pub(crate) fn served_rank(
 /// slot serving a checked copy moves onto an unchecked one only for a strictly higher resolution
 /// (the upgrade engine's unverified rule swaps an unchecked copy for a checked one of a possibly
 /// lower tier at the same resolution, which must not be undone).
-pub(crate) fn unchecked_may_displace(
+fn unchecked_may_displace(
     new: crate::release::QualityRank,
     cur: crate::release::QualityRank,
 ) -> bool {

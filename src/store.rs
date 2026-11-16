@@ -104,8 +104,9 @@ const SELECTION_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("sele
 /// (Since v6 the key carries a media-type discriminator — not the bare tmdb_id — which is why the
 /// v5→v6 migration clears the table.)
 const UPGRADE_CHECKS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("upgrade_checks");
-/// Upgrade staging intents: lowercased infohash -> serde_json(StagingIntent). Rebuildable: losing it
-/// only forgets candidates cut off mid-staging (see [`StagingIntent`]). Added without a schema bump:
+/// Staging intents of upgrade candidates and acquisitions being added: lowercased infohash ->
+/// serde_json(StagingIntent). Rebuildable: losing it only forgets adds cut off before they were
+/// checked or recorded (see [`StagingIntent`]). Added without a schema bump:
 /// `ensure_schema` creates it on every open, and an older build never opens it.
 const STAGING_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("staging");
 
@@ -249,11 +250,13 @@ pub struct OwnedRecord {
 }
 
 /// Persisted per-user Trakt OAuth tokens (the `trakt_tokens` table value; key = user slug).
-/// `needs_reenrolment` marks an account that likely needs re-authorising. It is set by `sync_trakt`
-/// on a non-transient token-refresh failure or a Trakt read failure, and by the accounts page's
-/// refresh (`enrolment::refresh_account`) on a non-transient refresh failure. A transient failure
-/// (429/5xx/transport) never sets it. The next successful sync or refresh clears it. Old records
-/// written before this field existed decode it as `false`.
+/// `needs_reenrolment` marks an account whose last sync failed. It is set by `sync_trakt` on a
+/// non-transient token-refresh failure, on any Trakt read failure (transient or not, including a
+/// failed page of a paginated read) and on a store write failure during the sync. The accounts
+/// page's refresh (`enrolment::refresh_account`) sets it on a non-transient refresh failure. A
+/// transient refresh failure (429/5xx/transport/incoherent answer,
+/// `trakt_client::refresh_error_is_transient`) never sets it. The next successful sync or refresh
+/// clears it. Old records written before this field existed decode it as `false`.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TraktTokens {
     pub access: String,
@@ -299,11 +302,18 @@ pub enum WatchedState {
         /// the sync could not ask (`show_progress` failed, no Trakt id) and assumed so: the
         /// catch-up source. It vetoes the finish verdict (`wanted::user_finished`), so a show is
         /// never finish-removed while Trakt says the user has an aired episode left, whatever
-        /// TMDB's aired set says. `#[serde(default)]`: rows written before it existed read as
-        /// `false`, and the next sync rewrites them.
-        #[serde(default)]
+        /// TMDB's aired set says. Rows written before it existed read as behind (not finished)
+        /// until the next successful sync rewrites them, so a legacy row is never judged finished
+        /// on TMDB's aired set alone; every row this build writes sets it explicitly.
+        #[serde(default = "legacy_trakt_behind")]
         trakt_behind: bool,
     },
+}
+
+/// The `trakt_behind` a show row written before the field existed reads as: behind, as for a show
+/// the sync could not ask Trakt about.
+fn legacy_trakt_behind() -> bool {
+    true
 }
 
 /// One (user, media_type, tmdb_id) row of the materialised wanted-set. Self-describing: it embeds
@@ -447,7 +457,14 @@ fn schema_failure(stage: &str, e: redb::Error) -> OpenFailure {
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Database>,
+    /// The staging intents THIS process opened and has not closed, each with when it was opened
+    /// (monotonic). Shared by every clone, so the scan loop's staging sweep can tell this process's
+    /// intents from those an earlier process left (see [`Store::local_staging_age`]) without
+    /// comparing wall-clock seconds, which a clock step or a same-second start would get wrong.
+    local_staging: LocalStaging,
 }
+
+type LocalStaging = Arc<std::sync::Mutex<HashMap<String, tokio::time::Instant>>>;
 
 impl Store {
     /// Open (or create) the database at `path`, recovering automatically from a genuinely
@@ -475,7 +492,10 @@ impl Store {
                 )));
             }
         };
-        Ok(Store { db: Arc::new(db) })
+        Ok(Store {
+            db: Arc::new(db),
+            local_staging: LocalStaging::default(),
+        })
     }
 
     /// Build from an already-open database (e.g. an in-memory backend). Ensures the
@@ -490,7 +510,10 @@ impl Store {
             )));
         }
         Self::ensure_schema(&db, version).map_err(AppError::Db)?;
-        Ok(Store { db })
+        Ok(Store {
+            db,
+            local_staging: LocalStaging::default(),
+        })
     }
 
     /// A fresh, empty store on an in-memory redb backend at the current schema, for tests (so test
@@ -1163,44 +1186,12 @@ impl Store {
         self.get_json(OWNED_TABLE, hash, "get_owned").await
     }
 
-    pub async fn set_owned_status(
-        &self,
-        hash: String,
-        status: OwnedStatus,
-    ) -> Result<(), AppError> {
-        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
-        let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-            // A record that won't deserialise / re-serialise is a real failure surfaced as `Err`
-            // (NOT a phantom Ok), so the caller — e.g. `observe` marking a torrent `Verified` —
-            // learns the status change did not land instead of believing it did while the record
-            // silently stays `Pending`.
-            let outcome = Self::update_json::<OwnedRecord>(
-                &db,
-                OWNED_TABLE,
-                &hash,
-                "set_owned_status",
-                |rec| {
-                    rec.status = status;
-                    true
-                },
-            )?;
-            // A missing record is a legitimate no-op (e.g. a hash reaped between listing and here),
-            // NOT a failure — nothing is written and the result is Ok.
-            if outcome.is_none() {
-                warn!("set_owned_status: no owned record for {hash}; status change skipped");
-            }
-            Ok(())
-        })
-        .await;
-        Self::flatten_join_app(result)
-    }
-
     /// Mark the owned record for `hash` `Verified`, as one read-modify-write transaction: its
     /// `provides` replaced by `provides` when given (a series), and its quality snapshot (if any)
     /// marked cached with `unverified` stamped on it. Returns the record's quality as written, or
     /// `None` when there is no record — so a record removed concurrently (dedup, Trigger A/B, a
-    /// reap) is never written back.
+    /// reap) is never written back. A record that won't deserialise is an `Err` (left untouched),
+    /// so `observe` learns the change did not land instead of believing it did.
     pub async fn mark_verified_if_present(
         &self,
         hash: String,
@@ -2082,19 +2073,45 @@ impl Store {
 
     // ── staging intents (see `StagingIntent`) ─────────────────────────────────
 
-    /// Open a staging intent for `hash` (no torrent id yet), replacing any earlier one.
+    /// Open a staging intent for `hash` (no torrent id yet), replacing any earlier one, and note it
+    /// as this process's ([`Store::local_staging_age`]). The local note is taken before the write
+    /// (and dropped again if the write fails), so the sweep never sees the row without it.
     pub async fn put_staging_intent(&self, hash: String, started_at: u64) -> Result<(), AppError> {
+        let key = hash.to_ascii_lowercase();
         let intent = StagingIntent {
             torrent_id: None,
             started_at,
         };
-        self.put_json(
-            STAGING_TABLE,
-            hash.to_ascii_lowercase(),
-            &intent,
-            "StagingIntent",
-        )
-        .await
+        self.local_staging()
+            .insert(key.clone(), tokio::time::Instant::now());
+        let written = self
+            .put_json(STAGING_TABLE, key.clone(), &intent, "StagingIntent")
+            .await;
+        if written.is_err() {
+            self.local_staging().remove(&key);
+        }
+        written
+    }
+
+    fn local_staging(&self) -> std::sync::MutexGuard<'_, HashMap<String, tokio::time::Instant>> {
+        self.local_staging
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// How long ago THIS process opened the staging intent of `hash` (monotonic), or `None` when it
+    /// did not open it (or has closed it): an intent with no local entry was left by an earlier
+    /// process.
+    pub(crate) fn local_staging_age(&self, hash: &str) -> Option<std::time::Duration> {
+        self.local_staging()
+            .get(&hash.to_ascii_lowercase())
+            .map(|opened| opened.elapsed())
+    }
+
+    /// Forget which staging intents this process opened, as a restart would (tests only).
+    #[cfg(test)]
+    pub(crate) fn forget_local_staging_intents(&self) {
+        self.local_staging().clear();
     }
 
     /// Record the torrent id the add returned on `hash`'s open intent. A hash with no intent is left
@@ -2124,10 +2141,15 @@ impl Store {
         Self::flatten_join_app(result)
     }
 
-    /// Close `hash`'s staging intent (a missing one is a no-op).
+    /// Close `hash`'s staging intent (a missing one is a no-op). The local note
+    /// ([`Store::local_staging_age`]) goes once the row is gone; a failed removal keeps both.
     pub async fn clear_staging_intent(&self, hash: String) -> Result<(), AppError> {
-        self.remove_key(STAGING_TABLE, hash.to_ascii_lowercase())
-            .await
+        let key = hash.to_ascii_lowercase();
+        let removed = self.remove_key(STAGING_TABLE, key.clone()).await;
+        if removed.is_ok() {
+            self.local_staging().remove(&key);
+        }
+        removed
     }
 
     /// Every open staging intent, keyed by lowercased infohash. A read failure is logged and reads
@@ -2854,7 +2876,7 @@ mod tests {
             OwnedStatus::Pending
         );
         store
-            .set_owned_status("h1".to_string(), OwnedStatus::Verified)
+            .mark_verified_if_present("h1".to_string(), None, false)
             .await
             .unwrap();
         assert_eq!(
@@ -2955,43 +2977,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_owned_status_on_missing_hash_is_a_noop_not_a_phantom_record() {
-        // A status change for a hash with no owned record must be a silent no-op (Ok), NOT create a
-        // phantom record — a phantom owned row is an invisible/duplicate torrent in the lifecycle.
+    async fn mark_verified_if_present_on_a_corrupt_record_returns_err() {
+        // Settling an existing-but-undeserialisable record must surface an Err (so `observe` knows
+        // the change did not land), NOT commit-and-return-Ok while the record silently stays as it
+        // was; and the raw row is left untouched.
         let store = Store::in_memory();
-        store
-            .set_owned_status("ghost".to_string(), OwnedStatus::Verified)
-            .await
-            .expect("a missing-hash status change must return Ok, not error");
-        assert!(store.get_owned("ghost".to_string()).await.is_none());
-        assert!(
-            store.all_owned().await.is_empty(),
-            "no phantom owned record may be created"
-        );
-    }
-
-    #[tokio::test]
-    async fn set_owned_status_on_a_corrupt_record_returns_err_not_phantom_ok() {
-        // A status change against an existing-but-undeserialisable record must surface an Err (so the
-        // caller knows the change did not land), NOT commit-and-return-Ok while the record silently
-        // keeps its old status.
-        let store = Store::in_memory();
+        let raw: &[u8] = b"not a valid OwnedRecord";
         {
             let txn = store.db.begin_write().unwrap();
             {
                 let mut t = txn.open_table(OWNED_TABLE).unwrap();
-                t.insert("bad", b"not a valid OwnedRecord".as_slice())
-                    .unwrap();
+                t.insert("bad", raw).unwrap();
             }
             txn.commit().unwrap();
         }
         let res = store
-            .set_owned_status("bad".to_string(), OwnedStatus::Verified)
+            .mark_verified_if_present("bad".to_string(), None, false)
             .await;
         assert!(
             matches!(res, Err(AppError::Task(_))),
             "a corrupt owned record must yield Err, got: {res:?}"
         );
+        let txn = store.db.begin_read().unwrap();
+        let t = txn.open_table(OWNED_TABLE).unwrap();
+        assert_eq!(t.get("bad").unwrap().unwrap().value(), raw);
     }
 
     #[tokio::test]
@@ -3634,19 +3643,28 @@ mod tests {
         assert_eq!(store.all_wanted().await.len(), 1);
     }
 
-    /// A show row written before `trakt_behind` existed reads as not behind (and an older build,
-    /// which ignores the unknown field, reads a new row).
+    /// A show row written before `trakt_behind` existed reads as behind, so it is never judged
+    /// finished on TMDB's aired set alone before a sync has asked Trakt (and an older build, which
+    /// ignores the unknown field, reads a new row).
     #[test]
-    fn a_legacy_show_watched_state_reads_as_not_behind() {
+    fn a_legacy_show_watched_state_reads_as_behind() {
         let legacy: WatchedState =
             serde_json::from_str(r#"{"Show":{"watched_episodes":[[1,1]]}}"#).unwrap();
         assert_eq!(
             legacy,
             WatchedState::Show {
                 watched_episodes: vec![(1, 1)],
-                trakt_behind: false,
+                trakt_behind: true,
             }
         );
+        // A row the current build writes keeps its explicit value.
+        let row = WatchedState::Show {
+            watched_episodes: vec![],
+            trakt_behind: false,
+        };
+        let back: WatchedState =
+            serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(back, row);
     }
 
     #[tokio::test]

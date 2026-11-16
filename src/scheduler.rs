@@ -169,9 +169,6 @@ where
 /// Spawn all background jobs over `app`, returning when all have stopped (after shutdown).
 pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
     let mut handles = Vec::new();
-    // Before any job can stage an upgrade candidate: a staging intent opened at or before this was
-    // left by an earlier process (see `ScanConfig::started_at`).
-    let started_at = crate::now_unix_secs();
 
     // Scan task (account sync + acquisition verification, both inlined in run_scan_loop) —
     // unchanged behaviour, own internal cadence.
@@ -188,7 +185,6 @@ pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
             run_scan_loop(
                 ScanConfig {
                     app: scan_app.clone(),
-                    started_at,
                 },
                 scan_shutdown.clone(),
             )
@@ -343,17 +339,20 @@ fn make_test_app(with_trakt: bool) -> crate::app_state::AppState {
     } else {
         None
     };
+    // Every client is aimed at a refused loopback port (the discard port 9), so a future test that
+    // runs a job through this AppState fails fast and offline instead of reaching TMDB/Torrentio.
+    const OFFLINE: &str = "http://127.0.0.1:9";
+    let tmdb =
+        || Arc::new(TmdbClient::with_base_url("k".to_string(), OFFLINE.to_string()).unwrap());
     let scraper: Arc<dyn crate::scraper::Scraper> =
         Arc::new(crate::scraper::TorrentioScraper::new(
-            None,
+            Some(OFFLINE.to_string()),
             ProviderKind::TorBox,
             "tok",
             reqwest::Client::new(),
         ));
     let validator: Arc<dyn crate::acquire::TitleValidator> =
-        Arc::new(crate::acquire::TmdbTitleValidator {
-            tmdb: Arc::new(TmdbClient::new("k".to_string()).unwrap()),
-        });
+        Arc::new(crate::acquire::TmdbTitleValidator { tmdb: tmdb() });
     let prober: Arc<dyn crate::acquire::Prober> = Arc::new(crate::acquire::HttpProber {
         http: reqwest::Client::new(),
     });
@@ -370,7 +369,7 @@ fn make_test_app(with_trakt: bool) -> crate::app_state::AppState {
     ));
     AppState {
         provider: provider.clone(),
-        tmdb_client: Arc::new(TmdbClient::new("k".to_string()).unwrap()),
+        tmdb_client: tmdb(),
         vfs: Arc::new(RwLock::new(DebridVfs::new())),
         store,
         repair_manager: Arc::new(RepairManager::new(provider)),

@@ -99,11 +99,6 @@ async fn identify_new_torrent(
 
 pub struct ScanConfig {
     pub app: AppState,
-    /// When this process's scheduler started (unix secs). A staging intent opened at or before it
-    /// was left by an earlier process, so the scan loop's staging sweep deletes its torrent
-    /// ([`crate::upgrade::sweep_staging_intents`]). Kept across a supervised restart of the loop, so
-    /// a restart never sweeps a staging or acquisition this process still has in flight.
-    pub started_at: u64,
 }
 
 /// Blacklist entries older than this are pruned (the table is otherwise append-only). A rejected
@@ -160,7 +155,6 @@ pub async fn run_scan_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let app = scan_config.app;
-    let started_at = scan_config.started_at;
     // Load persisted matches from DB on startup
     let persisted: HashMap<String, (crate::rd_client::TorrentInfo, MediaMetadata)> =
         app.store.load_all_matches().await;
@@ -193,7 +187,7 @@ pub async fn run_scan_loop(
             info!("Scan task: shutdown requested, exiting");
             return;
         }
-        if let TickEnd::Shutdown = scan_tick(&app, started_at, &mut state, &mut shutdown).await {
+        if let TickEnd::Shutdown = scan_tick(&app, &mut state, &mut shutdown).await {
             return;
         }
         if !sleep_until_next_scan(app.config.scan_interval_secs, &mut shutdown).await {
@@ -227,6 +221,10 @@ struct ScanState {
     /// listing on the prune tick leaves it due, so the next trusted listing runs it instead of the
     /// next day's.
     maintenance_due: bool,
+    /// The account-mirror records the daily maintenance found absent from its listing (lowercased
+    /// hashes), waiting for the next trusted listing to confirm they are gone before the reaper
+    /// drops them (see [`reap_absent_mirror_owned`]). Taken by that next listing.
+    reap_candidates: Option<std::collections::HashSet<String>>,
 }
 
 impl ScanState {
@@ -245,6 +243,7 @@ impl ScanState {
             consecutive_empty: 0,
             first_empty_at: None,
             maintenance_due: false,
+            reap_candidates: None,
         }
     }
 }
@@ -258,6 +257,25 @@ enum TickEnd {
     /// The library was refreshed from this tick's listing: what the VFS was built from.
     #[cfg_attr(not(test), allow(dead_code))]
     Done(Vec<(crate::rd_client::TorrentInfo, MediaMetadata)>),
+}
+
+/// The hashes among `open` (staging intents still open after the sweep, lowercased) that are not yet
+/// recorded as owned with an authoritative identification: the torrents the scan loop keeps out of
+/// its library until they are (see `scan_tick`). An intent whose hash is recorded only lost its
+/// clear, so that torrent is shown as usual.
+async fn staging_unrecorded(
+    store: &Store,
+    open: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for hash in open {
+        let recorded = store.get_owned(hash.clone()).await.is_some()
+            && store.authoritative_meta(hash.clone()).await.is_some();
+        if !recorded {
+            out.insert(hash.clone());
+        }
+    }
+    out
 }
 
 /// `torrents` without those whose (lowercased) hash is in `hashes`: torrents deleted earlier in the
@@ -278,7 +296,6 @@ fn drop_hashes(torrents: Vec<Torrent>, hashes: &std::collections::HashSet<String
 /// repoint selections and run the daily maintenance.
 async fn scan_tick(
     app: &AppState,
-    started_at: u64,
     state: &mut ScanState,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> TickEnd {
@@ -380,22 +397,27 @@ async fn scan_tick(
     // panic or OOM kill mid-staging or mid-acquire: their staging intents are still open), before
     // anything shows or adopts them: every intent an earlier process left, and this process's
     // intents open longer than any live staging takes. With no such intent this is one store read.
-    let cutoff = started_at
-        .max(crate::now_unix_secs().saturating_sub(crate::upgrade::STAGING_ABANDONED_AFTER_SECS));
     let swept = crate::upgrade::sweep_staging_intents(
         store,
         provider.as_ref(),
         &torrents,
-        cutoff,
         crate::now_unix_secs(),
     )
     .await;
-    let torrents = drop_hashes(torrents, &swept);
+    let torrents = drop_hashes(torrents, &swept.deleted);
+    // A torrent whose staging intent is still open is a candidate being staged or acquired (or one
+    // whose rejection delete failed), not yet recorded: nothing has checked it, and no
+    // authoritative identification names it yet. Keep it out of this tick's library so it is never
+    // shown (in place of the copy it may replace) or identified from its file name and cached for
+    // good; the tick after it is recorded identifies it through the authoritative entry. Observe,
+    // dedup and the mirror keep seeing the full listing.
+    let staging = staging_unrecorded(store, &swept.open).await;
 
     // Deduplicate torrents by hash — keep the newest "downloaded" entry per hash.
     // Duplicates arise when repair's add_magnet leaks a torrent, or when
     // external tools (e.g. DebridMediaManager) re-add the same hash.
-    let (deduped_torrents, duplicate_ids) = dedup_torrents_by_hash(&torrents);
+    let (mut deduped_torrents, duplicate_ids) = dedup_torrents_by_hash(&torrents);
+    deduped_torrents.retain(|t| !staging.contains(&t.hash.to_ascii_lowercase()));
     // Idle-gate the provider-side deletion, like every other destructive path
     // (execute_remove / dedup_owned / the upgrade prune): a redundant same-hash duplicate
     // is never urgent, so defer its removal while any stream is active rather than risk
@@ -602,9 +624,13 @@ async fn scan_tick(
     // Duplicate-dedup: now the whole library is owned, plan + (if enabled, idle-gated)
     // remove redundant duplicate torrents. Dry-run (log only) unless
     // DEDUP_REMOVE_DUPLICATES is set.
+    // The torrents the instant repair hides (Broken/Failed): never served, so dedup never keeps
+    // one in place of a playable copy and the repoint never moves a slot onto one.
+    let hidden_ids = repair_manager.hidden_torrent_ids().await;
     dedup_owned(
         app,
         &torrents,
+        &hidden_ids,
         &multi_feature_hashes(current_data.iter().map(|(info, _)| info)),
         &current_data,
     )
@@ -618,7 +644,7 @@ async fn scan_tick(
         store,
         &app.read_activity,
         Duration::from_secs(config.upgrade.idle_secs),
-        &repair_manager.hidden_torrent_ids().await,
+        &hidden_ids,
         &current_data,
         crate::selection::RepointRules {
             max_resolution: config.acquisition.prefs.max_resolution.height(),
@@ -634,18 +660,25 @@ async fn scan_tick(
     // absent mirror record), so the `owned` table grows unbounded over the deployment's
     // lifetime — slowing every O(all_owned) hot path (same rationale as the blacklist /
     // upgrade-cursor prunes above). Store-only cleanup: the torrent is already gone, so
-    // there is nothing to delete and no active stream to interrupt. Runs on the first trusted
-    // listing on or after the prune tick (`maintenance_due`).
-    if state.maintenance_due {
-        state.maintenance_due = false;
-        let present: std::collections::HashSet<String> = torrents
-            .iter()
-            .map(|t| t.hash.to_ascii_lowercase())
-            .collect();
-        let reaped = reap_absent_mirror_owned(store, &present, torrents.is_empty()).await;
+    // there is nothing to delete and no active stream to interrupt. The first trusted listing on
+    // or after the prune tick (`maintenance_due`) notes the absent records; the next trusted
+    // listing reaps those still absent, so one listing that happens to miss a present torrent
+    // never drops a record (and the selection slots, quality and languages it carries).
+    let present: std::collections::HashSet<String> = torrents
+        .iter()
+        .map(|t| t.hash.to_ascii_lowercase())
+        .collect();
+    if let Some(confirmed) = state.reap_candidates.take() {
+        let reaped =
+            reap_absent_mirror_owned(store, &present, torrents.is_empty(), &confirmed).await;
         if reaped > 0 {
             info!("Reaped {reaped} account-mirror owned record(s) whose hash left the provider");
         }
+    }
+    if state.maintenance_due {
+        state.maintenance_due = false;
+        state.reap_candidates =
+            Some(absent_mirror_hashes(store, &present, torrents.is_empty()).await);
         // A mirror record written while TMDB was failing has an empty IMDB id that
         // nothing else ever fills (the mirror skips a hash it already owns).
         backfill_missing_imdb_ids(store, tmdb_client, &present).await;
@@ -691,10 +724,11 @@ fn dedup_torrents_by_hash(torrents: &[Torrent]) -> (Vec<&Torrent>, Vec<String>) 
         // a repeated (non-empty) id is always such an artefact, never two distinct torrents. Skip the
         // repeat entirely: it must be neither kept twice NOR marked for deletion — deleting it would
         // remove the live torrent we already kept (data loss), and double-marking a genuine duplicate
-        // would spawn a redundant (error-logging on TorBox) second delete. The opposite race, a
-        // concurrent delete shifting entries back so one is never returned, is handled in the
-        // provider clients: a multi-page listing that overlapped one of our own deletes is re-listed
-        // (`provider::DeleteTracker`).
+        // would spawn a redundant (error-logging on TorBox) second delete. Both provider clients
+        // already drop such repeats from the listing (`rd_client::drop_repeated_ids`), so this skip
+        // is a second guard. The opposite race, a concurrent delete shifting entries back so one is
+        // never returned, is handled in the provider clients: a multi-page listing that overlapped
+        // one of our own deletes is re-listed (`provider::DeleteTracker`).
         if !torrent.id.is_empty() && !seen_ids.insert(torrent.id.as_str()) {
             continue;
         }
@@ -818,11 +852,13 @@ const REFRESH_BUFFER_SECS: u64 = 3_600;
 /// watched is auto-wanted (so the reconciler acquires every aired episode you haven't watched,
 /// including ones that aired before your last watch) only if you last watched it at/after this
 /// instant. `None` = all-time (every watched show qualifies the lookback gate).
-/// `catchup_behind`: the precise "behind?" gate — the set of show `tmdb_id`s Trakt reports as having
-/// ≥1 unwatched aired episode. `Some(set)` ⇒ a within-lookback watched show is caught up (and so NOT
-/// wanted) unless it's in the set, so fully-watched shows no longer bloat the wanted-set. `None` ⇒
-/// fall back to lookback-only (the pure path / when progress is unavailable). Either way the
-/// reconciler still filters which episodes to acquire with TMDB air dates.
+/// `catchup_behind`: the shows to fold into the catch-up wanted-set. `sync_trakt_user` passes the
+/// within-lookback watched shows Trakt reports behind (≥1 unwatched aired episode) or that it could
+/// not ask about (a failed `show_progress`, no Trakt id: assumed behind), plus, when
+/// `REMOVE_FINISHED_SHOWS` is on, the caught-up finished+ended owned shows ([`shows_to_fold`]).
+/// `Some(set)` ⇒ a within-lookback watched show outside the set is NOT wanted, so fully-watched
+/// shows don't bloat the wanted-set. `None` ⇒ fall back to lookback-only (the pure path). Either
+/// way the reconciler still filters which episodes to acquire with TMDB air dates.
 pub(crate) fn build_wanted(
     user: &str,
     watchlist: &[crate::trakt_client::TraktItem],
@@ -1598,14 +1634,12 @@ pub(crate) async fn backfill_owned_quality(
     filled
 }
 
-/// Owned-record hashes safe to reap because their torrent has left the provider: a `Verified`,
-/// EMPTY-provenance (account-mirror) record whose lowercased hash is absent from `present` (the
-/// current provider listing). The torrent is already gone, so reaping only drops a dangling
-/// bookkeeping row — `record_mirror_owned` re-creates it if the hash reappears, and the reconciler
-/// re-acquires it fresh if a Trakt user still wants it (so a rare wrongful reap on a transient
-/// listing glitch self-heals with no lost state). Engine/provenance-bearing records are left to the
-/// acquire/reconcile lifecycle. Returns empty when `listing_empty` — a wholesale-empty listing is an
-/// untrustworthy reap signal (same guard as `observe`).
+/// Owned-record hashes whose torrent looks gone from the provider: a `Verified`, EMPTY-provenance
+/// (account-mirror) record whose lowercased hash is absent from `present` (the current provider
+/// listing). Engine/provenance-bearing records are left to the acquire/reconcile lifecycle. Returns
+/// empty when `listing_empty` — a wholesale-empty listing is an untrustworthy reap signal (same
+/// guard as `observe`). The reaper acts on a hash only once two trusted listings in a row lack it
+/// ([`reap_absent_mirror_owned`]).
 fn absent_mirror_records_to_reap(
     owned: &[(String, OwnedRecord)],
     present: &std::collections::HashSet<String>,
@@ -1625,18 +1659,43 @@ fn absent_mirror_records_to_reap(
         .collect()
 }
 
-/// Reap the dangling account-mirror owned records identified by [`absent_mirror_records_to_reap`],
-/// cleaning up each owned record plus its authoritative-id and selection entries (mirrors the
-/// blacklisted-phantom reaper in `record_mirror_owned`). Store-only — the torrent is already absent
-/// from the provider, so there is nothing to delete and no stream to interrupt (no idle-gate needed).
-/// Returns the number of records reaped.
+/// [`absent_mirror_records_to_reap`] over the store's owned records, lowercased: what the daily
+/// maintenance notes for the reaper to confirm on the next trusted listing.
+async fn absent_mirror_hashes(
+    store: &Store,
+    present: &std::collections::HashSet<String>,
+    listing_empty: bool,
+) -> std::collections::HashSet<String> {
+    absent_mirror_records_to_reap(&store.all_owned().await, present, listing_empty)
+        .into_iter()
+        .map(|h| h.to_ascii_lowercase())
+        .collect()
+}
+
+/// Reap the dangling account-mirror owned records identified by [`absent_mirror_records_to_reap`]
+/// that the previous trusted listing lacked too (`confirmed`, lowercased), cleaning up each owned
+/// record plus its authoritative-id and selection entries (mirrors the blacklisted-phantom reaper in
+/// `record_mirror_owned`). Store-only — the torrent is already absent from the provider, so there is
+/// nothing to delete and no stream to interrupt (no idle-gate needed). Requiring two listings keeps
+/// one that misses a present torrent (a page shift from a delete made outside this process) from
+/// reaping it. A wrongful reap is not free: `record_mirror_owned` re-mirrors the hash next tick, but
+/// only as a bare record (quality from its file names, no TMDB languages, and an empty IMDB id while
+/// TMDB fails), and its selection slots and authoritative id are lost. Returns the number of records
+/// reaped.
 async fn reap_absent_mirror_owned(
     store: &Store,
     present: &std::collections::HashSet<String>,
     listing_empty: bool,
+    confirmed: &std::collections::HashSet<String>,
 ) -> usize {
+    if confirmed.is_empty() {
+        return 0;
+    }
     let owned = store.all_owned().await;
-    let to_reap = absent_mirror_records_to_reap(&owned, present, listing_empty);
+    let to_reap: Vec<String> = absent_mirror_records_to_reap(&owned, present, listing_empty)
+        .into_iter()
+        .filter(|h| confirmed.contains(&h.to_ascii_lowercase()))
+        .collect();
     if to_reap.is_empty() {
         return 0;
     }
@@ -2293,7 +2352,9 @@ pub(crate) struct DedupPlan {
 /// PURE duplicate planner. Within each `(media_type, tmdb_id)` group of **present** owned hashes,
 /// choose a minimal keep-set that still covers all owned content and mark redundant duplicates for
 /// removal — a copy is only ever removed in favour of copies of the SAME OR BETTER quality:
-/// - **Movie**: every hash is the same film → keep the single top-priority hash, remove the rest.
+/// - **Movie**: every hash is the same film → keep the top-priority single-film hash, remove the
+///   rest. A multi-film collection is always kept and never makes another copy redundant (see
+///   `collections` below).
 /// - **Show**: a greedy set-cover over the episodes each hash `provides`, best first — a hash whose
 ///   every episode is already provided by a kept hash of same-or-better quality is redundant →
 ///   remove; otherwise keep it. Complementary packs/episodes are therefore all kept. A show hash with
@@ -2319,9 +2380,9 @@ pub(crate) struct DedupPlan {
 /// `MAX_RESOLUTION` plays no part: a copy above it is never ranked down for it, so dedup never
 /// trades resolution down (a corrective downgrade is the upgrade engine's job, under
 /// `ALLOW_RESOLUTION_DOWNGRADE`). A `Manual`-provenance copy is never removed (invariant M-1), and
-/// neither is a movie hash in
-/// `collections` (a multi-film collection, [`multi_feature_hashes`]: no kept copy provides the
-/// other films in it). Only groups with at least one removal are returned. Absent (not-`present`)
+/// neither is a movie hash in `collections` (a multi-film collection, [`multi_feature_hashes`]: no
+/// kept copy provides the other films in it); nor does a collection count as the film's keep, so it
+/// never makes a single-film copy redundant. Only groups with at least one removal are returned. Absent (not-`present`)
 /// hashes are ignored entirely — they're already gone, never a removal target or coverage source —
 /// and so are unsettled (`Pending`) ones: only `Verified` copies are ranked, kept, removed or count
 /// as coverage, so a still-downloading or not-yet-checked acquisition never displaces a playable
@@ -2380,14 +2441,23 @@ pub(crate) fn plan_dedup(
         let mut remove = Vec::new();
         match media_type {
             MediaType::Movie => {
-                keep.push(hashes[0].0.clone());
-                for (h, r) in &hashes[1..] {
-                    // A Manual-provenance copy is a protected never-auto-remove class (invariant
-                    // M-1): never dedup-remove it, even when a higher-keep-priority duplicate won the
-                    // keep slot — that would silently drop its never-auto-remove designation from the
-                    // surviving group. Nor is a multi-film collection (`collections`): it holds
-                    // other films besides this one, which no kept copy provides.
-                    if r.provenance.has_manual_entry() || collections.contains(h) {
+                // The keep is the top-priority SINGLE-film copy. A multi-film collection
+                // (`collections`) is always kept, since it holds other films no kept copy provides,
+                // and it never makes another copy redundant either: its record's quality is its
+                // largest file's, which may be another film's, so its file for THIS film can be worse
+                // than a single copy it outranks. A collection only ever adds to what is kept.
+                let mut kept_single = false;
+                for (h, r) in &hashes {
+                    if collections.contains(h) {
+                        keep.push(h.clone());
+                    } else if !kept_single {
+                        kept_single = true;
+                        keep.push(h.clone());
+                    } else if r.provenance.has_manual_entry() {
+                        // A Manual-provenance copy is a protected never-auto-remove class (invariant
+                        // M-1): never dedup-remove it, even when a higher-keep-priority duplicate won
+                        // the keep slot — that would silently drop its never-auto-remove designation
+                        // from the surviving group.
                         keep.push(h.clone());
                     } else {
                         remove.push(h.clone());
@@ -2536,14 +2606,22 @@ pub(crate) fn fresh_dedup_groups(
 /// scan loop makes one `get_torrents` call per tick, not two; `current` (the tick's identified
 /// torrents with their files) lets [`plan_dedup`] rank a show copy by the file it serves for each
 /// episode.
+///
+/// Only copies the VFS can serve take part ([`plan_dedup`]'s `present`): a hash with at least one
+/// listed `downloaded` torrent that the instant repair doesn't hide (`hidden_ids`,
+/// `RepairManager::hidden_torrent_ids`: `Broken`/`Failed`). A copy left only as a hidden or
+/// not-yet-downloaded torrent is skipped like a `Pending` one — never ranked, kept, removed or counted
+/// as coverage — so a playable copy is never deleted in favour of one nobody can play.
 pub(crate) async fn dedup_owned(
     app: &AppState,
     torrents: &[Torrent],
+    hidden_ids: &std::collections::HashSet<String>,
     collections: &std::collections::HashSet<String>,
     current: &[(crate::rd_client::TorrentInfo, MediaMetadata)],
 ) {
     let present: std::collections::HashSet<String> = torrents
         .iter()
+        .filter(|t| t.status == "downloaded" && !hidden_ids.contains(&t.id))
         .map(|t| t.hash.to_ascii_lowercase())
         .collect();
     // Every listed id per hash: a hash can be listed under several torrent ids (the scan loop's
@@ -2834,7 +2912,7 @@ pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> V
 /// listings and drops it only once it accepts the account as empty ([`empty_listing_is_suspect`]),
 /// so the reconciler and episode monitor follow its verdict: until then an empty-but-OK listing (a
 /// provider glitch) must not read as "everything lapsed".
-async fn listing_is_suspect(store: &Store, torrents: &[Torrent]) -> bool {
+pub(crate) async fn listing_is_suspect(store: &Store, torrents: &[Torrent]) -> bool {
     torrents.is_empty() && store.has_matches().await
 }
 
@@ -4832,7 +4910,16 @@ mod tests {
             .unwrap();
 
         let present: std::collections::HashSet<String> = ["here".to_string()].into_iter().collect();
-        let reaped = reap_absent_mirror_owned(&store, &present, false).await;
+        // Only a hash the previous trusted listing also lacked is reaped.
+        let nothing_confirmed = std::collections::HashSet::new();
+        assert_eq!(
+            reap_absent_mirror_owned(&store, &present, false, &nothing_confirmed).await,
+            0
+        );
+        assert!(store.get_owned("gone".into()).await.is_some());
+        let confirmed = absent_mirror_hashes(&store, &present, false).await;
+        assert_eq!(confirmed, ["gone".to_string()].into_iter().collect());
+        let reaped = reap_absent_mirror_owned(&store, &present, false, &confirmed).await;
         assert_eq!(reaped, 1);
         assert!(store.get_owned("gone".into()).await.is_none());
         assert!(
@@ -4987,6 +5074,63 @@ mod tests {
             vec!["trilogy".to_string()],
             "control: a single-film copy is still deduped"
         );
+
+        // The reverse: the collection ranks ABOVE the single (its record's quality is its largest
+        // file's, which may be another film). It never makes a single redundant; only a worse
+        // single of the same film is.
+        let mirror = || Provenance { entries: vec![] };
+        let owned = vec![
+            (
+                "trilogy".to_string(),
+                qrec(
+                    MediaKind::Movie,
+                    1,
+                    vec![],
+                    Some(qs(2160, 8_000, 50)),
+                    mirror(),
+                ),
+            ),
+            (
+                "single".to_string(),
+                qrec(
+                    MediaKind::Movie,
+                    1,
+                    vec![],
+                    Some(qs(1080, 8_000, 9)),
+                    mirror(),
+                ),
+            ),
+            (
+                "worse".to_string(),
+                qrec(
+                    MediaKind::Movie,
+                    1,
+                    vec![],
+                    Some(qs(720, 3_000, 1)),
+                    mirror(),
+                ),
+            ),
+        ];
+        let collections = hset(&["trilogy"]);
+        let plans = plan_dedup(
+            &owned,
+            &hset(&["trilogy", "single"]),
+            &hset(&[]),
+            &collections,
+            &HashMap::new(),
+        );
+        assert!(plans.is_empty(), "{plans:?}");
+        let plans = plan_dedup(
+            &owned,
+            &hset(&["trilogy", "single", "worse"]),
+            &hset(&[]),
+            &collections,
+            &HashMap::new(),
+        );
+        assert_eq!(removed_for(&plans, 1), vec!["worse".to_string()]);
+        let mut kept = plans[0].keep.clone();
+        kept.sort();
+        assert_eq!(kept, vec!["single".to_string(), "trilogy".to_string()]);
     }
 
     /// A show copy covers an episode at the quality of the file it serves for it, not its record's:
@@ -5791,10 +5935,10 @@ mod tests {
         }
     }
 
-    /// A South-Park-style library: a complete-series pack plus season packs inside it. A season pack
-    /// at the SAME quality is a genuine duplicate (removed, mirror copies included); so is a worse
-    /// one; a season pack of BETTER quality than the complete pack is kept, and so is an episode only
-    /// one copy provides.
+    /// A long-running show's library: a complete-series pack plus season packs inside it. A season
+    /// pack at the SAME quality is a genuine duplicate (removed, mirror copies included); so is a
+    /// worse one; a season pack of BETTER quality than the complete pack is kept, and so is an
+    /// episode only one copy provides.
     #[test]
     fn plan_dedup_removes_equal_or_worse_season_packs_inside_a_complete_pack() {
         use crate::scraper::MediaKind::Series;
@@ -5806,7 +5950,7 @@ mod tests {
                 "complete",
                 qrec(
                     Series,
-                    2190,
+                    900610,
                     complete,
                     Some(qs(1080, 6_000, 1_200_000)),
                     engine(),
@@ -5816,7 +5960,7 @@ mod tests {
                 "s1pack",
                 qrec(
                     Series,
-                    2190,
+                    900610,
                     eps(1, 1, 10),
                     Some(qs(1080, 6_000, 1_190_000)),
                     engine(),
@@ -5826,7 +5970,7 @@ mod tests {
                 "s2pack",
                 qrec(
                     Series,
-                    2190,
+                    900610,
                     eps(2, 1, 10),
                     Some(qs(1080, 6_000, 1_250_000)),
                     mirror(),
@@ -5836,7 +5980,7 @@ mod tests {
                 "s3web",
                 qrec(
                     Series,
-                    2190,
+                    900610,
                     eps(3, 1, 10),
                     Some(qs(1080, 3_000, 1_113_000)),
                     engine(),
@@ -5846,13 +5990,16 @@ mod tests {
                 "s2remux",
                 qrec(
                     Series,
-                    2190,
+                    900610,
                     eps(2, 1, 10),
                     Some(qs(1080, 8_000, 1_118_000)),
                     engine(),
                 ),
             ),
-            ("s4single", qrec(Series, 2190, vec![(4, 1)], None, mirror())),
+            (
+                "s4single",
+                qrec(Series, 900610, vec![(4, 1)], None, mirror()),
+            ),
         ]
         .into_iter()
         .map(|(h, r)| (h.to_string(), r))
@@ -5860,7 +6007,10 @@ mod tests {
         let all: std::collections::HashSet<String> = owned.iter().map(|(h, _)| h.clone()).collect();
         // The season packs are the ones being served.
         let plans = plan(&owned, &all, &hset(&["s1pack", "s2pack", "s3web"]));
-        assert_eq!(removed_for(&plans, 2190), vec!["s1pack", "s2pack", "s3web"]);
+        assert_eq!(
+            removed_for(&plans, 900610),
+            vec!["s1pack", "s2pack", "s3web"]
+        );
         let mut keep = plans[0].keep.clone();
         keep.sort();
         assert_eq!(keep, vec!["complete", "s2remux", "s4single"]);
@@ -7606,8 +7756,9 @@ mod trakt_sync_tests {
     }
 
     /// The real samples, end-to-end: `watched()` is fetched through the REAL client from a loopback
-    /// server serving both captured pages (`extended=progress`), then the wanted-set is built exactly
-    /// as `sync_trakt_user` builds it and planned by the episode monitor. Before the fix (plain
+    /// server serving both captured pages (`extended=progress`), then the wanted-set is built as
+    /// `sync_trakt_user` builds it (`build_wanted`, then `mark_trakt_behind`) and planned by the
+    /// episode monitor. Before the fix (plain
     /// `/sync/watched/shows`, page 1 only) every watched-episode set was empty, so the fully-watched
     /// Ended show was never finish-removed and catch-up re-acquired episodes already watched.
     #[tokio::test]
@@ -7661,13 +7812,24 @@ mod trakt_sync_tests {
         let finished_ended = finished_ended_candidates(&caught_up_owned, &statuses);
         let fold = shows_to_fold(&behind, &finished_ended, true);
         let plan = |watched: &WatchedData, tmdb_id: u64, owned: Option<&OwnedGroup>| {
-            let wanted: Vec<WantedRecord> =
-                build_wanted("alice", &[], &[], watched, &statuses, None, Some(&fold))
-                    .into_iter()
-                    .filter(|r| r.media_type == MediaType::Show && r.tmdb_id == tmdb_id)
-                    .collect();
+            let mut wanted_all =
+                build_wanted("alice", &[], &[], watched, &statuses, None, Some(&fold));
+            mark_trakt_behind(&mut wanted_all, &behind);
+            let wanted: Vec<WantedRecord> = wanted_all
+                .into_iter()
+                .filter(|r| r.media_type == MediaType::Show && r.tmdb_id == tmdb_id)
+                .collect();
             assert_eq!(wanted.len(), 1, "tmdb {tmdb_id} is wanted (folded)");
             assert!(wanted[0].sources.in_progress && !wanted[0].sources.watchlist);
+            // Only the show Trakt reports behind is marked so, as `sync_trakt_user` writes it.
+            assert!(
+                matches!(
+                    wanted[0].watched_state,
+                    WatchedState::Show { trakt_behind, .. } if trakt_behind == (tmdb_id == DRAMA)
+                ),
+                "tmdb {tmdb_id}: {:?}",
+                wanted[0].watched_state
+            );
             // TMDB's aired set (season 0 excluded, as `aired_episodes` returns it).
             let aired = AiredEpisodes {
                 pairs: match tmdb_id {
@@ -9903,7 +10065,14 @@ mod dedup_owned_tests {
             .await
             .unwrap();
         let app = build_app(store.clone(), provider, true).await;
-        dedup_owned(&app, &torrents, &std::collections::HashSet::new(), &[]).await;
+        dedup_owned(
+            &app,
+            &torrents,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &[],
+        )
+        .await;
         assert_eq!(
             *deleted.lock().unwrap(),
             vec!["t_worse".to_string()],
@@ -9943,7 +10112,14 @@ mod dedup_owned_tests {
         });
         let torrents = provider.get_torrents().await.unwrap();
         let app = build_app(store.clone(), provider, true).await;
-        dedup_owned(&app, &torrents, &std::collections::HashSet::new(), &[]).await;
+        dedup_owned(
+            &app,
+            &torrents,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &[],
+        )
+        .await;
         let mut ids = deleted.lock().unwrap().clone();
         ids.sort();
         assert_eq!(ids, vec!["t_worse".to_string(), "t_worse2".to_string()]);
@@ -9967,7 +10143,14 @@ mod dedup_owned_tests {
         });
         let torrents = provider.get_torrents().await.unwrap();
         let app = build_app(store.clone(), provider, true).await;
-        dedup_owned(&app, &torrents, &std::collections::HashSet::new(), &[]).await;
+        dedup_owned(
+            &app,
+            &torrents,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &[],
+        )
+        .await;
         assert!(
             !deleted.lock().unwrap().is_empty(),
             "a delete was attempted"
@@ -9978,13 +10161,64 @@ mod dedup_owned_tests {
         );
     }
 
+    /// A copy the VFS can't serve never wins a keep slot: one whose only listed torrent is hidden by
+    /// the instant repair (`Failed` after repeated failed repairs), or not downloaded, is left out of
+    /// dedup like a `Pending` copy, so the worse but playable copy is kept. The control (the better
+    /// copy servable) deletes the worse one.
+    #[tokio::test]
+    async fn never_removes_a_playable_copy_in_favour_of_one_the_vfs_cannot_serve() {
+        for case in ["hidden", "downloading", "servable"] {
+            let (store, deleted, mut torrents, provider) = fixture().await;
+            let mut hidden = std::collections::HashSet::new();
+            match case {
+                "hidden" => {
+                    hidden.insert("t_better".to_string());
+                }
+                "downloading" => {
+                    torrents
+                        .iter_mut()
+                        .find(|t| t.id == "t_better")
+                        .unwrap()
+                        .status = "downloading".into();
+                }
+                _ => {}
+            }
+            let app = build_app(store.clone(), provider, true).await;
+            dedup_owned(
+                &app,
+                &torrents,
+                &hidden,
+                &std::collections::HashSet::new(),
+                &[],
+            )
+            .await;
+            if case == "servable" {
+                assert_eq!(*deleted.lock().unwrap(), vec!["t_worse".to_string()]);
+            } else {
+                assert!(
+                    deleted.lock().unwrap().is_empty(),
+                    "{case}: nothing deleted"
+                );
+                assert!(store.get_owned("worse".into()).await.is_some(), "{case}");
+                assert!(store.get_owned("better".into()).await.is_some(), "{case}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn defers_when_library_active() {
         let (store, deleted, torrents, provider) = fixture().await;
         let app = build_app(store.clone(), provider, true).await;
         // A read of an unrelated torrent: the dedup removal gate is library-wide.
         app.read_activity.touch("unrelated").await;
-        dedup_owned(&app, &torrents, &std::collections::HashSet::new(), &[]).await;
+        dedup_owned(
+            &app,
+            &torrents,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &[],
+        )
+        .await;
         assert!(
             deleted.lock().unwrap().is_empty(),
             "an active library must defer the destructive dedup removal"
@@ -10003,7 +10237,14 @@ mod dedup_owned_tests {
         let (store, deleted, torrents, provider) = fixture().await;
         let mut app = build_app(store.clone(), provider, true).await;
         app.read_activity = Arc::new(crate::read_activity::ReadActivity::new());
-        dedup_owned(&app, &torrents, &std::collections::HashSet::new(), &[]).await;
+        dedup_owned(
+            &app,
+            &torrents,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &[],
+        )
+        .await;
         assert!(
             deleted.lock().unwrap().is_empty(),
             "no dedup deletion within the first idle window after start-up"
@@ -10015,7 +10256,14 @@ mod dedup_owned_tests {
     async fn dry_run_default_logs_but_does_not_remove() {
         let (store, deleted, torrents, provider) = fixture().await;
         let app = build_app(store.clone(), provider, false).await; // DEDUP_REMOVE_DUPLICATES unset
-        dedup_owned(&app, &torrents, &std::collections::HashSet::new(), &[]).await;
+        dedup_owned(
+            &app,
+            &torrents,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &[],
+        )
+        .await;
         assert!(
             deleted.lock().unwrap().is_empty(),
             "dry-run (default) must not delete anything"
@@ -10053,7 +10301,14 @@ mod dedup_owned_tests {
             });
             let torrents = provider.get_torrents().await.unwrap();
             let app = build_app(store.clone(), provider, true).await;
-            dedup_owned(&app, &torrents, &std::collections::HashSet::new(), &[]).await;
+            dedup_owned(
+                &app,
+                &torrents,
+                &std::collections::HashSet::new(),
+                &std::collections::HashSet::new(),
+                &[],
+            )
+            .await;
             if fresh {
                 assert!(deleted.lock().unwrap().is_empty(), "nothing is deleted");
                 assert!(store.get_owned("new".into()).await.is_some());
@@ -10287,7 +10542,7 @@ mod scan_tick_tests {
         // Three in a row within ten minutes: still suspect.
         let mut state = ScanState::new(known(), 60);
         for _ in 0..3 {
-            let end = scan_tick(&app, 0, &mut state, &mut shutdown).await;
+            let end = scan_tick(&app, &mut state, &mut shutdown).await;
             assert!(matches!(end, TickEnd::Skipped));
             assert_eq!(
                 state.seen_torrents.len(),
@@ -10297,7 +10552,7 @@ mod scan_tick_tests {
         }
         // Empty for ten minutes since the first of them: trusted.
         state.first_empty_at = tokio::time::Instant::now().checked_sub(MIN_EMPTY_DURATION);
-        assert!(done(scan_tick(&app, 0, &mut state, &mut shutdown).await).is_empty());
+        assert!(done(scan_tick(&app, &mut state, &mut shutdown).await).is_empty());
         assert!(
             state.seen_torrents.is_empty(),
             "the empty account is accepted"
@@ -10305,13 +10560,13 @@ mod scan_tick_tests {
 
         // Ten minutes but only two in a row: still suspect; the third is trusted.
         let mut state = ScanState::new(known(), 60);
-        let end = scan_tick(&app, 0, &mut state, &mut shutdown).await;
+        let end = scan_tick(&app, &mut state, &mut shutdown).await;
         assert!(matches!(end, TickEnd::Skipped));
         state.first_empty_at = tokio::time::Instant::now().checked_sub(MIN_EMPTY_DURATION);
-        let end = scan_tick(&app, 0, &mut state, &mut shutdown).await;
+        let end = scan_tick(&app, &mut state, &mut shutdown).await;
         assert!(matches!(end, TickEnd::Skipped));
         assert_eq!(state.seen_torrents.len(), 1);
-        assert!(done(scan_tick(&app, 0, &mut state, &mut shutdown).await).is_empty());
+        assert!(done(scan_tick(&app, &mut state, &mut shutdown).await).is_empty());
         assert!(state.seen_torrents.is_empty());
     }
 
@@ -10344,7 +10599,7 @@ mod scan_tick_tests {
         let app = app(store, provider, None, false).await;
         let mut state = ScanState::new(HashMap::new(), 60);
 
-        let first = done(scan_tick(&app, 0, &mut state, &mut shutdown).await);
+        let first = done(scan_tick(&app, &mut state, &mut shutdown).await);
         assert_eq!(ids(&first), vec!["t0", "t1", "t2"]);
         assert!(state.tmdb_retry.contains_key("t1"));
         let fallback = first[1].1.clone();
@@ -10352,7 +10607,7 @@ mod scan_tick_tests {
 
         // Its retry is due (TMDB still down): replaced in place.
         state.tmdb_retry.get_mut("t1").unwrap().0 = tokio::time::Instant::now();
-        let second = done(scan_tick(&app, 0, &mut state, &mut shutdown).await);
+        let second = done(scan_tick(&app, &mut state, &mut shutdown).await);
         assert_eq!(ids(&second), vec!["t0", "t1", "t2"]);
         assert_eq!(second[1].1, fallback);
         assert!(state.tmdb_retry.contains_key("t1"), "retried again later");
@@ -10408,7 +10663,7 @@ mod scan_tick_tests {
             });
             let app = app(store.clone(), provider, None, true).await;
             let mut state = ScanState::new(seen, 60);
-            done(scan_tick(&app, 0, &mut state, &mut shutdown).await);
+            done(scan_tick(&app, &mut state, &mut shutdown).await);
             if collection {
                 assert!(deleted.lock().unwrap().is_empty(), "the collection is kept");
                 assert!(store.get_owned("hother".into()).await.is_some());
@@ -10426,6 +10681,8 @@ mod scan_tick_tests {
         let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
         let store = Store::in_memory();
         store.put_staging_intent("hcut".into(), 50).await.unwrap();
+        // Left by an earlier process.
+        store.forget_local_staging_intents();
         let seen = HashMap::from([
             (
                 "tcut".to_string(),
@@ -10450,8 +10707,7 @@ mod scan_tick_tests {
         });
         let app = app(store.clone(), provider, None, false).await;
         let mut state = ScanState::new(seen, 60);
-        // The scheduler of this process started at 100: the intent opened at 50 is an earlier one's.
-        let data = done(scan_tick(&app, 100, &mut state, &mut shutdown).await);
+        let data = done(scan_tick(&app, &mut state, &mut shutdown).await);
         assert_eq!(*deleted.lock().unwrap(), vec!["tcut".to_string()]);
         assert_eq!(ids(&data), vec!["tkeep"]);
         assert!(store.all_staging_intents().await.is_empty());
@@ -10461,6 +10717,71 @@ mod scan_tick_tests {
         );
         assert!(store.get_owned("hkeep".into()).await.is_some());
         assert!(!state.seen_torrents.contains_key("tcut"));
+    }
+
+    /// A candidate this process is still staging (its intent open, nothing recorded yet) is kept
+    /// out of the tick: not shown, not identified from its file name, nothing cached. Once it is
+    /// recorded (owned + authoritative, intent closed) the next tick shows it under its
+    /// authoritative identification, not the file name's.
+    #[tokio::test]
+    async fn a_candidate_being_staged_is_kept_out_of_the_tick_until_it_is_recorded() {
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let store = Store::in_memory();
+        store
+            .put_staging_intent("hstage".into(), crate::now_unix_secs())
+            .await
+            .unwrap();
+        let infos = [
+            info("tstage", "hstage", &[("Some.Other.Name.2001.mkv", 1)]),
+            info("tkeep", "hkeep", &[("Film.Keep.2001.mkv", 1)]),
+        ];
+        store
+            .put_authoritative("hkeep".into(), movie_meta(8))
+            .await
+            .unwrap();
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![listed("tstage", "hstage"), listed("tkeep", "hkeep")],
+            torrent_info_by_id: infos.iter().map(|i| (i.id.clone(), i.clone())).collect(),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app(store.clone(), provider, None, false).await;
+        let mut state = ScanState::new(HashMap::new(), 60);
+
+        let data = done(scan_tick(&app, &mut state, &mut shutdown).await);
+        assert_eq!(ids(&data), vec!["tkeep"]);
+        assert!(
+            deleted.lock().unwrap().is_empty(),
+            "a live staging is not swept"
+        );
+        assert!(!state.seen_torrents.contains_key("tstage"));
+        assert!(!state.tmdb_retry.contains_key("tstage"));
+        assert!(store.get_match("tstage".into()).await.is_none());
+        assert!(
+            store.get_owned("hstage".into()).await.is_none(),
+            "not mirrored"
+        );
+
+        // Recorded: owned + authoritative, intent closed.
+        store
+            .put_owned(
+                "hstage".into(),
+                movie_record(27205, OwnedStatus::Verified, 1080),
+            )
+            .await
+            .unwrap();
+        store
+            .put_authoritative("hstage".into(), movie_meta(27205))
+            .await
+            .unwrap();
+        store.clear_staging_intent("hstage".into()).await.unwrap();
+        let data = done(scan_tick(&app, &mut state, &mut shutdown).await);
+        let staged = data
+            .iter()
+            .find(|(i, _)| i.id == "tstage")
+            .expect("shown once recorded");
+        assert_eq!(staged.1, movie_meta(27205));
     }
 
     /// A release `observe` rejects on a tick after the one it was first shown in (a second
@@ -10500,11 +10821,11 @@ mod scan_tick_tests {
         let mut state = ScanState::new(HashMap::new(), 60);
 
         // Strike 1: shown (no managed slot yet, so through the VFS fallback).
-        let first = done(scan_tick(&app, 0, &mut state, &mut shutdown).await);
+        let first = done(scan_tick(&app, &mut state, &mut shutdown).await);
         assert_eq!(ids(&first), vec!["tbad"]);
         assert!(deleted.lock().unwrap().is_empty());
         // Strike 2: deleted, and gone from this very tick.
-        let second = done(scan_tick(&app, 0, &mut state, &mut shutdown).await);
+        let second = done(scan_tick(&app, &mut state, &mut shutdown).await);
         assert_eq!(*deleted.lock().unwrap(), vec!["tbad".to_string()]);
         assert!(second.is_empty(), "{:?}", ids(&second));
         assert!(!state.seen_torrents.contains_key("tbad"));
@@ -10538,15 +10859,94 @@ mod scan_tick_tests {
         let app = app(store.clone(), provider, None, false).await;
         let mut state = ScanState::new(seen, 60);
         assert!(matches!(
-            scan_tick(&app, 0, &mut state, &mut shutdown).await,
+            scan_tick(&app, &mut state, &mut shutdown).await,
             TickEnd::Skipped
         ));
         assert!(state.maintenance_due);
         assert!(store.get_owned("hgone".into()).await.is_some());
 
-        // Tick 1 is not a prune tick, but the maintenance is still due.
-        done(scan_tick(&app, 0, &mut state, &mut shutdown).await);
+        // Tick 1 is not a prune tick, but the maintenance is still due: the absent record is
+        // remembered, and reaped once the next trusted listing still lacks it.
+        done(scan_tick(&app, &mut state, &mut shutdown).await);
         assert!(!state.maintenance_due);
+        assert!(
+            store.get_owned("hgone".into()).await.is_some(),
+            "seen absent once"
+        );
+        done(scan_tick(&app, &mut state, &mut shutdown).await);
         assert!(store.get_owned("hgone".into()).await.is_none(), "reaped");
+    }
+
+    /// The mirror reaper acts only on a hash missing from two trusted listings in a row: one that
+    /// drops out of a single listing (a page shift from a delete made outside this process) and is
+    /// back in the next keeps its record and its selection slot. One missing from both is reaped,
+    /// slots included.
+    #[tokio::test]
+    async fn the_mirror_reaper_needs_a_second_listing_without_the_hash() {
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        for back in [true, false] {
+            let store = Store::in_memory();
+            store
+                .put_owned("hblip".into(), movie_record(3, OwnedStatus::Verified, 1080))
+                .await
+                .unwrap();
+            store
+                .put_selection(
+                    crate::store::movie_slot(3),
+                    crate::store::SelectionEntry {
+                        hash: "hblip".into(),
+                        file_path: "Film.Blip.2001.mkv".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let seen = HashMap::from([(
+                "tother".to_string(),
+                (
+                    info("tother", "hother", &[("Film.Other.2001.mkv", 1)]),
+                    movie_meta(4),
+                ),
+            )]);
+            let without = vec![listed("tother", "hother")];
+            let with = vec![listed("tother", "hother"), listed("tblip", "hblip")];
+            let second = if back { with.clone() } else { without.clone() };
+            let provider: Arc<dyn DebridProvider> = Arc::new(ListingSeq {
+                inner: MockProvider {
+                    torrents: with.clone(),
+                    torrent_info_by_id: HashMap::from([(
+                        "tblip".to_string(),
+                        info("tblip", "hblip", &[("Film.Blip.2001.mkv", 1)]),
+                    )]),
+                    ..Default::default()
+                },
+                listings: Mutex::new(VecDeque::from([Ok(without), Ok(second)])),
+            });
+            let app = app(store.clone(), provider, None, false).await;
+            let mut state = ScanState::new(seen, 60);
+            done(scan_tick(&app, &mut state, &mut shutdown).await);
+            assert!(
+                store.get_owned("hblip".into()).await.is_some(),
+                "one listing is not enough"
+            );
+            done(scan_tick(&app, &mut state, &mut shutdown).await);
+            let slot = store.get_selection(crate::store::movie_slot(3)).await;
+            if back {
+                assert!(
+                    store.get_owned("hblip".into()).await.is_some(),
+                    "back: kept"
+                );
+                assert_eq!(slot.unwrap().hash, "hblip", "back: its slot survives");
+            } else {
+                assert!(
+                    store.get_owned("hblip".into()).await.is_none(),
+                    "gone: reaped"
+                );
+                assert!(slot.is_none(), "gone: its slot goes with it");
+            }
+            // A third listing (the reaper is not due again until the next prune tick) changes
+            // nothing.
+            done(scan_tick(&app, &mut state, &mut shutdown).await);
+            assert_eq!(store.get_owned("hblip".into()).await.is_some(), back);
+        }
     }
 }

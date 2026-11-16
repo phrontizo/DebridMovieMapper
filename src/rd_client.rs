@@ -96,6 +96,32 @@ impl std::fmt::Debug for Torrent {
     }
 }
 
+/// Keep only the first occurrence of each torrent id in a paginated listing, in first-seen order,
+/// so every consumer sees each torrent once. Both clients page a newest-first listing, and an add
+/// that lands between two page fetches shifts every entry down by one, so the next page starts
+/// with the previous page's last torrent again. A provider id is unique per torrent, so a repeated
+/// id is always that artefact. Left in, it reaches every caller that collects the ids of a hash
+/// from the listing and deletes each one: the second delete of the same id is a 404 on Real-Debrid
+/// (mapped to `Ok`), but on TorBox it is an `Err`, which those callers read as a failed delete
+/// and keep the records for. An empty id (never sent by either provider) identifies nothing, so
+/// such entries are all kept.
+pub(crate) fn drop_repeated_ids(torrents: Vec<Torrent>, provider: &str) -> Vec<Torrent> {
+    let total = torrents.len();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let kept: Vec<Torrent> = torrents
+        .into_iter()
+        .filter(|t| t.id.is_empty() || seen.insert(t.id.clone()))
+        .collect();
+    if kept.len() < total {
+        debug!(
+            "{} listing: dropped {} page-boundary repeat(s) of an id already listed",
+            provider,
+            total - kept.len()
+        );
+    }
+    kept
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct TorrentInfo {
     pub id: String,
@@ -457,7 +483,7 @@ impl RealDebridClient {
         // A full first page means the empty terminator was fetched at a page boundary, so an item
         // can still have shifted out of reach even with only one non-empty page.
         let spans_pages = non_empty_pages > 1 || all_torrents.len() >= PAGE_LIMIT as usize;
-        Ok((all_torrents, spans_pages))
+        Ok((drop_repeated_ids(all_torrents, "RD"), spans_pages))
     }
 
     pub async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
@@ -759,7 +785,8 @@ impl RealDebridClient {
                                     // Retry ONE transient decode blip, then bail — a *persistent*
                                     // decode failure is a schema change that won't fix itself on retry.
                                     // This cap (2 attempts) is DELIBERATELY tighter than TorBox's
-                                    // full-budget decode-retry (`send_data_n`): `unrestrict_link` runs
+                                    // full-budget decode-retry (`send_enveloped`, the loop behind
+                                    // `send_data_n`/`send_ok`): `unrestrict_link` runs
                                     // on the synchronous playback resolve path with a small 3-attempt
                                     // budget, so it must fast-fail to instant repair rather than burn
                                     // the whole budget on a possibly-permanent format change.
@@ -1435,6 +1462,61 @@ mod tests {
             page1_fetches,
             crate::provider::MAX_LISTING_ATTEMPTS as usize
         );
+    }
+
+    /// An add that lands between two page fetches shifts a newest-first listing down by one, so
+    /// page 2 starts with page 1's last torrent again. The listing must carry each id once: every
+    /// consumer that deletes by the ids it finds for a hash would otherwise delete that torrent
+    /// twice.
+    #[tokio::test]
+    async fn get_torrents_drops_a_page_boundary_repeat() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = if req.contains("page=1&") {
+                    let items: Vec<String> =
+                        (0..100).map(|i| format!(r#"{{"id":"a{i}"}}"#)).collect();
+                    format!("[{}]", items.join(","))
+                } else if req.contains("page=2&") {
+                    // A concurrent add pushed a99 down onto page 2.
+                    r#"[{"id":"a99"}]"#.to_string()
+                } else {
+                    "[]".to_string()
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let client = RealDebridClient::new("fake".to_string())
+            .unwrap()
+            .with_base_url(format!("http://{addr}"));
+        let torrents = client.get_torrents().await.expect("listing succeeds");
+        let ids: Vec<String> = torrents.iter().map(|t| t.id.clone()).collect();
+        let expected: Vec<String> = (0..100).map(|i| format!("a{i}")).collect();
+        assert_eq!(ids, expected, "each id once, in first-seen order");
+    }
+
+    /// Torrents with an empty id (which no RD answer should carry) are not one torrent repeated:
+    /// the repeat filter leaves them all in place.
+    #[test]
+    fn drop_repeated_ids_keeps_every_empty_id() {
+        let t = |id: &str| Torrent {
+            id: id.to_string(),
+            ..Default::default()
+        };
+        let kept = drop_repeated_ids(vec![t("a"), t(""), t("b"), t("a"), t("")], "test");
+        let ids: Vec<&str> = kept.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "", "b", ""]);
     }
 
     #[tokio::test]

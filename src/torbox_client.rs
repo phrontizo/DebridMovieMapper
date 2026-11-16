@@ -1,7 +1,7 @@
 use crate::error::AppError;
 use crate::provider::FileLocator;
 use crate::ratelimit::AdaptiveRateLimiter;
-use crate::rd_client::{Torrent, TorrentFile, TorrentInfo};
+use crate::rd_client::{drop_repeated_ids, Torrent, TorrentFile, TorrentInfo};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -185,7 +185,10 @@ fn map_listed_torrents(raw: &[TbTorrent]) -> Vec<Torrent> {
 /// This costs exactly one extra (empty terminator) fetch per complete listing. Advancing by the
 /// items returned rather than by `limit` means a server that caps the page below `limit` loses
 /// nothing (stepping by `limit` would skip each page's tail); a short page caused by anything else
-/// only re-reads some items, which the scan loop skips as page-boundary repeats (same id).
+/// only re-reads some items. So does an add that lands between two fetches of a newest-first
+/// listing, even on a single-page account: the terminator, fetched at the offset of the items seen
+/// so far, returns the last of them again. The caller drops such page-boundary repeats (same id,
+/// `rd_client::drop_repeated_ids`), so every consumer of the listing sees each id once.
 ///
 /// Returns `(items, hit_cap)`. `hit_cap` is `true` when the loop stopped because it reached
 /// `max_pages` without an empty page and one more fetch (the probe below) still returned items —
@@ -718,14 +721,14 @@ impl TorBoxClient {
         })
         .await?;
         if hit_cap {
-            // We exhausted MAX_PAGES with a full final page → the listing is almost certainly
-            // truncated. FAIL rather than return a partial Ok (which downstream would read as a
-            // shrunken library → mass re-acquire + duplicate adds), exactly as RD's `get_torrents`
-            // does at its cap. An offset-ignoring API also lands here (every page full) instead of
-            // silently returning duplicated/partial data.
+            // No empty page came within MAX_PAGES and the probe fetch still returned items → the
+            // listing is almost certainly truncated. FAIL rather than return a partial Ok (which
+            // downstream would read as a shrunken library → mass re-acquire + duplicate adds),
+            // exactly as RD's `get_torrents` does at its cap. An offset-ignoring API also lands here
+            // (it never returns an empty page) instead of silently returning duplicated/partial data.
             warn!(
-                "TorBox mylist pagination hit the {}-page cap (~{} torrents) with a full final page — \
-                 refusing a possibly-truncated listing",
+                "TorBox mylist pagination hit the {}-page cap (~{} torrents) without reaching an \
+                 empty page — refusing a possibly-truncated listing",
                 MAX_PAGES,
                 raw.len()
             );
@@ -735,7 +738,10 @@ impl TorBoxClient {
         // full first page means the terminator was fetched at a page boundary, so an item can still
         // have shifted out of reach.
         let spans_pages = requests > 2 || raw.len() >= PAGE;
-        Ok((map_listed_torrents(&raw), spans_pages))
+        Ok((
+            drop_repeated_ids(map_listed_torrents(&raw), "TorBox"),
+            spans_pages,
+        ))
     }
 
     pub async fn torrent_info_raw(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
@@ -841,7 +847,8 @@ impl TorBoxClient {
         // unstable detail string, so a delete of an already-removed torrent surfaces as `Err`. We do
         // NOT blanket-treat delete failures as success (that would hide genuine auth/network errors).
         // It is safe in practice: every caller that gates an owned-record removal on delete success
-        // first filters to torrents present in the listing, and best-effort prune paths use `let _`;
+        // first filters to torrents present in the listing, which carries each id once
+        // (`drop_repeated_ids`, so no id is deleted twice), and best-effort prune paths use `let _`;
         // the only residual window (torrent vanishes between listing fetch and delete) self-heals.
         self.send_ok(|| self.client.post(&url).json(&body)).await
     }
@@ -1203,9 +1210,9 @@ mod tests {
     fn magnet_infohash_extracts_btih() {
         assert_eq!(
             magnet_infohash(
-                "magnet:?xt=urn:btih:64877b5490208c3015c0f5121287949d62622e54&dn=Sintel"
+                "magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98&dn=Example"
             ),
-            Some("64877b5490208c3015c0f5121287949d62622e54".to_string())
+            Some("fedcba9876543210fedcba9876543210fedcba98".to_string())
         );
         // Uppercase input is normalised to lowercase.
         assert_eq!(
@@ -1514,6 +1521,45 @@ mod tests {
             page1_fetches,
             crate::provider::MAX_LISTING_ATTEMPTS as usize
         );
+    }
+
+    /// An add that lands between the first page and the empty terminator shifts a newest-first
+    /// listing down by one, so the terminator (fetched at the offset of the items seen so far)
+    /// returns the first page's last item again. The listing must carry each id once: every
+    /// consumer that deletes by the ids it finds for a hash would otherwise delete that torrent
+    /// twice, and on TorBox the second delete fails, which those callers read as a failed delete.
+    #[tokio::test]
+    async fn mylist_drops_a_page_boundary_repeat() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let data = if req.contains("offset=0 ") {
+                    r#"[{"id":1,"hash":"h1"},{"id":2,"hash":"h2"}]"#
+                } else if req.contains("offset=2 ") {
+                    // A concurrent add pushed id 2 down to offset 2.
+                    r#"[{"id":2,"hash":"h2"}]"#
+                } else {
+                    "[]"
+                };
+                let body = format!(r#"{{"success":true,"data":{data}}}"#);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let client = TorBoxClient::with_base("fake".to_string(), format!("http://{addr}"));
+        let listed = client.list_torrents_raw().await.expect("listing succeeds");
+        let ids: Vec<&str> = listed.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "2"], "each id once, in first-seen order");
     }
 
     #[tokio::test]

@@ -17,8 +17,9 @@ services:
     # The settings reach the container ONLY through this list: compose substitutes each ${VAR:-}
     # from .env (next to this file) or the shell environment, and the app's own .env lookup finds
     # nothing inside the container. A variable you set in .env that isn't listed here is ignored.
-    # Every pass-through has an empty default, and the app treats an empty value as unset (its
-    # documented default, shown in the comments). JELLYFIN_URL, JELLYFIN_RCLONE_MOUNT_PATH and
+    # Every optional pass-through has an empty default (RUST_LOG defaults to info, and TMDB_API_KEY
+    # is required), and the app treats an empty value as unset (its documented default, shown in
+    # the comments). JELLYFIN_URL, JELLYFIN_RCLONE_MOUNT_PATH and
     # DB_PATH are fixed for this stack, and PORT only sets the published host port (see above).
     # Compose reads .env when it CREATES the container: after editing it run `docker compose up -d`
     # (which recreates the container); `docker compose restart` keeps the old environment.

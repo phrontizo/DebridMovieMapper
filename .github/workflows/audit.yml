@@ -1,0 +1,43 @@
+name: Audit
+
+# Checks Cargo.lock against the RustSec advisory database: vulnerable, yanked and unmaintained
+# crates. Dependabot alerts follow only the default branch's lockfile, so this is the advisory
+# check for v2. It is its own workflow rather than a ci.yml job: a scheduled run must never reach
+# ci.yml's publish pipeline, and an advisory must not block lint, test or publish.
+on:
+  push:
+    branches: [main, v2]
+  pull_request:
+    branches: [main, v2]
+  # A new advisory can land against an unchanged lockfile. GitHub runs scheduled workflows only
+  # from the default branch's copy of this file, so the scheduled run audits both lines (the
+  # matrix below) once the file is on main.
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions: {}
+
+jobs:
+  audit:
+    name: cargo audit${{ matrix.ref && format(' ({0})', matrix.ref) || '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # A push or pull request audits the ref that triggered it (an empty ref = checkout's
+        # default); the weekly run audits each line's lockfile.
+        ref: ${{ github.event_name == 'schedule' && fromJSON('["main", "v2"]') || fromJSON('[""]') }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.ref }}
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit Cargo.lock
+        run: cargo audit --deny warnings

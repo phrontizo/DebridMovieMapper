@@ -161,7 +161,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The action never infers a pre-release from the tag (`prerelease` defaults to false), so a
+      # v1.2.3-rc.1 tag would otherwise publish a normal release that GitHub marks Latest. Same
+      # semver rule as `latest=auto` above: a `-` in the tag makes it a pre-release.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
