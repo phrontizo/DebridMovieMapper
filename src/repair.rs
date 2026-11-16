@@ -102,7 +102,8 @@ pub struct RepairManager {
     /// resolve the deleted torrent and fail. A handle opened before the repair keeps the old locator
     /// past that rebuild, so `try_instant_repair` consults the redirect too. Dropped by
     /// `prune_health_status` once the listing has neither the old torrent nor the copy its chain of
-    /// redirects ends at, and that copy isn't a replacement still waiting for the scan loop.
+    /// redirects ends at (followed at most `MAX_REDIRECT_HOPS` hops), and that copy isn't a
+    /// replacement still waiting for the scan loop.
     repaired_locators: Arc<RwLock<HashMap<String, HashMap<String, crate::provider::FileLocator>>>>,
 }
 
@@ -110,8 +111,9 @@ pub struct RepairManager {
 /// id, and a redirect lives as long as the copy its chain ends at is listed, so a chain can span
 /// repairs separated by good reads (`note_read_success` resets the attempt budget, so
 /// `MAX_REPAIR_ATTEMPTS` doesn't bound it). This cap does: `redirect` follows at most this many
-/// hops, and `prune_health_status` drops a chain head whose copy this many hops on (or the chain's
-/// end, if nearer) is neither listed nor a replacement still waiting for the scan loop.
+/// hops. `prune_health_status` keeps a redirect while its old torrent is listed, or while the copy
+/// this many hops along its chain (or the chain's end, if nearer) is listed or is a replacement
+/// still waiting for the scan loop; otherwise it drops it.
 const MAX_REDIRECT_HOPS: usize = 8;
 
 /// RAII guard that makes the `Repairing` transition in `try_instant_repair` cancellation-safe.
@@ -974,10 +976,11 @@ impl RepairManager {
     /// cooldown and the attempt budget across the re-add, so it is kept while its replacement is
     /// still waiting for the scan loop (`take_repair_replacements`, which runs before the next
     /// listing). A repair redirect is dropped once the listing has neither its old torrent nor the
-    /// copy its chain of redirects ends at, and that copy isn't a replacement still waiting for the
-    /// scan loop. The VFS the scan loop builds from the listing no longer has the old locators, but
-    /// a handle opened before the repair (one long stream of a season pack's episode) still does,
-    /// and must reach the replacement for as long as it exists.
+    /// copy its chain of redirects ends at (followed at most `MAX_REDIRECT_HOPS` hops), and that
+    /// copy isn't a replacement still waiting for the scan loop. The VFS the scan loop builds from
+    /// the listing no longer has the old locators, but a handle opened before the repair (one long
+    /// stream of a season pack's episode) still does, and must reach the replacement for as long as
+    /// it exists.
     pub async fn prune_health_status(&self, active_torrent_ids: &std::collections::HashSet<&str>) {
         let mut health_map = self.health_status.write().await;
         let before = health_map.len();

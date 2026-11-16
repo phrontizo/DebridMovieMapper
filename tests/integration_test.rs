@@ -537,13 +537,16 @@ fn basename(path: &str) -> &str {
 /// `Sxx` / `Season N` / `NxNN` token in the file name; else the NEAREST directory naming a season
 /// (by such a token, else by a `Part N`), so each season of a multi-season pack keeps its own
 /// folder; else a `Part N` in the file name; else season 1. It reads only the season from an
-/// episode code, where the build decodes the whole code.
+/// episode code, where the build decodes the whole code. As in the build, an `NxM` code may carry a
+/// version suffix (`2x05v2`), and neither an `NxM` code nor an `NxNN` season token counts when it
+/// is a channel layout run into an `x264`/`x265` codec (`DD5.1x264`, `AAC2.0x264`) or, for a code,
+/// names episode `00`: the search moves on to the next one.
 fn season_folder(path: &str) -> String {
     static SXXEYY: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})[ ._]?e\d{1,3}").unwrap());
     static NXM: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r"(?i)(?:^|[^a-z0-9])(\d{1,2})x\d{2,3}(?:x\d{2,3}|[-_. ]\d{1,2}x\d{2,3})*(?:[^a-z0-9]|$)",
+            r"(?i)(?:^|[^a-z0-9])(\d{1,2})x(\d{2,3})(?:v\d{1,2})?(?:x\d{2,3}|[-_. ]\d{1,2}x\d{2,3})*(?:[^a-z0-9]|$)",
         )
         .unwrap()
     });
@@ -558,14 +561,50 @@ fn season_folder(path: &str) -> String {
         Regex::new(r"(?i)(?:^|[^a-z0-9])part[\s._-]*(\d{1,2})(?:[^a-z0-9]|$)").unwrap()
     });
     let number = |m: Option<regex::Match>| m.and_then(|m| m.as_str().parse::<u32>().ok());
+    // Whether the token whose season digits are `season` (ending at its `x`) is a channel layout
+    // run into a codec: the digits follow `<digit>.` and the `x` runs into `264`/`265`.
+    let channel_layout = |s: &str, season: regex::Match| {
+        let (bytes, start, x) = (s.as_bytes(), season.start(), season.end());
+        start >= 2
+            && bytes[start - 1] == b'.'
+            && bytes[start - 2].is_ascii_digit()
+            && matches!(bytes.get(x + 1..x + 4), Some(b"264" | b"265"))
+            && !bytes.get(x + 4).is_some_and(u8::is_ascii_digit)
+    };
     let strong = |s: &str| {
-        STRONG
-            .captures(s)
-            .and_then(|c| number(c.get(1)).or(number(c.get(2))).or(number(c.get(3))))
+        let mut at = 0;
+        while let Some(c) = STRONG.captures_at(s, at) {
+            let nxnn = c.get(3).filter(|m| !channel_layout(s, *m));
+            if let Some(season) = number(c.get(1)).or(number(c.get(2))).or(number(nxnn)) {
+                return Some(season);
+            }
+            // A token's trailing separator can open the next one, so the search resumes on it.
+            let whole = c.get(0)?;
+            at = match whole.as_str().chars().next_back() {
+                Some(ch) if !ch.is_ascii_alphanumeric() => whole.end() - ch.len_utf8(),
+                _ => whole.end(),
+            };
+        }
+        None
     };
     let part = |s: &str| PART.captures(s).and_then(|c| number(c.get(1)));
 
     let name = basename(path);
+    let nxm_code = || {
+        let mut at = 0;
+        while let Some(c) = NXM.captures_at(name, at) {
+            let season = c.get(1)?;
+            let episode_00 = c
+                .get(2)
+                .is_some_and(|m| m.as_str().bytes().all(|b| b == b'0'));
+            if !channel_layout(name, season) && !episode_00 {
+                return number(Some(season));
+            }
+            // The next match's leading boundary lies after the season digits and their `x`.
+            at = season.end();
+        }
+        None
+    };
     let dash_code = || {
         let c = DASH.captures(name)?;
         let (season, episode) = (number(c.get(1))?, number(c.get(2))?);
@@ -574,7 +613,7 @@ fn season_folder(path: &str) -> String {
     let code = SXXEYY
         .captures(name)
         .and_then(|c| number(c.get(1)))
-        .or_else(|| NXM.captures(name).and_then(|c| number(c.get(1))))
+        .or_else(nxm_code)
         .or_else(dash_code);
     let season = code.or_else(|| strong(name)).or_else(|| {
         path[..path.len() - name.len()]
@@ -787,6 +826,17 @@ fn season_folder_agrees_with_the_build() {
         ("/Show/Season 3/05 - Title, Part 2.mkv", "Season 03"),
         ("/Show/05 - Title, Part 2.mkv", "Season 02"),
         ("/Show/01.mkv", "Season 01"),
+        // An `NxM` code with a version suffix, and one after a year or a title ending in a digit.
+        ("/Show/Show.2x05v2.mkv", "Season 02"),
+        ("/Show/Show.Name.2005.2x05.mkv", "Season 02"),
+        ("/Show/Babylon.5.2x10.mkv", "Season 02"),
+        // A channel layout run into a codec is no code and names no season, and an episode 00 is
+        // skipped for the next code.
+        ("/Show.S02/Show.E05.DD5.1x264.mkv", "Season 02"),
+        ("/Show/01.AAC2.0x264.mkv", "Season 01"),
+        ("/Show/05 - Title.AAC2.0x264.S03.mkv", "Season 03"),
+        ("/Show/Show.1x00.2x05.mkv", "Season 02"),
+        ("/Show/1x00.2x05.mkv", "Season 02"),
     ];
     for (n, (path, expected)) in cases.into_iter().enumerate() {
         let id = (n + 1).to_string();

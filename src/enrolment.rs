@@ -382,8 +382,10 @@ impl EnrolmentService {
 }
 
 /// Poll the device-token endpoint until Authorized/terminal; on success fetch the user's slug
-/// and persist the tokens. Returns the stored slug. The loop is bounded by `expires_in_secs`
-/// so it can never spin forever.
+/// and persist the tokens. Returns the stored slug. Polling stops `expires_in_secs` after the call,
+/// by the clock, so it never outlives the device code. That includes the time a `poll_token` spends
+/// held up by the shared Trakt rate limiter (minutes per attempt under a 429 back-off): a poll
+/// still waiting at the deadline is cut off, since a code past its expiry can't be authorised.
 ///
 /// Also used directly by the interactive live integration test
 /// (`tests/trakt_integration_test.rs`) to drive the device flow end-to-end — that test calls
@@ -396,22 +398,32 @@ pub async fn poll_to_completion(
     expires_in_secs: u64,
 ) -> Result<String, AppError> {
     let interval = interval_secs.max(1);
-    let mut elapsed: u64 = 0;
+    // `expires_in` is Trakt's number: an absurd one must not overflow the `Instant` and panic.
+    let deadline = {
+        let now = tokio::time::Instant::now();
+        now.checked_add(std::time::Duration::from_secs(expires_in_secs))
+            .unwrap_or_else(|| now + std::time::Duration::from_secs(u64::from(u32::MAX)))
+    };
+    let expired = || AppError::Config("Trakt device code expired before authorisation".to_string());
     // A transient poll error (dropped connection/timeout) must not abort the whole enrolment after a
-    // single blip — retry it like `Pending`. Bounded by both `expires_in_secs` AND a consecutive-error
+    // single blip — retry it like `Pending`. Bounded by both the deadline AND a consecutive-error
     // cap, so a genuinely persistent error (e.g. a bad client id) still fails reasonably fast rather
     // than spinning until expiry. The counter resets on any successful poll.
     const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 5;
     let mut consecutive_errors: u32 = 0;
     loop {
-        let poll = match trakt.poll_token(&device_code).await {
-            Ok(p) => {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let poll = match tokio::time::timeout(remaining, trakt.poll_token(&device_code)).await {
+            Err(_) => return Err(expired()),
+            Ok(Ok(p)) => {
                 consecutive_errors = 0;
                 p
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 consecutive_errors += 1;
-                if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS || elapsed >= expires_in_secs {
+                if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS
+                    || tokio::time::Instant::now() >= deadline
+                {
                     return Err(e);
                 }
                 warn!(
@@ -419,7 +431,6 @@ pub async fn poll_to_completion(
                     consecutive_errors, MAX_CONSECUTIVE_POLL_ERRORS, e
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                elapsed = elapsed.saturating_add(interval);
                 continue;
             }
         };
@@ -477,13 +488,10 @@ pub async fn poll_to_completion(
                 }));
             }
             DeviceTokenPoll::Pending => {
-                if elapsed >= expires_in_secs {
-                    return Err(AppError::Config(
-                        "Trakt device code expired before authorisation".to_string(),
-                    ));
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(expired());
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                elapsed = elapsed.saturating_add(interval);
             }
             DeviceTokenPoll::Denied => {
                 return Err(AppError::Config("Trakt enrolment was denied".to_string()))
@@ -1048,6 +1056,20 @@ mod tests {
             assert!(!err.contains("TRAKT_CLIENT_SECRET"), "{err}");
             assert!(store.all_trakt_tokens().await.is_empty());
         }
+    }
+
+    /// `expires_in` comes from Trakt: an absurd value must not overflow the poll's deadline.
+    #[tokio::test]
+    async fn poll_to_completion_takes_an_absurd_expires_in_without_panicking() {
+        let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
+            poll: DeviceTokenPoll::Denied,
+            ..Default::default()
+        });
+        let err = poll_to_completion(&trakt, &Store::in_memory(), "dc".into(), 1, u64::MAX)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("denied"), "{err}");
     }
 
     #[tokio::test]
@@ -2022,12 +2044,14 @@ mod tests {
         );
     }
 
-    /// A `MockTrakt` whose `device_code` and `refresh` take `delay` to answer, as they do while the
-    /// shared Trakt rate limiter waits out a 429 back-off (up to minutes per attempt).
+    /// A `MockTrakt` whose `device_code`, `poll_token` and `refresh` take `delay` to answer, as
+    /// they do while the shared Trakt rate limiter waits out a 429 back-off (up to minutes per
+    /// attempt).
     struct SlowTrakt {
         inner: MockTrakt,
         delay: std::time::Duration,
         refresh_calls: std::sync::atomic::AtomicUsize,
+        poll_calls: std::sync::atomic::AtomicUsize,
     }
     #[async_trait::async_trait]
     impl TraktClient for SlowTrakt {
@@ -2036,6 +2060,9 @@ mod tests {
             self.inner.device_code().await
         }
         async fn poll_token(&self, dc: &str) -> Result<DeviceTokenPoll, AppError> {
+            self.poll_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
             self.inner.poll_token(dc).await
         }
         async fn refresh(&self, refresh_token: &str) -> Result<TraktTokenResponse, AppError> {
@@ -2084,6 +2111,7 @@ mod tests {
             },
             delay,
             refresh_calls: Default::default(),
+            poll_calls: Default::default(),
         })
     }
 
@@ -2223,6 +2251,7 @@ mod tests {
                 inner: MockTrakt::default(),
                 delay: std::time::Duration::from_secs(300),
                 refresh_calls: Default::default(),
+                poll_calls: Default::default(),
             }),
             Store::in_memory(),
         );
@@ -2246,5 +2275,38 @@ mod tests {
             MAX_CONCURRENT_ENROLMENTS,
             "a timed-out enrol must not hold an enrolment slot"
         );
+    }
+
+    /// While the Trakt limiter waits out a 429 back-off, every device-token poll takes minutes and
+    /// comes back `Pending` (a final 429 maps to it). The background poll must still end when the
+    /// device code expires by the clock, freeing its enrolment slot. Counting only the sleeps
+    /// between polls let it run for hours.
+    #[tokio::test(start_paused = true)]
+    async fn poll_to_completion_ends_at_the_codes_expiry_while_polls_are_throttled() {
+        use std::sync::atomic::Ordering;
+        let slow = Arc::new(SlowTrakt {
+            inner: MockTrakt::default(), // poll: Pending
+            delay: std::time::Duration::from_secs(60),
+            refresh_calls: Default::default(),
+            poll_calls: Default::default(),
+        });
+        let trakt: Arc<dyn TraktClient> = slow.clone();
+        let store = Store::in_memory();
+        let started = tokio::time::Instant::now();
+        let err = poll_to_completion(&trakt, &store, "dc".into(), 5, 600)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expired"), "{err}");
+        assert!(
+            started.elapsed() <= std::time::Duration::from_secs(600 + 5),
+            "the poll must end at the code's expiry, took {:?}",
+            started.elapsed()
+        );
+        // One poll per 65 s (60 s held up + the 5 s interval) fits ten into 600 s; counting only
+        // the sleeps would allow 121.
+        let polls = slow.poll_calls.load(Ordering::SeqCst);
+        assert!(polls <= 11, "{polls} polls");
+        assert!(store.all_trakt_tokens().await.is_empty());
     }
 }

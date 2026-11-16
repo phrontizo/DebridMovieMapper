@@ -56,6 +56,18 @@ fn identification_is_cacheable(tmdb_failed: bool) -> bool {
 /// ([`identify_new_torrent`]), so a tick costs one retry budget however many retries are due.
 const TMDB_RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
 
+/// How long the scan loop waits before asking the provider again for the files of a `downloaded`
+/// torrent whose cached identification lists no emittable video file (see `scan_tick`). TorBox can
+/// report a finished torrent with no files (a lapsed entry, or a transient `files: null`), and the
+/// identification is otherwise fetched once per torrent id and kept for good, so the torrent would
+/// stay out of the VFS, and its mirror record without `provides` or quality, after its files came
+/// back. An hour keeps an account of genuinely lapsed entries to a few requests a minute.
+const INFO_REFRESH_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// At most this many such refreshes per tick (the rest wait for a later one), so a library of
+/// lapsed entries never holds a tick up for long.
+const MAX_INFO_REFRESHES_PER_TICK: usize = 10;
+
 /// Identify one torrent the scan loop has no identification for: its info from the provider, then
 /// [`resolve_metadata`]. Returns `(info, metadata, tmdb_failed)`.
 ///
@@ -217,6 +229,9 @@ struct ScanState {
     /// hashes), waiting for the next trusted listing to confirm they are gone before the reaper
     /// drops them (see [`reap_absent_mirror_owned`]). Taken by that next listing.
     reap_candidates: Option<std::collections::HashSet<String>>,
+    /// Listed `downloaded` torrents whose cached identification lists no emittable video file, by
+    /// torrent id: when to fetch their files again ([`INFO_REFRESH_AFTER`]).
+    info_refresh: HashMap<String, tokio::time::Instant>,
 }
 
 impl ScanState {
@@ -236,8 +251,75 @@ impl ScanState {
             first_empty_at: None,
             maintenance_due: false,
             reap_candidates: None,
+            info_refresh: HashMap::new(),
         }
     }
+}
+
+/// Fetch again the files of the listed `downloaded` torrents in `fileless` (index into
+/// `current_data`, torrent id), whose cached identification lists no emittable video file, once
+/// each is due ([`INFO_REFRESH_AFTER`] after it was first seen so, then after every fetch that still
+/// found none; at most [`MAX_INFO_REFRESHES_PER_TICK`] per tick). A fresh file list that holds an
+/// emittable video file replaces the cached one, in this tick's data, the scan state and the
+/// persisted `matches` cache, with the identification itself kept; the mirror pass's quality and
+/// `provides` backfills then complete the torrent's record from it. A fetch that fails or still
+/// lists none changes nothing: a cached list is never swapped for an empty one. Torrents no longer
+/// listed, or whose files came back, are forgotten.
+async fn refresh_fileless_infos(
+    provider: &dyn DebridProvider,
+    store: &Store,
+    state: &mut ScanState,
+    current_data: &mut [(crate::rd_client::TorrentInfo, MediaMetadata)],
+    fileless: Vec<(usize, String)>,
+) {
+    let now = tokio::time::Instant::now();
+    let mut next = HashMap::new();
+    let mut fetched = 0usize;
+    for (idx, id) in fileless {
+        let due = match state.info_refresh.get(&id) {
+            None => {
+                next.insert(id, now + INFO_REFRESH_AFTER);
+                continue;
+            }
+            Some(&at) => at,
+        };
+        if now < due || fetched >= MAX_INFO_REFRESHES_PER_TICK {
+            next.insert(id, due);
+            continue;
+        }
+        fetched += 1;
+        match provider.get_torrent_info(&id).await {
+            Ok(fresh) if !crate::vfs::emittable_video_files(&fresh).is_empty() => {
+                let metadata = current_data[idx].1.clone();
+                info!(
+                    "scan: torrent {} ({}) lists its files again; refreshing its cached identification",
+                    id, fresh.filename
+                );
+                if let Err(e) = store
+                    .put_matches(vec![(id.clone(), fresh.clone(), metadata.clone())])
+                    .await
+                {
+                    warn!(
+                        "scan: failed to persist the refreshed files of {}: {}",
+                        id, e
+                    );
+                }
+                state
+                    .seen_torrents
+                    .insert(id, (fresh.clone(), metadata.clone()));
+                current_data[idx] = (fresh, metadata);
+            }
+            Ok(_) => {
+                debug!("scan: torrent {} still lists no video file", id);
+                next.insert(id, now + INFO_REFRESH_AFTER);
+            }
+            Err(e) => {
+                debug!("scan: refreshing the files of {} failed: {}", id, e);
+                next.insert(id, now + INFO_REFRESH_AFTER);
+            }
+        }
+    }
+    state.info_refresh = next;
 }
 
 /// How a [`scan_tick`] ended.
@@ -473,9 +555,14 @@ async fn scan_tick(
     // (which would tell Jellyfin it was deleted, then re-added).
     let mut retry_fallbacks: HashMap<String, MediaMetadata> = HashMap::new();
     let mut retry_slots: HashMap<String, usize> = HashMap::new();
+    // Cached identifications listing no emittable video file, with their index in `current_data`.
+    let mut fileless: Vec<(usize, String)> = Vec::new();
     for torrent in &deduped_torrents {
         if torrent.status == "downloaded" {
             if let Some(data) = state.seen_torrents.get(&torrent.id) {
+                if crate::vfs::emittable_video_files(&data.0).is_empty() {
+                    fileless.push((current_data.len(), torrent.id.clone()));
+                }
                 current_data.push(data.clone());
             } else if let Some(old_id) = repair_replacements.get(&torrent.id) {
                 // This torrent is a repair replacement — reuse old identification
@@ -528,6 +615,9 @@ async fn scan_tick(
                 let cached = store.get_match(torrent.id.clone()).await;
 
                 if let Some(data) = cached {
+                    if crate::vfs::emittable_video_files(&data.0).is_empty() {
+                        fileless.push((current_data.len(), torrent.id.clone()));
+                    }
                     state.seen_torrents.insert(torrent.id.clone(), data.clone());
                     current_data.push(data);
                 } else {
@@ -541,6 +631,8 @@ async fn scan_tick(
             }
         }
     }
+
+    refresh_fileless_infos(provider.as_ref(), store, state, &mut current_data, fileless).await;
 
     if !to_identify.is_empty() {
         let new_total = to_identify.len();
@@ -873,11 +965,17 @@ const REFRESH_BUFFER_SECS: u64 = 3_600;
 /// written as finished: a movie as not watched, a show as `trakt_behind`. Trakt drops a title from
 /// `/sync/playback` once it has been watched through, so the only playback title the watch history
 /// reads as finished is a paused re-watch. Trigger A would delete it from under the viewer and then
-/// refuse to re-acquire it while the pause lasts. A playback show's watched set also leaves out its
-/// paused episode ([`crate::trakt_client::TraktItem::paused_episode`]) and every later one: a
-/// re-watch begun without resetting Trakt progress has every episode watched, so the catch-up skip
-/// set would otherwise acquire none of it, not even an episode lapsed since. It acquires from the
-/// pause on, and on a first watch nothing changes (those episodes are unwatched).
+/// refuse to re-acquire it while the pause lasts. A paused re-watch of a show also has its watched
+/// set cut at the pause: a re-watch begun without resetting Trakt progress has every episode
+/// watched, so the catch-up skip set would otherwise acquire none of it, not even an episode lapsed
+/// since. A pause ([`crate::trakt_client::TraktItem::paused`]) is a re-watch position only when its
+/// episode had been watched BEFORE it was paused (its `last_watched_at`,
+/// [`crate::trakt_client::WatchedShow::episode_watched_at`], is earlier than its `paused_at`): the
+/// earliest such pause and every later episode then leave the watched set, so the re-watch
+/// acquires from the pause on. Any other pause (an episode never watched, as in a first watch
+/// stopped during the credits and never scrobbled, or one watched after it was paused) leaves the
+/// watched set as it is, so a first watch with an abandoned pause acquires only its unwatched
+/// episodes, never the ones watched since.
 /// `catchup_cutoff`: a Unix timestamp (seconds) bounding the **catch-up** source — a show you've
 /// watched is auto-wanted (so the reconciler acquires every aired episode you haven't watched,
 /// including ones that aired before your last watch) only if you last watched it at/after this
@@ -908,8 +1006,8 @@ pub(crate) fn build_wanted(
         in_progress: bool,
         /// In the user's `/sync/playback`: partway through it (see the doc above).
         playback: bool,
-        /// A playback show's earliest paused episode ([`crate::trakt_client::TraktItem`]).
-        paused_episode: Option<(u32, u32)>,
+        /// A playback show's pauses ([`crate::trakt_client::TraktItem::paused`]).
+        paused: Vec<((u32, u32), i64)>,
         /// First non-empty IMDB id seen for this title across its source rows.
         imdb_id: Option<String>,
     }
@@ -926,7 +1024,7 @@ pub(crate) fn build_wanted(
                 watchlist: false,
                 in_progress: false,
                 playback: false,
-                paused_episode: None,
+                paused: Vec::new(),
                 imdb_id: None,
             });
         a.watchlist = true;
@@ -942,15 +1040,12 @@ pub(crate) fn build_wanted(
                 watchlist: false,
                 in_progress: false,
                 playback: false,
-                paused_episode: None,
+                paused: Vec::new(),
                 imdb_id: None,
             });
         a.in_progress = true;
         a.playback = true;
-        a.paused_episode = match (a.paused_episode, item.paused_episode) {
-            (Some(x), Some(y)) => Some(x.min(y)),
-            (x, y) => x.or(y),
-        };
+        a.paused.extend(item.paused.iter().copied());
         if a.imdb_id.is_none() {
             a.imdb_id = item.imdb_id.clone();
         }
@@ -983,7 +1078,7 @@ pub(crate) fn build_wanted(
                 watchlist: false,
                 in_progress: false,
                 playback: false,
-                paused_episode: None,
+                paused: Vec::new(),
                 imdb_id: None,
             });
         // Carry Trakt's IMDB id so a catch-up-ONLY show (not watchlisted/in-progress, so no
@@ -1019,16 +1114,27 @@ pub(crate) fn build_wanted(
                     None,
                 ),
                 MediaType::Show => {
-                    // A paused re-watch resumes at its paused episode: that one and every later
-                    // one are not counted as watched, so the catch-up skip set lets it acquire
-                    // from the pause on (on a first watch they are unwatched anyway).
+                    // A paused re-watch resumes at its earliest pause on an episode watched before
+                    // it was paused: that episode and every later one are not counted as watched,
+                    // so the catch-up skip set lets it acquire from the pause on. Any other pause
+                    // (an unwatched episode: an abandoned first-watch pause) changes nothing.
                     let watched_episodes = watched_by_id
                         .get(&tmdb_id)
                         .map(|s| {
+                            let watched_at: HashMap<(u32, u32), i64> =
+                                s.episode_watched_at.iter().copied().collect();
+                            let resume = a
+                                .paused
+                                .iter()
+                                .filter(|(episode, paused_at)| {
+                                    watched_at.get(episode).is_some_and(|at| at < paused_at)
+                                })
+                                .map(|(episode, _)| *episode)
+                                .min();
                             s.watched_episodes
                                 .iter()
                                 .copied()
-                                .filter(|e| a.paused_episode.is_none_or(|p| *e < p))
+                                .filter(|e| resume.is_none_or(|p| *e < p))
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -1437,8 +1543,10 @@ async fn sync_trakt_user(
     }
 
     // Finish-cleanup candidates = caught-up (per Trakt's OWN progress signal) + owned + ENDED. These
-    // aren't "behind" for acquisition, but folding them into the wanted-set lets the reconciler's
-    // Trigger-A finish removal fire. Trigger A / the Show acquire-guard are decided by `user_finished`
+    // aren't "behind" for acquisition, but folding them into the wanted-set lets the episode
+    // monitor's (`monitor_episodes`) Trigger-A finish removal fire on its next run (every
+    // TRAKT_EPISODE_CHECK_INTERVAL_SECS, idle-gated; the Trakt cycle's `reconcile_wanted` does only
+    // Trigger B for shows). Trigger A / the Show acquire-guard are decided by `user_finished`
     // over the TMDB aired set, so the fold removes the show AND the acquire path acquires nothing ONLY
     // when TMDB and Trakt agree on the aired episodes. If TMDB lists an aired episode that Trakt's
     // watched set lacks (specials/numbering drift), the TMDB-authoritative reconcile instead treats
@@ -1572,7 +1680,9 @@ fn kind_of(media_type: &MediaType) -> MediaKind {
 /// and for the backfill of older records that have none ([`backfill_owned_quality`]) — with every
 /// axis the file name leaves untagged filled from the TORRENT name (an axis the file name tags
 /// wins). `None` only when there is no such video file (a lapsed TorBox entry lists none: it stays
-/// unknown-lowest, so a playable copy is never removed in its favour). Every axis neither name tags
+/// unknown-lowest, so a playable copy is never removed in its favour; once the entry lists its files
+/// again the scan loop refreshes its cached identification, `refresh_fileless_infos`, and
+/// [`backfill_owned_quality`] fills the quality in). Every axis neither name tags
 /// is recorded as 0 — UNKNOWN, the lowest at its resolution (see
 /// [`crate::release::is_unknown_quality`]), so a known cached release may replace it. A file ABOVE
 /// the resolution ceiling keeps its real resolution ([`QualitySummary::of_owned`]): recording it as
@@ -1700,9 +1810,11 @@ pub(crate) async fn backfill_owned_quality(
 /// episode monitor then plans every aired episode it holds again on every run (each one a scrape
 /// and a provider listing that `acquire` answers with the very same pack). `infos` carries the file
 /// lists cached when each torrent was first identified (`seen_torrents` / the `matches` cache, not
-/// re-fetched while the torrent id stays listed), so this heals only names the parser has since
-/// learned, and records whose match was re-identified; a record captured from a listing with no
-/// files stays empty, and `monitor_episodes`' `AssumedCoverage` covers for it. Only `Verified` show
+/// re-fetched while the torrent id stays listed, except a list with no emittable video file, which
+/// `refresh_fileless_infos` fetches again hourly until its files are back), so this heals names the
+/// parser has since learned, records whose match was re-identified, and a record captured from a
+/// listing with no files once its files are back; until then `monitor_episodes`' `AssumedCoverage`
+/// covers for it. Only `Verified` show
 /// records are touched (a `Pending` one's `provides` is `observe`'s to settle), and only while the
 /// store still has an empty `provides` ([`Store::set_provides_if_empty`] — atomic, never
 /// overwrites). Run by the scan loop's account-mirror pass. Returns how many were filled.
@@ -1921,17 +2033,34 @@ pub(crate) fn is_multi_feature_collection(info: &crate::rd_client::TorrentInfo) 
 }
 
 /// Whether `info` holds an emittable video file ([`crate::vfs::emittable_video_files`]) whose name
-/// carries no episode code: `vfs::parse_se_all` reads nothing in its basename (an OVA or special
-/// named without one, a `Season 02/E01 - Title.mkv`, an anime absolute number). A show copy's
-/// `provides` leaves such a file out, yet the VFS shows it (in the season its folder or name
-/// gives), so no other copy's coverage accounts for it. [`plan_dedup`] never removes a show hash
-/// holding one, and the upgrade engine never prunes one in a show swap.
-pub(crate) fn holds_codeless_video(info: &crate::rd_client::TorrentInfo) -> bool {
+/// carries no episode code (`vfs::parse_se_all` reads nothing in its basename: an OVA or special
+/// named without one, a `Season 02/E01 - Title.mkv`, an anime absolute number) and that the copy's
+/// own record, providing `provides`, doesn't account for. Such a file is shown by the VFS (in the
+/// season its folder or name gives), yet no other copy's coverage accounts for it, so
+/// [`plan_dedup`] never removes a show hash holding one, and the upgrade engine never prunes one in
+/// a show swap. A code-less file is accounted for when the acquisition engine maps it to an episode
+/// in `provides` ([`crate::acquire::codeless_episode_files`]), as `observe` records an engine copy
+/// of an absolute-numbered single or a code-less pack: that file is the episode's copy like any
+/// coded one. An account-mirror record never lists such an episode (its `provides` comes from
+/// episode codes alone), so the user's own code-less copies stay protected.
+pub(crate) fn holds_codeless_video(
+    info: &crate::rd_client::TorrentInfo,
+    provides: &[(u32, u32)],
+) -> bool {
+    let accounted: std::collections::HashSet<String> = if provides.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        crate::acquire::codeless_episode_files(info)
+            .into_iter()
+            .filter(|(s, e, _)| provides.contains(&(*s, *e)))
+            .map(|(_, _, path)| path)
+            .collect()
+    };
     crate::vfs::emittable_video_files(info)
         .into_iter()
         .any(|f| {
             let base = f.path.rsplit('/').next().unwrap_or(&f.path);
-            crate::vfs::parse_se_all(base).is_empty()
+            crate::vfs::parse_se_all(base).is_empty() && !accounted.contains(&f.path)
         })
 }
 
@@ -2457,8 +2586,10 @@ pub(crate) struct DedupPlan {
 ///   remove; otherwise keep it. Complementary packs/episodes are therefore all kept. A show hash with
 ///   **empty `provides`** (unknown coverage) is **always kept**, never removed on a guess. So is one
 ///   whose files (from `files`) include an emittable video file with no episode code in its name
-///   (an OVA, a `Season 02/E01 - Title.mkv`, an anime absolute number): `provides` leaves that file
-///   out, yet the VFS shows it, so no other copy's coverage accounts for it.
+///   (an OVA, a `Season 02/E01 - Title.mkv`, an anime absolute number) that its record's `provides`
+///   doesn't account for ([`holds_codeless_video`]): the VFS shows that file, so no other copy's
+///   coverage accounts for it. An engine copy whose code-less file `observe` mapped to an episode it
+///   provides is judged like any other.
 ///
 /// Keep-priority (highest kept first): QUALITY first — [`crate::release::quality_rank`]:
 /// resolution, then source tier, then checked before `unverified` (an untagged axis is 0, so an
@@ -2482,11 +2613,11 @@ pub(crate) struct DedupPlan {
 /// `ALLOW_RESOLUTION_DOWNGRADE`). A `Manual`-provenance copy is never removed (invariant M-1), and
 /// neither is a movie hash in `collections` (a multi-film collection, [`multi_feature_hashes`]: no
 /// kept copy provides the other films in it); nor does a collection count as the film's keep, so it
-/// never makes a single-film copy redundant. Only groups with at least one removal are returned. Absent (not-`present`)
-/// hashes are ignored entirely — they're already gone, never a removal target or coverage source —
-/// and so are unsettled (`Pending`) ones: only `Verified` copies are ranked, kept, removed or count
-/// as coverage, so a still-downloading or not-yet-checked acquisition never displaces a playable
-/// copy (and is judged once `observe` settles it).
+/// never makes a single-film copy redundant. Only groups with at least one removal are returned.
+/// Absent (not-`present`) hashes are ignored entirely — they're already gone, never a removal
+/// target or coverage source — and so are unsettled (`Pending`) ones: only `Verified` copies are
+/// ranked, kept, removed or count as coverage, so a still-downloading or not-yet-checked
+/// acquisition never displaces a playable copy (and is judged once `observe` settles it).
 pub(crate) fn plan_dedup(
     owned: &[(String, OwnedRecord)],
     present: &std::collections::HashSet<String>,
@@ -2576,13 +2707,13 @@ pub(crate) fn plan_dedup(
                     .map(|(h, r)| (h.as_str(), rank_of(r)))
                     .collect();
                 // Hashes whose files are known and include an emittable video file with no
-                // episode code ([`holds_codeless_video`]).
+                // episode code that their record doesn't account for ([`holds_codeless_video`]).
                 let uncoded: HashSet<&str> = hashes
                     .iter()
-                    .filter(|(h, _)| {
+                    .filter(|(h, r)| {
                         files
                             .get(h.as_str())
-                            .is_some_and(|info| holds_codeless_video(info))
+                            .is_some_and(|info| holds_codeless_video(info, &r.provides))
                     })
                     .map(|(h, _)| h.as_str())
                     .collect();
@@ -2942,8 +3073,9 @@ pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> V
                     match action {
                         Action::AcquireMovie { tmdb_id } => {
                             let mut prov = provenance_from_wanted(&wanted);
-                            // Preserve existing provenance (esp. Manual) on a lapsed re-acquire so a manually-owned
-                            // title can't have its Manual origin — and thus its never-auto-remove guard — silently erased.
+                            // Preserve existing provenance (esp. Manual) on a lapsed re-acquire so a
+                            // manually-owned title can't have its Manual origin — and thus its
+                            // never-auto-remove guard — silently erased.
                             if let Some(g) = owned_group {
                                 prov.merge(&g.provenance);
                             }
@@ -2968,9 +3100,9 @@ pub(crate) async fn plan_reconcile_ops(store: &Store, torrents: &[Torrent]) -> V
                                 // must not delete the user's pre-existing library. `removal_hashes`
                                 // enforces this via the group's media_type.
                                 let hashes = removal_hashes(g, reason, false);
-                                // A mirror-only movie resolves to zero hashes — don't emit a no-op
-                                // Remove every tick (it would just churn an empty op + a full
-                                // selection-table read in `execute_remove`).
+                                // A mirror-only movie resolves to zero hashes: don't emit a no-op
+                                // Remove every tick (it would only churn an empty op through
+                                // `execute_remove`).
                                 if !hashes.is_empty() {
                                     ops.push(ReconcileOp::Remove { tmdb_id, hashes });
                                 }
@@ -5114,7 +5246,7 @@ mod tests {
         let store = Store::in_memory();
         let tmdb = TmdbClient::offline().await;
         store
-            .put_staging_intent("hstaging".into(), 1)
+            .claim_staging_intent("hstaging".into(), 1)
             .await
             .unwrap();
         let prefs = crate::config::AcquisitionConfig::default().prefs;
@@ -5652,6 +5784,71 @@ mod tests {
             vec!["a".to_string()],
             "control: the second sweep removes the equal-rank pack B covers"
         );
+    }
+
+    /// An engine copy of an absolute-numbered single (`[Group] Show - 12 (720p).mkv`, which
+    /// `observe` recorded as providing S01E12) accounts for its code-less file, so a better coded
+    /// copy of S01E12 makes it redundant. The user's own copy of the same torrent (an account-mirror
+    /// record, whose `provides` comes from episode codes alone and is empty) is kept.
+    #[test]
+    fn plan_dedup_removes_an_engine_codeless_single_but_keeps_a_mirror_one() {
+        use crate::scraper::MediaKind;
+        let info = |hash: &str, path: &str| crate::rd_client::TorrentInfo {
+            hash: hash.into(),
+            status: "downloaded".into(),
+            files: vec![crate::rd_client::TorrentFile {
+                id: 0,
+                path: path.into(),
+                bytes: 2_000_000_000,
+                selected: 1,
+            }],
+            ..Default::default()
+        };
+        for (provenance, provides, removed) in [
+            (
+                Provenance::watchlist("u"),
+                vec![(1, 12)],
+                vec!["a".to_string()],
+            ),
+            (Provenance { entries: vec![] }, vec![], vec![]),
+        ] {
+            let owned = vec![
+                (
+                    "a".to_string(),
+                    qrec(
+                        MediaKind::Series,
+                        7,
+                        provides.clone(),
+                        Some(qs(720, 3_000, 1)),
+                        provenance,
+                    ),
+                ),
+                (
+                    "b".to_string(),
+                    qrec(
+                        MediaKind::Series,
+                        7,
+                        vec![(1, 12)],
+                        Some(qs(1080, 6_000, 1)),
+                        Provenance { entries: vec![] },
+                    ),
+                ),
+            ];
+            let a = info("a", "[Group] Show - 12 (720p) [ABCD1234].mkv");
+            let b = info("b", "Show.S01E12.1080p.BluRay.mkv");
+            let files: HashMap<String, &crate::rd_client::TorrentInfo> =
+                [("a".to_string(), &a), ("b".to_string(), &b)]
+                    .into_iter()
+                    .collect();
+            let plans = plan_dedup(
+                &owned,
+                &hset(&["a", "b"]),
+                &hset(&[]),
+                &std::collections::HashSet::new(),
+                &files,
+            );
+            assert_eq!(removed_for(&plans, 7), removed, "provides {provides:?}");
+        }
     }
 
     /// Only SELECTED feature-sized videos count: a collection with one film selected is a
@@ -6803,7 +7000,7 @@ mod trakt_sync_tests {
             media_type,
             tmdb_id,
             imdb_id: None,
-            paused_episode: None,
+            paused: Vec::new(),
         }
     }
 
@@ -6812,7 +7009,7 @@ mod trakt_sync_tests {
             media_type,
             tmdb_id,
             imdb_id: Some(imdb_id.to_string()),
-            paused_episode: None,
+            paused: Vec::new(),
         }
     }
 
@@ -6880,6 +7077,7 @@ mod trakt_sync_tests {
                 trakt_id: None,
                 imdb_id: None,
                 watched_episodes: vec![(1, 1), (1, 2)],
+                episode_watched_at: Vec::new(),
                 last_watched_at: None,
             }],
         };
@@ -7042,6 +7240,7 @@ mod trakt_sync_tests {
                 trakt_id: Some(1390),
                 imdb_id: None,
                 watched_episodes: vec![(1, 1)],
+                episode_watched_at: Vec::new(),
                 last_watched_at: Some(1_000_000),
             }],
         };
@@ -7110,6 +7309,7 @@ mod trakt_sync_tests {
                 trakt_id: Some(1390),
                 imdb_id: Some("tt0903747".into()),
                 watched_episodes: vec![(1, 1)],
+                episode_watched_at: Vec::new(),
                 last_watched_at: Some(1_000_000),
             }],
         };
@@ -7135,6 +7335,7 @@ mod trakt_sync_tests {
                 trakt_id: Some(1390),
                 imdb_id: None,
                 watched_episodes: vec![(1, 1)],
+                episode_watched_at: Vec::new(),
                 last_watched_at: Some(1_000_000),
             }],
         };
@@ -7223,6 +7424,7 @@ mod trakt_sync_tests {
                     trakt_id: Some(100),
                     imdb_id: None,
                     watched_episodes: vec![(1, 1)],
+                    episode_watched_at: Vec::new(),
                     last_watched_at: Some(1_000_000),
                 },
                 WatchedShow {
@@ -7230,6 +7432,7 @@ mod trakt_sync_tests {
                     trakt_id: Some(200),
                     imdb_id: None,
                     watched_episodes: vec![(1, 1)],
+                    episode_watched_at: Vec::new(),
                     last_watched_at: Some(1_000_000),
                 },
             ],
@@ -7325,6 +7528,7 @@ mod trakt_sync_tests {
             trakt_id: Some(trakt_id),
             imdb_id: None,
             watched_episodes: vec![(1, 1)],
+            episode_watched_at: Vec::new(),
             last_watched_at: Some(1_000_000),
         };
         let caught_up = ShowProgress {
@@ -7412,6 +7616,7 @@ mod trakt_sync_tests {
             trakt_id,
             imdb_id: None,
             watched_episodes: vec![(1, 1)],
+            episode_watched_at: Vec::new(),
             last_watched_at: Some(1_000_000),
         };
         let trakt: Arc<dyn TraktClient> = Arc::new(MockTrakt {
@@ -9059,7 +9264,7 @@ mod reconcile_wanted_tests {
             media_type: MediaType::Movie,
             tmdb_id: 27205,
             imdb_id: None,
-            paused_episode: None,
+            paused: Vec::new(),
         }];
         let watched = WatchedData {
             movies: vec![27205],
@@ -9118,7 +9323,7 @@ mod reconcile_wanted_tests {
             media_type: MediaType::Show,
             tmdb_id: 100,
             imdb_id: None,
-            paused_episode: None,
+            paused: Vec::new(),
         }];
         let watched = WatchedData {
             movies: vec![],
@@ -9127,6 +9332,7 @@ mod reconcile_wanted_tests {
                 trakt_id: Some(1),
                 imdb_id: None,
                 watched_episodes: vec![(1, 1), (1, 2)],
+                episode_watched_at: Vec::new(),
                 last_watched_at: Some(1_000),
             }],
         };
@@ -9152,33 +9358,16 @@ mod reconcile_wanted_tests {
 
     /// A paused re-watch of a show begun without resetting Trakt progress reads every aired episode
     /// as watched, so the catch-up skip set dropped them all: an episode lapsed or deleted since was
-    /// never acquired again, and an unowned show nothing at all. The sync drops the paused episode
-    /// and every later one from that row's watched set, so the re-watch gets everything from the
-    /// pause on, and nothing before it (a first watch is unchanged: those episodes are unwatched).
+    /// never acquired again, and an unowned show nothing at all. A pause on an episode the user had
+    /// watched BEFORE pausing it is where the re-watch resumes, so the sync drops that episode and
+    /// every later one from the row's watched set: the re-watch gets everything from the pause on,
+    /// and nothing before it.
     #[test]
     fn a_paused_rewatch_of_a_show_acquires_from_the_paused_episode_on() {
-        use crate::trakt_client::{TraktItem, WatchedData, WatchedShow};
         use crate::wanted::Action;
-        let playback = [TraktItem {
-            media_type: MediaType::Show,
-            tmdb_id: 100,
-            imdb_id: None,
-            paused_episode: Some((1, 3)),
-        }];
         let all = vec![(1, 1), (1, 2), (1, 3), (1, 4), (2, 1)];
-        let watched = WatchedData {
-            movies: vec![],
-            shows: vec![WatchedShow {
-                tmdb_id: 100,
-                trakt_id: Some(1),
-                imdb_id: None,
-                watched_episodes: all.clone(),
-                last_watched_at: Some(1_000),
-            }],
-        };
-        let status = HashMap::from([(100u64, ShowStatus::Ended)]);
-        let rows = build_wanted("alice", &[], &playback, &watched, &status, None, None);
-        assert_eq!(rows.len(), 1);
+        // Every episode watched at t=1_000; S01E03 paused at t=5_000 on the re-watch.
+        let rows = paused_show_rows(&all, 1_000, &[((1, 3), 5_000)]);
         assert_eq!(
             rows[0].watched_state,
             WatchedState::Show {
@@ -9216,6 +9405,84 @@ mod reconcile_wanted_tests {
             plan_episode_actions(100, &rows, Some(&owned), &present, &aired, false),
             acquire(&[(1, 4)])
         );
+    }
+
+    /// `build_wanted` rows for show 100 in alice's `/sync/playback` with `pauses`, whose watched
+    /// episodes `watched` were each last watched at `watched_at`.
+    fn paused_show_rows(
+        watched: &[(u32, u32)],
+        watched_at: i64,
+        pauses: &[((u32, u32), i64)],
+    ) -> Vec<crate::store::WantedRecord> {
+        use crate::trakt_client::{TraktItem, WatchedData, WatchedShow};
+        let playback = [TraktItem {
+            media_type: MediaType::Show,
+            tmdb_id: 100,
+            imdb_id: None,
+            paused: pauses.to_vec(),
+        }];
+        let watched = WatchedData {
+            movies: vec![],
+            shows: vec![WatchedShow {
+                tmdb_id: 100,
+                trakt_id: Some(1),
+                imdb_id: None,
+                watched_episodes: watched.to_vec(),
+                episode_watched_at: watched.iter().map(|e| (*e, watched_at)).collect(),
+                last_watched_at: Some(watched_at),
+            }],
+        };
+        let status = HashMap::from([(100u64, ShowStatus::Ended)]);
+        let rows = build_wanted("alice", &[], &playback, &watched, &status, None, None);
+        assert_eq!(rows.len(), 1);
+        rows
+    }
+
+    /// A pause is a re-watch position only on an episode watched before it was paused. A first
+    /// watch that left S01E03 paused (stopped in the credits, never scrobbled) and then watched
+    /// S01E04 onwards elsewhere keeps its watched set: only S01E03 is acquired, never the episodes
+    /// watched since. Nor does a pause on an episode watched AFTER it (finished later) cut anything.
+    /// With a stale abandoned pause and a real re-watch pause, the re-watch's decides.
+    #[test]
+    fn only_a_pause_on_an_episode_watched_before_it_marks_a_rewatch() {
+        use crate::wanted::Action;
+        let aired_pairs = vec![(1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (2, 1)];
+        let aired = AiredEpisodes {
+            pairs: aired_pairs.clone(),
+            complete: true,
+        };
+        let none = std::collections::HashSet::new();
+        let watched_of = |rows: &[crate::store::WantedRecord]| match &rows[0].watched_state {
+            WatchedState::Show {
+                watched_episodes, ..
+            } => watched_episodes.clone(),
+            other => panic!("{other:?}"),
+        };
+
+        // (a) First watch, an abandoned pause on the unwatched S01E03 (t=2_000), S01E04+ watched
+        // later (t=9_000).
+        let first_watch = vec![(1, 1), (1, 2), (1, 4), (1, 5), (2, 1)];
+        let rows = paused_show_rows(&first_watch, 9_000, &[((1, 3), 2_000)]);
+        assert_eq!(watched_of(&rows), first_watch, "watched set unchanged");
+        assert_eq!(
+            plan_episode_actions(100, &rows, None, &none, &aired, false),
+            vec![Action::AcquireEpisode {
+                tmdb_id: 100,
+                season: 1,
+                episode: 3
+            }],
+            "only the unwatched episode"
+        );
+
+        // (b) A pause on an episode last watched after the pause: not a re-watch position.
+        let rows = paused_show_rows(&aired_pairs, 9_000, &[((1, 3), 2_000)]);
+        assert_eq!(watched_of(&rows), aired_pairs);
+
+        // (c) A stale abandoned pause at S01E02 (unwatched) plus a re-watch pause at S01E04
+        // (watched at t=1_000, paused at t=5_000): cut at S01E04.
+        let watched = vec![(1, 1), (1, 3), (1, 4), (1, 5), (2, 1)];
+        let rows = paused_show_rows(&watched, 1_000, &[((1, 2), 500), ((1, 4), 5_000)]);
+        assert_eq!(watched_of(&rows), vec![(1, 1), (1, 3)]);
     }
 
     #[tokio::test]
@@ -11517,6 +11784,73 @@ mod scan_tick_tests {
         assert!(state.seen_torrents.is_empty());
     }
 
+    /// TorBox can report a finished torrent with no files (a lapsed entry, a transient
+    /// `files: null`), and the scan loop kept the file list it first saw for as long as the id
+    /// stayed listed: the torrent never reached the VFS and its mirror record never got a quality,
+    /// even once its files were back. Such an identification is fetched again once it is due, and
+    /// a fresh list with a video file replaces it (identification kept). A cached list that holds a
+    /// file is never refreshed, so a fetch that lists none can't empty it.
+    #[tokio::test]
+    async fn a_cached_identification_with_no_files_is_refreshed_once_its_files_are_back() {
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let store = Store::in_memory();
+        let full = info("t1", "h1", &[("Film.2001.1080p.BluRay.mkv", 2_000_000_000)]);
+        let kept = info("t2", "h2", &[("Other.2002.720p.WEB.mkv", 1_000_000_000)]);
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![listed("t1", "h1"), listed("t2", "h2")],
+            torrent_info_by_id: HashMap::from([
+                ("t1".to_string(), full.clone()),
+                ("t2".to_string(), info("t2", "h2", &[])),
+            ]),
+            ..Default::default()
+        });
+        let app = app(store.clone(), provider, None, false).await;
+        let seen = HashMap::from([
+            ("t1".to_string(), (info("t1", "h1", &[]), movie_meta(1))),
+            ("t2".to_string(), (kept.clone(), movie_meta(2))),
+        ]);
+        let mut state = ScanState::new(seen, 60);
+
+        let first = done(scan_tick(&app, &mut state, &mut shutdown).await);
+        assert!(first[0].0.files.is_empty(), "not due yet");
+        assert_eq!(
+            store.get_owned("h1".into()).await.unwrap().quality,
+            None,
+            "no video file, no quality"
+        );
+
+        // Due: the fresh list replaces the cached one, and the mirror record gets its quality.
+        *state.info_refresh.get_mut("t1").unwrap() = tokio::time::Instant::now();
+        let second = done(scan_tick(&app, &mut state, &mut shutdown).await);
+        let paths = |i: &TorrentInfo| i.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
+        assert_eq!(paths(&second[0].0), paths(&full));
+        assert_eq!(second[0].1, movie_meta(1), "the identification is kept");
+        assert_eq!(
+            paths(&second[1].0),
+            paths(&kept),
+            "a cached list with files is kept"
+        );
+        assert_eq!(paths(&state.seen_torrents["t1"].0), paths(&full));
+        assert_eq!(
+            paths(&store.get_match("t1".into()).await.unwrap().0),
+            paths(&full),
+            "persisted"
+        );
+        assert_eq!(
+            store
+                .get_owned("h1".into())
+                .await
+                .unwrap()
+                .quality
+                .map(|q| q.resolution),
+            Some(1080)
+        );
+        assert!(
+            !state.info_refresh.contains_key("t1"),
+            "a refreshed torrent is no longer watched"
+        );
+    }
+
     /// A torrent TMDB couldn't identify is retried in place: when its retry is due it keeps its
     /// position in the tick's data (where the VFS checkpoints show it under its fallback) and its
     /// new result replaces it there — never dropped, never listed twice.
@@ -11627,7 +11961,7 @@ mod scan_tick_tests {
     async fn the_staging_sweep_drops_swept_torrents_from_the_tick() {
         let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
         let store = Store::in_memory();
-        store.put_staging_intent("hcut".into(), 50).await.unwrap();
+        store.claim_staging_intent("hcut".into(), 50).await.unwrap();
         // Left by an earlier process.
         store.forget_local_staging_intents();
         let seen = HashMap::from([
@@ -11675,7 +12009,7 @@ mod scan_tick_tests {
         let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
         let store = Store::in_memory();
         store
-            .put_staging_intent("hstage".into(), crate::now_unix_secs())
+            .claim_staging_intent("hstage".into(), crate::now_unix_secs())
             .await
             .unwrap();
         let infos = [
@@ -11792,7 +12126,7 @@ mod scan_tick_tests {
         let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
         let store = Store::in_memory();
         store
-            .put_staging_intent("hstage".into(), crate::now_unix_secs())
+            .claim_staging_intent("hstage".into(), crate::now_unix_secs())
             .await
             .unwrap();
         let infos = [

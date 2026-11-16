@@ -39,7 +39,7 @@ use crate::vfs::MediaType;
 pub struct Owned {
     pub hash: String,
     pub provenance: Provenance,
-    pub available: bool, // false → cache lapsed / missing / 503 → re-acquire
+    pub available: bool, // false → no copy present or pending in the listing → re-acquire
     pub owned_episodes: Vec<(u32, u32)>, // shows: every (season, episode) the group owns
     pub covered_episodes: Vec<(u32, u32)>, // shows: owned episodes a present/pending copy supplies
 }
@@ -321,8 +321,9 @@ pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
             // unseen by any wanting user is still acquired so that user can catch up — a union here
             // would skip episodes one user watched elsewhere even though another hasn't seen them
             // (under-acquisition for multi-user households). A paused re-watch (a show still in
-            // `/sync/playback`) is written without its paused episode and every later one in its
-            // watched set (`tasks::build_wanted`), so it acquires from the pause on.
+            // `/sync/playback`, paused on an episode watched before the pause) is written without
+            // that episode and every later one in its watched set (`tasks::build_wanted`), so it
+            // acquires from the pause on.
             let watched: std::collections::HashSet<(u32, u32)> = if watchlisted {
                 std::collections::HashSet::new()
             } else {
@@ -641,8 +642,9 @@ mod tests {
     fn paused_show_rewatch_acquires_from_the_paused_episode_on() {
         // A paused re-watch (still in /sync/playback) of a fully watched show: the sync drops the
         // paused episode (S01E03) and every later one from the row's watched set, so only S01E01-02
-        // stay watched. Unowned, it acquires S01E03 on; owned with S01E01 and S01E03 lapsed, it
-        // restores S01E03 (at or after the pause) but not the already re-watched S01E01.
+        // stay watched. Unowned, it acquires S01E03 on; owned with S01E01 and S01E03 lapsed (owned,
+        // but no present or pending copy supplies them), it restores S01E03 (at or after the pause)
+        // but not the already re-watched S01E01.
         let aired = vec![(1, 1), (1, 2), (1, 3), (1, 4)];
         let rewatch = || {
             vec![behind_show_record(
@@ -661,15 +663,31 @@ mod tests {
             reconcile_title(&show_title(5, rewatch(), None, aired.clone())),
             vec![ep(3), ep(4)]
         );
-        let lapsed = owned(
-            "h",
-            Provenance::in_progress("alice"),
-            true,
-            vec![(1, 2), (1, 4)],
-        );
+        let lapsed = |provenance| Owned {
+            hash: "h".into(),
+            provenance,
+            available: true,
+            owned_episodes: aired.clone(),
+            covered_episodes: vec![(1, 2), (1, 4)],
+        };
         assert_eq!(
-            reconcile_title(&show_title(5, rewatch(), Some(lapsed), aired)),
+            reconcile_title(&show_title(
+                5,
+                rewatch(),
+                Some(lapsed(Provenance::in_progress("alice"))),
+                aired.clone()
+            )),
             vec![ep(3)]
+        );
+        // A manual show also restores the watched, lapsed S01E01.
+        assert_eq!(
+            reconcile_title(&show_title(
+                5,
+                rewatch(),
+                Some(lapsed(Provenance::manual())),
+                aired.clone()
+            )),
+            vec![ep(1), ep(3)]
         );
     }
 

@@ -1,9 +1,11 @@
-//! Background-job scheduler. Splits the single `run_scan_loop` spawn into cooperating periodic
-//! tasks over a shared [`AppState`]:
+//! Background-job scheduler: cooperating jobs over a shared [`AppState`].
 //!
-//! - **Scan task** = `run_scan_loop`: per tick, sharing one `get_torrents`, the account sync (VFS
-//!   mirror) + acquisition verification (`engine.observe`), plus (SP3) `record_mirror_owned` and
-//!   `dedup_owned`. Cadence: `SCAN_INTERVAL_SECS`.
+//! - **Scan task** = `run_scan_loop`, supervised (restarted after a panic), running
+//!   `tasks::scan_tick` every `SCAN_INTERVAL_SECS`; see `scan_tick` for its steps. Two of them run
+//!   on every trusted listing whatever the operator flags say, and can delete torrents: the
+//!   staging sweep (`upgrade::sweep_staging_intents`) and the same-hash duplicate deletion
+//!   (`tasks::dedup_torrents_by_hash`, idle-gated). `observe` deletes rejected acquisitions and
+//!   dead torrents, and `dedup_owned` deletes redundant copies only with `DEDUP_REMOVE_DUPLICATES`.
 //! - **Trakt cycle task** = `sync_trakt` THEN `reconcile_wanted`, sequentially each tick (so the
 //!   reconciler sees the just-synced wanted set). Cadence: `TRAKT_SYNC_INTERVAL_SECS`.
 //! - **Episode monitor task** = `monitor_episodes`. Cadence: `TRAKT_EPISODE_CHECK_INTERVAL_SECS`.
@@ -170,11 +172,11 @@ where
 pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
     let mut handles = Vec::new();
 
-    // Scan task (run_scan_loop → scan_tick every SCAN_INTERVAL_SECS: account sync + acquisition
-    // verification), own internal cadence.
+    // Scan task (run_scan_loop → scan_tick every SCAN_INTERVAL_SECS, own internal cadence; see
+    // `tasks::scan_tick` for its steps).
     // Supervised so a panic in a single tick can't silently freeze the most important subsystem
-    // (VFS refresh + observe + repair-replacement processing + account-mirror/dedup) for the process
-    // lifetime — it is restarted after a short backoff, mirroring the per-tick `catch_unwind`
+    // (the VFS refresh, `observe` and the rest of `scan_tick`) for the process lifetime: it is
+    // restarted after a short backoff, mirroring the per-tick `catch_unwind`
     // resilience the `periodic` jobs already have. (The scan loop maintains cross-tick state and its
     // own shutdown-aware awaits, so it isn't built on `periodic`; supervision gives the same guarantee
     // without restructuring the loop body.)

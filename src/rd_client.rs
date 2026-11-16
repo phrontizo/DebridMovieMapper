@@ -583,9 +583,9 @@ impl RealDebridClient {
         file_ids: &str,
     ) -> Result<(), reqwest::Error> {
         let url = build_id_url(&self.base_url, "torrents/selectFiles", torrent_id);
-        // RD returns 204 No Content on success. We deserialize as
-        // serde_json::Value which accepts the "[]" empty-body fallback
-        // in fetch_with_retry.
+        // RD returns 204 No Content on success, or 202 "Action already done" when the files are
+        // already selected. We deserialize as serde_json::Value which accepts the "[]" empty-body
+        // fallback fetch_with_retry applies to both.
         let _: serde_json::Value = self
             .fetch_with_retry(|| self.client.post(&url).form(&[("files", file_ids)]), &[])
             .await?;
@@ -726,34 +726,40 @@ impl RealDebridClient {
                                     continue;
                                 }
                             };
-                            // 204 No Content: try deserializing from "[]". This succeeds for Vec<T>
-                            // and serde_json::Value, allowing callers like select_files/delete_torrent
-                            // (which get a 204) to work transparently.
+                            // 204 No Content, and an empty-body 202 (RD's documented "Action
+                            // already done" on selectFiles): try deserializing from "[]". This
+                            // succeeds for Vec<T> and serde_json::Value, allowing callers like
+                            // select_files/delete_torrent (which get a 204, or a 202 for files
+                            // already selected) to work transparently. A 202 that carries a body
+                            // decodes that body below.
                             //
-                            // NOTE: this is gated on the 204 status, NOT on an empty body — an empty
-                            // body under a *200* must NOT decode to `[]`. `get_torrents` reads an
-                            // empty `Vec<Torrent>` as end-of-list, so an anomalous empty-body 200
+                            // NOTE: this is gated on the 204/202 status, NOT on an empty body — an
+                            // empty body under a *200* must NOT decode to `[]`. `get_torrents` reads
+                            // an empty `Vec<Torrent>` as end-of-list, so an anomalous empty-body 200
                             // mid-pagination (e.g. a proxy/CDN quirk) would silently truncate the
                             // listing, and downstream treats an owned title absent from the listing
                             // as lapsed → re-acquire. Letting an empty-body 200 fall through to the
                             // decode below (which fails → deserialization cap → surfaced error) makes
                             // `get_torrents` fail the whole listing instead — the safe outcome.
-                            if status == reqwest::StatusCode::NO_CONTENT {
+                            if status == reqwest::StatusCode::NO_CONTENT
+                                || (status == reqwest::StatusCode::ACCEPTED
+                                    && text.trim().is_empty())
+                            {
                                 if let Ok(val) = serde_json::from_str::<T>("[]") {
                                     self.rate_limiter.record_success().await;
                                     return Ok(val);
                                 }
-                                // A 204 whose body can't be decoded into T (i.e. T is not
-                                // Vec/Value) is a contract violation that won't fix itself on
+                                // A 204/202 whose empty body can't be decoded into T (i.e. T is
+                                // not Vec/Value) is a contract violation that won't fix itself on
                                 // retry — count it toward the deserialization cap so a
                                 // permanently-empty endpoint doesn't burn all 10 attempts.
                                 deserialization_failures += 1;
                                 warn!(
-                                    "RD API 204 not decodable into the expected type (attempt {}/{}). Status: {}",
-                                    attempt, max_attempts, status
+                                    "RD API empty {} not decodable into the expected type (attempt {}/{})",
+                                    status, attempt, max_attempts
                                 );
                                 if deserialization_failures >= 2 {
-                                    error!("Aborting after {} empty/undecodable RD responses — likely a contract change", deserialization_failures);
+                                    error!("Aborting after {} empty/undecodable RD responses (last HTTP {}) — likely a contract change", deserialization_failures, status);
                                     // The undecodable response is the terminating cause; drop any
                                     // earlier 429/5xx in `last_error` so the surfaced error is the
                                     // synthetic decode-failure below, not a stale prior status.
@@ -791,7 +797,7 @@ impl RealDebridClient {
                                     // budget, so it must fast-fail to instant repair rather than burn
                                     // the whole budget on a possibly-permanent format change.
                                     if deserialization_failures >= 2 {
-                                        error!("Aborting after {} deserialization failures on HTTP 200 — likely a schema change", deserialization_failures);
+                                        error!("Aborting after {} deserialization failures (last HTTP {}) — likely a schema change", deserialization_failures, status);
                                         // The decode failure is the terminating cause; drop any
                                         // earlier 429/5xx in `last_error` so the surfaced error is the
                                         // synthetic decode-failure below (accurate cause), not a stale
@@ -1551,6 +1557,24 @@ mod tests {
             client.deletes.changed_since(before),
             "a delete is recorded so a concurrent multi-page listing re-lists"
         );
+    }
+
+    #[tokio::test]
+    async fn select_files_succeeds_on_202_action_already_done_in_one_request() {
+        // RD documents `202 Action already done` as the other success status of selectFiles (the
+        // files were already selected, e.g. when `observe` re-selects a torrent whose status still
+        // lags at `waiting_files_selection`). Its empty body must decode like a 204's, so the call
+        // is Ok on the first try instead of being re-sent and reported as a schema change.
+        use std::sync::atomic::Ordering;
+        let (url, count) = spawn_counting("HTTP/1.1 202 Accepted", "").await;
+        let client = RealDebridClient::new("fake".to_string())
+            .unwrap()
+            .with_base_url(url);
+        client
+            .select_files("1", "2")
+            .await
+            .expect("a 202 on selectFiles is success");
+        assert_eq!(count.load(Ordering::SeqCst), 1, "no retry on a 202");
     }
 
     #[tokio::test]

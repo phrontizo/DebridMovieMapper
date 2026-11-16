@@ -51,9 +51,10 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// `S01E01v2` is), bounded on both sides by a non-alphanumeric character or the string edge, so `_`
 /// separates it as `.` does while a pixel size (`1920x1080`), an aspect ratio (`16x9`) and a codec
 /// (`x264`) are no codes. Nor is a channel layout run into a codec (`DD5.1x264`): a season digit
-/// right after `<digit>.` is skipped. Its continuations are a repeated `xNN` (`1x01x02`), a
-/// separated code of the SAME season (`1x01-1x02`; another season's code ends the run) and the
-/// dash-only one above (`1x01-02`).
+/// right after `<digit>.` whose `x` runs into `264`/`265` is skipped, while a real code after a
+/// year or a title ending in a digit (`Show.Name.2005.1x01`, `Babylon.5.2x10`) is read. Its
+/// continuations are a repeated `xNN` (`1x01x02`), a separated code of the SAME season
+/// (`1x01-1x02`; another season's code ends the run) and the dash-only one above (`1x01-02`).
 ///
 /// An `NxM` or separated `S01.E01` code followed by a range to another episode (`1x01-10`,
 /// `1x01~10`, `S01.E01-10`, `S01.E01-S01.E10`: `opens_episode_range`) decodes to nothing, as these
@@ -73,28 +74,29 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// episode-00 decode is rejected. The dash code needs SPACE-dash-SPACE on both sides, so a dotted
 /// scene form (`Show.-.409.-.Title`) yields no code at all (an empty `provides` for such a file), as
 /// does other absolute numbering (`Show - 041 [1080p]`). The acquisition engine still accepts a
-/// SINGLE-file release named that way (`acquire::codeless_episode`): its trailing number is the
-/// episode, in the season the VFS places the file in (season 1 unless the name or a directory names
-/// one). A multi-file pack of such files, or an absolute number past season 1 (`Show - 30` for
-/// S02E05), names no episode there, so `observe` still rejects it as `EpisodeMissing`.
+/// SINGLE-file release whose name ends its title with such a number (`Show - 041 [1080p]`,
+/// `acquire::codeless_episode`): that number is the episode, in the season the VFS places the file
+/// in (season 1 unless the name or a directory names one). The dotted dash form, whose number
+/// another ` - ` follows once its dots are read as spaces, stays rejected, as does a multi-file
+/// pack of such files or an absolute number past season 1 (`Show - 30` for S02E05): neither names
+/// an episode there, so `observe` rejects it as `EpisodeMissing`.
 pub(crate) fn parse_se_all(name: &str) -> Vec<(u32, u32)> {
-    static DASH_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s-\s(\d{3})\s-\s").unwrap());
     if let Some(eps) = sxxeyy_codes(name).or_else(|| nxm_codes(name)) {
         return eps;
     }
-    let Some(code) = DASH_CODE
-        .captures(name)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse::<u32>().ok())
-    else {
-        return Vec::new();
-    };
+    dash_code(name).map(|(_, se)| vec![se]).unwrap_or_default()
+}
+
+/// `parse_se_all`'s dash-concatenated arm (`Show - 409 - Title` → `(4, 9)`): the first three digits
+/// between SPACE-dash-SPACE pairs, read as season and episode, with the match of those digits.
+/// `None` when there is no such number, or it decodes to season or episode 0. `episode_code_span`
+/// reads it too, so `is_video_file` and the episode reader agree on the form.
+fn dash_code(name: &str) -> Option<(regex::Match<'_>, (u32, u32))> {
+    static DASH_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s-\s(\d{3})\s-\s").unwrap());
+    let digits = DASH_CODE.captures(name)?.get(1)?;
+    let code = digits.as_str().parse::<u32>().ok()?;
     let (season, episode) = (code / 100, code % 100);
-    if season >= 1 && episode >= 1 {
-        vec![(season, episode)]
-    } else {
-        Vec::new()
-    }
+    (season >= 1 && episode >= 1).then_some((digits, (season, episode)))
 }
 
 /// An `SxxEyy` code, with one optional separator before the `E` (group 2), and its `E`-prefixed
@@ -199,30 +201,43 @@ fn nxm_codes(name: &str) -> Option<Vec<(u32, u32)>> {
 }
 
 /// The first `NXM_RE` match in `name` that is an episode code: not episode `00`, and not a channel
-/// layout run into a codec (`DD5.1x264`, whose `1` follows `<digit>.`).
+/// layout run into a codec (`DD5.1x264`, `is_channel_layout_codec`).
 fn find_nxm(name: &str) -> Option<regex::Captures<'_>> {
-    let bytes = name.as_bytes();
     let mut at = 0;
     while let Some(c) = NXM_RE.captures_at(name, at) {
         let season = c.get(1)?;
-        let channel_layout = follows_channel_layout(bytes, season.start());
+        let channel_layout = is_channel_layout_codec(name, &season);
         let episode_00 = c
             .get(2)
             .is_some_and(|m| m.as_str().bytes().all(|b| b == b'0'));
         if !channel_layout && !episode_00 {
             return Some(c);
         }
-        // The next match's leading boundary lies at or after the season digit, so this advances.
-        at = season.start();
+        // The next match's leading boundary is a non-alphanumeric character, so it lies after the
+        // season digits and their `x`. Resuming at the `x` always advances, also when this match
+        // began at the start of the name (`1x00.mkv`), where resuming on the season digit found the
+        // same match again forever.
+        at = season.end();
     }
     None
 }
 
-/// Whether the digit at `digit_start` is the fraction of a channel layout run into a codec
-/// (`DD5.1x264`, `AAC2.0x264`): it follows `<digit>.`. `find_nxm` and `season_tokens` both skip such
-/// an `NxM`/`NxNN` token, so the episode reader and the season placement agree on it.
-fn follows_channel_layout(bytes: &[u8], digit_start: usize) -> bool {
-    digit_start >= 2 && bytes[digit_start - 1] == b'.' && bytes[digit_start - 2].is_ascii_digit()
+/// Whether the `NxM`/`NxNN` token whose season digits are `season` (a match in `s` that ends at
+/// the token's `x`) is a channel layout run into an `x264`/`x265` codec (`DD5.1x264`,
+/// `AAC2.0x265`): its season digit follows `<digit>.` and the digits after the `x` are exactly
+/// `264` or `265`. Only that run makes a channel layout read as such a token, so a real code after
+/// a year or a title ending in a digit (`Show.Name.2005.1x01`, `Babylon.5.2x10`, `24.3x05`) is no
+/// channel layout. `find_nxm` and `season_tokens` both skip such a token, so the episode reader and
+/// the season placement agree on it.
+fn is_channel_layout_codec(s: &str, season: &regex::Match<'_>) -> bool {
+    let bytes = s.as_bytes();
+    let start = season.start();
+    let follows_digit_dot =
+        start >= 2 && bytes[start - 1] == b'.' && bytes[start - 2].is_ascii_digit();
+    let codec = season.end() + 1;
+    follows_digit_dot
+        && matches!(bytes.get(codec..codec + 3), Some(b"264" | b"265"))
+        && !bytes.get(codec + 3).is_some_and(u8::is_ascii_digit)
 }
 
 /// Extend `eps` (all of season `s`) with the dash-only continuations that open `tail` (Sonarr's
@@ -285,24 +300,34 @@ fn parse_se(name: &str) -> Option<(u32, u32)> {
     parse_se_all(name).into_iter().next()
 }
 
-/// The selected video files of `t` the VFS can actually EMIT: a selected video file is emittable
-/// only when `links` is empty (TorBox) or has a link at its position among the SELECTED files
-/// (Real-Debrid pairs links positionally, and its `selected != links` anomaly can leave a file with
-/// none). The build's episode-slot check (`present_files`) and `selection::plan_selection_repoints`
-/// both use this, so a slot is only ever pointed at a file the build will emit.
+/// The selected video files of `t` the VFS can actually EMIT (`emittable_video_files_with_links`).
+/// The build's episode-slot check (`present_files`) and `selection::plan_selection_repoints` both
+/// use this, so a slot is only ever pointed at a file the build will emit.
 pub(crate) fn emittable_video_files(t: &TorrentInfo) -> Vec<&crate::rd_client::TorrentFile> {
+    emittable_video_files_with_links(t)
+        .map(|(f, _)| f)
+        .collect()
+}
+
+/// The selected video files of `t` the VFS can actually EMIT, each with its Real-Debrid link: a
+/// selected video file is emittable only when `links` is empty (TorBox, which resolves by id, so
+/// the link is `None`) or has a link at its position among the SELECTED files (Real-Debrid pairs
+/// links positionally, so the position advances once per selected file, video or not, and its
+/// `selected != links` anomaly can leave a file with none). The build's emit paths and
+/// `emittable_video_files` all read this one pairing, so an episode slot never points at a file
+/// the build won't emit.
+fn emittable_video_files_with_links(
+    t: &TorrentInfo,
+) -> impl Iterator<Item = (&crate::rd_client::TorrentFile, Option<&String>)> {
     let links_empty = t.links.is_empty();
-    let mut link_idx = 0usize;
-    let mut out = Vec::new();
-    for f in &t.files {
-        if f.selected == 1 {
-            if is_video_file(&f.path) && (links_empty || t.links.get(link_idx).is_some()) {
-                out.push(f);
-            }
-            link_idx += 1;
-        }
-    }
-    out
+    t.files
+        .iter()
+        .filter(|f| f.selected == 1)
+        .enumerate()
+        .filter_map(move |(link_idx, f)| {
+            let link = t.links.get(link_idx);
+            (is_video_file(&f.path) && (links_empty || link.is_some())).then_some((f, link))
+        })
 }
 
 /// The first episode code in a file's basename: the episode whose season folder the build places
@@ -803,12 +828,10 @@ impl DebridVfs {
                     // whose file was re-listed under a different path, OR a selected file with no
                     // positional link (RD's `selected != links` anomaly, see the warn below) — is
                     // stale/unservable and must NOT hide the episode (self-healing → falls back to
-                    // the legacy first/largest dedup so the episode still appears). The link check
-                    // MUST mirror the emit loop's `link_idx` accounting below exactly: `link_idx`
-                    // advances once per SELECTED file (video or not), and a video file is emittable
-                    // only when `links` is empty (TorBox) or has a link at its position — otherwise
-                    // present_files would mark a file "present" that the emit loop then refuses to
-                    // emit, suppressing every other torrent's copy and vanishing the episode.
+                    // the legacy first/largest dedup so the episode still appears). It and the emit
+                    // loop below read the same pairing (`emittable_video_files_with_links`), so
+                    // present_files never marks a file "present" that the emit loop then refuses to
+                    // emit, which would suppress every other torrent's copy and vanish the episode.
                     // Computed BEFORE the loop below moves `torrents`. `present_files` is consulted
                     // ONLY for an episode that has a selection entry (the selection gate below),
                     // which can't happen when this show is unidentified (no `show_tmdb`) or the
@@ -836,105 +859,84 @@ impl DebridVfs {
                             show_max_ts = torrent_ts;
                         }
                         note_link_count_mismatch(&torrent);
-                        let mut link_idx = 0;
-                        for file in &torrent.files {
-                            if file.selected == 1 {
-                                if is_video_file(&file.path) {
-                                    let link = torrent.links.get(link_idx).cloned();
-                                    if link.is_some() || torrent.links.is_empty() {
-                                        let filename =
-                                            file.path.split('/').next_back().unwrap_or(&file.path);
-                                        // Parse the episode codes once and reuse them for both the
-                                        // selection gate and the season-folder placement below
-                                        // (the regex match is not free).
-                                        let codes = parse_se_all(filename);
-                                        let se = codes.first().copied();
-                                        // SP3 selection gate: a file is skipped only when EVERY
-                                        // episode it carries has a managed selection naming
-                                        // another present (hash, file_path). A multi-episode file
-                                        // (`S01E01E02`) is therefore kept while any one of its
-                                        // slots selects it, or any one of its episodes has no
-                                        // present selection: `observe` writes a slot per episode,
-                                        // so its (1,1) slot can sit on a better singleton while
-                                        // (1,2) selects this file, and hiding the file would lose
-                                        // E02 (a duplicate E01 is the lesser evil). A stale
-                                        // selection (absent hash, or a path that no longer
-                                        // matches) never hides anything: that episode degrades to
-                                        // the legacy first/largest-wins dedup below.
-                                        if let Some(tmdb) = show_tmdb {
-                                            let selected_elsewhere = |&(s, e): &(u32, u32)| {
-                                                selection
-                                                    .get(&crate::store::episode_slot(tmdb, s, e))
-                                                    .is_some_and(|sel| {
-                                                        present_files.contains(&(
-                                                            sel.hash.to_ascii_lowercase(),
-                                                            sel.file_path.clone(),
-                                                        )) && !(torrent
-                                                            .hash
-                                                            .eq_ignore_ascii_case(&sel.hash)
-                                                            && file.path == sel.file_path)
-                                                    })
-                                            };
-                                            if !codes.is_empty()
-                                                && codes.iter().all(selected_elsewhere)
-                                            {
-                                                link_idx += 1;
-                                                continue;
-                                            }
-                                        }
-                                        // Prefer the FIRST episode code for the folder season: it
-                                        // handles SxxExx, NxM AND the dash-concatenated "Show - 409 -
-                                        // Title" absolute-code form, so such a pack's episodes land
-                                        // in the right Season folder (a double-episode file goes
-                                        // under its first episode's season). Otherwise SEASON_RE
-                                        // covers the patterns `parse_se_all` doesn't ("Season 4",
-                                        // "Part 2", a range it leaves undecoded such as "1x01-10")
-                                        // in the file name and then its directories, nearest first,
-                                        // with a `Part N` in the file name as the weakest signal
-                                        // (`season_of_codeless_file`), then season 1.
-                                        let season = se.map(|(s, _)| s).unwrap_or_else(|| {
-                                            season_of_codeless_file(&file.path, filename)
-                                        });
-
-                                        let season_name = format!("Season {:02}", season);
-                                        let season_dir = show_children
-                                            .entry(season_name.clone())
-                                            .or_insert_with(|| VfsNode::Directory {
-                                                children: BTreeMap::new(),
-                                            });
-
-                                        if let VfsNode::Directory {
-                                            children: season_children,
-                                        } = season_dir
-                                        {
-                                            // Skip if this episode already exists (from a larger/earlier torrent)
-                                            if season_children.contains_key(filename) {
-                                                link_idx += 1;
-                                                continue;
-                                            }
-                                            let file_name = Self::add_path_to_tree(
-                                                season_children,
-                                                filename,
-                                                file.bytes,
-                                                FileLocator {
-                                                    hash: torrent.hash.clone(),
-                                                    torrent_id: torrent.id.clone(),
-                                                    file_id: file.id,
-                                                    file_path: file.path.clone(),
-                                                    link,
-                                                },
-                                            );
-                                            timestamps.insert(
-                                                format!(
-                                                    "{}/{}/{}",
-                                                    show_prefix, season_name, file_name
-                                                ),
-                                                torrent_ts,
-                                            );
-                                        }
-                                    }
+                        for (file, link) in emittable_video_files_with_links(&torrent) {
+                            let filename = file.path.split('/').next_back().unwrap_or(&file.path);
+                            // Parse the episode codes once and reuse them for both the selection
+                            // gate and the season-folder placement below (the regex match is not
+                            // free).
+                            let codes = parse_se_all(filename);
+                            let se = codes.first().copied();
+                            // SP3 selection gate: a file is skipped only when EVERY episode it
+                            // carries has a managed selection naming another present (hash,
+                            // file_path). A multi-episode file (`S01E01E02`) is therefore kept
+                            // while any one of its slots selects it, or any one of its episodes has
+                            // no present selection: `observe` writes a slot per episode, so its
+                            // (1,1) slot can sit on a better singleton while (1,2) selects this
+                            // file, and hiding the file would lose E02 (a duplicate E01 is the
+                            // lesser evil). A stale selection (absent hash, or a path that no
+                            // longer matches) never hides anything: that episode degrades to the
+                            // legacy first/largest-wins dedup below.
+                            if let Some(tmdb) = show_tmdb {
+                                let selected_elsewhere = |&(s, e): &(u32, u32)| {
+                                    selection
+                                        .get(&crate::store::episode_slot(tmdb, s, e))
+                                        .is_some_and(|sel| {
+                                            present_files.contains(&(
+                                                sel.hash.to_ascii_lowercase(),
+                                                sel.file_path.clone(),
+                                            )) && !(torrent.hash.eq_ignore_ascii_case(&sel.hash)
+                                                && file.path == sel.file_path)
+                                        })
+                                };
+                                if !codes.is_empty() && codes.iter().all(selected_elsewhere) {
+                                    continue;
                                 }
-                                link_idx += 1;
+                            }
+                            // Prefer the FIRST episode code for the folder season: it handles
+                            // SxxExx, NxM AND the dash-concatenated "Show - 409 - Title"
+                            // absolute-code form, so such a pack's episodes land in the right
+                            // Season folder (a double-episode file goes under its first episode's
+                            // season). Otherwise SEASON_RE covers the patterns `parse_se_all`
+                            // doesn't ("Season 4", "Part 2", a range it leaves undecoded such as
+                            // "1x01-10") in the file name and then its directories, nearest first,
+                            // with a `Part N` in the file name as the weakest signal
+                            // (`season_of_codeless_file`), then season 1.
+                            let season = se
+                                .map(|(s, _)| s)
+                                .unwrap_or_else(|| season_of_codeless_file(&file.path, filename));
+
+                            let season_name = format!("Season {:02}", season);
+                            let season_dir = show_children
+                                .entry(season_name.clone())
+                                .or_insert_with(|| VfsNode::Directory {
+                                    children: BTreeMap::new(),
+                                });
+
+                            if let VfsNode::Directory {
+                                children: season_children,
+                            } = season_dir
+                            {
+                                // Skip if this episode already exists (from a larger/earlier
+                                // torrent).
+                                if season_children.contains_key(filename) {
+                                    continue;
+                                }
+                                let file_name = Self::add_path_to_tree(
+                                    season_children,
+                                    filename,
+                                    file.bytes,
+                                    FileLocator {
+                                        hash: torrent.hash.clone(),
+                                        torrent_id: torrent.id.clone(),
+                                        file_id: file.id,
+                                        file_path: file.path.clone(),
+                                        link: link.cloned(),
+                                    },
+                                );
+                                timestamps.insert(
+                                    format!("{}/{}/{}", show_prefix, season_name, file_name),
+                                    torrent_ts,
+                                );
                             }
                         }
                     }
@@ -1094,29 +1096,20 @@ impl DebridVfs {
 
     fn add_torrent_files(destination: &mut BTreeMap<String, VfsNode>, torrent: &TorrentInfo) {
         note_link_count_mismatch(torrent);
-        let mut link_idx = 0;
-        for file in &torrent.files {
-            if file.selected == 1 {
-                if is_video_file(&file.path) {
-                    let link = torrent.links.get(link_idx).cloned();
-                    if link.is_some() || torrent.links.is_empty() {
-                        let filename = file.path.split('/').next_back().unwrap_or(&file.path);
-                        Self::add_path_to_tree(
-                            destination,
-                            filename,
-                            file.bytes,
-                            FileLocator {
-                                hash: torrent.hash.clone(),
-                                torrent_id: torrent.id.clone(),
-                                file_id: file.id,
-                                file_path: file.path.clone(),
-                                link,
-                            },
-                        );
-                    }
-                }
-                link_idx += 1;
-            }
+        for (file, link) in emittable_video_files_with_links(torrent) {
+            let filename = file.path.split('/').next_back().unwrap_or(&file.path);
+            Self::add_path_to_tree(
+                destination,
+                filename,
+                file.bytes,
+                FileLocator {
+                    hash: torrent.hash.clone(),
+                    torrent_id: torrent.id.clone(),
+                    file_id: file.id,
+                    file_path: file.path.clone(),
+                    link: link.cloned(),
+                },
+            );
         }
     }
 
@@ -1282,19 +1275,24 @@ const RELEASE_TAG_TOKENS: &str = r"\d{3,4}p|4k|uhd|web|webdl|web-dl|webrip|web-r
 static RELEASE_YEAR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:19|20)\d{2}\b").unwrap());
 
-/// Where the first episode code starts in `name`: an `SxxEyy` or `NxM` code, the forms
-/// `parse_se_all` reads (`S01E05`, `S01.E05`, `2x05`; ranges included). An episode code marks a
-/// real episode, so a file with one is kept when an excluded keyword other than `sample` sits BEFORE
-/// the code (a title word: "Some.Trailer.Show.S02E03"), and when it sits in an extras/bonus
-/// directory (a mis-foldered real episode). It never rescues a `sample` keyword or a file in a
-/// `Sample`/`Samples` folder: scene samples carry the full release name and its episode code
-/// (`sample-show.s01e01…`, `Sample/show.s01e01…`). Returned as `(start, end)`, `end` being where
-/// the code's `SxxEyy` match (its `E` continuations included) or `NxM` match ends; a keyword after it
-/// is judged by `keyword_after_code_is_descriptor`.
+/// Where the first episode code starts in `name`: an `SxxEyy` or `NxM` code (`S01E05`, `S01.E05`,
+/// `2x05`; ranges included), else the dash-concatenated `Show - 105 - Title` code (`dash_code`),
+/// the forms `parse_se_all` reads. An episode code marks a real episode, so a file with one is
+/// kept when an excluded keyword other than `sample` sits BEFORE the code (a title word:
+/// "Some.Trailer.Show.S02E03"), and when it sits in an extras/bonus directory (a mis-foldered real
+/// episode). It never rescues a `sample` keyword or a file in a `Sample`/`Samples` folder: scene
+/// samples carry the full release name and its episode code (`sample-show.s01e01…`,
+/// `Sample/show.s01e01…`). Returned as `(start, end)`, `end` being where the code's `SxxEyy` match
+/// (its `E` continuations included), `NxM` match or dash code's three digits end; a keyword after
+/// it is judged by `keyword_after_code_is_descriptor`.
 fn episode_code_span(name: &str) -> Option<(usize, usize)> {
     let sxxeyy = SXXEYY_RE.find(name).map(|m| (m.start(), m.end()));
     let nxm = find_nxm(name).and_then(|c| Some((c.get(1)?.start(), c.get(3)?.end())));
-    sxxeyy.into_iter().chain(nxm).min()
+    sxxeyy
+        .into_iter()
+        .chain(nxm)
+        .min()
+        .or_else(|| dash_code(name).map(|(digits, _)| (digits.start(), digits.end())))
 }
 
 /// A word token: a run of letters or digits (`is_video_file` has already mapped `_` to `.`).
@@ -1493,20 +1491,20 @@ fn normalize_dir_component(component: &str) -> std::borrow::Cow<'_, str> {
 /// The season numbers an arbitrary string (a file name or one directory name) names via SEASON_RE,
 /// as `(strong, part)`: `strong` from its first `Sxx` / `Season N` / `NxNN` token, `part` from its
 /// first `Part N` token. Kept apart because `Part N` is the weaker signal (a two-part episode title
-/// as often as a season). An `NxNN` token that is a channel layout run into a codec (`AAC2.0x264`,
-/// `follows_channel_layout`) names no season. Used by the season-folder placement in the show-emit
-/// loop, and by the upgrade engine to tell a season pack's torrent name (`Show.S01.1080p`) from a
-/// single's (`upgrade::is_pack_stream`).
+/// as often as a season). An `NxNN` token that is a channel layout run into an `x264`/`x265` codec
+/// (`AAC2.0x264`, `is_channel_layout_codec`) names no season. Used by the season-folder placement
+/// in the show-emit loop, and by the upgrade engine to tell a season pack's torrent name
+/// (`Show.S01.1080p`) from a single's (`upgrade::is_pack_stream`).
 pub(crate) fn season_tokens(s: &str) -> (Option<u32>, Option<u32>) {
     let (mut strong, mut part) = (None, None);
     let mut at = 0;
     while let Some(cap) = SEASON_RE.captures_at(s, at) {
         let number = |i| cap.get(i).and_then(|m| m.as_str().parse::<u32>().ok());
-        // An `NxNN` token whose season digit follows `<digit>.` is a channel layout run into a codec
-        // (`AAC2.0x264`), no season, as `find_nxm` reads it.
+        // An `NxNN` token that is a channel layout run into a codec (`AAC2.0x264`) names no season,
+        // as `find_nxm` reads it.
         let nxnn = cap
             .get(3)
-            .filter(|m| !follows_channel_layout(s.as_bytes(), m.start()))
+            .filter(|m| !is_channel_layout_codec(s, m))
             .and_then(|m| m.as_str().parse::<u32>().ok());
         strong = strong.or_else(|| number(1).or_else(|| number(2)).or(nxnn));
         part = part.or_else(|| number(4));
@@ -1541,7 +1539,8 @@ pub(crate) fn season_tokens(s: &str) -> (Option<u32>, Option<u32>) {
 /// Season 02), since the root of such a pack often names a season RANGE ("Show.S01-S05/Part 3/")
 /// whose first season would be wrong. The acquisition engine reads an absolute-numbered single-file
 /// release's season from it too (`acquire::codeless_episode`), so it slots the episode the VFS
-/// places the file under.
+/// places the file under. For a file of a multi-file pack, `acquire::explicit_codeless_season`
+/// reads the same signals except the season-1 default and a file-name `Part N`.
 pub(crate) fn season_of_codeless_file(path: &str, filename: &str) -> u32 {
     let (strong, part) = season_tokens(filename);
     strong
@@ -3051,10 +3050,26 @@ mod tests {
         assert!(is_video_file("Some.Trailer.Show.S02.E03.mkv"));
         assert!(is_video_file("Show/Extras/Show - 1x01 - Pilot.mkv"));
         assert!(is_video_file("Show/Extras/Show S01 E01.mkv"));
+        assert!(is_video_file("Show/Extras/Show.Name.2005.1x01.Pilot.mkv"));
         // A sample is still a sample, and a channel layout run into a codec is no episode code.
         assert!(!is_video_file("Show - 1x01 - Pilot.sample.mkv"));
         assert!(!is_video_file("Movie/Extras/Movie.2010.DD5.1x264.mkv"));
         assert!(!is_video_file("Movie/Extras/Making.Of.1920x1080.mkv"));
+    }
+
+    #[test]
+    fn is_video_file_counts_the_dash_concatenated_episode_code() {
+        // The `Show - 105 - Title` code `parse_se_all` reads makes an episode-title keyword after
+        // it a title word, a keyword before it a title word, and keeps a mis-foldered episode.
+        assert!(is_video_file("Show - 105 - The Extra Mile.mkv"));
+        assert!(is_video_file("Show - 304 - Bonus Round.mkv"));
+        assert!(is_video_file("Show/Extras/Show - 105 - Pilot.mkv"));
+        assert!(is_video_file("Some.Trailer.Show - 203 - Title.mkv"));
+        // The keyword alone after the code is still a clip, and a sample is still a sample.
+        assert!(!is_video_file("Show - 105 - Trailer.mkv"));
+        assert!(!is_video_file("Show - 105 - Title.sample.mkv"));
+        // A dash code `parse_se_all` rejects (episode 00) rescues nothing.
+        assert!(!is_video_file("Show/Extras/Show - 100 - Pilot.mkv"));
     }
 
     #[test]
@@ -3223,9 +3238,19 @@ mod tests {
         assert!(parse_se_all("Movie.2010.x264.mkv").is_empty());
         assert!(parse_se_all("Movie.2010.DD5.1x264.mkv").is_empty());
         assert!(parse_se_all("Show.1x00.mkv").is_empty());
+        // An episode 00 at the very start of the name is skipped too, and the search goes on.
+        assert!(parse_se_all("1x00.mkv").is_empty());
+        assert_eq!(parse_se_all("1x00.2x05.mkv"), vec![(2, 5)]);
         assert!(parse_se_all("Show.2x720p.mkv").is_empty());
         // The contiguous form keeps winning over a later channel layout.
         assert_eq!(parse_se_all("Show.S01E01.DD5.1x264.mkv"), vec![(1, 1)]);
+        // Only a run into an `x264`/`x265` codec is a channel layout: a real code after a year or
+        // a title ending in a digit is still read.
+        assert!(parse_se_all("Movie.2010.AAC2.0x265.mkv").is_empty());
+        assert_eq!(parse_se_all("Show.Name.2005.1x01.Pilot.mkv"), vec![(1, 1)]);
+        assert_eq!(parse_se_all("Babylon.5.2x10.mkv"), vec![(2, 10)]);
+        assert_eq!(parse_se_all("24.3x05.mkv"), vec![(3, 5)]);
+        assert_eq!(parse_se_all("Stargate.SG-1.1x05.mkv"), vec![(1, 5)]);
         // A version suffix is read as the `SxxEyy` arm reads it (`S01E01v2`).
         assert_eq!(parse_se_all("Show - 1x01v2 - Title.mkv"), vec![(1, 1)]);
         assert_eq!(parse_se_all("Show.1x01v2.mkv"), vec![(1, 1)]);
@@ -4337,6 +4362,11 @@ mod tests {
         // either), so the directory's season places such a code-less file.
         assert_eq!(season_tokens("05 - Title.AAC2.0x264.mkv"), (None, None));
         assert_eq!(season_tokens("05 - Title.DD5.1x264.mkv"), (None, None));
+        assert_eq!(season_tokens("Show.AAC2.0x264.mkv"), (None, None));
+        assert_eq!(season_tokens("Show.DD5.1x265.mkv"), (None, None));
+        // A real `NxNN` code after a year or a title ending in a digit still names its season.
+        assert_eq!(season_tokens("Show.Name.2005.2x05.mkv"), (Some(2), None));
+        assert_eq!(season_tokens("Babylon.5.2x10.mkv"), (Some(2), None));
         assert_eq!(
             season_of_codeless_file(
                 "Show/Season 3/05 - Title.AAC2.0x264.mkv",

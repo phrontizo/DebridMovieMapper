@@ -1138,8 +1138,11 @@ fn ordering_prefs(
 /// never a candidate; against an unknown-quality (or uncached) owned copy, whose comparison ignores
 /// scores, and for a corrective downgrade, whose ceiling penalty swamps the language one, a release
 /// carrying that penalty ([`release::wrong_audio_language`]) is dropped outright. The improving
-/// candidates are then ordered by that score, so a wrong-language release is tried after a
-/// correctly-tagged one. The caller stages them in order until one is adopted (in-tick
+/// candidates are then ordered as acquisition ranks them under those prefs
+/// ([`release::rank_key`]: resolution and the language penalty, then a tagged source before an
+/// untagged one, then the score), so a wrong-language release is tried after a correctly-tagged one,
+/// and an untagged-source release (recorded as unknown quality, so replaced again on the next pass)
+/// after a tagged one at its resolution. The caller stages them in order until one is adopted (in-tick
 /// fall-through), so a top candidate that fails a candidate-specific gate no longer ends the tick.
 /// The list is direction-homogeneous (all `Upgrade` or all `Downgrade`) because
 /// `is_target_improvement` only rates a lower-resolution candidate as improving when the owned copy
@@ -1161,7 +1164,8 @@ async fn rank_changes(
     // Fetch the per-title blacklist ONCE and test membership in memory, rather than one awaited redb
     // read per candidate (Torrentio commonly returns dozens of streams per title) — mirrors `acquire`.
     let blacklist = app.store.blacklisted_hashes_for(media, tmdb_id).await;
-    let mut scored: Vec<(i64, release::ReleaseInfo, release::Improvement)> = Vec::new();
+    let mut scored: Vec<(release::RankKey, release::ReleaseInfo, release::Improvement)> =
+        Vec::new();
     for raw in raws {
         let r = release::parse(raw);
         if owned_hashes
@@ -1217,10 +1221,16 @@ async fn rank_changes(
         {
             continue;
         }
-        scored.push((order_score, r, imp));
+        // Ordered as acquisition ranks (`release::rank_key`): within one resolution a tagged source
+        // comes before an untagged one, whatever their scores. An untagged release is recorded at
+        // source tier 0, unknown quality, which the next pass replaces with any tagged release at
+        // its resolution, so adopting it first (as a corrective `Downgrade` may, where an untagged
+        // HEVC encode out-scores a WEB one) would only download the title twice.
+        let key = release::rank_key(&r, &order).unwrap_or((i64::MIN, false, order_score));
+        scored.push((key, r, imp));
     }
     // Best first (stable for ties).
-    scored.sort_by_key(|(score, ..)| std::cmp::Reverse(*score));
+    scored.sort_by_key(|(key, ..)| std::cmp::Reverse(*key));
     // Dedup by info_hash: Torrentio can return the same infohash under multiple stream entries
     // (different source/title strings, sometimes scored differently). Without this, a duplicate
     // whose first entry fails and is blacklisted would still be tried again from its second entry —
@@ -1693,9 +1703,13 @@ async fn record_staged(
 /// torrent would be deleted, or adopted as a staged copy. Checked against a fresh listing
 /// immediately before the add (one extra `get_torrents` per staged candidate); a listing failure is
 /// `Deferred`, like an add failure — presence can't be ruled out, so nothing is added. The add
-/// opens a staging intent
-/// ([`crate::store::StagingIntent`]), which [`record_staged`] or [`discard_staged`] closes; one a
-/// cancelled job leaves open is resolved by [`sweep_staging_intents`].
+/// claims a staging intent ([`crate::store::StagingIntent`],
+/// [`crate::store::Store::claim_staging_intent`]), which [`record_staged`] or [`discard_staged`]
+/// closes; one a cancelled job leaves open is resolved by [`sweep_staging_intents`]. A hash another
+/// stager holds (the episode monitor's `acquire`, which runs as its own task), or one recorded as
+/// owned since the candidates were ranked, is never staged (`NoChange`): the provider listing can
+/// lag that stager's add by tens of seconds on TorBox, where staging it would return the same
+/// torrent id, and a rejection (a pack the per-episode path never adopts) would delete it.
 async fn add_staging_candidate(
     app: &AppState,
     hash: &str,
@@ -1714,14 +1728,34 @@ async fn add_staging_candidate(
             "candidate already in the provider account".into(),
         ));
     }
-    // Open the staging intent BEFORE the add: from the add until `record_staged` records the
+    // Claim the staging intent BEFORE the add: from the add until `record_staged` records the
     // candidate (or `discard_staged` deletes it) the account holds a torrent no owned record names,
     // and a job cancelled in between (shutdown, panic) must leave a trace — the account mirror
     // would otherwise adopt the unchecked release as a `Verified` copy. Nothing is added without it.
-    app.store
-        .put_staging_intent(hash.to_string(), now_secs())
+    let claimed = app
+        .store
+        .claim_staging_intent(hash.to_string(), now_secs())
         .await
         .map_err(|e| UpgradeSkip::Deferred(format!("staging intent write failed: {e}")))?;
+    if !claimed {
+        debug!(
+            "upgrade: candidate {} is being staged or acquired elsewhere; not staging it",
+            hash
+        );
+        return Err(UpgradeSkip::NoChange(
+            "candidate being staged or acquired elsewhere".into(),
+        ));
+    }
+    // Recorded since it was ranked (an acquisition that has just added it, which the listing may
+    // not show yet): never stage it. The store doesn't lag the way the listing does.
+    if app.store.get_owned(hash.to_string()).await.is_some() {
+        let _ = app.store.clear_staging_intent(hash.to_string()).await;
+        debug!(
+            "upgrade: candidate {} was recorded as owned since it was ranked; not staging it",
+            hash
+        );
+        return Err(UpgradeSkip::NoChange("candidate already owned".into()));
+    }
     // A failed add closes the intent again: the provider reported nothing added, and a lingering
     // intent would have the sweep delete a torrent of this hash the user adds later.
     let added = match app
@@ -2077,12 +2111,18 @@ fn rank_cached_pack_candidates(
 
 /// Whether a scraped stream is a SINGLE-episode torrent: its torrent name — the first line of the
 /// stream description (Torrentio's title; a later line names the file inside a pack) — carries
-/// exactly one episode code and no episode range. A season pack's name carries none
+/// exactly one episode code and no episode range, or no code but a trailing ` - NN` episode number
+/// (the anime form `[Group] Show - 05 (1080p)`, which acquisition and phase (a) adopt as a single;
+/// a batch `[Group] Show - 01-12` has no such number). A season pack's name carries none
 /// (`Show.S01.1080p…`) or a range (`S01E01-E10`, `S01E01-10`, `S01E01-S01E10`, `S01E01~E10`), and
 /// a stream without a recognisable code is kept: its content is unknown until staged.
 fn is_single_episode_stream(c: &crate::release::RawCandidate) -> bool {
     let name = c.description.lines().next().unwrap_or_default();
-    crate::vfs::parse_se_all(name).len() == 1 && !EPISODE_RANGE_RE.is_match(name)
+    match crate::vfs::parse_se_all(name).len() {
+        0 => crate::identification::trailing_episode_number(name).is_some(),
+        1 => !EPISODE_RANGE_RE.is_match(name),
+        _ => false,
+    }
 }
 
 /// Whether a scraped stream's torrent name (the first description line, as for
@@ -2104,19 +2144,13 @@ fn is_pack_stream(c: &crate::release::RawCandidate) -> bool {
     match codes.len() {
         0 => {
             crate::vfs::season_tokens(name).0.is_some()
-                && !EPISODE_WORD_RE.is_match(name)
+                && !crate::acquire::EPISODE_WORD_RE.is_match(name)
                 && crate::identification::trailing_episode_number(name).is_none()
         }
         1 => false,
         _ => true,
     }
 }
-
-/// An episode named by a word and a number (`E05`, `Ep 5`, `Episode.12`), bounded like the season
-/// tokens, which `vfs::parse_se_all` doesn't read apart from a season code.
-static EPISODE_WORD_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)(?:^|[^a-z0-9])(?:e|ep|episode)[\s._-]*\d{1,3}(?:[^a-z0-9]|$)").unwrap()
-});
 
 /// An episode code followed directly by a range to a later episode that `vfs::parse_se_all` reads
 /// as a single code: `S01E01-10` (a dash-only continuation counts only when it names the next
@@ -2241,10 +2275,12 @@ async fn stage_and_await_cached(
 /// the target episode), validate the title, and probe the same audio/subtitle gate as acquisition.
 /// On success records the episode `OwnedRecord` (Verified, sticky provenance) + authoritative id and
 /// returns `(hash, torrent_id, file_path)`. On any failure the staged torrent is cleaned up and the
-/// current release is left untouched (non-destructive). A candidate that is no single for ANY
-/// episode — its files carry more than one distinct episode, or none that decodes — is added to
-/// `not_singles` ([`EpisodeTick::not_singles`]): it is rejected here for every target episode, so
-/// the caller skips it for the rest of the tick.
+/// current release is left untouched (non-destructive). Episodes are read as acquisition reads them
+/// ([`crate::acquire::show_episode_files`]), so a single-file release that names its episode by an
+/// absolute number and no code (`[Group] Show - 05 (1080p).mkv`) is a single. A candidate that is
+/// no single for ANY episode — its files carry more than one distinct episode, or none that maps to
+/// one — is added to `not_singles` ([`EpisodeTick::not_singles`]): it is rejected here for every
+/// target episode, so the caller skips it for the rest of the tick.
 async fn stage_episode_candidate(
     app: &AppState,
     tmdb_id: u64,
@@ -2256,7 +2292,7 @@ async fn stage_episode_candidate(
 ) -> Result<(String, String, String), UpgradeSkip> {
     let hash = cand.info_hash.clone();
     let (torrent_id, fresh) = stage_and_await_cached(app, &hash).await?;
-    let eps = crate::acquire::episode_files(&fresh);
+    let eps = crate::acquire::show_episode_files(&fresh);
     // Adopt a per-episode release ONLY when it is a TRUE singleton for the target (season, episode):
     // every parsed episode file must be exactly that episode. A multi-episode (or multi-season) pack
     // is left to the consolidation / pack-correction paths — adopting it here would record it with
@@ -2279,8 +2315,8 @@ async fn stage_episode_candidate(
         ));
     }
     let Some((_, _, path)) = eps.iter().find(|(s, e, _)| *s == season && *e == episode) else {
-        // Reached only with no decoded episode at all (every decoded one would be the target, by
-        // the check above): such a torrent lacks every target episode, so remember it too.
+        // Reached only with no mapped episode at all (every mapped one would be the target, by the
+        // check above): such a torrent lacks every target episode, so remember it too.
         not_singles.insert(hash.to_ascii_lowercase());
         discard_staged(app, &hash, &torrent_id).await;
         return Err(UpgradeSkip::NoChange(
@@ -2288,15 +2324,12 @@ async fn stage_episode_candidate(
         ));
     };
     let file_path = path.clone();
-    let fname = file_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(&file_path)
-        .to_string();
+    // The whole path, as `observe` checks it: a file with no episode code may take its season from a
+    // directory.
     match app
         .engine
         .validate_title(
-            &fname,
+            &file_path,
             tmdb_id,
             MediaKind::Series,
             Some(season),
@@ -2450,13 +2483,16 @@ async fn other_owned_coverage(
 }
 
 /// The lowercased hashes among the show copies `hashes` whose persisted identification (the scan
-/// loop's `matches` cache) holds a video file with no episode code
-/// ([`crate::tasks::holds_codeless_video`]: an OVA, a `Season 02/E01 - Title.mkv`, an anime absolute
-/// number). Such a copy's `provides` leaves that file out, yet the VFS shows it and no other copy
-/// holds it, so no show swap prunes it: phase (a) and (a2) keep it after moving its slot,
-/// consolidation doesn't supersede it, and pack correction doesn't replace it (as
-/// `tasks::plan_dedup` never removes one). A copy with no persisted identification is judged by its
-/// record alone. Reads the whole cache, so callers ask only when a prune is at hand.
+/// loop's `matches` cache) holds a video file with no episode code that the copy's own record does
+/// not account for ([`crate::tasks::holds_codeless_video`]: an OVA, an anime absolute number in a
+/// mirrored pack, any code-less file whose episode isn't in the record's `provides`). Such a file is
+/// shown by the VFS and held by no other copy, so no show swap prunes the copy: phase (a) and (a2)
+/// keep it after moving its slot, consolidation doesn't supersede it, and pack correction doesn't
+/// replace it (as `tasks::plan_dedup` never removes one). A code-less file acquisition mapped to an
+/// episode the record provides (`acquire::codeless_episode_files`) is accounted for, so an
+/// engine-verified absolute-numbered single is pruned like any other. A copy with no persisted
+/// identification is judged by its record alone. Reads the whole cache, so callers ask only when a
+/// prune is at hand.
 async fn copies_holding_codeless_files(
     app: &AppState,
     hashes: &[&str],
@@ -2466,17 +2502,23 @@ async fn copies_holding_codeless_files(
     }
     let wanted: std::collections::HashSet<String> =
         hashes.iter().map(|h| h.to_ascii_lowercase()).collect();
-    app.store
-        .load_all_matches()
-        .await
-        .into_values()
-        .map(|(info, _)| info)
-        .filter(|info| {
-            wanted.contains(&info.hash.to_ascii_lowercase())
-                && crate::tasks::holds_codeless_video(info)
-        })
-        .map(|info| info.hash.to_ascii_lowercase())
-        .collect()
+    let mut out = std::collections::HashSet::new();
+    for (info, _) in app.store.load_all_matches().await.into_values() {
+        let hash = info.hash.to_ascii_lowercase();
+        if !wanted.contains(&hash) || out.contains(&hash) {
+            continue;
+        }
+        let provides = app
+            .store
+            .get_owned(hash.clone())
+            .await
+            .map(|r| r.provides)
+            .unwrap_or_default();
+        if crate::tasks::holds_codeless_video(&info, &provides) {
+            out.insert(hash);
+        }
+    }
+    out
 }
 
 /// Which owned copy a per-episode swap supersedes ([`upgrade_episode_slot`]), and so what it prunes.
@@ -2561,9 +2603,11 @@ struct EpisodeTick {
     /// lacks it, and then prunes it by that id.
     adopted: Vec<(String, String)>,
     /// Lowercased infohashes that staged this tick as a torrent that is no single for ANY episode:
-    /// its files carry more than one distinct episode, or none `parse_se_all` decodes (an
-    /// absolute-numbered `Show - 05.mkv`, or a code only in a directory, `Season 01/E05.mkv`). The
-    /// per-episode path adopts only a TRUE singleton, so such a torrent is rejected for EVERY
+    /// its files carry more than one distinct episode, or none that maps to one
+    /// ([`crate::acquire::show_episode_files`]: a multi-file pack of absolutely numbered
+    /// `Show - 05.mkv` files with no explicit season). A single-file absolute-numbered release is a
+    /// single and is adopted. The per-episode path adopts only a TRUE singleton, so such a torrent
+    /// is rejected for EVERY
     /// target episode: skip it for the rest of the tick instead of re-staging it (add + cached poll +
     /// delete) for each later episode — Torrentio commonly lists the same season pack under every
     /// episode query. (A pack whose torrent name says so never gets this far: [`is_pack_stream`].)
@@ -3483,9 +3527,10 @@ where
             "no imdb id; cannot scrape for consolidation".into(),
         ));
     }
-    // Only a season held as scattered single-episode records (≥2 records) can be consolidated
-    // (`consolidate_show_seasons` checks the same), so a show held as packs alone — most of them —
-    // skips the aired-episode lookup (one TMDB request per season) altogether.
+    // Only a season with a single-episode record and at least two owned records supplying it, packs
+    // included, can be consolidated (`season_has_scatter`, which `consolidate_show_seasons` checks
+    // too), so a show held as packs alone — most of them — skips the aired-episode lookup (one TMDB
+    // request per season) altogether.
     let scattered = owned
         .iter()
         .filter(|(_, r)| r.provides.len() == 1)
@@ -3816,9 +3861,9 @@ async fn consolidate_show_seasons(
                 .filter(|(s, _, _)| *s == season)
                 .map(|(_, e, _)| *e)
                 .collect();
-            // Every owned hash this pack fully supersedes for the season (pruned below). M-2
-            // safety: EVERY episode it provides is for this season AND covered by the new pack, so
-            // no held episode is left with an un-repointed selection.
+            // Every owned hash this pack fully supersedes for the season (pruned below): every episode
+            // such a record provides is in this season and in the new pack, so no held episode is
+            // left on a slot that isn't repointed.
             let mut superseded: Vec<&(String, OwnedRecord)> = owned
                 .iter()
                 .filter(|(h, rec)| {
@@ -4631,12 +4676,12 @@ mod tests {
         };
         // Abandoned (left by an earlier process) and unowned: its torrent goes.
         store
-            .put_staging_intent("horphan".into(), 100)
+            .claim_staging_intent("horphan".into(), 100)
             .await
             .unwrap();
         // Abandoned but owned: the candidate was recorded and only the clear was lost.
         store
-            .put_staging_intent("howned".into(), 100)
+            .claim_staging_intent("howned".into(), 100)
             .await
             .unwrap();
         store
@@ -4655,7 +4700,10 @@ mod tests {
             .unwrap();
         // Abandoned, not listed: deleted by the id its add returned (and closed, though younger than
         // the listing lag, since that delete succeeded).
-        store.put_staging_intent("hgone".into(), 100).await.unwrap();
+        store
+            .claim_staging_intent("hgone".into(), 100)
+            .await
+            .unwrap();
         store
             .set_staging_torrent_id("hgone".into(), "t-gone".into())
             .await
@@ -4664,7 +4712,7 @@ mod tests {
         store.forget_local_staging_intents();
         // Opened by this process just now: may still be staging, so it is left alone.
         store
-            .put_staging_intent("hlive".into(), 5_000)
+            .claim_staging_intent("hlive".into(), 5_000)
             .await
             .unwrap();
 
@@ -4696,7 +4744,7 @@ mod tests {
             ..Default::default()
         };
         store
-            .put_staging_intent("horphan".into(), 100)
+            .claim_staging_intent("horphan".into(), 100)
             .await
             .unwrap();
         store.forget_local_staging_intents();
@@ -4732,7 +4780,10 @@ mod tests {
 
         // (1) Cut off before the add returned (no id), opened just now: kept.
         let store = mem_store();
-        store.put_staging_intent("hnoid".into(), now).await.unwrap();
+        store
+            .claim_staging_intent("hnoid".into(), now)
+            .await
+            .unwrap();
         store.forget_local_staging_intents();
         assert!(sweep_staging_intents(&store, &ok, &[], now)
             .await
@@ -4746,7 +4797,10 @@ mod tests {
 
         // (2) The delete by id fails, opened just now: kept.
         let store = mem_store();
-        store.put_staging_intent("hfail".into(), now).await.unwrap();
+        store
+            .claim_staging_intent("hfail".into(), now)
+            .await
+            .unwrap();
         store
             .set_staging_torrent_id("hfail".into(), "t-fail".into())
             .await
@@ -4776,7 +4830,10 @@ mod tests {
 
         // (3) No id, older than the listing lag: closed.
         let store = mem_store();
-        store.put_staging_intent("hold".into(), 100).await.unwrap();
+        store
+            .claim_staging_intent("hold".into(), 100)
+            .await
+            .unwrap();
         store.forget_local_staging_intents();
         sweep_staging_intents(&store, &ok, &[], now).await;
         assert!(open(store).await.is_empty());
@@ -4803,7 +4860,7 @@ mod tests {
         for stamp in [0, u64::MAX / 2] {
             let store = mem_store();
             store
-                .put_staging_intent("hlive".into(), stamp)
+                .claim_staging_intent("hlive".into(), stamp)
                 .await
                 .unwrap();
             let swept = sweep_staging_intents(&store, &provider, &listing, 1_000_000).await;
@@ -4815,7 +4872,7 @@ mod tests {
 
         // Still open an hour later (monotonic): abandoned, so its torrent goes.
         let store = mem_store();
-        store.put_staging_intent("hlive".into(), 0).await.unwrap();
+        store.claim_staging_intent("hlive".into(), 0).await.unwrap();
         tokio::time::advance(Duration::from_secs(STAGING_ABANDONED_AFTER_SECS - 1)).await;
         assert!(sweep_staging_intents(&store, &provider, &listing, 0)
             .await
@@ -4834,7 +4891,7 @@ mod tests {
         deleted.lock().unwrap().clear();
         let store = mem_store();
         store
-            .put_staging_intent("hlive".into(), u64::MAX / 2)
+            .claim_staging_intent("hlive".into(), u64::MAX / 2)
             .await
             .unwrap();
         store.forget_local_staging_intents();
@@ -8814,6 +8871,67 @@ mod tests {
         }
     }
 
+    /// A corrective downgrade of an over-ceiling copy accepts a within-ceiling release whose source
+    /// is untagged, and the plain score ranks an untagged HEVC encode above a tagged WEB one (its
+    /// HEVC bonus outweighs the WEB tier). Adopted, it would be recorded at an unknown source tier
+    /// and replaced by the WEB release on the next pass (downloaded twice). So `rank_changes` orders
+    /// as acquisition does (`release::rank_key`): a tagged source first at the same resolution.
+    #[tokio::test]
+    async fn rank_changes_puts_a_tagged_source_first_for_a_corrective_downgrade() {
+        let app = app_with(
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(MockProvider::default()),
+            mem_store(),
+        );
+        let raw = |hash: &str, name: &str| RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: format!("{name}\nRD+"),
+            info_hash: hash.into(),
+            file_idx: Some(0),
+            file_name: Some(format!("{name}.mkv")),
+        };
+        let raws = vec![
+            raw("huntagged", "M.2020.1080p.HEVC.x265-GRP"),
+            raw("hweb", "M.2020.1080p.WEB.h264-GRP"),
+        ];
+        let prefs = &app.config.acquisition.prefs;
+        assert!(
+            release::score(&release::parse(&raws[0]), prefs)
+                > release::score(&release::parse(&raws[1]), prefs),
+            "the plain score prefers the untagged encode"
+        );
+        let ranked = rank_changes(
+            &app,
+            MediaKind::Movie,
+            27205,
+            &raws,
+            &q2160_remux(),
+            &[],
+            &movie_req(),
+        )
+        .await;
+        let got: Vec<_> = ranked
+            .iter()
+            .map(|(r, imp)| (r.info_hash.as_str(), *imp))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("hweb", release::Improvement::Downgrade),
+                ("huntagged", release::Improvement::Downgrade),
+            ]
+        );
+        let acquisition: Vec<_> = release::rank(raws.iter().map(release::parse).collect(), prefs)
+            .into_iter()
+            .map(|r| r.info_hash)
+            .collect();
+        assert_eq!(
+            acquisition,
+            vec!["hweb", "huntagged"],
+            "acquisition's order"
+        );
+    }
+
     #[tokio::test]
     async fn rank_changes_skips_known_unverifiable_containers() {
         // The upgrade pass only adopts a release whose tracks PASS the probe, and the probe can never
@@ -12699,16 +12817,172 @@ mod tests {
         }
     }
 
+    /// The owned 720p S01E01 singleton `e720` (listed as `told720`, its slot on it) and an app whose
+    /// scraper offers one cached candidate `cand_hash` whose staged torrent `tcand` holds `paths`.
+    /// Returns the app and the provider's deleted ids.
+    async fn codeless_candidate_app(
+        cand_hash: &str,
+        description: &str,
+        paths: &[&str],
+    ) -> (AppState, Arc<std::sync::Mutex<Vec<String>>>) {
+        let store = mem_store();
+        store
+            .put_owned("e720".into(), ep_record(1, 1, q720_web()))
+            .await
+            .unwrap();
+        store
+            .put_selection(
+                crate::store::episode_slot(SHOW_TMDB, 1, 1),
+                SelectionEntry {
+                    hash: "e720".into(),
+                    file_path: "old720.mkv".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let cand = RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: format!("{description}\nRD+"),
+            info_hash: cand_hash.into(),
+            file_idx: Some(0),
+            file_name: Some(paths[0].into()),
+        };
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent {
+                id: "told720".into(),
+                hash: "e720".into(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tcand".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tcand".into(),
+                hash: cand_hash.into(),
+                status: "downloaded".into(),
+                files: paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| TorrentFile {
+                        id: i as u32,
+                        path: (*p).into(),
+                        bytes: 2_000_000_000,
+                        selected: 1,
+                    })
+                    .collect(),
+                links: (0..paths.len())
+                    .map(|i| format!("https://cdn/c{i}"))
+                    .collect(),
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/c0".into()),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![cand],
+        });
+        (app_with(scraper, provider, store), deleted)
+    }
+
+    /// A cached single-file release that names its episode by an absolute number and no code
+    /// (`[Group] S - 01 (1080p WEB-DL).mkv`, which acquisition accepts) is adopted by phase (a) like
+    /// any single: the slot moves to its file, the worse singleton is pruned and the new record
+    /// provides the episode. It used to be staged and deleted again on every pass.
+    #[tokio::test]
+    async fn singleton_episode_upgrades_to_a_codeless_absolute_numbered_single() {
+        let path = "[Group] S - 01 (1080p WEB-DL) [ABCD1234].mkv";
+        let (app, deleted) = codeless_candidate_app(
+            "habs01",
+            "[Group] S - 01 (1080p WEB-DL) [ABCD1234]",
+            &[path],
+        )
+        .await;
+        upgrade_show_episodes_and_packs(&app, SHOW_TMDB, &["e720".into()], Duration::from_secs(0))
+            .await;
+        let sel = app
+            .store
+            .get_selection(crate::store::episode_slot(SHOW_TMDB, 1, 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            (sel.hash.as_str(), sel.file_path.as_str()),
+            ("habs01", path)
+        );
+        assert_eq!(
+            app.store.get_owned("habs01".into()).await.unwrap().provides,
+            vec![(1, 1)]
+        );
+        assert!(app.store.get_owned("e720".into()).await.is_none());
+        assert_eq!(*deleted.lock().unwrap(), vec!["told720".to_string()]);
+    }
+
+    /// A code-less single naming ANOTHER episode is that episode's valid single, so staging it for
+    /// this one rejects it without remembering it as no single for the tick; a torrent whose files
+    /// map to no episode at all (absolute numbers in a pack with no explicit season) is remembered.
+    #[tokio::test]
+    async fn codeless_candidate_for_another_episode_is_not_remembered_as_no_single() {
+        for (paths, remembered) in [
+            (vec!["[Group] S - 02 (1080p WEB-DL).mkv"], false),
+            (
+                vec![
+                    "Pack/[Group] S - 01 (1080p WEB-DL).mkv",
+                    "Pack/[Group] S - 02 (1080p WEB-DL).mkv",
+                ],
+                true,
+            ),
+        ] {
+            let (app, deleted) =
+                codeless_candidate_app("habs", "[Group] S - 02 (1080p WEB-DL)", &paths).await;
+            let mut not_singles = std::collections::HashSet::new();
+            let cand = RawCandidate {
+                name: "Torrentio\n1080p".into(),
+                description: "[Group] S - 02 (1080p WEB-DL)\nRD+".into(),
+                info_hash: "habs".into(),
+                file_idx: Some(0),
+                file_name: None,
+            };
+            let res = stage_episode_candidate(
+                &app,
+                SHOW_TMDB,
+                &ep_record(1, 1, q720_web()).request,
+                &release::parse(&cand),
+                (1, 1),
+                &Provenance::watchlist("a"),
+                &mut not_singles,
+            )
+            .await;
+            assert!(
+                matches!(res, Err(UpgradeSkip::NoChange(_))),
+                "{paths:?}: {res:?}"
+            );
+            assert_eq!(not_singles.contains("habs"), remembered, "{paths:?}");
+            assert_eq!(*deleted.lock().unwrap(), vec!["tcand".to_string()]);
+        }
+    }
+
     /// Phase (a) prunes the singleton it upgrades, except one holding a video file with no episode
     /// code: the slot still moves to the better copy, and the old torrent is kept for that file.
     #[tokio::test]
     async fn singleton_holding_a_file_with_no_episode_code_is_kept_after_its_upgrade() {
-        for codeless in [true, false] {
+        // `codeless` = whether the old copy holds a code-less file its record doesn't account for.
+        // A single-file release naming its episode by an absolute number (how acquisition adopts
+        // such a release, with that episode in `provides`) is accounted for, so it is pruned.
+        for (files, codeless) in [
+            (
+                vec![
+                    "S.S01E01.720p.WEB/S.S01E01.720p.WEB.mkv",
+                    "S.S01E01.720p.WEB/Season 02/E01 - Title.mkv",
+                ],
+                true,
+            ),
+            (vec!["S.S01E01.720p.WEB/S.S01E01.720p.WEB.mkv"], false),
+            (vec!["[Group] S - 01 (720p WEB) [ABCD1234].mkv"], false),
+        ] {
             let h = show_harness_singleton_720_ep().await;
-            let mut files = vec!["S.S01E01.720p.WEB/S.S01E01.720p.WEB.mkv"];
-            if codeless {
-                files.push("S.S01E01.720p.WEB/Season 02/E01 - Title.mkv");
-            }
             persist_show_files(&h.app.store, "told720", &h.old_720_hash, &files).await;
             upgrade_show_episodes_and_packs(
                 &h.app,
@@ -14124,6 +14398,46 @@ mod tests {
         assert!(store.get_owned("hnew".into()).await.is_none());
     }
 
+    /// The episode monitor runs as its own task and may acquire a candidate (here the season pack
+    /// the per-episode path would stage and then delete) after the upgrade pass ranked it. The store
+    /// shows it before a lagging TorBox listing does, so staging never adds it: on TorBox the add
+    /// would return the acquired torrent's id. Nor is a hash another stager holds staged.
+    #[tokio::test]
+    async fn staging_never_adds_a_candidate_owned_since_ranking_or_held_elsewhere() {
+        for owned in [true, false] {
+            let h = show_harness_singleton_720_ep().await;
+            if owned {
+                h.app
+                    .store
+                    .put_owned(h.cand_1080_hash.clone(), ep_record(1, 2, q1080_web()))
+                    .await
+                    .unwrap();
+            } else {
+                assert!(h
+                    .app
+                    .store
+                    .claim_staging_intent(h.cand_1080_hash.clone(), 1)
+                    .await
+                    .unwrap());
+            }
+            let res = add_staging_candidate(&h.app, &h.cand_1080_hash).await;
+            assert!(
+                matches!(res, Err(UpgradeSkip::NoChange(_))),
+                "owned={owned}: {res:?}"
+            );
+            assert!(h.added.lock().unwrap().is_empty(), "owned={owned}: no add");
+            assert!(
+                h.deleted.lock().unwrap().is_empty(),
+                "owned={owned}: no delete"
+            );
+            assert_eq!(
+                h.app.store.all_staging_intents().await.len(),
+                usize::from(!owned),
+                "owned={owned}: only the other stager's intent is left"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn episode_upgrade_never_stages_a_candidate_already_in_the_account() {
         let h = show_harness_singleton_720_ep_with(true).await;
@@ -14813,8 +15127,19 @@ mod tests {
             "Show.1x05.720p.HDTV\nRD+",
             "Show - 1x05 - Title 720p\nRD+",
             "Show.S01.E05.1080p.WEB\nRD+",
+            // An absolute-numbered single (no code, a trailing ` - NN` number), which acquisition
+            // and phase (a) adopt as a single.
+            "[Group] Show - 05 (1080p) [ABCD1234]\nRD+",
+            "[Group] Show S2 - 05 (1080p)\nRD+",
         ] {
             assert!(is_single_episode_stream(&stream(single)), "{single}");
+        }
+        // A batch of absolute numbers is a pack.
+        for pack in [
+            "[Group] Show - 01-12 [Batch] (1080p)\nRD+",
+            "[Group] Show (01-12) (1080p)\nRD+",
+        ] {
+            assert!(!is_single_episode_stream(&stream(pack)), "{pack}");
         }
     }
 

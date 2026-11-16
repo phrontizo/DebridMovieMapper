@@ -325,7 +325,14 @@ fn detect_source(lower: &str) -> Source {
 
 pub fn parse(c: &RawCandidate) -> ReleaseInfo {
     let text = format!("{}\n{}", c.name, c.description);
-    let lower = text.to_ascii_lowercase();
+    // The regex crate's `\b` counts `_` as a word character, so in an underscore-separated name
+    // (`Movie_2019_2160p_UHD_BluRay_x265`) every `\b`-bounded matcher below (the resolution, the cam
+    // and source tags, the language words) would read nothing, and a missing resolution passes the
+    // `MAX_RESOLUTION` ceiling. They read `tags`, the text with `_` mapped to `.` (as
+    // `vfs::is_video_file` does). It has the same length, so match offsets stay valid. The size, the
+    // seeders and the cached marker still read the original `text`.
+    let tags = text.replace('_', ".");
+    let lower = tags.to_ascii_lowercase();
 
     // Prefer an explicit `\d{3,4}p` resolution over a bare `4k`/`uhd` tag REGARDLESS of position: a
     // plain leftmost `captures()` would read a "4K Remastered" tag preceding an actually-`1080p`
@@ -334,7 +341,7 @@ pub fn parse(c: &RawCandidate) -> ReleaseInfo {
     let resolution = {
         let mut digit_res = None;
         let mut had_4k = false;
-        for cap in RES_RE.captures_iter(&text) {
+        for cap in RES_RE.captures_iter(&tags) {
             if let Some(m) = cap.get(1) {
                 if let Ok(r) = m.as_str().parse::<u16>() {
                     digit_res = Some(r);
@@ -948,9 +955,13 @@ pub enum Improvement {
 /// UNKNOWN quality ([`is_unknown_quality`]) is the lowest: within the ceiling an unknown current is
 /// improved by any known cached candidate at or above its resolution when that is tagged (scores
 /// ignored — a known resolution stays a floor, so a 1080p copy with an untagged source is never
-/// traded for 720p), and a known current is never improved by an unknown candidate. Replacing an
-/// unknown copy records a known one, so that rule fires at most once per slot (converges); an
-/// unknown candidate is never adopted over anything cached.
+/// traded for 720p), and a known current is never improved by an unknown candidate within the
+/// ceiling. Replacing an unknown copy records a known one, so that rule fires at most once per slot
+/// (converges). The one exception: an over-ceiling current is corrected by any within-ceiling
+/// candidate with a tagged resolution, its source untagged included (a corrective `Downgrade`).
+/// `upgrade::rank_changes` orders a tagged source first at each resolution (`rank_key`), so such a
+/// release is adopted only when no tagged one at its resolution qualifies; the next pass may then
+/// upgrade it once.
 pub fn is_target_improvement(
     current: &QualitySummary,
     candidate: &QualitySummary,
@@ -1087,6 +1098,37 @@ mod tests {
             file_idx: None,
             file_name: file.map(String::from),
         }
+    }
+
+    /// The regex crate's `\b` counts `_` as a word character, so the separator-bounded tag
+    /// matchers read nothing in an underscore-separated name: no resolution (which lets a release
+    /// through the `MAX_RESOLUTION` ceiling), no cam source (past the cam floor), no language. A
+    /// name line without its own quality label (another addon than Torrentio) relies on them.
+    #[test]
+    fn underscore_separated_tags_are_read() {
+        let p = prefs();
+        let uhd = parse(&raw(
+            "Addon",
+            "Movie_2019_2160p_UHD_BluRay_x265\nRD+",
+            "h",
+            None,
+        ));
+        assert_eq!(uhd.resolution, Some(2160));
+        assert_eq!(uhd.source, Source::BluRay);
+        assert!(score(&uhd, &p).is_none(), "above the 1080 ceiling");
+
+        let cam = parse(&raw("Addon", "Movie_2025_HDCAM_x264\nRD+", "h", None));
+        assert_eq!(cam.source, Source::Cam);
+        assert!(score(&cam, &p).is_none(), "cam floor");
+
+        let ita = parse(&raw("Addon", "Movie_2020_ITA_1080p_WEB\nRD+", "h", None));
+        assert_eq!(ita.resolution, Some(1080));
+        assert_eq!(ita.source, Source::Web);
+        assert_eq!(ita.languages, vec!["ita".to_string()]);
+
+        // The size still reads from the original text.
+        let sized = parse(&raw("Addon", "Movie_2020_4.7GB_x264\nRD+", "h", None));
+        assert_eq!(sized.size_bytes, Some(4_700_000_000));
     }
 
     #[test]

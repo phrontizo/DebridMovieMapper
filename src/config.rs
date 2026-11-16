@@ -147,6 +147,13 @@ const NOT_LANGUAGE_CODES: [&str; 3] = ["off", "any", "all"];
 /// "any language", so they are rejected like [`NOT_LANGUAGE_CODES`].
 const NO_TRACK_CODES: [&str; 2] = ["und", "mul"];
 
+/// ISO 639-1 codes an operator may write to mean "no requirement": `no` (Norwegian) and `na`
+/// (Nauruan, which also reads as "N/A"). Each is kept as its language, with a warning naming the
+/// 3-letter code that keeps the language without the warning. Entries: (2-letter code, language
+/// name, 3-letter code).
+const MISREADABLE_CODES: [(&str, &str, &str); 2] =
+    [("no", "Norwegian", "nor"), ("na", "Nauruan", "nau")];
+
 /// Read a trimmed, non-keyword `AUDIO_LANGUAGE` / `SUBTITLE_LANGUAGE` value (`name`) as a language
 /// code, lowercased, or `None` when it is no language code; the caller then falls back to its
 /// default, the keyword `fallback`, which the warnings name along with what it does
@@ -155,7 +162,8 @@ const NO_TRACK_CODES: [&str; 2] = ["und", "mul"];
 /// days. Hence:
 /// - 2 letters: kept only if `probe::is_known_language_code` knows it. Its ISO 639-1 table is
 ///   complete, so anything else (`xy`) is a typo and is rejected with a warning. `no` is kept as
-///   Norwegian, with a warning, since it reads like "no requirement".
+///   Norwegian and `na` as Nauruan, each with a warning ([`MISREADABLE_CODES`]), since they read
+///   like "no requirement" and "N/A".
 /// - 3 letters: kept. A code the probe doesn't know is warned about, since that is what a misspelt
 ///   code (`egn`) looks like, but rare valid ISO 639-2 codes (`haw`) aren't in its tables either.
 ///   The words in [`NOT_LANGUAGE_CODES`] and the codes in [`NO_TRACK_CODES`] are rejected.
@@ -179,10 +187,11 @@ fn parse_lang_code(name: &str, v: &str, fallback: &str, fallback_means: &str) ->
         );
         return None;
     }
-    if code == "no" {
+    if let Some((_, language, three)) = MISREADABLE_CODES.iter().find(|(two, ..)| *two == code) {
         warn!(
-            "{name} '{v}' is Norwegian, so a release with no Norwegian track is rejected. Use \
-             '{fallback}' for {fallback_means}; to keep Norwegian without this warning, write 'nor'"
+            "{name} '{v}' is {language}, so a release with no {language} track is rejected. Use \
+             '{fallback}' for {fallback_means}; to keep {language} without this warning, write \
+             '{three}'"
         );
     } else if !known {
         warn!(
@@ -196,8 +205,8 @@ fn parse_lang_code(name: &str, v: &str, fallback: &str, fallback_means: &str) ->
 
 impl AudioReq {
     /// `None`/empty/"original" → Original; a language code → that language, lowercased
-    /// ([`parse_lang_code`], which warns about an unknown 3-letter code and about `no`); any other
-    /// non-empty value is invalid (warned) and falls back to Original.
+    /// ([`parse_lang_code`], which warns about an unknown 3-letter code and about `no`/`na`); any
+    /// other non-empty value is invalid (warned) and falls back to Original.
     pub fn parse(s: Option<String>) -> Self {
         match s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
             None => AudioReq::Original,
@@ -217,8 +226,8 @@ pub enum SubReq {
 
 impl SubReq {
     /// `None`/empty/"none"/"off" → None (skip); a language code → that language, lowercased
-    /// ([`parse_lang_code`], which warns about an unknown 3-letter code and about `no`); any other
-    /// non-empty value is invalid (warned) and falls back to None (skip the check).
+    /// ([`parse_lang_code`], which warns about an unknown 3-letter code and about `no`/`na`); any
+    /// other non-empty value is invalid (warned) and falls back to None (skip the check).
     pub fn parse(s: Option<String>) -> Self {
         match s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
             None => SubReq::None,
@@ -1568,6 +1577,40 @@ mod tests {
             assert_eq!(
                 AudioReq::parse(Some("nob".into())),
                 AudioReq::Lang("nob".into())
+            );
+        });
+        assert!(logs.is_empty(), "{logs:?}");
+    }
+
+    #[test]
+    fn language_reqs_keep_na_as_nauruan_with_a_warning() {
+        // `na` is Nauruan's ISO 639-1 code, so it is kept, but an operator may write it for "N/A";
+        // taken silently, every release without a Nauruan track would be rejected and blacklisted.
+        let logs = captured_warnings(|| {
+            assert_eq!(SubReq::parse(Some("na".into())), SubReq::Lang("na".into()));
+            assert_eq!(
+                AudioReq::parse(Some("NA".into())),
+                AudioReq::Lang("na".into())
+            );
+        });
+        assert!(
+            logs.contains("SUBTITLE_LANGUAGE 'na' is Nauruan")
+                && logs.contains("AUDIO_LANGUAGE 'NA' is Nauruan"),
+            "{logs:?}"
+        );
+        assert!(
+            logs.contains("'none'") && logs.contains("'original'") && logs.contains("'nau'"),
+            "{logs:?}"
+        );
+        // The 3-letter spelling is plain Nauruan, with no warning.
+        let logs = captured_warnings(|| {
+            assert_eq!(
+                SubReq::parse(Some("nau".into())),
+                SubReq::Lang("nau".into())
+            );
+            assert_eq!(
+                AudioReq::parse(Some("nau".into())),
+                AudioReq::Lang("nau".into())
             );
         });
         assert!(logs.is_empty(), "{logs:?}");

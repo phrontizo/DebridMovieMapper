@@ -470,7 +470,16 @@ pub struct Store {
     local_staging: LocalStaging,
 }
 
-type LocalStaging = Arc<std::sync::Mutex<HashMap<String, tokio::time::Instant>>>;
+/// Per lowercased hash: when this process opened its staging intent (monotonic) and the claim's
+/// generation ([`next_staging_generation`]), so a clear removes only the note of the intent it
+/// closed, never that of a claim opened right after it.
+type LocalStaging = Arc<std::sync::Mutex<HashMap<String, (tokio::time::Instant, u64)>>>;
+
+/// A process-unique generation for a staging claim's local note.
+fn next_staging_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 impl Store {
     /// Open (or create) the database at `path`, recovering automatically from a genuinely
@@ -2169,30 +2178,69 @@ impl Store {
 
     // ── staging intents (see `StagingIntent`) ─────────────────────────────────
 
-    /// Open a staging intent for `hash` (no torrent id yet), replacing any earlier one, and note it
-    /// as this process's ([`Store::local_staging_age`]). The local note is taken before the write
-    /// (and dropped again if the write fails), so the sweep never sees the row without it.
-    pub async fn put_staging_intent(&self, hash: String, started_at: u64) -> Result<(), AppError> {
+    /// Claim `hash` for staging: open its staging intent (no torrent id yet) and note it as this
+    /// process's ([`Store::local_staging_age`]), in one write transaction that refuses when an
+    /// intent for `hash` is already open. `Ok(false)` means another stager holds it (the acquisition
+    /// engine and the upgrade job run as separate tasks and both add through this table), or a
+    /// leftover intent waits for `upgrade::sweep_staging_intents`: nothing is written, and no local
+    /// note is touched. The caller skips the candidate, as one already in the account. Without the
+    /// claim, a second stager whose (lagging) provider listing didn't show the first one's add
+    /// would add the same hash, get the SAME torrent id back on TorBox, and could delete it on a
+    /// rejection.
+    ///
+    /// The note is taken inside the transaction, before the commit, so the sweep never sees the row
+    /// without it, and dropped again only if this claim's commit fails.
+    pub async fn claim_staging_intent(
+        &self,
+        hash: String,
+        started_at: u64,
+    ) -> Result<bool, AppError> {
         let key = hash.to_ascii_lowercase();
-        let intent = StagingIntent {
+        let bytes = serde_json::to_vec(&StagingIntent {
             torrent_id: None,
             started_at,
-        };
-        self.local_staging()
-            .insert(key.clone(), tokio::time::Instant::now());
-        let written = self
-            .put_json(STAGING_TABLE, key.clone(), &intent, "StagingIntent")
-            .await;
-        if written.is_err() {
-            self.local_staging().remove(&key);
-        }
-        written
+        })
+        .map_err(|e| AppError::Task(format!("serialise StagingIntent for {key}: {e}")))?;
+        let db = self.db.clone();
+        let local = self.local_staging.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, redb::Error> {
+            let txn = db.begin_write()?;
+            {
+                let mut table = txn.open_table(STAGING_TABLE)?;
+                // `.is_some()` drops the read guard before the `&mut` insert below.
+                if table.get(key.as_str())?.is_some() {
+                    return Ok(false); // the transaction is dropped unwritten
+                }
+                table.insert(key.as_str(), bytes.as_slice())?;
+            }
+            let generation = next_staging_generation();
+            Self::lock_local_staging(&local)
+                .insert(key.clone(), (tokio::time::Instant::now(), generation));
+            if let Err(e) = txn.commit() {
+                let mut local = Self::lock_local_staging(&local);
+                if local.get(&key).is_some_and(|(_, g)| *g == generation) {
+                    local.remove(&key);
+                }
+                return Err(e.into());
+            }
+            Ok(true)
+        })
+        .await;
+        Self::flatten_join(result)
     }
 
-    fn local_staging(&self) -> std::sync::MutexGuard<'_, HashMap<String, tokio::time::Instant>> {
-        self.local_staging
+    fn lock_local_staging(
+        local: &LocalStaging,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, (tokio::time::Instant, u64)>> {
+        local
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn local_staging(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, (tokio::time::Instant, u64)>> {
+        Self::lock_local_staging(&self.local_staging)
     }
 
     /// How long ago THIS process opened the staging intent of `hash` (monotonic), or `None` when it
@@ -2201,7 +2249,7 @@ impl Store {
     pub(crate) fn local_staging_age(&self, hash: &str) -> Option<std::time::Duration> {
         self.local_staging()
             .get(&hash.to_ascii_lowercase())
-            .map(|opened| opened.elapsed())
+            .map(|(opened, _)| opened.elapsed())
     }
 
     /// Forget which staging intents this process opened, as a restart would (tests only).
@@ -2238,14 +2286,29 @@ impl Store {
     }
 
     /// Close `hash`'s staging intent (a missing one is a no-op). The local note
-    /// ([`Store::local_staging_age`]) goes once the row is gone; a failed removal keeps both.
+    /// ([`Store::local_staging_age`]) goes once the row is gone; a failed removal keeps both. Only
+    /// the note of the intent this removed goes: a claim opened right after the commit keeps its own.
     pub async fn clear_staging_intent(&self, hash: String) -> Result<(), AppError> {
         let key = hash.to_ascii_lowercase();
-        let removed = self.remove_key(STAGING_TABLE, key.clone()).await;
-        if removed.is_ok() {
-            self.local_staging().remove(&key);
-        }
-        removed
+        let db = self.db.clone();
+        let local = self.local_staging.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            let txn = db.begin_write()?;
+            {
+                txn.open_table(STAGING_TABLE)?.remove(key.as_str())?;
+            }
+            // Read under the write lock every claim takes, so this is the generation of the intent
+            // being removed.
+            let generation = Self::lock_local_staging(&local).get(&key).map(|(_, g)| *g);
+            txn.commit()?;
+            let mut local = Self::lock_local_staging(&local);
+            if generation.is_some() && local.get(&key).map(|(_, g)| *g) == generation {
+                local.remove(&key);
+            }
+            Ok(())
+        })
+        .await;
+        Self::flatten_join(result)
     }
 
     /// Every open staging intent, keyed by lowercased infohash. A read failure is logged and reads
@@ -3369,7 +3432,7 @@ mod tests {
     async fn staging_intents_round_trip() {
         let store = Store::in_memory();
         assert!(store.all_staging_intents().await.is_empty());
-        store.put_staging_intent("ABC".into(), 100).await.unwrap();
+        assert!(store.claim_staging_intent("ABC".into(), 100).await.unwrap());
         assert_eq!(
             store.all_staging_intents().await,
             vec![(
@@ -3394,19 +3457,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.all_staging_intents().await.len(), 1);
-        // Re-opening replaces the intent (the id is reset until the new add returns).
-        store.put_staging_intent("abc".into(), 200).await.unwrap();
+        // A second claim of an open intent is refused and leaves it (and its local note) as it was.
+        let age = store.local_staging_age("abc").unwrap();
+        assert!(!store.claim_staging_intent("abc".into(), 200).await.unwrap());
         assert_eq!(
             store.all_staging_intents().await[0].1,
             StagingIntent {
-                torrent_id: None,
-                started_at: 200
+                torrent_id: Some("T1".into()),
+                started_at: 100
             }
         );
+        assert!(store.local_staging_age("abc").unwrap() >= age);
         store.clear_staging_intent("ABC".into()).await.unwrap();
         assert!(store.all_staging_intents().await.is_empty());
+        assert!(store.local_staging_age("abc").is_none());
         // Clearing a missing intent is a no-op.
         store.clear_staging_intent("abc".into()).await.unwrap();
+        // Once closed, the hash can be claimed again.
+        assert!(store.claim_staging_intent("abc".into(), 300).await.unwrap());
+        assert_eq!(store.all_staging_intents().await[0].1.started_at, 300);
+    }
+
+    /// A claim whose write fails leaves no row and no note, and never removes the note of an intent
+    /// that is already open.
+    #[tokio::test]
+    async fn a_failed_staging_claim_never_drops_another_intents_note() {
+        let (store, switch) = fail_writes::fail_after_arm_store();
+        assert!(store.claim_staging_intent("held".into(), 1).await.unwrap());
+        // Refused before it writes anything: the open intent and its note are untouched.
+        assert!(!store.claim_staging_intent("held".into(), 3).await.unwrap());
+        assert!(store.local_staging_age("held").is_some());
+        let per_commit = fail_writes::syncs_per_commit(&store, &switch).await;
+        switch.arm_after(0, per_commit);
+        assert!(store.claim_staging_intent("fresh".into(), 2).await.is_err());
+        assert!(store.local_staging_age("fresh").is_none());
+        assert!(store.local_staging_age("held").is_some());
+        switch.disarm();
+        let store = switch.reopen();
+        assert_eq!(
+            store
+                .all_staging_intents()
+                .await
+                .into_iter()
+                .map(|(h, _)| h)
+                .collect::<Vec<_>>(),
+            vec!["held".to_string()]
+        );
     }
 
     #[tokio::test]

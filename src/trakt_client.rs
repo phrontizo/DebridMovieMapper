@@ -12,15 +12,17 @@ use tracing::{debug, warn};
 /// A movie or show identified by its TMDB id (a watchlist or playback entry). Also carries the
 /// IMDB id Trakt provided (`tt…`), if present, so acquisition can prefer it over re-deriving from
 /// TMDB's (sometimes-incomplete) `external_ids`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraktItem {
     pub media_type: MediaType,
     pub tmdb_id: u64,
     pub imdb_id: Option<String>,
-    /// A playback show's earliest paused `(season, episode)` of the regular run (see
-    /// [`parse_playback`]): where a paused re-watch resumes. `None` for a movie, a watchlist entry,
-    /// or a show paused only on a special.
-    pub paused_episode: Option<(u32, u32)>,
+    /// A playback show's paused episodes of the regular run, each with when it was paused
+    /// (`paused_at`, Unix seconds), from all of its `/sync/playback` entries ([`parse_playback`]).
+    /// `tasks::build_wanted` reads a pause on an episode the user had watched before it as where a
+    /// re-watch resumes. Empty for a movie, a watchlist entry, or a show paused only on a special
+    /// or with no readable `paused_at`.
+    pub paused: Vec<((u32, u32), i64)>,
 }
 
 /// Device-flow code response (`POST /oauth/device/code`).
@@ -119,6 +121,10 @@ pub struct WatchedShow {
     /// id and be silently skipped. Mirrors `TraktItem.imdb_id`.
     pub imdb_id: Option<String>,
     pub watched_episodes: Vec<(u32, u32)>,
+    /// When each episode of `watched_episodes` was last watched (its `last_watched_at`, Unix
+    /// seconds), for the episodes that carry one. Tells a paused re-watch (a pause on an episode
+    /// watched before it) from an abandoned first-watch pause (`tasks::build_wanted`).
+    pub episode_watched_at: Vec<((u32, u32), i64)>,
     /// When the user last watched any episode of this show, as a Unix timestamp (seconds). `None`
     /// if Trakt omitted/malformed `last_watched_at`. Drives the catch-up lookback window (SP2.5).
     pub last_watched_at: Option<i64>,
@@ -871,7 +877,7 @@ pub fn parse_watchlist(v: &serde_json::Value, media_type: MediaType) -> Vec<Trak
                 media_type: media_type.clone(),
                 tmdb_id,
                 imdb_id: imdb_id_of(obj),
-                paused_episode: None,
+                paused: Vec::new(),
             })
         })
         .collect()
@@ -879,9 +885,10 @@ pub fn parse_watchlist(v: &serde_json::Value, media_type: MediaType) -> Vec<Trak
 
 /// Parse a `/sync/playback` array into deduped in-progress items. `type == "movie"` →
 /// `movie.ids.tmdb`; `type == "episode"` → `show.ids.tmdb` (so a show appears once even with
-/// several in-progress episodes), carrying the earliest paused `episode.season`/`episode.number`
-/// of its entries in `paused_episode`. A special (season 0) sets no position: it says nothing about
-/// where in the regular run the user is. Entries lacking a numeric tmdb are skipped.
+/// several in-progress episodes), carrying every entry's paused `episode.season`/`episode.number`
+/// and `paused_at` in `paused`. A special (season 0) is left out: it says nothing about where in
+/// the regular run the user is, and so is an entry with no readable `paused_at`. Entries lacking a
+/// numeric tmdb are skipped.
 pub fn parse_playback(v: &serde_json::Value) -> Vec<TraktItem> {
     let Some(arr) = v.as_array() else {
         return Vec::new();
@@ -889,7 +896,7 @@ pub fn parse_playback(v: &serde_json::Value) -> Vec<TraktItem> {
     let mut out: Vec<TraktItem> = Vec::new();
     // Dedup in first-seen order on (media_type, tmdb_id), via an index into `out` (O(n)) rather
     // than a linear scan per item (O(n²)) — a show with many in-progress episodes collapses to one
-    // entry, which keeps the earliest paused episode.
+    // entry, which keeps every pause.
     let mut index: std::collections::HashMap<(MediaType, u64), usize> =
         std::collections::HashMap::new();
     for e in arr {
@@ -899,7 +906,7 @@ pub fn parse_playback(v: &serde_json::Value) -> Vec<TraktItem> {
                     media_type: MediaType::Movie,
                     tmdb_id: tmdb_id_of(m)?,
                     imdb_id: imdb_id_of(m),
-                    paused_episode: None,
+                    paused: Vec::new(),
                 })
             }),
             Some("episode") => e.get("show").and_then(|s| {
@@ -907,11 +914,16 @@ pub fn parse_playback(v: &serde_json::Value) -> Vec<TraktItem> {
                     media_type: MediaType::Show,
                     tmdb_id: tmdb_id_of(s)?,
                     imdb_id: imdb_id_of(s),
-                    paused_episode: e.get("episode").and_then(|ep| {
-                        let number = |key: &str| u32::try_from(ep.get(key)?.as_u64()?).ok();
-                        Some((number("season")?, number("number")?))
-                            .filter(crate::wanted::is_regular_episode)
-                    }),
+                    paused: e
+                        .get("episode")
+                        .and_then(|ep| {
+                            let number = |key: &str| u32::try_from(ep.get(key)?.as_u64()?).ok();
+                            let episode = Some((number("season")?, number("number")?))
+                                .filter(crate::wanted::is_regular_episode)?;
+                            Some((episode, timestamp_field(e, "paused_at")?))
+                        })
+                        .into_iter()
+                        .collect(),
                 })
             }),
             _ => None,
@@ -922,10 +934,7 @@ pub fn parse_playback(v: &serde_json::Value) -> Vec<TraktItem> {
         match index.get(&(item.media_type.clone(), item.tmdb_id)) {
             Some(&at) => {
                 let kept = &mut out[at];
-                kept.paused_episode = match (kept.paused_episode, item.paused_episode) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                };
+                kept.paused.extend(item.paused);
                 if kept.imdb_id.is_none() {
                     kept.imdb_id = item.imdb_id;
                 }
@@ -975,6 +984,7 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
             let imdb_id = e.get("show").and_then(imdb_id_of);
             let reset_at = timestamp_field(e, "reset_at");
             let mut watched_episodes = Vec::new();
+            let mut episode_watched_at = Vec::new();
             if let Some(seasons) = e.get("seasons").and_then(|s| s.as_array()) {
                 for season in seasons {
                     let Some(season_number) = season
@@ -988,8 +998,9 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
                         continue;
                     };
                     for ep in episodes {
+                        let watched_at = timestamp_field(ep, "last_watched_at");
                         if let Some(reset) = reset_at {
-                            if timestamp_field(ep, "last_watched_at").is_none_or(|t| t < reset) {
+                            if watched_at.is_none_or(|t| t < reset) {
                                 continue; // watched before the progress reset → unwatched now
                             }
                         }
@@ -999,6 +1010,9 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
                             .and_then(|n| u32::try_from(n).ok())
                         {
                             watched_episodes.push((season_number, episode_number));
+                            if let Some(at) = watched_at {
+                                episode_watched_at.push(((season_number, episode_number), at));
+                            }
                         }
                     }
                 }
@@ -1009,6 +1023,7 @@ pub fn parse_watched_shows(v: &serde_json::Value) -> Vec<WatchedShow> {
                 trakt_id,
                 imdb_id,
                 watched_episodes,
+                episode_watched_at,
                 last_watched_at,
             })
         })
@@ -1439,7 +1454,7 @@ mod tests {
                 media_type: MediaType::Movie,
                 tmdb_id: 27205,
                 imdb_id: Some("tt1375666".into()),
-                paused_episode: None,
+                paused: Vec::new(),
             }]
         );
     }
@@ -1458,13 +1473,13 @@ mod tests {
                     media_type: MediaType::Show,
                     tmdb_id: 1396,
                     imdb_id: Some("tt0903747".into()),
-                    paused_episode: None,
+                    paused: Vec::new(),
                 },
                 TraktItem {
                     media_type: MediaType::Show,
                     tmdb_id: 1397,
                     imdb_id: None,
-                    paused_episode: None,
+                    paused: Vec::new(),
                 },
             ]
         );
@@ -1486,43 +1501,50 @@ mod tests {
                     media_type: MediaType::Movie,
                     tmdb_id: 100,
                     imdb_id: None,
-                    paused_episode: None,
+                    paused: Vec::new(),
                 },
                 TraktItem {
                     media_type: MediaType::Show,
                     tmdb_id: 200,
                     imdb_id: Some("tt0944947".into()),
-                    paused_episode: None,
+                    paused: Vec::new(),
                 },
             ]
         );
     }
 
-    /// A show's playback entries collapse to one item carrying its EARLIEST paused episode of the
-    /// regular run, where a re-watch resumes (a paused special says nothing about that position).
+    /// A show's playback entries collapse to one item carrying every paused episode of the
+    /// regular run with its `paused_at` (a paused special says nothing about where in the run the
+    /// user is, and a pause with no readable `paused_at` can't be told from an abandoned one).
     #[test]
-    fn parse_playback_keeps_the_earliest_paused_episode_of_a_show() {
+    fn parse_playback_keeps_every_paused_episode_of_a_show() {
+        let at = "2021-01-01T00:00:00.000Z"; // 1_609_459_200
         let v = serde_json::json!([
-            { "type": "episode", "episode": { "season": 2, "number": 5 }, "show": { "ids": { "tmdb": 200 } } },
-            { "type": "episode", "episode": { "season": 1, "number": 3 }, "show": { "ids": { "tmdb": 200 } } },
-            { "type": "episode", "episode": { "season": 0, "number": 1 }, "show": { "ids": { "tmdb": 200 } } },
-            { "type": "episode", "episode": { "season": 0, "number": 2 }, "show": { "ids": { "tmdb": 300 } } },
-            { "type": "episode", "show": { "ids": { "tmdb": 400 } } }, // no episode object
-            { "type": "movie", "movie": { "ids": { "tmdb": 100 } } },
+            { "type": "episode", "paused_at": at, "episode": { "season": 2, "number": 5 }, "show": { "ids": { "tmdb": 200 } } },
+            { "type": "episode", "paused_at": "2021-01-01T00:00:10.000Z", "episode": { "season": 1, "number": 3 }, "show": { "ids": { "tmdb": 200 } } },
+            { "type": "episode", "paused_at": at, "episode": { "season": 0, "number": 1 }, "show": { "ids": { "tmdb": 200 } } },
+            { "type": "episode", "episode": { "season": 1, "number": 4 }, "show": { "ids": { "tmdb": 200 } } }, // no paused_at
+            { "type": "episode", "paused_at": at, "episode": { "season": 0, "number": 2 }, "show": { "ids": { "tmdb": 300 } } },
+            { "type": "episode", "paused_at": at, "show": { "ids": { "tmdb": 400 } } }, // no episode object
+            { "type": "movie", "paused_at": at, "movie": { "ids": { "tmdb": 100 } } },
         ]);
-        let item = |media_type, tmdb_id, paused_episode| TraktItem {
+        let item = |media_type, tmdb_id, paused| TraktItem {
             media_type,
             tmdb_id,
             imdb_id: None,
-            paused_episode,
+            paused,
         };
         assert_eq!(
             parse_playback(&v),
             vec![
-                item(MediaType::Show, 200, Some((1, 3))),
-                item(MediaType::Show, 300, None),
-                item(MediaType::Show, 400, None),
-                item(MediaType::Movie, 100, None),
+                item(
+                    MediaType::Show,
+                    200,
+                    vec![((2, 5), 1_609_459_200), ((1, 3), 1_609_459_210)]
+                ),
+                item(MediaType::Show, 300, vec![]),
+                item(MediaType::Show, 400, vec![]),
+                item(MediaType::Movie, 100, vec![]),
             ]
         );
     }
@@ -1562,6 +1584,7 @@ mod tests {
                     trakt_id: Some(1390),
                     imdb_id: Some("tt0903747".into()),
                     watched_episodes: vec![(1, 1), (1, 2), (2, 1)],
+                    episode_watched_at: vec![],
                     last_watched_at: Some(1_609_459_200), // 2021-01-01T00:00:00Z
                 },
                 WatchedShow {
@@ -1569,6 +1592,7 @@ mod tests {
                     trakt_id: None,
                     imdb_id: None,
                     watched_episodes: vec![(1, 1)],
+                    episode_watched_at: vec![],
                     last_watched_at: None,
                 },
             ]
@@ -1645,13 +1669,13 @@ mod tests {
                 media_type: MediaType::Movie,
                 tmdb_id: 1,
                 imdb_id: None,
-                paused_episode: None,
+                paused: Vec::new(),
             }],
             in_progress: vec![TraktItem {
                 media_type: MediaType::Show,
                 tmdb_id: 2,
                 imdb_id: None,
-                paused_episode: None,
+                paused: Vec::new(),
             }],
             watched: WatchedData {
                 movies: vec![3],
@@ -1687,7 +1711,7 @@ mod tests {
                 media_type: MediaType::Movie,
                 tmdb_id: 1,
                 imdb_id: None,
-                paused_episode: None,
+                paused: Vec::new(),
             }]
         );
         assert_eq!(
@@ -1696,7 +1720,7 @@ mod tests {
                 media_type: MediaType::Show,
                 tmdb_id: 2,
                 imdb_id: None,
-                paused_episode: None,
+                paused: Vec::new(),
             }]
         );
         assert_eq!(client.watched("ignored").await.unwrap().movies, vec![3]);
@@ -1992,7 +2016,7 @@ mod tests {
                 media_type: MediaType::Movie,
                 tmdb_id: 1,
                 imdb_id: None,
-                paused_episode: None,
+                paused: Vec::new(),
             }],
             fail_reads: true,
             fail_refresh: true,
@@ -2217,7 +2241,31 @@ mod pagination_tests {
 
     #[test]
     fn parse_watched_shows_reads_the_real_extended_progress_shape() {
-        let p1 = parse_watched_shows(&json(WATCHED_SHOWS_P1));
+        // Each episode's own `last_watched_at` (checked below for the first show) is set aside for
+        // the whole-struct comparisons.
+        let without_episode_times = |shows: Vec<WatchedShow>| -> Vec<WatchedShow> {
+            shows
+                .into_iter()
+                .map(|s| WatchedShow {
+                    episode_watched_at: Vec::new(),
+                    ..s
+                })
+                .collect()
+        };
+        let p1_full = parse_watched_shows(&json(WATCHED_SHOWS_P1));
+        let mut drama_times: Vec<((u32, u32), i64)> = eps(1, 1..=8)
+            .into_iter()
+            .chain(eps(2, 1..=5))
+            .map(|e| (e, 1_746_128_220)) // 2025-05-01T19:37:00.000Z
+            .collect();
+        drama_times.push(((2, 6), 1_746_132_000)); // 2025-05-01T20:40:00.000Z
+        drama_times.push(((2, 7), 1_759_873_440)); // 2025-10-07T21:44:00.000Z
+        assert_eq!(p1_full[0].episode_watched_at, drama_times);
+        assert!(p1_full[1]
+            .episode_watched_at
+            .iter()
+            .all(|(_, at)| *at == 1_737_450_120));
+        let p1 = without_episode_times(p1_full);
         let mut drama_eps = eps(1, 1..=8);
         drama_eps.extend(eps(2, 1..=7));
         assert_eq!(
@@ -2228,6 +2276,7 @@ mod pagination_tests {
                     trakt_id: Some(811000),
                     imdb_id: Some("tt9900900".into()),
                     watched_episodes: drama_eps,
+                    episode_watched_at: vec![],
                     last_watched_at: Some(1_759_873_440), // 2025-10-07T21:44:00.000Z
                 },
                 WatchedShow {
@@ -2235,13 +2284,14 @@ mod pagination_tests {
                     trakt_id: Some(811300),
                     imdb_id: Some("tt9901100".into()),
                     watched_episodes: eps(1, 1..=4),
+                    episode_watched_at: vec![],
                     last_watched_at: Some(1_737_450_120), // 2025-01-21T09:02:00.000Z
                 },
             ],
             "extended=progress keeps every id the sync needs (tmdb/trakt/imdb) + last_watched_at, \
              and carries the per-episode watched set"
         );
-        let p2 = parse_watched_shows(&json(WATCHED_SHOWS_P2));
+        let p2 = without_episode_times(parse_watched_shows(&json(WATCHED_SHOWS_P2)));
         assert_eq!(
             p2,
             vec![
@@ -2250,6 +2300,7 @@ mod pagination_tests {
                     trakt_id: Some(810900),
                     imdb_id: Some("tt9900600".into()),
                     watched_episodes: eps(1, 1..=5),
+                    episode_watched_at: vec![],
                     last_watched_at: Some(1_663_699_684), // 2022-09-20T18:48:04.000Z
                 },
                 WatchedShow {
@@ -2258,6 +2309,7 @@ mod pagination_tests {
                     trakt_id: Some(810700),
                     imdb_id: None,
                     watched_episodes: eps(1, 1..=2),
+                    episode_watched_at: vec![],
                     last_watched_at: Some(1_663_356_321), // 2022-09-16T19:25:21.000Z
                 },
             ]
@@ -2311,13 +2363,13 @@ mod pagination_tests {
             media_type: MediaType::Movie,
             tmdb_id,
             imdb_id: Some(imdb.into()),
-            paused_episode: None,
+            paused: Vec::new(),
         };
         let show = |tmdb_id: u64, imdb: &str| TraktItem {
             media_type: MediaType::Show,
             tmdb_id,
             imdb_id: Some(imdb.into()),
-            paused_episode: None,
+            paused: Vec::new(),
         };
         assert_eq!(
             parse_watchlist(&json(WATCHLIST_MOVIES), MediaType::Movie),
@@ -2335,17 +2387,18 @@ mod pagination_tests {
             parse_watched_movies(&json(WATCHED_MOVIES_P1)),
             vec![911600, 910500, 911500]
         );
-        let paused = |tmdb_id: u64, imdb: &str, at: (u32, u32)| TraktItem {
-            paused_episode: Some(at),
+        let paused = |tmdb_id: u64, imdb: &str, at: (u32, u32), paused_at: i64| TraktItem {
+            paused: vec![(at, paused_at)],
             ..show(tmdb_id, imdb)
         };
         assert_eq!(
             parse_playback(&json(PLAYBACK)),
             vec![
-                paused(910200, "tt9900400", (1, 1)),
-                paused(910600, "tt9901700", (4, 5))
+                // 2025-09-04T20:54:51.000Z and 2025-06-29T16:51:47.000Z
+                paused(910200, "tt9900400", (1, 1), 1_757_019_291),
+                paused(910600, "tt9901700", (4, 5), 1_751_215_907)
             ],
-            "in-progress episodes map to their show, with the paused episode"
+            "in-progress episodes map to their show, with the paused episode and when"
         );
     }
 

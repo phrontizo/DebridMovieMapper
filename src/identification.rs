@@ -130,8 +130,12 @@ static NXM_TITLE_ONLY_RE: LazyLock<Regex> =
 /// that way (e.g. `10x10.2018`, `24x36.2019`): such a title is the whole cleaned name (only a
 /// year/quality metadata follows), whereas a real `NxM` marker is preceded by the show name — so
 /// after cleaning the former reduces to exactly the `NxM` token and is NOT treated as a marker.
+/// A trailing ` - NN` / ` - EpNN` episode number ([`trailing_episode_number`], the absolute-numbered
+/// anime form `[Group] Some Show - 12 (1080p).mkv`) is one too: the acquisition engine reads it as
+/// the file's episode, and that rule already leaves out a release year, a single digit and a
+/// numeric film title followed by its bracketed year.
 fn filename_has_show_marker(filename: &str) -> bool {
-    if STRONG_SHOW_RE.is_match(filename) {
+    if STRONG_SHOW_RE.is_match(filename) || trailing_episode_number(filename).is_some() {
         return true;
     }
     if NXM_RE.is_match(filename) {
@@ -937,7 +941,8 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
 }
 
 pub fn is_show_guess(files: &[rd_client::TorrentFile]) -> bool {
-    // An episode marker (SxxExx, NxM, "Season N", …) in any served file name → definitely a show.
+    // An episode marker (SxxExx, NxM, "Season N", a trailing ` - NN`, …) in any served file name →
+    // definitely a show.
     // An unselected file is never shown, so its marker doesn't count (see `served_files`).
     if served_files(files).any(|f| {
         let filename = f.path.split('/').next_back().unwrap_or(&f.path);
@@ -2874,6 +2879,99 @@ mod tests {
             "Anime.S01E13v2.mkv",
         ] {
             assert!(is_show_guess(&one_file(name)), "{name} should be a show");
+        }
+    }
+
+    #[test]
+    fn is_show_guess_detects_a_trailing_episode_number() {
+        // The absolute-numbered anime form names a single episode file by a ` - NN` number alone.
+        // Read as a movie, the title check picked a same-named film over the series and rejected
+        // the release, and the account mirror recorded the user's episode as that film.
+        for name in [
+            "[SubsPlease] Some Show - 12 (1080p) [ABCD1234].mkv",
+            "[Group] Some Show - 05v2 [1080p].mkv",
+            "Some Show - Ep01 [720p].mkv",
+            "Some_Show_-_12_(1080p).mkv",
+        ] {
+            assert!(is_show_guess(&one_file(name)), "{name} should be a show");
+        }
+        // `trailing_episode_number` reads none of these: a release year, a number followed by a
+        // bracketed release year (a numeric film title), a single-digit sequel, and a number a
+        // second ` - ` follows.
+        for name in [
+            "Dr.No - 1962.mkv",
+            "Some Show - 12 (2008).mkv",
+            "Some Film - 2.mkv",
+            "Some Show - 12 - Title (1080p).mkv",
+        ] {
+            assert!(
+                !is_show_guess(&one_file(name)),
+                "{name} should NOT be a show"
+            );
+        }
+    }
+
+    /// A single-file absolute-numbered episode whose series TMDB lists under another title (or
+    /// beside a same-titled film) is undecided by title and year, so `select_best_match` falls back
+    /// on the show guess. Guessed a movie, the film won and the title check rejected the release.
+    #[tokio::test]
+    async fn a_single_absolute_numbered_episode_is_identified_as_the_show() {
+        use crate::acquire::{TitleCheck, TitleValidator, TmdbTitleValidator};
+        use crate::scraper::MediaKind;
+        use crate::trakt_client::test_http::{spawn, Reply};
+        let name = "[Group] Some Show - 12 (1080p).mkv";
+        let files = one_file(name);
+        for (tv, movie) in [
+            // Neither result is an exact title match: the series under a longer English title, a
+            // franchise film beside it.
+            (
+                r#"{"results":[{"id":11,"title":"Some Show: Rising","original_title":"Rising",
+                    "release_date":"2019-04-06","popularity":30.0,"vote_count":900,"vote_average":8.5}]}"#,
+                r#"{"results":[{"id":22,"title":"Some Show the Movie: Train","release_date":"2020-10-16",
+                    "popularity":30.0,"vote_count":900,"vote_average":8.5}]}"#,
+            ),
+            // Both are an exact title match: a series and a same-titled film.
+            (
+                r#"{"results":[{"id":11,"title":"Some Show","release_date":"2019-04-06",
+                    "popularity":30.0,"vote_count":900,"vote_average":8.5}]}"#,
+                r#"{"results":[{"id":22,"title":"Some Show","release_date":"2020-10-16",
+                    "popularity":30.0,"vote_count":900,"vote_average":8.5}]}"#,
+            ),
+        ] {
+            let server = spawn(vec![
+                ("/search/tv?api_key=k&query=Some+Show", Reply::json(tv)),
+                (
+                    "/search/movie?api_key=k&query=Some+Show",
+                    Reply::json(movie),
+                ),
+            ])
+            .await;
+            let tmdb = TmdbClient::with_base_url("k".into(), server.base_url.clone()).unwrap();
+            let found = identify_name(name, &files, &tmdb).await;
+            assert!(
+                matches!(
+                    &found,
+                    Identification::Identified(m)
+                        if m.media_type == MediaType::Show
+                            && m.external_id.as_deref() == Some("tmdb:11")
+                ),
+                "expected the series, got {found:?} (requests {:?})",
+                server.requests()
+            );
+            // The account mirror identifies the user's single-episode torrent as the series.
+            let mirrored = identify_torrent(&single_file_torrent(name), &tmdb).await;
+            assert_eq!(mirrored.media_type, MediaType::Show);
+            assert_eq!(mirrored.external_id.as_deref(), Some("tmdb:11"));
+            // The acquisition title check accepts the release for its episode.
+            let validator = TmdbTitleValidator {
+                tmdb: std::sync::Arc::new(tmdb),
+            };
+            assert_eq!(
+                validator
+                    .validate(name, 11, MediaKind::Series, Some(1), Some(12))
+                    .await,
+                TitleCheck::Match
+            );
         }
     }
 

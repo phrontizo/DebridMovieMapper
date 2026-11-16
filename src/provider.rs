@@ -16,6 +16,31 @@ pub(crate) fn synthetic_bad_gateway(detail: &'static [u8]) -> reqwest::Error {
     .expect_err("BAD_GATEWAY always yields an error status")
 }
 
+/// The status of [`provider_busy_error`].
+const PROVIDER_BUSY: reqwest::StatusCode = reqwest::StatusCode::TOO_MANY_REQUESTS;
+
+/// The error an add returns when the provider took it but won't start it now (TorBox queues an add
+/// once the account is at its active-download limit; the client deletes the queued entry). A
+/// 429-status `reqwest::Error`, so it reads as "retry later" like throttling: the caller stops
+/// adding candidates for now ([`is_provider_busy`]).
+pub(crate) fn provider_busy_error(detail: &'static [u8]) -> reqwest::Error {
+    reqwest::Response::from(
+        hyper::Response::builder()
+            .status(PROVIDER_BUSY)
+            .body(hyper::body::Bytes::from_static(detail))
+            .expect("static 429 response always builds"),
+    )
+    .error_for_status()
+    .expect_err("429 is an error status")
+}
+
+/// Whether an add failed because the provider is busy ([`provider_busy_error`]) or throttling
+/// (a 429 that outlasted the client's retries): either way the next candidate's add would fare no
+/// better, so the caller retries later.
+pub(crate) fn is_provider_busy(e: &reqwest::Error) -> bool {
+    e.status() == Some(PROVIDER_BUSY)
+}
+
 /// A 404 `reqwest::Error`, as TorBox's `mylist?id=` sometimes answers for a torrent that exists.
 /// Shared by the tests that script such a lookup.
 #[cfg(test)]
@@ -277,6 +302,8 @@ pub struct MockProvider {
     /// Infohashes whose `add_magnet` returns a `reqwest::Error`, so a test can drive the acquisition
     /// engine's "add failed → try the next candidate" fall-through for one specific candidate.
     pub fail_add_magnet_hashes: std::collections::HashSet<String>,
+    /// Every add fails with [`provider_busy_error`] (TorBox queued it).
+    pub add_magnet_busy: bool,
     /// Per-torrent-id resolved URL. When a locator's `torrent_id` is present here, `resolve_url`
     /// returns that URL instead of the flat `resolved_url` — letting a test resolve the ORIGINAL and
     /// the REPAIRED torrent to different CDN endpoints (e.g. the original 5xxs, the repaired serves).
@@ -321,6 +348,9 @@ impl DebridProvider for MockProvider {
     async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
         let hash = magnet.rsplit("urn:btih:").next().unwrap_or("").to_string();
         self.added.lock().unwrap().push(hash.clone());
+        if self.add_magnet_busy {
+            return Err(provider_busy_error(b"queued"));
+        }
         if self.fail_add_magnet_hashes.contains(&hash) {
             // Drive an immediate URL-parse failure to produce a reqwest::Error without any I/O,
             // so the acquisition loop takes its "add failed → try next candidate" branch.
