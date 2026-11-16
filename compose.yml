@@ -171,15 +171,29 @@ services:
     container_name: jellyfin
     restart: unless-stopped
     user: "65534:65534"
+    # Jellyfin reads the FUSE mount rclone makes on ./rclone, and both settings below are needed
+    # for it to keep seeing that mount:
+    # - `rslave` on the bind: with Docker's default (rprivate) Jellyfin's view of ./rclone is fixed
+    #   when it starts, so a mount rclone makes afterwards never reaches it. After a host reboot
+    #   the Docker daemon restarts the containers by their restart policies, ignoring depends_on,
+    #   so Jellyfin can start before rclone has mounted and would show an empty /media.
+    # - `restart: true` (Compose 2.17 or later): when compose recreates or restarts rclone
+    #   (`docker compose pull && docker compose up -d` with rclone:latest, `docker compose restart
+    #   rclone`), it restarts Jellyfin too. Jellyfin's bind holds rclone's old mount, which rslave
+    #   doesn't replace, so without the restart every read under /media fails ("Transport endpoint
+    #   is not connected").
+    # Not covered: when the Docker daemon itself restarts a crashed rclone while Jellyfin keeps
+    # running, Jellyfin still holds the dead mount; run `docker compose restart jellyfin`.
     depends_on:
       rclone:
         condition: service_healthy
+        restart: true
     ports:
       - "8096:8096"
     volumes:
       - jellyfin-config:/config
       - jellyfin-cache:/cache
-      - ./rclone:/media:ro
+      - ./rclone:/media:ro,rslave
     # devices:
     #   - /dev/dri:/dev/dri  # Uncomment for hardware transcoding (requires GPU)
 

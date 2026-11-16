@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use crate::provider::FileLocator;
+use crate::provider::{synthetic_bad_gateway, FileLocator};
 use crate::ratelimit::AdaptiveRateLimiter;
 use crate::rd_client::{drop_repeated_ids, Torrent, TorrentFile, TorrentInfo};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
@@ -374,14 +374,6 @@ fn parse_rate_headers(headers: &reqwest::header::HeaderMap) -> Option<(u64, f64)
     Some((remaining, reset))
 }
 
-/// Build a synthetic Bad Gateway `reqwest::Error` for cases where we must return a
-/// `reqwest::Error` but have no live response — exhausted retries, or unparsable
-/// input we refuse to act on. Centralised so the fallible construction lives in one
-/// place rather than being duplicated (with `.unwrap()`) at every call site.
-fn synthetic_bad_gateway() -> reqwest::Error {
-    crate::provider::synthetic_bad_gateway(b"torbox request failed")
-}
-
 struct CachedUrl {
     url: String,
     at: Instant,
@@ -586,7 +578,7 @@ impl TorBoxClient {
                     .error_for_status_ref()
                     .err()
                     .map(|e| e.without_url())
-                    .unwrap_or_else(synthetic_bad_gateway));
+                    .unwrap_or_else(|| synthetic_bad_gateway(b"torbox still throttling")));
             }
             // Retry transient 5xx (500/502/503/504) with a short backoff before giving up.
             if is_transient_status(resp.status()) && attempt < max_attempts {
@@ -667,7 +659,9 @@ impl TorBoxClient {
             }
             break;
         }
-        Err(synthetic_bad_gateway())
+        Err(synthetic_bad_gateway(
+            b"torbox answered success:false, no data or an undecodable body",
+        ))
     }
 
     /// Send a request whose success requires `success:true` AND a `data` payload, returning the
@@ -740,7 +734,9 @@ impl TorBoxClient {
                 );
             }
         }
-        Err(synthetic_bad_gateway())
+        Err(synthetic_bad_gateway(
+            b"torbox mylist: concurrent deletes kept shifting the pages",
+        ))
     }
 
     /// Fetch every `mylist` page once. Also returns whether the listing ran past a single short page
@@ -779,7 +775,9 @@ impl TorBoxClient {
                 MAX_PAGES,
                 raw.len()
             );
-            return Err(synthetic_bad_gateway());
+            return Err(synthetic_bad_gateway(
+                b"torbox mylist exceeded its page cap",
+            ));
         }
         let mapped = map_listed_torrents(&raw);
         if mapped.is_empty() && !raw.is_empty() {
@@ -793,7 +791,9 @@ impl TorBoxClient {
                  their format?), refusing the listing",
                 raw.len()
             );
-            return Err(synthetic_bad_gateway());
+            return Err(synthetic_bad_gateway(
+                b"torbox mylist: every entry had an unusable id or hash",
+            ));
         }
         // More than two requests means at least two non-empty pages (plus the empty terminator); a
         // full first page means the terminator was fetched at a page boundary, so an item can still
@@ -862,7 +862,9 @@ impl TorBoxClient {
                 Some(found) => Ok(found),
                 // No usable id AND no match to recover — surface a synthetic 502 (the same signal
                 // `send_data` uses for a soft failure) so the caller treats it as a failed add.
-                None => Err(synthetic_bad_gateway()),
+                None => Err(synthetic_bad_gateway(
+                    b"torbox createtorrent returned no usable torrent id",
+                )),
             },
             Err(e) => {
                 // TorBox rejects an add for a torrent already in the account ("Download already
@@ -921,21 +923,28 @@ impl TorBoxClient {
         // would issue a delete against an unintended torrent and report success. `map_listed_torrents`
         // already drops id-0 entries, but enforce the `> 0` invariant locally so a future caller that
         // passes an unvalidated "0"/negative id can never delete against `torrent_id: 0`.
-        let torrent_id: i64 = id.parse().map_err(|_| synthetic_bad_gateway())?;
+        const INVALID_ID: &[u8] = b"torbox delete refused: not a positive torrent id";
+        let torrent_id: i64 = id.parse().map_err(|_| synthetic_bad_gateway(INVALID_ID))?;
         if torrent_id <= 0 {
-            return Err(synthetic_bad_gateway());
+            return Err(synthetic_bad_gateway(INVALID_ID));
         }
         let body = serde_json::json!({ "torrent_id": torrent_id, "operation": "delete" });
         // Held across the retries: the delete can land on any attempt.
         let _in_flight = self.deletes.begin();
         // NOTE: unlike Real-Debrid (which maps a 404 on delete to `Ok(())` for idempotency), TorBox
         // has no clean "already gone" signal here — controltorrent returns `success:false` with an
-        // unstable detail string, so a delete of an already-removed torrent surfaces as `Err`. We do
-        // NOT blanket-treat delete failures as success (that would hide genuine auth/network errors).
-        // It is safe in practice: every caller that gates an owned-record removal on delete success
-        // first filters to torrents present in the listing, which carries each id once
-        // (`drop_repeated_ids`, so no id is deleted twice), and best-effort prune paths use `let _`;
-        // the only residual window (torrent vanishes between listing fetch and delete) self-heals.
+        // unstable detail string, so a delete of an already-removed torrent surfaces as `Err`. A
+        // delete of an id already deleted has been seen to answer 500 `DATABASE_ERROR`, which
+        // `send_ok` retries like any transient 5xx before returning the error. We do NOT
+        // blanket-treat delete failures as success (that would hide genuine auth/network errors).
+        // It is safe in practice: callers that gate an owned-record removal on delete success delete
+        // ids taken from the listing, which carries each id once (`drop_repeated_ids`, so no id is
+        // deleted twice), and best-effort prune paths use `let _`; the residual window (torrent
+        // vanishes between listing fetch and delete) self-heals. One caller deletes an unlisted id:
+        // `upgrade::prune_owned_hash_in` deletes a copy adopted earlier in the same visit by the id
+        // its add returned when a lagging listing doesn't show it yet. If TorBox rejects that delete
+        // (say the torrent is already gone), the copy's records are kept, so no record is dropped
+        // while its torrent may still be in the account.
         self.send_ok(|| self.client.post(&url).json(&body)).await
     }
 
@@ -1083,39 +1092,18 @@ mod tests {
     async fn delete_torrent_raw_posts_the_controltorrent_delete_body() {
         // Pin the wire shape of a delete: POST .../torrents/controltorrent with
         // {"torrent_id": <numeric id>, "operation": "delete"}, and `success:true` maps to Ok.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            // Read until the whole JSON body has arrived (headers and body may come separately).
-            let mut req = Vec::new();
-            let mut buf = [0u8; 4096];
-            while !req.ends_with(b"}") {
-                let n = sock.read(&mut buf).await.unwrap();
-                if n == 0 {
-                    break;
-                }
-                req.extend_from_slice(&buf[..n]);
-            }
-            let body = r#"{"success":true,"detail":"deleted"}"#;
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = sock.write_all(head.as_bytes()).await;
-            let _ = sock.write_all(body.as_bytes()).await;
-            let _ = sock.flush().await;
-            let _ = tx.send(String::from_utf8_lossy(&req).to_string());
-        });
-        let client = TorBoxClient::with_base("fake".to_string(), format!("http://{addr}"));
+        let (base, requests) = spawn_recording_sequence(vec![(
+            200,
+            r#"{"success":true,"detail":"deleted"}"#.to_string(),
+        )])
+        .await;
+        let client = TorBoxClient::with_base("fake".to_string(), base);
         let before = client.deletes.snapshot();
         client
             .delete_torrent_raw("42")
             .await
             .expect("success:true is Ok");
-        let req = rx.await.unwrap();
+        let req = requests.lock().unwrap()[0].clone();
         assert!(
             req.starts_with("POST /torrents/controltorrent "),
             "wrong request line: {}",
@@ -1702,14 +1690,11 @@ mod tests {
     /// `page(offset)` returns (a JSON array), in TorBox's `{success, data}` envelope. Returns the
     /// base URL.
     async fn serve_mylist(page: impl Fn(usize) -> String + Send + Sync + 'static) -> String {
-        use tokio::io::AsyncReadExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 4096];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let req = read_request(&mut sock).await;
                 let request_line = req.lines().next().unwrap_or_default();
                 let offset = request_line
                     .split_once("offset=")
@@ -1759,9 +1744,15 @@ mod tests {
         )
         .await;
         let client = TorBoxClient::with_base("fake".to_string(), base);
+        let err = client
+            .list_torrents_raw()
+            .await
+            .expect_err("a listing whose every entry was dropped must be an Err, not an empty Ok");
+        // The scan loop logs this error: it names the cause, not a bare 502.
         assert!(
-            client.list_torrents_raw().await.is_err(),
-            "a listing whose every entry was dropped must be an Err, not an empty Ok"
+            err.to_string()
+                .contains("every entry had an unusable id or hash"),
+            "{err}"
         );
     }
 
@@ -1784,19 +1775,73 @@ mod tests {
         assert_eq!(p.name(), "torbox");
     }
 
-    /// Spawn a local HTTP server that replies once with `200 OK` and the given JSON body.
-    async fn spawn_json_200(body: &'static str) -> String {
+    /// Read one request from `sock`: its head and as much body as its `Content-Length` declares.
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
         use tokio::io::AsyncReadExt;
+        let mut req = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            req.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&req);
+            let complete = text.split_once("\r\n\r\n").is_some_and(|(head, rest)| {
+                let len = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                rest.len() >= len
+            });
+            if n == 0 || complete {
+                return text.into_owned();
+            }
+        }
+    }
+
+    /// A loopback server started by [`serve_sequence`].
+    struct Loopback {
+        /// `http://<addr>`, with no trailing slash.
+        base: String,
+        /// Connections accepted so far.
+        connections: Arc<std::sync::atomic::AtomicUsize>,
+        /// Each request (head and body) read so far, in order.
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    /// The core of the `spawn_*` helpers: replies to successive connections with the given
+    /// `(status, body)` pairs in order (JSON bodies), counting the connections and recording each
+    /// request before replying to it. Serves exactly `responses.len()` connections.
+    async fn serve_sequence(responses: Vec<(u16, String)>) -> Loopback {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (count, log) = (connections.clone(), requests.clone());
         tokio::spawn(async move {
-            if let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf).await;
-                write_json_reply(&mut sock, 200, body).await;
+            for (status, body) in responses {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let req = read_request(&mut sock).await;
+                log.lock().unwrap().push(req);
+                write_json_reply(&mut sock, status, &body).await;
             }
         });
-        format!("http://{}/", addr)
+        Loopback {
+            base: format!("http://{addr}"),
+            connections,
+            requests,
+        }
+    }
+
+    /// Spawn a local HTTP server that replies once with `200 OK` and the given JSON body.
+    async fn spawn_json_200(body: &'static str) -> String {
+        let server = serve_sequence(vec![(200, body.to_string())]).await;
+        format!("{}/", server.base)
     }
 
     /// Spawn a local HTTP server that replies to every request with `status` (empty body) and
@@ -1804,112 +1849,37 @@ mod tests {
     async fn spawn_status_repeating(
         status: u16,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::AsyncReadExt;
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let c2 = counter.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            for _ in 0..8 {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf).await;
-                write_json_reply(&mut sock, status, "").await;
-            }
-        });
-        (format!("http://{}/", addr), counter)
+        let server = serve_sequence(vec![(status, String::new()); 8]).await;
+        (format!("{}/", server.base), server.connections)
     }
 
     /// Spawn a local HTTP server that replies with `first` on the first connection then `second` on
-    /// every subsequent connection (both `200 OK` JSON), counting the requests it saw.
+    /// every subsequent connection (both `200 OK` JSON), counting the requests it saw. Serves up to
+    /// 8 connections.
     async fn spawn_json_200_sequence(
         first: &'static str,
         second: &'static str,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::AsyncReadExt;
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let c2 = counter.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            for i in 0..8 {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf).await;
-                write_json_reply(&mut sock, 200, if i == 0 { first } else { second }).await;
-            }
-        });
-        (format!("http://{}/", addr), counter)
+        let responses = std::iter::once(first)
+            .chain(std::iter::repeat_n(second, 7))
+            .map(|body| (200, body.to_string()))
+            .collect();
+        let server = serve_sequence(responses).await;
+        (format!("{}/", server.base), server.connections)
     }
 
     /// [`spawn_response_sequence`], also recording each request (head and body) it read.
     async fn spawn_recording_sequence(
         responses: Vec<(u16, String)>,
     ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
-        use tokio::io::AsyncReadExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let log = seen.clone();
-        tokio::spawn(async move {
-            for (status, body) in responses {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                // Read until the head and the Content-Length body are in.
-                let mut req = Vec::new();
-                let mut buf = [0u8; 4096];
-                loop {
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    req.extend_from_slice(&buf[..n]);
-                    let text = String::from_utf8_lossy(&req).to_string();
-                    let complete = text.split_once("\r\n\r\n").is_some_and(|(head, rest)| {
-                        let len = head
-                            .lines()
-                            .find_map(|l| {
-                                l.to_ascii_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .and_then(|v| v.trim().parse::<usize>().ok())
-                            })
-                            .unwrap_or(0);
-                        rest.len() >= len
-                    });
-                    if n == 0 || complete {
-                        break;
-                    }
-                }
-                log.lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&req).to_string());
-                write_json_reply(&mut sock, status, &body).await;
-            }
-        });
-        (format!("http://{addr}"), seen)
+        let server = serve_sequence(responses).await;
+        (server.base, server.requests)
     }
 
     /// Spawn a local HTTP server that replies to successive connections with the given
     /// `(status, body)` pairs in order (JSON bodies). Serves exactly `responses.len()` connections.
     async fn spawn_response_sequence(responses: Vec<(u16, String)>) -> String {
-        use tokio::io::AsyncReadExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            for (status, body) in responses {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                let mut buf = [0u8; 4096];
-                let _ = sock.read(&mut buf).await;
-                write_json_reply(&mut sock, status, &body).await;
-            }
-        });
-        format!("http://{}", addr)
+        serve_sequence(responses).await.base
     }
 
     /// An account at its active-download limit gets an add QUEUED: createtorrent answers with a
@@ -1934,6 +1904,8 @@ mod tests {
             .await
             .expect_err("a queued add is no add");
         assert!(crate::provider::is_provider_busy(&err), "{err:?}");
+        // acquire logs this error: it says the add was queued, not that TorBox throttled.
+        assert!(err.to_string().contains("torbox add queued"), "{err}");
         let requests = requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 2, "{requests:?}");
         assert!(requests[0].contains("/torrents/createtorrent"));
@@ -2046,26 +2018,11 @@ mod tests {
         // (truncating the token → the endpoint 4xxs every read → perpetual Unavailable/repair);
         // reqwest's `.query()` encoder prevents that. Capture the request line and assert encoding.
         use crate::provider::FileLocator;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 4096];
-            let n = sock.read(&mut buf).await.unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
-            let body = r#"{"success":true,"data":"http://cdn.example/file.mkv"}"#;
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = sock.write_all(head.as_bytes()).await;
-            let _ = sock.write_all(body.as_bytes()).await;
-            let _ = sock.flush().await;
-            let _ = tx.send(req);
-        });
-        let base = format!("http://{}", addr);
+        let (base, requests) = spawn_recording_sequence(vec![(
+            200,
+            r#"{"success":true,"data":"http://cdn.example/file.mkv"}"#.to_string(),
+        )])
+        .await;
         let client = TorBoxClient::with_base("x&y=z".to_string(), base);
         let loc = FileLocator {
             torrent_id: "1/2".to_string(),
@@ -2074,7 +2031,7 @@ mod tests {
         };
         let cdn = client.resolve_locator(&loc).await.expect("resolve ok");
         assert_eq!(cdn, "http://cdn.example/file.mkv");
-        let req = rx.await.unwrap();
+        let req = requests.lock().unwrap()[0].clone();
         let request_line = req.lines().next().unwrap_or_default();
         assert!(
             request_line.contains("token=x%26y%3Dz"),

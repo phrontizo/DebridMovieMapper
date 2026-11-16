@@ -133,9 +133,11 @@ pub struct AcquireRequest {
 /// A torrent being added that no owned record names yet (the `staging` table value, keyed by
 /// lowercased infohash): an upgrade candidate the engine is staging and has not checked yet, or an
 /// acquisition `AcquisitionEngine::acquire` is adding before it records it `Pending`. Written before
-/// the add and cleared once the hash is recorded as owned or its torrent is deleted. One cut off in
-/// between (a shutdown, a panic, an OOM kill) leaves its intent behind: the account mirror never
-/// adopts that hash, and `upgrade::sweep_staging_intents` deletes its torrent.
+/// the add and cleared once the hash is recorded as owned or its torrent is deleted, and also when
+/// the add fails, or when the re-read right after the claim finds the hash already recorded as
+/// owned (nothing is added then). One cut off in between (a shutdown, a panic, an OOM kill) leaves
+/// its intent behind: the account mirror never adopts that hash, and
+/// `upgrade::sweep_staging_intents` deletes its torrent.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StagingIntent {
     /// The torrent id the add returned; `None` until it has returned.
@@ -1319,6 +1321,43 @@ impl Store {
         Self::flatten_join_app(result)
     }
 
+    /// Replace the `quality` of the `Verified` owned record for `hash` with `quality` ONLY while it
+    /// still equals `expected`, as one read-modify-write transaction that touches no other field: a
+    /// compare-and-set, so the quality backfill's re-derivation of an older record's untagged axes
+    /// never clobbers a quality `observe`, an upgrade swap or another backfill wrote meanwhile.
+    /// Returns `true` if it wrote; `false` when the record is missing (never resurrected), not
+    /// `Verified`, or holds another quality.
+    pub async fn replace_quality_if_eq(
+        &self,
+        hash: String,
+        expected: crate::release::QualitySummary,
+        quality: crate::release::QualitySummary,
+    ) -> Result<bool, AppError> {
+        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, AppError> {
+            let outcome = Self::update_json::<OwnedRecord>(
+                &db,
+                OWNED_TABLE,
+                &hash,
+                "replace_quality_if_eq",
+                |rec| {
+                    if rec.status == OwnedStatus::Verified
+                        && rec.quality.as_ref() == Some(&expected)
+                    {
+                        rec.quality = Some(quality);
+                        true
+                    } else {
+                        false
+                    }
+                },
+            )?;
+            Ok(outcome == Some(true))
+        })
+        .await;
+        Self::flatten_join_app(result)
+    }
+
     /// Set `request.imdb_id` of the owned record for `hash` ONLY while it is empty, as one
     /// read-modify-write transaction that touches no other field. The account mirror writes an empty
     /// id when TMDB's `external_ids` lookup fails transiently, and nothing else would ever fill it
@@ -2183,10 +2222,12 @@ impl Store {
     /// intent for `hash` is already open. `Ok(false)` means another stager holds it (the acquisition
     /// engine and the upgrade job run as separate tasks and both add through this table), or a
     /// leftover intent waits for `upgrade::sweep_staging_intents`: nothing is written, and no local
-    /// note is touched. The caller skips the candidate, as one already in the account. Without the
-    /// claim, a second stager whose (lagging) provider listing didn't show the first one's add
-    /// would add the same hash, get the SAME torrent id back on TorBox, and could delete it on a
-    /// rejection.
+    /// note is touched. The upgrade engine then skips the candidate (`NoChange`), as one already in
+    /// the account; `AcquisitionEngine::acquire` returns `TemporarilyUnavailable` without trying
+    /// another one, since the other stager may be adding this very torrent and on TorBox an add of
+    /// ours would return its id. Without the claim, a second stager whose (lagging) provider listing
+    /// didn't show the first one's add would add the same hash, get the SAME torrent id back on
+    /// TorBox, and could delete it on a rejection.
     ///
     /// The note is taken inside the transaction, before the commit, so the sweep never sees the row
     /// without it, and dropped again only if this claim's commit fails.
@@ -2217,16 +2258,33 @@ impl Store {
             Self::lock_local_staging(&local)
                 .insert(key.clone(), (tokio::time::Instant::now(), generation));
             if let Err(e) = txn.commit() {
-                let mut local = Self::lock_local_staging(&local);
-                if local.get(&key).is_some_and(|(_, g)| *g == generation) {
-                    local.remove(&key);
-                }
+                // Only this claim's note: once the failed commit dropped the transaction, redb has
+                // released the write lock, and another claim of the same hash may have committed its
+                // row and noted its own generation before this re-takes the local lock.
+                Self::drop_note_if(&local, &key, Some(generation));
                 return Err(e.into());
             }
             Ok(true)
         })
         .await;
         Self::flatten_join(result)
+    }
+
+    /// Drop the local note of `key` only while it is still the one of `generation` (a note a later
+    /// claim of the same hash took is kept); `None` drops nothing.
+    fn drop_note_if(local: &LocalStaging, key: &str, generation: Option<u64>) {
+        let mut local = Self::lock_local_staging(local);
+        if generation.is_some() && local.get(key).map(|(_, g)| *g) == generation {
+            local.remove(key);
+        }
+    }
+
+    /// The generation of this process's note of `hash`'s staging intent, if it has one.
+    #[cfg(test)]
+    pub(crate) fn local_staging_generation(&self, hash: &str) -> Option<u64> {
+        self.local_staging()
+            .get(&hash.to_ascii_lowercase())
+            .map(|(_, g)| *g)
     }
 
     fn lock_local_staging(
@@ -2298,13 +2356,12 @@ impl Store {
                 txn.open_table(STAGING_TABLE)?.remove(key.as_str())?;
             }
             // Read under the write lock every claim takes, so this is the generation of the intent
-            // being removed.
+            // being removed. A new claim of the same hash can commit, with its own note, between
+            // this commit and the local lock below: that note must stay, or the staging sweep would
+            // read the live claim as one an earlier process left and delete its torrent.
             let generation = Self::lock_local_staging(&local).get(&key).map(|(_, g)| *g);
             txn.commit()?;
-            let mut local = Self::lock_local_staging(&local);
-            if generation.is_some() && local.get(&key).map(|(_, g)| *g) == generation {
-                local.remove(&key);
-            }
+            Self::drop_note_if(&local, &key, generation);
             Ok(())
         })
         .await;
@@ -3458,7 +3515,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.all_staging_intents().await.len(), 1);
         // A second claim of an open intent is refused and leaves it (and its local note) as it was.
-        let age = store.local_staging_age("abc").unwrap();
+        let generation = store.local_staging_generation("abc").unwrap();
         assert!(!store.claim_staging_intent("abc".into(), 200).await.unwrap());
         assert_eq!(
             store.all_staging_intents().await[0].1,
@@ -3467,7 +3524,7 @@ mod tests {
                 started_at: 100
             }
         );
-        assert!(store.local_staging_age("abc").unwrap() >= age);
+        assert_eq!(store.local_staging_generation("abc"), Some(generation));
         store.clear_staging_intent("ABC".into()).await.unwrap();
         assert!(store.all_staging_intents().await.is_empty());
         assert!(store.local_staging_age("abc").is_none());
@@ -3478,10 +3535,12 @@ mod tests {
         assert_eq!(store.all_staging_intents().await[0].1.started_at, 300);
     }
 
-    /// A claim whose write fails leaves no row and no note, and never removes the note of an intent
-    /// that is already open.
+    /// A claim whose write fails leaves no row and no note, and a refused claim leaves an open
+    /// intent's note alone. (A failed claim never drops another claim's note of the SAME hash
+    /// either: `drop_note_if`, which both the failed claim and `clear_staging_intent` drop their
+    /// own note through, is tested on that interleaving directly below.)
     #[tokio::test]
-    async fn a_failed_staging_claim_never_drops_another_intents_note() {
+    async fn a_failed_staging_claim_leaves_no_row_or_note() {
         let (store, switch) = fail_writes::fail_after_arm_store();
         assert!(store.claim_staging_intent("held".into(), 1).await.unwrap());
         // Refused before it writes anything: the open intent and its note are untouched.
@@ -3503,6 +3562,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["held".to_string()]
         );
+    }
+
+    /// `clear_staging_intent` (and a failed claim) drops a note only while it is still its own: a
+    /// claim of the same hash that commits, with its own note, between the clear's commit and its
+    /// local lock keeps that note. Losing it, the staging sweep would read the live claim as one an
+    /// earlier process left and delete its torrent on the next trusted listing.
+    #[test]
+    fn a_note_is_dropped_only_by_its_own_generation() {
+        let local: LocalStaging = Arc::default();
+        let note = |generation: u64| {
+            Store::lock_local_staging(&local)
+                .insert("h".to_string(), (tokio::time::Instant::now(), generation));
+        };
+        let generation = || Store::lock_local_staging(&local).get("h").map(|(_, g)| *g);
+        note(1);
+        // A new claim re-notes the hash after the old intent's clear committed.
+        note(2);
+        Store::drop_note_if(&local, "h", Some(1));
+        assert_eq!(generation(), Some(2), "the new claim's note is kept");
+        Store::drop_note_if(&local, "h", None);
+        assert_eq!(generation(), Some(2), "no generation drops nothing");
+        Store::drop_note_if(&local, "h", Some(2));
+        assert_eq!(generation(), None, "its own generation drops it");
     }
 
     #[tokio::test]
@@ -4917,6 +4999,69 @@ mod tests {
             .map(|r| r.user)
             .collect();
         assert_eq!(rows, vec!["bob".to_string()]);
+    }
+
+    /// `replace_quality_if_eq` replaces a `Verified` record's quality only while it still equals the
+    /// expected one, touching no other field; a quality written meanwhile, a `Pending` record and a
+    /// missing record are left as they are.
+    #[tokio::test]
+    async fn replace_quality_if_eq_is_a_compare_and_set() {
+        let store = Store::in_memory();
+        let q = |resolution: u16, source_tier: i64| crate::release::QualitySummary {
+            cached: true,
+            source_tier,
+            resolution,
+            score: 1,
+            unverified: false,
+        };
+        let rec = OwnedRecord {
+            request: req("tt1", 27205),
+            provenance: Provenance { entries: vec![] },
+            added_at: 100,
+            status: OwnedStatus::Verified,
+            provides: vec![(1, 2)],
+            quality: Some(q(0, 6_000)),
+        };
+        store.put_owned("h".into(), rec.clone()).await.unwrap();
+        store
+            .put_owned(
+                "pending".into(),
+                OwnedRecord {
+                    status: OwnedStatus::Pending,
+                    ..rec.clone()
+                },
+            )
+            .await
+            .unwrap();
+        // A stale expectation writes nothing.
+        assert!(!store
+            .replace_quality_if_eq("h".into(), q(720, 6_000), q(2160, 6_000))
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get_owned("h".into()).await.unwrap().quality,
+            Some(q(0, 6_000))
+        );
+        assert!(store
+            .replace_quality_if_eq("H".into(), q(0, 6_000), q(2160, 6_000))
+            .await
+            .unwrap());
+        let got = store.get_owned("h".into()).await.unwrap();
+        assert_eq!(got.quality, Some(q(2160, 6_000)));
+        assert_eq!(
+            (got.provides, got.added_at),
+            (vec![(1, 2)], 100),
+            "other fields intact"
+        );
+        assert!(!store
+            .replace_quality_if_eq("pending".into(), q(0, 6_000), q(2160, 6_000))
+            .await
+            .unwrap());
+        assert!(!store
+            .replace_quality_if_eq("missing".into(), q(0, 6_000), q(2160, 6_000))
+            .await
+            .unwrap());
+        assert!(store.get_owned("missing".into()).await.is_none());
     }
 
     /// The quality backfill (re-deriving a `quality: None` record's quality from its file name) sets

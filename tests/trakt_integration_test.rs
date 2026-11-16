@@ -13,6 +13,7 @@ use debridmoviemapper::store::Store;
 use debridmoviemapper::tasks::sync_trakt;
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::trakt_client::{TraktClient, TraktClientImpl};
+use debridmoviemapper::vfs::MediaType;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -167,6 +168,44 @@ async fn trakt_live_device_flow_and_sync() {
         assert!(
             with_eps > 0,
             "watched shows must carry their watched episodes (extended=progress)"
+        );
+        // Every live `extended=progress` episode carries `last_watched_at`. Without it the parser
+        // still succeeds, but `tasks::build_wanted` can no longer tell a paused re-watch (a pause
+        // on an episode watched before it) from a first-watch pause, so a re-watch acquires nothing.
+        let without_times = watched
+            .shows
+            .iter()
+            .filter(|s| !s.watched_episodes.is_empty() && s.episode_watched_at.is_empty())
+            .count();
+        eprintln!(
+            "watched shows with episodes but no per-episode last_watched_at: {}",
+            without_times
+        );
+        assert_eq!(
+            without_times, 0,
+            "watched episodes must carry last_watched_at (extended=progress); the paused re-watch \
+             detection reads it"
+        );
+    }
+
+    // A playback show's `paused_at` is the other half of the re-watch detection. A show paused
+    // only on a special, or with no readable `paused_at`, legitimately carries none, and a parsed
+    // item can't tell that apart from a renamed field, so this only warns.
+    let ip_shows: Vec<_> = ip
+        .iter()
+        .filter(|i| i.media_type == MediaType::Show)
+        .collect();
+    let with_pause = ip_shows.iter().filter(|i| !i.paused.is_empty()).count();
+    eprintln!(
+        "in-progress shows with a paused regular episode: {}/{}",
+        with_pause,
+        ip_shows.len()
+    );
+    if !ip_shows.is_empty() && with_pause == 0 {
+        eprintln!(
+            "WARNING: no in-progress show carries a paused episode. Expected only when every \
+             playback show is paused on a special; otherwise Trakt may have dropped or renamed \
+             `paused_at`, and the paused re-watch detection would stop working"
         );
     }
 

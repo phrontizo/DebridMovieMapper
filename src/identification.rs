@@ -106,11 +106,14 @@ static YEAR_RANGE_RE: LazyLock<Regex> =
 
 // Word-anchored STRONG show markers — everything except the loose `NxM` form, which is handled
 // separately (see `NXM_RE`) so a movie *title* written `NxM` can be excluded. `\be\d{1,3}\b`
-// (episode marker E05) excludes embedded matches like the `e7` in "Se7en". The SxxExx alternative
-// is leading-`\b`-anchored but intentionally NOT trailing-anchored, so contiguous multi-episode
-// and version markers (S01E01E02, S01E13v2) still match.
+// (episode marker E05) excludes embedded matches like the `e7` in "Se7en", and
+// `\bep[\s.-]*\d{1,3}\b` (the short episode word: `Ep 5`, `Ep.05`) the `ep` of "Step 2". The SxxExx
+// alternative is leading-`\b`-anchored but intentionally NOT trailing-anchored, so contiguous
+// multi-episode and version markers (S01E01E02, S01E13v2) still match. A bare `Episode N` is no
+// marker: films are named that way too (`Star.Wars.Episode.4`). The acquisition title check, which
+// knows it wants a show, passes that hint itself ([`identify_name_with_show_hint`]).
 static STRONG_SHOW_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bs\d+\.?e\d+|\bs\d+\b|\bseasons?\s*\d+|\b\d+\s*seasons?|\btemporada\s*\d+|\bsaison\s*\d+|\be\d{1,3}\b").unwrap()
+    Regex::new(r"(?i)\bs\d+\.?e\d+|\bs\d+\b|\bseasons?\s*\d+|\b\d+\s*seasons?|\btemporada\s*\d+|\bsaison\s*\d+|\be\d{1,3}\b|\bep[\s.-]*\d{1,3}\b").unwrap()
 });
 
 // The loose `NxM` episode form (e.g. 1x01, 3x14, 10x24). Bounded so a movie filename does not
@@ -134,11 +137,17 @@ static NXM_TITLE_ONLY_RE: LazyLock<Regex> =
 /// anime form `[Group] Some Show - 12 (1080p).mkv`) is one too: the acquisition engine reads it as
 /// the file's episode, and that rule already leaves out a release year, a single digit and a
 /// numeric film title followed by its bracketed year.
+///
+/// The `\b`-bounded markers run on the name with `_` read as a space: the regex crate counts `_` as
+/// a word character, so `Some_Show_S01E05_720p.mkv` would otherwise carry no marker while
+/// `vfs::parse_se_all`, which has no `\b`, reads it as S01E05. A space rather than a `.`, so
+/// `Season_2` reads as `Season 2`, as `clean_name` and [`trailing_episode_number`] read it.
 fn filename_has_show_marker(filename: &str) -> bool {
-    if STRONG_SHOW_RE.is_match(filename) || trailing_episode_number(filename).is_some() {
+    let spaced = filename.replace('_', " ");
+    if STRONG_SHOW_RE.is_match(&spaced) || trailing_episode_number(filename).is_some() {
         return true;
     }
-    if NXM_RE.is_match(filename) {
+    if NXM_RE.is_match(&spaced) {
         let (title, _year) = clean_name(filename);
         return !NXM_TITLE_ONLY_RE.is_match(title.trim());
     }
@@ -211,6 +220,65 @@ pub(crate) fn trailing_episode_number(file_name: &str) -> Option<u32> {
     trailing_episode_cut(&name)
         .filter(|&(start, _)| start > 0)
         .map(|(_, number)| number)
+}
+
+/// Numbering that opens a name (after the dot/underscore → space replacement): an `SxxEyy` code
+/// (`S01E05`), a season token (`S04`, `Season 04`), an episode word (`E09`, `Ep 9`, `Episode 9`),
+/// or a part, disc or volume number (`Part 2`, `Disc 1`, `CD1`, `Vol 3`). A title run ends at any
+/// of them, so a name that opens with one names no title.
+static LEADING_NUMBERING_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:s\d{1,3}\s?e\d{1,4}|s\d{1,3}\b|(?:e|ep|episodes?|seasons?|parts?|dis[ck]s?|cd|vol(?:ume)?)\s*\d{1,4}\b)").unwrap()
+});
+
+/// A bare number or an `NxM` code opening a name (`05`, `1x05`). Films open with numbers too (`12
+/// Angry Men`, `300 2006`, `10x10 2018`), so [`names_a_title`] reads one as an episode's numbering
+/// only when nothing but a ` - `, a bracket group or a release tag follows it.
+static LEADING_NUMBER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(?:\d{1,2}x\d{2,3}|\d{1,3})\b").unwrap());
+
+/// Whether a file or directory name carries a title of its own: the text before its first episode
+/// marker or release tag, once leading bracket tags (`[Group]`, `(2019)`) and separators are
+/// dropped, is not empty. `E09 - Title.mkv`, `S01E05.mkv`, `05 [1080p].mkv`, `05 - Title.mkv`,
+/// `Season 04` and `Disc 1` carry none (the text after the marker is an episode title, if
+/// anything); `Show.S01E05`, `[Group] Show - 05`, `Movie (2019)` and `12 Angry Men` do. A leading
+/// `[Title] (YYYY)` is a title, as in [`clean_name`]. The acquisition title check identifies a file
+/// that carries none by its directory or torrent name instead.
+pub(crate) fn names_a_title(name: &str) -> bool {
+    let mut rest = name;
+    if let Some(pos) = rest.rfind('.') {
+        let ext = rest[pos..].to_lowercase();
+        if VIDEO_EXTENSIONS.iter().any(|e| *e == ext) {
+            rest = &rest[..pos];
+        }
+    }
+    loop {
+        rest = rest.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '[' && c != '(');
+        if TITLE_BRACKET_YEAR_RE.is_match(rest) {
+            return true;
+        }
+        let close = match rest.chars().next() {
+            Some('[') => ']',
+            Some('(') => ')',
+            _ => break,
+        };
+        match rest.find(close) {
+            Some(end) => rest = &rest[end + 1..],
+            None => break,
+        }
+    }
+    let spaced = rest.replace(['.', '_'], " ");
+    let spaced = spaced.trim_start_matches(|c: char| !c.is_alphanumeric());
+    let opens_with_tag = |s: &str| STOP_RE.find(s).is_some_and(|m| m.start() == 0);
+    if spaced.is_empty() || LEADING_NUMBERING_RE.is_match(spaced) || opens_with_tag(spaced) {
+        return false;
+    }
+    match LEADING_NUMBER_RE.find(spaced) {
+        Some(number) => {
+            let after = spaced[number.end()..].trim_start();
+            !(after.is_empty() || after.starts_with(['-', '[', '(']) || opens_with_tag(after))
+        }
+        None => true,
+    }
 }
 
 /// What [`identify_name`] concluded about a name.
@@ -571,11 +639,26 @@ pub async fn identify_name(
     files: &[rd_client::TorrentFile],
     tmdb: &TmdbClient,
 ) -> Identification {
+    identify_name_with_show_hint(name, files, tmdb, false).await
+}
+
+/// [`identify_name`], with `show_hint` set when the caller already knows the name is a show's: the
+/// acquisition title check of a show request, whose file may name its episode by a form the show
+/// guess doesn't count (`Some Show Episode 12.mkv`: a bare `Episode N` names films too). The hint
+/// only settles the show-versus-film choice [`is_show_guess`] makes; the caller still requires the
+/// requested TMDB id, media type and episode. Movie identification and the account mirror pass no
+/// hint.
+pub async fn identify_name_with_show_hint(
+    name: &str,
+    files: &[rd_client::TorrentFile],
+    tmdb: &TmdbClient,
+    show_hint: bool,
+) -> Identification {
     let (cleaned_name, year) = clean_name(name);
     if cleaned_name.is_empty() || is_generic_title(&cleaned_name) {
         return Identification::NoMatch;
     }
-    let is_show_guess = is_show_guess(files);
+    let is_show_guess = show_hint || is_show_guess(files);
 
     let normalized_cleaned = normalize_title(&cleaned_name);
     // A cleaned name that survives the empty/generic guard but normalizes to empty — e.g. an
@@ -1201,7 +1284,7 @@ mod tests {
         };
         assert_eq!(
             validator
-                .validate("Zzqx.mkv", 1, MediaKind::Movie, None, None)
+                .validate("Zzqx.mkv", "Zzqx.mkv", 1, MediaKind::Movie, None, None)
                 .await,
             TitleCheck::Unavailable
         );
@@ -2877,6 +2960,15 @@ mod tests {
             "Friends.S10E17E18.720p.mkv",
             "Show.S01E01E02.1080p.mkv",
             "Anime.S01E13v2.mkv",
+            // Underscore-separated codes: the regex crate's `\b` counts `_` as a word character, so
+            // these read as movies while `vfs::parse_se_all` read the episode.
+            "Some_Show_S01E05_720p_HDTV.mkv",
+            "some_show_s01e05.mkv",
+            "Some_Show_1x05_720p.mkv",
+            "Some_Show_Season_2_E05.mkv",
+            // The short episode word, separated from its number.
+            "Some Show Ep 12 [720p].mkv",
+            "Some.Show.Ep.05.mkv",
         ] {
             assert!(is_show_guess(&one_file(name)), "{name} should be a show");
         }
@@ -2918,35 +3010,10 @@ mod tests {
     async fn a_single_absolute_numbered_episode_is_identified_as_the_show() {
         use crate::acquire::{TitleCheck, TitleValidator, TmdbTitleValidator};
         use crate::scraper::MediaKind;
-        use crate::trakt_client::test_http::{spawn, Reply};
         let name = "[Group] Some Show - 12 (1080p).mkv";
         let files = one_file(name);
-        for (tv, movie) in [
-            // Neither result is an exact title match: the series under a longer English title, a
-            // franchise film beside it.
-            (
-                r#"{"results":[{"id":11,"title":"Some Show: Rising","original_title":"Rising",
-                    "release_date":"2019-04-06","popularity":30.0,"vote_count":900,"vote_average":8.5}]}"#,
-                r#"{"results":[{"id":22,"title":"Some Show the Movie: Train","release_date":"2020-10-16",
-                    "popularity":30.0,"vote_count":900,"vote_average":8.5}]}"#,
-            ),
-            // Both are an exact title match: a series and a same-titled film.
-            (
-                r#"{"results":[{"id":11,"title":"Some Show","release_date":"2019-04-06",
-                    "popularity":30.0,"vote_count":900,"vote_average":8.5}]}"#,
-                r#"{"results":[{"id":22,"title":"Some Show","release_date":"2020-10-16",
-                    "popularity":30.0,"vote_count":900,"vote_average":8.5}]}"#,
-            ),
-        ] {
-            let server = spawn(vec![
-                ("/search/tv?api_key=k&query=Some+Show", Reply::json(tv)),
-                (
-                    "/search/movie?api_key=k&query=Some+Show",
-                    Reply::json(movie),
-                ),
-            ])
-            .await;
-            let tmdb = TmdbClient::with_base_url("k".into(), server.base_url.clone()).unwrap();
+        for answers in SHOW_OR_FILM {
+            let (server, tmdb) = some_show_tmdb(answers).await;
             let found = identify_name(name, &files, &tmdb).await;
             assert!(
                 matches!(
@@ -2968,10 +3035,247 @@ mod tests {
             };
             assert_eq!(
                 validator
-                    .validate(name, 11, MediaKind::Series, Some(1), Some(12))
+                    .validate(name, name, 11, MediaKind::Series, Some(1), Some(12))
                     .await,
                 TitleCheck::Match
             );
+        }
+    }
+
+    /// The two TMDB answers to a `Some Show` search that leave the show-versus-film choice to the
+    /// show guess: a series under a longer title beside a franchise film (neither exact), and a
+    /// series beside a same-titled film (both exact). As `(tv, movie)` search bodies.
+    const SHOW_OR_FILM: [(&str, &str); 2] = [
+        (
+            r#"{"results":[{"id":11,"title":"Some Show: Rising","original_title":"Rising",
+                "release_date":"2019-04-06","popularity":30.0,"vote_count":900,"vote_average":8.5}]}"#,
+            r#"{"results":[{"id":22,"title":"Some Show the Movie: Train","release_date":"2020-10-16",
+                "popularity":30.0,"vote_count":900,"vote_average":8.5}]}"#,
+        ),
+        (
+            r#"{"results":[{"id":11,"title":"Some Show","release_date":"2019-04-06",
+                "popularity":30.0,"vote_count":900,"vote_average":8.5}]}"#,
+            r#"{"results":[{"id":22,"title":"Some Show","release_date":"2020-10-16",
+                "popularity":30.0,"vote_count":900,"vote_average":8.5}]}"#,
+        ),
+    ];
+
+    /// A loopback TMDB answering a `Some Show` search with `(tv, movie)`.
+    async fn some_show_tmdb(
+        (tv, movie): (&str, &str),
+    ) -> (crate::trakt_client::test_http::Server, TmdbClient) {
+        use crate::trakt_client::test_http::{spawn, Reply};
+        let server = spawn(vec![
+            ("/search/tv?api_key=k&query=Some+Show", Reply::json(tv)),
+            (
+                "/search/movie?api_key=k&query=Some+Show",
+                Reply::json(movie),
+            ),
+        ])
+        .await;
+        let tmdb = TmdbClient::with_base_url("k".into(), server.base_url.clone()).unwrap();
+        (server, tmdb)
+    }
+
+    /// An episode code glued to the title by underscores is a show marker, as `vfs::parse_se_all`
+    /// reads it. The regex crate's `\b` counts `_` as a word character, so the show guess used to
+    /// call the file a movie: the same-titled film won, the title check rejected the release, and
+    /// the account mirror recorded the user's episode as the film.
+    #[tokio::test]
+    async fn an_underscore_named_episode_is_identified_as_the_show() {
+        use crate::acquire::{TitleCheck, TitleValidator, TmdbTitleValidator};
+        use crate::scraper::MediaKind;
+        let name = "Some_Show_S01E05_720p_HDTV.mkv";
+        for answers in SHOW_OR_FILM {
+            let (server, tmdb) = some_show_tmdb(answers).await;
+            let found = identify_name(name, &one_file(name), &tmdb).await;
+            assert!(
+                matches!(
+                    &found,
+                    Identification::Identified(m)
+                        if m.media_type == MediaType::Show
+                            && m.external_id.as_deref() == Some("tmdb:11")
+                ),
+                "expected the series, got {found:?} (requests {:?})",
+                server.requests()
+            );
+            let mirrored = identify_torrent(&single_file_torrent(name), &tmdb).await;
+            assert_eq!(mirrored.media_type, MediaType::Show);
+            assert_eq!(mirrored.external_id.as_deref(), Some("tmdb:11"));
+            let validator = TmdbTitleValidator {
+                tmdb: std::sync::Arc::new(tmdb),
+            };
+            assert_eq!(
+                validator
+                    .validate(name, name, 11, MediaKind::Series, Some(1), Some(5))
+                    .await,
+                TitleCheck::Match
+            );
+        }
+    }
+
+    /// A show request's file may name its episode by an episode word the show guess doesn't count
+    /// (`Episode 12`: films are named that way too). The title check knows it wants a show, so the
+    /// same-titled film can't win there, while plain identification (the account mirror) still
+    /// guesses a film for such a name.
+    #[tokio::test]
+    async fn a_show_request_identifies_an_episode_word_file_as_the_show() {
+        use crate::acquire::{TitleCheck, TitleValidator, TmdbTitleValidator};
+        use crate::scraper::MediaKind;
+        for name in ["Some Show Ep 12 [720p].mkv", "Some Show Episode 12.mkv"] {
+            for answers in SHOW_OR_FILM {
+                let (server, tmdb) = some_show_tmdb(answers).await;
+                let validator = TmdbTitleValidator {
+                    tmdb: std::sync::Arc::new(tmdb),
+                };
+                assert_eq!(
+                    validator
+                        .validate(name, name, 11, MediaKind::Series, Some(1), Some(12))
+                        .await,
+                    TitleCheck::Match,
+                    "{name} (requests {:?})",
+                    server.requests()
+                );
+            }
+        }
+        // Without the hint, a bare `Episode N` is no show marker: with both titles exact, the film.
+        let (_server, tmdb) = some_show_tmdb(SHOW_OR_FILM[1]).await;
+        let name = "Some Show Episode 12.mkv";
+        assert!(matches!(
+            identify_name(name, &one_file(name), &tmdb).await,
+            Identification::Identified(m) if m.media_type == MediaType::Movie
+        ));
+    }
+
+    /// A file name that names no title (`E09 - Title.mkv`, `S01E05.mkv`) is identified by its folder
+    /// or its torrent's name; one that does is identified by itself, whatever the torrent is called.
+    #[tokio::test]
+    async fn the_title_check_identifies_a_title_less_file_by_its_folder_or_torrent() {
+        use crate::acquire::{TitleCheck, TitleValidator, TmdbTitleValidator};
+        use crate::scraper::MediaKind;
+        use crate::trakt_client::test_http::{spawn, Reply};
+        const NONE: &str = r#"{"results":[]}"#;
+        let server = spawn(vec![
+            (
+                "/search/tv?api_key=k&query=Some+Show",
+                Reply::json(
+                    r#"{"results":[{"id":11,"title":"Some Show","release_date":"2019-04-06",
+                        "popularity":30.0,"vote_count":900,"vote_average":8.5}]}"#,
+                ),
+            ),
+            ("/search/movie?api_key=k&query=Some+Show", Reply::json(NONE)),
+            (
+                "/search/tv?api_key=k&query=Other+Show",
+                Reply::json(
+                    r#"{"results":[{"id":33,"title":"Other Show","release_date":"2015-01-01",
+                        "popularity":30.0,"vote_count":900,"vote_average":8.5}]}"#,
+                ),
+            ),
+            (
+                "/search/movie?api_key=k&query=Other+Show",
+                Reply::json(NONE),
+            ),
+        ])
+        .await;
+        let tmdb = TmdbClient::with_base_url("k".into(), server.base_url.clone()).unwrap();
+        let validator = TmdbTitleValidator {
+            tmdb: std::sync::Arc::new(tmdb),
+        };
+        for (path, torrent, (season, episode), verdict) in [
+            // TorBox: the path starts with the torrent folder; `Season 04` names no title.
+            (
+                "Some.Show.S04.1080p/Season 04/E09 - Title.mkv",
+                "Some.Show.S04.1080p",
+                (4, 9),
+                TitleCheck::Match,
+            ),
+            // Real-Debrid: no torrent folder in the path, so the torrent name.
+            (
+                "/Season 04/E09 - Title.mkv",
+                "Some Show S04 1080p",
+                (4, 9),
+                TitleCheck::Match,
+            ),
+            (
+                "/S01E05.mkv",
+                "Other Show S01 1080p",
+                (1, 5),
+                TitleCheck::Mismatch,
+            ),
+            // A file name that names a title is identified by itself.
+            (
+                "Other.Show.S01E05.mkv",
+                "Some.Show.S01.1080p",
+                (1, 5),
+                TitleCheck::Mismatch,
+            ),
+            (
+                "Some.Show.S01.1080p/Some.Show.S01E05.mkv",
+                "Other Show S01",
+                (1, 5),
+                TitleCheck::Match,
+            ),
+        ] {
+            assert_eq!(
+                validator
+                    .validate(
+                        path,
+                        torrent,
+                        11,
+                        MediaKind::Series,
+                        Some(season),
+                        Some(episode)
+                    )
+                    .await,
+                verdict,
+                "{path} in {torrent} (requests {:?})",
+                server.requests()
+            );
+        }
+    }
+
+    #[test]
+    fn names_a_title_reads_the_text_before_the_numbering() {
+        for name in [
+            "Show.S01E05.mkv",
+            "[Group] Show - 05 [1080p].mkv",
+            "Movie (2019).mkv",
+            "[REC] (2007).mkv",
+            "Some.Show.S04.1080p",
+            "Show_Name_S01E05.mkv",
+            "1917.2019.1080p.mkv",
+            "Se7en.mkv",
+            // Films whose titles open with a number, which more title words or a year follow.
+            "12.Angry.Men.1957.mkv",
+            "300.2006.1080p.BluRay.mkv",
+            "10x10.2018.1080p.mkv",
+            "28 Days Later (2002).mkv",
+        ] {
+            assert!(names_a_title(name), "{name} names a title");
+        }
+        for name in [
+            "E09 - Title.mkv",
+            "Episode 9.mkv",
+            "Ep.05.mkv",
+            "S01E05.mkv",
+            "S01E05 - Pilot.mkv",
+            "1x05.mkv",
+            "1x05 - Title.mkv",
+            "05.mkv",
+            "05.1080p.mkv",
+            "05 - Title.mkv",
+            "[Group] 05 [1080p].mkv",
+            "[1080p].mkv",
+            "1080p.WEB.mkv",
+            "Season 04",
+            "S04",
+            "Season.2",
+            "Part 2",
+            "Disc 1",
+            "CD1",
+            "",
+        ] {
+            assert!(!names_a_title(name), "{name} names no title");
         }
     }
 
@@ -3017,6 +3321,14 @@ mod tests {
             "10x10.2018.1080p.BluRay.x264.mkv",
             "24x36.2019.1080p.WEBRip.mkv",
             "10x10.1080p.mkv",
+            // The same with underscores, which the show markers read as spaces.
+            "Se7en_1995_1080p_BluRay_x264.mkv",
+            "Movie_1920x1080_HDR.mkv",
+            "10x10_2018_1080p_BluRay.mkv",
+            // A film named by a bare `Episode N`, and a sequel number after a word ending in `ep`.
+            "Star.Wars.Episode.4.mkv",
+            "Step Up 3.mkv",
+            "Step.2.mkv",
         ] {
             assert!(
                 !is_show_guess(&one_file(name)),

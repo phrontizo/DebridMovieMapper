@@ -136,7 +136,18 @@ impl EnrolmentService {
         // visits. Reject any POST a browser flags as cross-origin (non-browser clients send
         // neither header and are allowed, consistent with the trusted-LAN model).
         if method == Method::POST && is_cross_origin(&req) {
-            warn!("Rejecting cross-origin POST to {} (CSRF guard)", path);
+            // Log the values the check compared, so an operator can see a Host that a reverse
+            // proxy rewrote. None is a secret, and `HeaderValue`'s Debug escapes control bytes.
+            let headers = req.headers();
+            warn!(
+                "Rejecting cross-origin POST to {} (CSRF guard): Origin {:?}, Host {:?}, \
+                 Sec-Fetch-Site {:?} (behind a reverse proxy, forward the browser's Host header \
+                 unchanged)",
+                path,
+                headers.get(hyper::header::ORIGIN),
+                headers.get(hyper::header::HOST),
+                headers.get("sec-fetch-site"),
+            );
             return html(
                 StatusCode::FORBIDDEN,
                 "<h1>403 Forbidden</h1><p>Cross-origin request rejected.</p>".to_string(),
@@ -562,7 +573,10 @@ fn is_cross_origin<B>(req: &hyper::Request<B>) -> bool {
                     && !host.is_empty()
                     // Normalise the default port for the scheme so a same-origin POST that carries the
                     // default port on one side but omits it on the other (e.g. a reverse proxy that
-                    // rewrites Host but not Origin) isn't falsely rejected as CSRF.
+                    // forwards the browser's Host with an explicit `:443`) isn't falsely rejected as
+                    // CSRF. Only the default port is evened out: a proxy that forwards another name,
+                    // or drops a non-default port, fails the check, so it has to pass the browser's
+                    // Host through.
                     && strip_default_port(scheme, origin_host)
                         .eq_ignore_ascii_case(strip_default_port(scheme, host))
             });
@@ -1675,6 +1689,53 @@ mod tests {
         // The http default (:80) must not be stripped from an https origin (scheme mismatch case).
         let req = post_req(&[("host", "host.local"), ("origin", "https://host.local:80")]);
         assert!(is_cross_origin(&req));
+    }
+
+    #[test]
+    fn reverse_proxy_must_forward_the_browsers_host() {
+        // The guard compares the browser's Origin with the Host the service receives, so a reverse
+        // proxy has to pass the browser's Host through unchanged, port included (README: nginx
+        // `proxy_set_header Host $http_host;`).
+        let origin = "https://media.example.com";
+        // nginx's default (`$proxy_host`) sends the upstream's own name: every POST is refused.
+        let req = post_req(&[("host", "debridmoviemapper:8080"), ("origin", origin)]);
+        assert!(is_cross_origin(&req));
+        // `$host` drops a non-default port that the Origin carries: refused too.
+        let req = post_req(&[
+            ("host", "media.example.com"),
+            ("origin", "https://media.example.com:8443"),
+        ]);
+        assert!(is_cross_origin(&req));
+        // The browser's Host forwarded unchanged passes, with or without the default port.
+        for host in ["media.example.com", "media.example.com:443"] {
+            let req = post_req(&[("host", host), ("origin", origin)]);
+            assert!(!is_cross_origin(&req), "Host {host} must pass");
+        }
+    }
+
+    #[tokio::test]
+    async fn csrf_rejection_log_names_origin_host_and_the_proxy_hint() {
+        // Behind a reverse proxy that rewrites Host, the 403 is otherwise opaque: the warn line has
+        // to show what the service compared, so the operator can see the proxy changed the Host.
+        let svc = EnrolmentService::new(Arc::new(MockTrakt::default()), Store::in_memory());
+        let req = hyper::Request::builder()
+            .method(Method::POST)
+            .uri("/trakt/enrol")
+            .header("host", "debridmoviemapper:8080")
+            .header("origin", "https://media.example.com")
+            .header("sec-fetch-site", "same-origin")
+            .body(())
+            .unwrap();
+        let (r, logs) = crate::test_log::capture_async(tracing::Level::WARN, svc.handle(req)).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        for want in [
+            "\"https://media.example.com\"",
+            "\"debridmoviemapper:8080\"",
+            "\"same-origin\"",
+            "forward the browser's Host header unchanged",
+        ] {
+            assert!(logs.contains(want), "missing {want:?} in: {logs}");
+        }
     }
 
     fn routed_req(method: Method, uri: &str, same_origin: bool) -> hyper::Request<()> {

@@ -18,8 +18,9 @@ pub enum AcquireOutcome {
     /// episode, or coverage not yet known) and is present on the provider, so nothing was added. It
     /// may itself still be `Pending` (`observe` settles it). Presence is checked against the
     /// provider listing; when that listing can't be fetched, an owned copy that supplies the request
-    /// is assumed present. So is one recorded by another stager while this acquire ran, which the
-    /// listing may not show yet.
+    /// is assumed present. So is a `Pending` one added no more than `ACQUIRE_DEAD_TIMEOUT_SECS` ago,
+    /// and one recorded by another stager while this acquire ran: the listing may not show either
+    /// yet.
     Acquired(String),
     /// This candidate was added and recorded `Pending`; `observe` resolves it (title check, probe)
     /// once its files appear.
@@ -30,11 +31,15 @@ pub enum AcquireOutcome {
     /// `max_attempts` add attempts all failed, or the request names no episode for a show.
     NoAcceptableRelease,
     /// Retry later: the scraper or the provider listing was unreachable, the staging intent could
-    /// not be written or another stager holds it (nothing was added), the provider is busy (an add
-    /// TorBox queued at the account's active-download limit, or throttling), or an added candidate
-    /// couldn't be recorded (the add was deleted again, or left for the staging sweep when that
-    /// delete failed).
+    /// not be written or another stager holds it (nothing was added), or an added candidate couldn't
+    /// be recorded (the add was deleted again, or left for the staging sweep when that delete
+    /// failed).
     TemporarilyUnavailable,
+    /// Retry later, and add nothing else for now: the provider is busy (an add TorBox queued at the
+    /// account's active-download limit, whose queued entry the client deleted, or a 429 that
+    /// outlasted the client's retries). Any other title's add would fare no better, so the
+    /// reconciler and the episode monitor stop acquiring for the rest of their run.
+    ProviderBusy,
 }
 
 /// The verdict of a [`TitleValidator`].
@@ -59,11 +64,15 @@ pub struct TitleLanguages {
 /// Validates an acquired file genuinely matches the requested title (reuses `identify_name`).
 #[async_trait]
 pub trait TitleValidator: Send + Sync {
-    /// `file_path` is the file's path in its torrent, or just its name: the title is identified from
-    /// the name, while the season of a file with no episode code may come from a directory.
+    /// `file_path` is the file's path in its torrent, or just its name, and `torrent_name` the
+    /// torrent's name (empty when unknown). The title is identified from the file name, or, when that
+    /// names no title (`E09 - Title.mkv`, `S01E05.mkv`, `05.mkv`), from the nearest directory that
+    /// does, else the torrent name (`title_check_name`). The episode is read from the file itself:
+    /// its code, or for a file with none the number it names, in the season a directory may give.
     async fn validate(
         &self,
         file_path: &str,
+        torrent_name: &str,
         expected_tmdb_id: u64,
         kind: MediaKind,
         season: Option<u32>,
@@ -104,6 +113,7 @@ impl TitleValidator for TmdbTitleValidator {
     async fn validate(
         &self,
         file_path: &str,
+        torrent_name: &str,
         expected: u64,
         kind: MediaKind,
         season: Option<u32>,
@@ -111,7 +121,9 @@ impl TitleValidator for TmdbTitleValidator {
     ) -> TitleCheck {
         // Reuse the existing identification logic; confident == resolves to the expected tmdb id.
         // identify_name needs the file(s) for its show-vs-movie heuristic; the selected file
-        // (whose name carries any SxxExx pattern) is enough to drive that for a single title.
+        // (whose name carries any SxxExx pattern) is enough to drive that for a single title, and a
+        // show request settles it outright: its file may name the episode by a form the show guess
+        // doesn't count (`Some Show Episode 12.mkv`), which would let a same-titled film win.
         let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
         let files = [crate::rd_client::TorrentFile {
             id: 0,
@@ -119,7 +131,13 @@ impl TitleValidator for TmdbTitleValidator {
             bytes: 0,
             selected: 1,
         }];
-        let found = crate::identification::identify_name(file_name, &files, &self.tmdb).await;
+        let found = crate::identification::identify_name_with_show_hint(
+            title_check_name(file_path, torrent_name),
+            &files,
+            &self.tmdb,
+            kind == MediaKind::Series,
+        )
+        .await;
         title_check(&found, file_path, expected, kind, season, episode)
     }
 
@@ -134,6 +152,38 @@ impl TitleValidator for TmdbTitleValidator {
                 None
             }
         }
+    }
+}
+
+/// The name [`TmdbTitleValidator`] identifies the file at `file_path` (in a torrent named
+/// `torrent_name`) by: the file name when it names a title of its own
+/// (`identification::names_a_title`), so `Other.Show.S01E05.mkv` is still another show whatever its
+/// torrent is called. A file name that names none (`E09 - Title.mkv`, `S01E05.mkv`, `05.mkv`) says
+/// nothing about the title, so the nearest enclosing directory that names one is used instead
+/// (`Season 04`, `S04`, `Part 2` and `Disc 1` are skipped), else the torrent name: TorBox paths
+/// start with the torrent folder, while Real-Debrid paths (`/Season 04/E09 - Title.mkv`) carry no
+/// torrent name. When nothing names a title, the file name is used, as before.
+fn title_check_name<'a>(file_path: &'a str, torrent_name: &'a str) -> &'a str {
+    use crate::identification::names_a_title;
+    let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
+    if names_a_title(file_name) {
+        return file_name;
+    }
+    let dir = &file_path[..file_path.len() - file_name.len()];
+    dir.rsplit('/')
+        .filter(|c| !c.is_empty())
+        .find(|c| names_a_title(c))
+        .or_else(|| Some(torrent_name).filter(|n| names_a_title(n)))
+        .unwrap_or(file_name)
+}
+
+/// The torrent name a title check passes for `info` ([`TitleValidator::validate`]): its `filename`,
+/// else its `original_filename`.
+pub(crate) fn torrent_name_of(info: &TorrentInfo) -> &str {
+    if info.filename.is_empty() {
+        &info.original_filename
+    } else {
+        &info.filename
     }
 }
 
@@ -246,6 +296,8 @@ pub struct AcquisitionEngine {
 /// can't decode, e.g. absolute numbering such as `Show - 041 [1080p]`, or an account-mirror record
 /// written before `parse_se_all` read the `NxM` form: the VFS still emits those files, so the
 /// coverage is unknown and assumed — adding a singleton for every episode would duplicate them all).
+/// An empty `provides` never means no files: the account mirror doesn't adopt a torrent that lists
+/// no video file (`tasks::record_mirror_owned`), and drops such a record an earlier build wrote.
 fn supplies_request(rec: &OwnedRecord, req: &AcquireRequest) -> bool {
     match (req.kind, req.season, req.episode) {
         (MediaKind::Series, Some(s), Some(e)) => {
@@ -255,6 +307,15 @@ fn supplies_request(rec: &OwnedRecord, req: &AcquireRequest) -> bool {
         }
         _ => true,
     }
+}
+
+/// Whether `rec` is an acquisition still in flight at `now`: `Pending` and added no more than
+/// `dead_timeout` ago. The provider listing may not show its torrent yet (TorBox lags an add by tens
+/// of seconds), so an unlisted one is not lapsed: `observe` reaps an absent `Pending` record only
+/// once it is older, and `tasks::plan_episode_actions` counts a `Pending` record as covering its
+/// episode whether listed or not.
+fn in_flight(rec: &OwnedRecord, now: u64, dead_timeout: Duration) -> bool {
+    rec.status == OwnedStatus::Pending && now.saturating_sub(rec.added_at) <= dead_timeout.as_secs()
 }
 
 /// A show request that names no single episode (an account-mirror season pack's record). Shows are
@@ -356,35 +417,26 @@ fn codeless_episode(path: &str) -> Option<(u32, u32)> {
     Some((crate::vfs::season_of_codeless_file(path, name), episode))
 }
 
-/// The season a file with no episode code names EXPLICITLY: an `Sxx` / `Season N` / `NxNN` token in
-/// the file name, else the nearest directory naming one (a `Part N` directory included), as
-/// `vfs::season_of_codeless_file` reads them, so wherever this names a season the VFS places the
-/// file in it. `None` when nothing does: the VFS's season-1 default, and its weakest signal, a
-/// `Part N` in the file name (usually a two-part episode's title), don't count.
-fn explicit_codeless_season(path: &str, name: &str) -> Option<u32> {
-    crate::vfs::season_tokens(name).0.or_else(|| {
-        let dir = &path[..path.len() - name.len()];
-        dir.rsplit('/').filter(|c| !c.is_empty()).find_map(|c| {
-            let (strong, part) = crate::vfs::season_tokens(c);
-            strong.or(part)
-        })
-    })
-}
-
 /// The selected video files of a show torrent that carry no `parse_se_all` code but name their
 /// episode by [`codeless_episode_number`], each mapped to `(season, episode, file_path)`:
 ///
 /// - a single-file release in the season the VFS places it in ([`codeless_episode`]; season 1
 ///   unless something names one);
-/// - a file of a multi-file pack only under an explicit season ([`explicit_codeless_season`]: a
-///   `Season 04/E09 - Title.mkv`, a `[Group] Show S2 - 05.mkv`). A pack of absolutely numbered files
-///   (`[Group] Show - 01..50`) maps nothing: placing a number past season 1 needs TMDB's per-season
-///   episode counts, and the season-1 default would record S01E26..E50 for what TMDB calls S02.
+/// - a file of a multi-file pack only under an explicit season
+///   (`vfs::explicit_season_of_codeless_file`: a `Season 04/E09 - Title.mkv`, a
+///   `[Group] Show S2 - 05.mkv`). A pack of absolutely numbered files (`[Group] Show - 01..50`)
+///   maps nothing, and nor does one under a season RANGE (`[Group] Show (Season 1-2)/`,
+///   `Show.S01-S03/`): placing a number past season 1 needs TMDB's per-season episode counts, and
+///   the season-1 default would record S01E26..E50 for what TMDB calls S02.
 ///
 /// The mapping is all or nothing: when a mapped episode is also named by another selected video
-/// file (coded or not), the names are ambiguous and nothing is mapped. Only the acquisition engine
-/// reads this ([`show_episode_files`]): the account mirror's `provides`, dedup and the VFS read
-/// episode codes alone, so a user's own code-less copy keeps an empty `provides`.
+/// file (coded or not), the names are ambiguous and nothing is mapped. `observe` and the upgrade
+/// engine's staging sites map episodes with it ([`show_episode_files`]), and
+/// `tasks::holds_codeless_video` (dedup and the show-swap prune guard) reads it to tell whether a
+/// record's `provides` accounts for a code-less file. The account mirror's `provides` reads episode
+/// codes alone, so a user's own code-less copy keeps an empty `provides` (and stays protected),
+/// while the VFS hides a code-less file another present copy's slot serves the episode of by this
+/// mapping too.
 pub(crate) fn codeless_episode_files(info: &TorrentInfo) -> Vec<(u32, u32, String)> {
     let videos: Vec<&crate::rd_client::TorrentFile> = info
         .files
@@ -409,7 +461,7 @@ pub(crate) fn codeless_episode_files(info: &TorrentInfo) -> Vec<(u32, u32, Strin
         let season = if single {
             Some(crate::vfs::season_of_codeless_file(&f.path, name))
         } else {
-            explicit_codeless_season(&f.path, name)
+            crate::vfs::explicit_season_of_codeless_file(&f.path, name)
         };
         if let Some(season) = season {
             *named.entry((season, episode)).or_default() += 1;
@@ -425,8 +477,9 @@ pub(crate) fn codeless_episode_files(info: &TorrentInfo) -> Vec<(u32, u32, Strin
 /// Every episode a show torrent's selected video files supply, as `(season, episode, file_path)` in
 /// provider file order: the coded files' episodes ([`episode_files`], each episode once, from its
 /// first file) and the code-less files [`codeless_episode_files`] maps. What `observe` records as a
-/// verified show copy's `provides` (and slots), and what the upgrade engine's per-episode staging
-/// reads, so both accept the releases acquisition accepts.
+/// verified show copy's `provides` (and slots), and what the upgrade engine's staging sites read
+/// (per-episode staging, pack correction and consolidation), so they accept and record the
+/// releases acquisition accepts the way `observe` records them.
 pub(crate) fn show_episode_files(info: &TorrentInfo) -> Vec<(u32, u32, String)> {
     let codeless: HashMap<String, (u32, u32)> = codeless_episode_files(info)
         .into_iter()
@@ -474,31 +527,37 @@ pub(crate) fn count_feature_videos(info: &TorrentInfo) -> usize {
         .count()
 }
 
-/// Build a FileLocator for `path` within `info` (pairs the per-file link by position among selected).
+/// Build a FileLocator for `path` within `info` (`locator_for_selected`), or, when no selected
+/// file is at `path`, one with `file_id` 0 and no link.
 /// `pub` so integration tests can resolve a real file's CDN URL through the exact engine logic.
 pub fn locator_for(info: &TorrentInfo, hash: &str, path: &str) -> FileLocator {
-    let mut link_idx = 0;
-    for f in &info.files {
-        if f.selected == 1 {
-            if f.path == path {
-                return FileLocator {
-                    hash: hash.to_string(),
-                    torrent_id: info.id.clone(),
-                    file_id: f.id,
-                    file_path: path.to_string(),
-                    link: info.links.get(link_idx).cloned(),
-                };
-            }
-            link_idx += 1;
-        }
-    }
-    FileLocator {
+    locator_for_selected(info, hash, path).unwrap_or_else(|| FileLocator {
         hash: hash.to_string(),
         torrent_id: info.id.clone(),
         file_id: 0,
         file_path: path.to_string(),
         link: None,
-    }
+    })
+}
+
+/// A FileLocator for the SELECTED file at `path` within `info`, its Real-Debrid link paired by
+/// position among the selected files (`vfs::selected_files_with_links`; `None` on TorBox, which
+/// resolves by `(torrent_id, file_id)`). `None` when no selected file is at `path`. Shared with the
+/// instant repair, which locates the replacement's copy of a file this way.
+pub(crate) fn locator_for_selected(
+    info: &TorrentInfo,
+    hash: &str,
+    path: &str,
+) -> Option<FileLocator> {
+    crate::vfs::selected_files_with_links(info)
+        .find(|(f, _)| f.path == path)
+        .map(|(f, link)| FileLocator {
+            hash: hash.to_string(),
+            torrent_id: info.id.clone(),
+            file_id: f.id,
+            file_path: path.to_string(),
+            link: link.cloned(),
+        })
 }
 
 /// The verdict of probing a cached file's tracks against the language requirement.
@@ -580,10 +639,10 @@ impl AcquisitionEngine {
     }
 
     /// Optimistically acquire `req`: scrape, rank, add the best non-blacklisted candidate, record
-    /// it `Pending`, and return — WITHOUT synchronously selecting/validating/probing (that is
-    /// `observe`'s job once the torrent's files resolve). A slow-to-seed release is therefore no
-    /// longer judged or deleted prematurely. `provenance` is recorded and preserved across
-    /// `observe`'s re-acquire (sticky).
+    /// it `Pending`, and return without validating or probing it (beyond a best-effort
+    /// `select_files` for an already-cached add); that is `observe`'s job once the torrent's files
+    /// resolve. A slow-to-seed release is therefore no longer judged or deleted prematurely.
+    /// `provenance` is recorded and preserved across `observe`'s re-acquire (sticky).
     pub async fn acquire(&self, req: AcquireRequest, provenance: Provenance) -> AcquireOutcome {
         // A show is acquired one episode at a time. A request naming none (an account-mirror season
         // pack's record) would scrape S1E1 — the scraper's default — whatever season it held, and
@@ -679,14 +738,23 @@ impl AcquisitionEngine {
             let rec = self.store.get_owned(cand.info_hash.clone()).await;
             let rec_owner = rec.as_ref().map(|r| (r.request.kind, r.request.tmdb_id));
             owner.insert(cand.info_hash.clone(), rec_owner);
-            if rec_owner != Some(this_title) || !rec.is_some_and(|r| supplies_request(&r, &req)) {
+            let Some(rec) =
+                rec.filter(|r| rec_owner == Some(this_title) && supplies_request(r, &req))
+            else {
                 continue;
-            }
+            };
             if present.is_none() {
                 present = Some(self.present_hashes().await);
             }
+            // A young `Pending` copy the listing lacks is still in flight (TorBox lags an add by tens
+            // of seconds; `monitor_episodes` asks about a show's next episode seconds after adding a
+            // pack for the last), not lapsed: `observe` and the episode planner count it too. As it
+            // always supplies the request (`supplies_request`), the add loop below never meets one.
             let owned_present = match present.as_ref().expect("just fetched") {
-                Some(p) => p.contains(&cand.info_hash.to_ascii_lowercase()),
+                Some(p) => {
+                    p.contains(&cand.info_hash.to_ascii_lowercase())
+                        || in_flight(&rec, now_secs(), self.dead_timeout)
+                }
                 None => true, // listing unavailable → keep the old idempotent behaviour
             };
             if owned_present {
@@ -744,8 +812,8 @@ impl AcquisitionEngine {
                     continue;
                 }
                 // Owned for this title but not present (the pre-scan returned on a present one that
-                // supplies the request): the title lapsed (cache lost / externally deleted), the
-                // documented re-acquire case.
+                // supplies the request, or on one still in flight): the title lapsed (cache lost /
+                // externally deleted), the documented re-acquire case.
                 Some(o) if o == this_title => {
                     debug!(
                         "acquire: tmdb {} — owned {} is absent (lapsed) — re-adding",
@@ -807,7 +875,7 @@ impl AcquisitionEngine {
             // provider listing can lag that add by tens of seconds, the store doesn't): adding it
             // would return that torrent's id on TorBox. Use it when it is this title's and supplies
             // the request, otherwise move on. (A record the pre-scan saw is a lapsed copy of this
-            // title, re-added on purpose.)
+            // title, absent and not in flight, re-added on purpose.)
             let owned_at_scan = owner.get(&cand.info_hash).copied().flatten().is_some();
             let owned_now = if owned_at_scan {
                 None
@@ -851,14 +919,14 @@ impl AcquisitionEngine {
                         .clear_staging_intent(cand.info_hash.clone())
                         .await;
                     // Busy (TorBox queued the add at the account's active-download limit, and its
-                    // client deleted the queued entry) or throttled: the next candidate's add would
-                    // fare no better, so stop and retry later.
+                    // client deleted the queued entry) or throttled: the next candidate's add, or
+                    // another title's, would fare no better, so stop and retry later.
                     if crate::provider::is_provider_busy(&e) {
                         warn!(
                             "acquire: tmdb {} — the provider is busy ({}); not adding more candidates, retrying later",
                             req.tmdb_id, e
                         );
-                        return AcquireOutcome::TemporarilyUnavailable;
+                        return AcquireOutcome::ProviderBusy;
                     }
                     warn!(
                         "add_magnet failed for {}: {} — trying next",
@@ -991,21 +1059,23 @@ impl AcquisitionEngine {
         })
     }
 
-    /// Validate a file against the expected title: `file_path` is the file's path in its torrent,
-    /// or just its name (a file with no episode code may take its season from a directory), as for
-    /// [`TitleValidator::validate`]. The upgrade engine calls it after it has staged (added) a
-    /// candidate, before adopting it: a `Mismatch` discards and blacklists the candidate, an
-    /// `Unavailable` defers it.
+    /// Validate a file against the expected title: `file_path` is the file's path in its torrent and
+    /// `torrent_name` the torrent's name (`torrent_name_of`), as for [`TitleValidator::validate`]:
+    /// a file name that names no title is identified by its directory or torrent name, and a file
+    /// with no episode code may take its season from a directory. The upgrade engine calls it after
+    /// it has staged (added) a candidate, before adopting it: a `Mismatch` discards and blacklists
+    /// the candidate, an `Unavailable` defers it.
     pub async fn validate_title(
         &self,
         file_path: &str,
+        torrent_name: &str,
         tmdb_id: u64,
         kind: MediaKind,
         season: Option<u32>,
         episode: Option<u32>,
     ) -> TitleCheck {
         self.validator
-            .validate(file_path, tmdb_id, kind, season, episode)
+            .validate(file_path, torrent_name, tmdb_id, kind, season, episode)
             .await
     }
 
@@ -1509,11 +1579,13 @@ impl AcquisitionEngine {
                 let check = if tmdb_down {
                     TitleCheck::Unavailable
                 } else {
-                    // The whole path: a file with no episode code may take its season from a
-                    // directory, as the VFS places it.
+                    // The whole path and the torrent name: a file with no episode code may take its
+                    // season from a directory, as the VFS places it, and a file name that names no
+                    // title (`Season 04/E09 - Title.mkv`) is identified by its folder or torrent.
                     self.validator
                         .validate(
                             &selected_path,
+                            torrent_name_of(&info),
                             rec.request.tmdb_id,
                             rec.request.kind,
                             rec.request.season,
@@ -1853,8 +1925,9 @@ impl AcquisitionEngine {
     /// stream to interrupt (hence no idle-gate). Conservative to avoid ever reaping a live record:
     /// only an EXACT slot supersede (a same-tmdb movie, or a singleton episode == the requested one)
     /// and only a NON-manual record (invariant M-1) is reaped; a pack covering other episodes, any
-    /// still-present copy, and `new_hash` itself are all kept. `present` must be a confirmed,
-    /// non-empty listing (the caller guards off an unknown/empty one, like `observe`).
+    /// still-present copy, a `Pending` record still in flight ([`in_flight`]: the listing may not
+    /// show it yet), and `new_hash` itself are all kept. `present` must be a confirmed, non-empty
+    /// listing (the caller guards off an unknown/empty one, like `observe`).
     async fn reap_lapsed_superseded(
         &self,
         req: &AcquireRequest,
@@ -1883,6 +1956,9 @@ impl AcquisitionEngine {
             }
             if present.contains(&hash.to_ascii_lowercase()) {
                 continue; // still present on the provider → keep
+            }
+            if in_flight(&rec, now_secs(), self.dead_timeout) {
+                continue; // a young `Pending` add the listing may not show yet → `observe`'s
             }
             debug!(
                 "acquire: tmdb {} — reaping lapsed superseded owned {} (replaced by {})",
@@ -2226,6 +2302,7 @@ mod tests {
         async fn validate(
             &self,
             _f: &str,
+            _n: &str,
             _t: u64,
             _k: MediaKind,
             _s: Option<u32>,
@@ -2249,6 +2326,7 @@ mod tests {
         async fn validate(
             &self,
             _f: &str,
+            _n: &str,
             _t: u64,
             _k: MediaKind,
             _s: Option<u32>,
@@ -2272,6 +2350,7 @@ mod tests {
         async fn validate(
             &self,
             _f: &str,
+            _n: &str,
             _t: u64,
             _k: MediaKind,
             _s: Option<u32>,
@@ -2812,7 +2891,8 @@ mod tests {
 
     /// TorBox queued the add (the account is at its active-download limit; the client deleted the
     /// queued entry and reported the provider busy): `acquire` closes the intent and stops, rather
-    /// than queueing every next candidate the same way.
+    /// than queueing every next candidate the same way, and says the provider is busy, so its caller
+    /// stops acquiring other titles too.
     #[tokio::test]
     async fn acquire_stops_when_the_provider_is_busy() {
         let st = store();
@@ -2830,10 +2910,183 @@ mod tests {
             st.clone(),
         );
         let out = eng.acquire(req(), Provenance::watchlist("alice")).await;
-        assert_eq!(out, AcquireOutcome::TemporarilyUnavailable);
+        assert_eq!(out, AcquireOutcome::ProviderBusy);
         assert_eq!(provider.added.lock().unwrap().len(), 1, "one add attempt");
         assert!(st.all_staging_intents().await.is_empty());
         assert!(st.all_owned().await.is_empty());
+    }
+
+    /// An owned record as JSON, to compare whole records (`OwnedRecord` has no `PartialEq`).
+    fn record_json(rec: Option<OwnedRecord>) -> Option<String> {
+        rec.map(|r| serde_json::to_string(&r).unwrap())
+    }
+
+    /// `monitor_episodes` asks `acquire` about every missing episode of a show in turn. A pack added
+    /// for S01E01 seconds ago is `Pending`, and a lagging TorBox listing may not show it yet. Asked
+    /// for S01E02, `acquire` counts that young record as in flight, as `observe` (which reaps an
+    /// absent `Pending` record only past the dead timeout) and the episode planner do: it answers
+    /// with the pack, adds nothing and leaves the record alone, instead of adding a duplicate single
+    /// or re-adding the pack over its record. A `Pending` record past the dead timeout is a lapsed
+    /// copy, and the episode is acquired again.
+    #[tokio::test]
+    async fn acquire_counts_a_young_unlisted_pending_pack_as_in_flight() {
+        for (age, in_flight) in [(0, true), (601, false)] {
+            let st = store();
+            let pack = OwnedRecord {
+                request: series_req_for(1),
+                provenance: Provenance::watchlist("alice"),
+                added_at: now_secs() - age,
+                status: OwnedStatus::Pending,
+                provides: vec![(1, 1)],
+                quality: None,
+            };
+            st.put_owned("hp".into(), pack.clone()).await.unwrap();
+            let provider = Arc::new(MockProvider {
+                torrents: vec![torrent("tother", "hother", "downloaded", 100.0)],
+                add_magnet: Some(AddMagnetResponse {
+                    id: "tid_new".into(),
+                    uri: String::new(),
+                }),
+                ..Default::default()
+            });
+            let eng = engine(
+                provider.clone(),
+                Arc::new(MockScraper {
+                    candidates: vec![cand("hs2", true), cand("hp", true)],
+                }),
+                Arc::new(OkValidator(true)),
+                Arc::new(CannedProber(Ok(vec![]))),
+                st.clone(),
+            );
+            let out = eng
+                .acquire(series_req_for(2), Provenance::watchlist("alice"))
+                .await;
+            if in_flight {
+                assert_eq!(out, AcquireOutcome::Acquired("hp".into()));
+                assert!(provider.added.lock().unwrap().is_empty(), "nothing added");
+                assert_eq!(
+                    record_json(st.get_owned("hp".into()).await),
+                    record_json(Some(pack)),
+                    "the pack's record is untouched"
+                );
+            } else {
+                assert!(
+                    matches!(out, AcquireOutcome::Pending(_)),
+                    "a lapsed copy is acquired again, got {out:?}"
+                );
+                assert!(!provider.added.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    /// A provider that, on its first listing, records `rec` as owned under `hash` (another stager
+    /// recording the candidate between `acquire`'s pre-scan and its claim, while a lagging listing
+    /// doesn't show its torrent yet), then delegates to `inner`.
+    struct RecordsOnListing {
+        inner: MockProvider,
+        store: Store,
+        write: std::sync::Mutex<Option<(String, OwnedRecord)>>,
+    }
+    impl std::fmt::Debug for RecordsOnListing {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RecordsOnListing").finish_non_exhaustive()
+        }
+    }
+    #[async_trait]
+    impl DebridProvider for RecordsOnListing {
+        fn name(&self) -> &'static str {
+            "records-on-listing"
+        }
+        async fn get_torrents(&self) -> Result<Vec<crate::rd_client::Torrent>, reqwest::Error> {
+            let write = self.write.lock().unwrap().take();
+            if let Some((hash, rec)) = write {
+                self.store.put_owned(hash, rec).await.unwrap();
+            }
+            self.inner.get_torrents().await
+        }
+        async fn get_torrent_info(&self, id: &str) -> Result<TI, reqwest::Error> {
+            self.inner.get_torrent_info(id).await
+        }
+        async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+            self.inner.add_magnet(magnet).await
+        }
+        async fn select_files(&self, t: &str, f: &str) -> Result<(), reqwest::Error> {
+            self.inner.select_files(t, f).await
+        }
+        async fn delete_torrent(&self, t: &str) -> Result<(), reqwest::Error> {
+            self.inner.delete_torrent(t).await
+        }
+        async fn resolve_url(
+            &self,
+            l: &crate::provider::FileLocator,
+        ) -> Result<String, crate::error::AppError> {
+            self.inner.resolve_url(l).await
+        }
+        async fn invalidate(&self, l: &crate::provider::FileLocator) {
+            self.inner.invalidate(l).await
+        }
+    }
+
+    /// The top candidate is recorded as owned after `acquire`'s pre-scan saw it unowned: by the
+    /// upgrade job, say, whose add a lagging listing doesn't show yet. Adding it would return that
+    /// torrent's id on TorBox and overwrite its record, so `acquire` re-reads the store after its
+    /// claim. A record of this title that supplies the request is the answer; one of another title
+    /// is skipped, and the next candidate is added. No staging intent is left open either way.
+    #[tokio::test]
+    async fn acquire_never_adds_a_candidate_recorded_since_its_scan() {
+        let mirror = OwnedRecord {
+            request: req(),
+            provenance: Provenance { entries: vec![] },
+            added_at: 1,
+            status: OwnedStatus::Verified,
+            provides: vec![],
+            quality: None,
+        };
+        let other = OwnedRecord {
+            request: AcquireRequest {
+                tmdb_id: 99,
+                ..req()
+            },
+            ..mirror.clone()
+        };
+        for (rec, this_title) in [(mirror, true), (other, false)] {
+            let st = store();
+            let provider = Arc::new(RecordsOnListing {
+                inner: MockProvider {
+                    add_magnet: Some(AddMagnetResponse {
+                        id: "tid_h2".into(),
+                        uri: String::new(),
+                    }),
+                    ..Default::default()
+                },
+                store: st.clone(),
+                write: std::sync::Mutex::new(Some(("h1".into(), rec.clone()))),
+            });
+            let eng = engine(
+                provider.clone(),
+                Arc::new(MockScraper {
+                    candidates: vec![cand("h1", true), cand("h2", true)],
+                }),
+                Arc::new(OkValidator(true)),
+                Arc::new(CannedProber(Ok(vec![]))),
+                st.clone(),
+            );
+            let out = eng.acquire(req(), Provenance::watchlist("alice")).await;
+            let added = provider.inner.added.lock().unwrap().clone();
+            if this_title {
+                assert_eq!(out, AcquireOutcome::Acquired("h1".into()));
+                assert!(added.is_empty(), "nothing added: {added:?}");
+            } else {
+                assert_eq!(out, AcquireOutcome::Pending("h2".into()));
+                assert_eq!(added, vec!["h2".to_string()]);
+            }
+            assert_eq!(
+                record_json(st.get_owned("h1".into()).await),
+                record_json(Some(rec)),
+                "the other stager's record is untouched"
+            );
+            assert!(st.all_staging_intents().await.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -4529,6 +4782,7 @@ mod tests {
         async fn validate(
             &self,
             _f: &str,
+            _n: &str,
             _t: u64,
             _k: MediaKind,
             _s: Option<u32>,
@@ -6485,26 +6739,198 @@ mod tests {
         }
     }
 
-    /// `explicit_codeless_season` reads `vfs::season_of_codeless_file`'s season signals bar the
-    /// season-1 default and a file name's `Part N`: wherever it names a season, the VFS places the
-    /// file in that season.
+    /// Matches every title and records the `(file_path, torrent_name)` of each check.
+    #[derive(Default)]
+    struct RecordingValidator {
+        seen: std::sync::Mutex<Vec<(String, String)>>,
+    }
+    #[async_trait]
+    impl TitleValidator for RecordingValidator {
+        async fn validate(
+            &self,
+            file_path: &str,
+            torrent_name: &str,
+            _t: u64,
+            _k: MediaKind,
+            _s: Option<u32>,
+            _e: Option<u32>,
+        ) -> TitleCheck {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((file_path.to_string(), torrent_name.to_string()));
+            TitleCheck::Match
+        }
+    }
+
+    /// `observe` title-checks a code-less pack's file by its whole path and the torrent's name, so a
+    /// file name that names no title (`E09 - B.mkv`) is identified by the pack's folder, and the
+    /// pack settles `Verified`.
+    #[tokio::test]
+    async fn observe_title_checks_a_codeless_pack_by_its_folder() {
+        let st = store();
+        let mut request = series_req_for(9);
+        request.season = Some(4);
+        st.put_owned(
+            "hp".into(),
+            OwnedRecord {
+                request,
+                provenance: Provenance::watchlist("alice"),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![(4, 9)],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let paths = [
+            "Some.Show.S04.1080p/Season 04/E08 - A.mkv",
+            "Some.Show.S04.1080p/Season 04/E09 - B.mkv",
+        ];
+        let provider = Arc::new(MockProvider {
+            resolve_by_link: true,
+            torrent_info: Some(TI {
+                id: "tid_hp".into(),
+                hash: "hp".into(),
+                filename: "Some.Show.S04.1080p".into(),
+                status: "downloaded".into(),
+                files: paths
+                    .iter()
+                    .enumerate()
+                    .map(|(id, path)| TorrentFile {
+                        id: id as u32,
+                        path: (*path).into(),
+                        bytes: 1_000_000_000,
+                        selected: 1,
+                    })
+                    .collect(),
+                links: vec!["https://cdn/f0".into(), "https://cdn/f1".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let validator = Arc::new(RecordingValidator::default());
+        let eng = engine(
+            provider.clone(),
+            Arc::new(MockScraper { candidates: vec![] }),
+            validator.clone(),
+            Arc::new(RecordingProber::default()),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_hp", "hp", "downloaded", 100.0)])
+            .await;
+        let seen = validator.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![(paths[1].to_string(), "Some.Show.S04.1080p".to_string())]
+        );
+        assert_eq!(
+            title_check_name(&seen[0].0, &seen[0].1),
+            "Some.Show.S04.1080p",
+            "the file name names no title, so the pack's folder is identified"
+        );
+        let rec = st.get_owned("hp".into()).await.unwrap();
+        assert_eq!(rec.status, OwnedStatus::Verified);
+        assert_eq!(rec.provides, vec![(4, 8), (4, 9)]);
+    }
+
+    /// The name a title check identifies a file by: the file name when it names a title, else the
+    /// nearest directory that does (season, part and disc folders skipped), else the torrent name,
+    /// else the file name as before.
+    #[test]
+    fn title_check_name_falls_back_to_the_folder_then_the_torrent() {
+        for (path, torrent, expected) in [
+            (
+                "Show.S04.1080p/Season 04/E09 - Title.mkv",
+                "Show.S04.1080p",
+                "Show.S04.1080p",
+            ),
+            (
+                "/Season 04/E09 - Title.mkv",
+                "Show S04 1080p",
+                "Show S04 1080p",
+            ),
+            ("Show.S01/S01E05.mkv", "", "Show.S01"),
+            (
+                "[Group] Show (Season 2)/05.mkv",
+                "x",
+                "[Group] Show (Season 2)",
+            ),
+            ("Show/Disc 1/Part 2/E01.mkv", "", "Show"),
+            // A file name that names a title is kept, whatever the folder or torrent is called.
+            (
+                "Pack/Other.Show.S01E05.mkv",
+                "Show",
+                "Other.Show.S01E05.mkv",
+            ),
+            // Nothing names a title: the file name, as before.
+            ("/S01E05.mkv", "S01", "S01E05.mkv"),
+            ("/S01E05.mkv", "", "S01E05.mkv"),
+        ] {
+            assert_eq!(
+                title_check_name(path, torrent),
+                expected,
+                "{path} in {torrent:?}"
+            );
+        }
+    }
+
+    /// `vfs::explicit_season_of_codeless_file` reads `vfs::season_of_codeless_file`'s season signals
+    /// bar the season-1 default and a file name's `Part N`: wherever it names a season, the VFS
+    /// places the file in that season. The nearest name that names a season RANGE names none.
     #[test]
     fn explicit_codeless_season_agrees_with_the_vfs_placement() {
         for (path, expected) in [
             ("Show.S04/Season 04/E09 - B.mkv", Some(4)),
             ("Show S2 - 05 (1080p).mkv", Some(2)),
+            ("[Group] Show Season 2 - 05.mkv", Some(2)),
             ("Show.S01-S03/Season 2/E01.mkv", Some(2)),
             ("Show/Part 3/E01.mkv", Some(3)),
             ("Show - 05 (1080p).mkv", None),
             ("Pack/[Group] Show - 05.mkv", None),
             ("Pack/E05 - Title, Part 2.mkv", None),
+            (
+                "[Group] Show (Season 1-2) [1080p]/[Group] Show - 13.mkv",
+                None,
+            ),
+            ("Show.S01-S03/Show.E01.mkv", None),
+            ("Show Seasons 1 to 3/E01.mkv", None),
+            ("Show.S01.S02/E01.mkv", None),
+            // A range in an outer directory doesn't hide a season the nearer one names.
+            ("Show.S01-S03/Part 2/E01.mkv", Some(2)),
         ] {
             let name = path.rsplit('/').next().unwrap();
-            assert_eq!(explicit_codeless_season(path, name), expected, "{path}");
+            assert_eq!(
+                crate::vfs::explicit_season_of_codeless_file(path, name),
+                expected,
+                "{path}"
+            );
             if let Some(s) = expected {
                 assert_eq!(crate::vfs::season_of_codeless_file(path, name), s, "{path}");
             }
         }
+    }
+
+    /// An absolutely numbered batch under a season-range folder (TorBox paths start with the torrent
+    /// folder) names no season for its files: mapping them to the range's first season would record
+    /// S01E26 and on for what TMDB calls S02.
+    #[test]
+    fn a_batch_under_a_season_range_maps_nothing() {
+        let info = TI {
+            files: ["13", "14"]
+                .iter()
+                .enumerate()
+                .map(|(i, n)| TorrentFile {
+                    id: i as u32,
+                    path: format!("[Group] Show (Season 1-2) [1080p]/[Group] Show - {n}.mkv"),
+                    bytes: 1_000_000_000,
+                    selected: 1,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(codeless_episode_files(&info).is_empty());
     }
 
     /// A keyword in the episode title after the code (`Bonus Round`) doesn't make the file an extras

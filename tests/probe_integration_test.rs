@@ -10,6 +10,10 @@
 //! Uses the Creative-Commons *Sintel* torrent (cached on both services), and cleans up after itself,
 //! also when a step fails. Each sub-test skips cleanly if its token (`RD_API_TOKEN` /
 //! `TORBOX_API_KEY`) is unset.
+//!
+//! Run with: `cargo test --test probe_integration_test -- --ignored --show-output`
+//! libtest captures a passing test's stderr, and `--show-output` prints it, so a WARNING from the
+//! cleanup (`common::cleanup_added`) that a Sintel copy may be left in the account is seen.
 
 mod common;
 
@@ -19,9 +23,7 @@ use common::{
 };
 use debridmoviemapper::acquire::locator_for;
 use debridmoviemapper::probe::{probe_tracks, ProbeError, Track};
-use debridmoviemapper::provider::DebridProvider;
-use debridmoviemapper::rd_client::RealDebridClient;
-use debridmoviemapper::torbox_client::TorBoxClient;
+use debridmoviemapper::provider::{DebridProvider, ProviderKind};
 use debridmoviemapper::vfs::is_video_file;
 use std::sync::Arc;
 use std::time::Duration;
@@ -109,19 +111,17 @@ async fn probe_sintel(
 #[tokio::test]
 #[ignore]
 async fn probe_works_through_real_debrid_cdn() {
-    let Some(rd) = common::token("RD_API_TOKEN") else {
-        println!("skipping probe_works_through_real_debrid_cdn: RD_API_TOKEN not set");
-        return;
-    };
-    run_probe(Arc::new(RealDebridClient::new(rd).unwrap()), "RD").await;
+    let kind = ProviderKind::RealDebrid;
+    if let Some(provider) = common::provider(kind, "probe_works_through_real_debrid_cdn") {
+        run_probe(provider, common::label(kind)).await;
+    }
 }
 
 #[tokio::test]
 #[ignore]
 async fn probe_works_through_torbox_cdn() {
-    let Some(tb) = common::token("TORBOX_API_KEY") else {
-        println!("skipping probe_works_through_torbox_cdn: TORBOX_API_KEY not set");
-        return;
-    };
-    run_probe(Arc::new(TorBoxClient::new(tb).unwrap()), "TorBox").await;
+    let kind = ProviderKind::TorBox;
+    if let Some(provider) = common::provider(kind, "probe_works_through_torbox_cdn") {
+        run_probe(provider, common::label(kind)).await;
+    }
 }

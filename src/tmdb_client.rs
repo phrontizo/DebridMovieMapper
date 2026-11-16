@@ -548,19 +548,9 @@ pub(crate) fn parse_external_ids(v: &serde_json::Value) -> Option<String> {
 }
 
 /// Build the synthetic Bad Gateway error returned when every retry attempt hit a retryable
-/// status code, so the function surfaces an error instead of panicking. The construction is
-/// infallible by design (a fixed valid status and static body), hence the `expect`s.
+/// status code, so the function surfaces an error instead of panicking.
 fn synthetic_exhausted_error() -> reqwest::Error {
-    reqwest::Response::from(
-        hyper::Response::builder()
-            .status(reqwest::StatusCode::BAD_GATEWAY)
-            .body(hyper::body::Bytes::from_static(
-                b"all attempts exhausted: retryable status codes",
-            ))
-            .expect("static BAD_GATEWAY response always builds"),
-    )
-    .error_for_status()
-    .expect_err("BAD_GATEWAY always yields an error status")
+    crate::provider::synthetic_bad_gateway(b"all attempts exhausted: retryable status codes")
 }
 
 /// TMDB series production status, collapsed to the three buckets the removal
@@ -746,6 +736,10 @@ mod tests {
         let err = synthetic_exhausted_error();
         assert!(err.is_status());
         assert_eq!(err.status(), Some(reqwest::StatusCode::BAD_GATEWAY));
+        // The log line names the cause, not reqwest's placeholder URL.
+        let shown = err.to_string();
+        assert!(shown.contains("all attempts exhausted"), "{shown}");
+        assert!(!shown.contains("no.url.provided"), "{shown}");
     }
 
     #[test]

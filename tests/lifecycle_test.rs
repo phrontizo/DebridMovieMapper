@@ -8,18 +8,19 @@
 //! `LIVE_ACCOUNT` while they run, so the harness's default parallelism can't make two of
 //! them add and delete Sintel in the same account at once.
 //!
-//! Run with: `cargo test --test lifecycle_test -- --ignored`
-//! (needs `RD_API_TOKEN` and/or `TORBOX_API_KEY`, plus `TMDB_API_KEY`, in `.env`.)
+//! Run with: `cargo test --test lifecycle_test -- --ignored --show-output`
+//! (needs `RD_API_TOKEN` and/or `TORBOX_API_KEY`, plus `TMDB_API_KEY`, in `.env`.) libtest
+//! captures a passing test's stderr, and `--show-output` prints it, so the cleanup's WARNINGs
+//! (`common::delete_ids_then_sweep`: a Sintel copy may be left in the account;
+//! `common::preclean_sintel_candidates`: a copy an earlier run left was deleted) are seen.
 
 mod common;
 
 use common::{cleanup_added, find_ids_by_hash, with_cleanup, AddedIds, SINTEL_HASH};
 use debridmoviemapper::identification::identify_torrent;
 use debridmoviemapper::provider::{DebridProvider, ProviderKind};
-use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::scraper::{Scraper, TorrentioScraper};
 use debridmoviemapper::tmdb_client::TmdbClient;
-use debridmoviemapper::torbox_client::TorBoxClient;
 use debridmoviemapper::vfs::{DebridVfs, VfsNode};
 use std::sync::Arc;
 use std::time::Duration;
@@ -126,8 +127,9 @@ async fn lifecycle_steps(
     );
     println!("[{label}] appears in library ✓");
 
-    // 6. Delete.
+    // 6. Delete. The cleanup needn't delete the id again (TorBox answers that with a 500).
     provider.delete_torrent(&id).await.expect("delete_torrent");
+    common::forget_added_id(added, &id);
 
     // 7. Disappears from the provider's list.
     let mut gone = false;
@@ -150,54 +152,63 @@ async fn lifecycle_steps(
     println!("[{label}] disappeared after delete ✓");
 }
 
+/// [`run_lifecycle`] on the `kind` provider, or a skip line for `test` when its token is unset.
+async fn lifecycle_on(kind: ProviderKind, test: &str) {
+    let _live = LIVE_ACCOUNT.lock().await;
+    tracing_subscriber::fmt::try_init().ok();
+    let Some(token) = common::provider_token(kind, test) else {
+        return;
+    };
+    let scraper = scraper_for(kind, &token);
+    let provider = common::client(kind, token);
+    run_lifecycle(
+        provider,
+        common::tmdb_client(),
+        scraper,
+        common::label(kind),
+    )
+    .await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn lifecycle_real_debrid() {
-    let _live = LIVE_ACCOUNT.lock().await;
-    tracing_subscriber::fmt::try_init().ok();
-    let Some(rd) = common::token("RD_API_TOKEN") else {
-        println!("skipping lifecycle_real_debrid: RD_API_TOKEN not set");
-        return;
-    };
-    let scraper = scraper_for(ProviderKind::RealDebrid, &rd);
-    let provider: Arc<dyn DebridProvider> = Arc::new(RealDebridClient::new(rd).unwrap());
-    run_lifecycle(provider, common::tmdb_client(), scraper, "real-debrid").await;
+    lifecycle_on(ProviderKind::RealDebrid, "lifecycle_real_debrid").await;
 }
 
 #[tokio::test]
 #[ignore]
 async fn lifecycle_torbox() {
+    lifecycle_on(ProviderKind::TorBox, "lifecycle_torbox").await;
+}
+
+/// [`run_acquire`] on the `kind` provider, or a skip line for `test` when its token is unset.
+async fn acquire_on(kind: ProviderKind, test: &str) {
     let _live = LIVE_ACCOUNT.lock().await;
-    tracing_subscriber::fmt::try_init().ok();
-    let Some(tb) = common::token("TORBOX_API_KEY") else {
-        println!("skipping lifecycle_torbox: TORBOX_API_KEY not set");
+    let Some(token) = common::provider_token(kind, test) else {
         return;
     };
-    let scraper = scraper_for(ProviderKind::TorBox, &tb);
-    let provider: Arc<dyn DebridProvider> = Arc::new(TorBoxClient::new(tb).unwrap());
-    run_lifecycle(provider, common::tmdb_client(), scraper, "torbox").await;
+    run_acquire(kind, token, common::label(kind)).await;
 }
 
 #[tokio::test]
 #[ignore]
 async fn lifecycle_acquire_sintel_by_imdb_real_debrid() {
-    let _live = LIVE_ACCOUNT.lock().await;
-    let Some(rd) = common::token("RD_API_TOKEN") else {
-        println!("skipping lifecycle_acquire_sintel_by_imdb_real_debrid: RD_API_TOKEN not set");
-        return;
-    };
-    run_acquire(ProviderKind::RealDebrid, rd, "real-debrid").await;
+    acquire_on(
+        ProviderKind::RealDebrid,
+        "lifecycle_acquire_sintel_by_imdb_real_debrid",
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore]
 async fn lifecycle_acquire_sintel_by_imdb_torbox() {
-    let _live = LIVE_ACCOUNT.lock().await;
-    let Some(tb) = common::token("TORBOX_API_KEY") else {
-        println!("skipping lifecycle_acquire_sintel_by_imdb_torbox: TORBOX_API_KEY not set");
-        return;
-    };
-    run_acquire(ProviderKind::TorBox, tb, "torbox").await;
+    acquire_on(
+        ProviderKind::TorBox,
+        "lifecycle_acquire_sintel_by_imdb_torbox",
+    )
+    .await;
 }
 
 /// Acquire Sintel by IMDB id through the `AcquisitionEngine` on one provider, drive `observe`
@@ -207,14 +218,7 @@ async fn lifecycle_acquire_sintel_by_imdb_torbox() {
 async fn run_acquire(kind: ProviderKind, provider_token: String, label: &str) {
     // With a provider configured, TMDB is required: a missing key or a TMDB failure fails the test.
     let tmdb = common::tmdb_client();
-    let provider: Arc<dyn debridmoviemapper::provider::DebridProvider> = match kind {
-        ProviderKind::RealDebrid => Arc::new(
-            debridmoviemapper::rd_client::RealDebridClient::new(provider_token.clone()).unwrap(),
-        ),
-        ProviderKind::TorBox => Arc::new(
-            debridmoviemapper::torbox_client::TorBoxClient::new(provider_token.clone()).unwrap(),
-        ),
-    };
+    let provider = common::client(kind, provider_token.clone());
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -308,7 +312,8 @@ async fn run_acquire(kind: ProviderKind, provider_token: String, label: &str) {
         for _ in 0..20 {
             let torrents = provider.get_torrents().await.expect("get_torrents");
             record_owned_ids(&store, &torrents, &added).await;
-            engine.observe(&torrents).await;
+            let deleted = engine.observe(&torrents).await;
+            forget_deleted_ids(&torrents, &deleted, &added);
             if matches!(
                 store.get_owned(hash.clone()).await.map(|r| r.status),
                 Some(debridmoviemapper::store::OwnedStatus::Verified)
@@ -394,6 +399,22 @@ async fn record_owned_ids(
         .filter(|t| owned.iter().any(|(h, _)| t.hash.eq_ignore_ascii_case(h)))
     {
         common::record_added_id(added, &t.id);
+    }
+}
+
+/// Forget from `added` the id of every listed torrent (in the `torrents` `observe` was given) whose
+/// hash is in `deleted`, the hashes `observe` returned as deleted (it deletes a rejected release
+/// under every listing id), so the cleanup doesn't delete them again.
+fn forget_deleted_ids(
+    torrents: &[debridmoviemapper::rd_client::Torrent],
+    deleted: &std::collections::HashSet<String>,
+    added: &AddedIds,
+) {
+    for t in torrents
+        .iter()
+        .filter(|t| deleted.contains(&t.hash.to_ascii_lowercase()))
+    {
+        common::forget_added_id(added, &t.id);
     }
 }
 
@@ -584,12 +605,23 @@ fn listed(entries: &[(&str, &str)]) -> Listing {
         .collect())
 }
 
-/// Run the cleanup core against scripted listings; returns its outcome, the ids it deleted (in
-/// order) and how many listings it made.
+/// Run the cleanup core against scripted listings, with every delete succeeding; returns its
+/// outcome, the ids it deleted (in order) and how many listings it made.
 async fn sweep(
     listings: Vec<Listing>,
     ids: &[&str],
     hashes: &[&str],
+) -> (Result<(), String>, Vec<String>, usize) {
+    sweep_failing(listings, ids, hashes, &[]).await
+}
+
+/// [`sweep`], with every delete of an id in `failing` failing. The returned ids are every delete
+/// attempted, failed ones included.
+async fn sweep_failing(
+    listings: Vec<Listing>,
+    ids: &[&str],
+    hashes: &[&str],
+    failing: &[&str],
 ) -> (Result<(), String>, Vec<String>, usize) {
     let calls = std::cell::Cell::new(0usize);
     let deleted = std::cell::RefCell::new(Vec::new());
@@ -603,8 +635,9 @@ async fn sweep(
             async move { listing }
         },
         |id: String| {
+            let ok = !failing.contains(&id.as_str());
             deleted.borrow_mut().push(id);
-            async {}
+            async move { ok }
         },
         &ids,
         &hashes,
@@ -669,9 +702,66 @@ async fn cleanup_warns_when_the_torrent_stays_listed() {
     let (outcome, deleted, listings) =
         sweep(vec![listed(&[("7", SINTEL_HASH)])], &[], &[SINTEL_HASH]).await;
     let why = outcome.unwrap_err();
-    assert!(why.contains("still listed"), "{why}");
+    assert!(why.contains("deleted but still listed"), "{why}");
     assert!(why.contains('7') && why.contains(SINTEL_HASH), "{why}");
-    assert_eq!(deleted, vec!["7".to_string(); 3], "each listing retries it");
+    assert_eq!(
+        deleted,
+        vec!["7".to_string()],
+        "a deleted torrent isn't deleted again"
+    );
+    assert_eq!(listings, 3, "it waits for a listing without the torrent");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cleanup_retries_a_delete_that_failed() {
+    let (outcome, deleted, listings) = sweep_failing(
+        vec![listed(&[("42", SINTEL_HASH)])],
+        &["42"],
+        &[SINTEL_HASH],
+        &["42"],
+    )
+    .await;
+    let why = outcome.unwrap_err();
+    assert!(why.contains("still listed"), "{why}");
+    assert!(!why.contains("deleted but"), "{why}");
+    assert_eq!(
+        deleted,
+        vec!["42".to_string(); 4],
+        "the first delete, then one on each listing that still shows it"
+    );
+    assert_eq!(listings, 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cleanup_does_not_delete_again_an_id_it_deleted() {
+    // TorBox's listing can lag a delete too: right after the cleanup deleted the known id, the
+    // listing still shows it. Deleting it again gets TorBox's 500 DATABASE_ERROR, which its client
+    // retries five times, so the sweep waits for a listing without it instead.
+    let (outcome, deleted, listings) = sweep(
+        vec![listed(&[("42", SINTEL_HASH)]), listed(&[])],
+        &["42"],
+        &[SINTEL_HASH],
+    )
+    .await;
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(deleted, vec!["42".to_string()], "one delete per torrent");
+    assert_eq!(listings, 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cleanup_does_not_delete_again_a_swept_torrent_it_deleted() {
+    let (outcome, deleted, listings) = sweep(
+        vec![
+            listed(&[("7", SINTEL_HASH)]),
+            listed(&[("7", SINTEL_HASH)]),
+            listed(&[]),
+        ],
+        &[],
+        &[SINTEL_HASH],
+    )
+    .await;
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(deleted, vec!["7".to_string()], "one delete per torrent");
     assert_eq!(listings, 3);
 }
 
@@ -770,4 +860,36 @@ fn record_added_id_keeps_each_id_once() {
         common::added_ids(&added),
         vec!["42".to_string(), "43".to_string()]
     );
+}
+
+#[test]
+fn forget_deleted_ids_drops_the_ids_observe_deleted() {
+    let added = common::AddedIds::default();
+    for id in ["1", "2", "3"] {
+        common::record_added_id(&added, id);
+    }
+    let listing = vec![
+        listed_torrent(
+            "1",
+            &SINTEL_RELEASE.to_ascii_uppercase(),
+            "Sintel.2010.720p",
+        ),
+        listed_torrent("2", SINTEL_HASH, "Sintel"),
+        // A second listing id of the rejected hash: `observe` deletes it under every id.
+        listed_torrent("3", SINTEL_RELEASE, "Sintel.2010.720p"),
+    ];
+    // `observe` returns the lowercased hashes whose listed torrents it deleted.
+    let deleted: std::collections::HashSet<String> = [SINTEL_RELEASE.to_string()].into();
+    forget_deleted_ids(&listing, &deleted, &added);
+    assert_eq!(common::added_ids(&added), vec!["2".to_string()]);
+}
+
+#[test]
+fn forget_added_id_drops_only_that_id() {
+    let added = common::AddedIds::default();
+    common::record_added_id(&added, "42");
+    common::record_added_id(&added, "43");
+    common::forget_added_id(&added, "42");
+    common::forget_added_id(&added, "44");
+    assert_eq!(common::added_ids(&added), vec!["43".to_string()]);
 }

@@ -3,10 +3,11 @@
 #![allow(dead_code)]
 
 use debridmoviemapper::error::AppError;
-use debridmoviemapper::provider::{DebridProvider, FileLocator};
-use debridmoviemapper::rd_client::{AddMagnetResponse, Torrent, TorrentInfo};
+use debridmoviemapper::provider::{DebridProvider, FileLocator, ProviderKind};
+use debridmoviemapper::rd_client::{AddMagnetResponse, RealDebridClient, Torrent, TorrentInfo};
 use debridmoviemapper::scraper::{MediaKind, Scraper};
 use debridmoviemapper::tmdb_client::TmdbClient;
+use debridmoviemapper::torbox_client::TorBoxClient;
 use debridmoviemapper::vfs::is_video_file;
 use futures_util::FutureExt;
 use std::future::Future;
@@ -52,6 +53,57 @@ pub fn token(var: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// How long to wait before each retry of a torrent lookup that answered 404
+/// (`provider::torrent_info_retrying_not_found`). TorBox's `mylist?id=` sometimes answers 404 for
+/// a torrent that exists (the service's staging retries it too, see `STAGED_INFO_BACKOFF` in
+/// `src/upgrade.rs`), which would otherwise fail a live test.
+pub const INFO_NOT_FOUND_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
+/// The provider's name in test output and in file names (`integration_test`'s caches).
+pub fn label(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::RealDebrid => "real-debrid",
+        ProviderKind::TorBox => "torbox",
+    }
+}
+
+/// The env var that holds the provider's token.
+pub fn token_var(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::RealDebrid => "RD_API_TOKEN",
+        ProviderKind::TorBox => "TORBOX_API_KEY",
+    }
+}
+
+/// A client for the `kind` provider with `token`.
+pub fn client(kind: ProviderKind, token: String) -> Arc<dyn DebridProvider> {
+    match kind {
+        ProviderKind::RealDebrid => Arc::new(RealDebridClient::new(token).unwrap()),
+        ProviderKind::TorBox => Arc::new(TorBoxClient::new(token).unwrap()),
+    }
+}
+
+/// The `kind` provider's token ([`token`]), or `None` after printing a skip line for `test` when
+/// it is unset or blank.
+pub fn provider_token(kind: ProviderKind, test: &str) -> Option<String> {
+    let var = token_var(kind);
+    let token = token(var);
+    if token.is_none() {
+        println!("skipping {test} on {}: {var} not set", label(kind));
+    }
+    token
+}
+
+/// The `kind` provider, or `None` (after printing a skip line for `test`) when its token is unset
+/// or blank. A set token that the provider then rejects is a real failure, not a skip.
+pub fn provider(kind: ProviderKind, test: &str) -> Option<Arc<dyn DebridProvider>> {
+    provider_token(kind, test).map(|token| client(kind, token))
 }
 
 /// A provider wrapper for live tests that must only READ the account: listings, lookups and file
@@ -191,16 +243,30 @@ pub fn record_added_id(added: &AddedIds, id: &str) {
     }
 }
 
+/// Forget a recorded id the body has deleted itself, so the cleanup doesn't delete it again: TorBox
+/// answers a delete of an id already deleted with `500 DATABASE_ERROR`, which its client retries
+/// five times.
+pub fn forget_added_id(added: &AddedIds, id: &str) {
+    added
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|known| known != id);
+}
+
 /// The ids recorded so far.
 pub fn added_ids(added: &AddedIds) -> Vec<String> {
     added.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// The cleanup core: `delete` each known id in `ids` first (an already-deleted one just fails,
-/// which is ignored), then sweep by `hashes`: up to `attempts` listings (`list` returns
-/// `(id, hash)` pairs), `every` apart, deleting every listed torrent that carries one of `hashes`
-/// (case-insensitively) or one of `ids`, until a listing shows none. `Err` says what it couldn't
-/// confirm gone: a torrent still listed, or, when no listing succeeded, every hash and id.
+/// The cleanup core: `delete` each known id in `ids` first (whether or not a listing shows it,
+/// since TorBox's listing can lag the add), then sweep by `hashes`: up to `attempts` listings
+/// (`list` returns `(id, hash)` pairs), `every` apart, deleting every listed torrent that carries
+/// one of `hashes` (case-insensitively) or one of `ids`, until a listing shows none. `delete`
+/// returns whether the delete succeeded, and a torrent deleted once is never deleted again: a
+/// listing that still shows it lags the delete (TorBox's can), and a second delete only gets
+/// TorBox's `500 DATABASE_ERROR`. A failed delete is retried on the next listing that shows the
+/// torrent. `Err` says what it couldn't confirm gone: a torrent still listed, or, when no listing
+/// succeeded, every hash and id.
 pub async fn delete_ids_then_sweep_with<L, LFut, E, D, DFut>(
     mut list: L,
     mut delete: D,
@@ -214,13 +280,17 @@ where
     LFut: Future<Output = Result<Vec<(String, String)>, E>>,
     E: std::fmt::Display,
     D: FnMut(String) -> DFut,
-    DFut: Future<Output = ()>,
+    DFut: Future<Output = bool>,
 {
     if ids.is_empty() && hashes.is_empty() {
         return Ok(());
     }
+    // The ids this cleanup deleted successfully.
+    let mut deleted: Vec<String> = Vec::new();
     for id in ids {
-        delete(id.clone()).await;
+        if delete(id.clone()).await {
+            deleted.push(id.clone());
+        }
     }
     let mut still_listed: Option<Vec<(String, String)>> = None;
     let mut last_error = None;
@@ -240,7 +310,9 @@ where
                     return Ok(());
                 }
                 for (id, _) in &ours {
-                    delete(id.clone()).await;
+                    if !deleted.contains(id) && delete(id.clone()).await {
+                        deleted.push(id.clone());
+                    }
                 }
                 still_listed = Some(ours);
             }
@@ -251,7 +323,14 @@ where
         Some(ours) => format!(
             "still listed: {}",
             ours.iter()
-                .map(|(id, hash)| format!("id {id} (hash {hash})"))
+                .map(|(id, hash)| {
+                    let note = if deleted.contains(id) {
+                        ", deleted but still listed"
+                    } else {
+                        ""
+                    };
+                    format!("id {id} (hash {hash}{note})")
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -284,9 +363,7 @@ pub async fn delete_ids_then_sweep(
                     .collect::<Vec<_>>()
             })
         },
-        |id: String| async move {
-            let _ = provider.delete_torrent(&id).await;
-        },
+        |id: String| async move { provider.delete_torrent(&id).await.is_ok() },
         ids,
         hashes,
         SWEEP_LISTINGS,

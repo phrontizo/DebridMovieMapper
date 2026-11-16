@@ -171,11 +171,11 @@ pub fn user_finished(r: &WantedRecord, aired: &[(u32, u32)]) -> bool {
 /// A **watchlisted** title is an explicit "keep this available" signal and is NEVER finished-removed:
 /// re-adding a title you've already watched to your watchlist means you want to (re)watch it, so it
 /// must stay acquired regardless of watched state. So Trigger A does not fire while ANY user
-/// watchlists the title — it only reclaims *in-progress-only* titles (scrobbled but not watchlisted)
-/// once everyone watching them has finished. A watchlisted title is removed solely via Trigger B
-/// (un-watchlisted AND nobody wants it). Without this guard, a watched + watchlisted title oscillates
-/// every reconcile tick — acquired (acquire ignores watched) then deleted (Trigger A) — flapping the
-/// library.
+/// watchlists the title — it only reclaims titles wanted without a watchlist once every wanter has
+/// finished them (in practice a show `REMOVE_FINISHED_SHOWS` folds back in; see above). A
+/// watchlisted title is removed solely via Trigger B (un-watchlisted AND nobody wants it). Without
+/// this guard, a watched + watchlisted title oscillates every reconcile tick — acquired (acquire
+/// ignores watched) then deleted (Trigger A) — flapping the library.
 pub fn trigger_a_finished(wanted: &[WantedRecord], aired: &[(u32, u32)]) -> bool {
     if wanted.iter().any(|r| r.sources.watchlist) {
         return false;
@@ -304,10 +304,11 @@ pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
         MediaType::Show => {
             // Symmetry with the Movie branch: don't acquire a show every watcher has finished (an
             // ended show, fully watched). The Trigger-A watchlist guard means a watchlisted show is
-            // never "finished", so it still acquires — only in-progress-only finished shows are
-            // skipped. Manual content is removal-protected and never flip-flops, so it is not
-            // suppressed here — it must stay available and restore its previously-owned episodes if
-            // the cache lapses (see the `owned_eps` filter below).
+            // never "finished", so it still acquires — only a finished show wanted without a
+            // watchlist (in practice a `REMOVE_FINISHED_SHOWS` fold) is skipped. Manual content is
+            // removal-protected and never flip-flops, so it is not suppressed here — it must stay
+            // available and restore its previously-owned episodes if the cache lapses (see the
+            // `owned_eps` filter below).
             if !manual && finished {
                 return vec![];
             }
@@ -500,6 +501,9 @@ mod tests {
     #[test]
     fn finished_movie_is_removed_trigger_a() {
         // An IN-PROGRESS-only (not watchlisted) movie that's been watched is reclaimed by Trigger A.
+        // The sync never writes this movie state (`tasks::build_wanted` writes a playback movie as
+        // not watched, and `REMOVE_FINISHED_SHOWS` folds only shows), so this pins the pure core
+        // only.
         let t = movie_title(
             1,
             vec![movie_record(
@@ -1488,7 +1492,9 @@ mod tests {
         let titles = [
             // wanted, not owned → AcquireMovie
             movie_title(10, vec![watchlist_movie_record("a", 10, false)], None),
-            // finished + owned (non-manual), in-progress-only (not watchlisted) → Remove
+            // finished + owned (non-manual), in-progress-only (not watchlisted) → Remove. The sync
+            // never writes this movie state (a playback movie is written as not watched, and
+            // `REMOVE_FINISHED_SHOWS` folds only shows): this pins the pure core only.
             movie_title(
                 1,
                 vec![movie_record(

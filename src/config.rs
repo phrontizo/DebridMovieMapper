@@ -227,15 +227,29 @@ pub enum SubReq {
 impl SubReq {
     /// `None`/empty/"none"/"off" → None (skip); a language code → that language, lowercased
     /// ([`parse_lang_code`], which warns about an unknown 3-letter code and about `no`/`na`); any
-    /// other non-empty value is invalid (warned) and falls back to None (skip the check).
+    /// other non-empty value is invalid (warned) and falls back to None (skip the check). So is a
+    /// no-language code (`xx`/`zxx`, `probe::is_no_language`): `AUDIO_LANGUAGE` reads it as "no
+    /// audio check", but no subtitle track is tagged with it and the probe's subtitle check has no
+    /// such exemption, so taken as written it would reject every release.
     pub fn parse(s: Option<String>) -> Self {
         match s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
             None => SubReq::None,
             Some(v) if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") => {
                 SubReq::None
             }
-            Some(v) => parse_lang_code("SUBTITLE_LANGUAGE", &v, "none", "no subtitle check")
-                .map_or(SubReq::None, SubReq::Lang),
+            Some(v) => {
+                match parse_lang_code("SUBTITLE_LANGUAGE", &v, "none", "no subtitle check") {
+                    Some(code) if crate::probe::is_no_language(&code) => {
+                        warn!(
+                        "Invalid SUBTITLE_LANGUAGE '{v}': it means no language, which no subtitle \
+                         track is tagged with, so every release would be rejected; falling back \
+                         to 'none' (no subtitle check)"
+                    );
+                        SubReq::None
+                    }
+                    code => code.map_or(SubReq::None, SubReq::Lang),
+                }
+            }
         }
     }
 }
@@ -1439,9 +1453,11 @@ mod tests {
                 && logs.contains("Invalid SUBTITLE_LANGUAGE 'xy'"),
             "an unknown 2-letter code must be rejected with a warning: {logs:?}"
         );
-        // Known codes, TMDB's non-ISO `cn` and a /T form are kept, silently.
+        // Known codes, TMDB's non-ISO `cn` / `sh` and a /T form are kept, silently. The
+        // no-language `xx` / `zxx` are kept for the audio only (they turn its check off); the
+        // subtitle side refuses them, see `subtitle_language_refuses_no_language_to_none`.
         let logs = captured_warnings(|| {
-            for code in ["en", "eng", "deu", "cn", "yue", "zxx", "cmn"] {
+            for code in ["en", "eng", "deu", "cn", "sh", "yue", "cmn"] {
                 assert_eq!(
                     AudioReq::parse(Some(code.into())),
                     AudioReq::Lang(code.into()),
@@ -1453,8 +1469,37 @@ mod tests {
                     "{code}"
                 );
             }
+            for code in ["xx", "zxx"] {
+                assert_eq!(
+                    AudioReq::parse(Some(code.into())),
+                    AudioReq::Lang(code.into()),
+                    "{code}"
+                );
+            }
         });
         assert!(logs.is_empty(), "a known code must not warn: {logs:?}");
+    }
+
+    #[test]
+    fn subtitle_language_refuses_no_language_to_none() {
+        // `xx` (TMDB's "No Language") / `zxx` name no language, and no subtitle track is tagged
+        // with them. The probe's subtitle check has no no-language exemption, so taken as written
+        // every probed release would fail it and be blacklisted for 30 days.
+        let logs = captured_warnings(|| {
+            for code in ["xx", "zxx", " ZXX ", "XX"] {
+                assert_eq!(SubReq::parse(Some(code.into())), SubReq::None, "{code}");
+            }
+        });
+        for code in ["xx", "zxx", "ZXX", "XX"] {
+            assert!(
+                logs.contains(&format!("Invalid SUBTITLE_LANGUAGE '{code}'")),
+                "a no-language subtitle code must be refused with a warning: {logs:?}"
+            );
+        }
+        assert!(
+            logs.contains("falling back to 'none'"),
+            "the warning names the fallback: {logs:?}"
+        );
     }
 
     #[test]

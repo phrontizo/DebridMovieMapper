@@ -61,7 +61,7 @@ pub enum RepairFailure {
     /// torrent stays `Healthy`/visible with its attempt budget reset and a later read retries, so
     /// `dav_fs` logs this at info level (like `NotCached`), NOT warn.
     Deferred(String),
-    /// An actual repair failure (rate-limited, max attempts exceeded, a provider info/listing error).
+    /// An actual repair failure (rate-limited, max attempts exceeded, a provider torrent-info error).
     /// `dav_fs` logs this at warn level.
     Failed(String),
 }
@@ -620,32 +620,18 @@ impl RepairManager {
         });
     }
 
-    /// Build a `FileLocator` for the file at `file_path` within `info`. The per-file
-    /// restricted link is paired by position among selected files (Real-Debrid); for
-    /// providers with no per-file link array (TorBox) `links` is empty so `link` is
-    /// `None` and the file is addressed by `(torrent_id, file_id)`. Returns `None` if
-    /// no selected file matches `file_path`.
+    /// Build a `FileLocator` for the file at `file_path` within `info`
+    /// (`acquire::locator_for_selected`, over the one copy of the pairing,
+    /// `vfs::selected_files_with_links`). The per-file restricted link is paired by position among
+    /// selected files (Real-Debrid); for providers with no per-file link array (TorBox) `links` is
+    /// empty so `link` is `None` and the file is addressed by `(torrent_id, file_id)`. Returns
+    /// `None` if no selected file matches `file_path`.
     fn locator_for_file(
         info: &TorrentInfo,
         hash: &str,
         file_path: &str,
     ) -> Option<crate::provider::FileLocator> {
-        let mut link_idx = 0;
-        for file in &info.files {
-            if file.selected == 1 {
-                if file.path == file_path {
-                    return Some(crate::provider::FileLocator {
-                        hash: hash.to_string(),
-                        torrent_id: info.id.clone(),
-                        file_id: file.id,
-                        file_path: file_path.to_string(),
-                        link: info.links.get(link_idx).cloned(),
-                    });
-                }
-                link_idx += 1;
-            }
-        }
-        None
+        crate::acquire::locator_for_selected(info, hash, file_path)
     }
 
     /// Attempt instant repair (re-acquire) for a broken/uncached file. Re-adds the
@@ -744,7 +730,7 @@ impl RepairManager {
         {
             Ok(info) => info,
             Err(e) => {
-                // Transient listing failure, no replacement produced — keep the torrent VISIBLE
+                // Transient torrent-info failure, no replacement produced — keep the torrent VISIBLE
                 // (Healthy) so the next read can re-attempt repair (Broken would hide it with no way
                 // back). Reset the attempt budget (a transient error is not a broken-file signal),
                 // preserving the cooldown; see `note_transient_repair_failure`.

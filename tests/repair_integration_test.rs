@@ -11,58 +11,24 @@
 //! re-cache, lose it.
 //! `test_broken_torrents_hidden_from_webdav_*` only reads the account: its provider calls go
 //! through `common::ReadOnlyProvider`.
+//!
+//! Run with: `cargo test --test repair_integration_test -- --ignored --show-output`
+//! (needs `RD_API_TOKEN` and/or `TORBOX_API_KEY` in `.env`). libtest captures a passing test's
+//! stderr, and `--show-output` prints it, so a WARNING from the cleanup (`common::cleanup_added`)
+//! that a Sintel copy may be left in the account is seen.
 
 mod common;
 
 use common::{
-    cleanup_added, cleanup_by_hash, find_ids_by_hash, poll_until_listed, record_added_id,
-    with_cleanup, AddedIds, SINTEL_HASH,
+    cleanup_added, cleanup_by_hash, find_ids_by_hash, label, poll_until_listed, provider,
+    record_added_id, with_cleanup, AddedIds, INFO_NOT_FOUND_BACKOFF, SINTEL_HASH,
 };
 use debridmoviemapper::acquire::locator_for;
 use debridmoviemapper::provider::{torrent_info_retrying_not_found, DebridProvider, ProviderKind};
-use debridmoviemapper::rd_client::RealDebridClient;
 use debridmoviemapper::repair::{RepairFailure, RepairManager};
-use debridmoviemapper::torbox_client::TorBoxClient;
 use debridmoviemapper::vfs::is_video_file;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
-
-/// How long to wait before each retry of a torrent lookup that answered 404. TorBox's
-/// `mylist?id=` sometimes answers 404 for a torrent that exists (the service retries it too, see
-/// `STAGED_INFO_BACKOFF` in `src/upgrade.rs`).
-const INFO_NOT_FOUND_BACKOFF: [Duration; 3] = [
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(4),
-];
-
-fn label(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::RealDebrid => "real-debrid",
-        ProviderKind::TorBox => "torbox",
-    }
-}
-
-fn token_var(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::RealDebrid => "RD_API_TOKEN",
-        ProviderKind::TorBox => "TORBOX_API_KEY",
-    }
-}
-
-/// The `kind` provider, or `None` (after printing a skip line for `test`) when its token is unset
-/// or blank. A set token that the provider then rejects is a real failure, not a skip.
-fn provider(kind: ProviderKind, test: &str) -> Option<Arc<dyn DebridProvider>> {
-    let var = token_var(kind);
-    let Some(token) = common::token(var) else {
-        println!("skipping {test} on {}: {var} not set", label(kind));
-        return None;
-    };
-    Some(match kind {
-        ProviderKind::RealDebrid => Arc::new(RealDebridClient::new(token).unwrap()),
-        ProviderKind::TorBox => Arc::new(TorBoxClient::new(token).unwrap()),
-    })
-}
 
 /// Poll the listing (every 2 s for up to 30 s, since TorBox's can lag an add) until it shows the
 /// torrent `id`, and fail the test with what the polls saw if it never does.
@@ -197,6 +163,7 @@ async fn repair_sintel(provider: &Arc<dyn DebridProvider>, added: &AddedIds, lab
                     "[{label}] the repair should delete the original torrent {}",
                     info.id
                 );
+                common::forget_added_id(added, &info.id);
                 println!("  ✓ Repaired: {} -> {}", info.id, new_locator.torrent_id);
             }
         }

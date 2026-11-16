@@ -1,19 +1,38 @@
 use crate::error::AppError;
 use crate::rd_client::{AddMagnetResponse, Torrent, TorrentInfo};
 
-/// Build a synthetic Bad Gateway `reqwest::Error` for cases where we must return a `reqwest::Error`
-/// but have no live error response (exhausted retries that only produced deserialisation failures, or
-/// an input we refuse to act on). Shared by both provider clients so the fallible construction lives
-/// in exactly one place.
-pub(crate) fn synthetic_bad_gateway(detail: &'static [u8]) -> reqwest::Error {
+/// Build a `reqwest::Error` carrying `status` for cases where we must return one but have no live
+/// error response. Shared by both provider clients and the TMDB client so the fallible
+/// construction lives in exactly one place.
+///
+/// reqwest never reads a response body into its error, so `detail` goes in the reason phrase, and
+/// the error carries no URL (reqwest would otherwise show its `http://no.url.provided.local`
+/// placeholder): it displays as `HTTP status client error (429 <detail>)`. A detail that isn't a
+/// valid reason phrase (it holds a control character) is dropped, and the status's standard
+/// reason is shown instead.
+pub(crate) fn synthetic_status_error(
+    status: reqwest::StatusCode,
+    detail: &'static [u8],
+) -> reqwest::Error {
+    let mut builder = hyper::Response::builder().status(status);
+    if let Ok(reason) = hyper::ext::ReasonPhrase::try_from(detail) {
+        builder = builder.extension(reason);
+    }
     reqwest::Response::from(
-        hyper::Response::builder()
-            .status(reqwest::StatusCode::BAD_GATEWAY)
-            .body(hyper::body::Bytes::from_static(detail))
-            .expect("static BAD_GATEWAY response always builds"),
+        builder
+            .body(hyper::body::Bytes::new())
+            .expect("a response with a valid status and no headers always builds"),
     )
     .error_for_status()
-    .expect_err("BAD_GATEWAY always yields an error status")
+    .expect_err("synthetic errors are built with an error status")
+    .without_url()
+}
+
+/// Build a synthetic Bad Gateway `reqwest::Error` for cases where we must return a `reqwest::Error`
+/// but have no live error response (exhausted retries that only produced deserialisation failures, or
+/// an input we refuse to act on).
+pub(crate) fn synthetic_bad_gateway(detail: &'static [u8]) -> reqwest::Error {
+    synthetic_status_error(reqwest::StatusCode::BAD_GATEWAY, detail)
 }
 
 /// The status of [`provider_busy_error`].
@@ -24,14 +43,7 @@ const PROVIDER_BUSY: reqwest::StatusCode = reqwest::StatusCode::TOO_MANY_REQUEST
 /// 429-status `reqwest::Error`, so it reads as "retry later" like throttling: the caller stops
 /// adding candidates for now ([`is_provider_busy`]).
 pub(crate) fn provider_busy_error(detail: &'static [u8]) -> reqwest::Error {
-    reqwest::Response::from(
-        hyper::Response::builder()
-            .status(PROVIDER_BUSY)
-            .body(hyper::body::Bytes::from_static(detail))
-            .expect("static 429 response always builds"),
-    )
-    .error_for_status()
-    .expect_err("429 is an error status")
+    synthetic_status_error(PROVIDER_BUSY, detail)
 }
 
 /// Whether an add failed because the provider is busy ([`provider_busy_error`]) or throttling
@@ -45,14 +57,7 @@ pub(crate) fn is_provider_busy(e: &reqwest::Error) -> bool {
 /// Shared by the tests that script such a lookup.
 #[cfg(test)]
 pub(crate) fn not_found_error() -> reqwest::Error {
-    reqwest::Response::from(
-        hyper::Response::builder()
-            .status(reqwest::StatusCode::NOT_FOUND)
-            .body(hyper::body::Bytes::new())
-            .expect("an empty 404 response always builds"),
-    )
-    .error_for_status()
-    .expect_err("404 is an error status")
+    synthetic_status_error(reqwest::StatusCode::NOT_FOUND, b"not found")
 }
 
 /// Per-request timeout for the synchronous on-read resolve calls (RD `unrestrict/link`, TorBox
@@ -407,6 +412,56 @@ mod tests {
     use super::*;
     use crate::rd_client::RealDebridClient;
     use std::sync::Arc;
+
+    #[test]
+    fn provider_busy_error_names_its_detail_and_no_placeholder_url() {
+        let err = provider_busy_error(b"torbox add queued: active-download limit reached");
+        assert_eq!(err.status(), Some(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_provider_busy(&err));
+        let shown = err.to_string();
+        assert!(
+            shown.contains("torbox add queued: active-download limit reached"),
+            "the detail must reach the log line: {shown}"
+        );
+        assert!(
+            !shown.contains("no.url.provided"),
+            "a synthetic error has no URL to show: {shown}"
+        );
+    }
+
+    #[test]
+    fn synthetic_bad_gateway_names_its_detail_and_no_placeholder_url() {
+        let err =
+            synthetic_bad_gateway(b"get_torrents: concurrent deletes kept shifting the pages");
+        assert!(err.is_status());
+        assert_eq!(err.status(), Some(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(!is_provider_busy(&err));
+        let shown = err.to_string();
+        assert!(
+            shown.contains("get_torrents: concurrent deletes kept shifting the pages"),
+            "the detail must reach the log line: {shown}"
+        );
+        assert!(
+            !shown.contains("no.url.provided"),
+            "a synthetic error has no URL to show: {shown}"
+        );
+    }
+
+    #[test]
+    fn synthetic_status_error_survives_a_detail_that_is_no_valid_reason_phrase() {
+        // A control character can't go in a reason phrase; the error still carries its status
+        // instead of panicking.
+        let err = synthetic_status_error(reqwest::StatusCode::BAD_GATEWAY, b"bad\ndetail");
+        assert_eq!(err.status(), Some(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(!err.to_string().contains("no.url.provided"));
+    }
+
+    #[test]
+    fn not_found_error_is_a_404_with_no_placeholder_url() {
+        let err = not_found_error();
+        assert_eq!(err.status(), Some(reqwest::StatusCode::NOT_FOUND));
+        assert!(!err.to_string().contains("no.url.provided"));
+    }
 
     #[test]
     fn delete_tracker_flags_deletes_that_overlap_a_listing() {

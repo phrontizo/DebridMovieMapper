@@ -6,22 +6,21 @@
 //!
 //! Each provider's identifications are cached between runs in its own `Store` under Cargo's scratch
 //! directory for integration tests (`CARGO_TARGET_TMPDIR`), never in the service's own
-//! `metadata.db`. A TMDB search that fails fails the run and is never cached, and a torrent cached
-//! as unidentified is identified again (see [`fetch_and_identify`]).
+//! `metadata.db`. A TMDB search that fails fails the run and is never cached, a torrent cached
+//! as unidentified is identified again, and an identified torrent cached with no streamable video
+//! file has its files looked up again (see [`fetch_and_identify`]).
 
 mod common;
 
+use common::{label, token_var, INFO_NOT_FOUND_BACKOFF};
 use debridmoviemapper::error::AppError;
 use debridmoviemapper::identification::identify_torrent;
 use debridmoviemapper::provider::{
     torrent_info_retrying_not_found, DebridProvider, FileLocator, ProviderKind,
 };
-use debridmoviemapper::rd_client::{
-    AddMagnetResponse, RealDebridClient, Torrent, TorrentFile, TorrentInfo,
-};
+use debridmoviemapper::rd_client::{AddMagnetResponse, Torrent, TorrentFile, TorrentInfo};
 use debridmoviemapper::store::Store;
 use debridmoviemapper::tmdb_client::track_search_failures;
-use debridmoviemapper::torbox_client::TorBoxClient;
 use debridmoviemapper::vfs::{is_video_file, DebridVfs, MediaMetadata, MediaType, VfsNode};
 use futures_util::FutureExt;
 use regex::Regex;
@@ -29,8 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::sync::{LazyLock, Mutex};
 use tokio::sync::OnceCell;
 
 /// Identified torrents: each torrent's info with the metadata identification gave it.
@@ -43,20 +41,6 @@ const PROVIDERS: [ProviderKind; 2] = [ProviderKind::RealDebrid, ProviderKind::To
 /// when the provider's token is unset or blank.
 static RD_DATA: OnceCell<Option<Identified>> = OnceCell::const_new();
 static TORBOX_DATA: OnceCell<Option<Identified>> = OnceCell::const_new();
-
-fn label(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::RealDebrid => "real-debrid",
-        ProviderKind::TorBox => "torbox",
-    }
-}
-
-fn token_var(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::RealDebrid => "RD_API_TOKEN",
-        ProviderKind::TorBox => "TORBOX_API_KEY",
-    }
-}
 
 /// The provider's identification cache. Each provider has its own, since the cache is keyed by
 /// torrent id and the two providers' ids are unrelated.
@@ -78,11 +62,7 @@ async fn identified(kind: ProviderKind) -> Option<&'static Identified> {
         tracing_subscriber::fmt::try_init().ok();
         let token = common::token(token_var(kind))?;
         let tmdb_client = common::tmdb_client();
-        let client: Arc<dyn DebridProvider> = match kind {
-            ProviderKind::RealDebrid => Arc::new(RealDebridClient::new(token).unwrap()),
-            ProviderKind::TorBox => Arc::new(TorBoxClient::new(token).unwrap()),
-        };
-        let provider = common::ReadOnlyProvider(client);
+        let provider = common::ReadOnlyProvider(common::client(kind, token));
         let store = Store::open(&cache_path(kind))
             .expect("Failed to open the integration-test identification cache");
         let limit = std::env::var("INTEGRATION_TEST_LIMIT")
@@ -117,15 +97,6 @@ async fn for_each_provider(test: &str, check: impl Fn(&str, &[(TorrentInfo, Medi
     }
 }
 
-/// How long to wait before each retry of a torrent lookup that answered 404. TorBox's
-/// `mylist?id=` sometimes answers 404 for a torrent that exists (the service's staging retries it
-/// too, see `STAGED_INFO_BACKOFF` in `src/upgrade.rs`), which would otherwise fail the run.
-const INFO_NOT_FOUND_BACKOFF: [Duration; 3] = [
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(4),
-];
-
 /// Fetch the downloaded torrents (the first `limit` when set) and identify them with `identify`,
 /// which returns the metadata and whether a TMDB search failed, using the store's identification
 /// cache.
@@ -135,6 +106,11 @@ const INFO_NOT_FOUND_BACKOFF: [Duration; 3] = [
 /// on every later run, failing `test_identification` long after TMDB recovered. A torrent cached
 /// as unidentified (by a run that predates that rule, or a genuine no-match) is identified again,
 /// at the cost of one TMDB search ladder per such torrent per run.
+///
+/// An identified torrent whose cached file list holds no streamable video file (cached while
+/// TorBox listed it with `files: null`, or while its cache had lapsed) has its files looked up
+/// again ([`refresh_fileless`]), so the VFS checks never cover such a torrent with no files for
+/// good. Every other identified torrent is served from the cache with no lookup.
 async fn fetch_and_identify<F, Fut>(
     provider: &dyn DebridProvider,
     store: &Store,
@@ -171,9 +147,12 @@ where
 
     for torrent in &to_process {
         match store.get_match(torrent.id.clone()).await {
-            Some(data) if data.1.external_id.is_some() => {
+            Some(data) if data.1.external_id.is_some() && has_streamable_video(&data.0) => {
                 println!("Cached: {} (ID: {:?})", data.0.filename, data.1.external_id);
                 current_data.push(data);
+            }
+            Some(data) if data.1.external_id.is_some() => {
+                current_data.push(refresh_fileless(provider, store, &torrent.id, data).await);
             }
             Some(data) => {
                 println!(
@@ -219,6 +198,54 @@ where
         current_data.push((info, metadata));
     }
     current_data
+}
+
+/// Whether the torrent lists a video file the VFS can stream ([`split_by_link`]).
+fn has_streamable_video(info: &TorrentInfo) -> bool {
+    !split_by_link(info).0.is_empty()
+}
+
+/// The cached identification `cached` of torrent `id`, whose file list holds no streamable video
+/// file, with the torrent's current files when they hold one: those replace the cached list in the
+/// returned data and in the cache, and the identification is kept. A lookup that fails or still
+/// lists none changes nothing, so an empty list never replaces a cached one.
+async fn refresh_fileless(
+    provider: &dyn DebridProvider,
+    store: &Store,
+    id: &str,
+    cached: (TorrentInfo, MediaMetadata),
+) -> (TorrentInfo, MediaMetadata) {
+    match torrent_info_retrying_not_found(provider, id, &INFO_NOT_FOUND_BACKOFF).await {
+        Ok(fresh) if has_streamable_video(&fresh) => {
+            println!(
+                "Cached with no video file, now lists its files: {} (ID: {:?})",
+                fresh.filename, cached.1.external_id
+            );
+            let metadata = cached.1;
+            if let Err(e) = store
+                .put_matches(vec![(id.to_string(), fresh.clone(), metadata.clone())])
+                .await
+            {
+                println!("WARNING: failed to cache the files of {id}: {e}");
+            }
+            (fresh, metadata)
+        }
+        Ok(_) => {
+            println!(
+                "Cached with no video file, still lists none: {} (ID: {:?})",
+                cached.0.filename, cached.1.external_id
+            );
+            cached
+        }
+        Err(e) => {
+            println!(
+                "WARNING: could not look up the files of {id} ({}) again: {e}; using the cached \
+                 entry",
+                cached.0.filename
+            );
+            cached
+        }
+    }
 }
 
 /// Test 1: Torrent fetching and TMDB identification only. No VFS, no unrestrict.
@@ -956,6 +983,11 @@ fn unidentified(info: &TorrentInfo) -> MediaMetadata {
     }
 }
 
+/// The paths of a torrent's files, in order.
+fn paths(info: &TorrentInfo) -> Vec<&str> {
+    info.files.iter().map(|f| f.path.as_str()).collect()
+}
+
 /// A run while TMDB is failing (an outage, a rejected key) must fail, and must not cache the
 /// name-derived fallback it got: a later run would serve it from the cache and keep failing
 /// `test_identification` after TMDB recovers.
@@ -1025,6 +1057,101 @@ async fn a_cached_unidentified_torrent_is_identified_again() {
         recached.and_then(|(_, metadata)| metadata.external_id),
         Some("tmdb:2".to_string()),
         "the new identification replaces the cached fallback"
+    );
+}
+
+/// An identified torrent cached while its file list held no streamable video file (TorBox lists a
+/// lapsed or not yet resolved torrent with `files: null`) gets its current files: otherwise the
+/// completeness check would cover none of its files on every later run. The identification is
+/// kept, the cache takes the fresh files, and an identified entry that has its files costs no
+/// lookup.
+#[tokio::test]
+async fn a_cached_torrent_without_a_video_file_gets_its_files_again() {
+    let (store, path) = scratch_store("cached_fileless");
+    let fileless = rd_torrent("1", 1_000, &[]);
+    let listed = rd_torrent("1", 1_000, &["/Some.Film.2010.mkv"]);
+    let other = rd_torrent("2", 1_000, &["/Other.Film.2010.mkv"]);
+    store
+        .put_matches(vec![
+            (
+                "1".to_string(),
+                fileless,
+                title("Some Film", 1, MediaType::Movie),
+            ),
+            (
+                "2".to_string(),
+                other.clone(),
+                title("Other Film", 2, MediaType::Movie),
+            ),
+        ])
+        .await
+        .unwrap();
+    let account = FakeAccount::new(vec![listed.clone(), other]);
+
+    let data = fetch_and_identify(&account, &store, None, |info| async move {
+        panic!("an identified torrent is not identified again: {}", info.id)
+    })
+    .await;
+
+    let recached = store.get_match("1".to_string()).await;
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        account.lookups.load(Ordering::SeqCst),
+        1,
+        "only the entry with no video file is looked up"
+    );
+    let (info, metadata) = data
+        .iter()
+        .find(|(info, _)| info.id == "1")
+        .expect("torrent 1 is in the data");
+    assert_eq!(
+        paths(info),
+        paths(&listed),
+        "the data holds the fresh files"
+    );
+    assert_eq!(metadata.external_id, Some("tmdb:1".to_string()));
+    let (cached_info, cached_metadata) = recached.expect("torrent 1 stays cached");
+    assert_eq!(
+        paths(&cached_info),
+        paths(&listed),
+        "the cache takes the files"
+    );
+    assert_eq!(cached_metadata.external_id, Some("tmdb:1".to_string()));
+    assert_eq!(data.len(), 2);
+}
+
+/// A lookup that still lists no streamable video file never replaces the cached entry.
+#[tokio::test]
+async fn a_lookup_still_without_a_video_file_keeps_the_cached_entry() {
+    let (store, path) = scratch_store("still_fileless");
+    let cached = rd_torrent("1", 1_000, &["/Some.Film.2010.nfo"]);
+    store
+        .put_matches(vec![(
+            "1".to_string(),
+            cached.clone(),
+            title("Some Film", 1, MediaType::Movie),
+        )])
+        .await
+        .unwrap();
+    let account = FakeAccount::new(vec![rd_torrent("1", 1_000, &[])]);
+
+    let data = fetch_and_identify(&account, &store, None, |info| async move {
+        panic!("an identified torrent is not identified again: {}", info.id)
+    })
+    .await;
+
+    let recached = store.get_match("1".to_string()).await;
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(account.lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(data.len(), 1);
+    assert_eq!(paths(&data[0].0), paths(&cached));
+    let (cached_info, _) = recached.expect("torrent 1 stays cached");
+    assert_eq!(
+        paths(&cached_info),
+        paths(&cached),
+        "the cached files are kept"
     );
 }
 

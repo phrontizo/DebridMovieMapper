@@ -1065,33 +1065,81 @@ mod tests {
 
     // --- fetch_with_retry does not retry permanent (non-retryable) error statuses ---
 
+    /// Read one request from `sock`: its head and as much body as its `Content-Length` declares
+    /// (an unread body would make the close reset the connection under the client).
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut req = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            req.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&req);
+            let complete = text.split_once("\r\n\r\n").is_some_and(|(head, rest)| {
+                let len = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                rest.len() >= len
+            });
+            if n == 0 || complete {
+                return text.into_owned();
+            }
+        }
+    }
+
+    /// Write a `Connection: close` JSON reply under `status_line`, with `extra_headers` (each
+    /// line ending in `\r\n`), then flush.
+    async fn write_json_reply(
+        sock: &mut tokio::net::TcpStream,
+        status_line: &str,
+        extra_headers: &str,
+        body: &str,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let head = format!(
+            "{status_line}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = sock.write_all(head.as_bytes()).await;
+        let _ = sock.write_all(body.as_bytes()).await;
+        let _ = sock.flush().await;
+    }
+
+    /// Loopback server that answers each request with the status line and body `respond`
+    /// returns for the request's text, plus `extra_headers`, counting the connections it
+    /// accepted. Returns `http://<addr>` and the count.
+    async fn serve_replies(
+        extra_headers: &'static str,
+        respond: impl Fn(&str) -> (&'static str, String) + Send + Sync + 'static,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = count.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let req = read_request(&mut sock).await;
+                let (status_line, body) = respond(&req);
+                write_json_reply(&mut sock, status_line, extra_headers, &body).await;
+            }
+        });
+        (format!("http://{addr}"), count)
+    }
+
     /// Spawn a loopback server that replies to EVERY connection with `status_line` + `body`,
     /// counting how many connections it accepted. Used to assert the retry loop's attempt count.
     async fn spawn_counting(
         status_line: &'static str,
         body: &'static str,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let c2 = count.clone();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf).await;
-                let head = format!(
-                    "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    status_line,
-                    body.len()
-                );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(body.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        (format!("http://{}/", addr), count)
+        let (base, count) = serve_replies("", move |_| (status_line, body.to_string())).await;
+        (format!("{base}/"), count)
     }
 
     /// Like `spawn_counting` but adds `Retry-After: 0` so a retryable status's backoff is instant
@@ -1100,27 +1148,20 @@ mod tests {
         status_line: &'static str,
         body: &'static str,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let c2 = count.clone();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf).await;
-                let head = format!(
-                    "{}\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    status_line,
-                    body.len()
-                );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(body.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        (format!("http://{}/", addr), count)
+        let (base, count) = serve_replies("Retry-After: 0\r\n", move |_| {
+            (status_line, body.to_string())
+        })
+        .await;
+        (format!("{base}/"), count)
+    }
+
+    /// Loopback `/torrents` listing server: [`serve_replies`] under `Retry-After: 0`, so a
+    /// retryable status (a failed page) backs off at once instead of running the real exponential
+    /// backoff, which would make a test take minutes. Returns (base_url, request count).
+    async fn serve_torrent_pages(
+        respond: impl Fn(&str) -> (&'static str, String) + Send + Sync + 'static,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        serve_replies("Retry-After: 0\r\n", respond).await
     }
 
     #[tokio::test]
@@ -1192,7 +1233,7 @@ mod tests {
         cut_first: usize,
         body: &'static str,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1200,8 +1241,7 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let seen = c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf).await;
+                let _ = read_request(&mut sock).await;
                 let (len, sent) = if seen < cut_first {
                     (body.len() + 100, &body[..body.len() / 2])
                 } else {
@@ -1284,46 +1324,25 @@ mod tests {
     async fn spawn_paged_torrents(
         fail_page: Option<&'static str>,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let c2 = count.clone();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut buf = [0u8; 2048];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                let (status_line, body): (&str, String) = if let Some(fp) = fail_page {
-                    if req.contains(&format!("page={}&", fp)) {
-                        (
-                            "HTTP/1.1 500 Internal Server Error",
-                            r#"{"e":1}"#.to_string(),
-                        )
-                    } else if req.contains("page=1&") {
-                        ("HTTP/1.1 200 OK", r#"[{"id":"a"}]"#.to_string())
-                    } else {
-                        ("HTTP/1.1 200 OK", "[]".to_string())
-                    }
+        serve_torrent_pages(move |req| {
+            if let Some(fp) = fail_page {
+                if req.contains(&format!("page={}&", fp)) {
+                    (
+                        "HTTP/1.1 500 Internal Server Error",
+                        r#"{"e":1}"#.to_string(),
+                    )
                 } else if req.contains("page=1&") {
-                    ("HTTP/1.1 200 OK", r#"[{"id":"a"},{"id":"b"}]"#.to_string())
+                    ("HTTP/1.1 200 OK", r#"[{"id":"a"}]"#.to_string())
                 } else {
                     ("HTTP/1.1 200 OK", "[]".to_string())
-                };
-                // Retry-After:0 so a retryable 500 (the fail-page case) backs off instantly instead
-                // of running the real exponential backoff (which would make this test take minutes).
-                let head = format!(
-                    "{}\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    status_line,
-                    body.len()
-                );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(body.as_bytes()).await;
-                let _ = sock.flush().await;
+                }
+            } else if req.contains("page=1&") {
+                ("HTTP/1.1 200 OK", r#"[{"id":"a"},{"id":"b"}]"#.to_string())
+            } else {
+                ("HTTP/1.1 200 OK", "[]".to_string())
             }
-        });
-        (format!("http://{}", addr), count)
+        })
+        .await
     }
 
     #[tokio::test]
@@ -1362,33 +1381,18 @@ mod tests {
         // A mid-pagination 200 with an EMPTY body (a reverse-proxy/CDN quirk) must NOT be read as an
         // empty page (end-of-list): that would silently drop every later page, and downstream treats
         // an owned title absent from the listing as lapsed → re-acquire. Fail the whole listing.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 2048];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                let (status_line, body): (&str, &str) = if req.contains("page=1&") {
-                    ("HTTP/1.1 200 OK", r#"[{"id":"a"}]"#)
-                } else {
-                    // page 2+: a 200 with an empty body (NOT "[]").
-                    ("HTTP/1.1 200 OK", "")
-                };
-                let head = format!(
-                    "{}\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    status_line,
-                    body.len()
-                );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(body.as_bytes()).await;
-                let _ = sock.flush().await;
+        let (base, _count) = serve_torrent_pages(|req| {
+            if req.contains("page=1&") {
+                ("HTTP/1.1 200 OK", r#"[{"id":"a"}]"#.to_string())
+            } else {
+                // page 2+: a 200 with an empty body (NOT "[]").
+                ("HTTP/1.1 200 OK", String::new())
             }
-        });
+        })
+        .await;
         let client = RealDebridClient::new("fake".to_string())
             .unwrap()
-            .with_base_url(format!("http://{}", addr));
+            .with_base_url(base);
         let r = client.get_torrents().await;
         assert!(
             r.is_err(),
@@ -1405,42 +1409,38 @@ mod tests {
         bump: fn(usize) -> bool,
     ) -> (Result<Vec<Torrent>, reqwest::Error>, usize) {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = Arc::new(
-            RealDebridClient::new("fake".to_string())
-                .unwrap()
-                .with_base_url(format!("http://{addr}")),
-        );
+        // The server records the delete on the client, which needs the server's URL first.
+        let client_slot: Arc<std::sync::OnceLock<Arc<RealDebridClient>>> = Arc::default();
         let page1_hits = Arc::new(AtomicUsize::new(0));
-        let (c, hits) = (client.clone(), page1_hits.clone());
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 2048];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                let body = if req.contains("page=1&") {
-                    if bump(hits.fetch_add(1, Ordering::SeqCst) + 1) {
-                        drop(c.deletes.begin());
-                    }
-                    let items: Vec<String> = (0..page1_len)
-                        .map(|i| format!(r#"{{"id":"a{i}"}}"#))
-                        .collect();
-                    format!("[{}]", items.join(","))
-                } else if req.contains("page=2&") && page1_len >= 100 {
-                    r#"[{"id":"b"}]"#.to_string()
-                } else {
-                    "[]".to_string()
-                };
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(body.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
+        let (c, hits) = (client_slot.clone(), page1_hits.clone());
+        let (base, _count) = serve_torrent_pages(move |req| {
+            let body = if req.contains("page=1&") {
+                if bump(hits.fetch_add(1, Ordering::SeqCst) + 1) {
+                    drop(
+                        c.get()
+                            .expect("the client is set before listing")
+                            .deletes
+                            .begin(),
+                    );
+                }
+                let items: Vec<String> = (0..page1_len)
+                    .map(|i| format!(r#"{{"id":"a{i}"}}"#))
+                    .collect();
+                format!("[{}]", items.join(","))
+            } else if req.contains("page=2&") && page1_len >= 100 {
+                r#"[{"id":"b"}]"#.to_string()
+            } else {
+                "[]".to_string()
+            };
+            ("HTTP/1.1 200 OK", body)
+        })
+        .await;
+        let client = client_slot.get_or_init(|| {
+            Arc::new(
+                RealDebridClient::new("fake".to_string())
+                    .unwrap()
+                    .with_base_url(base),
+            )
         });
         let r = client.get_torrents().await;
         (r, page1_hits.load(Ordering::SeqCst))
@@ -1463,7 +1463,13 @@ mod tests {
         // If every attempt overlaps a delete, fail the listing (callers skip the tick) rather than
         // return an Ok that may be missing a live torrent.
         let (r, page1_fetches) = list_with_concurrent_deletes(100, |_| true).await;
-        assert!(r.is_err(), "a listing that never settles must be an Err");
+        let err = r.expect_err("a listing that never settles must be an Err");
+        // The scan loop logs this error: it names the cause, not a bare 502.
+        assert!(
+            err.to_string()
+                .contains("concurrent deletes kept shifting the pages"),
+            "{err}"
+        );
         assert_eq!(
             page1_fetches,
             crate::provider::MAX_LISTING_ATTEMPTS as usize
@@ -1476,36 +1482,22 @@ mod tests {
     /// twice.
     #[tokio::test]
     async fn get_torrents_drops_a_page_boundary_repeat() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 2048];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                let body = if req.contains("page=1&") {
-                    let items: Vec<String> =
-                        (0..100).map(|i| format!(r#"{{"id":"a{i}"}}"#)).collect();
-                    format!("[{}]", items.join(","))
-                } else if req.contains("page=2&") {
-                    // A concurrent add pushed a99 down onto page 2.
-                    r#"[{"id":"a99"}]"#.to_string()
-                } else {
-                    "[]".to_string()
-                };
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(body.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
+        let (base, _count) = serve_torrent_pages(|req| {
+            let body = if req.contains("page=1&") {
+                let items: Vec<String> = (0..100).map(|i| format!(r#"{{"id":"a{i}"}}"#)).collect();
+                format!("[{}]", items.join(","))
+            } else if req.contains("page=2&") {
+                // A concurrent add pushed a99 down onto page 2.
+                r#"[{"id":"a99"}]"#.to_string()
+            } else {
+                "[]".to_string()
+            };
+            ("HTTP/1.1 200 OK", body)
+        })
+        .await;
         let client = RealDebridClient::new("fake".to_string())
             .unwrap()
-            .with_base_url(format!("http://{addr}"));
+            .with_base_url(base);
         let torrents = client.get_torrents().await.expect("listing succeeds");
         let ids: Vec<String> = torrents.iter().map(|t| t.id.clone()).collect();
         let expected: Vec<String> = (0..100).map(|i| format!("a{i}")).collect();
@@ -1536,7 +1528,8 @@ mod tests {
     #[tokio::test]
     async fn select_files_and_delete_succeed_on_204_no_content_in_one_request() {
         // RD answers selectFiles and delete with `204 No Content`. fetch_with_retry decodes "[]" for
-        // a 204 only (an empty-body 200 must still fail), so both calls must be Ok on the first try.
+        // a 204, or an empty-body 202 (an empty-body 200 must still fail), so both calls must be Ok
+        // on the first try.
         use std::sync::atomic::Ordering;
         let (url, count) = spawn_counting("HTTP/1.1 204 No Content", "").await;
         let client = RealDebridClient::new("fake".to_string())
@@ -1623,7 +1616,6 @@ mod tests {
         status_line: &'static str,
         body: &'static str,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1631,8 +1623,7 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let seen = c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf).await;
+                let _ = read_request(&mut sock).await;
                 if seen == 0 {
                     // First connection: drain the request then drop the socket WITHOUT any HTTP
                     // response, so the client's `send()` fails at the transport level (EOF before
@@ -1640,14 +1631,7 @@ mod tests {
                     drop(sock);
                     continue;
                 }
-                let head = format!(
-                    "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    status_line,
-                    body.len()
-                );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(body.as_bytes()).await;
-                let _ = sock.flush().await;
+                write_json_reply(&mut sock, status_line, "", body).await;
             }
         });
         (format!("http://{}/", addr), count)

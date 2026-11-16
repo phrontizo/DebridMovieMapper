@@ -26,8 +26,10 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// The VFS build uses every code for its selection gate (a double-episode file stays visible while
 /// any episode it carries is not served by another copy), and the first one for season placement.
 /// The acquisition engine uses it too, for a show's `provides`, the `selection` slots `observe`
-/// writes and the title check's episode test, so the VFS and the engine always agree on which file
-/// supplies which episode. A multi-episode file contributes every episode it carries: reporting only
+/// writes and the title check's episode test, so for a coded file the VFS and the engine agree on
+/// which file supplies which episode. The engine also maps a file with no code to the episode its
+/// name gives (`acquire::codeless_episode_files`), and the VFS gates such a file by that same
+/// mapping. A multi-episode file contributes every episode it carries: reporting only
 /// the first would leave the second looking un-owned, and `monitor_episodes` would re-acquire it as a
 /// duplicate singleton. The `NxM` and dash-code arms exist for the same reason: without them a pack
 /// named `Show - 2x05 - Title` or `Show - 409 - Title` derives an empty `provides`, so the
@@ -73,13 +75,17 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// 1–9) are accepted, so a 4-digit year/date token (`Show - 2024 - Title`) never decodes, and an
 /// episode-00 decode is rejected. The dash code needs SPACE-dash-SPACE on both sides, so a dotted
 /// scene form (`Show.-.409.-.Title`) yields no code at all (an empty `provides` for such a file), as
-/// does other absolute numbering (`Show - 041 [1080p]`). The acquisition engine still accepts a
-/// SINGLE-file release whose name ends its title with such a number (`Show - 041 [1080p]`,
-/// `acquire::codeless_episode`): that number is the episode, in the season the VFS places the file
-/// in (season 1 unless the name or a directory names one). The dotted dash form, whose number
-/// another ` - ` follows once its dots are read as spaces, stays rejected, as does a multi-file
-/// pack of such files or an absolute number past season 1 (`Show - 30` for S02E05): neither names
-/// an episode there, so `observe` rejects it as `EpisodeMissing`.
+/// does other absolute numbering (`Show - 041 [1080p]`) and an episode word with no season code
+/// (`E09 - Title.mkv`, `Episode 9.mkv`). The acquisition engine still maps a file with no code
+/// that names its episode by an episode word or a trailing ` - NN` number
+/// (`acquire::codeless_episode_files`, read by `acquire::show_episode_files`): a single-file
+/// release in the season the VFS places it in (season 1 unless the name or a directory names one),
+/// and a file of a multi-file pack only under an explicit season (a season token in its name or a
+/// season directory, not a `Part N` in the file name, nor a season range), and nothing when another
+/// selected file names the same episode. The dotted dash form, whose number another ` - ` follows
+/// once its dots are read as spaces, stays rejected as `EpisodeMissing`, as do an absolutely
+/// numbered pack with no explicit season and an absolute number past season 1 (`Show - 30` for
+/// S02E05): neither names an episode there.
 pub(crate) fn parse_se_all(name: &str) -> Vec<(u32, u32)> {
     if let Some(eps) = sxxeyy_codes(name).or_else(|| nxm_codes(name)) {
         return eps;
@@ -309,25 +315,35 @@ pub(crate) fn emittable_video_files(t: &TorrentInfo) -> Vec<&crate::rd_client::T
         .collect()
 }
 
-/// The selected video files of `t` the VFS can actually EMIT, each with its Real-Debrid link: a
-/// selected video file is emittable only when `links` is empty (TorBox, which resolves by id, so
-/// the link is `None`) or has a link at its position among the SELECTED files (Real-Debrid pairs
-/// links positionally, so the position advances once per selected file, video or not, and its
-/// `selected != links` anomaly can leave a file with none). The build's emit paths and
-/// `emittable_video_files` all read this one pairing, so an episode slot never points at a file
-/// the build won't emit.
-fn emittable_video_files_with_links(
+/// The SELECTED files of `t`, each with its Real-Debrid restricted link: Real-Debrid pairs `links`
+/// positionally among the selected files, so the position advances once per selected file, video
+/// or not, and an unselected file takes none. TorBox resolves by `(torrent_id, file_id)` and lists
+/// no links, so every link is `None` there, as is a file past the end of `links` (Real-Debrid's
+/// `selected != links` anomaly). The one copy of this pairing: the VFS build
+/// ([`emittable_video_files_with_links`]), the instant repair's replacement locator and the
+/// acquisition engine's locators (`acquire::locator_for_selected`) all read it.
+pub(crate) fn selected_files_with_links(
     t: &TorrentInfo,
 ) -> impl Iterator<Item = (&crate::rd_client::TorrentFile, Option<&String>)> {
-    let links_empty = t.links.is_empty();
     t.files
         .iter()
         .filter(|f| f.selected == 1)
         .enumerate()
-        .filter_map(move |(link_idx, f)| {
-            let link = t.links.get(link_idx);
-            (is_video_file(&f.path) && (links_empty || link.is_some())).then_some((f, link))
-        })
+        .map(|(link_idx, f)| (f, t.links.get(link_idx)))
+}
+
+/// The selected video files of `t` the VFS can actually EMIT, each with its Real-Debrid link
+/// ([`selected_files_with_links`]): a selected video file is emittable only when `links` is empty
+/// (TorBox, which resolves by id, so the link is `None`) or has a link at its position among the
+/// SELECTED files (Real-Debrid's `selected != links` anomaly can leave a file with none). The
+/// build's emit paths and `emittable_video_files` all read this one pairing, so an episode slot
+/// never points at a file the build won't emit.
+fn emittable_video_files_with_links(
+    t: &TorrentInfo,
+) -> impl Iterator<Item = (&crate::rd_client::TorrentFile, Option<&String>)> {
+    let links_empty = t.links.is_empty();
+    selected_files_with_links(t)
+        .filter(move |(f, link)| is_video_file(&f.path) && (links_empty || link.is_some()))
 }
 
 /// The first episode code in a file's basename: the episode whose season folder the build places
@@ -859,6 +875,10 @@ impl DebridVfs {
                             show_max_ts = torrent_ts;
                         }
                         note_link_count_mismatch(&torrent);
+                        // The episodes this torrent's code-less files name, as the acquisition
+                        // engine maps (and slots) them: built on the first code-less file the
+                        // selection gate meets.
+                        let mut codeless: Option<HashMap<String, (u32, u32)>> = None;
                         for (file, link) in emittable_video_files_with_links(&torrent) {
                             let filename = file.path.split('/').next_back().unwrap_or(&file.path);
                             // Parse the episode codes once and reuse them for both the selection
@@ -875,7 +895,12 @@ impl DebridVfs {
                             // file, and hiding the file would lose E02 (a duplicate E01 is the
                             // lesser evil). A stale selection (absent hash, or a path that no
                             // longer matches) never hides anything: that episode degrades to the
-                            // legacy first/largest-wins dedup below.
+                            // legacy first/largest-wins dedup below. A file with no episode code is
+                            // gated the same way on the episode the engine maps it to
+                            // (`acquire::codeless_episode_files`, in the season folder it lands in
+                            // below), so a slot moved off it (a repoint, a pack-served episode split
+                            // to a single) hides it like a coded file, instead of leaving the
+                            // episode listed twice. A file that maps to nothing is never hidden.
                             if let Some(tmdb) = show_tmdb {
                                 let selected_elsewhere = |&(s, e): &(u32, u32)| {
                                     selection
@@ -888,8 +913,20 @@ impl DebridVfs {
                                                 && file.path == sel.file_path)
                                         })
                                 };
-                                if !codes.is_empty() && codes.iter().all(selected_elsewhere) {
-                                    continue;
+                                if !codes.is_empty() {
+                                    if codes.iter().all(selected_elsewhere) {
+                                        continue;
+                                    }
+                                } else if !selection.is_empty() {
+                                    let mapped = codeless.get_or_insert_with(|| {
+                                        crate::acquire::codeless_episode_files(&torrent)
+                                            .into_iter()
+                                            .map(|(s, e, path)| (path, (s, e)))
+                                            .collect()
+                                    });
+                                    if mapped.get(&file.path).is_some_and(selected_elsewhere) {
+                                        continue;
+                                    }
                                 }
                             }
                             // Prefer the FIRST episode code for the folder season: it handles
@@ -1151,9 +1188,10 @@ impl DebridVfs {
 /// silently strips), and bare Windows reserved device names (CON, NUL, COM1…) — important for
 /// WebDAV clients accessing via rclone on Windows/SMB.
 ///
-/// NOTE on a deliberate asymmetry: this is applied to library-CONSTRUCTED names — Movie/Show folder
-/// names, season folders, and NFO file names — but NOT to media-file LEAF names, which keep the exact
-/// torrent basename (`file.path.split('/').next_back()`). That is intentional: Jellyfin/Plex parse
+/// NOTE on a deliberate asymmetry: this is applied to the library-CONSTRUCTED Movie/Show folder
+/// names (the title, and the `[tmdbid-N]`-suffixed folder name; season folders (`Season NN`) and
+/// NFO names (`movie.nfo`/`tvshow.nfo`) are fixed strings that need no sanitising) but NOT to
+/// media-file LEAF names, which keep the exact torrent basename (`file.path.split('/').next_back()`). That is intentional: Jellyfin/Plex parse
 /// episode/quality metadata out of the original scene filename, so mangling it would degrade
 /// identification. It is not a path-traversal risk — `/` is already stripped by taking the basename,
 /// the WebDAV layer XML-encodes names, and `dav_fs::walk_components` rejects any `..` component. (A
@@ -1539,20 +1577,99 @@ pub(crate) fn season_tokens(s: &str) -> (Option<u32>, Option<u32>) {
 /// Season 02), since the root of such a pack often names a season RANGE ("Show.S01-S05/Part 3/")
 /// whose first season would be wrong. The acquisition engine reads an absolute-numbered single-file
 /// release's season from it too (`acquire::codeless_episode`), so it slots the episode the VFS
-/// places the file under. For a file of a multi-file pack, `acquire::explicit_codeless_season`
-/// reads the same signals except the season-1 default and a file-name `Part N`.
+/// places the file under. For a file of a multi-file pack it reads
+/// [`explicit_season_of_codeless_file`], built on the same lookup ([`nearest_codeless_season`]).
 pub(crate) fn season_of_codeless_file(path: &str, filename: &str) -> u32 {
-    let (strong, part) = season_tokens(filename);
-    strong
-        .or_else(|| {
-            let dir = &path[..path.len() - filename.len()];
-            dir.rsplit('/').filter(|c| !c.is_empty()).find_map(|c| {
-                let (strong, part) = season_tokens(c);
-                strong.or(part)
-            })
-        })
+    let (_, part) = season_tokens(filename);
+    nearest_codeless_season(path, filename)
+        .map(|(season, _)| season)
         .or(part)
         .unwrap_or(1)
+}
+
+/// The season a show file with no episode code names EXPLICITLY, as [`season_of_codeless_file`]
+/// reads it: an `Sxx` / `Season N` / `NxNN` token in the file name, else the nearest directory
+/// naming one (a `Part N` directory included). `None` when nothing does (the season-1 default and a
+/// file-name `Part N`, usually a two-part episode's title, don't count), and when the nearest name
+/// that names a season names a RANGE of them (`[Group] Show (Season 1-2)`, `Show.S01-S03`,
+/// `Seasons 1-3`): which season the file is in isn't said there, and an outer directory says even
+/// less. The acquisition engine maps a code-less file of a multi-file pack only under such a season
+/// (`acquire::codeless_episode_files`), since the season-1 default would record an absolutely
+/// numbered batch's S02 episodes as S01E26 and on.
+pub(crate) fn explicit_season_of_codeless_file(path: &str, filename: &str) -> Option<u32> {
+    nearest_codeless_season(path, filename)
+        .filter(|&(_, range)| !range)
+        .map(|(season, _)| season)
+}
+
+/// The lookup [`season_of_codeless_file`] and [`explicit_season_of_codeless_file`] share: the
+/// season of the strongest name that names one (the file name's strong token, else the nearest
+/// directory's strong token or `Part N`), and whether that name names a season range
+/// ([`names_season_range`]).
+fn nearest_codeless_season(path: &str, filename: &str) -> Option<(u32, bool)> {
+    if let Some(season) = season_tokens(filename).0 {
+        return Some((season, names_season_range(filename)));
+    }
+    let dir = &path[..path.len() - filename.len()];
+    dir.rsplit('/').filter(|c| !c.is_empty()).find_map(|c| {
+        let (strong, part) = season_tokens(c);
+        strong
+            .or(part)
+            .map(|season| (season, names_season_range(c)))
+    })
+}
+
+/// A season range in one name: `S01-S03`, `S01 - S03`, `Season 1-2`, `Seasons 1 - 3`,
+/// `Season 1 to 3`, `Season 1 & 2`, `Season 1 - Season 2`. A dash with a bare number after it is a
+/// range only glued to `Season N` (`Season 1-2`) or after `Seasons`: `Show S2 - 05` and
+/// `Show Season 2 - 05` are season 2's episode 5.
+static SEASON_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:^|[^a-z0-9])s(\d{1,2})[\s._]*[-~][\s._]*s(\d{1,2})(?:[^a-z0-9]|$)|season[\s._-]*(\d{1,2})[-~](\d{1,2})(?:[^a-z0-9]|$)|seasons[\s._-]*(\d{1,2})[\s._]*(?:-|~|&|to|and)[\s._]*(\d{1,2})(?:[^a-z0-9]|$)|season[\s._-]*(\d{1,2})[\s._]+(?:&|to|and)[\s._]+(?:seasons?[\s._-]*)?(\d{1,2})(?:[^a-z0-9]|$)|season[\s._-]*(\d{1,2})[\s._]*[-~][\s._]*seasons?[\s._-]*(\d{1,2})(?:[^a-z0-9]|$)",
+    )
+    .unwrap()
+});
+
+/// Whether a file or directory name names a range of seasons rather than one: a range token
+/// ([`SEASON_RANGE_RE`]) of two different seasons, or two different seasons named apart
+/// (`Show.S01.S02`).
+fn names_season_range(s: &str) -> bool {
+    let ranged = SEASON_RANGE_RE.captures_iter(s).any(|c| {
+        let mut numbers = c
+            .iter()
+            .skip(1)
+            .flatten()
+            .filter_map(|m| m.as_str().parse::<u32>().ok());
+        matches!((numbers.next(), numbers.next()), (Some(a), Some(b)) if a != b)
+    });
+    if ranged {
+        return true;
+    }
+    // Two different strong tokens apart: `season_tokens` reads only the first, so read on past it.
+    let Some(first) = season_tokens(s).0 else {
+        return false;
+    };
+    let mut at = 0;
+    while let Some(cap) = SEASON_RE.captures_at(s, at) {
+        let Some(whole) = cap.get(0) else { break };
+        let number = |i| cap.get(i).and_then(|m| m.as_str().parse::<u32>().ok());
+        let nxnn = cap
+            .get(3)
+            .filter(|m| !is_channel_layout_codec(s, m))
+            .and_then(|m| m.as_str().parse::<u32>().ok());
+        if number(1)
+            .or_else(|| number(2))
+            .or(nxnn)
+            .is_some_and(|n| n != first)
+        {
+            return true;
+        }
+        at = match whole.as_str().chars().next_back() {
+            Some(c) if !c.is_ascii_alphanumeric() => whole.end() - c.len_utf8(),
+            _ => whole.end(),
+        };
+    }
+    false
 }
 
 fn xml_escape(s: &str) -> String {
@@ -4613,6 +4730,102 @@ mod selection_tests {
         assert_eq!(
             locs[0].hash, "h_video",
             "an archive-only selection must fall through to the streamable copy"
+        );
+    }
+
+    /// A code-less pack's file is gated on the episode the engine maps it to, as a coded file is on
+    /// its code: once its slot has moved to another present copy (a repoint, or a pack-served
+    /// episode split to a single), the pack's file for that episode is hidden instead of listed
+    /// beside the new copy. A stale slot hides nothing, and nor does a slot elsewhere for a file
+    /// that maps to no episode (an absolutely numbered pack with no explicit season).
+    #[test]
+    fn a_codeless_pack_file_is_hidden_once_its_slot_moved_to_another_copy() {
+        let pack = || {
+            show_torrent(
+                "pack",
+                "h_pack",
+                4_000_000_000,
+                &[
+                    "Show.S04/Season 04/E09 - Title.mkv",
+                    "Show.S04/Season 04/E10 - Title.mkv",
+                ],
+            )
+        };
+        let single = || {
+            show_torrent(
+                "single",
+                "h_single",
+                3_000_000_000,
+                &["Show.S04E09.1080p.mkv"],
+            )
+        };
+        let slots = |e09_hash: &str, e09_path: &str| {
+            let mut sel = SelectionMap::new();
+            sel.insert(
+                episode_slot(1396, 4, 9),
+                SelectionEntry {
+                    hash: e09_hash.into(),
+                    file_path: e09_path.into(),
+                },
+            );
+            sel.insert(
+                episode_slot(1396, 4, 10),
+                SelectionEntry {
+                    hash: "h_pack".into(),
+                    file_path: "Show.S04/Season 04/E10 - Title.mkv".into(),
+                },
+            );
+            sel
+        };
+        // (4,9) moved to the single: one E09 file, the single's, and the pack's E10.
+        let vfs = DebridVfs::build(
+            vec![(pack(), show_meta(1396)), (single(), show_meta(1396))],
+            &slots("h_single", "Show.S04E09.1080p.mkv"),
+        );
+        assert_eq!(
+            season_file_names(&vfs, "Season 04"),
+            vec!["E10 - Title.mkv", "Show.S04E09.1080p.mkv"]
+        );
+        // A stale (4,9) slot (its hash isn't listed) hides nothing.
+        let vfs = DebridVfs::build(
+            vec![(pack(), show_meta(1396)), (single(), show_meta(1396))],
+            &slots("h_gone", "Show.S04E09.1080p.mkv"),
+        );
+        assert_eq!(
+            season_file_names(&vfs, "Season 04"),
+            vec![
+                "E09 - Title.mkv",
+                "E10 - Title.mkv",
+                "Show.S04E09.1080p.mkv"
+            ]
+        );
+        // An absolutely numbered pack with no explicit season maps nothing, so it stays whole.
+        let batch = show_torrent(
+            "batch",
+            "h_batch",
+            4_000_000_000,
+            &["Pack/[Group] Show - 05.mkv", "Pack/[Group] Show - 06.mkv"],
+        );
+        let coded = show_torrent("coded", "h_coded", 1_000_000_000, &["Show.S01E05.mkv"]);
+        let mut sel = SelectionMap::new();
+        sel.insert(
+            episode_slot(1396, 1, 5),
+            SelectionEntry {
+                hash: "h_coded".into(),
+                file_path: "Show.S01E05.mkv".into(),
+            },
+        );
+        let vfs = DebridVfs::build(
+            vec![(batch, show_meta(1396)), (coded, show_meta(1396))],
+            &sel,
+        );
+        assert_eq!(
+            season_file_names(&vfs, "Season 01"),
+            vec![
+                "Show.S01E05.mkv",
+                "[Group] Show - 05.mkv",
+                "[Group] Show - 06.mkv"
+            ]
         );
     }
 
