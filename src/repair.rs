@@ -77,9 +77,10 @@ impl std::fmt::Display for RepairFailure {
 }
 
 impl From<String> for RepairFailure {
-    /// An error string from `check_and_begin_repair` (cooldown/attempt-cap refusal or a missing
-    /// torrent), consumed via `?`, is an actual failure. (The transient `add_and_select_files` /
-    /// final-info-fetch blips are mapped explicitly to `Deferred` at their call sites instead.)
+    /// An error string from `check_and_begin_repair` (a cooldown, attempt-cap, already-repairing
+    /// or permanently-failed refusal), consumed via `?`, is an actual failure. (The transient
+    /// `add_and_select_files` / final-info-fetch blips are mapped explicitly to `Deferred` at their
+    /// call sites instead.)
     fn from(m: String) -> Self {
         RepairFailure::Failed(m)
     }
@@ -90,7 +91,8 @@ pub struct RepairManager {
     health_status: Arc<RwLock<HashMap<String, TorrentHealth>>>,
     /// The active debrid provider (Real-Debrid or TorBox) — repair is provider-neutral.
     provider: Arc<dyn DebridProvider>,
-    /// Maps new_torrent_id -> old_torrent_id for successful repairs.
+    /// Maps new_torrent_id -> old_torrent_id for every new-id (Real-Debrid) repair: the cached one
+    /// and the not-cached one whose re-add is left to download.
     /// The scan loop consumes this to reuse old TMDB identifications.
     repair_replacements: Arc<RwLock<HashMap<String, String>>>,
     /// Old torrent id -> (file path -> that file's locator in the torrent that replaced it), for a
@@ -104,8 +106,12 @@ pub struct RepairManager {
     repaired_locators: Arc<RwLock<HashMap<String, HashMap<String, crate::provider::FileLocator>>>>,
 }
 
-/// How many repairs in a row [`RepairManager::redirect`] follows (each Real-Debrid re-add is a new
-/// id, and a still-broken file is re-added at most `MAX_REPAIR_ATTEMPTS` times in a row).
+/// How many repairs in a row [`RepairManager::redirect`] follows. Each Real-Debrid re-add is a new
+/// id, and a redirect lives as long as the copy its chain ends at is listed, so a chain can span
+/// repairs separated by good reads (`note_read_success` resets the attempt budget, so
+/// `MAX_REPAIR_ATTEMPTS` doesn't bound it). This cap does: `redirect` follows at most this many
+/// hops, and `prune_health_status` drops a chain head whose copy this many hops on (or the chain's
+/// end, if nearer) is neither listed nor a replacement still waiting for the scan loop.
 const MAX_REDIRECT_HOPS: usize = 8;
 
 /// RAII guard that makes the `Repairing` transition in `try_instant_repair` cancellation-safe.
@@ -3096,8 +3102,10 @@ mod tests {
     /// VFS keeps the old torrent's locators until the next scan rebuilds it. Until then `redirect`
     /// maps every selected file of the old torrent onto the repaired one (by path, each with its own
     /// link), so a later open of the same file, or of a sibling episode, doesn't resolve the deleted
-    /// torrent and fail. Once a listing no longer has the old torrent (the VFS is rebuilt from that
-    /// listing) the redirect is dropped.
+    /// torrent and fail. A handle opened before the repair holds the old locator past the VFS
+    /// rebuild, so the redirect is kept while a listing has the old torrent or the copy its chain
+    /// of redirects ends at, or while that copy is a replacement still waiting for the scan loop.
+    /// It is dropped once none of those holds.
     #[tokio::test(start_paused = true)]
     async fn a_new_id_repair_redirects_every_file_of_the_old_torrent() {
         let provider = Arc::new(ScriptedProvider {

@@ -5,6 +5,7 @@
 use debridmoviemapper::error::AppError;
 use debridmoviemapper::provider::{DebridProvider, FileLocator};
 use debridmoviemapper::rd_client::{AddMagnetResponse, Torrent, TorrentInfo};
+use debridmoviemapper::scraper::{MediaKind, Scraper};
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::vfs::is_video_file;
 use futures_util::FutureExt;
@@ -14,9 +15,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Blender's *Sintel*: Creative-Commons, a single ~129 MB `.mp4`, widely seeded and cached on both
-/// providers. The tests that change the live account add and delete this torrent and never touch
-/// any other torrent in it.
+/// providers. The live tests that change the account add and delete only Sintel: this torrent, or
+/// (`lifecycle_test`'s acquire tests) whichever cached Sintel release the acquisition engine picks.
+/// They touch no other torrent in it.
 pub const SINTEL_HASH: &str = "08ada5a7a6183aae1e09d831df6748d566095a10";
+
+/// Sintel's IMDB id, the title `lifecycle_test`'s acquire tests request.
+pub const SINTEL_IMDB: &str = "tt1727587";
 
 pub fn sintel_magnet() -> String {
     format!(
@@ -307,6 +312,106 @@ pub async fn cleanup_by_hash(provider: &Arc<dyn DebridProvider>, hash: &str) {
 /// `hash` (see [`delete_ids_then_sweep`]).
 pub async fn cleanup_added(provider: &Arc<dyn DebridProvider>, added: &AddedIds, hash: &str) {
     delete_ids_then_sweep(provider, &added_ids(added), &[hash.to_string()]).await;
+}
+
+/// The Sintel copies [`preclean_sintel_candidates`] found in a listing.
+#[derive(Debug, Default)]
+pub struct SintelLeftovers<'a> {
+    /// To delete: a torrent with [`SINTEL_HASH`], and each of Sintel's scraped releases whose name
+    /// mentions Sintel.
+    pub delete: Vec<&'a Torrent>,
+    /// Sintel's scraped releases whose name doesn't mention Sintel (a collection of open movies,
+    /// say). They are only named in a warning, since the account may hold one on purpose.
+    pub unnamed: Vec<&'a Torrent>,
+}
+
+/// Sort the torrents of `listing` that are Sintel copies a test may have left behind:
+/// [`SINTEL_HASH`], or one of `candidates` (the hashes of the releases the scraper lists for
+/// [`SINTEL_IMDB`]). Hashes compare case-insensitively; every other torrent is left out.
+pub fn sintel_leftovers<'a>(listing: &'a [Torrent], candidates: &[String]) -> SintelLeftovers<'a> {
+    let mut found = SintelLeftovers::default();
+    for torrent in listing.iter().filter(|t| !t.hash.is_empty()) {
+        if torrent.hash.eq_ignore_ascii_case(SINTEL_HASH) {
+            found.delete.push(torrent);
+        } else if candidates
+            .iter()
+            .any(|c| torrent.hash.eq_ignore_ascii_case(c))
+        {
+            if torrent.filename.to_lowercase().contains("sintel") {
+                found.delete.push(torrent);
+            } else {
+                found.unnamed.push(torrent);
+            }
+        }
+    }
+    found
+}
+
+/// Best effort, before a live test adds Sintel: delete every Sintel copy an earlier run left in the
+/// account (a run stopped with Ctrl-C or killed, or a cleanup whose deletes all failed). That is
+/// [`SINTEL_HASH`] and each release `scraper` lists for [`SINTEL_IMDB`] whose name mentions Sintel
+/// ([`sintel_leftovers`]). The acquire tests add whichever cached release ranks best, and a later
+/// run never cleans up a leftover one by itself: its fresh store doesn't own the copy, so its
+/// acquire skips it as already in the account and adds another. A production deployment sharing
+/// the account would meanwhile mirror the leftover and show it in its library.
+///
+/// Each copy it deletes is named in a WARNING on stderr, and so is a scraped release whose name
+/// doesn't mention Sintel, which it leaves alone. A failed scrape still deletes [`SINTEL_HASH`],
+/// and a failed listing still sweeps it.
+pub async fn preclean_sintel_candidates(provider: &Arc<dyn DebridProvider>, scraper: &dyn Scraper) {
+    let candidates: Vec<String> = match scraper
+        .find(SINTEL_IMDB, MediaKind::Movie, None, None)
+        .await
+    {
+        Ok(found) => found.into_iter().map(|c| c.info_hash).collect(),
+        Err(e) => {
+            eprintln!(
+                "WARNING: could not scrape Sintel's releases to pre-clean them ({e}); a Sintel \
+                 release other than {SINTEL_HASH} that an earlier run left in the account stays \
+                 there"
+            );
+            Vec::new()
+        }
+    };
+    let listing = match provider.get_torrents().await {
+        Ok(listing) => listing,
+        Err(e) => {
+            eprintln!(
+                "WARNING: could not list the account to pre-clean Sintel copies ({e}); sweeping \
+                 only {SINTEL_HASH}"
+            );
+            cleanup_by_hash(provider, SINTEL_HASH).await;
+            return;
+        }
+    };
+    let found = sintel_leftovers(&listing, &candidates);
+    for t in &found.unnamed {
+        eprintln!(
+            "WARNING: torrent {} (hash {}, \"{}\") is one of Sintel's scraped releases, but its \
+             name doesn't mention Sintel, so the pre-clean leaves it alone; delete it by hand if a \
+             test run added it",
+            t.id, t.hash, t.filename
+        );
+    }
+    if found.delete.is_empty() {
+        return;
+    }
+    for t in &found.delete {
+        eprintln!(
+            "WARNING: deleting a Sintel copy an earlier test run left in the account: torrent {} \
+             (hash {}, \"{}\")",
+            t.id, t.hash, t.filename
+        );
+    }
+    let ids: Vec<String> = found.delete.iter().map(|t| t.id.clone()).collect();
+    let mut hashes: Vec<String> = found
+        .delete
+        .iter()
+        .map(|t| t.hash.to_ascii_lowercase())
+        .collect();
+    hashes.sort();
+    hashes.dedup();
+    delete_ids_then_sweep(provider, &ids, &hashes).await;
 }
 
 /// Run `body`, then run `cleanup` whether or not `body` panicked, and only then re-raise the panic.

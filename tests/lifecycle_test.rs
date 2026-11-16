@@ -3,21 +3,21 @@
 //! For each provider: add a Creative-Commons torrent (Blender's *Sintel*) → assert it
 //! appears in the provider's list AND in the built VFS library → delete it → assert it
 //! disappears. These tests MODIFY the live account (add/delete a torrent) and clean up
-//! after themselves, also when an assertion fails. They hold `LIVE_ACCOUNT` while they
-//! run, so the harness's default parallelism can't make two of them add and delete Sintel
-//! in the same account at once.
+//! after themselves, also when an assertion fails. Each first deletes any Sintel copy an
+//! earlier, interrupted run left (`common::preclean_sintel_candidates`). They hold
+//! `LIVE_ACCOUNT` while they run, so the harness's default parallelism can't make two of
+//! them add and delete Sintel in the same account at once.
 //!
 //! Run with: `cargo test --test lifecycle_test -- --ignored`
 //! (needs `RD_API_TOKEN` and/or `TORBOX_API_KEY`, plus `TMDB_API_KEY`, in `.env`.)
 
 mod common;
 
-use common::{
-    cleanup_added, cleanup_by_hash, find_ids_by_hash, with_cleanup, AddedIds, SINTEL_HASH,
-};
+use common::{cleanup_added, find_ids_by_hash, with_cleanup, AddedIds, SINTEL_HASH};
 use debridmoviemapper::identification::identify_torrent;
 use debridmoviemapper::provider::{DebridProvider, ProviderKind};
 use debridmoviemapper::rd_client::RealDebridClient;
+use debridmoviemapper::scraper::{Scraper, TorrentioScraper};
 use debridmoviemapper::tmdb_client::TmdbClient;
 use debridmoviemapper::torbox_client::TorBoxClient;
 use debridmoviemapper::vfs::{DebridVfs, VfsNode};
@@ -57,10 +57,31 @@ fn has_media_from(node: &VfsNode, hash: &str) -> bool {
     }
 }
 
+/// The scraper the service would build for `kind` (`SCRAPER_ADDON_URL`, else Torrentio).
+fn scraper_for(kind: ProviderKind, provider_token: &str) -> Arc<dyn Scraper> {
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    Arc::new(TorrentioScraper::new(
+        // Trimmed and blank-as-unset, as the service reads it.
+        common::token("SCRAPER_ADDON_URL"),
+        kind,
+        provider_token,
+        http,
+    ))
+}
+
 /// add → appears (provider list + VFS) → delete → disappears, for any `DebridProvider`.
-async fn run_lifecycle(provider: Arc<dyn DebridProvider>, tmdb: Arc<TmdbClient>, label: &str) {
-    // Delete any leftover Sintel from a prior interrupted run.
-    cleanup_by_hash(&provider, SINTEL_HASH).await;
+async fn run_lifecycle(
+    provider: Arc<dyn DebridProvider>,
+    tmdb: Arc<TmdbClient>,
+    scraper: Arc<dyn Scraper>,
+    label: &str,
+) {
+    // Delete any Sintel copy a prior interrupted run left: this test's own torrent, or a release
+    // an acquire test picked.
+    common::preclean_sintel_candidates(&provider, scraper.as_ref()).await;
     // The cleanup deletes the added torrent by its id too: after the "should appear in
     // get_torrents()" failure the listing is lagging, so a sweep by hash alone could miss it.
     let added = AddedIds::default();
@@ -138,8 +159,9 @@ async fn lifecycle_real_debrid() {
         println!("skipping lifecycle_real_debrid: RD_API_TOKEN not set");
         return;
     };
+    let scraper = scraper_for(ProviderKind::RealDebrid, &rd);
     let provider: Arc<dyn DebridProvider> = Arc::new(RealDebridClient::new(rd).unwrap());
-    run_lifecycle(provider, common::tmdb_client(), "real-debrid").await;
+    run_lifecycle(provider, common::tmdb_client(), scraper, "real-debrid").await;
 }
 
 #[tokio::test]
@@ -151,8 +173,9 @@ async fn lifecycle_torbox() {
         println!("skipping lifecycle_torbox: TORBOX_API_KEY not set");
         return;
     };
+    let scraper = scraper_for(ProviderKind::TorBox, &tb);
     let provider: Arc<dyn DebridProvider> = Arc::new(TorBoxClient::new(tb).unwrap());
-    run_lifecycle(provider, common::tmdb_client(), "torbox").await;
+    run_lifecycle(provider, common::tmdb_client(), scraper, "torbox").await;
 }
 
 #[tokio::test]
@@ -202,21 +225,14 @@ async fn run_acquire(kind: ProviderKind, provider_token: String, label: &str) {
         std::process::id()
     ));
     let store = debridmoviemapper::store::Store::open(dbp.to_str().unwrap()).unwrap();
-    let scraper: Arc<dyn debridmoviemapper::scraper::Scraper> =
-        Arc::new(debridmoviemapper::scraper::TorrentioScraper::new(
-            // Trimmed and blank-as-unset, as the service reads it.
-            common::token("SCRAPER_ADDON_URL"),
-            kind,
-            &provider_token,
-            http.clone(),
-        ));
+    let scraper = scraper_for(kind, &provider_token);
     let validator: Arc<dyn debridmoviemapper::acquire::TitleValidator> =
         Arc::new(debridmoviemapper::acquire::TmdbTitleValidator { tmdb: tmdb.clone() });
     let prober: Arc<dyn debridmoviemapper::acquire::Prober> =
         Arc::new(debridmoviemapper::acquire::HttpProber { http: http.clone() });
     let engine = debridmoviemapper::acquire::AcquisitionEngine::new(
         provider.clone(),
-        scraper,
+        scraper.clone(),
         validator,
         prober,
         store.clone(),
@@ -227,7 +243,7 @@ async fn run_acquire(kind: ProviderKind, provider_token: String, label: &str) {
     );
 
     // Resolve Sintel's TMDB id from its IMDB id at runtime.
-    let imdb = "tt1727587";
+    let imdb = common::SINTEL_IMDB;
     let (tmdb_id, mtype) = match tmdb.find_by_imdb(imdb).await {
         Ok(Some(v)) => v,
         Ok(None) => panic!("[{label}] TMDB found no title for Sintel's IMDB id {imdb}"),
@@ -265,12 +281,17 @@ async fn run_acquire(kind: ProviderKind, provider_token: String, label: &str) {
         .with_test_writer()
         .try_init();
 
+    // Delete any Sintel copy a prior interrupted run left. The fresh store doesn't own one, so the
+    // acquire would skip it as already in the account and add another release, and this run's
+    // cleanup, which deletes only what the store owns, would leave the old copy in the account.
+    common::preclean_sintel_candidates(&provider, scraper.as_ref()).await;
+
     // The ids of the owned torrents the body sees listed. The engine's add doesn't hand back an id,
     // so the listings are where they come from; the cleanup deletes them directly, so a later
     // listing that lags or errors can't leave one behind.
     let added = AddedIds::default();
     let body = async {
-        // Optimistic acquire: returns Pending quickly (or Acquired if the cached check is instant).
+        // Optimistic acquire: adds the best candidate and returns Pending; observe checks it below.
         let hash = match engine
             .acquire(req.clone(), debridmoviemapper::store::Provenance::manual())
             .await
@@ -683,6 +704,60 @@ async fn cleanup_sweeps_at_most_its_window() {
         Duration::from_secs(4),
         "3 listings, 2 s apart"
     );
+}
+
+// --- Offline checks of `common::sintel_leftovers` (what the pre-clean deletes) ---
+
+fn listed_torrent(id: &str, hash: &str, name: &str) -> debridmoviemapper::rd_client::Torrent {
+    debridmoviemapper::rd_client::Torrent {
+        id: id.to_string(),
+        filename: name.to_string(),
+        hash: hash.to_string(),
+        ..Default::default()
+    }
+}
+
+fn ids_of(torrents: &[&debridmoviemapper::rd_client::Torrent]) -> Vec<String> {
+    torrents.iter().map(|t| t.id.clone()).collect()
+}
+
+const SINTEL_RELEASE: &str = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+const SINTEL_COLLECTION: &str = "3333333333333333333333333333333333333333";
+
+#[test]
+fn sintel_leftovers_deletes_only_sintel_copies() {
+    let upper = SINTEL_RELEASE.to_ascii_uppercase();
+    let listing = vec![
+        listed_torrent("1", OTHER_HASH, "Other.Film.2010.1080p"),
+        // A scraped Sintel release an earlier acquire test left (hashes compare case-insensitively).
+        listed_torrent("2", &upper, "Sintel.2010.1080p.BluRay"),
+        // A scraped release whose name doesn't mention Sintel: reported, never deleted.
+        listed_torrent("3", SINTEL_COLLECTION, "Open.Movie.Collection"),
+        // The lifecycle tests' own torrent, whatever it is called.
+        listed_torrent("4", SINTEL_HASH, "sintel-1024-surround"),
+        // Named Sintel but not one of the scraped releases: not the tests' to delete.
+        listed_torrent(
+            "5",
+            "4444444444444444444444444444444444444444",
+            "Sintel.Fan.Edit",
+        ),
+    ];
+    let candidates = [SINTEL_RELEASE.to_string(), SINTEL_COLLECTION.to_string()];
+    let found = common::sintel_leftovers(&listing, &candidates);
+    assert_eq!(ids_of(&found.delete), vec!["2", "4"]);
+    assert_eq!(ids_of(&found.unnamed), vec!["3"]);
+}
+
+#[test]
+fn sintel_leftovers_without_a_scrape_deletes_only_sintel_hash() {
+    let listing = vec![
+        listed_torrent("2", SINTEL_RELEASE, "Sintel.2010.1080p.BluRay"),
+        listed_torrent("4", SINTEL_HASH, "Sintel"),
+        listed_torrent("6", "", "Sintel"),
+    ];
+    let found = common::sintel_leftovers(&listing, &[]);
+    assert_eq!(ids_of(&found.delete), vec!["4"]);
+    assert!(found.unnamed.is_empty());
 }
 
 #[test]

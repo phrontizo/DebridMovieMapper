@@ -281,6 +281,10 @@ pub struct MockProvider {
     /// returns that URL instead of the flat `resolved_url` — letting a test resolve the ORIGINAL and
     /// the REPAIRED torrent to different CDN endpoints (e.g. the original 5xxs, the repaired serves).
     pub resolved_url_by_torrent_id: std::collections::HashMap<String, String>,
+    /// When `true`, `resolve_url` returns the locator's own `link` (`Unavailable` without one), so a
+    /// test can tell which file of a torrent was resolved: the flat `resolved_url` is the same for
+    /// every file.
+    pub resolve_by_link: bool,
 }
 
 #[cfg(test)]
@@ -348,6 +352,9 @@ impl DebridProvider for MockProvider {
         Ok(())
     }
     async fn resolve_url(&self, loc: &FileLocator) -> Result<String, crate::error::AppError> {
+        if self.resolve_by_link {
+            return loc.link.clone().ok_or(crate::error::AppError::Unavailable);
+        }
         if self.unavailable_torrent_ids.contains(&loc.torrent_id) {
             return Err(crate::error::AppError::Unavailable);
         }

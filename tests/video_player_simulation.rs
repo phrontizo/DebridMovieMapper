@@ -125,8 +125,7 @@ async fn run_player_simulation(provider: Arc<dyn DebridProvider>, label: &str) {
         return;
     }
 
-    // Select a few movies and shows at random
-    // rand 0.9 moved `choose` from `SliceRandom` to the `IndexedRandom` trait.
+    // Select a few movies and shows at random (`choose` comes from `IndexedRandom`).
     use rand::seq::IndexedRandom;
     let mut rng = rand::rng();
 

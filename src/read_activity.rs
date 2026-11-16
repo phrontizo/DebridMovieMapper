@@ -83,9 +83,10 @@ impl ReadActivity {
         }
     }
 
-    /// A tracker with NO start-up grace: idle from the start until something is read. For tests (and
-    /// any caller that must treat a brand-new tracker as idle).
-    pub fn without_startup_grace() -> Self {
+    /// Test-only: a tracker with no start-up grace (idle until something is read). Production builds
+    /// trackers with [`new`](Self::new)/`Default`, which carry the grace.
+    #[cfg(test)]
+    pub(crate) fn without_startup_grace() -> Self {
         Self {
             last_read: Arc::default(),
             started: None,
@@ -149,7 +150,7 @@ impl ReadActivity {
     }
 
     /// The most recent read across all torrents, if any.
-    pub async fn most_recent(&self) -> Option<Instant> {
+    async fn most_recent(&self) -> Option<Instant> {
         self.last_read.read().await.values().copied().max()
     }
 

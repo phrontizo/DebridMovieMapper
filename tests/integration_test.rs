@@ -24,11 +24,12 @@ use debridmoviemapper::tmdb_client::track_search_failures;
 use debridmoviemapper::torbox_client::TorBoxClient;
 use debridmoviemapper::vfs::{is_video_file, DebridVfs, MediaMetadata, MediaType, VfsNode};
 use futures_util::FutureExt;
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::OnceCell;
 
@@ -359,7 +360,7 @@ fn check_vfs_completeness(label: &str, data: &[(TorrentInfo, MediaMetadata)]) {
     println!("Selected video files:   {}", report.selected_videos);
     println!("Shown in the VFS:       {}", report.shown);
     println!(
-        "Hidden by design:       {} (a movie's other copies, same-named episode copies)",
+        "Hidden by design:       {} (a movie's other copies, same-named copies in a season folder)",
         report.hidden
     );
     println!(
@@ -378,8 +379,8 @@ fn check_vfs_completeness(label: &str, data: &[(TorrentInfo, MediaMetadata)]) {
     assert!(
         report.missing.is_empty(),
         "[{label}] {} streamable video file(s) are missing from the VFS although no other copy of \
-         them is shown (a movie's other copies and same-named episode copies are already \
-         excluded), so the VFS build dropped them: {:#?}",
+         them is shown (a movie's other copies and same-named copies in the same season folder \
+         are already excluded), so the VFS build dropped them: {:#?}",
         report.missing.len(),
         report.missing
     );
@@ -418,18 +419,20 @@ struct Completeness {
 /// so a file is left out only by design. With no managed selection the VFS shows:
 /// - for a movie, ONE copy: the largest torrent of the title with a streamable file. The title's
 ///   other copies are hidden.
-/// - for a show, each distinct episode file name once, from the largest torrent that has it.
-///   Same-named copies in other torrents are hidden.
+/// - for a show, each distinct episode file name once per season folder, from the largest torrent
+///   that has it. A copy in another torrent is hidden only when the season folder it belongs in
+///   (see [`season_folder`]) already shows a file of that name: two seasons' `01.mkv` are both
+///   shown.
 ///
 /// A selected video file with no link at its position among the selected files (Real-Debrid's
 /// selected-file/link-count mismatch) can't be streamed and is left out too; those are counted
 /// separately. Any other streamable file that isn't shown is reported as missing.
 fn check_completeness(data: &[(TorrentInfo, MediaMetadata)], root: &VfsNode) -> Completeness {
-    // (torrent id, file path) of every media file the VFS shows.
-    let mut shown_files = HashSet::new();
-    collect_locators(root, &mut shown_files);
+    // (torrent id, file path) of every media file the VFS shows, with the folder it sits in.
+    let mut shown_files = HashMap::new();
+    collect_locators("", root, &mut shown_files);
     let shown = |info: &TorrentInfo, file: &TorrentFile| {
-        shown_files.contains(&(info.id.clone(), file.path.clone()))
+        shown_files.contains_key(&(info.id.clone(), file.path.clone()))
     };
 
     // Group the torrents as the build does: by `MediaMetadata`'s Eq/Hash (the external id, else
@@ -474,17 +477,22 @@ fn check_completeness(data: &[(TorrentInfo, MediaMetadata)], root: &VfsNode) -> 
                 }
             }
             MediaType::Show => {
-                let shown_names: HashSet<&str> = streamable
+                // (season folder, file name) of every file the show shows.
+                let shown_names: HashSet<(&str, &str)> = streamable
                     .iter()
-                    .filter(|(i, f)| shown(i, f))
-                    .map(|(_, f)| basename(&f.path))
+                    .filter_map(|(i, f)| {
+                        shown_files
+                            .get(&(i.id.clone(), f.path.clone()))
+                            .map(|folder| (folder.as_str(), basename(&f.path)))
+                    })
                     .collect();
                 for (info, file) in streamable.iter().filter(|(i, f)| !shown(i, f)) {
-                    if shown_names.contains(basename(&file.path)) {
+                    let folder = season_folder(&file.path);
+                    if shown_names.contains(&(folder.as_str(), basename(&file.path))) {
                         report.hidden += 1;
                     } else {
                         report.missing.push(format!(
-                            "Show '{}' ({:?}): no copy of {} is shown (torrent: {})",
+                            "Show '{}' ({:?}): no copy of {} is shown in {folder} (torrent: {})",
                             metadata.title, metadata.external_id, file.path, info.filename
                         ));
                     }
@@ -521,6 +529,61 @@ fn split_by_link(info: &TorrentInfo) -> (Vec<&TorrentFile>, Vec<&TorrentFile>) {
 
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+/// The `Season NN` folder a show's video file belongs in, restated from the build's rule for the
+/// same reason as [`split_by_link`]: the season of the first episode code in the file name
+/// (`S01E05`, `S01.E05`, `1x05`, or a three-digit ` - 105 - `). For a file with no code, the first
+/// `Sxx` / `Season N` / `NxNN` token in the file name; else the NEAREST directory naming a season
+/// (by such a token, else by a `Part N`), so each season of a multi-season pack keeps its own
+/// folder; else a `Part N` in the file name; else season 1. It reads only the season from an
+/// episode code, where the build decodes the whole code.
+fn season_folder(path: &str) -> String {
+    static SXXEYY: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})[ ._]?e\d{1,3}").unwrap());
+    static NXM: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)(?:^|[^a-z0-9])(\d{1,2})x\d{2,3}(?:x\d{2,3}|[-_. ]\d{1,2}x\d{2,3})*(?:[^a-z0-9]|$)",
+        )
+        .unwrap()
+    });
+    static DASH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s-\s(\d)(\d\d)\s-\s").unwrap());
+    static STRONG: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)(?:^|[^a-z0-9])s(\d{1,2})(?:e|[^a-z0-9]|$)|season[\s._-]*(\d+)|(?:^|[^a-z0-9])(\d{1,2})x\d{1,3}(?:[^a-z0-9]|$)",
+        )
+        .unwrap()
+    });
+    static PART: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(?:^|[^a-z0-9])part[\s._-]*(\d{1,2})(?:[^a-z0-9]|$)").unwrap()
+    });
+    let number = |m: Option<regex::Match>| m.and_then(|m| m.as_str().parse::<u32>().ok());
+    let strong = |s: &str| {
+        STRONG
+            .captures(s)
+            .and_then(|c| number(c.get(1)).or(number(c.get(2))).or(number(c.get(3))))
+    };
+    let part = |s: &str| PART.captures(s).and_then(|c| number(c.get(1)));
+
+    let name = basename(path);
+    let dash_code = || {
+        let c = DASH.captures(name)?;
+        let (season, episode) = (number(c.get(1))?, number(c.get(2))?);
+        (season >= 1 && episode >= 1).then_some(season)
+    };
+    let code = SXXEYY
+        .captures(name)
+        .and_then(|c| number(c.get(1)))
+        .or_else(|| NXM.captures(name).and_then(|c| number(c.get(1))))
+        .or_else(dash_code);
+    let season = code.or_else(|| strong(name)).or_else(|| {
+        path[..path.len() - name.len()]
+            .rsplit('/')
+            .filter(|dir| !dir.is_empty())
+            .find_map(|dir| strong(dir).or_else(|| part(dir)))
+            .or_else(|| part(name))
+    });
+    format!("Season {:02}", season.unwrap_or(1))
 }
 
 // --- Offline checks of `check_completeness` (fictional torrents; no account needed) ---
@@ -644,6 +707,103 @@ fn completeness_reports_files_the_build_left_out() {
     );
     // Torrent 4's E01 is still covered by torrent 3's.
     assert_eq!(report.hidden, 1, "{report:#?}");
+}
+
+/// A show held as season packs of code-less file names: two seasons with the same `01.mkv`, and a
+/// smaller copy of season 1 under a `Season.1` folder.
+fn codeless_packs() -> Vec<(TorrentInfo, MediaMetadata)> {
+    let show = title("Pack Show", 4, MediaType::Show);
+    vec![
+        (
+            rd_torrent(
+                "6",
+                6_000,
+                &["/Pack.Show.S01/01.mkv", "/Pack.Show.S01/02.mkv"],
+            ),
+            show.clone(),
+        ),
+        (
+            rd_torrent("7", 5_000, &["/Pack.Show.S02/01.mkv"]),
+            show.clone(),
+        ),
+        (
+            rd_torrent("8", 2_000, &["/Pack.Show.Season.1.720p/01.mkv"]),
+            show,
+        ),
+    ]
+}
+
+#[test]
+fn completeness_hides_a_same_named_file_only_within_its_season() {
+    let data = codeless_packs();
+    let vfs = DebridVfs::build(data.clone(), &debridmoviemapper::vfs::SelectionMap::new());
+    let report = check_completeness(&data, &vfs.root);
+    assert!(report.missing.is_empty(), "{report:#?}");
+    // Season 1's 01.mkv and 02.mkv, and season 2's 01.mkv.
+    assert_eq!(report.shown, 3, "{report:#?}");
+    // Torrent 8's 01.mkv is the same season-1 episode as torrent 6's.
+    assert_eq!(report.hidden, 1, "{report:#?}");
+}
+
+#[test]
+fn completeness_reports_a_dropped_file_named_like_another_seasons() {
+    let data = codeless_packs();
+    // A VFS built without the season-2 pack stands in for a build that dropped its 01.mkv, e.g. by
+    // filing it under Season 01, where a file of that name already is.
+    let partial: Vec<_> = data
+        .iter()
+        .filter(|(info, _)| info.id != "7")
+        .cloned()
+        .collect();
+    let vfs = DebridVfs::build(partial, &debridmoviemapper::vfs::SelectionMap::new());
+    let report = check_completeness(&data, &vfs.root);
+    assert_eq!(report.missing.len(), 1, "{report:#?}");
+    assert!(
+        report.missing[0].contains("Pack.Show.S02/01.mkv"),
+        "{report:#?}"
+    );
+    // Torrent 8's 01.mkv is still covered by torrent 6's in Season 01.
+    assert_eq!(report.hidden, 1, "{report:#?}");
+}
+
+/// `season_folder` and the build agree on the season folder of each kind of show file name, so the
+/// live check never reports a copy as missing because the two disagree.
+#[test]
+fn season_folder_agrees_with_the_build() {
+    let cases = [
+        ("/Show.S01E05.mkv", "Season 01"),
+        ("/Show.S03.E05.mkv", "Season 03"),
+        ("/Show.2x05.Title.mkv", "Season 02"),
+        ("/Show - 409 - Title.mkv", "Season 04"),
+        // An episode code in the file name beats a directory's season.
+        ("/Show.S01/Show.S02E03.mkv", "Season 02"),
+        ("/Show.S03/01.mkv", "Season 03"),
+        ("/Show.Season.2/01.mkv", "Season 02"),
+        ("/Show_S02_1080p/01.mkv", "Season 02"),
+        // The nearest directory decides, not a multi-season pack's root folder.
+        ("/Show.S01-S03/Season 2/01.mkv", "Season 02"),
+        ("/Show.S04/Part 2/01.mkv", "Season 02"),
+        // A directory's season beats a `Part N` in the file name, which is the weakest signal.
+        ("/Show/Season 3/05 - Title, Part 2.mkv", "Season 03"),
+        ("/Show/05 - Title, Part 2.mkv", "Season 02"),
+        ("/Show/01.mkv", "Season 01"),
+    ];
+    for (n, (path, expected)) in cases.into_iter().enumerate() {
+        let id = (n + 1).to_string();
+        let data = vec![(
+            rd_torrent(&id, 1_000, &[path]),
+            title("Some Show", 5, MediaType::Show),
+        )];
+        let vfs = DebridVfs::build(data, &debridmoviemapper::vfs::SelectionMap::new());
+        let mut files = HashMap::new();
+        collect_locators("", &vfs.root, &mut files);
+        assert_eq!(season_folder(path), expected, "season_folder({path})");
+        assert_eq!(
+            files.get(&(id, path.to_string())).map(String::as_str),
+            Some(expected),
+            "the build's folder for {path}"
+        );
+    }
 }
 
 // --- Offline checks of `fetch_and_identify` (a fictional account; no provider or TMDB call) ---
@@ -913,17 +1073,23 @@ fn collect_paths(node: &VfsNode, prefix: &str, paths: &mut Vec<String>) {
     }
 }
 
-/// The (torrent id, file path) of every media file under `node`.
-fn collect_locators(node: &VfsNode, files: &mut HashSet<(String, String)>) {
-    match node {
-        VfsNode::Directory { children } => {
-            for child in children.values() {
-                collect_locators(child, files);
+/// Every media file under the directory `node`, named `name`, as its (torrent id, file path)
+/// mapped to the name of the directory holding it: a show episode's `Season NN`, a movie's title
+/// folder.
+fn collect_locators(name: &str, node: &VfsNode, files: &mut HashMap<(String, String), String>) {
+    let VfsNode::Directory { children } = node else {
+        return;
+    };
+    for (child_name, child) in children {
+        match child {
+            VfsNode::Directory { .. } => collect_locators(child_name, child, files),
+            VfsNode::MediaFile { locator, .. } => {
+                files.insert(
+                    (locator.torrent_id.clone(), locator.file_path.clone()),
+                    name.to_string(),
+                );
             }
+            VfsNode::VirtualFile { .. } => {}
         }
-        VfsNode::MediaFile { locator, .. } => {
-            files.insert((locator.torrent_id.clone(), locator.file_path.clone()));
-        }
-        VfsNode::VirtualFile { .. } => {}
     }
 }

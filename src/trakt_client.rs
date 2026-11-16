@@ -17,6 +17,10 @@ pub struct TraktItem {
     pub media_type: MediaType,
     pub tmdb_id: u64,
     pub imdb_id: Option<String>,
+    /// A playback show's earliest paused `(season, episode)` of the regular run (see
+    /// [`parse_playback`]): where a paused re-watch resumes. `None` for a movie, a watchlist entry,
+    /// or a show paused only on a special.
+    pub paused_episode: Option<(u32, u32)>,
 }
 
 /// Device-flow code response (`POST /oauth/device/code`).
@@ -190,8 +194,8 @@ pub(crate) struct Pagination {
 }
 
 /// Read the pagination headers off a Trakt response. PURE + total: a missing, non-UTF-8 or
-/// non-numeric header yields `None` for that field (the caller then treats the read as a single
-/// page, exactly like an unpaginated endpoint such as `/sync/playback`).
+/// non-numeric header yields `None` for that field (without a page count the caller reads on only
+/// while pages come back exactly full, see `TraktClientImpl::authed_get_list`).
 pub(crate) fn parse_pagination(headers: &reqwest::header::HeaderMap) -> Pagination {
     fn num<T: std::str::FromStr>(headers: &reqwest::header::HeaderMap, name: &str) -> Option<T> {
         headers.get(name)?.to_str().ok()?.trim().parse().ok()
@@ -445,12 +449,16 @@ impl TraktClientImpl {
     ///   that does not paginate today, e.g. `/sync/playback`); should the response nevertheless
     ///   carry a page count > 1, the rest is fetched as `page=N` at the server's default size.
     ///
-    /// The page count comes from page 1's `X-Pagination-Page-Count`; a missing/garbled/zero value
-    /// reads as a single page. SAFETY: any failure is an `Err` for the WHOLE read — a page's
-    /// request/status/body failing, a non-array body, a page count above `MAX_PAGES`, or the list
-    /// visibly changing mid-read (`check_page_consistency`, `repeated_list_item`; see the former
-    /// for the one shift neither can see) — so the caller keeps its previous state rather than
-    /// acting on a silently truncated list.
+    /// The page count comes from page 1's `X-Pagination-Page-Count`. When it is missing, garbled or
+    /// zero, a page 1 shorter than `limit` (or any page 1 when `limit` is `None`) is the whole list,
+    /// and so is one longer than `limit` (the server ignored it); an exactly full page is followed
+    /// by the next, until a page comes back short, so a list is never cut at its first page.
+    /// SAFETY: any failure is an `Err` for the WHOLE read — a page's request/status/body failing, a
+    /// non-array body, a page count above `MAX_PAGES` (or, without one, still-full pages past it),
+    /// or the list visibly changing mid-read (`check_page_consistency`, `repeated_list_item`, which
+    /// also catches a server that ignores `page` and repeats page 1; see the former for the one
+    /// shift neither can see) — so the caller keeps its previous state rather than acting on a
+    /// silently truncated list.
     async fn authed_get_list(
         &self,
         path: &str,
@@ -462,7 +470,8 @@ impl TraktClientImpl {
         let mut seen_keys: std::collections::HashSet<ListItemKey> =
             std::collections::HashSet::new();
         let mut first = Pagination::default();
-        let mut total_pages: u32 = 1;
+        // Page 1's usable page count; `None` when it has none (absent, garbled or 0).
+        let mut page_count: Option<u32> = None;
         let mut page: u32 = 1;
         loop {
             let mut query: Vec<(String, String)> = params
@@ -502,35 +511,43 @@ impl TraktClientImpl {
             }
             seen_keys.extend(page_items.iter().filter_map(list_item_key));
             items.extend(page_items);
+            // An exactly full page (`limit` items): without a usable page count, the one hint the
+            // list goes on. A longer page means the server ignored `limit` and sent the whole list.
+            let page_full = limit.is_some_and(|l| page_len == l as usize);
             if page == 1 {
                 first = info;
-                total_pages = match info.page_count {
+                page_count = match info.page_count {
                     Some(c) if c > MAX_PAGES => {
                         return Err(AppError::Upstream(format!(
                             "Trakt {path}: {c} pages exceeds the {MAX_PAGES}-page cap"
                         )));
                     }
-                    Some(c) => c.max(1),
-                    None => {
-                        // Read as one page (as specified for absent/garbled headers). A FULL page
-                        // with no usable count is the one hint the list may be longer — say so.
-                        if limit.is_some_and(|l| page_len >= l as usize) {
-                            warn!(
-                                "trakt: {} returned a full page ({} items) without a usable \
-                                 X-Pagination-Page-Count; reading it as a single page",
-                                path, page_len
-                            );
-                        }
-                        1
-                    }
+                    Some(c) if c >= 1 => Some(c),
+                    _ => None,
                 };
+                if page_count.is_none() && page_full {
+                    warn!(
+                        "trakt: {} returned a full page ({} items) without a usable \
+                         X-Pagination-Page-Count; following pages until one comes back short",
+                        path, page_len
+                    );
+                }
             } else {
                 check_page_consistency(page, &first, &info).map_err(|why| {
                     AppError::Upstream(format!("Trakt {path} page {page}: {why}"))
                 })?;
             }
-            if page >= total_pages {
+            let more = match page_count {
+                Some(c) => page < c,
+                None => page_full,
+            };
+            if !more {
                 break;
+            }
+            if page >= MAX_PAGES {
+                return Err(AppError::Upstream(format!(
+                    "Trakt {path}: still full after {MAX_PAGES} pages without a page count"
+                )));
             }
             page += 1;
         }
@@ -538,7 +555,7 @@ impl TraktClientImpl {
             "trakt: {} — {} item(s) over {} page(s)",
             path,
             items.len(),
-            total_pages
+            page
         );
         Ok(serde_json::Value::Array(items))
     }
@@ -854,6 +871,7 @@ pub fn parse_watchlist(v: &serde_json::Value, media_type: MediaType) -> Vec<Trak
                 media_type: media_type.clone(),
                 tmdb_id,
                 imdb_id: imdb_id_of(obj),
+                paused_episode: None,
             })
         })
         .collect()
@@ -861,15 +879,19 @@ pub fn parse_watchlist(v: &serde_json::Value, media_type: MediaType) -> Vec<Trak
 
 /// Parse a `/sync/playback` array into deduped in-progress items. `type == "movie"` →
 /// `movie.ids.tmdb`; `type == "episode"` → `show.ids.tmdb` (so a show appears once even with
-/// several in-progress episodes). Entries lacking a numeric tmdb are skipped.
+/// several in-progress episodes), carrying the earliest paused `episode.season`/`episode.number`
+/// of its entries in `paused_episode`. A special (season 0) sets no position: it says nothing about
+/// where in the regular run the user is. Entries lacking a numeric tmdb are skipped.
 pub fn parse_playback(v: &serde_json::Value) -> Vec<TraktItem> {
     let Some(arr) = v.as_array() else {
         return Vec::new();
     };
     let mut out: Vec<TraktItem> = Vec::new();
-    // Dedup in first-seen order via a set membership check (O(n)) rather than a linear
-    // `Vec::contains` per item (O(n²)) — a show with many in-progress episodes collapses to one entry.
-    let mut seen: std::collections::HashSet<TraktItem> = std::collections::HashSet::new();
+    // Dedup in first-seen order on (media_type, tmdb_id), via an index into `out` (O(n)) rather
+    // than a linear scan per item (O(n²)) — a show with many in-progress episodes collapses to one
+    // entry, which keeps the earliest paused episode.
+    let mut index: std::collections::HashMap<(MediaType, u64), usize> =
+        std::collections::HashMap::new();
     for e in arr {
         let item = match e.get("type").and_then(|t| t.as_str()) {
             Some("movie") => e.get("movie").and_then(|m| {
@@ -877,6 +899,7 @@ pub fn parse_playback(v: &serde_json::Value) -> Vec<TraktItem> {
                     media_type: MediaType::Movie,
                     tmdb_id: tmdb_id_of(m)?,
                     imdb_id: imdb_id_of(m),
+                    paused_episode: None,
                 })
             }),
             Some("episode") => e.get("show").and_then(|s| {
@@ -884,12 +907,31 @@ pub fn parse_playback(v: &serde_json::Value) -> Vec<TraktItem> {
                     media_type: MediaType::Show,
                     tmdb_id: tmdb_id_of(s)?,
                     imdb_id: imdb_id_of(s),
+                    paused_episode: e.get("episode").and_then(|ep| {
+                        let number = |key: &str| u32::try_from(ep.get(key)?.as_u64()?).ok();
+                        Some((number("season")?, number("number")?))
+                            .filter(crate::wanted::is_regular_episode)
+                    }),
                 })
             }),
             _ => None,
         };
-        if let Some(item) = item {
-            if seen.insert(item.clone()) {
+        let Some(item) = item else {
+            continue;
+        };
+        match index.get(&(item.media_type.clone(), item.tmdb_id)) {
+            Some(&at) => {
+                let kept = &mut out[at];
+                kept.paused_episode = match (kept.paused_episode, item.paused_episode) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                if kept.imdb_id.is_none() {
+                    kept.imdb_id = item.imdb_id;
+                }
+            }
+            None => {
+                index.insert((item.media_type.clone(), item.tmdb_id), out.len());
                 out.push(item);
             }
         }
@@ -1397,6 +1439,7 @@ mod tests {
                 media_type: MediaType::Movie,
                 tmdb_id: 27205,
                 imdb_id: Some("tt1375666".into()),
+                paused_episode: None,
             }]
         );
     }
@@ -1415,11 +1458,13 @@ mod tests {
                     media_type: MediaType::Show,
                     tmdb_id: 1396,
                     imdb_id: Some("tt0903747".into()),
+                    paused_episode: None,
                 },
                 TraktItem {
                     media_type: MediaType::Show,
                     tmdb_id: 1397,
                     imdb_id: None,
+                    paused_episode: None,
                 },
             ]
         );
@@ -1441,12 +1486,43 @@ mod tests {
                     media_type: MediaType::Movie,
                     tmdb_id: 100,
                     imdb_id: None,
+                    paused_episode: None,
                 },
                 TraktItem {
                     media_type: MediaType::Show,
                     tmdb_id: 200,
                     imdb_id: Some("tt0944947".into()),
+                    paused_episode: None,
                 },
+            ]
+        );
+    }
+
+    /// A show's playback entries collapse to one item carrying its EARLIEST paused episode of the
+    /// regular run, where a re-watch resumes (a paused special says nothing about that position).
+    #[test]
+    fn parse_playback_keeps_the_earliest_paused_episode_of_a_show() {
+        let v = serde_json::json!([
+            { "type": "episode", "episode": { "season": 2, "number": 5 }, "show": { "ids": { "tmdb": 200 } } },
+            { "type": "episode", "episode": { "season": 1, "number": 3 }, "show": { "ids": { "tmdb": 200 } } },
+            { "type": "episode", "episode": { "season": 0, "number": 1 }, "show": { "ids": { "tmdb": 200 } } },
+            { "type": "episode", "episode": { "season": 0, "number": 2 }, "show": { "ids": { "tmdb": 300 } } },
+            { "type": "episode", "show": { "ids": { "tmdb": 400 } } }, // no episode object
+            { "type": "movie", "movie": { "ids": { "tmdb": 100 } } },
+        ]);
+        let item = |media_type, tmdb_id, paused_episode| TraktItem {
+            media_type,
+            tmdb_id,
+            imdb_id: None,
+            paused_episode,
+        };
+        assert_eq!(
+            parse_playback(&v),
+            vec![
+                item(MediaType::Show, 200, Some((1, 3))),
+                item(MediaType::Show, 300, None),
+                item(MediaType::Show, 400, None),
+                item(MediaType::Movie, 100, None),
             ]
         );
     }
@@ -1569,11 +1645,13 @@ mod tests {
                 media_type: MediaType::Movie,
                 tmdb_id: 1,
                 imdb_id: None,
+                paused_episode: None,
             }],
             in_progress: vec![TraktItem {
                 media_type: MediaType::Show,
                 tmdb_id: 2,
                 imdb_id: None,
+                paused_episode: None,
             }],
             watched: WatchedData {
                 movies: vec![3],
@@ -1609,6 +1687,7 @@ mod tests {
                 media_type: MediaType::Movie,
                 tmdb_id: 1,
                 imdb_id: None,
+                paused_episode: None,
             }]
         );
         assert_eq!(
@@ -1617,6 +1696,7 @@ mod tests {
                 media_type: MediaType::Show,
                 tmdb_id: 2,
                 imdb_id: None,
+                paused_episode: None,
             }]
         );
         assert_eq!(client.watched("ignored").await.unwrap().movies, vec![3]);
@@ -1912,6 +1992,7 @@ mod tests {
                 media_type: MediaType::Movie,
                 tmdb_id: 1,
                 imdb_id: None,
+                paused_episode: None,
             }],
             fail_reads: true,
             fail_refresh: true,
@@ -2104,7 +2185,7 @@ pub(crate) mod test_http {
 ///   - `playback.json` — `GET /sync/playback` (no pagination headers at all).
 #[cfg(test)]
 mod pagination_tests {
-    use super::test_http::{spawn, Reply};
+    use super::test_http::{spawn, Reply, Server};
     use super::*;
 
     const WATCHED_SHOWS_P1: &str =
@@ -2230,11 +2311,13 @@ mod pagination_tests {
             media_type: MediaType::Movie,
             tmdb_id,
             imdb_id: Some(imdb.into()),
+            paused_episode: None,
         };
         let show = |tmdb_id: u64, imdb: &str| TraktItem {
             media_type: MediaType::Show,
             tmdb_id,
             imdb_id: Some(imdb.into()),
+            paused_episode: None,
         };
         assert_eq!(
             parse_watchlist(&json(WATCHLIST_MOVIES), MediaType::Movie),
@@ -2252,10 +2335,17 @@ mod pagination_tests {
             parse_watched_movies(&json(WATCHED_MOVIES_P1)),
             vec![911600, 910500, 911500]
         );
+        let paused = |tmdb_id: u64, imdb: &str, at: (u32, u32)| TraktItem {
+            paused_episode: Some(at),
+            ..show(tmdb_id, imdb)
+        };
         assert_eq!(
             parse_playback(&json(PLAYBACK)),
-            vec![show(910200, "tt9900400"), show(910600, "tt9901700")],
-            "in-progress episodes map to their show"
+            vec![
+                paused(910200, "tt9900400", (1, 1)),
+                paused(910600, "tt9901700", (4, 5))
+            ],
+            "in-progress episodes map to their show, with the paused episode"
         );
     }
 
@@ -2416,6 +2506,7 @@ mod pagination_tests {
         assert!(client(&server.base_url).watchlist("at").await.is_err());
     }
 
+    /// Without a usable page count, a page 1 shorter than `limit` is the whole list.
     #[tokio::test]
     async fn missing_or_garbled_pagination_headers_read_as_a_single_page() {
         for reply in [
@@ -2439,9 +2530,79 @@ mod pagination_tests {
             assert_eq!(
                 server.hits("/sync/watched/movies"),
                 1,
-                "no page-2 request without a usable page count"
+                "no page-2 request after a short page without a usable page count"
             );
         }
+    }
+
+    /// A `/sync/watched/movies` page body of one watched movie per id in `ids` (Trakt id `i`,
+    /// TMDB id `900_000 + i`).
+    fn watched_movies_body(ids: std::ops::Range<u64>) -> String {
+        let items: Vec<serde_json::Value> = ids
+            .map(|i| serde_json::json!({ "plays": 1, "movie": { "ids": { "trakt": i, "tmdb": 900_000 + i } } }))
+            .collect();
+        serde_json::Value::Array(items).to_string()
+    }
+
+    /// Serve `movies_p1` (and `movies_p2`, when given) as the watched-movies pages, with no shows.
+    async fn watched_movies_server(movies_p1: Reply, movies_p2: Option<Reply>) -> Server {
+        let mut routes = vec![
+            ("/sync/watched/movies?page=1&limit=100", movies_p1),
+            (
+                "/sync/watched/shows?extended=progress&page=1&limit=100",
+                Reply::json("[]"),
+            ),
+        ];
+        if let Some(p2) = movies_p2 {
+            routes.push(("/sync/watched/movies?page=2&limit=100", p2));
+        }
+        spawn(routes).await
+    }
+
+    /// A FULL page 1 without a usable page count (none, garbled or 0) may be the first of several,
+    /// so pages are followed until one comes back short: reading it as the whole list would cut a
+    /// watchlist at 100 titles and Trigger-B every title past them.
+    #[tokio::test]
+    async fn a_full_page_without_a_usable_page_count_is_followed_until_a_short_page() {
+        for count in [None, Some("lots"), Some("0")] {
+            let mut p1 = Reply::json(&watched_movies_body(0..100));
+            if let Some(v) = count {
+                p1 = p1.header("x-pagination-page-count", v);
+            }
+            let p2 = Reply::json(&watched_movies_body(100..103));
+            let server = watched_movies_server(p1, Some(p2)).await;
+            let w = client(&server.base_url)
+                .watched("at")
+                .await
+                .expect("watched");
+            assert_eq!(
+                w.movies,
+                (0..103).map(|i| 900_000 + i).collect::<Vec<u64>>(),
+                "page count {count:?}: both pages are read"
+            );
+            assert_eq!(server.hits("/sync/watched/movies"), 2, "{count:?}");
+        }
+    }
+
+    /// Without a usable page count, a page 2 that repeats page 1 (a server ignoring `page`) is a
+    /// loud `Err`, never a silently truncated or duplicated list; a page 1 longer than `limit` (a
+    /// server ignoring `limit`, so the whole list) is read as the only page.
+    #[tokio::test]
+    async fn without_a_page_count_a_repeated_page_is_an_err_and_an_oversized_page_is_the_list() {
+        let server = watched_movies_server(
+            Reply::json(&watched_movies_body(0..100)),
+            Some(Reply::json(&watched_movies_body(0..100))),
+        )
+        .await;
+        assert!(client(&server.base_url).watched("at").await.is_err());
+
+        let server = watched_movies_server(Reply::json(&watched_movies_body(0..150)), None).await;
+        let w = client(&server.base_url)
+            .watched("at")
+            .await
+            .expect("watched");
+        assert_eq!(w.movies.len(), 150);
+        assert_eq!(server.hits("/sync/watched/movies"), 1);
     }
 
     #[tokio::test]

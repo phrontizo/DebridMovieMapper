@@ -320,7 +320,9 @@ pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
             // catch-up wanter has watched it (the INTERSECTION of their watched sets). An episode
             // unseen by any wanting user is still acquired so that user can catch up — a union here
             // would skip episodes one user watched elsewhere even though another hasn't seen them
-            // (under-acquisition for multi-user households).
+            // (under-acquisition for multi-user households). A paused re-watch (a show still in
+            // `/sync/playback`) is written without its paused episode and every later one in its
+            // watched set (`tasks::build_wanted`), so it acquires from the pause on.
             let watched: std::collections::HashSet<(u32, u32)> = if watchlisted {
                 std::collections::HashSet::new()
             } else {
@@ -632,6 +634,42 @@ mod tests {
                 season: 1,
                 episode: 3
             }]
+        );
+    }
+
+    #[test]
+    fn paused_show_rewatch_acquires_from_the_paused_episode_on() {
+        // A paused re-watch (still in /sync/playback) of a fully watched show: the sync drops the
+        // paused episode (S01E03) and every later one from the row's watched set, so only S01E01-02
+        // stay watched. Unowned, it acquires S01E03 on; owned with S01E01 and S01E03 lapsed, it
+        // restores S01E03 (at or after the pause) but not the already re-watched S01E01.
+        let aired = vec![(1, 1), (1, 2), (1, 3), (1, 4)];
+        let rewatch = || {
+            vec![behind_show_record(
+                "alice",
+                5,
+                vec![(1, 1), (1, 2)],
+                ShowStatus::Ended,
+            )]
+        };
+        let ep = |episode| Action::AcquireEpisode {
+            tmdb_id: 5,
+            season: 1,
+            episode,
+        };
+        assert_eq!(
+            reconcile_title(&show_title(5, rewatch(), None, aired.clone())),
+            vec![ep(3), ep(4)]
+        );
+        let lapsed = owned(
+            "h",
+            Provenance::in_progress("alice"),
+            true,
+            vec![(1, 2), (1, 4)],
+        );
+        assert_eq!(
+            reconcile_title(&show_title(5, rewatch(), Some(lapsed), aired)),
+            vec![ep(3)]
         );
     }
 

@@ -173,6 +173,42 @@ static TRAILING_EPISODE_NUM_DASH_RE: LazyLock<Regex> = LazyLock::new(|| {
 static BRACKETED_YEAR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(?:19|20)\d{2}\s*[)\]]").unwrap());
 
+/// The first [`TRAILING_EPISODE_NUM_DASH_RE`] episode number in `title` (a name after the dot →
+/// space replacement), as where its match starts and the number. A 19xx/20xx year and a number
+/// followed by a bracketed release year ([`BRACKETED_YEAR_RE`]) are skipped: those are a release
+/// year and a numeric film title. `clean_name` cuts the title there, and
+/// [`trailing_episode_number`] reads the episode from it.
+fn trailing_episode_cut(title: &str) -> Option<(usize, u32)> {
+    TRAILING_EPISODE_NUM_DASH_RE
+        .captures_iter(title)
+        .filter(|c| {
+            c.get(1).is_some_and(|n| !YEAR_RE.is_match(n.as_str()))
+                && !c
+                    .get(0)
+                    .is_some_and(|m| BRACKETED_YEAR_RE.is_match(&title[m.end()..]))
+        })
+        .find_map(|c| Some((c.get(0)?.start(), c.get(1)?.as_str().parse().ok()?)))
+}
+
+/// The ` - NN` episode number a file name ends its title with (the common anime form
+/// `[SubsPlease] Some Show - 12 (1080p) [ABCD1234].mkv` → 12), by the rule `clean_name` cuts the
+/// title at: `None` for a release year, a numeric film title (`Some Film - 21 (2008)`), a number a
+/// second ` - ` follows, or a name with no such number. The acquisition engine maps a single-file
+/// release with no episode code to its episode with it.
+pub(crate) fn trailing_episode_number(file_name: &str) -> Option<u32> {
+    let mut name = file_name;
+    if let Some(pos) = name.rfind('.') {
+        let ext = name[pos..].to_lowercase();
+        if VIDEO_EXTENSIONS.iter().any(|e| *e == ext) {
+            name = &name[..pos];
+        }
+    }
+    let name = name.replace(['.', '_'], " ");
+    trailing_episode_cut(&name)
+        .filter(|&(start, _)| start > 0)
+        .map(|(_, number)| number)
+}
+
 /// What [`identify_name`] concluded about a name.
 #[derive(Debug, Clone)]
 pub enum Identification {
@@ -806,17 +842,7 @@ pub fn clean_name(name: &str) -> (String, Option<String>) {
     // searching the number alone. A year there is the release year (`Dr.No - 1962`), kept for
     // step 4, and a number followed by a bracketed year is a numeric film title (`21 (2008)`,
     // e.g. behind a kept site prefix), kept with its year.
-    let episode_cut = TRAILING_EPISODE_NUM_DASH_RE
-        .captures_iter(&title)
-        .filter(|c| {
-            c.get(1).is_some_and(|n| !YEAR_RE.is_match(n.as_str()))
-                && !c
-                    .get(0)
-                    .is_some_and(|m| BRACKETED_YEAR_RE.is_match(&title[m.end()..]))
-        })
-        .find_map(|c| c.get(0))
-        .map(|m| m.start());
-    if let Some(start) = episode_cut.filter(|&start| start > 0) {
+    if let Some((start, _)) = trailing_episode_cut(&title).filter(|&(start, _)| start > 0) {
         title.truncate(start);
     }
 
@@ -1498,6 +1524,35 @@ mod tests {
             clean_name("Spider-Man - Far From Home 1080p").0,
             "Spider-Man - Far From Home"
         );
+    }
+
+    #[test]
+    fn trailing_episode_number_reads_the_number_clean_name_cuts_at() {
+        // The acquisition engine maps an absolute-numbered anime file to its episode with the same
+        // rule `clean_name` cuts the title at.
+        for (name, number) in [
+            ("[SubsPlease] Some Show - 12 (1080p) [ABCD1234].mkv", 12),
+            ("[Group] Some Show - 05v2 [1080p].mkv", 5),
+            ("[Group] Some Show S2 - 05 (1080p).mkv", 5),
+            ("Some Show - Ep01 [720p].mkv", 1),
+            ("Some_Show_-_12_(1080p).mkv", 12),
+            ("Some.Show - 12.mkv", 12),
+        ] {
+            assert_eq!(trailing_episode_number(name), Some(number), "{name:?}");
+        }
+        // A release year, a number followed by a bracketed release year (a numeric film title), a
+        // single digit, a number a second ` - ` follows, and a name with no such number are none.
+        for name in [
+            "Dr.No - 1962.mkv",
+            "Some Show - 12 (2008).mkv",
+            "Some.Collection - 1408 [2007] 1080p.mkv",
+            "Some Film - 2.mkv",
+            "Some Show - 12 - Title (1080p).mkv",
+            "Some.Show.S01E12.1080p.mkv",
+            " - 12 (1080p).mkv",
+        ] {
+            assert_eq!(trailing_episode_number(name), None, "{name:?}");
+        }
     }
 
     #[test]

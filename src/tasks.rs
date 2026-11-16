@@ -873,7 +873,11 @@ const REFRESH_BUFFER_SECS: u64 = 3_600;
 /// written as finished: a movie as not watched, a show as `trakt_behind`. Trakt drops a title from
 /// `/sync/playback` once it has been watched through, so the only playback title the watch history
 /// reads as finished is a paused re-watch. Trigger A would delete it from under the viewer and then
-/// refuse to re-acquire it while the pause lasts.
+/// refuse to re-acquire it while the pause lasts. A playback show's watched set also leaves out its
+/// paused episode ([`crate::trakt_client::TraktItem::paused_episode`]) and every later one: a
+/// re-watch begun without resetting Trakt progress has every episode watched, so the catch-up skip
+/// set would otherwise acquire none of it, not even an episode lapsed since. It acquires from the
+/// pause on, and on a first watch nothing changes (those episodes are unwatched).
 /// `catchup_cutoff`: a Unix timestamp (seconds) bounding the **catch-up** source — a show you've
 /// watched is auto-wanted (so the reconciler acquires every aired episode you haven't watched,
 /// including ones that aired before your last watch) only if you last watched it at/after this
@@ -904,6 +908,8 @@ pub(crate) fn build_wanted(
         in_progress: bool,
         /// In the user's `/sync/playback`: partway through it (see the doc above).
         playback: bool,
+        /// A playback show's earliest paused episode ([`crate::trakt_client::TraktItem`]).
+        paused_episode: Option<(u32, u32)>,
         /// First non-empty IMDB id seen for this title across its source rows.
         imdb_id: Option<String>,
     }
@@ -920,6 +926,7 @@ pub(crate) fn build_wanted(
                 watchlist: false,
                 in_progress: false,
                 playback: false,
+                paused_episode: None,
                 imdb_id: None,
             });
         a.watchlist = true;
@@ -935,10 +942,15 @@ pub(crate) fn build_wanted(
                 watchlist: false,
                 in_progress: false,
                 playback: false,
+                paused_episode: None,
                 imdb_id: None,
             });
         a.in_progress = true;
         a.playback = true;
+        a.paused_episode = match (a.paused_episode, item.paused_episode) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, y) => x.or(y),
+        };
         if a.imdb_id.is_none() {
             a.imdb_id = item.imdb_id.clone();
         }
@@ -971,6 +983,7 @@ pub(crate) fn build_wanted(
                 watchlist: false,
                 in_progress: false,
                 playback: false,
+                paused_episode: None,
                 imdb_id: None,
             });
         // Carry Trakt's IMDB id so a catch-up-ONLY show (not watchlisted/in-progress, so no
@@ -1006,9 +1019,18 @@ pub(crate) fn build_wanted(
                     None,
                 ),
                 MediaType::Show => {
+                    // A paused re-watch resumes at its paused episode: that one and every later
+                    // one are not counted as watched, so the catch-up skip set lets it acquire
+                    // from the pause on (on a first watch they are unwatched anyway).
                     let watched_episodes = watched_by_id
                         .get(&tmdb_id)
-                        .map(|s| s.watched_episodes.clone())
+                        .map(|s| {
+                            s.watched_episodes
+                                .iter()
+                                .copied()
+                                .filter(|e| a.paused_episode.is_none_or(|p| *e < p))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     (
                         WatchedState::Show {
@@ -1672,12 +1694,17 @@ pub(crate) async fn backfill_owned_quality(
 /// Re-derive the episodes of owned show records whose `provides` is EMPTY from their torrent's
 /// selected video files ([`crate::acquire::episode_files`]), for every record whose torrent is in
 /// `infos`. The account mirror writes a show's `provides` once, from the files it could decode then,
-/// and never rewrites an existing record, so a record mirrored before its files were selected, or
-/// from file names the episode parser could not read at the time, would otherwise cover nothing for
-/// good: the episode monitor then plans every aired episode it holds again on every run (each one a
-/// scrape and a provider listing that `acquire` answers with the very same pack). Only `Verified`
-/// show records are touched (a `Pending` one's `provides` is `observe`'s to settle), and only while
-/// the store still has an empty `provides` ([`Store::set_provides_if_empty`] — atomic, never
+/// and never rewrites an existing record, so a record whose file names the episode parser could not
+/// decode when it was written (e.g. `NxM` codes before `vfs::parse_se_all` learned them), or one
+/// written without `provides` by an older build, would otherwise cover nothing for good: the
+/// episode monitor then plans every aired episode it holds again on every run (each one a scrape
+/// and a provider listing that `acquire` answers with the very same pack). `infos` carries the file
+/// lists cached when each torrent was first identified (`seen_torrents` / the `matches` cache, not
+/// re-fetched while the torrent id stays listed), so this heals only names the parser has since
+/// learned, and records whose match was re-identified; a record captured from a listing with no
+/// files stays empty, and `monitor_episodes`' `AssumedCoverage` covers for it. Only `Verified` show
+/// records are touched (a `Pending` one's `provides` is `observe`'s to settle), and only while the
+/// store still has an empty `provides` ([`Store::set_provides_if_empty`] — atomic, never
 /// overwrites). Run by the scan loop's account-mirror pass. Returns how many were filled.
 pub(crate) async fn backfill_owned_provides(
     store: &Store,
@@ -1790,37 +1817,19 @@ async fn reap_absent_mirror_owned(
     if to_reap.is_empty() {
         return 0;
     }
-    // Index selection slots by (lowercased) hash ONCE so per-hash slot cleanup is O(1) rather than an
-    // O(reaped × selection-table) nested scan.
-    let slots_by_hash = index_selection_slots_by_hash(&store.all_selection().await);
     let mut reaped = 0;
     for h in &to_reap {
-        // Only count a record as reaped once its owned row is ACTUALLY gone — log (don't swallow via
-        // `let _`) a transient store error so a reported reap count can't overstate what happened.
-        // The record survives: the next daily prune tick notes it again, and the trusted listing
-        // after that confirms it.
-        match store.remove_owned(h.clone()).await {
-            Ok(()) => reaped += 1,
-            Err(e) => {
-                warn!(
-                    "reap: failed to remove absent-mirror owned record {} ({}); retried after the next daily prune tick",
-                    h, e
-                );
-                continue;
-            }
-        }
-        if let Err(e) = store.remove_authoritative(h.clone()).await {
-            warn!("reap: failed to remove authoritative id for {} ({})", h, e);
-        }
-        if let Some(slots) = slots_by_hash.get(&h.to_ascii_lowercase()) {
-            for slot in slots {
-                if let Err(e) = store.remove_selection(slot.clone()).await {
-                    warn!(
-                        "reap: failed to remove dangling selection slot {} for {} ({})",
-                        slot, h, e
-                    );
-                }
-            }
+        // Only count a record as reaped once it is ACTUALLY gone — log (don't swallow via `let _`) a
+        // transient store error so a reported reap count can't overstate what happened.
+        // `forget_owned` drops the record, its authoritative id and its slots in one transaction, so
+        // a failure leaves all of them: the next daily prune tick notes the record again, and the
+        // trusted listing after that confirms it.
+        match store.forget_owned(h.clone()).await {
+            Ok(_) => reaped += 1,
+            Err(e) => warn!(
+                "reap: failed to remove absent-mirror owned record {} ({}); retried after the next daily prune tick",
+                h, e
+            ),
         }
     }
     reaped
@@ -1892,20 +1901,6 @@ pub(crate) async fn backfill_missing_imdb_ids(
     filled
 }
 
-/// Index selection slots by lowercased hash, so a destructive pass that removes many hashes can look
-/// up each hash's slots in O(1) instead of re-scanning the whole selection snapshot per hash.
-fn index_selection_slots_by_hash(
-    selection: &[(String, crate::store::SelectionEntry)],
-) -> std::collections::HashMap<String, Vec<String>> {
-    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    for (slot, entry) in selection {
-        map.entry(entry.hash.to_ascii_lowercase())
-            .or_default()
-            .push(slot.clone());
-    }
-    map
-}
-
 /// Whether a torrent is a multi-film collection: more than one SELECTED feature-sized video
 /// ([`crate::acquire::FEATURE_MIN_BYTES`], the floor `acquire::count_feature_videos` uses to reject
 /// multi-movie packs; a sample or bonus clip is smaller). The engine never adds one for a movie
@@ -1923,6 +1918,21 @@ pub(crate) fn is_multi_feature_collection(info: &crate::rd_client::TorrentInfo) 
         })
         .count()
         > 1
+}
+
+/// Whether `info` holds an emittable video file ([`crate::vfs::emittable_video_files`]) whose name
+/// carries no episode code: `vfs::parse_se_all` reads nothing in its basename (an OVA or special
+/// named without one, a `Season 02/E01 - Title.mkv`, an anime absolute number). A show copy's
+/// `provides` leaves such a file out, yet the VFS shows it (in the season its folder or name
+/// gives), so no other copy's coverage accounts for it. [`plan_dedup`] never removes a show hash
+/// holding one, and the upgrade engine never prunes one in a show swap.
+pub(crate) fn holds_codeless_video(info: &crate::rd_client::TorrentInfo) -> bool {
+    crate::vfs::emittable_video_files(info)
+        .into_iter()
+        .any(|f| {
+            let base = f.path.rsplit('/').next().unwrap_or(&f.path);
+            crate::vfs::parse_se_all(base).is_empty()
+        })
 }
 
 /// The (lowercased) hashes of the multi-film collections among `infos`
@@ -1956,14 +1966,17 @@ pub(crate) fn multi_feature_hashes<'a>(
 ///
 /// Never overwrites an existing record (`put_owned_if_absent`): a hash the engine already owns (or
 /// a previously-recorded mirror hash) is left untouched, so an in-flight `Pending` acquisition or an
-/// engine record's provenance/`provides` is never clobbered — the one exception being a record with
-/// NO quality, which gets it filled from its file names ([`backfill_owned_quality`]). It never
-/// adopts a hash the engine has blacklisted (for any title) or one with an open staging intent (an
-/// add cut off before it was checked or recorded). It does remove records: a phantom — a `Verified`
-/// empty-provenance record adopted no later than its hash's newest non-"Dead" blacklist entry — is
-/// reaped together with its authoritative id and selection slots. `provides` for a show is the
-/// SE-parsed set of its selected video files (a movie's is empty); `quality` is derived from the
-/// representative (largest) video file via [`mirror_quality`] (`None` only when there is no video).
+/// engine record's provenance/`provides` is never clobbered. There are two exceptions, both
+/// filling only an unset field: a record with NO quality gets it from its file names
+/// ([`backfill_owned_quality`]), and a `Verified` show record with an EMPTY `provides`, engine
+/// records included, gets the episodes its file names now decode to ([`backfill_owned_provides`]).
+/// It never adopts a hash the engine has blacklisted (for any title) or one with an open staging
+/// intent (an upgrade candidate or an acquisition being added, or cut off mid-add, before it was
+/// checked or recorded). It does remove records: a phantom — a `Verified` empty-provenance record
+/// adopted no later than its hash's newest non-"Dead" blacklist entry — is reaped together with its
+/// authoritative id and selection slots. `provides` for a show is the SE-parsed set of its selected
+/// video files (a movie's is empty); `quality` is derived from the representative (largest) video
+/// file via [`mirror_quality`] (`None` only when there is no video).
 /// The IMDB lookup stops for the rest of a pass at the first transient TMDB failure (a TMDB outage
 /// would otherwise cost every new title a full retry budget, inline in the scan loop); the records
 /// it skips get an empty id, filled by the daily [`backfill_missing_imdb_ids`].
@@ -1978,10 +1991,11 @@ pub(crate) async fn record_mirror_owned(
     let mut imdb_cache: HashMap<(MediaType, u64), String> = HashMap::new();
     // Set by the first transient TMDB failure of the pass: TMDB is not asked again this pass.
     let mut tmdb_unavailable = false;
-    // Hashes the upgrade engine is staging (or was cut off staging: `upgrade::sweep_staging_intents`
-    // deletes those). Such a torrent is a candidate nothing has checked yet, so it is never adopted.
-    // Read BEFORE the owned snapshot: `record_staged` writes the owned record before it closes the
-    // intent, so a candidate is always in one snapshot or the other.
+    // Hashes with an open staging intent: an upgrade candidate or an acquisition being added, or
+    // cut off mid-add (`upgrade::sweep_staging_intents` deletes those). Such a torrent is a
+    // candidate nothing has checked yet, so it is never adopted. Read BEFORE the owned snapshot:
+    // `record_staged` (and `acquire`, with its `Pending` record) writes the owned record before it
+    // closes the intent, so a candidate is always in one snapshot or the other.
     let staging: std::collections::HashSet<String> = store
         .all_staging_intents()
         .await
@@ -2004,19 +2018,23 @@ pub(crate) async fn record_mirror_owned(
     // reclaim). Loaded once per tick; hash-scoped so it catches a wrong-title re-identification too.
     let blacklisted: std::collections::HashSet<String> = store.all_blacklisted_hashes().await;
     // Consistency reaper for a narrow race: a scan adopting a torrent that upgrade staging then
-    // rejects, blacklists and deletes (the blacklisting gates: WrongTitle / MoviePack /
-    // probe-Reject) — possible only when the staging closes its intent between this tick's listing
-    // and the intents snapshot above. It leaves a Verified empty-provenance record for a now-absent
-    // (or rejected) hash that nothing else cleans (dedup/observe ignore absent/mirror records). Reap
-    // it (store-only — no provider handle here; a still-present blacklisted torrent simply stays
-    // un-adopted via the skip below). The race adopts the record BEFORE staging blacklists the hash,
-    // so only a `Verified` empty-provenance record no newer than its hash's newest blacklist entry
-    // is a phantom. Left alone: an engine record (non-empty provenance) or a `Pending` one, whose
-    // lifecycle `observe` owns; a record staged or acquired for this title AFTER another title
-    // blacklisted the hash (the engine filters candidates by the per-title blacklist only). A "Dead"
-    // entry doesn't count either. `fail_and_reacquire` blacklists a hash only once every delete of
-    // it has succeeded, so a record it keeps for a delete retry carries no entry, and this reaper
-    // can't drop it (mirror records included).
+    // rejects, deletes and blacklists (the blacklisting gates: WrongTitle / MoviePack /
+    // probe-Reject). `scan_tick` already keeps out of the tick any hash whose intent was open
+    // before its listing (`staging_before`) or still open at the staging sweep, so the race needs a
+    // whole staging that opens its intent after the `staging_before` read and closes it (once the
+    // delete succeeded, before the blacklist write) ahead of the sweep, and so of the intents
+    // snapshot above, with the blacklist landing after this pass read it. It leaves a Verified
+    // empty-provenance record for a now-absent (or rejected) hash that nothing else cleans
+    // (dedup/observe ignore absent/mirror records). Reap it (store-only — no provider handle here;
+    // a still-present blacklisted torrent simply stays un-adopted via the skip below). The race
+    // adopts the record BEFORE staging blacklists the hash, so only a `Verified` empty-provenance
+    // record no newer than its hash's newest blacklist entry is a phantom. Left alone: an engine
+    // record (non-empty provenance) or a `Pending` one, whose lifecycle `observe` owns; a record
+    // staged or acquired for this title AFTER another title blacklisted the hash (the engine
+    // filters candidates by the per-title blacklist only). A "Dead" entry doesn't count either.
+    // `fail_and_reacquire` blacklists a hash only once every delete of it has succeeded, so a
+    // record it keeps for a delete retry carries no entry, and this reaper can't drop it (mirror
+    // records included).
     // A NON-blacklisting staging rejection (unverifiable Accept, probe Defer, not cached, a partial
     // or multi-season pack, ...) whose torrent a concurrent scan mirrored leaves an absent
     // empty-provenance record behind. Until the daily `reap_absent_mirror_owned` drops it, its hash
@@ -2042,36 +2060,18 @@ pub(crate) async fn record_mirror_owned(
         .map(|(h, _)| h.clone())
         .collect();
     if !phantoms.is_empty() {
-        let slots_by_hash = index_selection_slots_by_hash(&store.all_selection().await);
         let mut reaped = 0;
         for h in &phantoms {
-            // Count only records whose owned row was ACTUALLY removed; log (don't swallow) a transient
-            // store error so the reaped count can't overstate what happened (retried next tick).
-            match store.remove_owned(h.clone()).await {
-                Ok(()) => reaped += 1,
-                Err(e) => {
-                    warn!(
-                        "mirror: failed to reap phantom owned record {} ({}); will retry",
-                        h, e
-                    );
-                    continue;
-                }
-            }
-            if let Err(e) = store.remove_authoritative(h.clone()).await {
-                warn!(
-                    "mirror: failed to remove authoritative id for {} ({})",
+            // Count only records ACTUALLY removed; log (don't swallow) a transient store error so the
+            // reaped count can't overstate what happened (retried next tick). `forget_owned` drops the
+            // record, its authoritative id and its slots in one transaction, so a failure leaves no
+            // slot serving the blacklisted torrent with no record behind it.
+            match store.forget_owned(h.clone()).await {
+                Ok(_) => reaped += 1,
+                Err(e) => warn!(
+                    "mirror: failed to reap phantom owned record {} ({}); will retry",
                     h, e
-                );
-            }
-            if let Some(slots) = slots_by_hash.get(&h.to_ascii_lowercase()) {
-                for slot in slots {
-                    if let Err(e) = store.remove_selection(slot.clone()).await {
-                        warn!(
-                            "mirror: failed to remove selection slot {} for {} ({})",
-                            slot, h, e
-                        );
-                    }
-                }
+                ),
             }
         }
         info!(
@@ -2105,7 +2105,8 @@ pub(crate) async fn record_mirror_owned(
         if blacklisted.contains(&hash) {
             continue;
         }
-        // An upgrade candidate mid-staging (or cut off mid-staging) → never adopt (see `staging`).
+        // An upgrade candidate or an acquisition being added (or cut off mid-add) → never adopt
+        // (see `staging`).
         if staging.contains(&hash) {
             continue;
         }
@@ -2454,7 +2455,10 @@ pub(crate) struct DedupPlan {
 /// - **Show**: a greedy set-cover over the episodes each hash `provides`, best first — a hash whose
 ///   every episode is already provided by a kept hash of same-or-better quality is redundant →
 ///   remove; otherwise keep it. Complementary packs/episodes are therefore all kept. A show hash with
-///   **empty `provides`** (unknown coverage) is **always kept** — never removed on a guess.
+///   **empty `provides`** (unknown coverage) is **always kept**, never removed on a guess. So is one
+///   whose files (from `files`) include an emittable video file with no episode code in its name
+///   (an OVA, a `Season 02/E01 - Title.mkv`, an anime absolute number): `provides` leaves that file
+///   out, yet the VFS shows it, so no other copy's coverage accounts for it.
 ///
 /// Keep-priority (highest kept first): QUALITY first — [`crate::release::quality_rank`]:
 /// resolution, then source tier, then checked before `unverified` (an untagged axis is 0, so an
@@ -2571,9 +2575,17 @@ pub(crate) fn plan_dedup(
                     .iter()
                     .map(|(h, r)| (h.as_str(), rank_of(r)))
                     .collect();
-                // Manual (M-1) and unknown-coverage (empty `provides`) hashes are never removed.
-                let unremovable =
-                    |r: &OwnedRecord| r.provenance.has_manual_entry() || r.provides.is_empty();
+                // Hashes whose files are known and include an emittable video file with no
+                // episode code ([`holds_codeless_video`]).
+                let uncoded: HashSet<&str> = hashes
+                    .iter()
+                    .filter(|(h, _)| {
+                        files
+                            .get(h.as_str())
+                            .is_some_and(|info| holds_codeless_video(info))
+                    })
+                    .map(|(h, _)| h.as_str())
+                    .collect();
                 // Per hash whose files are known: the served rank of the file it would serve for
                 // each episode (its largest emittable video file carrying the episode code — every
                 // code of a multi-episode file, which the VFS keeps visible for each of them).
@@ -2604,6 +2616,12 @@ pub(crate) fn plan_dedup(
                         Some((h.as_str(), ranks))
                     })
                     .collect();
+                // Never removed: Manual (M-1), unknown coverage (empty `provides`), and a hash
+                // holding a video file with no episode code (`uncoded`: that file would go with it).
+                // A hash whose files aren't known is judged by its record alone.
+                let unremovable = |h: &str, r: &OwnedRecord| {
+                    r.provenance.has_manual_entry() || r.provides.is_empty() || uncoded.contains(h)
+                };
                 // The rank `h` serves `ep` at: its file's, or its record's when its files aren't
                 // known; `None` when its files are known and none carries the episode.
                 let rank_for = |h: &str, ep: &(u32, u32)| match served.get(h) {
@@ -2626,7 +2644,7 @@ pub(crate) fn plan_dedup(
                 // Greedy pass, best first: every hash kept so far ranks at least as high, so this
                 // keeps a hash exactly when it adds an episode no kept hash provides yet.
                 for (h, r) in &hashes {
-                    if !unremovable(r) && covered_by_same_or_better(h, &keep) {
+                    if !unremovable(h, r) && covered_by_same_or_better(h, &keep) {
                         remove.push(h.clone());
                     } else {
                         keep.push(h.clone());
@@ -2643,7 +2661,7 @@ pub(crate) fn plan_dedup(
                 // never breaks total coverage.
                 let removable: HashMap<&str, bool> = hashes
                     .iter()
-                    .map(|(h, r)| (h.as_str(), !unremovable(r)))
+                    .map(|(h, r)| (h.as_str(), !unremovable(h, r)))
                     .collect();
                 let mut i = keep.len();
                 while i > 0 {
@@ -2730,13 +2748,13 @@ pub(crate) async fn dedup_owned(
             .push(t.id.clone());
     }
     let owned = app.store.all_owned().await;
-    let selection = app.store.all_selection().await;
-    let selected: std::collections::HashSet<String> = selection
+    let selected: std::collections::HashSet<String> = app
+        .store
+        .all_selection()
+        .await
         .iter()
         .map(|(_, e)| e.hash.to_ascii_lowercase())
         .collect();
-    // Index slots by hash ONCE so per-removed-hash selection cleanup is O(1), not O(removed × table).
-    let slots_by_hash = index_selection_slots_by_hash(&selection);
 
     let files: HashMap<String, &crate::rd_client::TorrentInfo> = current
         .iter()
@@ -2820,33 +2838,20 @@ pub(crate) async fn dedup_owned(
             if delete_failed {
                 continue;
             }
-            // The torrent is already gone from the provider; if dropping the owned record fails, the
-            // stale record would never be reclaimed (plan_dedup only considers PRESENT hashes), so
-            // log it and DON'T count the hash as removed — mirrors `execute_remove`'s discipline.
-            if let Err(e) = app.store.remove_owned(h.clone()).await {
+            // The torrent is already gone from the provider: drop its owned record, authoritative
+            // identification and every selection slot that still names it (the VFS re-derives such
+            // a slot from the kept covering hash on the next scan), in one transaction. The slots
+            // are matched in that transaction, so a slot a concurrent upgrade swap moved to another
+            // copy after the snapshot above is kept. If it fails, the stale record would never be
+            // reclaimed (plan_dedup only considers PRESENT hashes), so log it and DON'T count the
+            // hash as removed — mirrors `execute_remove`'s discipline.
+            if let Err(e) = app.store.forget_owned(h.clone()).await {
                 warn!(
-                    "dedup: remove_owned {} failed after delete: {} — record left stale",
+                    "dedup: dropping the owned record of {} failed after delete: {} — record left stale",
                     short(h),
                     e
                 );
                 continue;
-            }
-            if let Err(e) = app.store.remove_authoritative(h.clone()).await {
-                warn!("dedup: remove_authoritative {} failed: {}", short(h), e);
-            }
-            // Clear any selection slot that pointed at the removed hash (the VFS re-derives it from
-            // the kept covering hash on the next scan).
-            if let Some(slots) = slots_by_hash.get(&h.to_ascii_lowercase()) {
-                for slot in slots {
-                    if let Err(e) = app.store.remove_selection(slot.clone()).await {
-                        warn!(
-                            "dedup: remove selection slot {} for {} failed: {}",
-                            slot,
-                            short(h),
-                            e
-                        );
-                    }
-                }
             }
             removed += 1;
         }
@@ -3025,8 +3030,8 @@ async fn execute_remove(
     hashes: &[String],
 ) {
     // A reason-scoped removal can resolve to zero hashes (e.g. a Trigger-A finish on a mirror-only
-    // title that protects every pre-existing copy). Skip early so we don't read the whole selection
-    // table just to iterate an empty list.
+    // title that protects every pre-existing copy). Skip early: there is nothing to do, not even the
+    // idle check.
     if hashes.is_empty() {
         return;
     }
@@ -3042,13 +3047,9 @@ async fn execute_remove(
         );
         return;
     }
-    // NOTE: on a delete failure we skip remove_owned so the next reconcile tick retries — leaving
-    // the owned record intact means the Remove op is re-derived and the torrent is retried instead
-    // of being silently orphaned on the provider.
-    //
-    // Read + index the selection table ONCE (we only ever remove from it below), so per-hash slot
-    // cleanup is O(1) rather than an O(hashes × table) nested scan.
-    let slots_by_hash = index_selection_slots_by_hash(&store.all_selection().await);
+    // NOTE: on a delete failure we keep the owned record so the next reconcile tick retries — leaving
+    // it intact means the Remove op is re-derived and the torrent is retried instead of being
+    // silently orphaned on the provider.
     let mut removed = 0usize;
     for hash in hashes {
         let mut delete_failed = false;
@@ -3067,28 +3068,17 @@ async fn execute_remove(
         if delete_failed {
             continue; // leave the owned record so the next reconcile retries
         }
-        if let Err(e) = store.remove_owned(hash.clone()).await {
-            warn!("reconcile: remove_owned {} (tmdb {}) failed: {}; leaving selection intact for retry", hash, tmdb_id, e);
+        // Drop the owned record, its authoritative identification and every selection slot that
+        // still names the hash, in one transaction (a slot a concurrent upgrade swap moved to
+        // another copy meanwhile is kept). On failure all of them stay, for the next tick's retry.
+        if let Err(e) = store.forget_owned(hash.clone()).await {
+            warn!(
+                "reconcile: dropping the owned record of {} (tmdb {}) failed: {}; left for retry",
+                hash, tmdb_id, e
+            );
             continue;
         }
         removed += 1;
-        if let Err(e) = store.remove_authoritative(hash.clone()).await {
-            warn!(
-                "reconcile: remove_authoritative {} (tmdb {}) failed: {}",
-                hash, tmdb_id, e
-            );
-        }
-        // SP3: drop any selection slots this hash represented.
-        if let Some(slots) = slots_by_hash.get(&hash.to_ascii_lowercase()) {
-            for slot in slots {
-                if let Err(e) = store.remove_selection(slot.clone()).await {
-                    warn!(
-                        "reconcile: remove selection slot {} for {} failed: {}",
-                        slot, hash, e
-                    );
-                }
-            }
-        }
     }
     if removed > 0 {
         info!(
@@ -4224,9 +4214,9 @@ mod tests {
         assert!(!crate::release::is_unknown_quality(&q, 1080));
     }
 
-    /// A show record whose `provides` is empty (mirrored before its files were selected, or from
-    /// file names the episode parser could not decode then) gets its `provides` re-derived from the
-    /// listed torrent's files by the mirror pass, so the episode monitor counts its episodes as
+    /// A show record whose `provides` is empty (written from file names the episode parser could not
+    /// decode then, such as `NxM` codes) gets its `provides` re-derived from the listed torrent's
+    /// files by the mirror pass, so the episode monitor counts its episodes as
     /// covered instead of re-planning them every run. A `Pending` record (`observe` settles its
     /// `provides`) and a record that already lists episodes are left alone.
     #[tokio::test]
@@ -5555,6 +5545,115 @@ mod tests {
         );
     }
 
+    /// A show pack's `provides` lists only the files whose names carry an episode code, yet the VFS
+    /// shows every one of its video files (a code-less file lands in the season its folder names).
+    /// A pack holding such a file is therefore never removed, even when every coded episode is
+    /// covered by a better (greedy pass) or equal (second sweep) copy: that file would go with it.
+    #[test]
+    fn plan_dedup_never_removes_a_show_pack_holding_a_file_with_no_episode_code() {
+        use crate::scraper::MediaKind;
+        let info = |hash: &str, paths: &[&str]| crate::rd_client::TorrentInfo {
+            hash: hash.into(),
+            status: "downloaded".into(),
+            files: paths
+                .iter()
+                .enumerate()
+                .map(|(i, path)| crate::rd_client::TorrentFile {
+                    id: i as u32,
+                    path: (*path).into(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mirror = || Provenance { entries: vec![] };
+        // `pack_files` is pack A's file list, `(a_q, b_q)` the two copies' qualities, `b_eps` the
+        // episodes B provides (its files are `Show.S01Exx.1080p.BluRay.mkv`).
+        let run = |pack_files: &[&str],
+                   a_q: crate::release::QualitySummary,
+                   b_q: crate::release::QualitySummary,
+                   b_eps: Vec<(u32, u32)>| {
+            let owned = vec![
+                (
+                    "a".to_string(),
+                    qrec(MediaKind::Series, 7, eps(1, 1, 2), Some(a_q), mirror()),
+                ),
+                (
+                    "b".to_string(),
+                    qrec(MediaKind::Series, 7, b_eps.clone(), Some(b_q), mirror()),
+                ),
+            ];
+            let b_paths: Vec<String> = b_eps
+                .iter()
+                .map(|(s, e)| format!("Show.S{s:02}E{e:02}.1080p.BluRay.mkv"))
+                .collect();
+            let a = info("a", pack_files);
+            let b = info("b", &b_paths.iter().map(String::as_str).collect::<Vec<_>>());
+            let files: HashMap<String, &crate::rd_client::TorrentInfo> =
+                [("a".to_string(), &a), ("b".to_string(), &b)]
+                    .into_iter()
+                    .collect();
+            removed_for(
+                &plan_dedup(
+                    &owned,
+                    &hset(&["a", "b"]),
+                    &hset(&[]),
+                    &std::collections::HashSet::new(),
+                    &files,
+                ),
+                7,
+            )
+        };
+        let with_codeless = [
+            "Pack/Season 01/Show.S01E01.720p.WEB.mkv",
+            "Pack/Season 01/Show.S01E02.720p.WEB.mkv",
+            "Pack/Season 02/E01 - Title.mkv",
+        ];
+        let coded_only = &with_codeless[..2];
+
+        // Greedy pass: B (1080p BluRay) outranks A (720p WEB) and covers both coded episodes.
+        assert!(
+            run(
+                &with_codeless,
+                qs(720, 3_000, 1),
+                qs(1080, 6_000, 1),
+                eps(1, 1, 2)
+            )
+            .is_empty(),
+            "the pack holding a code-less file is kept"
+        );
+        assert_eq!(
+            run(
+                coded_only,
+                qs(720, 3_000, 1),
+                qs(1080, 6_000, 1),
+                eps(1, 1, 2)
+            ),
+            vec!["a".to_string()],
+            "control: without the code-less file the covered pack is removed"
+        );
+
+        // Second sweep: A outranks B on score at an equal rank, so the greedy pass keeps A; B adds
+        // S01E03, so it is kept too, and the sweep then finds A covered by B.
+        let a_q = qs(1080, 6_000, 9);
+        let b_q = qs(1080, 6_000, 1);
+        let with_codeless_1080 = [
+            "Pack/Season 01/Show.S01E01.1080p.BluRay.mkv",
+            "Pack/Season 01/Show.S01E02.1080p.BluRay.mkv",
+            "Pack/Season 02/E01 - Title.mkv",
+        ];
+        assert!(
+            run(&with_codeless_1080, a_q.clone(), b_q.clone(), eps(1, 1, 3)).is_empty(),
+            "the second sweep keeps the pack holding a code-less file"
+        );
+        assert_eq!(
+            run(&with_codeless_1080[..2], a_q, b_q, eps(1, 1, 3)),
+            vec!["a".to_string()],
+            "control: the second sweep removes the equal-rank pack B covers"
+        );
+    }
+
     /// Only SELECTED feature-sized videos count: a collection with one film selected is a
     /// single-film copy, and a sample or bonus clip is no film.
     #[test]
@@ -6704,6 +6803,7 @@ mod trakt_sync_tests {
             media_type,
             tmdb_id,
             imdb_id: None,
+            paused_episode: None,
         }
     }
 
@@ -6712,6 +6812,7 @@ mod trakt_sync_tests {
             media_type,
             tmdb_id,
             imdb_id: Some(imdb_id.to_string()),
+            paused_episode: None,
         }
     }
 
@@ -8958,6 +9059,7 @@ mod reconcile_wanted_tests {
             media_type: MediaType::Movie,
             tmdb_id: 27205,
             imdb_id: None,
+            paused_episode: None,
         }];
         let watched = WatchedData {
             movies: vec![27205],
@@ -9016,6 +9118,7 @@ mod reconcile_wanted_tests {
             media_type: MediaType::Show,
             tmdb_id: 100,
             imdb_id: None,
+            paused_episode: None,
         }];
         let watched = WatchedData {
             movies: vec![],
@@ -9047,14 +9150,81 @@ mod reconcile_wanted_tests {
         assert!(actions.is_empty(), "{actions:?}");
     }
 
+    /// A paused re-watch of a show begun without resetting Trakt progress reads every aired episode
+    /// as watched, so the catch-up skip set dropped them all: an episode lapsed or deleted since was
+    /// never acquired again, and an unowned show nothing at all. The sync drops the paused episode
+    /// and every later one from that row's watched set, so the re-watch gets everything from the
+    /// pause on, and nothing before it (a first watch is unchanged: those episodes are unwatched).
+    #[test]
+    fn a_paused_rewatch_of_a_show_acquires_from_the_paused_episode_on() {
+        use crate::trakt_client::{TraktItem, WatchedData, WatchedShow};
+        use crate::wanted::Action;
+        let playback = [TraktItem {
+            media_type: MediaType::Show,
+            tmdb_id: 100,
+            imdb_id: None,
+            paused_episode: Some((1, 3)),
+        }];
+        let all = vec![(1, 1), (1, 2), (1, 3), (1, 4), (2, 1)];
+        let watched = WatchedData {
+            movies: vec![],
+            shows: vec![WatchedShow {
+                tmdb_id: 100,
+                trakt_id: Some(1),
+                imdb_id: None,
+                watched_episodes: all.clone(),
+                last_watched_at: Some(1_000),
+            }],
+        };
+        let status = HashMap::from([(100u64, ShowStatus::Ended)]);
+        let rows = build_wanted("alice", &[], &playback, &watched, &status, None, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].watched_state,
+            WatchedState::Show {
+                watched_episodes: vec![(1, 1), (1, 2)],
+                trakt_behind: true,
+            }
+        );
+        let aired = AiredEpisodes {
+            pairs: all,
+            complete: true,
+        };
+        let acquire = |eps: &[(u32, u32)]| -> Vec<Action> {
+            eps.iter()
+                .map(|&(season, episode)| Action::AcquireEpisode {
+                    tmdb_id: 100,
+                    season,
+                    episode,
+                })
+                .collect()
+        };
+        let none = std::collections::HashSet::new();
+        assert_eq!(
+            plan_episode_actions(100, &rows, None, &none, &aired, false),
+            acquire(&[(1, 3), (1, 4), (2, 1)]),
+            "unowned: everything from the paused episode on"
+        );
+        // Owned, but S01E01 and S01E04 have lapsed: only the one at or after the pause comes back.
+        let owned = owned_group_show(
+            &["h1"],
+            &[(1, 2), (1, 3), (2, 1)],
+            Provenance::in_progress("alice"),
+        );
+        let present: std::collections::HashSet<String> = ["h1".to_string()].into_iter().collect();
+        assert_eq!(
+            plan_episode_actions(100, &rows, Some(&owned), &present, &aired, false),
+            acquire(&[(1, 4)])
+        );
+    }
+
     #[tokio::test]
     async fn plan_finished_mirror_only_movie_emits_no_remove_op() {
         // A movie the user already had in their library (mirror copy, EMPTY provenance) whose wanted
         // row reads finished (in-progress + watched: a state the sync no longer writes for a movie in
         // `/sync/playback`, but the planner must stay safe on) triggers Trigger-A, but
         // `removal_hashes` protects the mirror copy (movies are never folded). The planner must NOT
-        // emit a no-op empty Remove
-        // op each tick — it would churn an empty op and a full selection-table read in execute_remove.
+        // emit a no-op empty Remove op each tick: it would churn an empty op through execute_remove.
         let store = mem_store();
         store
             .put_wanted(wanted_movie("alice", 27205, false, true, true))
@@ -9370,8 +9540,10 @@ mod reconcile_wanted_tests {
         let mut fin_on = removal_hashes(&g, RemoveReason::Finished, /*flag*/ true);
         fin_on.sort();
         assert_eq!(fin_on, vec!["engine".to_string(), "mirror".to_string()]);
-        // With the flag OFF, a Trigger-A removal can only be a genuine in-progress re-watch, which
-        // must KEEP the user's pre-existing mirror copy — only the engine hash is reclaimed.
+        // With the flag OFF only the engine hash is reclaimed. The sync writes no show row that
+        // reads finished then (a `/sync/playback` show is `trakt_behind`, and a catch-up show is
+        // folded in only while Trakt reports it behind), so this is the backstop `removal_hashes`
+        // documents: whatever reads finished must not delete the user's pre-existing mirror copy.
         assert_eq!(
             removal_hashes(&g, RemoveReason::Finished, /*flag*/ false),
             vec!["engine".to_string()]
@@ -9390,9 +9562,10 @@ mod reconcile_wanted_tests {
     #[test]
     fn removal_hashes_movie_mirror_is_never_finish_reclaimed() {
         use crate::wanted::RemoveReason;
-        // A MOVIE group with a pre-existing mirror copy. REMOVE_FINISHED_SHOWS never folds movies, so
-        // a movie mirror must NEVER be Trigger-A reclaimed — even with the flag on — or a re-watched
-        // (in /sync/playback + watched) pre-existing movie would be deleted from the user's library.
+        // A MOVIE group with a pre-existing mirror copy. REMOVE_FINISHED_SHOWS never folds movies,
+        // and the sync never writes an in-progress movie row as finished (a `/sync/playback` movie
+        // is written unwatched), so a movie mirror must NEVER be Trigger-A reclaimed, even with the
+        // flag on: the same backstop, so whatever reads finished never deletes the user's own copy.
         let g = OwnedGroup {
             hashes: vec!["engine".into(), "mirror".into()],
             engine_hashes: vec!["engine".into()],
@@ -10739,6 +10912,133 @@ mod dedup_owned_tests {
             store.get_selection(movie_slot(27205)).await.unwrap().hash,
             "better",
             "the kept copy's selection is intact"
+        );
+    }
+
+    /// A provider whose `delete_torrent` first repoints `slot` to `to`, as a concurrent upgrade swap
+    /// can while a destructive pass is deleting the copy the slot served.
+    struct RepointOnDelete {
+        inner: MockProvider,
+        store: Store,
+        slot: String,
+        to: SelectionEntry,
+    }
+    impl std::fmt::Debug for RepointOnDelete {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RepointOnDelete")
+                .field("slot", &self.slot)
+                .finish_non_exhaustive()
+        }
+    }
+    #[async_trait::async_trait]
+    impl DebridProvider for RepointOnDelete {
+        fn name(&self) -> &'static str {
+            "repoint-on-delete"
+        }
+        async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
+            self.inner.get_torrents().await
+        }
+        async fn get_torrent_info(
+            &self,
+            id: &str,
+        ) -> Result<crate::rd_client::TorrentInfo, reqwest::Error> {
+            self.inner.get_torrent_info(id).await
+        }
+        async fn add_magnet(
+            &self,
+            magnet: &str,
+        ) -> Result<crate::rd_client::AddMagnetResponse, reqwest::Error> {
+            self.inner.add_magnet(magnet).await
+        }
+        async fn select_files(&self, t: &str, f: &str) -> Result<(), reqwest::Error> {
+            self.inner.select_files(t, f).await
+        }
+        async fn delete_torrent(&self, id: &str) -> Result<(), reqwest::Error> {
+            self.store
+                .put_selection(self.slot.clone(), self.to.clone())
+                .await
+                .unwrap();
+            self.inner.delete_torrent(id).await
+        }
+        async fn resolve_url(
+            &self,
+            l: &crate::provider::FileLocator,
+        ) -> Result<String, crate::error::AppError> {
+            self.inner.resolve_url(l).await
+        }
+        async fn invalidate(&self, l: &crate::provider::FileLocator) {
+            self.inner.invalidate(l).await
+        }
+    }
+
+    /// The fixture with the movie slot on the copy being removed ("worse"), and a provider that
+    /// repoints that slot to a freshly staged copy while the copy is deleted.
+    async fn repoint_race_fixture() -> (Store, Vec<Torrent>, Arc<dyn DebridProvider>) {
+        let (store, deleted, torrents, _) = fixture().await;
+        let worse = SelectionEntry {
+            hash: "worse".into(),
+            file_path: "m.mkv".into(),
+        };
+        store.put_selection(movie_slot(27205), worse).await.unwrap();
+        let provider: Arc<dyn DebridProvider> = Arc::new(RepointOnDelete {
+            inner: MockProvider {
+                torrents: torrents.clone(),
+                deleted,
+                ..Default::default()
+            },
+            store: store.clone(),
+            slot: movie_slot(27205),
+            to: SelectionEntry {
+                hash: "staged".into(),
+                file_path: "new.mkv".into(),
+            },
+        });
+        (store, torrents, provider)
+    }
+
+    /// Dedup reads the selection table before its provider deletes. A slot an upgrade swap moves
+    /// off the removed copy in the meantime must survive the cleanup: deleting it by key would
+    /// leave the episode or film unmanaged, and nothing re-creates a slot.
+    #[tokio::test]
+    async fn dedup_keeps_a_slot_repointed_while_it_deletes() {
+        let (store, torrents, provider) = repoint_race_fixture().await;
+        let app = build_app(store.clone(), provider, true).await;
+        dedup_owned(
+            &app,
+            &torrents,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &[],
+        )
+        .await;
+        assert!(store.get_owned("worse".into()).await.is_none(), "deduped");
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "staged",
+            "the slot the swap repointed is kept"
+        );
+    }
+
+    /// The same race in a Trakt lifecycle removal (`execute_remove`).
+    #[tokio::test]
+    async fn execute_remove_keeps_a_slot_repointed_while_it_deletes() {
+        let (store, torrents, provider) = repoint_race_fixture().await;
+        let idle = Arc::new(crate::read_activity::ReadActivity::without_startup_grace());
+        execute_remove(
+            &provider,
+            &torrents,
+            &store,
+            &idle,
+            Duration::from_secs(300),
+            27205,
+            &["worse".to_string()],
+        )
+        .await;
+        assert!(store.get_owned("worse".into()).await.is_none(), "removed");
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "staged",
+            "the slot the swap repointed is kept"
         );
     }
 

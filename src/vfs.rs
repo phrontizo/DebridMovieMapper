@@ -17,8 +17,9 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 
 /// Parse ALL `(season, episode)` pairs a file name declares: a single `SxxEyy` (also with one `.`,
 /// space or `_` before the `E`: `S01.E05`, `S01 E05`), a single `NxM` (`2x05`), their MULTI-episode
-/// forms (`S01E01E02`, `S01E01-E02`, `S01E01.E02`, Sonarr's "Extend" `S01E01-02`, `1x01x02`,
-/// `1x01-1x02`, `1x01-02`), or the dash-concatenated absolute code (`Show - 409 - Title` →
+/// forms (`S01E01E02`, `S01E01-E02`, `S01E01.E02`, Sonarr's "Extend" `S01E01-02`, its "Duplicate"
+/// `S01E01.S01E02` / `S01E01 - S01E02`, `1x01x02`, `1x01-1x02`, `1x01-02`), or the
+/// dash-concatenated absolute code (`Show - 409 - Title` →
 /// `[(4, 9)]`). Empty when no episode code is found. The first element is the file's FIRST code
 /// (`parse_se`).
 ///
@@ -41,22 +42,25 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// continuation), except a dash-only one directly after the code (`S01E01-02-03`), which counts only
 /// when it is a whole number naming the NEXT episode (so `S01E05-720p` and `S01E09-10bit` don't) and
 /// is not the whole part of a channel layout: a single digit followed by `.` and one more digit
-/// (`S01E04-5.1`, `S01E01-2.0`), while `S01E01-02.1080p` still counts.
+/// (`S01E04-5.1`, `S01E01-2.0`), while `S01E01-02.1080p` still counts. After those, a separated full
+/// code of the SAME season (`.S01E02`, `-S01E02`, ` - S01E02`) continues the run too, as `1x01-1x02`
+/// does for `NxM`; another season's code or an episode 00 ends it.
 ///
 /// The `NxM` arm, tried when there is no `SxxEyy` code, takes identification's bounds: a 1-2 digit
-/// season and a 2-3 digit episode (never `00`), bounded on both sides by a non-alphanumeric character
-/// or the string edge, so `_` separates it as `.` does while a pixel size (`1920x1080`), an aspect
-/// ratio (`16x9`), a version suffix (`1x01v2`) and a codec (`x264`) are no codes. Nor is a channel
-/// layout run into a codec (`DD5.1x264`): a season digit right after `<digit>.` is skipped. Its
-/// continuations are a repeated `xNN` (`1x01x02`), a separated code of the SAME season (`1x01-1x02`;
-/// another season's code ends the run) and the dash-only one above (`1x01-02`).
+/// season and a 2-3 digit episode (never `00`) with an optional version suffix (`1x01v2`, read as
+/// `S01E01v2` is), bounded on both sides by a non-alphanumeric character or the string edge, so `_`
+/// separates it as `.` does while a pixel size (`1920x1080`), an aspect ratio (`16x9`) and a codec
+/// (`x264`) are no codes. Nor is a channel layout run into a codec (`DD5.1x264`): a season digit
+/// right after `<digit>.` is skipped. Its continuations are a repeated `xNN` (`1x01x02`), a
+/// separated code of the SAME season (`1x01-1x02`; another season's code ends the run) and the
+/// dash-only one above (`1x01-02`).
 ///
 /// An `NxM` or separated `S01.E01` code followed by a range to another episode (`1x01-10`,
 /// `1x01~10`, `S01.E01-10`, `S01.E01-S01.E10`: `opens_episode_range`) decodes to nothing, as these
 /// forms did before they were read: its first code alone would make a pack named this way read as a
 /// single episode (`upgrade::is_single_episode_stream`, whose range test knows only the contiguous
 /// `S01E01-10` form). An explicit second code (`1x01-1x10`, `S01.E01-E10`) gives the two endpoints,
-/// as `S01E01-E10` does.
+/// as `S01E01-E10` and `S01E01-S01E10` do.
 ///
 /// KNOWN LIMITATIONS: a RANGE form spanning more than two episodes yields only the explicit
 /// endpoints (`S01E01-E03` → `[(1,1),(1,3)]`) or, without the `e`, only the first episode
@@ -68,7 +72,11 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// 1–9) are accepted, so a 4-digit year/date token (`Show - 2024 - Title`) never decodes, and an
 /// episode-00 decode is rejected. The dash code needs SPACE-dash-SPACE on both sides, so a dotted
 /// scene form (`Show.-.409.-.Title`) yields no code at all (an empty `provides` for such a file), as
-/// does other absolute numbering (`Show - 041 [1080p]`).
+/// does other absolute numbering (`Show - 041 [1080p]`). The acquisition engine still accepts a
+/// SINGLE-file release named that way (`acquire::codeless_episode`): its trailing number is the
+/// episode, in the season the VFS places the file in (season 1 unless the name or a directory names
+/// one). A multi-file pack of such files, or an absolute number past season 1 (`Show - 30` for
+/// S02E05), names no episode there, so `observe` still rejects it as `EpisodeMissing`.
 pub(crate) fn parse_se_all(name: &str) -> Vec<(u32, u32)> {
     static DASH_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s-\s(\d{3})\s-\s").unwrap());
     if let Some(eps) = sxxeyy_codes(name).or_else(|| nxm_codes(name)) {
@@ -95,13 +103,14 @@ static SXXEYY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)s(\d{1,2})([ ._]?)e(\d{1,3})((?:[-_. ]?e\d{1,3})*)").unwrap()
 });
 
-/// An `NxM` code (`2x05`) and its repeated (`x02`) or separated (`-1x02`) continuations (group 3),
+/// An `NxM` code (`2x05`, with an optional version suffix: `1x01v2`, as the `SxxEyy` arm reads
+/// `S01E01v2`) and its repeated (`x02`) or separated (`-1x02`) continuations (group 3),
 /// bounded by a non-alphanumeric character or the string edge on both sides. The regex crate has
 /// no look-around, so these boundaries consume a character; `find_nxm` adds the checks a regex
 /// can't make.
 static NXM_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?:^|[^a-z0-9])(\d{1,2})x(\d{2,3})((?:x\d{2,3}|[-_. ]\d{1,2}x\d{2,3})*)(?:[^a-z0-9]|$)",
+        r"(?i)(?:^|[^a-z0-9])(\d{1,2})x(\d{2,3})(?:v\d{1,2})?((?:x\d{2,3}|[-_. ]\d{1,2}x\d{2,3})*)(?:[^a-z0-9]|$)",
     )
     .unwrap()
 });
@@ -127,7 +136,32 @@ fn sxxeyy_codes(name: &str) -> Option<Vec<(u32, u32)>> {
     if separated && opens_episode_range(tail) {
         return None;
     }
+    extend_with_same_season_codes(tail, s, &mut eps);
     Some(eps)
+}
+
+/// Extend `eps` (all of season `s`) with the separated full codes of the same season that open
+/// `tail`: Sonarr's "Duplicate" multi-episode style (`S01E01.S01E02`, `S01E01-S01E02`,
+/// `S01E01 - S01E02`), as the `NxM` arm reads `1x01-1x02`. Another season's code or an episode 00
+/// ends the run.
+fn extend_with_same_season_codes(mut tail: &str, s: u32, eps: &mut Vec<(u32, u32)>) {
+    static NEXT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^(?:\s-\s|[-_. ])s(\d{1,2})[ ._]?e(\d{1,3})(?:[^0-9]|$)").unwrap()
+    });
+    while let Some(next) = NEXT.captures(tail) {
+        let season = next.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
+        let episode = next.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
+        let (Some(season), Some(e), Some(digits)) = (season, episode, next.get(2)) else {
+            break;
+        };
+        if season != s || e == 0 {
+            break;
+        }
+        if !eps.contains(&(s, e)) {
+            eps.push((s, e));
+        }
+        tail = &tail[digits.end()..];
+    }
 }
 
 /// `parse_se_all`'s `NxM` arm: `None` when `name` has no such code, or when it opens a range.
@@ -171,9 +205,7 @@ fn find_nxm(name: &str) -> Option<regex::Captures<'_>> {
     let mut at = 0;
     while let Some(c) = NXM_RE.captures_at(name, at) {
         let season = c.get(1)?;
-        let channel_layout = season.start() >= 2
-            && bytes[season.start() - 1] == b'.'
-            && bytes[season.start() - 2].is_ascii_digit();
+        let channel_layout = follows_channel_layout(bytes, season.start());
         let episode_00 = c
             .get(2)
             .is_some_and(|m| m.as_str().bytes().all(|b| b == b'0'));
@@ -184,6 +216,13 @@ fn find_nxm(name: &str) -> Option<regex::Captures<'_>> {
         at = season.start();
     }
     None
+}
+
+/// Whether the digit at `digit_start` is the fraction of a channel layout run into a codec
+/// (`DD5.1x264`, `AAC2.0x264`): it follows `<digit>.`. `find_nxm` and `season_tokens` both skip such
+/// an `NxM`/`NxNN` token, so the episode reader and the season placement agree on it.
+fn follows_channel_layout(bytes: &[u8], digit_start: usize) -> bool {
+    digit_start >= 2 && bytes[digit_start - 1] == b'.' && bytes[digit_start - 2].is_ascii_digit()
 }
 
 /// Extend `eps` (all of season `s`) with the dash-only continuations that open `tail` (Sonarr's
@@ -1225,11 +1264,16 @@ static EXCLUDED_LEADING_RE: LazyLock<Regex> =
 /// a bare 4-digit year is NOT a resolution, so it is preserved). Anchored so the metadata token must
 /// come IMMEDIATELY after the keyword+separator. Matched against the filename stem.
 static EXCLUDED_LEADING_METADATA_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)^(?:trailer|extras?)[._\s-](?:\d{3,4}p|4k|uhd|web|webdl|web-dl|webrip|web-rip|bluray|blu-ray|bdrip|brrip|hdtv|dvdrip|remux|hdr|hevc|x264|x265)\b",
-    )
+    Regex::new(&format!(
+        r"(?i)^(?:trailer|extras?)[._\s-](?:{RELEASE_TAG_TOKENS})\b"
+    ))
     .unwrap()
 });
+
+/// The resolution, source and codec tokens that mark a keyword next to them as a clip descriptor
+/// (`EXCLUDED_LEADING_METADATA_RE`, `RELEASE_TAG_RE`). A year is not one of them: after a leading
+/// keyword it marks a title (`Extras.2020`), so only `RELEASE_TAG_RE` adds it.
+const RELEASE_TAG_TOKENS: &str = r"\d{3,4}p|4k|uhd|web|webdl|web-dl|webrip|web-rip|bluray|blu-ray|bdrip|brrip|hdtv|dvdrip|remux|hdr|hevc|x264|x265|h264|h265";
 
 /// A release-year token. In `is_video_file` a keyword followed by the year (and with none before it)
 /// is part of the title ("The.Extra.Man.2010"), one after the year is a descriptor
@@ -1244,11 +1288,63 @@ static RELEASE_YEAR_RE: LazyLock<Regex> =
 /// the code (a title word: "Some.Trailer.Show.S02E03"), and when it sits in an extras/bonus
 /// directory (a mis-foldered real episode). It never rescues a `sample` keyword or a file in a
 /// `Sample`/`Samples` folder: scene samples carry the full release name and its episode code
-/// (`sample-show.s01e01…`, `Sample/show.s01e01…`).
-fn episode_code_start(name: &str) -> Option<usize> {
-    let sxxeyy = SXXEYY_RE.find(name).map(|m| m.start());
-    let nxm = find_nxm(name).and_then(|c| c.get(1)).map(|m| m.start());
+/// (`sample-show.s01e01…`, `Sample/show.s01e01…`). Returned as `(start, end)`, `end` being where
+/// the code's `SxxEyy` match (its `E` continuations included) or `NxM` match ends; a keyword after it
+/// is judged by `keyword_after_code_is_descriptor`.
+fn episode_code_span(name: &str) -> Option<(usize, usize)> {
+    let sxxeyy = SXXEYY_RE.find(name).map(|m| (m.start(), m.end()));
+    let nxm = find_nxm(name).and_then(|c| Some((c.get(1)?.start(), c.get(3)?.end())));
     sxxeyy.into_iter().chain(nxm).min()
+}
+
+/// A word token: a run of letters or digits (`is_video_file` has already mapped `_` to `.`).
+static WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\p{L}\p{N}]+").unwrap());
+
+/// A token that still belongs to an episode code right after it: a dash continuation (`-02`), a
+/// version suffix (`v2`), or another code (`.S01E02`, `.E02`, `-1x02`).
+static CODE_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:\d{1,3}|v\d{1,2}|s\d{1,2}|e\d{1,3}|s\d{1,2}e\d{1,3}(?:e\d{1,3})*|\d{1,2}x\d{2,3}(?:v\d{1,2})?(?:x\d{2,3})*)$")
+        .unwrap()
+});
+
+/// A release tag opening the text it is matched against: a resolution, source or codec token (the
+/// shared `RELEASE_TAG_TOKENS`) or a release year.
+static RELEASE_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"(?i)^(?:{RELEASE_TAG_TOKENS}|(?:19|20)\d{{2}})\b"
+    ))
+    .unwrap()
+});
+
+/// Whether the excluded keyword `kw` of `stem`, after an episode code that ends at `code_end`,
+/// describes the file (an extras clip) rather than being a word of the episode title. It is a
+/// descriptor in the tag part (after the first release tag that follows the code:
+/// `Show.S01E01.1080p.WEB-GRP.featurette`), and as the first word after the code when the end of the
+/// name, a release tag or a trailing `-GROUP` follows it (`Show.S01E05.Featurette`,
+/// `Show.S01E05-trailer`, `Show.S01E05.Extras.1080p`, `Show.S01E05.Featurette-GRP`). Anything else is
+/// a title word: `Show.S03E07.The.Extra.1080p`, `Show - S02E05 - Bonus Round`.
+fn keyword_after_code_is_descriptor(stem: &str, code_end: usize, kw: &regex::Match<'_>) -> bool {
+    let between = &stem[code_end..kw.start()];
+    if WORD_RE
+        .find_iter(between)
+        .any(|w| RELEASE_TAG_RE.is_match(&between[w.start()..]))
+    {
+        return true;
+    }
+    if !WORD_RE
+        .find_iter(between)
+        .all(|w| CODE_TOKEN_RE.is_match(w.as_str()))
+    {
+        return false;
+    }
+    let rest = &stem[kw.end()..];
+    match WORD_RE.find(rest) {
+        None => true,
+        Some(w) => {
+            RELEASE_TAG_RE.is_match(&rest[w.start()..])
+                || (rest[..w.start()].ends_with('-') && w.end() == rest.len())
+        }
+    }
 }
 
 /// Regex matching release-site / release-group advertisement clips that ship
@@ -1309,7 +1405,7 @@ pub fn is_video_file(path: &str) -> bool {
     else {
         return false;
     };
-    let episode = episode_code_start(stem);
+    let episode = episode_code_span(stem);
     // Decide whether an excluded keyword (sample/trailer/extras/…) marks this as an ANCILLARY clip
     // rather than real content. Every occurrence is judged, and ANY descriptor makes the file
     // ancillary. An occurrence is a TITLE word when:
@@ -1317,15 +1413,23 @@ pub fn is_video_file(path: &str) -> bool {
     //   "Extras 2020"), unless a resolution/source tag immediately follows it (a metadata-suffixed
     //   clip like `Trailer.1080p.WEB-DL`, which would otherwise be surfaced as a bogus "movie");
     // - it comes BEFORE the episode code ("Some.Trailer.Show.S02E03");
+    // - it is a word of the episode title AFTER the code ("Show.S03E07.The.Extra.1080p",
+    //   "Show - S02E05 - Bonus Round"): not alone as the code's first word, and not in the tag part
+    //   (`keyword_after_code_is_descriptor`);
     // - with no episode code, it sits mid-title BEFORE the release year with no year ahead of it
     //   ("The.Extra.Man.2010.1080p", "The.Bonus.Army.2024").
     // `sample` is never a title word, wherever it sits ("sample-show.s01e01…" is a sample).
-    // Anything else is a descriptor: after the episode code ("Show.S01E01.sample" — an episode code
-    // does NOT rescue a trailing-descriptor sample), after the year ("Movie.2010.Trailer"), trailing
-    // with no year ("Movie.Name.Trailer"), or, with no episode code, leading the stem as
-    // `bonus`/`featurette`.
+    // Anything else is a descriptor: alone after the episode code ("Show.S01E05.Featurette",
+    // "Show.S01E05-trailer", "Show.S01E05.Extras.1080p"), in the tag part after it
+    // ("Show.S01E01.1080p.WEB-GRP.featurette"; an episode code does NOT rescue a sample either), after
+    // the year ("Movie.2010.Trailer"), trailing with no year ("Movie.Name.Trailer"), or, with no
+    // episode code, leading the stem as `bonus`/`featurette`.
     // KNOWN LIMITATIONS: a title that leads with `bonus`/`featurette` ("Bonus.Track.2023") is still
     // excluded, and a trailer named with the keyword before the year ("Movie.Trailer.2010") is kept.
+    // After an episode code, an episode titled with the bare keyword is excluded
+    // ("Show.S01E05.Extras.1080p" reads as an extras clip), and a clip whose keyword sits among
+    // other words before the tags is kept ("Show.S01E05.Featurette.Making.Of",
+    // "Show.S01E05.Making.Of.Featurette").
     let leading_title =
         EXCLUDED_LEADING_RE.is_match(stem) && !EXCLUDED_LEADING_METADATA_RE.is_match(stem);
     let ancillary = EXCLUDED_VIDEO_RE.find_iter(stem).any(|kw| {
@@ -1333,8 +1437,8 @@ pub fn is_video_file(path: &str) -> bool {
             false
         } else if kw.start() == 0 && leading_title {
             true
-        } else if let Some(ep) = episode {
-            kw.start() < ep
+        } else if let Some((start, end)) = episode {
+            kw.start() < start || !keyword_after_code_is_descriptor(stem, end, &kw)
         } else {
             kw.start() > 0
                 && RELEASE_YEAR_RE.is_match(&stem[kw.end()..])
@@ -1389,13 +1493,22 @@ fn normalize_dir_component(component: &str) -> std::borrow::Cow<'_, str> {
 /// The season numbers an arbitrary string (a file name or one directory name) names via SEASON_RE,
 /// as `(strong, part)`: `strong` from its first `Sxx` / `Season N` / `NxNN` token, `part` from its
 /// first `Part N` token. Kept apart because `Part N` is the weaker signal (a two-part episode title
-/// as often as a season). Used by the season-folder placement in the show-emit loop.
-fn season_tokens(s: &str) -> (Option<u32>, Option<u32>) {
+/// as often as a season). An `NxNN` token that is a channel layout run into a codec (`AAC2.0x264`,
+/// `follows_channel_layout`) names no season. Used by the season-folder placement in the show-emit
+/// loop, and by the upgrade engine to tell a season pack's torrent name (`Show.S01.1080p`) from a
+/// single's (`upgrade::is_pack_stream`).
+pub(crate) fn season_tokens(s: &str) -> (Option<u32>, Option<u32>) {
     let (mut strong, mut part) = (None, None);
     let mut at = 0;
     while let Some(cap) = SEASON_RE.captures_at(s, at) {
         let number = |i| cap.get(i).and_then(|m| m.as_str().parse::<u32>().ok());
-        strong = strong.or_else(|| number(1).or_else(|| number(2)).or_else(|| number(3)));
+        // An `NxNN` token whose season digit follows `<digit>.` is a channel layout run into a codec
+        // (`AAC2.0x264`), no season, as `find_nxm` reads it.
+        let nxnn = cap
+            .get(3)
+            .filter(|m| !follows_channel_layout(s.as_bytes(), m.start()))
+            .and_then(|m| m.as_str().parse::<u32>().ok());
+        strong = strong.or_else(|| number(1).or_else(|| number(2)).or(nxnn));
         part = part.or_else(|| number(4));
         if strong.is_some() && part.is_some() {
             break;
@@ -1426,8 +1539,10 @@ fn season_tokens(s: &str) -> (Option<u32>, Option<u32>) {
 /// `Part N` DIRECTORY, though, names a season (a show released in parts, "Show/Part 3/01.mkv"), and
 /// deliberately beats a season token in an outer directory too ("Show.S04/Part 2/01.mkv" lands in
 /// Season 02), since the root of such a pack often names a season RANGE ("Show.S01-S05/Part 3/")
-/// whose first season would be wrong.
-fn season_of_codeless_file(path: &str, filename: &str) -> u32 {
+/// whose first season would be wrong. The acquisition engine reads an absolute-numbered single-file
+/// release's season from it too (`acquire::codeless_episode`), so it slots the episode the VFS
+/// places the file under.
+pub(crate) fn season_of_codeless_file(path: &str, filename: &str) -> u32 {
     let (strong, part) = season_tokens(filename);
     strong
         .or_else(|| {
@@ -2865,6 +2980,37 @@ mod tests {
     }
 
     #[test]
+    fn is_video_file_keeps_an_episode_title_word_after_the_episode_code() {
+        // A keyword in an episode title after the code is part of that title. Excluding it hid the
+        // episode, kept Real-Debrid from selecting it, and left it out of a pack's `provides`.
+        assert!(is_video_file(
+            "Show.S03E07.The.Extra.1080p.WEB.h264-GRP.mkv"
+        ));
+        assert!(is_video_file("Show - S02E05 - Bonus Round.mkv"));
+        assert!(is_video_file(
+            "Show (2010) - S01E10 - Trailer Trash (1080p BluRay x265).mkv"
+        ));
+        assert!(is_video_file("Show.S04E02.Extra.Credit.mkv"));
+        assert!(is_video_file("Show - 2x05 - Bonus Round.mkv"));
+        assert!(is_video_file("Show.S01E05.Featurette.Making.Of.mkv"));
+        // The keyword alone after the code (the end of the name, a release tag or a group follows
+        // it), a Plex-style suffix, and a keyword in the tag part are still descriptors.
+        assert!(!is_video_file("Show.S01E05.Featurette.mkv"));
+        assert!(!is_video_file("Show.S01E05-trailer.mkv"));
+        assert!(!is_video_file("Show.S01E05.Extras.1080p.mkv"));
+        assert!(!is_video_file("Show.S01E05.Featurette-GRP.mkv"));
+        assert!(!is_video_file("Show - S01E05 - Trailer (1080p).mkv"));
+        assert!(!is_video_file("Show.S01E01E02.Extras.720p.mkv"));
+        assert!(!is_video_file("Show.S01E01-02.Bonus.mkv"));
+        assert!(!is_video_file(
+            "Show.S01E01.1080p.WEB.x264-GRP.featurette.mkv"
+        ));
+        assert!(!is_video_file("Show.S01E01.1080p.Extra.Credit.mkv"));
+        // `sample` stays a descriptor wherever it sits.
+        assert!(!is_video_file("Show.S01E05.Sample.Round.mkv"));
+    }
+
+    #[test]
     fn is_video_file_keeps_a_title_word_keyword_before_the_release_year() {
         // A keyword mid-title, before the release year, is part of the title ("The Extra Man",
         // 2010), not a descriptor. Excluding it hid the film and made every acquisition candidate
@@ -3077,10 +3223,42 @@ mod tests {
         assert!(parse_se_all("Movie.2010.x264.mkv").is_empty());
         assert!(parse_se_all("Movie.2010.DD5.1x264.mkv").is_empty());
         assert!(parse_se_all("Show.1x00.mkv").is_empty());
-        assert!(parse_se_all("Show.1x01v2.mkv").is_empty());
         assert!(parse_se_all("Show.2x720p.mkv").is_empty());
         // The contiguous form keeps winning over a later channel layout.
         assert_eq!(parse_se_all("Show.S01E01.DD5.1x264.mkv"), vec![(1, 1)]);
+        // A version suffix is read as the `SxxEyy` arm reads it (`S01E01v2`).
+        assert_eq!(parse_se_all("Show - 1x01v2 - Title.mkv"), vec![(1, 1)]);
+        assert_eq!(parse_se_all("Show.1x01v2.mkv"), vec![(1, 1)]);
+        assert_eq!(parse_se_all("Show.S01E01v2.mkv"), vec![(1, 1)]);
+    }
+
+    #[test]
+    fn parse_se_all_reads_a_separated_same_season_sxxeyy_code() {
+        // Sonarr's "Duplicate" multi-episode style repeats the whole code after the separator, as
+        // the `NxM` arm's `1x01-1x02` does.
+        assert_eq!(
+            parse_se_all("Show.S01E01.S01E02.720p.mkv"),
+            vec![(1, 1), (1, 2)]
+        );
+        assert_eq!(
+            parse_se_all("Show.S01E01-S01E02.720p.mkv"),
+            vec![(1, 1), (1, 2)]
+        );
+        assert_eq!(
+            parse_se_all("Show - S01E01 - S01E02 - Title.mkv"),
+            vec![(1, 1), (1, 2)]
+        );
+        assert_eq!(parse_se_all("Show S01E01 S01E02.mkv"), vec![(1, 1), (1, 2)]);
+        // A range's explicit second code gives its endpoints, as `S01E01-E10` does.
+        assert_eq!(
+            parse_se_all("Show S01E01 - S01E10 1080p"),
+            vec![(1, 1), (1, 10)]
+        );
+        // Another season's code, or an episode 00, ends the run.
+        assert_eq!(parse_se_all("Show.S01E01.S02E05.mkv"), vec![(1, 1)]);
+        assert_eq!(parse_se_all("Show.S01E01.S01E00.mkv"), vec![(1, 1)]);
+        // A separated first code that opens a range still decodes to nothing.
+        assert!(parse_se_all("Show.S01.E01-S01.E10.720p").is_empty());
     }
 
     #[test]
@@ -4155,6 +4333,24 @@ mod tests {
         assert_eq!(season_tokens("Show.12x05.mkv"), (Some(12), None));
         // An explicit SxxExx marker still wins even when a resolution is present.
         assert_eq!(season_tokens("Show.S03E05.1920x1080.mkv"), (Some(3), None));
+        // Nor is a channel layout run into a codec a season (`parse_se_all` reads no code there
+        // either), so the directory's season places such a code-less file.
+        assert_eq!(season_tokens("05 - Title.AAC2.0x264.mkv"), (None, None));
+        assert_eq!(season_tokens("05 - Title.DD5.1x264.mkv"), (None, None));
+        assert_eq!(
+            season_of_codeless_file(
+                "Show/Season 3/05 - Title.AAC2.0x264.mkv",
+                "05 - Title.AAC2.0x264.mkv"
+            ),
+            3
+        );
+        assert_eq!(
+            season_of_codeless_file(
+                "Show/Season 3/05 - Title.DD5.1x264.mkv",
+                "05 - Title.DD5.1x264.mkv"
+            ),
+            3
+        );
     }
 
     #[test]

@@ -170,8 +170,8 @@ where
 pub async fn run(app: AppState, shutdown: watch::Receiver<bool>) {
     let mut handles = Vec::new();
 
-    // Scan task (account sync + acquisition verification, both inlined in run_scan_loop) —
-    // unchanged behaviour, own internal cadence.
+    // Scan task (run_scan_loop → scan_tick every SCAN_INTERVAL_SECS: account sync + acquisition
+    // verification), own internal cadence.
     // Supervised so a panic in a single tick can't silently freeze the most important subsystem
     // (VFS refresh + observe + repair-replacement processing + account-mirror/dedup) for the process
     // lifetime — it is restarted after a short backoff, mirroring the per-tick `catch_unwind`

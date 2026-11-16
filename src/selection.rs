@@ -107,14 +107,16 @@ pub fn plan_selection_repoints(
         }
     }
     // The file a copy would serve for a slot: the largest emittable video file — for an episode,
-    // among those whose first episode code is that episode.
-    let file_for = |hash: &str, episode: Option<(u32, u32)>| -> Option<String> {
+    // among those whose first episode code is that episode. Each candidate's files are indexed once
+    // per plan, on its first lookup, so a pack offered for many slots is scanned and parsed once
+    // rather than once per slot.
+    let mut file_index: HashMap<String, FileIndex> = HashMap::new();
+    let mut file_for = |hash: &str, episode: Option<(u32, u32)>| -> Option<String> {
         let t = present_by_hash.get(hash)?;
-        crate::vfs::emittable_video_files(t)
-            .into_iter()
-            .filter(|f| episode.is_none_or(|ep| crate::vfs::episode_of_file(&f.path) == Some(ep)))
-            .max_by_key(|f| f.bytes)
-            .map(|f| f.path.clone())
+        if !file_index.contains_key(hash) {
+            file_index.insert(hash.to_string(), FileIndex::of(t));
+        }
+        file_index[hash].file_for(episode).map(|f| f.path.clone())
     };
 
     let mut out = Vec::new();
@@ -237,6 +239,45 @@ pub fn plan_selection_repoints(
     }
     out.sort_by(|a, b| a.slot.cmp(&b.slot));
     out
+}
+
+/// A present copy's emittable video files (`vfs::emittable_video_files`) as
+/// [`plan_selection_repoints`] looks them up: the largest one overall (what a movie copy serves),
+/// and per FIRST episode code (`vfs::episode_of_file`) the largest one carrying it (what an episode
+/// copy serves). Of equally large files the LAST in provider order wins, as `Iterator::max_by_key`
+/// picks.
+struct FileIndex<'a> {
+    largest: Option<&'a crate::rd_client::TorrentFile>,
+    by_episode: std::collections::HashMap<(u32, u32), &'a crate::rd_client::TorrentFile>,
+}
+
+impl<'a> FileIndex<'a> {
+    fn of(t: &'a TorrentInfo) -> Self {
+        let mut index = FileIndex {
+            largest: None,
+            by_episode: std::collections::HashMap::new(),
+        };
+        for f in crate::vfs::emittable_video_files(t) {
+            if index.largest.is_none_or(|l| f.bytes >= l.bytes) {
+                index.largest = Some(f);
+            }
+            if let Some(ep) = crate::vfs::episode_of_file(&f.path) {
+                let best = index.by_episode.entry(ep).or_insert(f);
+                if f.bytes >= best.bytes {
+                    *best = f;
+                }
+            }
+        }
+        index
+    }
+
+    /// The file this copy serves for a slot: `episode`'s, or for a movie (`None`) the largest.
+    fn file_for(&self, episode: Option<(u32, u32)>) -> Option<&'a crate::rd_client::TorrentFile> {
+        match episode {
+            None => self.largest,
+            Some(ep) => self.by_episode.get(&ep).copied(),
+        }
+    }
 }
 
 /// The [`QualityRank`](crate::release::QualityRank) of the file a copy serves for a slot: its
@@ -944,6 +985,86 @@ mod tests {
                 to: sel("bluray", "Film/Film.1080p.BluRay.mkv"),
             }]
         );
+    }
+
+    /// The file a better copy serves for each slot, as the planner looks it up from the copy's
+    /// per-plan file index: the largest emittable video file whose FIRST episode code is the slot's
+    /// episode (the last of equally large ones, as `Iterator::max_by_key` picks), or for a movie
+    /// the largest emittable video file. An episode the pack has no emittable file for (only a
+    /// sample) is not repointed.
+    #[test]
+    fn a_pack_serving_several_slots_serves_each_its_own_largest_file() {
+        let owned = vec![
+            (
+                "cur".to_string(),
+                rec(MediaKind::Series, 7, eps(1, 4), q(720, 3_000, 1)),
+            ),
+            (
+                "pack".to_string(),
+                rec(MediaKind::Series, 7, eps(1, 4), q(1080, 8_000, 1)),
+            ),
+            (
+                "web".to_string(),
+                rec(MediaKind::Movie, 5, vec![], q(720, 3_000, 1)),
+            ),
+            (
+                "bluray".to_string(),
+                rec(MediaKind::Movie, 5, vec![], q(1080, 6_000, 1)),
+            ),
+        ];
+        let cur = info(
+            "cur",
+            &[
+                ("Show.S01E01.mkv", 1),
+                ("Show.S01E02.mkv", 1),
+                ("Show.S01E03.mkv", 1),
+                ("Show.S01E04.mkv", 1),
+            ],
+        );
+        let pack = info(
+            "pack",
+            &[
+                ("P/a/Show.S01E01.mkv", 5),
+                ("P/b/Show.S01E01.mkv", 5),
+                ("P/Show.S01E02E03.mkv", 9),
+                ("P/Show.S01E02.mkv", 4),
+                ("P/Show.S01E03.mkv", 6),
+                ("P/Sample/Show.S01E04.mkv", 3),
+            ],
+        );
+        let web = info("web", &[("Film.720p.WEB.mkv", 3)]);
+        let bluray = info(
+            "bluray",
+            &[("Film/Film.Part.A.mkv", 8), ("Film/Film.Part.B.mkv", 8)],
+        );
+        let selection: Vec<_> = (1..=4)
+            .map(|e| {
+                (
+                    episode_slot(7, 1, e),
+                    sel("cur", &format!("Show.S01E0{e}.mkv")),
+                )
+            })
+            .chain([(movie_slot(5), sel("web", "Film.720p.WEB.mkv"))])
+            .collect();
+        let plan = plan_selection_repoints(
+            &owned,
+            &selection,
+            &[&cur, &pack, &web, &bluray],
+            OFF,
+            &prefs(),
+        );
+        let to: Vec<_> = plan
+            .iter()
+            .map(|r| (r.slot.clone(), r.to.clone()))
+            .collect();
+        let mut expected = vec![
+            (episode_slot(7, 1, 1), sel("pack", "P/b/Show.S01E01.mkv")),
+            (episode_slot(7, 1, 2), sel("pack", "P/Show.S01E02E03.mkv")),
+            (episode_slot(7, 1, 3), sel("pack", "P/Show.S01E03.mkv")),
+            (movie_slot(5), sel("bluray", "Film/Film.Part.B.mkv")),
+        ];
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(to, expected);
     }
 
     /// A slot never moves from a checked copy onto an unchecked one at the same resolution, even of

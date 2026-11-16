@@ -727,8 +727,9 @@ mod tests {
         assert!(healthcheck(port), "an HTTP response must report healthy");
         let _ = h.join();
 
-        // A server that accepts but replies with non-HTTP bytes (e.g. an exhausted pool dropping the
-        // stream after a bare accept) → unhealthy. A bare TCP connect would have falsely passed.
+        // A server that accepts and reads the request, then closes without answering (e.g. an
+        // exhausted pool dropping the stream) → unhealthy. A bare TCP connect would have falsely
+        // passed.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let h = std::thread::spawn(move || {
@@ -740,7 +741,24 @@ mod tests {
         });
         assert!(
             !healthcheck(port),
-            "a dropped/non-HTTP connection must report unhealthy"
+            "a connection closed without an answer must report unhealthy"
+        );
+        let _ = h.join();
+
+        // A server that answers with something other than HTTP (another service on the port) →
+        // unhealthy.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 128];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"SSH-2.0-OpenSSH_9.6\r\n");
+            }
+        });
+        assert!(
+            !healthcheck(port),
+            "a non-HTTP answer must report unhealthy"
         );
         let _ = h.join();
 
@@ -758,7 +776,7 @@ mod tests {
     fn healthcheck_accumulates_a_split_status_line() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
-        // MAIN1: the "HTTP/" prefix arrives split across multiple reads — "HT" then, after a delay,
+        // The "HTTP/" prefix arrives split across multiple reads — "HT" then, after a delay,
         // the rest. The accumulation loop must gather ≥5 bytes and report healthy, NOT mark a healthy
         // server unhealthy because the first read() delivered fewer than 5 bytes.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

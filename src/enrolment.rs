@@ -36,10 +36,49 @@ pub struct EnrolmentService {
     /// Extra hostnames (lowercase, no port) accepted in the `Host` header on top of the built-in
     /// local-network names — from `TRAKT_ENROL_ALLOWED_HOSTS`, e.g. a reverse proxy's FQDN.
     allowed_hosts: Vec<String>,
+    /// Slugs whose Refresh click's refresh is still running. That refresh outlives the click (see
+    /// the refresh route), so without this every further click while Trakt throttles would queue
+    /// one more refresh behind the shared rate limiter, pushing the background sync back further.
+    refreshing: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// A slug's claim on `EnrolmentService::refreshing`, released on drop (a panicking refresh too).
+struct RefreshClaim {
+    refreshing: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    slug: String,
+}
+
+impl RefreshClaim {
+    /// `None` while a refresh of `slug` is already running.
+    fn take(
+        refreshing: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+        slug: &str,
+    ) -> Option<Self> {
+        let mut set = refreshing.lock().unwrap_or_else(|e| e.into_inner());
+        set.insert(slug.to_string()).then(|| RefreshClaim {
+            refreshing: refreshing.clone(),
+            slug: slug.to_string(),
+        })
+    }
+}
+
+impl Drop for RefreshClaim {
+    fn drop(&mut self) {
+        self.refreshing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.slug);
+    }
 }
 
 /// Max simultaneous pending device-flow enrolments (each holds a slot for the ~600s poll window).
 const MAX_CONCURRENT_ENROLMENTS: usize = 3;
+
+/// How long a Refresh or Enrol click waits on Trakt before the page answers. Both calls share the
+/// Trakt client's rate limiter with the background sync, so while a throttled sync has parked it
+/// a 429 back-off (up to `ratelimit::MAX_RETRY_AFTER_SECS` per attempt) would otherwise hold the
+/// browser, and its connection permit, for minutes.
+const TRAKT_CLICK_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 impl EnrolmentService {
     pub fn new(trakt: Arc<dyn TraktClient>, store: Store) -> Self {
@@ -48,6 +87,7 @@ impl EnrolmentService {
             store,
             inflight: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ENROLMENTS)),
             allowed_hosts: Vec::new(),
+            refreshing: Default::default(),
         }
     }
 
@@ -113,12 +153,45 @@ impl EnrolmentService {
                 // `decode_path_segment`) — otherwise a fallback slug with a space/special byte
                 // never matches the stored key and the button silently no-ops.
                 let slug = decode_path_segment(slug);
-                if let Err(e) = self.refresh_account(&slug).await {
-                    // refresh_account already logs a Trakt-refresh failure (flagging the account
-                    // only for a non-transient one); the only error surfaced here is a token-store
-                    // write failure, which would otherwise be lost silently (unlike the `remove`
-                    // arm below).
-                    warn!("Trakt token refresh persist failed for '{}': {}", slug, e);
+                let Some(claim) = RefreshClaim::take(&self.refreshing, &slug) else {
+                    info!(
+                        "Trakt token refresh for '{}' is already running; not starting another",
+                        slug
+                    );
+                    return redirect("/trakt/accounts");
+                };
+                // The refresh runs in its own task, so a browser that gives up and closes the
+                // connection (dropping this future) can't cut it off after Trakt has processed the
+                // grant and lose the rotated single-use refresh token. That is also why the
+                // refresh itself is never put under a timeout. The click waits for it at most
+                // `TRAKT_CLICK_WAIT`. A refresh held up longer by the shared limiter's 429
+                // back-off finishes in the background, and the accounts page shows the outcome
+                // once reloaded.
+                let svc = self.clone();
+                let task_slug = slug.clone();
+                let refresh = tokio::spawn(async move {
+                    let _claim = claim;
+                    if let Err(e) = svc.refresh_account(&task_slug).await {
+                        // refresh_account already logs a Trakt-refresh failure (flagging the
+                        // account only for a non-transient one); the only error surfaced here is a
+                        // token-store write failure, which would otherwise be lost silently
+                        // (unlike the `remove` arm below).
+                        warn!(
+                            "Trakt token refresh persist failed for '{}': {}",
+                            task_slug, e
+                        );
+                    }
+                });
+                match tokio::time::timeout(TRAKT_CLICK_WAIT, refresh).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("Trakt token refresh for '{}' panicked: {}", slug, e),
+                    // Dropping the JoinHandle detaches the task; it is not aborted.
+                    Err(_) => info!(
+                        "Trakt token refresh for '{}' is still waiting on Trakt after {}s \
+                         (rate-limited?); it carries on in the background",
+                        slug,
+                        TRAKT_CLICK_WAIT.as_secs()
+                    ),
                 }
                 redirect("/trakt/accounts")
             }
@@ -148,7 +221,8 @@ impl EnrolmentService {
     }
 
     /// Begin device-flow enrolment: fetch a device code, spawn the background poll that
-    /// completes the link, and return HTML showing the user_code + verification URL.
+    /// completes the link, and return HTML showing the user_code + verification URL. A device code
+    /// that takes longer than `TRAKT_CLICK_WAIT` to arrive is given up on with a 503.
     pub(crate) async fn start_enrolment(&self) -> Response<Body> {
         // Admit only a small bounded number of in-flight enrolments (the route is unauthenticated).
         // The owned permit is moved into the background poll below and released when it
@@ -163,9 +237,11 @@ impl EnrolmentService {
                     .to_string(),
             );
         };
-        let dc = match self.trakt.device_code().await {
-            Ok(dc) => dc,
-            Err(e) => {
+        // Unlike the Refresh click's refresh, this request may be cut off: an unused device code
+        // simply expires.
+        let dc = match tokio::time::timeout(TRAKT_CLICK_WAIT, self.trakt.device_code()).await {
+            Ok(Ok(dc)) => dc,
+            Ok(Err(e)) => {
                 // `permit` drops here, releasing the slot for the next attempt.
                 return html(
                     StatusCode::BAD_GATEWAY,
@@ -174,6 +250,22 @@ impl EnrolmentService {
                          <body><h1>Could not start enrolment</h1><p>{}</p></body></html>",
                         esc(&e.to_string())
                     ),
+                );
+            }
+            Err(_) => {
+                warn!(
+                    "Trakt device-code request still unanswered after {}s (rate-limited?); \
+                     answering 503",
+                    TRAKT_CLICK_WAIT.as_secs()
+                );
+                // `permit` drops here too.
+                return html(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Enrolment error</title></head>\
+                     <body><h1>Could not start enrolment</h1>\
+                     <p>Trakt is slow to answer (probably rate-limiting); try again shortly.</p>\
+                     <p><a href=\"/trakt/accounts\">Back to accounts</a></p></body></html>"
+                        .to_string(),
                 );
             }
         };
@@ -1927,6 +2019,232 @@ mod tests {
         assert!(
             !tok.needs_reenrolment,
             "a rate-limited refresh must NOT flag re-enrolment"
+        );
+    }
+
+    /// A `MockTrakt` whose `device_code` and `refresh` take `delay` to answer, as they do while the
+    /// shared Trakt rate limiter waits out a 429 back-off (up to minutes per attempt).
+    struct SlowTrakt {
+        inner: MockTrakt,
+        delay: std::time::Duration,
+        refresh_calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl TraktClient for SlowTrakt {
+        async fn device_code(&self) -> Result<DeviceCode, AppError> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.device_code().await
+        }
+        async fn poll_token(&self, dc: &str) -> Result<DeviceTokenPoll, AppError> {
+            self.inner.poll_token(dc).await
+        }
+        async fn refresh(&self, refresh_token: &str) -> Result<TraktTokenResponse, AppError> {
+            self.refresh_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.inner.refresh(refresh_token).await
+        }
+        async fn me(&self, at: &str) -> Result<TraktUser, AppError> {
+            self.inner.me(at).await
+        }
+        async fn watchlist(
+            &self,
+            at: &str,
+        ) -> Result<Vec<crate::trakt_client::TraktItem>, AppError> {
+            self.inner.watchlist(at).await
+        }
+        async fn in_progress(
+            &self,
+            at: &str,
+        ) -> Result<Vec<crate::trakt_client::TraktItem>, AppError> {
+            self.inner.in_progress(at).await
+        }
+        async fn watched(&self, at: &str) -> Result<crate::trakt_client::WatchedData, AppError> {
+            self.inner.watched(at).await
+        }
+        async fn show_progress(
+            &self,
+            at: &str,
+            trakt_id: u64,
+        ) -> Result<crate::trakt_client::ShowProgress, AppError> {
+            self.inner.show_progress(at, trakt_id).await
+        }
+    }
+
+    fn slow_refreshing_trakt(delay: std::time::Duration) -> Arc<SlowTrakt> {
+        Arc::new(SlowTrakt {
+            inner: MockTrakt {
+                token: TraktTokenResponse {
+                    access_token: "FRESH".into(),
+                    refresh_token: "NEWREF".into(),
+                    expires_in: 100,
+                    created_at: 2_000,
+                },
+                ..Default::default()
+            },
+            delay,
+            refresh_calls: Default::default(),
+        })
+    }
+
+    async fn refresh_click(svc: &EnrolmentService) -> Response<Body> {
+        svc.handle(routed_req(
+            Method::POST,
+            "http://host.local/trakt/accounts/alice/refresh",
+            true,
+        ))
+        .await
+    }
+
+    /// Clicking Refresh again while an earlier click's refresh is still waiting on Trakt starts no
+    /// second refresh (each would queue one more request behind the throttled limiter, delaying the
+    /// background sync further). Once it has finished, a click refreshes again.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_click_does_not_start_a_second_refresh_while_one_is_running() {
+        use std::sync::atomic::Ordering;
+        let store = Store::in_memory();
+        store
+            .put_trakt_tokens("alice".into(), tokens_fixture("OLD", "Alice"))
+            .await
+            .unwrap();
+        let slow = std::time::Duration::from_secs(300);
+        let trakt = slow_refreshing_trakt(slow);
+        let svc = EnrolmentService::new(trakt.clone(), store.clone());
+
+        assert_eq!(refresh_click(&svc).await.status(), StatusCode::SEE_OTHER);
+        let started = tokio::time::Instant::now();
+        assert_eq!(refresh_click(&svc).await.status(), StatusCode::SEE_OTHER);
+        assert!(
+            started.elapsed() < TRAKT_CLICK_WAIT,
+            "a click while a refresh is running answers at once, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(trakt.refresh_calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(slow).await;
+        for _ in 0..50 {
+            if store.get_trakt_tokens("alice".into()).await.unwrap().access == "FRESH" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            store.get_trakt_tokens("alice".into()).await.unwrap().access,
+            "FRESH"
+        );
+        assert_eq!(refresh_click(&svc).await.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            trakt.refresh_calls.load(Ordering::SeqCst),
+            2,
+            "a click after the refresh finished refreshes again"
+        );
+    }
+
+    /// A Refresh click whose refresh answers within the bound redirects once the new tokens are
+    /// stored, as before.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_click_waits_for_a_prompt_refresh() {
+        let store = Store::in_memory();
+        store
+            .put_trakt_tokens("alice".into(), tokens_fixture("OLD", "Alice"))
+            .await
+            .unwrap();
+        let svc = EnrolmentService::new(
+            slow_refreshing_trakt(std::time::Duration::from_secs(1)),
+            store.clone(),
+        );
+        let r = svc
+            .handle(routed_req(
+                Method::POST,
+                "http://host.local/trakt/accounts/alice/refresh",
+                true,
+            ))
+            .await;
+        assert_eq!(r.status(), StatusCode::SEE_OTHER);
+        let tok = store.get_trakt_tokens("alice".into()).await.unwrap();
+        assert_eq!(tok.access, "FRESH", "stored before the redirect");
+        assert_eq!(tok.refresh, "NEWREF");
+    }
+
+    /// While the Trakt limiter waits out a 429 back-off, a Refresh click must not hang the browser
+    /// for minutes: it redirects after `TRAKT_CLICK_WAIT`, and the refresh runs on to completion
+    /// (cancelling it after Trakt processed the grant would lose the rotated refresh token).
+    #[tokio::test(start_paused = true)]
+    async fn refresh_click_answers_while_a_throttled_refresh_finishes_in_the_background() {
+        let store = Store::in_memory();
+        store
+            .put_trakt_tokens("alice".into(), tokens_fixture("OLD", "Alice"))
+            .await
+            .unwrap();
+        let slow = std::time::Duration::from_secs(300);
+        let svc = EnrolmentService::new(slow_refreshing_trakt(slow), store.clone());
+        let started = tokio::time::Instant::now();
+        let r = svc
+            .handle(routed_req(
+                Method::POST,
+                "http://host.local/trakt/accounts/alice/refresh",
+                true,
+            ))
+            .await;
+        assert_eq!(r.status(), StatusCode::SEE_OTHER);
+        assert!(
+            started.elapsed() <= TRAKT_CLICK_WAIT,
+            "the click must be answered within the bound, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            store.get_trakt_tokens("alice".into()).await.unwrap().access,
+            "OLD",
+            "the refresh is still waiting on Trakt"
+        );
+
+        tokio::time::sleep(slow).await;
+        let mut tok = store.get_trakt_tokens("alice".into()).await.unwrap();
+        for _ in 0..50 {
+            if tok.access == "FRESH" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tok = store.get_trakt_tokens("alice".into()).await.unwrap();
+        }
+        assert_eq!(
+            tok.access, "FRESH",
+            "the refresh completed after the redirect"
+        );
+        assert_eq!(tok.refresh, "NEWREF");
+    }
+
+    /// An Enrol click whose device-code request is held up by the Trakt limiter answers 503 after
+    /// `TRAKT_CLICK_WAIT` instead of hanging, and frees its enrolment slot.
+    #[tokio::test(start_paused = true)]
+    async fn enrol_click_answers_503_when_the_device_code_is_held_up() {
+        let svc = EnrolmentService::new(
+            Arc::new(SlowTrakt {
+                inner: MockTrakt::default(),
+                delay: std::time::Duration::from_secs(300),
+                refresh_calls: Default::default(),
+            }),
+            Store::in_memory(),
+        );
+        let started = tokio::time::Instant::now();
+        let r = svc
+            .handle(routed_req(
+                Method::POST,
+                "http://host.local/trakt/enrol",
+                true,
+            ))
+            .await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            started.elapsed() <= TRAKT_CLICK_WAIT,
+            "the click must be answered within the bound, took {:?}",
+            started.elapsed()
+        );
+        assert!(body_text(r).await.contains("try again shortly"));
+        assert_eq!(
+            svc.inflight.available_permits(),
+            MAX_CONCURRENT_ENROLMENTS,
+            "a timed-out enrol must not hold an enrolment slot"
         );
     }
 }

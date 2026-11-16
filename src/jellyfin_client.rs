@@ -200,7 +200,13 @@ impl JellyfinClient {
                     // Connect failures (not started yet), timeouts (slow/overloaded Jellyfin) and a
                     // connection that drops after the request was sent (Jellyfin restarting
                     // mid-request: a reset, or closed before any response) are all transient, so
-                    // retry. Any other error (e.g. building the request) gives up.
+                    // retry; a repeated POST /Library/Media/Updated is harmless. Any other error
+                    // (e.g. building the request) gives up. In reqwest 0.12 every error from
+                    // sending the request, connect failures and the client timeout included, is a
+                    // request error, so `is_request()` alone matches all three. The explicit checks
+                    // choose the log label, and keep connect and timeout errors retried should a
+                    // later reqwest classify them differently
+                    // (`reqwest_connect_and_timeout_errors_are_request_errors` pins today's).
                     tracing::warn!(
                         "Transient Jellyfin error ({}), attempt {}/{}",
                         if e.is_timeout() {
@@ -208,7 +214,7 @@ impl JellyfinClient {
                         } else if e.is_connect() {
                             "cannot connect"
                         } else {
-                            "connection dropped"
+                            "request failed"
                         },
                         attempt + 1,
                         MAX_SEND_ATTEMPTS
@@ -743,21 +749,51 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn notify_changes_retries_a_transient_timeout_then_succeeds() {
-        // A transport-level timeout (Jellyfin slow/overloaded) hits the is_connect()||is_timeout()
-        // retry branch — the reason that branch exists — and must recover on the next 200. Guards
-        // against a regression narrowing that guard (which would silently drop notifications during a
-        // Jellyfin restart). `start_paused` auto-advances the reqwest request timeout so it is instant.
+        // A client timeout (Jellyfin slow/overloaded) is transient, so the notification is retried
+        // and recovers on the next 200. Each scan tick sends its change set once, so a notification
+        // given up on is lost. `start_paused` auto-advances the reqwest request timeout so it is
+        // instant.
         use std::sync::atomic::Ordering;
         let (url, counter) = spawn_timeout_then_200(1).await;
         let client = JellyfinClient::new(url, "key".to_string(), "/media".to_string()).unwrap();
         client.notify_changes(&one_change()).await;
         // ≥2 connections proves the timeout was RETRIED past the hang (the exact count is left loose:
-        // reqwest's connect/pool behaviour under a paused clock can add a connection). A regression
-        // that narrowed the is_connect()||is_timeout() guard would give up after the first hang = 1.
+        // reqwest's connect/pool behaviour under a paused clock can add a connection). Giving up on
+        // a timeout would stop at the first hang = 1.
         assert!(
             counter.load(Ordering::SeqCst) >= 2,
             "a transient timeout must be retried (>=2 connections), got {}",
             counter.load(Ordering::SeqCst)
+        );
+    }
+
+    /// `notify_changes`' retry guard relies on reqwest 0.12 reporting connect failures and the
+    /// client timeout as request errors too (`is_request()`), with `is_connect()` / `is_timeout()`
+    /// only picking the log label. A reqwest bump that changes either classification shows up here.
+    #[tokio::test(start_paused = true)]
+    async fn reqwest_connect_and_timeout_errors_are_request_errors() {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+
+        let (url, _) = spawn_timeout_then_200(1).await;
+        let e = http.post(&url).send().await.expect_err("the server hangs");
+        assert!(e.is_timeout(), "{e:?}");
+        assert!(e.is_request(), "a timeout is a request error: {e:?}");
+
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let e = http
+            .post(format!("http://{addr}"))
+            .send()
+            .await
+            .expect_err("nothing listens");
+        assert!(e.is_connect(), "{e:?}");
+        assert!(
+            e.is_request(),
+            "a connect failure is a request error: {e:?}"
         );
     }
 

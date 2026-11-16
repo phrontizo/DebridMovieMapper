@@ -140,6 +140,13 @@ pub enum AudioReq {
 /// as written they would match no track.
 const NOT_LANGUAGE_CODES: [&str; 3] = ["off", "any", "all"];
 
+/// ISO 639-2's special codes `und` (undetermined) and `mul` (multiple languages). The probe knows
+/// them, but no parsed track carries either: both track parsers read an `und` track as untagged,
+/// and a multi-audio release tags each track with its own language. Taken as written they would
+/// fail every release whose tracks are all tagged, and an operator may well write them to mean
+/// "any language", so they are rejected like [`NOT_LANGUAGE_CODES`].
+const NO_TRACK_CODES: [&str; 2] = ["und", "mul"];
+
 /// Read a trimmed, non-keyword `AUDIO_LANGUAGE` / `SUBTITLE_LANGUAGE` value (`name`) as a language
 /// code, lowercased, or `None` when it is no language code; the caller then falls back to its
 /// default, the keyword `fallback`, which the warnings name along with what it does
@@ -151,7 +158,7 @@ const NOT_LANGUAGE_CODES: [&str; 3] = ["off", "any", "all"];
 ///   Norwegian, with a warning, since it reads like "no requirement".
 /// - 3 letters: kept. A code the probe doesn't know is warned about, since that is what a misspelt
 ///   code (`egn`) looks like, but rare valid ISO 639-2 codes (`haw`) aren't in its tables either.
-///   The words in [`NOT_LANGUAGE_CODES`] are rejected.
+///   The words in [`NOT_LANGUAGE_CODES`] and the codes in [`NO_TRACK_CODES`] are rejected.
 /// - anything else (a full name like `english`, a locale like `pt-BR`): rejected with a warning.
 fn parse_lang_code(name: &str, v: &str, fallback: &str, fallback_means: &str) -> Option<String> {
     let code = v.to_ascii_lowercase();
@@ -161,6 +168,14 @@ fn parse_lang_code(name: &str, v: &str, fallback: &str, fallback_means: &str) ->
         warn!(
             "Invalid {name} '{v}' (expected an ISO 639 language code such as 'en' or 'eng', or \
              '{fallback}'); falling back to '{fallback}' ({fallback_means})"
+        );
+        return None;
+    }
+    if NO_TRACK_CODES.contains(&code.as_str()) {
+        warn!(
+            "Invalid {name} '{v}': no track is tagged with it (an 'und' track reads as untagged, \
+             and a multi-audio release tags each track with its own language), so every release \
+             would be rejected; falling back to '{fallback}' ({fallback_means})"
         );
         return None;
     }
@@ -683,20 +698,14 @@ impl UpgradeConfig {
     }
 
     /// Pure construction from raw optional values (env-independent, for tests).
-    /// `interval_secs`: 0 disables; otherwise clamped to a 600s minimum. Invalid → 86_400.
+    /// `interval_secs`: see [`parse_upgrade_interval`].
     pub fn from_parts(
         interval_secs: Option<String>,
         budget_per_tick: Option<String>,
         idle_secs: Option<String>,
     ) -> Self {
-        // No floor in the parse itself: 0 must get through it to mean "disabled".
-        let interval_secs = match parse_num(interval_secs, "UPGRADE_INTERVAL_SECS", 86_400, 0, None)
-        {
-            0 => 0,
-            n => n.max(600),
-        };
         UpgradeConfig {
-            interval_secs,
+            interval_secs: parse_upgrade_interval(interval_secs),
             budget_per_tick: parse_upgrade_budget(budget_per_tick),
             idle_secs: parse_num(idle_secs, "UPGRADE_IDLE_SECS", 300, 30, None),
         }
@@ -710,6 +719,35 @@ impl UpgradeConfig {
             std::env::var("UPGRADE_BUDGET_PER_TICK").ok(),
             std::env::var("UPGRADE_IDLE_SECS").ok(),
         )
+    }
+}
+
+/// `UPGRADE_INTERVAL_SECS`: unset or blank = daily (86_400); `0`, or one of the off-words
+/// [`AcquisitionConfig::parse_bool`] takes (`false`/`no`/`off`, case-insensitive) = disabled; any
+/// other number is clamped to a 600 s minimum. It is the only switch that stops the upgrade engine,
+/// which replaces and deletes torrents the user added, so an off-word must not read as a typo and
+/// leave the engine running. Anything else warns, saying the engine is on, and falls back to daily.
+fn parse_upgrade_interval(v: Option<String>) -> u64 {
+    const DAILY: u64 = 86_400;
+    let Some(s) = v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+        return DAILY;
+    };
+    if ["false", "no", "off"]
+        .iter()
+        .any(|w| s.eq_ignore_ascii_case(w))
+    {
+        return 0;
+    }
+    match s.parse::<u64>() {
+        Ok(0) => 0,
+        Ok(n) => n.max(600),
+        Err(_) => {
+            warn!(
+                "Invalid UPGRADE_INTERVAL_SECS value '{s}', falling back to {DAILY}: the upgrade \
+                 engine is ON (set 0 or off to disable it)"
+            );
+            DAILY
+        }
     }
 }
 
@@ -1394,7 +1432,7 @@ mod tests {
         );
         // Known codes, TMDB's non-ISO `cn` and a /T form are kept, silently.
         let logs = captured_warnings(|| {
-            for code in ["en", "eng", "deu", "cn", "yue", "zxx", "cmn", "mul"] {
+            for code in ["en", "eng", "deu", "cn", "yue", "zxx", "cmn"] {
                 assert_eq!(
                     AudioReq::parse(Some(code.into())),
                     AudioReq::Lang(code.into()),
@@ -1466,6 +1504,39 @@ mod tests {
         ] {
             assert!(logs.contains(warned), "{warned}: {logs:?}");
         }
+    }
+
+    #[test]
+    fn language_reqs_reject_the_special_codes_no_track_carries() {
+        // `und` (undetermined) and `mul` (multiple languages) are ISO 639-2 codes the probe knows,
+        // but no parsed track carries them: both track parsers read an `und` track as untagged, and
+        // a multi-audio release tags each track with its own language. Taken as written either
+        // would fail every release whose tracks are all tagged, so, like `any`, they fall back to
+        // the default with a warning that says why.
+        let logs = captured_warnings(|| {
+            for code in ["und", "MUL", " mul "] {
+                assert_eq!(
+                    AudioReq::parse(Some(code.into())),
+                    AudioReq::Original,
+                    "{code}"
+                );
+                assert_eq!(SubReq::parse(Some(code.into())), SubReq::None, "{code}");
+            }
+        });
+        for warned in [
+            "Invalid AUDIO_LANGUAGE 'und'",
+            "Invalid AUDIO_LANGUAGE 'MUL'",
+            "Invalid AUDIO_LANGUAGE 'mul'",
+            "Invalid SUBTITLE_LANGUAGE 'und'",
+            "Invalid SUBTITLE_LANGUAGE 'MUL'",
+            "Invalid SUBTITLE_LANGUAGE 'mul'",
+        ] {
+            assert!(logs.contains(warned), "{warned}: {logs:?}");
+        }
+        assert!(
+            logs.contains("no track") && logs.contains("falling back to 'original'"),
+            "the warning says the code matches no track, and what is used instead: {logs:?}"
+        );
     }
 
     #[test]
@@ -1560,29 +1631,9 @@ mod tests {
         assert!(AcquisitionConfig::parse_bool(Some("  ".into()), "X", true));
     }
 
-    /// Everything `warn!`ed while `f` runs, on this thread.
+    /// Everything `warn!`ed (or worse) while `f` runs, on this thread.
     fn captured_warnings(f: impl FnOnce()) -> String {
-        #[derive(Clone, Default)]
-        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let buf = Buf::default();
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let bytes = buf.0.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
+        crate::test_log::capture(tracing::Level::WARN, f)
     }
 
     #[test]
@@ -1982,6 +2033,35 @@ mod tests {
         assert_eq!(capped.budget_per_tick, Some(400));
         let blank = UpgradeConfig::from_parts(None, Some("  ".into()), None);
         assert_eq!(blank.budget_per_tick, None);
+    }
+
+    #[test]
+    fn upgrade_interval_reads_the_boolean_off_words_as_disabled() {
+        // UPGRADE_INTERVAL_SECS is the only switch that stops the upgrade engine's swaps and prunes,
+        // so `off`/`false`/`no` (what the boolean switches beside it take) must turn it off, not
+        // fall back to the daily default with the engine still on.
+        let logs = captured_warnings(|| {
+            for off in ["off", " FALSE ", "No", "0", " 0 "] {
+                let u = UpgradeConfig::from_parts(Some(off.into()), None, None);
+                assert_eq!(u.interval_secs, 0, "{off:?}");
+                assert!(!u.enabled(), "{off:?}");
+            }
+        });
+        assert!(logs.is_empty(), "an off-word is not a typo: {logs:?}");
+
+        // Any other non-number still keeps the daily default, and the warning says the engine is
+        // on and how to turn it off.
+        let logs = captured_warnings(|| {
+            let u = UpgradeConfig::from_parts(Some("disable".into()), None, None);
+            assert_eq!(u.interval_secs, 86_400);
+            assert!(u.enabled());
+        });
+        assert!(
+            logs.contains("Invalid UPGRADE_INTERVAL_SECS value 'disable'")
+                && logs.contains("the upgrade engine is ON")
+                && logs.contains("off"),
+            "{logs:?}"
+        );
     }
 
     #[test]

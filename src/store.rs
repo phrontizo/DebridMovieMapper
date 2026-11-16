@@ -236,9 +236,15 @@ pub struct OwnedRecord {
     pub provenance: Provenance,
     pub added_at: u64,
     pub status: OwnedStatus,
-    /// (season, episode) pairs this hash supplies. Single-episode ⇒ one pair; movie ⇒ empty;
-    /// season pack ⇒ the full set (computed in `observe` from the resolved files). The union
-    /// across a show's hashes is the show's owned-episode set (kills season-pack churn).
+    /// (season, episode) pairs this hash supplies. Single-episode ⇒ one pair; season pack ⇒ the
+    /// full set; movie ⇒ empty. Written by `observe` (from the resolved files), by the account
+    /// mirror and `tasks::backfill_owned_provides` (via [`Store::set_provides_if_empty`]), and by
+    /// the upgrade engine's `record_staged`; a `Pending` acquisition lists only the requested
+    /// episode until `observe` records the full set. The union across a show's hashes is the
+    /// show's owned-episode set (kills season-pack churn). On a SHOW record an EMPTY set means
+    /// coverage UNKNOWN, not "supplies nothing": a mirror record whose file names `parse_se_all`
+    /// could not decode. `acquire::supplies_request` treats such a copy as covering, dedup never
+    /// removes it, and `set_provides_if_empty` fills it once its files decode.
     #[serde(default)]
     pub provides: Vec<(u32, u32)>,
     /// Quality snapshot of the chosen release, for upgrade comparison. `None` on pre-SP3 records, on
@@ -947,10 +953,11 @@ impl Store {
     }
 
     /// Collapse a read accessor's `spawn_blocking` join result: a JoinError (the blocking task
-    /// panicked or was cancelled) is logged under `label` and falls back to the empty/zero default
-    /// rather than reading downstream as a silent "empty". Most of these accessors read
-    /// authoritative, non-regenerable tables (owned/wanted/selection/trakt_tokens/blacklist), where
-    /// an undiagnosed empty read can drive mass re-acquire or wrong lifecycle decisions.
+    /// panicked or was cancelled) is logged under `label` and the caller gets the empty/zero
+    /// default, so a failed read can be told apart from a genuinely empty one in the logs. Most of
+    /// these accessors read authoritative, non-regenerable tables (owned/wanted/selection/
+    /// trakt_tokens/blacklist), where an undiagnosed empty read can drive mass re-acquire or wrong
+    /// lifecycle decisions.
     fn join_or_default<T: Default>(label: &str, r: Result<T, tokio::task::JoinError>) -> T {
         r.unwrap_or_else(|e| {
             error!("{label}: blocking read task failed: {e:?}");
@@ -1384,6 +1391,45 @@ impl Store {
         self.remove_key(OWNED_TABLE, hash).await
     }
 
+    /// Drop everything the store holds for an owned `hash` in ONE write transaction: its owned
+    /// record, its authoritative identification, and every `selection` slot whose entry names the
+    /// hash (case-insensitively). Returns the slots it removed. The slots are matched inside the
+    /// transaction, so a slot that a concurrent upgrade swap or selection repoint moved to another
+    /// copy after the caller's snapshot is left alone (deleting it by key would make the episode
+    /// unmanaged, and nothing re-creates a slot). On `Err` nothing changed, so a caller that keeps
+    /// the hash for a retry never leaves a slot serving a forgotten record. A missing record is
+    /// `Ok` (whatever slots still name the hash are removed). A selection row that won't
+    /// deserialise is left in place.
+    pub async fn forget_owned(&self, hash: String) -> Result<Vec<String>, AppError> {
+        let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<Vec<String>, redb::Error> {
+            let txn = db.begin_write()?;
+            let slots = {
+                txn.open_table(OWNED_TABLE)?.remove(hash.as_str())?;
+                txn.open_table(AUTH_TABLE)?.remove(hash.as_str())?;
+                let mut selection = txn.open_table(SELECTION_TABLE)?;
+                let mut slots = Vec::new();
+                for row in selection.iter()? {
+                    let (slot, raw) = row?;
+                    let names_hash = serde_json::from_slice::<SelectionEntry>(raw.value())
+                        .is_ok_and(|entry| entry.hash.eq_ignore_ascii_case(&hash));
+                    if names_hash {
+                        slots.push(slot.value().to_string());
+                    }
+                }
+                for slot in &slots {
+                    selection.remove(slot.as_str())?;
+                }
+                slots
+            };
+            txn.commit()?;
+            Ok(slots)
+        })
+        .await;
+        Self::flatten_join(result)
+    }
+
     pub async fn all_owned(&self) -> Vec<(String, OwnedRecord)> {
         let db = self.db.clone();
         // owned_hashes is authoritative + non-regenerable: a silently-dropped row becomes an
@@ -1413,6 +1459,9 @@ impl Store {
         self.get_json(AUTH_TABLE, hash, "authoritative_meta").await
     }
 
+    /// Test-only: production drops an authoritative id together with its owned record and slots
+    /// ([`Store::forget_owned`]).
+    #[cfg(test)]
     pub async fn remove_authoritative(&self, hash: String) -> Result<(), AppError> {
         let hash = hash.to_ascii_lowercase(); // case-normalised key (see put_owned)
         self.remove_key(AUTH_TABLE, hash).await
@@ -1921,6 +1970,10 @@ impl Store {
         Self::flatten_join_app(result)
     }
 
+    /// Test-only: production removes a slot only with the record its entry names
+    /// ([`Store::forget_owned`], which matches the slot inside its transaction), never by key from a
+    /// snapshot that a concurrent repoint may have outdated.
+    #[cfg(test)]
     pub async fn remove_selection(&self, slot: String) -> Result<(), AppError> {
         self.remove_key(SELECTION_TABLE, slot).await
     }
@@ -5101,6 +5154,88 @@ mod tests {
         assert_eq!(all[0].1.hash, "h1");
         store.remove_selection(slot.clone()).await.unwrap();
         assert!(store.get_selection(slot).await.is_none());
+    }
+
+    /// An owned record of `hash` (a Verified movie), its authoritative id, and a selection slot per
+    /// `(slot, entry hash)` pair, for the `forget_owned` tests.
+    async fn seed_forget_fixture(store: &Store, hash: &str, slots: &[(&str, &str)]) {
+        store
+            .put_owned(
+                hash.into(),
+                OwnedRecord {
+                    request: req("tt1", 1),
+                    provenance: Provenance { entries: vec![] },
+                    added_at: 1,
+                    status: OwnedStatus::Verified,
+                    provides: vec![],
+                    quality: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_authoritative(hash.into(), movie("A"))
+            .await
+            .unwrap();
+        for (slot, entry_hash) in slots {
+            store
+                .put_selection(
+                    slot.to_string(),
+                    SelectionEntry {
+                        hash: entry_hash.to_string(),
+                        file_path: "f.mkv".into(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// `forget_owned` drops the owned row, the authoritative id and every selection slot that
+    /// still names the hash (matched case-insensitively) in one transaction. A slot naming another
+    /// hash is left alone, so a slot an upgrade swap repointed after the caller's snapshot survives.
+    #[tokio::test]
+    async fn forget_owned_removes_the_record_its_identification_and_its_slots_only() {
+        let store = Store::in_memory();
+        seed_forget_fixture(
+            &store,
+            "abc",
+            &[("e|1|1|1", "ABC"), ("e|1|1|2", "abc"), ("e|1|1|3", "other")],
+        )
+        .await;
+        let mut slots = store.forget_owned("AbC".into()).await.unwrap();
+        slots.sort();
+        assert_eq!(slots, vec!["e|1|1|1".to_string(), "e|1|1|2".to_string()]);
+        assert!(store.get_owned("abc".into()).await.is_none());
+        assert!(store.authoritative_meta("abc".into()).await.is_none());
+        assert!(store.get_selection("e|1|1|1".into()).await.is_none());
+        assert!(store.get_selection("e|1|1|2".into()).await.is_none());
+        assert_eq!(
+            store.get_selection("e|1|1|3".into()).await.unwrap().hash,
+            "other",
+            "a slot naming another hash is kept"
+        );
+        // Nothing left to forget: still Ok, no slots.
+        assert!(store.forget_owned("abc".into()).await.unwrap().is_empty());
+    }
+
+    /// A failed commit leaves all three tables as they were, so a caller that keeps the hash for a
+    /// retry never sees a record without its slots (or slots without their record).
+    #[tokio::test]
+    async fn forget_owned_failed_commit_changes_nothing() {
+        let (store, switch) = crate::store::fail_writes::fail_after_arm_store();
+        seed_forget_fixture(&store, "abc", &[("m|1", "abc")]).await;
+        let per_commit = crate::store::fail_writes::syncs_per_commit(&store, &switch).await;
+        switch.arm_after(0, per_commit);
+        assert!(store.forget_owned("abc".into()).await.is_err());
+        switch.disarm();
+        let store = switch.reopen();
+        assert!(store.get_owned("abc".into()).await.is_some());
+        assert_eq!(
+            store.authoritative_meta("abc".into()).await,
+            Some(movie("A"))
+        );
+        assert_eq!(store.get_selection("m|1".into()).await.unwrap().hash, "abc");
     }
 
     #[tokio::test]

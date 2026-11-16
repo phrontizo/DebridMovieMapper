@@ -297,56 +297,30 @@ mod tests {
         assert!(r.is_err(), "must error after max_wait with no file list");
     }
 
-    /// Provider that records delete_torrent calls — to prove `protect_id` suppresses the cleanup
-    /// delete when the (same-id) re-add returned the protected torrent.
-    #[derive(Debug, Default)]
-    struct DeleteRecordingProvider {
-        deleted: std::sync::Mutex<Vec<String>>,
-    }
-    #[async_trait::async_trait]
-    impl DebridProvider for DeleteRecordingProvider {
-        fn name(&self) -> &'static str {
-            "rec"
-        }
-        async fn get_torrents(&self) -> Result<Vec<crate::rd_client::Torrent>, reqwest::Error> {
-            Ok(vec![])
-        }
-        async fn get_torrent_info(&self, _id: &str) -> Result<TorrentInfo, reqwest::Error> {
-            // No files → selector matches nothing → materialise hits the cleanup-delete path.
-            Ok(TorrentInfo {
+    /// A provider whose add returns `tid` (the id a TorBox same-hash re-add returns for the torrent
+    /// under repair) and whose torrent lists no files, so the selector matches nothing and
+    /// `materialise` reaches its cleanup delete, which `MockProvider::deleted` records.
+    fn no_files_same_id() -> MockProvider {
+        MockProvider {
+            add_magnet: Some(AddMagnetResponse {
+                id: "tid".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
                 id: "tid".into(),
                 hash: "H".into(),
                 status: "downloading".into(),
                 ..Default::default()
-            })
+            }),
+            ..Default::default()
         }
-        async fn add_magnet(&self, _m: &str) -> Result<AddMagnetResponse, reqwest::Error> {
-            Ok(AddMagnetResponse {
-                id: "tid".into(), // same id as protect_id — TorBox behaviour
-                uri: String::new(),
-            })
-        }
-        async fn select_files(&self, _t: &str, _f: &str) -> Result<(), reqwest::Error> {
-            Ok(())
-        }
-        async fn delete_torrent(&self, t: &str) -> Result<(), reqwest::Error> {
-            self.deleted.lock().unwrap().push(t.to_string());
-            Ok(())
-        }
-        async fn resolve_url(
-            &self,
-            _l: &crate::provider::FileLocator,
-        ) -> Result<String, crate::error::AppError> {
-            Err(crate::error::AppError::Unavailable)
-        }
-        async fn invalidate(&self, _l: &crate::provider::FileLocator) {}
     }
 
     #[tokio::test]
     async fn materialise_protect_id_suppresses_cleanup_delete_on_failure() {
         // Same-id re-add (new == protect_id) with no matching files: materialise must NOT delete the
         // protected (real) torrent — that would be data loss on TorBox.
-        let provider = Arc::new(DeleteRecordingProvider::default());
+        let provider = Arc::new(no_files_same_id());
         let p: Arc<dyn DebridProvider> = provider.clone();
         let r = materialise(
             &*p,
@@ -370,7 +344,7 @@ mod tests {
     async fn materialise_records_the_added_id_unless_it_is_protected() {
         // The slot lets a caller that may drop the future mid-await delete the add itself; the
         // protected (same-id) torrent is never put in it.
-        let provider = DeleteRecordingProvider::default();
+        let provider = no_files_same_id();
         let unprotected = std::sync::Mutex::new(None);
         let _ = materialise(
             &provider,
@@ -403,7 +377,7 @@ mod tests {
         // The positive counterpart: with `protect_id = None`, a failed materialise (no matching files)
         // MUST delete the leaked torrent so a rejected/failed candidate doesn't linger as a dead
         // "checking" torrent.
-        let provider = Arc::new(DeleteRecordingProvider::default());
+        let provider = Arc::new(no_files_same_id());
         let p: Arc<dyn DebridProvider> = provider.clone();
         let r = materialise(
             &*p,
@@ -423,32 +397,6 @@ mod tests {
         );
     }
 
-    /// Everything logged at `ERROR` while `fut` runs.
-    async fn captured_errors<T>(fut: impl std::future::Future<Output = T>) -> (T, String) {
-        use tracing::instrument::WithSubscriber;
-        #[derive(Clone, Default)]
-        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let buf = Buf::default();
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::ERROR)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let out = fut.with_subscriber(subscriber).await;
-        let bytes = buf.0.lock().unwrap().clone();
-        (out, String::from_utf8(bytes).unwrap())
-    }
-
     /// A cleanup delete that fails leaves the added torrent in the account (on Real-Debrid
     /// un-selected, in `waiting_files_selection` for good, and nothing else deletes it), so it must
     /// be logged with the torrent's id rather than dropped silently.
@@ -462,15 +410,18 @@ mod tests {
             fail_delete: true,
             ..mock("downloaded")
         };
-        let (r, logs) = captured_errors(materialise(
-            &provider,
-            "H",
-            Duration::ZERO,
-            Duration::ZERO,
-            None,
-            None,
-            |_| Vec::<u32>::new(),
-        ))
+        let (r, logs) = crate::test_log::capture_async(
+            tracing::Level::ERROR,
+            materialise(
+                &provider,
+                "H",
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+                None,
+                |_| Vec::<u32>::new(),
+            ),
+        )
         .await;
         assert!(r.is_err(), "no matching files → Err");
         assert_eq!(

@@ -46,9 +46,30 @@ where
     Ok(serde_json::from_value::<T>(value).unwrap_or_default())
 }
 
+/// Like `null_to_default` for an integer id, except that a number sent as a JSON string
+/// (`"35928498"`, which many APIs do for 64-bit ids) keeps its value. `null_to_default` would
+/// decode it to 0, and an id-0 torrent is dropped from the listing (so a stringized torrent id
+/// would empty the whole library) while an id-0 file would send `requestdl` file 0 for every file
+/// of a pack.
+/// Anything else that isn't an integer in `T`'s range (null, a non-numeric string, a float, a
+/// negative file id) still falls back to the default, never failing the surrounding decode.
+fn lenient_int<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: TryFrom<i64> + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let n = match &value {
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    };
+    Ok(n.and_then(|n| T::try_from(n).ok()).unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 struct TbFile {
-    #[serde(default, deserialize_with = "null_to_default")]
+    #[serde(default, deserialize_with = "lenient_int")]
     id: u32,
     #[serde(default, deserialize_with = "null_to_default")]
     name: String,
@@ -60,7 +81,7 @@ struct TbFile {
 
 #[derive(Debug, Deserialize)]
 struct TbTorrent {
-    #[serde(default, deserialize_with = "null_to_default")]
+    #[serde(default, deserialize_with = "lenient_int")]
     id: i64,
     #[serde(default, deserialize_with = "null_to_default")]
     hash: String,
@@ -92,10 +113,11 @@ struct TbTorrent {
 struct TbCreate {
     // Defensive decode like every other TorBox field: `#[serde(default)]` alone covers a MISSING
     // key but a present `null` or a stringized number would still fail the whole `Envelope<TbCreate>`
-    // decode. `null_to_default` tolerates both, decoding an unusable id to 0; `add_magnet_raw` then
-    // treats a non-positive `torrent_id` as "no usable id" and recovers the real torrent by infohash
-    // (rather than recording an unusable "0" that would never resolve and get reaped/blacklisted).
-    #[serde(default, deserialize_with = "null_to_default")]
+    // decode. `lenient_int` tolerates both, reading a stringized number as the id and decoding an
+    // unusable one to 0; `add_magnet_raw` then treats a non-positive `torrent_id` as "no usable id"
+    // and recovers the real torrent by infohash (rather than recording an unusable "0" that would
+    // never resolve and get reaped/blacklisted).
+    #[serde(default, deserialize_with = "lenient_int")]
     torrent_id: i64,
     // createtorrent also returns the infohash; serde ignores it (we derive the canonical torrent
     // later).
@@ -146,11 +168,11 @@ fn to_torrent_file(f: &TbFile) -> TorrentFile {
 }
 
 /// Map a decoded `mylist` into canonical torrents, DROPPING any entry with an unusable identity
-/// (id ≤ 0 or empty hash). `null_to_default` defaults a null/missing/type-mismatched id→0 and
-/// hash→"" rather than failing the whole list decode; such an entry can't be acted on (a delete
-/// against id "0", or a hash-keyed lookup on ""), so skip it instead of surfacing a phantom torrent.
-/// The filter is `id > 0` (not `id != 0`) to match `delete_torrent_raw`'s own `> 0` guard: a
-/// (garbage) negative id would otherwise surface as an owned torrent that can never be deleted.
+/// (id ≤ 0 or empty hash). `lenient_int` / `null_to_default` default a null/missing/type-mismatched
+/// id→0 and hash→"" rather than failing the whole list decode; such an entry can't be acted on (a
+/// delete against id "0", or a hash-keyed lookup on ""), so skip it instead of surfacing a phantom
+/// torrent. The filter is `id > 0` (not `id != 0`) to match `delete_torrent_raw`'s own `> 0` guard:
+/// a (garbage) negative id would otherwise surface as an owned torrent that can never be deleted.
 /// A real TorBox torrent always has a positive id and a non-empty hash.
 fn map_listed_torrents(raw: &[TbTorrent]) -> Vec<Torrent> {
     let mapped: Vec<Torrent> = raw
@@ -158,9 +180,9 @@ fn map_listed_torrents(raw: &[TbTorrent]) -> Vec<Torrent> {
         .filter(|t| t.id > 0 && !t.hash.is_empty())
         .map(to_torrent)
         .collect();
-    // Surface a count when entries are dropped: normally zero, but if TorBox ever changed the wire
-    // shape of `id`/`hash` (e.g. stringized id) `null_to_default` would zero them and the WHOLE
-    // library would silently vanish here — a `debug!` makes that diagnosable rather than mysterious.
+    // Surface a count when entries are dropped: normally zero. A listing whose EVERY entry is
+    // dropped (a change to the wire shape of `id`/`hash`) is refused by `list_mylist_pages`, with a
+    // warning; a few odd entries among good ones only log here, so they don't warn every tick.
     let dropped = raw.len() - mapped.len();
     if dropped > 0 {
         debug!(
@@ -734,14 +756,25 @@ impl TorBoxClient {
             );
             return Err(synthetic_bad_gateway());
         }
+        let mapped = map_listed_torrents(&raw);
+        if mapped.is_empty() && !raw.is_empty() {
+            // Every entry had an unusable id or hash. A real TorBox torrent always has both, so
+            // TorBox has changed the wire shape of one of them. An empty `Ok` would read as an
+            // emptied account: once the scan loop stops treating it as suspect, the VFS is rebuilt
+            // empty and every wanted title re-acquired. Fail the tick instead, as for a truncated
+            // listing.
+            warn!(
+                "TorBox mylist: all {} entries had an unusable id or hash (has TorBox changed \
+                 their format?), refusing the listing",
+                raw.len()
+            );
+            return Err(synthetic_bad_gateway());
+        }
         // More than two requests means at least two non-empty pages (plus the empty terminator); a
         // full first page means the terminator was fetched at a page boundary, so an item can still
         // have shifted out of reach.
         let spans_pages = requests > 2 || raw.len() >= PAGE;
-        Ok((
-            drop_repeated_ids(map_listed_torrents(&raw), "TorBox"),
-            spans_pages,
-        ))
+        Ok((drop_repeated_ids(mapped, "TorBox"), spans_pages))
     }
 
     pub async fn torrent_info_raw(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
@@ -1571,18 +1604,101 @@ mod tests {
 
     #[test]
     fn tbcreate_tolerates_null_or_mistyped_torrent_id() {
-        // createtorrent's torrent_id is decoded defensively (null_to_default), so a present `null`
-        // or a wrong type defaults to 0 rather than failing the whole Envelope<TbCreate> decode
-        // (which every other TorBox field already tolerates).
+        // createtorrent's torrent_id is decoded defensively (lenient_int), so a present `null` or a
+        // wrong type defaults to 0 rather than failing the whole Envelope<TbCreate> decode (which
+        // every other TorBox field already tolerates), and a stringized number is read as the id.
         let v: TbCreate = serde_json::from_str(r#"{"torrent_id": null, "hash": null}"#).unwrap();
         assert_eq!(v.torrent_id, 0);
         let v: TbCreate = serde_json::from_str(r#"{"torrent_id": "99"}"#).unwrap();
+        assert_eq!(v.torrent_id, 99, "a stringized id is read as the number");
+        let v: TbCreate = serde_json::from_str(r#"{"torrent_id": "abc"}"#).unwrap();
         assert_eq!(
             v.torrent_id, 0,
-            "a stringized id defaults rather than erroring"
+            "a non-numeric string defaults rather than erroring"
         );
         let v: TbCreate = serde_json::from_str(r#"{"torrent_id": 42, "hash": "abc"}"#).unwrap();
         assert_eq!(v.torrent_id, 42);
+    }
+
+    #[test]
+    fn tbfile_reads_a_stringized_id_and_defaults_an_unusable_one() {
+        // A stringized file id must keep its value: decoding it to 0 would send `requestdl` file 0
+        // for every file of a pack.
+        let f: TbFile = serde_json::from_str(r#"{"id": "7", "name": "a.mkv", "size": 1}"#).unwrap();
+        assert_eq!(f.id, 7);
+        let f: TbFile = serde_json::from_str(r#"{"id": 7, "name": "a.mkv"}"#).unwrap();
+        assert_eq!(f.id, 7);
+        for bad in [r#""seven""#, "-1", "null", "1.5", "[]", "4294967296"] {
+            let f: TbFile = serde_json::from_str(&format!(r#"{{"id": {bad}, "name": "a.mkv"}}"#))
+                .unwrap_or_else(|e| panic!("id {bad} must decode leniently: {e}"));
+            assert_eq!(f.id, 0, "id {bad} is unusable and defaults to 0");
+        }
+    }
+
+    /// Serve a `mylist` whose first page (offset 0) is `page` and every later page is empty.
+    async fn serve_one_mylist_page(page: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let data = if req.contains("offset=0 ") {
+                    page
+                } else {
+                    "[]"
+                };
+                let body = format!(r#"{{"success":true,"data":{data}}}"#);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn mylist_keeps_torrents_whose_ids_are_stringized() {
+        let base =
+            serve_one_mylist_page(r#"[{"id":"11","hash":"h1"},{"id":12,"hash":"h2"}]"#).await;
+        let client = TorBoxClient::with_base("fake".to_string(), base);
+        let listed = client.list_torrents_raw().await.expect("listing succeeds");
+        let ids: Vec<&str> = listed.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["11", "12"]);
+    }
+
+    /// If every listed entry has an unusable identity (a change TorBox made to the wire shape of
+    /// `id` or `hash`), an empty `Ok` would read as an emptied account: once the scan loop stops
+    /// treating it as suspect, the whole library would leave the VFS and every wanted title would
+    /// be re-acquired. Failing the listing skips the tick instead, like any failed listing.
+    #[tokio::test]
+    async fn mylist_fails_when_every_entry_has_an_unusable_identity() {
+        let base = serve_one_mylist_page(
+            r#"[{"id":"notanumber","hash":"h1"},{"id":-3,"hash":"h2"},{"id":5,"hash":""}]"#,
+        )
+        .await;
+        let client = TorBoxClient::with_base("fake".to_string(), base);
+        assert!(
+            client.list_torrents_raw().await.is_err(),
+            "a listing whose every entry was dropped must be an Err, not an empty Ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn mylist_of_an_empty_account_is_an_empty_ok() {
+        let base = serve_one_mylist_page("[]").await;
+        let client = TorBoxClient::with_base("fake".to_string(), base);
+        let listed = client
+            .list_torrents_raw()
+            .await
+            .expect("an empty account lists");
+        assert!(listed.is_empty());
     }
 
     #[test]
@@ -2156,8 +2272,9 @@ mod tests {
         let t: TbTorrent =
             serde_json::from_str(bad).expect("type-mismatched fields must decode to defaults");
         let info = to_torrent_info(&t);
-        // Each mismatched field fell back to its default rather than erroring.
-        assert_eq!(info.id, "0"); // stringized id → default 0
+        // A stringized id is read as the number (decoding it to 0 would drop the entry); every
+        // other mismatched field fell back to its default rather than erroring.
+        assert_eq!(info.id, "35928498");
         assert_eq!(info.filename, "Sintel"); // a correctly-typed field is still parsed
         assert!(info.files.is_empty()); // "files": "nope" → default empty
 

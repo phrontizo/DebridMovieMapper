@@ -54,9 +54,11 @@ pub struct TitleLanguages {
 /// Validates an acquired file genuinely matches the requested title (reuses `identify_name`).
 #[async_trait]
 pub trait TitleValidator: Send + Sync {
+    /// `file_path` is the file's path in its torrent, or just its name: the title is identified from
+    /// the name, while the season of a file with no episode code may come from a directory.
     async fn validate(
         &self,
-        file_name: &str,
+        file_path: &str,
         expected_tmdb_id: u64,
         kind: MediaKind,
         season: Option<u32>,
@@ -96,7 +98,7 @@ pub struct TmdbTitleValidator {
 impl TitleValidator for TmdbTitleValidator {
     async fn validate(
         &self,
-        file_name: &str,
+        file_path: &str,
         expected: u64,
         kind: MediaKind,
         season: Option<u32>,
@@ -105,6 +107,7 @@ impl TitleValidator for TmdbTitleValidator {
         // Reuse the existing identification logic; confident == resolves to the expected tmdb id.
         // identify_name needs the file(s) for its show-vs-movie heuristic; the selected file
         // (whose name carries any SxxExx pattern) is enough to drive that for a single title.
+        let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
         let files = [crate::rd_client::TorrentFile {
             id: 0,
             path: file_name.to_string(),
@@ -112,15 +115,11 @@ impl TitleValidator for TmdbTitleValidator {
             selected: 1,
         }];
         let found = crate::identification::identify_name(file_name, &files, &self.tmdb).await;
-        title_check(&found, file_name, expected, kind, season, episode)
+        title_check(&found, file_path, expected, kind, season, episode)
     }
 
     async fn title_languages(&self, tmdb_id: u64, kind: MediaKind) -> Option<TitleLanguages> {
-        let media_type = match kind {
-            MediaKind::Movie => crate::vfs::MediaType::Movie,
-            MediaKind::Series => crate::vfs::MediaType::Show,
-        };
-        match self.tmdb.details(tmdb_id, media_type).await {
+        match self.tmdb.details(tmdb_id, media_type_of(kind)).await {
             Ok(d) => Some(TitleLanguages {
                 original_language: d.original_language,
                 spoken_languages: d.spoken_languages,
@@ -133,12 +132,22 @@ impl TitleValidator for TmdbTitleValidator {
     }
 }
 
-/// [`TmdbTitleValidator`]'s verdict for the identification `found` of `file_name`. A failed TMDB
-/// search, matched or not, is `Unavailable`, never a `Mismatch`, so an outage can't get a correct
-/// release blacklisted.
+/// The TMDB media type a request of `kind` names.
+fn media_type_of(kind: MediaKind) -> crate::vfs::MediaType {
+    match kind {
+        MediaKind::Movie => crate::vfs::MediaType::Movie,
+        MediaKind::Series => crate::vfs::MediaType::Show,
+    }
+}
+
+/// [`TmdbTitleValidator`]'s verdict for the identification `found` of the file at `file_path` (a
+/// path in its torrent, or just a file name). A failed TMDB search, matched or not, is
+/// `Unavailable`, never a `Mismatch`, so an outage can't get a correct release blacklisted. The
+/// identification must carry the requested media type as well as the id: TMDB's movie and TV id
+/// spaces overlap, so movie 42 and show 42 are unrelated titles.
 fn title_check(
     found: &crate::identification::Identification,
-    file_name: &str,
+    file_path: &str,
     expected: u64,
     kind: MediaKind,
     season: Option<u32>,
@@ -150,15 +159,20 @@ fn title_check(
         Identification::NoMatch => return TitleCheck::Mismatch,
         Identification::Unavailable => return TitleCheck::Unavailable,
     };
-    if m.external_id.as_deref() != Some(format!("tmdb:{}", expected).as_str()) {
+    if m.external_id.as_deref() != Some(format!("tmdb:{}", expected).as_str())
+        || m.media_type != media_type_of(kind)
+    {
         return TitleCheck::Mismatch;
     }
     // A show's file must declare the requested episode — a multi-episode file (e.g. `S01E01E02`)
-    // requested for its second episode included.
+    // requested for its second episode included, as must a file with no episode code that names it
+    // by an absolute number (`codeless_episode`).
+    let name = file_path.rsplit('/').next().unwrap_or(file_path);
     let episode_ok = kind != MediaKind::Series
         || matches!(
             (season, episode),
-            (Some(s), Some(e)) if crate::vfs::parse_se_all(file_name).contains(&(s, e))
+            (Some(s), Some(e)) if crate::vfs::parse_se_all(name).contains(&(s, e))
+                || codeless_episode(file_path) == Some((s, e))
         );
     if episode_ok {
         TitleCheck::Match
@@ -299,6 +313,51 @@ pub(crate) fn episode_files(info: &TorrentInfo) -> Vec<(u32, u32, String)> {
         })
         .filter(|(s, e, _)| seen.insert((*s, *e)))
         .collect()
+}
+
+/// The episode a show file with no `parse_se_all` code names by a trailing ` - NN` number, the
+/// common anime form (`[Group] Show - 12 (1080p) [ABCD1234].mkv`,
+/// `identification::trailing_episode_number`): that number, in the season the VFS places the file in
+/// (`vfs::season_of_codeless_file`: season 1 unless the name or a directory names one, so
+/// `Show S2 - 05 (1080p).mkv` is S02E05). `None` for a file with an episode code or no such number.
+/// An absolute number past season 1 (`Show - 30` for S02E05) therefore names no requested episode.
+fn codeless_episode(path: &str) -> Option<(u32, u32)> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if !crate::vfs::parse_se_all(name).is_empty() {
+        return None;
+    }
+    let episode = crate::identification::trailing_episode_number(name).filter(|&e| e >= 1)?;
+    Some((crate::vfs::season_of_codeless_file(path, name), episode))
+}
+
+/// A single-file show release named by an absolute number: the torrent's only selected video file,
+/// when it carries no episode code but names an episode by `codeless_episode`, with that episode.
+/// A torrent of several such files is a pack whose numbers can't be mapped to seasons without
+/// TMDB's per-season episode counts, so it gets none (and `observe` still rejects it as
+/// `EpisodeMissing`).
+fn codeless_single_episode(info: &TorrentInfo) -> Option<(u32, u32, String)> {
+    let mut videos = info
+        .files
+        .iter()
+        .filter(|f| f.selected == 1 && crate::vfs::is_video_file(&f.path));
+    let only = videos.next()?;
+    if videos.next().is_some() {
+        return None;
+    }
+    let (s, e) = codeless_episode(&only.path)?;
+    Some((s, e, only.path.clone()))
+}
+
+/// The file of `info` that supplies the episode a show request names: the first selected video file
+/// carrying its code (`episode_files`), else a single-file release naming it by an absolute number
+/// (`codeless_single_episode`).
+fn requested_episode_file(info: &TorrentInfo, req: &AcquireRequest) -> Option<(u32, u32, String)> {
+    let requested =
+        |(s, e, _): &(u32, u32, String)| Some(*s) == req.season && Some(*e) == req.episode;
+    episode_files(info)
+        .into_iter()
+        .find(requested)
+        .or_else(|| codeless_single_episode(info).filter(requested))
 }
 
 /// The size floor of a feature-length video: smaller ones are samples / extras / featurettes.
@@ -865,10 +924,26 @@ impl AcquisitionEngine {
         unverified: bool,
     ) -> bool {
         // Compute the SE-mapped episode set for a series (this hash's `provides` — the season-pack
-        // churn fix); a movie supplies none.
+        // churn fix); a movie supplies none. A single-file release with no episode code that names
+        // the requested episode by an absolute number (`codeless_single_episode`, how `observe`
+        // found it) supplies that episode, so `monitor_episodes` sees it covered.
         let eps: Vec<(u32, u32, String)> = match req.kind {
             MediaKind::Movie => Vec::new(),
-            MediaKind::Series => episode_files(info),
+            MediaKind::Series => {
+                let eps = episode_files(info);
+                if eps.is_empty() {
+                    codeless_single_episode(info)
+                        .filter(|(s, e, path)| {
+                            Some(*s) == req.season
+                                && Some(*e) == req.episode
+                                && path == selected_path
+                        })
+                        .into_iter()
+                        .collect()
+                } else {
+                    eps
+                }
+            }
         };
 
         // One atomic read-modify-write FIRST, so status (+ series `provides`) and the cached-quality
@@ -1207,15 +1282,11 @@ impl AcquisitionEngine {
             }
             // Choose the representative file to validate + probe. Movie: the feature video.
             // Series: the file matching the REQUESTED episode (validating a pack's largest file
-            // against the requested (s,e) would misfire — a pack holds many episodes).
+            // against the requested (s,e) would misfire — a pack holds many episodes), or a
+            // single-file release that names it by an absolute number.
             let selected_path = match rec.request.kind {
                 MediaKind::Movie => select_target(&info).map(|f| f.path.clone()),
-                MediaKind::Series => episode_files(&info)
-                    .into_iter()
-                    .find(|(s, e, _)| {
-                        Some(*s) == rec.request.season && Some(*e) == rec.request.episode
-                    })
-                    .map(|(_, _, p)| p),
+                MediaKind::Series => requested_episode_file(&info, &rec.request).map(|(_, _, p)| p),
             };
             let Some(selected_path) = selected_path else {
                 // The requested episode isn't present (or no video resolved). Past the dead-timeout,
@@ -1295,9 +1366,11 @@ impl AcquisitionEngine {
                 let check = if tmdb_down {
                     TitleCheck::Unavailable
                 } else {
+                    // The whole path: a file with no episode code may take its season from a
+                    // directory, as the VFS places it.
                     self.validator
                         .validate(
-                            &file_name,
+                            &selected_path,
                             rec.request.tmdb_id,
                             rec.request.kind,
                             rec.request.season,
@@ -1548,13 +1621,12 @@ impl AcquisitionEngine {
             .store
             .blacklist_add(req.kind, req.tmdb_id, hash.to_string(), reason, now_secs())
             .await;
-        let _ = self.store.remove_owned(hash.to_string()).await;
-        let _ = self.store.remove_authoritative(hash.to_string()).await;
-        // Drop any selection slots this hash represented so the VFS stops showing the dead release.
-        for (slot, entry) in self.store.all_selection().await {
-            if entry.hash.eq_ignore_ascii_case(hash) {
-                let _ = self.store.remove_selection(slot).await;
-            }
+        // Drop the owned record, its authoritative id and every selection slot naming the hash (so
+        // the VFS stops showing the dead release), in one transaction: a failure leaves all three
+        // in place, never a slot serving a forgotten record. The torrent is already gone, so a kept
+        // record is reaped again on a later tick.
+        if let Err(e) = self.store.forget_owned(hash.to_string()).await {
+            warn!("observe: dropping the records of reaped {hash} failed: {e}");
         }
         // Re-acquire ONLY once the dead record was actually cleared (a failed delete returned above
         // with the record kept for the retry): adding a replacement then would leave the dead hash
@@ -1670,12 +1742,12 @@ impl AcquisitionEngine {
                 "acquire: tmdb {} — reaping lapsed superseded owned {} (replaced by {})",
                 req.tmdb_id, hash, new_hash
             );
-            let _ = self.store.remove_owned(hash.clone()).await;
-            let _ = self.store.remove_authoritative(hash.clone()).await;
-            for (slot, entry) in self.store.all_selection().await {
-                if entry.hash.eq_ignore_ascii_case(&hash) {
-                    let _ = self.store.remove_selection(slot).await;
-                }
+            // One transaction for the record, its authoritative id and its slots (`forget_owned`).
+            if let Err(e) = self.store.forget_owned(hash.clone()).await {
+                warn!(
+                    "acquire: tmdb {} — dropping the records of lapsed {} failed: {}",
+                    req.tmdb_id, hash, e
+                );
             }
         }
     }
@@ -2082,41 +2154,6 @@ mod tests {
             Ok(vec![])
         }
     }
-    /// A `MockProvider` whose `resolve_url` returns the locator's own link, so a test can tell which
-    /// file was resolved (the mock's flat `resolved_url` is the same for every file of a torrent).
-    #[derive(Debug)]
-    struct LinkResolvingProvider(MockProvider);
-    #[async_trait]
-    impl DebridProvider for LinkResolvingProvider {
-        fn name(&self) -> &'static str {
-            "link-resolving"
-        }
-        async fn get_torrents(&self) -> Result<Vec<crate::rd_client::Torrent>, reqwest::Error> {
-            self.0.get_torrents().await
-        }
-        async fn get_torrent_info(&self, id: &str) -> Result<TI, reqwest::Error> {
-            self.0.get_torrent_info(id).await
-        }
-        async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
-            self.0.add_magnet(magnet).await
-        }
-        async fn select_files(&self, t: &str, f: &str) -> Result<(), reqwest::Error> {
-            self.0.select_files(t, f).await
-        }
-        async fn delete_torrent(&self, id: &str) -> Result<(), reqwest::Error> {
-            self.0.delete_torrent(id).await
-        }
-        async fn resolve_url(
-            &self,
-            l: &crate::provider::FileLocator,
-        ) -> Result<String, crate::error::AppError> {
-            l.link.clone().ok_or(crate::error::AppError::Unavailable)
-        }
-        async fn invalidate(&self, l: &crate::provider::FileLocator) {
-            self.0.invalidate(l).await
-        }
-    }
-
     /// Hash-aware provider for end-to-end re-acquire tests: `add_magnet` derives the torrent id from
     /// the magnet's infohash and `get_torrent_info` returns a downloaded single-file movie for that
     /// hash — so a blacklist→re-scrape→add-next-candidate round-trip resolves a DIFFERENT hash than
@@ -3790,9 +3827,15 @@ mod tests {
             "a TMDB failure is no verdict, never a mismatch"
         );
         // A show's file must declare the requested episode.
+        let show_identified = Identification::Identified(MediaMetadata {
+            title: "Show".into(),
+            year: Some("2023".into()),
+            media_type: MediaType::Show,
+            external_id: Some("tmdb:27205".into()),
+        });
         let show = |e: u32| {
             title_check(
-                &identified(27205),
+                &show_identified,
                 "Show.S01E01E02.mkv",
                 27205,
                 MediaKind::Series,
@@ -3805,7 +3848,7 @@ mod tests {
         // ...in any form `parse_se_all` reads, the `NxM` one included.
         assert_eq!(
             title_check(
-                &identified(27205),
+                &show_identified,
                 "Show - 2x05 - Title.mkv",
                 27205,
                 MediaKind::Series,
@@ -3813,6 +3856,78 @@ mod tests {
                 Some(5),
             ),
             TitleCheck::Match
+        );
+    }
+
+    #[test]
+    fn title_check_requires_the_requested_media_type() {
+        // TMDB's movie and TV id spaces overlap: a file identified as the show that carries the
+        // requested movie's numeric id (or the reverse) is another title.
+        use crate::identification::Identification;
+        let identified = |media_type: MediaType| {
+            Identification::Identified(MediaMetadata {
+                title: "Title".into(),
+                year: Some("2023".into()),
+                media_type,
+                external_id: Some("tmdb:42".into()),
+            })
+        };
+        let series = |found: &Identification| {
+            title_check(
+                found,
+                "Show.S01E01.mkv",
+                42,
+                MediaKind::Series,
+                Some(1),
+                Some(1),
+            )
+        };
+        let movie = |found: &Identification| {
+            title_check(found, "Movie.2023.mkv", 42, MediaKind::Movie, None, None)
+        };
+        assert_eq!(series(&identified(MediaType::Movie)), TitleCheck::Mismatch);
+        assert_eq!(movie(&identified(MediaType::Show)), TitleCheck::Mismatch);
+        assert_eq!(series(&identified(MediaType::Show)), TitleCheck::Match);
+        assert_eq!(movie(&identified(MediaType::Movie)), TitleCheck::Match);
+    }
+
+    #[test]
+    fn title_check_reads_an_absolute_numbered_episode_file() {
+        // The common anime form names the episode by a trailing ` - NN` number and no code: it is
+        // that episode of the season the VFS places the file in (season 1 unless the name or a
+        // directory names one).
+        use crate::identification::Identification;
+        let found = Identification::Identified(MediaMetadata {
+            title: "Show".into(),
+            year: None,
+            media_type: MediaType::Show,
+            external_id: Some("tmdb:42".into()),
+        });
+        let check = |path: &str, s: u32, e: u32| {
+            title_check(&found, path, 42, MediaKind::Series, Some(s), Some(e))
+        };
+        assert_eq!(check("Show - 12 (1080p).mkv", 1, 12), TitleCheck::Match);
+        assert_eq!(
+            check(
+                "[Group] Show - 12 (1080p) [ABCD1234]/Show - 12 (1080p).mkv",
+                1,
+                12
+            ),
+            TitleCheck::Match
+        );
+        assert_eq!(check("Show - 12 (1080p).mkv", 1, 13), TitleCheck::Mismatch);
+        assert_eq!(check("Show S2 - 05 (1080p).mkv", 2, 5), TitleCheck::Match);
+        assert_eq!(
+            check("Show S2/Show - 05 (1080p).mkv", 2, 5),
+            TitleCheck::Match
+        );
+        assert_eq!(check("Show - 05 (1080p).mkv", 2, 5), TitleCheck::Mismatch);
+        // A number followed by a bracketed release year is no episode number.
+        assert_eq!(check("Show - 12 (2008).mkv", 1, 12), TitleCheck::Mismatch);
+        // A file with an episode code is read by its code alone.
+        assert_eq!(
+            check("Show S01E05 - 12 (1080p).mkv", 1, 12),
+            TitleCheck::Mismatch
         );
     }
 
@@ -5922,7 +6037,8 @@ mod tests {
             selected: 1,
         };
         // Each file resolves to its own link, so the probed URL names the probed file.
-        let provider: Arc<dyn DebridProvider> = Arc::new(LinkResolvingProvider(MockProvider {
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            resolve_by_link: true,
             torrent_info: Some(TI {
                 id: "tid_hp".into(),
                 hash: "hp".into(),
@@ -5932,7 +6048,7 @@ mod tests {
                 ..Default::default()
             }),
             ..Default::default()
-        }));
+        });
         let prober = Arc::new(RecordingProber::default());
         let eng = engine(
             provider,
@@ -5990,7 +6106,8 @@ mod tests {
             bytes: 1_000_000_000,
             selected: 1,
         };
-        let provider = Arc::new(LinkResolvingProvider(MockProvider {
+        let provider = Arc::new(MockProvider {
+            resolve_by_link: true,
             torrent_info: Some(TI {
                 id: "tid_hp".into(),
                 hash: "hp".into(),
@@ -6008,7 +6125,7 @@ mod tests {
                 ..Default::default()
             }),
             ..Default::default()
-        }));
+        });
         let prober = Arc::new(RecordingProber::default());
         let eng = engine(
             provider.clone(),
@@ -6025,7 +6142,7 @@ mod tests {
             .expect("the pack is kept, not rejected as EpisodeMissing");
         assert_eq!(rec.status, OwnedStatus::Verified);
         assert_eq!(rec.provides, vec![(2, 4), (2, 5), (2, 6)]);
-        assert!(provider.0.deleted.lock().unwrap().is_empty());
+        assert!(provider.deleted.lock().unwrap().is_empty());
         assert_eq!(
             *prober.urls.lock().unwrap(),
             vec!["https://cdn/e05".to_string()],
@@ -6038,6 +6155,146 @@ mod tests {
                 .unwrap()
                 .file_path,
             "Show S02/Show - 2x05 - Second.mkv"
+        );
+    }
+
+    /// Run one `observe` tick over a downloaded show torrent `hp` holding `paths`, owned `Pending`
+    /// for S`season`E`episode` and added an hour ago (past the 600 s dead timeout, where a torrent
+    /// lacking the episode is rejected). Returns the store and the provider.
+    async fn observe_show_torrent(
+        paths: &[&str],
+        season: u32,
+        episode: u32,
+    ) -> (Store, Arc<MockProvider>) {
+        let st = store();
+        let mut request = series_req_for(episode);
+        request.season = Some(season);
+        st.put_owned(
+            "hp".into(),
+            OwnedRecord {
+                request,
+                provenance: Provenance::watchlist("alice"),
+                added_at: now_secs() - 3_600,
+                status: OwnedStatus::Pending,
+                provides: vec![(season, episode)],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        let provider = Arc::new(MockProvider {
+            resolve_by_link: true,
+            torrent_info: Some(TI {
+                id: "tid_hp".into(),
+                hash: "hp".into(),
+                status: "downloaded".into(),
+                files: paths
+                    .iter()
+                    .enumerate()
+                    .map(|(id, path)| TorrentFile {
+                        id: id as u32,
+                        path: (*path).into(),
+                        bytes: 1_000_000_000,
+                        selected: 1,
+                    })
+                    .collect(),
+                links: (0..paths.len())
+                    .map(|i| format!("https://cdn/f{i}"))
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider.clone(),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(RecordingProber::default()),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_hp", "hp", "downloaded", 100.0)])
+            .await;
+        (st, provider)
+    }
+
+    /// A single-file anime release named by its absolute number (`[Group] Show - 12 (1080p)`, no
+    /// episode code) supplies the episode it names in season 1, where the VFS places it: `observe`
+    /// verifies it and slots it, rather than rejecting it as EpisodeMissing once the dead timeout has
+    /// passed (and blacklisting a correct release for 30 days).
+    #[tokio::test]
+    async fn observe_verifies_a_single_absolute_numbered_episode_file() {
+        let path = "[Group] Show - 12 (1080p) [ABCD1234].mkv";
+        let (st, provider) = observe_show_torrent(&[path], 1, 12).await;
+        let rec = st
+            .get_owned("hp".into())
+            .await
+            .expect("the release is kept, not rejected as EpisodeMissing");
+        assert_eq!(rec.status, OwnedStatus::Verified);
+        assert_eq!(rec.provides, vec![(1, 12)]);
+        assert!(provider.deleted.lock().unwrap().is_empty());
+        assert!(
+            !st.is_blacklisted(MediaKind::Series, 27205, "hp".into())
+                .await
+        );
+        assert_eq!(
+            st.get_selection(crate::store::episode_slot(27205, 1, 12))
+                .await
+                .unwrap()
+                .file_path,
+            path
+        );
+    }
+
+    /// The fallback is narrow: a number naming another episode, and a multi-file torrent of
+    /// code-less files (whose absolute numbers can't be mapped past season 1 without TMDB's
+    /// per-season episode counts), are still rejected as EpisodeMissing.
+    #[tokio::test]
+    async fn observe_rejects_an_absolute_numbered_file_for_another_episode_or_in_a_pack() {
+        for (paths, episode) in [
+            (vec!["[Group] Show - 12 (1080p) [ABCD1234].mkv"], 13),
+            (
+                vec![
+                    "Pack/[Group] Show - 12 (1080p).mkv",
+                    "Pack/[Group] Show - 13 (1080p).mkv",
+                ],
+                12,
+            ),
+        ] {
+            let (st, provider) = observe_show_torrent(&paths, 1, episode).await;
+            assert!(
+                st.get_owned("hp".into()).await.is_none(),
+                "{paths:?} requested as E{episode} is rejected"
+            );
+            assert!(
+                st.is_blacklisted(MediaKind::Series, 27205, "hp".into())
+                    .await
+            );
+            assert_eq!(
+                *provider.deleted.lock().unwrap(),
+                vec!["tid_hp".to_string()]
+            );
+        }
+    }
+
+    /// A keyword in the episode title after the code (`Bonus Round`) doesn't make the file an extras
+    /// clip, so the episode is found and verified instead of being reaped as NeverResolved.
+    #[tokio::test]
+    async fn observe_verifies_an_episode_whose_title_holds_an_extras_keyword() {
+        let path = "Show - S02E05 - Bonus Round.mkv";
+        let (st, provider) = observe_show_torrent(&[path], 2, 5).await;
+        let rec = st
+            .get_owned("hp".into())
+            .await
+            .expect("the release is kept");
+        assert_eq!(rec.status, OwnedStatus::Verified);
+        assert_eq!(rec.provides, vec![(2, 5)]);
+        assert!(provider.deleted.lock().unwrap().is_empty());
+        assert_eq!(
+            st.get_selection(crate::store::episode_slot(27205, 2, 5))
+                .await
+                .unwrap()
+                .file_path,
+            path
         );
     }
 
@@ -6445,5 +6702,113 @@ mod tests {
         // outranks a 720p single.
         let st = run_pack_gate_q(q(720, 3_000, 1_075_000), q(1080, 0, 1)).await;
         assert_eq!(slot(st).await, "hpack");
+    }
+
+    /// Seed `hash` as an owned movie record of [`req`] with its authoritative id and the film's
+    /// selection slot, plus an unrelated title's slot that must survive.
+    async fn seed_owned_with_slot(st: &Store, hash: &str, status: OwnedStatus) {
+        st.put_owned(
+            hash.into(),
+            OwnedRecord {
+                request: req(),
+                provenance: Provenance::watchlist("alice"),
+                added_at: 1,
+                status,
+                provides: vec![],
+                quality: None,
+            },
+        )
+        .await
+        .unwrap();
+        st.put_authoritative(hash.into(), meta()).await.unwrap();
+        for (slot, h) in [
+            (crate::store::movie_slot(27205), hash),
+            (crate::store::movie_slot(4242), "other"),
+        ] {
+            st.put_selection(
+                slot,
+                crate::store::SelectionEntry {
+                    hash: h.into(),
+                    file_path: format!("{h}.mkv"),
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Assert `hash`'s owned record, authoritative id and slot are all gone, and the other title's
+    /// slot kept.
+    async fn assert_forgotten(st: &Store, hash: &str) {
+        assert!(st.get_owned(hash.into()).await.is_none(), "owned row");
+        assert!(
+            st.authoritative_meta(hash.into()).await.is_none(),
+            "authoritative id"
+        );
+        assert!(
+            st.get_selection(crate::store::movie_slot(27205))
+                .await
+                .is_none(),
+            "the film's slot"
+        );
+        assert_eq!(
+            st.get_selection(crate::store::movie_slot(4242))
+                .await
+                .map(|e| e.hash),
+            Some("other".to_string()),
+            "another title's slot is untouched"
+        );
+    }
+
+    /// A reaped torrent's owned row, authoritative id and slots go in ONE commit after the
+    /// blacklist entry, so a write failure can't leave a slot serving a forgotten record (or an
+    /// authoritative id for one): with only two commits let through, all three are gone.
+    #[tokio::test]
+    async fn fail_and_reacquire_forgets_the_record_in_one_commit() {
+        let (st, switch) = crate::store::fail_writes::fail_after_arm_store();
+        let per_commit = crate::store::fail_writes::syncs_per_commit(&st, &switch).await;
+        seed_owned_with_slot(&st, "h1", OwnedStatus::Pending).await;
+        let eng = engine(
+            Arc::new(MockProvider::default()),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st,
+        );
+        switch.arm_after(2, per_commit); // the blacklist entry, then the forget
+        assert!(
+            eng.fail_and_reacquire(
+                "h1",
+                &["tid_h1"],
+                &req(),
+                "Dead",
+                &Provenance::watchlist("alice"),
+            )
+            .await
+        );
+        switch.disarm();
+        let st = switch.reopen();
+        assert!(st.blacklist_newest_at_by_hash(&[]).await.contains_key("h1"));
+        assert_forgotten(&st, "h1").await;
+    }
+
+    /// The lapsed record `acquire` reaps for the same slot is forgotten in one commit too.
+    #[tokio::test]
+    async fn reap_lapsed_superseded_forgets_the_record_in_one_commit() {
+        let (st, switch) = crate::store::fail_writes::fail_after_arm_store();
+        let per_commit = crate::store::fail_writes::syncs_per_commit(&st, &switch).await;
+        seed_owned_with_slot(&st, "hold", OwnedStatus::Verified).await;
+        let eng = engine(
+            Arc::new(MockProvider::default()),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Ok(vec![]))),
+            st,
+        );
+        switch.arm_after(1, per_commit);
+        let present: std::collections::HashSet<String> = ["hnew".to_string()].into();
+        eng.reap_lapsed_superseded(&req(), "hnew", &present).await;
+        switch.disarm();
+        assert_forgotten(&switch.reopen(), "hold").await;
     }
 }

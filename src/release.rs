@@ -230,31 +230,33 @@ fn is_cam_source(lower: &str) -> bool {
         })
 }
 
-// A bare `ts` telesync tag, but NOT a trailing `.ts` container extension. Requiring a trailing
-// separator means `…1080p.HDTV.ts` (a real transport-stream file) is treated as a container, while a
-// mid-name telesync tag (`…1080p.TS.x265`, ` ts `, `-ts-`) is still caught by the quality floor.
-// The LEADING boundary class includes `\n` (the separator joining `name`+`description` in `parse`)
-// so a telesync tag at the start of the description is caught — matching the sibling `WEB_RE`/
-// `MULTI_RE`. The TRAILING class deliberately omits `\n`/`$` to preserve the `.ts`-container guard
-// (a name ending `.ts` is joined as `.ts\n…`, which a trailing `\n` would wrongly cam-reject).
-static TS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[ .\-_\n])ts[ .\-_]").unwrap());
+// A bare `ts` telesync tag, but NOT a trailing `.ts` container extension. A bare `ts` counts only
+// with a separator after it, and `is_cam_source` matches this one line at a time (a line's
+// `cam_word_part`, or a padded bracket group of it), so a line ending `….ts` (`…1080p.HDTV.ts`, a
+// real transport-stream file) is read as the container, while a mid-line telesync tag
+// (`…1080p.TS.x265`, ` ts `, `-ts-`) is still caught by the quality floor. Never add `$` to the
+// trailing class: it would cam-reject every `.ts` file line. A line holds no `\n`, so neither class
+// lists it.
+static TS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[ .\-_])ts[ .\-_]").unwrap());
 
 // A bare `web` source token (the canonical scene tag, e.g. `…1080p.WEB.H264-GROUP`) that the
-// explicit `web-dl`/`webrip`/etc. checks miss. Separator-bounded (start/space/`.`/`-`/`_`/newline on
-// both sides) so it matches `WEB` as a standalone token but not a substring of another word
-// (`webrip` is handled explicitly; `spiderweb` won't match). Without this, a bare-`WEB` release falls
-// to `Source::Other` (tier 0) — scoring BELOW HDTV and blocking a legitimate HDTV→WEB upgrade. Like
-// the bare cam words it is matched only in a line's `tag_part`, so the title word in
+// explicit `web-dl`/`webrip`/etc. checks miss. Separator-bounded (start/end, space, `.`, `-` or `_`
+// on both sides; it only ever sees one line, so no `\n`) so it matches `WEB` as a standalone token
+// but not a substring of another word (`webrip` is handled explicitly; `spiderweb` won't match).
+// Without this, a bare-`WEB` release falls to `Source::Other` (tier 0) — scoring BELOW HDTV and
+// blocking a legitimate HDTV→WEB upgrade. Like the bare cam words it is matched only in a line's
+// `tag_part`, so the title word in
 // `Charlotte's.Web.2006.720p.HDTV` doesn't make an HDTV release WEB. A show line's tag part still
 // holds its episode title (`S01E05.Web.of.Lies.720p.HDTV`), as does a pack's file line
 // (`05 - Web of Lies.mkv`), so the bare token also counts only when the text names no other source
 // (`NON_WEB_SOURCE_TAGS`): a release is never both HDTV and WEB.
 static WEB_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:^|[ ._\n-])web(?:[ ._\n-]|$)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?:^|[ ._-])web(?:[ ._-]|$)").unwrap());
 // Source tags a bare `web` token never sits beside on a real WEB release (BluRay/REMUX win earlier).
 const NON_WEB_SOURCE_TAGS: [&str; 5] = ["hdtv", "pdtv", "sdtv", "tvrip", "dvdrip"];
 
 // A separator-bounded `multi` (multi-language) token — see the language-parsing loop in `parse`.
+// It runs on the joined `name\ndescription` text, so `\n` is a separator here.
 static MULTI_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|[ ._\n-])multi(?:[ ._\n-]|$)").unwrap());
 
@@ -276,7 +278,7 @@ static SUB_SEP_ONLY_RE: LazyLock<Regex> =
 
 // A separator-bounded Dolby-Vision `dv` token — matches `Movie.2160p.DV.HEVC` (dot-separated, the
 // common Torrentio form) as well as space-separated ` dv `, without false-positiving on words that
-// merely contain "dv". Bounded like `WEB_RE`/`MULTI_RE`.
+// merely contain "dv". Bounded like `MULTI_RE`, `\n` included: it runs on the joined text too.
 static DV_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|[ ._\n-])dv(?:[ ._\n-]|$)").unwrap());
 
@@ -669,6 +671,8 @@ pub const CACHED_BONUS: i64 = 1_000_000;
 /// (+3_000), verifiable container (+2_000), bitrate (up to +3_000), seeders (up to +2_000) — so,
 /// e.g., the HEVC bonus can outweigh a one-step source-tier difference, and bitrate can outweigh the
 /// container bonus. See the body for exact magnitudes and the `AUDIO_LANGUAGE`-mismatch penalty.
+/// [`rank`] does not sort on this sum alone: it orders by the cached, resolution and language terms
+/// first and puts a tagged source before an untagged one within them.
 pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
     // Quality floor: never acquire a cam / telesync / telecine / screener / R5 / workprint source.
     if r.source == Source::Cam {
@@ -687,12 +691,8 @@ pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
     if !r.cached && r.seeders == Some(0) {
         return None;
     }
-    let mut s: i64 = 0;
-    if r.cached {
-        s += CACHED_BONUS;
-    }
+    let mut s = coarse_score(r, prefs);
     s += r.source.tier_score();
-    s += r.resolution.unwrap_or(0) as i64 * 100;
     if prefs.prefer_hevc && r.codec == Codec::Hevc {
         s += 5_000;
     }
@@ -718,10 +718,23 @@ pub fn score(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<i64> {
             s += (sz / 1_000_000_000).min(15) as i64 * 200; // up to +3000 at ≥15 GB
         }
     }
+    Some(s)
+}
+
+/// `score`'s coarse terms: cached availability, resolution and the wrong-`AUDIO_LANGUAGE` penalty.
+/// The source tier and the additive bonuses make up the rest of the score. [`rank`] orders by this
+/// first, so the source tie-break it applies within one coarse group never crosses a cached,
+/// resolution or language difference.
+fn coarse_score(r: &ReleaseInfo, prefs: &QualityPrefs) -> i64 {
+    let mut s: i64 = 0;
+    if r.cached {
+        s += CACHED_BONUS;
+    }
+    s += r.resolution.unwrap_or(0) as i64 * 100;
     if wrong_audio_language(r, prefs) {
         s -= 50_000;
     }
-    Some(s)
+    s
 }
 
 /// Whether `r` carries [`score`]'s wrong-`AUDIO_LANGUAGE` penalty under `prefs`: it names (or flags)
@@ -753,13 +766,33 @@ pub fn wrong_audio_language(r: &ReleaseInfo, prefs: &QualityPrefs) -> bool {
         .any(|l| l == "mul" || wants.iter().any(|w| crate::probe::lang_eq(l, w)))
 }
 
+/// The candidates [`score`] accepts, best first. Ordered by `score`'s coarse terms
+/// ([`coarse_score`]: cached, resolution, the language penalty), then a tagged source before an
+/// untagged one (`Source::Other`), then the full score. Within one coarse group a release with no
+/// source tag therefore ranks below every tagged one, whatever its bonuses: it is recorded with
+/// source tier 0, which the upgrade pass treats as unknown quality ([`is_unknown_quality`]) and
+/// replaces with any known release at its resolution, so acquiring it over a tagged release would
+/// only download the title twice. Across coarse groups the order is `score`'s, bar a resolution
+/// gap small enough for the tier and bonuses to overturn (576p against 720p): there the higher
+/// resolution ranks first.
 pub fn rank(candidates: Vec<ReleaseInfo>, prefs: &QualityPrefs) -> Vec<ReleaseInfo> {
-    let mut scored: Vec<(i64, ReleaseInfo)> = candidates
+    let mut scored: Vec<(RankKey, ReleaseInfo)> = candidates
         .into_iter()
-        .filter_map(|r| score(&r, prefs).map(|s| (s, r)))
+        .filter_map(|r| Some((rank_key(&r, prefs)?, r)))
         .collect();
-    scored.sort_by_key(|s| std::cmp::Reverse(s.0));
+    scored.sort_by_key(|(key, _)| std::cmp::Reverse(*key));
     scored.into_iter().map(|(_, r)| r).collect()
+}
+
+/// [`rank`]'s order key, higher first: [`coarse_score`], then whether the source is tagged, then
+/// the full [`score`]. A total order (a plain tuple), so a sort by it is well defined.
+pub(crate) type RankKey = (i64, bool, i64);
+
+/// The key [`rank`] orders `r` by under `prefs`, or `None` when [`score`] rejects it. The upgrade
+/// engine's pack ranker orders by it too, so a pack it stages is the one acquisition would pick.
+pub(crate) fn rank_key(r: &ReleaseInfo, prefs: &QualityPrefs) -> Option<RankKey> {
+    let s = score(r, prefs)?;
+    Some((coarse_score(r, prefs), r.source != Source::Other, s))
 }
 
 /// A compact, serialisable snapshot of a release's quality, recorded on `OwnedRecord` at acquire
@@ -1227,6 +1260,125 @@ mod tests {
         assert_eq!(ranked.len(), 2, "the 2160p candidate is dropped");
         assert_eq!(ranked[0].info_hash, "hc", "cached ranks first");
         assert_eq!(ranked[1].info_hash, "hu");
+    }
+
+    /// A release whose name tags no source (`Source::Other`) is recorded with source tier 0, which
+    /// the upgrade pass treats as unknown quality and replaces with any known release at its
+    /// resolution. The HEVC bonus (+5k) outweighs the WEB tier (3k), so ranking on score alone
+    /// added the untagged x265 encode, and the next upgrade pass swapped it for the WEB release
+    /// acquisition had ranked below it. At the same cached state, resolution and language state a
+    /// tagged source ranks first.
+    #[test]
+    fn rank_puts_a_tagged_source_above_an_untagged_one_at_the_same_resolution() {
+        let untagged = parse(&raw(
+            "Torrentio\n1080p",
+            "Show.S01E01.1080p.HEVC.x265-MeGusta\n\u{1f4be} 1.2 GB \u{1f464} 50\nRD+",
+            "huntagged",
+            Some("Show.S01E01.1080p.HEVC.x265-MeGusta.mkv"),
+        ));
+        let web = parse(&raw(
+            "Torrentio\n1080p",
+            "Show.S01E01.1080p.WEB.h264-GROUP\n\u{1f4be} 1.2 GB \u{1f464} 50\nRD+",
+            "hweb",
+            Some("Show.S01E01.1080p.WEB.h264-GROUP.mkv"),
+        ));
+        assert_eq!(untagged.source, Source::Other, "premise: no source tag");
+        assert_eq!(web.source, Source::Web);
+        assert!(
+            score(&untagged, &prefs()).unwrap() > score(&web, &prefs()).unwrap(),
+            "premise: the HEVC bonus out-scores the WEB tier"
+        );
+        let ranked = rank(vec![untagged.clone(), web.clone()], &prefs());
+        assert_eq!(ranked[0].info_hash, "hweb", "the tagged source ranks first");
+        // Input order doesn't matter.
+        let ranked = rank(vec![web, untagged], &prefs());
+        assert_eq!(ranked[0].info_hash, "hweb");
+    }
+
+    /// The tagged-source tie-break never crosses `score`'s coarse terms: a higher resolution, or a
+    /// cached release, still ranks above a tagged one.
+    #[test]
+    fn rank_keeps_resolution_and_cache_above_the_source_tie_break() {
+        let mut p = prefs();
+        p.max_resolution = MaxResolution::P2160;
+        let untagged_2160 = parse(&raw("t", "Film.2160p.x264\nRD+", "h2160", Some("F.mkv")));
+        let remux_1080 = parse(&raw(
+            "t",
+            "Film.1080p.REMUX.x265\nRD+",
+            "hremux",
+            Some("F.mkv"),
+        ));
+        let untagged_1080 = parse(&raw("t", "Film.1080p.x265\nRD+", "h1080", Some("F.mkv")));
+        let bluray_720 = parse(&raw(
+            "t",
+            "Film.720p.BluRay.x265\nRD+",
+            "h720",
+            Some("F.mkv"),
+        ));
+        let uncached_remux_1080 = parse(&raw(
+            "t",
+            "Film.1080p.REMUX.x265 \u{1f464} 500",
+            "hunc",
+            Some("F.mkv"),
+        ));
+        let ranked: Vec<String> = rank(
+            vec![
+                uncached_remux_1080,
+                bluray_720,
+                untagged_1080,
+                remux_1080,
+                untagged_2160,
+            ],
+            &p,
+        )
+        .into_iter()
+        .map(|r| r.info_hash)
+        .collect();
+        assert_eq!(ranked, ["h2160", "hremux", "h1080", "h720", "hunc"]);
+    }
+
+    /// The wrong-`AUDIO_LANGUAGE` penalty keeps its weight across resolutions: it is one of the
+    /// coarse terms `rank` orders by first, exactly as in `score`.
+    #[test]
+    fn rank_keeps_the_language_penalty_order_across_resolutions() {
+        let mut p = prefs();
+        p.max_resolution = MaxResolution::P2160;
+        p.audio = AudioReq::Lang("eng".to_string());
+        let wrong_2160 = parse(&raw(
+            "t",
+            "Film.2160p.BluRay.x265 German\nRD+",
+            "hw2160",
+            Some("F.mkv"),
+        ));
+        let right_1080 = parse(&raw(
+            "t",
+            "Film.1080p.BluRay.x265\nRD+",
+            "hr1080",
+            Some("F.mkv"),
+        ));
+        let ranked = rank(vec![right_1080, wrong_2160], &p);
+        assert_eq!(
+            ranked[0].info_hash, "hw2160",
+            "a wrong-language 2160p still outranks a 1080p, as its score does"
+        );
+
+        let wrong_1080 = parse(&raw(
+            "t",
+            "Film.1080p.REMUX.x265 German\nRD+",
+            "hw1080",
+            Some("F.mkv"),
+        ));
+        let right_720 = parse(&raw(
+            "t",
+            "Film.720p.HDTV.x264\nRD+",
+            "hr720",
+            Some("F.mkv"),
+        ));
+        let ranked = rank(vec![wrong_1080, right_720], &p);
+        assert_eq!(
+            ranked[0].info_hash, "hr720",
+            "a wrong-language 1080p still ranks below a correct 720p"
+        );
     }
 
     #[test]
