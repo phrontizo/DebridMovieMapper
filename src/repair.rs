@@ -34,6 +34,12 @@ pub enum RepairState {
     Failed,
 }
 
+/// The states [`RepairManager::hidden_torrent_ids`] and [`RepairManager::is_hidden`] leave out of
+/// the VFS. A `Repairing` torrent stays listed while its reads are refused.
+fn hidden_from_vfs(state: &RepairState) -> bool {
+    matches!(state, RepairState::Broken | RepairState::Failed)
+}
+
 #[derive(Debug, Clone)]
 pub struct TorrentHealth {
     pub torrent_id: String,
@@ -273,14 +279,12 @@ impl RepairManager {
     /// Record that `new_info` (downloaded) replaced the torrent `old_torrent_id`, so
     /// [`Self::redirect`] maps each of its selected files onto `new_info`.
     async fn record_redirect(&self, old_torrent_id: &str, new_info: &TorrentInfo, hash: &str) {
-        let files: HashMap<String, crate::provider::FileLocator> = new_info
-            .files
-            .iter()
-            .filter(|f| f.selected == 1)
-            .filter_map(|f| {
-                Self::locator_for_file(new_info, hash, &f.path).map(|l| (f.path.clone(), l))
-            })
-            .collect();
+        let mut files: HashMap<String, crate::provider::FileLocator> = HashMap::new();
+        for locator in crate::vfs::selected_locators(new_info, hash) {
+            // A path listed twice keeps its first selected file, as `vfs::locator_for_selected`
+            // finds it.
+            files.entry(locator.file_path.clone()).or_insert(locator);
+        }
         self.repaired_locators
             .write()
             .await
@@ -572,10 +576,11 @@ impl RepairManager {
         let mut health_map = self.health_status.write().await;
         // Carry the attempt budget forward ONLY for a new-id (Real-Debrid) re-add, so the 30s
         // cooldown + 3-attempt cap bound RD's per-read new-id storm. For a same-id (TorBox) re-add
-        // this success path is reached only when the file IS present and cached (`locator_for_file`
-        // matched), so a still-failing byte read is a transient CDN issue, not missing content —
-        // RESET the budget so it can never accumulate to the Failed/hidden state, which is
-        // unrecoverable for a same-id torrent (hidden → no reads → `note_read_success` never fires).
+        // this success path is reached only when the file IS present and cached
+        // (`vfs::locator_for_selected` matched), so a still-failing byte read is a transient CDN
+        // issue, not missing content — RESET the budget so it can never accumulate to the
+        // Failed/hidden state, which is unrecoverable for a same-id torrent (hidden → no reads →
+        // `note_read_success` never fires).
         // The fresh `last_repair_trigger` below still rate-limits re-adds to one per 30s.
         let carried_attempts = if same {
             0
@@ -618,20 +623,6 @@ impl RepairManager {
                 warn!("Failed to delete old torrent {}: {}", old, e);
             }
         });
-    }
-
-    /// Build a `FileLocator` for the file at `file_path` within `info`
-    /// (`acquire::locator_for_selected`, over the one copy of the pairing,
-    /// `vfs::selected_files_with_links`). The per-file restricted link is paired by position among
-    /// selected files (Real-Debrid); for providers with no per-file link array (TorBox) `links` is
-    /// empty so `link` is `None` and the file is addressed by `(torrent_id, file_id)`. Returns
-    /// `None` if no selected file matches `file_path`.
-    fn locator_for_file(
-        info: &TorrentInfo,
-        hash: &str,
-        file_path: &str,
-    ) -> Option<crate::provider::FileLocator> {
-        crate::acquire::locator_for_selected(info, hash, file_path)
     }
 
     /// Attempt instant repair (re-acquire) for a broken/uncached file. Re-adds the
@@ -797,7 +788,7 @@ impl RepairManager {
 
         if final_info.status == "downloaded" {
             // Match the SAME file by path (provider-neutral; no positional link index).
-            match Self::locator_for_file(&final_info, &locator.hash, &locator.file_path) {
+            match crate::vfs::locator_for_selected(&final_info, &locator.hash, &locator.file_path) {
                 Some(new_locator) => {
                     // Adopting the add: from here a cut-short repair must not delete it, since
                     // `complete_repair` records it as the replacement and has the superseded
@@ -930,9 +921,21 @@ impl RepairManager {
         let health_map = self.health_status.read().await;
         health_map
             .values()
-            .filter(|h| matches!(h.state, RepairState::Broken | RepairState::Failed))
+            .filter(|h| hidden_from_vfs(&h.state))
             .map(|h| h.torrent_id.clone())
             .collect()
+    }
+
+    /// Whether the VFS leaves `torrent_id` out ([`Self::hidden_torrent_ids`]: `Broken` or
+    /// `Failed`, not `Repairing`). An opened file of such a torrent reports an empty file; one
+    /// opened mid-repair reports its real size, and only its reads are refused
+    /// ([`Self::should_hide_torrent`]).
+    pub async fn is_hidden(&self, torrent_id: &str) -> bool {
+        self.health_status
+            .read()
+            .await
+            .get(torrent_id)
+            .is_some_and(|h| hidden_from_vfs(&h.state))
     }
 
     /// Summary of repair status as `(healthy, repairing, failed)`, where "repairing" counts both
@@ -1009,6 +1012,21 @@ impl RepairManager {
             .map(|(old_id, _)| old_id.clone())
             .collect();
         locators.retain(|old_id, _| keep.contains(old_id));
+    }
+
+    /// Put `torrent_id` in `state` (no attempts, no cooldown). Test support for other modules,
+    /// whose tests can't reach the health map.
+    #[cfg(test)]
+    pub(crate) async fn set_state_for_test(&self, torrent_id: &str, state: RepairState) {
+        self.health_status.write().await.insert(
+            torrent_id.to_string(),
+            TorrentHealth {
+                torrent_id: torrent_id.to_string(),
+                state,
+                repair_attempts: 0,
+                last_repair_trigger: None,
+            },
+        );
     }
 
     /// Force a torrent into the `Broken` state (hidden from WebDAV until a replacement is
@@ -1146,64 +1164,6 @@ mod tests {
     /// here sent `complete_repair`'s DELETE to api.real-debrid.com).
     fn make_test_manager() -> RepairManager {
         RepairManager::new(Arc::new(crate::provider::MockProvider::default()))
-    }
-
-    /// `locator_for_file` advances `link_idx` ONLY for `selected == 1` files, pairing RD's
-    /// per-file restricted links positionally among the SELECTED files. With a SELECTED file
-    /// AND an UNSELECTED file both preceding the target, the target is the 2nd selected file
-    /// (`link_idx == 1`) and must pair `links[1]`; the unselected file must NOT consume an index.
-    /// The single-selected-file repair tests never reach `link_idx > 0`, so this guards it.
-    #[test]
-    fn locator_for_file_pairs_link_by_position_among_selected_files() {
-        use crate::rd_client::{TorrentFile, TorrentInfo};
-
-        let info = TorrentInfo {
-            id: "tid".to_string(),
-            hash: "H".to_string(),
-            status: "downloaded".to_string(),
-            files: vec![
-                // Selected, but not the target → pushes link_idx to 1.
-                TorrentFile {
-                    id: 10,
-                    path: "/SelectedFirst.mkv".to_string(),
-                    bytes: 1000,
-                    selected: 1,
-                },
-                // Unselected → must be skipped WITHOUT consuming a link index.
-                TorrentFile {
-                    id: 20,
-                    path: "/Unselected.mkv".to_string(),
-                    bytes: 500,
-                    selected: 0,
-                },
-                // The target: the 2nd selected file → must pair links[1].
-                TorrentFile {
-                    id: 30,
-                    path: "/Target.mkv".to_string(),
-                    bytes: 2000,
-                    selected: 1,
-                },
-            ],
-            // RD emits one link per SELECTED file, in selected order: [SelectedFirst, Target].
-            links: vec![
-                "https://rd/selected-first".to_string(),
-                "https://rd/target".to_string(),
-            ],
-            ..Default::default()
-        };
-
-        let loc = RepairManager::locator_for_file(&info, "H", "/Target.mkv")
-            .expect("target file should resolve to a locator");
-
-        assert_eq!(loc.file_id, 30);
-        assert_eq!(loc.file_path, "/Target.mkv");
-        assert_eq!(loc.hash, "H");
-        assert_eq!(loc.torrent_id, "tid");
-        assert_eq!(
-            loc.link.as_deref(),
-            Some("https://rd/target"),
-            "the 2nd selected file must pair links[1]; the unselected file must not consume an index"
-        );
     }
 
     #[tokio::test]
@@ -2459,6 +2419,14 @@ mod tests {
             manager.should_hide_torrent("c").await,
             "reads of a Repairing torrent are still refused"
         );
+        // `is_hidden` (what an opened file's metadata goes by) is the VFS's view, state by state.
+        for id in ["a", "b", "c", "d", "unknown"] {
+            assert_eq!(
+                manager.is_hidden(id).await,
+                hidden_set.contains(id),
+                "is_hidden and hidden_torrent_ids must agree for torrent '{id}'"
+            );
+        }
     }
 
     #[tokio::test]

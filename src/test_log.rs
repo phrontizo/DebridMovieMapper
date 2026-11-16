@@ -3,8 +3,16 @@
 //! what it logged. [`capture`] runs a closure, [`capture_async`] a future.
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::instrument::WithSubscriber;
+
+/// A dispatcher with no subscriber, registered on the first capture and kept for the life of the
+/// test process. tracing-core caches whether each log line is enabled when the line is first hit.
+/// While only one dispatcher is registered it asks just the hitting thread's, so a line another
+/// test's thread (one with no subscriber) hits first while a capture runs is cached as disabled,
+/// and the capture misses it. With this one registered too there are always at least two, and
+/// tracing-core asks every live dispatcher: the line is then checked on each hit.
+static ANCHOR: OnceLock<tracing::Dispatch> = OnceLock::new();
 
 /// The buffer the subscriber writes into. Cloned into the subscriber's writer, so the test keeps a
 /// handle to read it back.
@@ -32,6 +40,7 @@ fn subscriber(
     level: tracing::Level,
     buf: &Buf,
 ) -> impl tracing::Subscriber + Send + Sync + 'static {
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()));
     let writer = buf.clone();
     tracing_subscriber::fmt()
         .with_max_level(level)
@@ -56,4 +65,21 @@ pub(crate) async fn capture_async<T>(
     let buf = Buf::default();
     let out = fut.with_subscriber(subscriber(level, &buf)).await;
     (out, buf.text())
+}
+
+#[cfg(test)]
+mod tests {
+    /// A log line no other test reaches, so this test is the first to register it.
+    fn probe_line() {
+        tracing::warn!("test_log probe line");
+    }
+
+    #[test]
+    fn a_line_first_reached_on_a_thread_with_no_subscriber_is_still_captured() {
+        let logs = super::capture(tracing::Level::WARN, || {
+            std::thread::spawn(probe_line).join().unwrap();
+            probe_line();
+        });
+        assert!(logs.contains("test_log probe line"), "{logs:?}");
+    }
 }

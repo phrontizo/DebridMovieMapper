@@ -249,10 +249,13 @@ pub struct OwnedRecord {
     /// removes it, and `set_provides_if_empty` fills it once its files decode.
     #[serde(default)]
     pub provides: Vec<(u32, u32)>,
-    /// Quality snapshot of the chosen release, for upgrade comparison. `None` on pre-SP3 records, on
-    /// account-mirror records written before quality capture or for an over-ceiling file (both
-    /// re-derived by `tasks::backfill_owned_quality`), and on a mirror record whose torrent lists no
-    /// video file (unknown-lowest).
+    /// Quality snapshot of the chosen release, for upgrade comparison. `None` on pre-SP3 records and
+    /// on account-mirror records written before quality capture or for an over-ceiling file (both
+    /// re-derived by `tasks::backfill_owned_quality`). Earlier builds also wrote `None` for a mirror
+    /// record whose torrent listed no video file; `tasks::record_mirror_owned` now drops such a
+    /// record (`Verified`, empty provenance, no `provides`) and doesn't mirror the torrent until its
+    /// files are back. A record left `None` because its torrent has no video file to re-derive from
+    /// (e.g. an older show record with `provides`) ranks unknown-lowest.
     #[serde(default)]
     pub quality: Option<crate::release::QualitySummary>,
 }

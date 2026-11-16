@@ -305,9 +305,9 @@ impl EnrolmentService {
 
     /// Refresh one account's tokens. On success, rebuild + persist with the re-enrolment flag
     /// cleared. A transient failure (`trakt_client::refresh_error_is_transient`: a 429, a 5xx, a
-    /// transport error, `Upstream`) is logged and leaves the record alone. Any other failure sets
-    /// the flag (compare-and-swap, only while the stored refresh token is still the one tried) so
-    /// the accounts page surfaces it.
+    /// transport error, an undecodable answer) is logged and leaves the record alone. Any other
+    /// failure sets the flag (compare-and-swap, only while the stored refresh token is still the
+    /// one tried) so the accounts page surfaces it.
     pub(crate) async fn refresh_account(&self, slug: &str) -> Result<(), AppError> {
         let Some(tokens) = self.store.get_trakt_tokens(slug.to_string()).await else {
             return Ok(()); // nothing stored under this slug — no-op

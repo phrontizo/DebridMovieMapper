@@ -52,8 +52,10 @@ fn identification_is_cacheable(tmdb_failed: bool) -> bool {
 /// How long a torrent left unidentified by a TMDB outage waits before it is identified again. Every
 /// attempt during an outage spends the TMDB retry budget (~2.5 min per search stage), so retrying it
 /// on every scan tick would stall the scan loop for the length of the outage. Within one tick, the
-/// first such failure also stops the rest of the batch from trying TMDB
-/// ([`identify_new_torrent`]), so a tick costs one retry budget however many retries are due.
+/// first such failure also stops the tick's other file-less refreshes and identifications from
+/// trying TMDB ([`resolve_metadata_unless_tmdb_down`]), so a tick costs one retry budget however
+/// many are due. A file-less torrent whose files are back but that TMDB could not identify waits
+/// this long too ([`refresh_fileless_infos`]).
 const TMDB_RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
 
 /// How long the scan loop waits, after a fetch that still found none, before asking the provider
@@ -78,8 +80,9 @@ const MAX_INFO_REFRESHES_PER_TICK: usize = 10;
 /// Identify one torrent the scan loop has no identification for: its info from the provider, then
 /// [`resolve_metadata`]. Returns `(info, metadata, tmdb_failed)`.
 ///
-/// Per-tick circuit breaker: once an identification this tick came out unidentified because TMDB
-/// was unreachable, `tmdb_down` is set, and every later torrent of the batch skips TMDB — only an
+/// Per-tick circuit breaker: once a refresh or identification this tick came out unidentified
+/// because TMDB was unreachable, `tmdb_down` is set, and every later torrent of the batch skips
+/// TMDB ([`resolve_metadata_unless_tmdb_down`]) — only an
 /// authoritative identification (a store read) is still looked up; anything else comes back as its
 /// fallback with `tmdb_failed` set, so the caller shows it under that title and retries it after
 /// [`TMDB_RETRY_AFTER`] like any TMDB-failed one. A failed identification spends the whole TMDB
@@ -97,23 +100,39 @@ async fn identify_new_torrent(
     prior: Option<MediaMetadata>,
     tmdb_down: &std::sync::atomic::AtomicBool,
 ) -> Result<(crate::rd_client::TorrentInfo, MediaMetadata, bool), reqwest::Error> {
-    use std::sync::atomic::Ordering;
     let info = provider.get_torrent_info(id).await?;
+    match resolve_metadata_unless_tmdb_down(store, tmdb, &info, tmdb_down).await {
+        Some((metadata, tmdb_failed)) => Ok((info, metadata, tmdb_failed)),
+        None => {
+            let metadata = prior.unwrap_or_else(|| crate::identification::fallback_metadata(&info));
+            Ok((info, metadata, true))
+        }
+    }
+}
+
+/// [`resolve_metadata`] behind a tick's TMDB circuit breaker (`tmdb_down`, shared by the tick's
+/// file-less refreshes and its identification batch): once it is set, only an authoritative
+/// identification is looked up (a store read), and anything else comes back `None` without asking
+/// TMDB. A TMDB search that fails sets it. Otherwise the metadata and whether a TMDB search failed
+/// during it, as [`resolve_metadata`] returns them.
+async fn resolve_metadata_unless_tmdb_down(
+    store: &Store,
+    tmdb: &TmdbClient,
+    info: &crate::rd_client::TorrentInfo,
+    tmdb_down: &std::sync::atomic::AtomicBool,
+) -> Option<(MediaMetadata, bool)> {
+    use std::sync::atomic::Ordering;
     if tmdb_down.load(Ordering::Relaxed) {
-        if let Some(m) = store
+        return store
             .authoritative_meta(info.hash.to_ascii_lowercase())
             .await
-        {
-            return Ok((info, m, false));
-        }
-        let metadata = prior.unwrap_or_else(|| crate::identification::fallback_metadata(&info));
-        return Ok((info, metadata, true));
+            .map(|m| (m, false));
     }
-    let (metadata, tmdb_failed) = resolve_metadata(store, tmdb, &info).await;
+    let (metadata, tmdb_failed) = resolve_metadata(store, tmdb, info).await;
     if !identification_is_cacheable(tmdb_failed) {
         tmdb_down.store(true, Ordering::Relaxed);
     }
-    Ok((info, metadata, tmdb_failed))
+    Some((metadata, tmdb_failed))
 }
 
 /// Blacklist entries older than this are pruned (the table is otherwise append-only). A rejected
@@ -237,7 +256,9 @@ struct ScanState {
     /// drops them (see [`reap_absent_mirror_owned`]). Taken by that next listing.
     reap_candidates: Option<std::collections::HashSet<String>>,
     /// Listed `downloaded` torrents whose cached identification lists no emittable video file, by
-    /// torrent id: when to fetch their files again ([`INFO_REFRESH_AFTER`]).
+    /// torrent id: when to fetch their files again ([`FIRST_INFO_REFRESH_AFTER`] after one is first
+    /// noticed, then [`INFO_REFRESH_AFTER`] after a fetch that fails or still finds none, or
+    /// [`TMDB_RETRY_AFTER`] after one whose files are back but that TMDB could not identify).
     info_refresh: HashMap<String, tokio::time::Instant>,
 }
 
@@ -271,12 +292,16 @@ impl ScanState {
 /// tick's data, the scan state and the persisted `matches` cache. The torrent is identified again
 /// from it ([`resolve_metadata`]): the cached identification was made with no files, so it went by
 /// the torrent name alone and guessed a film (a show pack's episode codes were not there to see).
-/// An engine copy keeps its authoritative identification, and a TMDB search that fails keeps the
-/// cached one and skips TMDB for the rest of the tick's refreshes (as `identify_new_torrent`'s
-/// breaker does), so an outage costs one retry budget per tick. The account mirror then adopts the
-/// torrent from the fresh list (it never adopts one with no video file). A fetch that fails or still
-/// lists none changes nothing: a cached list is never swapped for an empty one. Torrents no longer
-/// listed, or whose files came back, are forgotten.
+/// An engine copy keeps its authoritative identification. The tick's TMDB circuit breaker
+/// (`tmdb_down`, [`resolve_metadata_unless_tmdb_down`]) is shared with the identification batch
+/// that follows, so an outage costs one retry budget per tick. A refresh TMDB could not identify
+/// (its search failed, or the breaker was already set) changes nothing and is tried again after
+/// [`TMDB_RETRY_AFTER`]: keeping the torrent-name identification with the fresh files would make it
+/// permanent, since nothing identifies a torrent with files again. Until then the torrent stays out
+/// of the VFS and the mirror, as it was while file-less. The account mirror adopts a refreshed
+/// torrent from its fresh list (it never adopts one with no video file). A fetch that fails or still
+/// lists none changes nothing either: a cached list is never swapped for an empty one. Torrents no
+/// longer listed, or whose files came back, are forgotten.
 async fn refresh_fileless_infos(
     provider: &dyn DebridProvider,
     store: &Store,
@@ -284,12 +309,11 @@ async fn refresh_fileless_infos(
     state: &mut ScanState,
     current_data: &mut [(crate::rd_client::TorrentInfo, MediaMetadata)],
     fileless: Vec<(usize, String)>,
+    tmdb_down: &std::sync::atomic::AtomicBool,
 ) {
     let now = tokio::time::Instant::now();
     let mut next = HashMap::new();
     let mut fetched = 0usize;
-    // Set by the first refresh this tick whose identification a TMDB failure left unanswered.
-    let mut tmdb_down = false;
     for (idx, id) in fileless {
         let due = match state.info_refresh.get(&id) {
             None => {
@@ -305,16 +329,23 @@ async fn refresh_fileless_infos(
         fetched += 1;
         match provider.get_torrent_info(&id).await {
             Ok(fresh) if !crate::vfs::emittable_video_files(&fresh).is_empty() => {
-                let cached = current_data[idx].1.clone();
-                let metadata = if tmdb_down {
-                    cached
-                } else {
-                    let (metadata, tmdb_failed) = resolve_metadata(store, tmdb, &fresh).await;
-                    if identification_is_cacheable(tmdb_failed) {
+                let metadata = match resolve_metadata_unless_tmdb_down(
+                    store, tmdb, &fresh, tmdb_down,
+                )
+                .await
+                {
+                    Some((metadata, tmdb_failed)) if identification_is_cacheable(tmdb_failed) => {
                         metadata
-                    } else {
-                        tmdb_down = true;
-                        cached
+                    }
+                    _ => {
+                        warn!(
+                            "scan: torrent {} ({}) lists its files again, but TMDB is unreachable; identifying it in {}s",
+                            id,
+                            fresh.filename,
+                            TMDB_RETRY_AFTER.as_secs()
+                        );
+                        next.insert(id, now + TMDB_RETRY_AFTER);
+                        continue;
                     }
                 };
                 info!(
@@ -534,7 +565,8 @@ async fn scan_tick(
     // cached for good; the tick after it is recorded identifies it through the authoritative entry.
     // An intent open before the listing counts even if it has been closed since: a candidate
     // discarded while `observe` ran is deleted, and showing it would let a read re-add it through
-    // instant repair. Observe and dedup still see the full listing.
+    // instant repair. Observe still sees the full listing, and dedup deletes a removed hash under
+    // every listed id, but judges only the copies this tick identified with a video file.
     let staging_candidates: std::collections::HashSet<String> = staging_before
         .union(&swept.open)
         .filter(|h| !swept.deleted.contains(*h))
@@ -658,6 +690,9 @@ async fn scan_tick(
         }
     }
 
+    // The tick's TMDB circuit breaker: set by the first refresh or identification whose TMDB search
+    // failed, after which neither asks TMDB again this tick.
+    let tmdb_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
     refresh_fileless_infos(
         provider.as_ref(),
         store,
@@ -665,14 +700,13 @@ async fn scan_tick(
         state,
         &mut current_data,
         fileless,
+        &tmdb_down,
     )
     .await;
 
     if !to_identify.is_empty() {
         let new_total = to_identify.len();
         info!("Identifying {} new torrents...", new_total);
-        // Set by the first TMDB-failed identification of the batch (circuit breaker).
-        let tmdb_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut stream = futures_util::stream::iter(to_identify)
             .map(|torrent| {
                 let provider = provider.clone();
@@ -1794,14 +1828,17 @@ fn mirror_quality(
 /// records are touched (a `Pending` one gets its quality from `observe`), and only where the store
 /// still has no quality ([`Store::set_quality_if_unset`] — atomic, never overwrites).
 ///
-/// It also heals an account-mirror record (`Verified`, empty provenance) whose recorded quality
-/// leaves an axis untagged (a resolution or source tier of 0) that its file names now tag: older
-/// builds read no resolution glued in by underscores (`Movie_2019_2160p_UHD_BluRay`), so such a
-/// 2160p copy was recorded as unknown-lowest, and the upgrade engine would have replaced it with a
-/// cached 1080p release and deleted it with no `ALLOW_RESOLUTION_DOWNGRADE`. The re-derived
-/// quality is written only when it tags an axis the stored one left at 0 and untags none, through
+/// It also heals a `Verified` record with empty provenance (an account-mirror copy, or an engine
+/// copy that replaced one and kept its empty provenance) whose recorded quality leaves an axis
+/// untagged (a resolution or source tier of 0) that its file names now tag: older builds read no
+/// resolution glued in by underscores (`Movie_2019_2160p_UHD_BluRay`), so such a 2160p copy was
+/// recorded as unknown-lowest, and the upgrade engine would have replaced it with a cached 1080p
+/// release and deleted it with no `ALLOW_RESOLUTION_DOWNGRADE`. The re-derived quality is written
+/// only when it tags an axis the stored one left at 0 and untags none, through
 /// [`Store::replace_quality_if_eq`] (a compare-and-set against the stored value, so a concurrent
-/// `observe` or upgrade write wins). An engine record keeps its scraped release's quality.
+/// `observe` or upgrade write wins). It keeps the stored `unverified` flag (`observe` sets it on a
+/// copy whose tracks or audio it could not check), so a healed unchecked copy is still replaced by
+/// a checked one. A record with watchlist or other provenance keeps its scraped release's quality.
 ///
 /// Run by the scan loop's account-mirror pass (so the dedup pass right after it sees the result)
 /// and at the start of every upgrade tick (from the persisted identification cache). Returns how
@@ -1850,8 +1887,15 @@ pub(crate) async fn backfill_owned_quality(
                 if !(tags_more && loses_none) {
                     continue;
                 }
+                // Empty provenance doesn't mean a mirror copy: a dead mirror copy's replacement
+                // keeps it, and `observe` may have flagged that copy `unverified` (its audio could
+                // not be checked). The heal fixes the axes, never that flag.
+                let healed = crate::release::QualitySummary {
+                    unverified: q.unverified || old.unverified,
+                    ..q
+                };
                 store
-                    .replace_quality_if_eq(hash.clone(), old.clone(), q)
+                    .replace_quality_if_eq(hash.clone(), old.clone(), healed)
                     .await
             }
         };
@@ -1871,7 +1915,7 @@ pub(crate) async fn backfill_owned_quality(
 }
 
 /// Re-derive the episodes of owned show records whose `provides` is EMPTY from their torrent's
-/// selected video files ([`crate::acquire::episode_files`]), for every record whose torrent is in
+/// selected video files ([`crate::vfs::episode_files`]), for every record whose torrent is in
 /// `infos`. The account mirror writes a show's `provides` once, from the files it could decode then,
 /// and never rewrites an existing record, so a record whose file names the episode parser could not
 /// decode when it was written (e.g. `NxM` codes before `vfs::parse_se_all` learned them), or one
@@ -1911,7 +1955,7 @@ pub(crate) async fn backfill_owned_provides(
         if !missing.contains(&hash) || !seen.insert(hash.clone()) {
             continue;
         }
-        let provides: Vec<(u32, u32)> = crate::acquire::episode_files(info)
+        let provides: Vec<(u32, u32)> = crate::vfs::episode_files(info)
             .into_iter()
             .map(|(s, e, _)| (s, e))
             .collect();
@@ -2108,7 +2152,7 @@ pub(crate) fn is_multi_feature_collection(info: &crate::rd_client::TorrentInfo) 
 /// season its folder or name gives), yet no other copy's coverage accounts for it, so
 /// [`plan_dedup`] never removes a show hash holding one, and the upgrade engine never prunes one in
 /// a show swap. A code-less file is accounted for when the acquisition engine maps it to an episode
-/// in `provides` ([`crate::acquire::codeless_episode_files`]), as `observe` records an engine copy
+/// in `provides` ([`crate::vfs::codeless_episode_files`]), as `observe` records an engine copy
 /// of an absolute-numbered single or a code-less pack: that file is the episode's copy like any
 /// coded one. An account-mirror record never lists such an episode (its `provides` comes from
 /// episode codes alone), so the user's own code-less copies stay protected.
@@ -2127,7 +2171,7 @@ pub(crate) fn holds_codeless_video(
 
 /// The code-less video files of `info` that a record providing `provides` accounts for, each with
 /// its episode: those the acquisition engine maps to an episode in `provides`
-/// ([`crate::acquire::codeless_episode_files`]). Empty for an account-mirror record, whose
+/// ([`crate::vfs::codeless_episode_files`]). Empty for an account-mirror record, whose
 /// `provides` comes from episode codes alone. Shared by [`holds_codeless_video`] and
 /// [`plan_dedup`]'s coverage check, so a file that accounts for its copy also covers its episode.
 fn accounted_codeless_files(
@@ -2137,7 +2181,7 @@ fn accounted_codeless_files(
     if provides.is_empty() {
         return HashMap::new();
     }
-    crate::acquire::codeless_episode_files(info)
+    crate::vfs::codeless_episode_files(info)
         .into_iter()
         .filter(|(s, e, _)| provides.contains(&(*s, *e)))
         .map(|(s, e, path)| (path, (s, e)))
@@ -2175,9 +2219,11 @@ pub(crate) fn multi_feature_hashes<'a>(
 ///
 /// Never overwrites an existing record (`put_owned_if_absent`): a hash the engine already owns (or
 /// a previously-recorded mirror hash) is left untouched, so an in-flight `Pending` acquisition or an
-/// engine record's provenance/`provides` is never clobbered. There are two exceptions, both
-/// filling only an unset field: a record with NO quality gets it from its file names
-/// ([`backfill_owned_quality`]), and a `Verified` show record with an EMPTY `provides`, engine
+/// engine record's provenance/`provides` is never clobbered. There are three exceptions: a record
+/// with NO quality gets it from its file names, and a `Verified` empty-provenance record whose
+/// quality leaves a resolution or source tier untagged that its file names now tag has that
+/// quality healed, by compare-and-set and keeping its `unverified` flag (both
+/// [`backfill_owned_quality`]); and a `Verified` show record with an EMPTY `provides`, engine
 /// records included, gets the episodes its file names now decode to ([`backfill_owned_provides`]).
 /// It never adopts a hash the engine has blacklisted (for any title) or one with an open staging
 /// intent (an upgrade candidate or an acquisition being added, or cut off mid-add, before it was
@@ -2368,7 +2414,7 @@ pub(crate) async fn record_mirror_owned(
         let media_type = metadata.media_type.clone();
         let kind = kind_of(&media_type);
         let provides: Vec<(u32, u32)> = match kind {
-            MediaKind::Series => crate::acquire::episode_files(info)
+            MediaKind::Series => crate::vfs::episode_files(info)
                 .into_iter()
                 .map(|(s, e, _)| (s, e))
                 .collect(),
@@ -2740,7 +2786,15 @@ pub(crate) struct DedupPlan {
 /// `ALLOW_RESOLUTION_DOWNGRADE`). A `Manual`-provenance copy is never removed (invariant M-1), and
 /// neither is a movie hash in `collections` (a multi-film collection, [`multi_feature_hashes`]: no
 /// kept copy provides the other films in it); nor does a collection count as the film's keep, so it
-/// never makes a single-film copy redundant. Only groups with at least one removal are returned.
+/// never makes a single-film copy redundant. Nor does a copy tagged only with audio languages other
+/// than the title's make a right-language copy redundant: the selection planner's test
+/// ([`crate::selection::copy_tags_wrong_audio`] on the file a copy serves, under `prefs` with
+/// `AUDIO_LANGUAGE` resolved from any record of the title that records its languages,
+/// [`crate::selection::title_audio_prefs`]). A movie's keep is then its top-priority copy that is no
+/// such dub, and a dub ranked above it is kept beside it; a show copy covers an episode for another
+/// copy only when it doesn't serve it as a dub, or that copy does too. Under the default
+/// `AUDIO_LANGUAGE=original` a title with no recorded language has no dub, as for acquisition.
+/// Only groups with at least one removal are returned.
 /// Absent (not-`present`) hashes are ignored entirely — they're already gone, never a removal
 /// target or coverage source — and so are unsettled (`Pending`) ones: only `Verified` copies are
 /// ranked, kept, removed or count as coverage, so a still-downloading or not-yet-checked
@@ -2751,6 +2805,7 @@ pub(crate) fn plan_dedup(
     selected: &std::collections::HashSet<String>,
     collections: &std::collections::HashSet<String>,
     files: &HashMap<String, &crate::rd_client::TorrentInfo>,
+    prefs: &crate::config::QualityPrefs,
 ) -> Vec<DedupPlan> {
     use crate::release::{quality_rank, QualityRank};
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2776,12 +2831,28 @@ pub(crate) fn plan_dedup(
             .push((h, rec));
     }
     let rank_of = |r: &OwnedRecord| quality_rank(r.quality.as_ref());
+    let title_langs = crate::selection::title_language_requests(owned);
 
     let mut plans = Vec::new();
     for ((media_type, tmdb_id), mut hashes) in groups {
         if hashes.len() < 2 {
             continue; // no possible duplicate
         }
+        // The title's audio requirement, resolved as the selection planner resolves it, and
+        // whether `h`'s file `path` is tagged only with other audio languages: such a copy never
+        // makes a right-language copy redundant (and its files must be known to tell).
+        let audio = crate::selection::title_audio_prefs(
+            prefs,
+            &hashes[0].1.request,
+            title_langs
+                .get(&(media_type == MediaType::Movie, tmdb_id))
+                .copied(),
+        );
+        let wrong_language = |h: &str, path: &str| {
+            files
+                .get(h)
+                .is_some_and(|info| crate::selection::copy_tags_wrong_audio(info, path, &audio))
+        };
         // Sort by keep-priority DESC; deterministic tie-break on hash ASC.
         hashes.sort_by(|(ha, ra), (hb, rb)| {
             let key = |h: &str, r: &OwnedRecord| {
@@ -2804,12 +2875,28 @@ pub(crate) fn plan_dedup(
                 // and it never makes another copy redundant either: its record's quality is its
                 // largest file's, which may be another film's, so its file for THIS film can be worse
                 // than a single copy it outranks. A collection only ever adds to what is kept.
-                let mut kept_single = false;
+                // A single copy whose largest video file (the one it serves) is tagged only with
+                // other audio languages is a dub: the keep is the top-priority copy that isn't
+                // one (the top single when every one is), and a dub that ranks above that keep is
+                // kept too, so a right-language copy is never removed in a dub's favour.
+                let dub: HashSet<&str> = hashes
+                    .iter()
+                    .filter(|(h, _)| {
+                        files.get(h.as_str()).is_some_and(|info| {
+                            crate::vfs::emittable_video_files(info)
+                                .into_iter()
+                                .max_by_key(|f| f.bytes)
+                                .is_some_and(|f| wrong_language(h, &f.path))
+                        })
+                    })
+                    .map(|(h, _)| h.as_str())
+                    .collect();
+                let singles = || hashes.iter().filter(|(h, _)| !collections.contains(h));
+                let kept_single = singles()
+                    .find(|(h, _)| !dub.contains(h.as_str()))
+                    .or_else(|| singles().next());
                 for (h, r) in &hashes {
-                    if collections.contains(h) {
-                        keep.push(h.clone());
-                    } else if !kept_single {
-                        kept_single = true;
+                    if collections.contains(h) || kept_single.is_some_and(|(k, _)| k == h) {
                         keep.push(h.clone());
                     } else if r.provenance.has_manual_entry() {
                         // A Manual-provenance copy is a protected never-auto-remove class (invariant
@@ -2817,8 +2904,14 @@ pub(crate) fn plan_dedup(
                         // the keep slot — that would silently drop its never-auto-remove designation
                         // from the surviving group.
                         keep.push(h.clone());
-                    } else {
+                    } else if kept_single.is_some_and(|(k, kr)| {
+                        rank_of(kr) >= rank_of(r)
+                            && (!dub.contains(k.as_str()) || dub.contains(h.as_str()))
+                    }) {
                         remove.push(h.clone());
+                    } else {
+                        // A dub that outranks the right-language keep.
+                        keep.push(h.clone());
                     }
                 }
             }
@@ -2848,8 +2941,10 @@ pub(crate) fn plan_dedup(
                 // each episode (its largest emittable video file carrying the episode code — every
                 // code of a multi-episode file, which the VFS keeps visible for each of them — or a
                 // code-less file its record accounts for by that episode, `accounted_codeless_files`,
-                // as `observe` slots it).
-                let served: HashMap<&str, HashMap<(u32, u32), QualityRank>> = hashes
+                // as `observe` slots it), and whether that file is tagged only with other audio
+                // languages (`wrong_language`).
+                type ServedFile = (QualityRank, bool);
+                let served: HashMap<&str, HashMap<(u32, u32), ServedFile>> = hashes
                     .iter()
                     .filter_map(|(h, r)| {
                         let info = files.get(h.as_str())?;
@@ -2874,7 +2969,10 @@ pub(crate) fn plan_dedup(
                             .map(|(ep, f)| {
                                 (
                                     ep,
-                                    crate::selection::served_rank(r.quality.as_ref(), &f.path),
+                                    (
+                                        crate::selection::served_rank(r.quality.as_ref(), &f.path),
+                                        wrong_language(h, &f.path),
+                                    ),
                                 )
                             })
                             .collect();
@@ -2887,27 +2985,32 @@ pub(crate) fn plan_dedup(
                 let unremovable = |h: &str, r: &OwnedRecord| {
                     r.provenance.has_manual_entry() || r.provides.is_empty() || uncoded.contains(h)
                 };
-                // The rank `h` serves `ep` at: its file's, or its record's when its files aren't
-                // known; `None` when its files are known and none carries the episode.
-                let rank_for = |h: &str, ep: &(u32, u32)| match served.get(h) {
-                    None => Some(rank_by_hash[h]),
+                // The rank `h` serves `ep` at, and whether that file is a dub: its file's, or its
+                // record's (no dub) when its files aren't known; `None` when its files are known
+                // and none carries the episode.
+                let served_for = |h: &str, ep: &(u32, u32)| match served.get(h) {
+                    None => Some((rank_by_hash[h], false)),
                     Some(by_ep) => by_ep.get(ep).copied(),
                 };
                 // Every episode `h` provides is also provided by a hash in `by` (other than `h`)
-                // that serves it at a quality rank at least `h`'s — the only coverage that may make
-                // `h` redundant (score ignored: same rank = same quality).
+                // that serves it at a quality rank at least `h`'s, and not as a dub unless `h`
+                // serves it as one too — the only coverage that may make `h` redundant (score
+                // ignored: same rank = same quality).
                 let covered_by_same_or_better = |h: &str, by: &[String]| {
                     provides_of[h].iter().all(|ep| {
-                        let mine = rank_for(h, ep).unwrap_or(rank_by_hash[h]);
+                        let (mine, mine_dub) =
+                            served_for(h, ep).unwrap_or((rank_by_hash[h], false));
                         by.iter().any(|k| {
                             k.as_str() != h
                                 && provides_of[k.as_str()].contains(ep)
-                                && rank_for(k, ep).is_some_and(|rank| rank >= mine)
+                                && served_for(k, ep)
+                                    .is_some_and(|(rank, dub)| rank >= mine && (!dub || mine_dub))
                         })
                     })
                 };
                 // Greedy pass, best first: every hash kept so far ranks at least as high, so this
-                // keeps a hash exactly when it adds an episode no kept hash provides yet.
+                // keeps a hash exactly when it adds an episode no kept hash provides yet (at its
+                // quality, and in its language when the kept copy serves it as a dub).
                 for (h, r) in &hashes {
                     if !unremovable(h, r) && covered_by_same_or_better(h, &keep) {
                         remove.push(h.clone());
@@ -2988,9 +3091,13 @@ pub(crate) fn fresh_dedup_groups(
 ///
 /// Only copies the VFS can serve take part ([`plan_dedup`]'s `present`): a hash with at least one
 /// listed `downloaded` torrent that the instant repair doesn't hide (`hidden_ids`,
-/// `RepairManager::hidden_torrent_ids`: `Broken`/`Failed`). A copy left only as a hidden or
-/// not-yet-downloaded torrent is skipped like a `Pending` one — never ranked, kept, removed or counted
-/// as coverage — so a playable copy is never deleted in favour of one nobody can play.
+/// `RepairManager::hidden_torrent_ids`: `Broken`/`Failed`) and that this tick identified with an
+/// emittable video file (`current`). A copy left only as a hidden or not-yet-downloaded torrent, or
+/// one the tick has no files for (its cached info lists no video file, or its info lookup failed),
+/// is skipped like a `Pending` one — never ranked, kept, removed or counted as coverage — until a
+/// later tick can serve and judge it, so a playable copy is never deleted in favour of one nobody
+/// can play, and a copy is never judged without its files (a multi-film collection read as one
+/// film). The removal still deletes every listed torrent id of a removed hash.
 pub(crate) async fn dedup_owned(
     app: &AppState,
     torrents: &[Torrent],
@@ -2998,9 +3105,21 @@ pub(crate) async fn dedup_owned(
     collections: &std::collections::HashSet<String>,
     current: &[(crate::rd_client::TorrentInfo, MediaMetadata)],
 ) {
+    // The hashes this tick identified with an emittable video file: the copies the VFS serves, and
+    // the only ones whose files `plan_dedup` can judge (a multi-film collection, a code-less file,
+    // the file each episode is served from).
+    let servable: std::collections::HashSet<String> = current
+        .iter()
+        .filter(|(info, _)| !crate::vfs::emittable_video_files(info).is_empty())
+        .map(|(info, _)| info.hash.to_ascii_lowercase())
+        .collect();
     let present: std::collections::HashSet<String> = torrents
         .iter()
-        .filter(|t| t.status == "downloaded" && !hidden_ids.contains(&t.id))
+        .filter(|t| {
+            t.status == "downloaded"
+                && !hidden_ids.contains(&t.id)
+                && servable.contains(&t.hash.to_ascii_lowercase())
+        })
         .map(|t| t.hash.to_ascii_lowercase())
         .collect();
     // Every listed id per hash: a hash can be listed under several torrent ids (the scan loop's
@@ -3025,7 +3144,14 @@ pub(crate) async fn dedup_owned(
         .iter()
         .map(|(info, _)| (info.hash.to_ascii_lowercase(), info))
         .collect();
-    let mut plans = plan_dedup(&owned, &present, &selected, collections, &files);
+    let mut plans = plan_dedup(
+        &owned,
+        &present,
+        &selected,
+        collections,
+        &files,
+        &app.config.acquisition.prefs,
+    );
     // Don't dedup a title with a FRESHLY-staged copy. The upgrade engine records a staged hash owned
     // BEFORE it repoints the selection and prunes the copies it replaces. For an ordinary upgrade
     // the better new copy wins dedup, but a concurrent dedup tick (separate task) that preferred the
@@ -4522,7 +4648,9 @@ mod tests {
     /// replace a 2160p film with any cached 1080p release and delete it, with no
     /// `ALLOW_RESOLUTION_DOWNGRADE`. The backfill re-derives such a mirror record's quality when the
     /// file names now tag an axis it left at 0. An engine record (it holds its scraped release's
-    /// quality) and a record whose names still tag nothing new are left alone.
+    /// quality) and a record whose names still tag nothing new are left alone. An empty-provenance
+    /// record `observe` flagged `unverified` (a dead mirror copy's replacement whose audio could not
+    /// be checked) keeps the flag through the heal, so the upgrade pass still replaces it.
     #[tokio::test]
     async fn backfill_owned_quality_heals_a_mirror_quality_left_untagged_by_an_older_parser() {
         use crate::scraper::MediaKind;
@@ -4538,6 +4666,16 @@ mod tests {
                 "mir",
                 OwnedRecord {
                     quality: Some(legacy.clone()),
+                    ..movie(Provenance { entries: vec![] })
+                },
+            ),
+            (
+                "unchecked",
+                OwnedRecord {
+                    quality: Some(crate::release::QualitySummary {
+                        unverified: true,
+                        ..legacy.clone()
+                    }),
                     ..movie(Provenance { entries: vec![] })
                 },
             ),
@@ -4571,6 +4709,7 @@ mod tests {
         };
         let infos = [
             info("mir", name),
+            info("unchecked", name),
             info("eng", name),
             info("bare", "Some_Film.mkv"),
         ];
@@ -4579,7 +4718,18 @@ mod tests {
         let infos: Vec<&crate::rd_client::TorrentInfo> = infos.iter().collect();
         assert_eq!(
             backfill_owned_quality(&store, &prefs, &owned, &infos).await,
-            1
+            2
+        );
+        let unchecked = store
+            .get_owned("unchecked".into())
+            .await
+            .unwrap()
+            .quality
+            .unwrap();
+        assert_eq!(unchecked.resolution, 2160, "healed");
+        assert!(
+            unchecked.unverified,
+            "an unverified flag observe set survives the heal"
         );
         let healed = store
             .get_owned("mir".into())
@@ -4608,7 +4758,8 @@ mod tests {
     /// Existing `quality: None` records (account-mirror copies recorded before their quality was
     /// derived, or recorded `None` for being above the ceiling) get their quality re-derived from
     /// their torrent's representative file — so an over-ceiling copy is recognised as such instead
-    /// of reading as unknown-lowest. Only `Verified` records with no quality are touched.
+    /// of reading as unknown-lowest. Only `Verified` records with no quality are filled (the heal of
+    /// an untagged mirror quality has its own test).
     #[tokio::test]
     async fn backfill_owned_quality_re_derives_missing_qualities_from_file_names() {
         use crate::scraper::MediaKind;
@@ -4668,7 +4819,7 @@ mod tests {
         assert_eq!(
             q("kept").await,
             Some(known),
-            "a recorded quality is never replaced"
+            "a fully tagged recorded quality is never replaced"
         );
         assert_eq!(
             q("pending").await,
@@ -5900,7 +6051,13 @@ mod tests {
             selected,
             &std::collections::HashSet::new(),
             &HashMap::new(),
+            &default_prefs(),
         )
+    }
+
+    /// The default acquisition prefs (`AUDIO_LANGUAGE=original`, resolved per title).
+    fn default_prefs() -> crate::config::QualityPrefs {
+        crate::config::AcquisitionConfig::default().prefs
     }
 
     /// A dedup fixture record with an explicit quality and provenance.
@@ -5969,7 +6126,8 @@ mod tests {
                 &present,
                 &hset(&[]),
                 &hset(&["trilogy"]),
-                &HashMap::new()
+                &HashMap::new(),
+                &default_prefs(),
             )
             .is_empty(),
             "the collection is kept, so nothing is planned"
@@ -6023,6 +6181,7 @@ mod tests {
             &hset(&[]),
             &collections,
             &HashMap::new(),
+            &default_prefs(),
         );
         assert!(plans.is_empty(), "{plans:?}");
         let plans = plan_dedup(
@@ -6031,6 +6190,7 @@ mod tests {
             &hset(&[]),
             &collections,
             &HashMap::new(),
+            &default_prefs(),
         );
         assert_eq!(removed_for(&plans, 1), vec!["worse".to_string()]);
         let mut kept = plans[0].keep.clone();
@@ -6095,6 +6255,7 @@ mod tests {
                     &hset(&["single"]),
                     &std::collections::HashSet::new(),
                     &files,
+                    &default_prefs(),
                 ),
                 7,
             )
@@ -6197,6 +6358,7 @@ mod tests {
                     &hset(&[]),
                     &std::collections::HashSet::new(),
                     &files,
+                    &default_prefs(),
                 ),
                 7,
             )
@@ -6310,6 +6472,7 @@ mod tests {
                 &hset(&[]),
                 &std::collections::HashSet::new(),
                 &files,
+                &default_prefs(),
             );
             assert_eq!(removed_for(&plans, 7), removed, "provides {provides:?}");
         }
@@ -6366,8 +6529,167 @@ mod tests {
             &hset(&[]),
             &std::collections::HashSet::new(),
             &files,
+            &default_prefs(),
         );
         assert_eq!(removed_for(&plans, 7), vec!["b".to_string()]);
+    }
+
+    /// A copy whose torrent and file name carry `name`, as `plan_dedup` reads it from `files`.
+    fn named_copy(hash: &str, torrent_name: &str, paths: &[&str]) -> crate::rd_client::TorrentInfo {
+        crate::rd_client::TorrentInfo {
+            hash: hash.into(),
+            filename: torrent_name.into(),
+            status: "downloaded".into(),
+            files: paths
+                .iter()
+                .enumerate()
+                .map(|(i, path)| crate::rd_client::TorrentFile {
+                    id: i as u32,
+                    path: (*path).into(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Dedup applies the selection planner's audio-language test: a copy tagged only with audio
+    /// languages other than the title's (`AUDIO_LANGUAGE` resolved for the title, as acquisition
+    /// resolves it) never takes a film's keep slot from a right-language copy, so the right-language
+    /// copy is not deleted in favour of a better-ranked dub (the VFS would then serve the dub, and
+    /// nothing brings the original back). A dub that ranks no higher is removed in favour of it.
+    /// Under the default `AUDIO_LANGUAGE=original`, a title with no recorded language is planned as
+    /// before.
+    #[test]
+    fn plan_dedup_never_removes_a_right_language_movie_copy_for_a_dub() {
+        use crate::scraper::MediaKind;
+        let record = |quality, original_language: Option<&str>| {
+            let mut r = qrec(
+                MediaKind::Movie,
+                1,
+                vec![],
+                Some(quality),
+                Provenance { entries: vec![] },
+            );
+            r.request.original_language = original_language.map(str::to_string);
+            r
+        };
+        let eng = named_copy(
+            "eng",
+            "Movie.2020.1080p.WEB-DL",
+            &["Movie.2020.1080p.WEB-DL.mkv"],
+        );
+        let rus = named_copy(
+            "rus",
+            "Movie.2020.2160p.BluRay.RUS",
+            &["Movie.2020.2160p.BluRay.RUS.mkv"],
+        );
+        let files: HashMap<String, &crate::rd_client::TorrentInfo> =
+            [("eng".to_string(), &eng), ("rus".to_string(), &rus)]
+                .into_iter()
+                .collect();
+        let plan = |dub_quality, original_language| {
+            let owned = vec![
+                (
+                    "eng".to_string(),
+                    record(qs(1080, 3_000, 1), original_language),
+                ),
+                ("rus".to_string(), record(dub_quality, None)),
+            ];
+            removed_for(
+                &plan_dedup(
+                    &owned,
+                    &hset(&["eng", "rus"]),
+                    &hset(&[]),
+                    &std::collections::HashSet::new(),
+                    &files,
+                    &default_prefs(),
+                ),
+                1,
+            )
+        };
+        assert!(
+            plan(qs(2160, 6_000, 9), Some("en")).is_empty(),
+            "the English copy is kept beside the better-ranked Russian dub"
+        );
+        assert_eq!(
+            plan(qs(720, 3_000, 9), Some("en")),
+            vec!["rus".to_string()],
+            "a dub ranked lower is removed in favour of the English copy"
+        );
+        assert_eq!(
+            plan(qs(2160, 6_000, 9), None),
+            vec!["eng".to_string()],
+            "control: no recorded language, so no copy reads as wrong-language"
+        );
+    }
+
+    /// The show half: a pack tagged only with another audio language never makes a right-language
+    /// single redundant, however it ranks; the same pack with no language tag does.
+    #[test]
+    fn plan_dedup_never_lets_a_dub_pack_make_a_right_language_single_redundant() {
+        use crate::scraper::MediaKind;
+        let mut single = qrec(
+            MediaKind::Series,
+            7,
+            vec![(1, 1)],
+            Some(qs(720, 3_000, 1)),
+            Provenance::watchlist("u"),
+        );
+        single.request.original_language = Some("en".into());
+        let owned = vec![
+            ("single".to_string(), single),
+            (
+                "pack".to_string(),
+                qrec(
+                    MediaKind::Series,
+                    7,
+                    vec![(1, 1), (1, 2)],
+                    Some(qs(1080, 6_000, 9)),
+                    Provenance { entries: vec![] },
+                ),
+            ),
+        ];
+        let single = named_copy(
+            "single",
+            "Show.S01E01.720p.WEB",
+            &["Show.S01E01.720p.WEB.mkv"],
+        );
+        let removed = |pack_name: &str| {
+            let pack = named_copy(
+                "pack",
+                pack_name,
+                &[
+                    &format!("{pack_name}/Show.S01E01.1080p.BluRay.mkv"),
+                    &format!("{pack_name}/Show.S01E02.1080p.BluRay.mkv"),
+                ],
+            );
+            let files: HashMap<String, &crate::rd_client::TorrentInfo> =
+                [("pack".to_string(), &pack), ("single".to_string(), &single)]
+                    .into_iter()
+                    .collect();
+            removed_for(
+                &plan_dedup(
+                    &owned,
+                    &hset(&["pack", "single"]),
+                    &hset(&["single"]),
+                    &std::collections::HashSet::new(),
+                    &files,
+                    &default_prefs(),
+                ),
+                7,
+            )
+        };
+        assert!(
+            removed("Show.S01.1080p.BluRay.RUS").is_empty(),
+            "a Russian-only pack never makes the English single redundant"
+        );
+        assert_eq!(
+            removed("Show.S01.1080p.BluRay"),
+            vec!["single".to_string()],
+            "control: an untagged pack covers the single at a better rank"
+        );
     }
 
     /// Only SELECTED feature-sized videos count: a collection with one film selected is a
@@ -11673,6 +11995,85 @@ mod dedup_owned_tests {
         }
     }
 
+    /// The tick's identified torrents for `torrents`: each with one video file, as the VFS can serve.
+    fn servable(torrents: &[Torrent]) -> Vec<(crate::rd_client::TorrentInfo, MediaMetadata)> {
+        torrents
+            .iter()
+            .map(|t| {
+                let info = crate::rd_client::TorrentInfo {
+                    id: t.id.clone(),
+                    hash: t.hash.clone(),
+                    filename: "Film.2010.1080p.mkv".into(),
+                    status: "downloaded".into(),
+                    files: vec![crate::rd_client::TorrentFile {
+                        id: 0,
+                        path: "Film.2010.1080p.mkv".into(),
+                        bytes: 2_000_000_000,
+                        selected: 1,
+                    }],
+                    ..Default::default()
+                };
+                let meta = MediaMetadata {
+                    title: "Film".into(),
+                    year: Some("2010".into()),
+                    media_type: MediaType::Movie,
+                    external_id: Some("tmdb:27205".into()),
+                };
+                (info, meta)
+            })
+            .collect()
+    }
+
+    /// Only copies this tick identified with a video file take part, as only those are served: a
+    /// better copy whose cached info lists no video file (first seen with `files: null`), or that the
+    /// tick has no identification for (its info lookup failed), never wins the keep slot and gets
+    /// the playable copy deleted. Nor is a copy the tick has no files for removed: without them a
+    /// multi-film collection can't be told from a single film. The control (both identified with a
+    /// video file) deletes the worse copy.
+    #[tokio::test]
+    async fn dedup_judges_only_copies_identified_this_tick_with_a_video_file() {
+        for case in [
+            "better_fileless",
+            "better_unidentified",
+            "worse_unidentified",
+            "both",
+        ] {
+            let (store, deleted, torrents, provider) = fixture().await;
+            let mut current = servable(&torrents);
+            match case {
+                "better_fileless" => current
+                    .iter_mut()
+                    .find(|(i, _)| i.hash == "better")
+                    .unwrap()
+                    .0
+                    .files
+                    .clear(),
+                "better_unidentified" => current.retain(|(i, _)| i.hash != "better"),
+                "worse_unidentified" => current.retain(|(i, _)| i.hash != "worse"),
+                _ => {}
+            }
+            let app = build_app(store.clone(), provider, true).await;
+            dedup_owned(
+                &app,
+                &torrents,
+                &std::collections::HashSet::new(),
+                &multi_feature_hashes(current.iter().map(|(i, _)| i)),
+                &current,
+            )
+            .await;
+            if case == "both" {
+                assert_eq!(*deleted.lock().unwrap(), vec!["t_worse".to_string()]);
+            } else {
+                assert!(
+                    deleted.lock().unwrap().is_empty(),
+                    "{case}: nothing deleted"
+                );
+                assert!(store.get_owned("worse".into()).await.is_some(), "{case}");
+                assert!(store.get_owned("better".into()).await.is_some(), "{case}");
+            }
+        }
+    }
+
     /// Two present copies of the same title; selection points at the kept (better) one so quality
     /// decides. Build the store + a MockProvider listing both, plus the deleted-id sink.
     async fn fixture() -> (
@@ -11733,7 +12134,7 @@ mod dedup_owned_tests {
             &torrents,
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
-            &[],
+            &servable(&torrents),
         )
         .await;
         assert_eq!(
@@ -11851,7 +12252,7 @@ mod dedup_owned_tests {
             &torrents,
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
-            &[],
+            &servable(&torrents),
         )
         .await;
         assert!(store.get_owned("worse".into()).await.is_none(), "deduped");
@@ -11907,7 +12308,7 @@ mod dedup_owned_tests {
             &torrents,
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
-            &[],
+            &servable(&torrents),
         )
         .await;
         let mut ids = deleted.lock().unwrap().clone();
@@ -11938,7 +12339,7 @@ mod dedup_owned_tests {
             &torrents,
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
-            &[],
+            &servable(&torrents),
         )
         .await;
         assert!(
@@ -11979,7 +12380,7 @@ mod dedup_owned_tests {
                 &torrents,
                 &hidden,
                 &std::collections::HashSet::new(),
-                &[],
+                &servable(&torrents),
             )
             .await;
             if case == "servable" {
@@ -12006,7 +12407,7 @@ mod dedup_owned_tests {
             &torrents,
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
-            &[],
+            &servable(&torrents),
         )
         .await;
         assert!(
@@ -12032,7 +12433,7 @@ mod dedup_owned_tests {
             &torrents,
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
-            &[],
+            &servable(&torrents),
         )
         .await;
         assert!(
@@ -12051,7 +12452,7 @@ mod dedup_owned_tests {
             &torrents,
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
-            &[],
+            &servable(&torrents),
         )
         .await;
         assert!(
@@ -12096,7 +12497,7 @@ mod dedup_owned_tests {
                 &torrents,
                 &std::collections::HashSet::new(),
                 &std::collections::HashSet::new(),
-                &[],
+                &servable(&torrents),
             )
             .await;
             if fresh {
@@ -12315,10 +12716,13 @@ mod scan_tick_tests {
 
     /// TorBox can report a finished torrent with no files (a lapsed entry, a transient
     /// `files: null`), and the scan loop kept the file list it first saw for as long as the id
-    /// stayed listed: the torrent never reached the VFS and its mirror record never got a quality,
-    /// even once its files were back. Such an identification is fetched again once it is due, and
-    /// a fresh list with a video file replaces it (identification kept). A cached list that holds a
-    /// file is never refreshed, so a fetch that lists none can't empty it.
+    /// stayed listed: the torrent never reached the VFS or the account mirror, even once its files
+    /// were back. Such an identification is fetched again once it is due, and a fresh list with a
+    /// video file replaces the cached one, the torrent being identified again from it. A file-less
+    /// torrent is neither shown nor mirrored. While TMDB can't be asked, a refreshed torrent waits,
+    /// still file-less, and is tried again `TMDB_RETRY_AFTER` later: keeping its torrent-name
+    /// identification with the fresh files would keep that guess for good. A cached list that holds
+    /// a file is never refreshed, so a fetch that lists none can't empty it.
     #[tokio::test]
     async fn a_cached_identification_with_no_files_is_refreshed_once_its_files_are_back() {
         let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
@@ -12334,6 +12738,10 @@ mod scan_tick_tests {
             ..Default::default()
         });
         let app = app(store.clone(), provider, None, false).await;
+        store
+            .put_matches(vec![("t1".into(), info("t1", "h1", &[]), movie_meta(1))])
+            .await
+            .unwrap();
         let seen = HashMap::from([
             ("t1".to_string(), (info("t1", "h1", &[]), movie_meta(1))),
             ("t2".to_string(), (kept.clone(), movie_meta(2))),
@@ -12352,16 +12760,40 @@ mod scan_tick_tests {
             "a newly noticed torrent is fetched again within minutes"
         );
 
-        // Due: the fresh list replaces the cached one, and the torrent is mirrored with its quality.
+        // Due while TMDB can't be asked (the offline TMDB fails every search): nothing changes, and
+        // the torrent is tried again once TMDB may answer.
+        *state.info_refresh.get_mut("t1").unwrap() = tokio::time::Instant::now();
+        let before = tokio::time::Instant::now();
+        let waiting = done(scan_tick(&app, &mut state, &mut shutdown).await);
+        assert!(waiting[0].0.files.is_empty(), "still file-less this tick");
+        assert!(state.seen_torrents["t1"].0.files.is_empty());
+        assert!(
+            store
+                .get_match("t1".into())
+                .await
+                .unwrap()
+                .0
+                .files
+                .is_empty(),
+            "the cached entry is left as it was"
+        );
+        assert!(store.get_owned("h1".into()).await.is_none(), "not mirrored");
+        assert!(
+            state.info_refresh["t1"] >= before + TMDB_RETRY_AFTER,
+            "tried again once TMDB may answer"
+        );
+
+        // Due again with an identification that needs no TMDB (an engine copy): the fresh list
+        // replaces the cached one, and the torrent is mirrored with its quality.
+        store
+            .put_authoritative("h1".into(), movie_meta(1))
+            .await
+            .unwrap();
         *state.info_refresh.get_mut("t1").unwrap() = tokio::time::Instant::now();
         let second = done(scan_tick(&app, &mut state, &mut shutdown).await);
         let paths = |i: &TorrentInfo| i.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
         assert_eq!(paths(&second[0].0), paths(&full));
-        assert_eq!(
-            second[0].1,
-            movie_meta(1),
-            "the identification is kept while TMDB can't be asked"
-        );
+        assert_eq!(second[0].1, movie_meta(1));
         assert_eq!(
             paths(&second[1].0),
             paths(&kept),
@@ -12386,6 +12818,56 @@ mod scan_tick_tests {
             !state.info_refresh.contains_key("t1"),
             "a refreshed torrent is no longer watched"
         );
+    }
+
+    /// One TMDB circuit breaker covers a tick's file-less refreshes and its identification batch: a
+    /// refresh whose TMDB search fails stops the new torrents of the same tick from asking TMDB
+    /// (each is shown under its fallback and retried later), so an outage costs one TMDB retry
+    /// budget per tick, not two.
+    #[tokio::test]
+    async fn a_failed_refresh_trips_the_identification_breaker_of_the_same_tick() {
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let store = Store::in_memory();
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![listed("t1", "h1"), listed("t3", "h3")],
+            torrent_info_by_id: HashMap::from([
+                (
+                    "t1".to_string(),
+                    info("t1", "h1", &[("Film.2001.1080p.BluRay.mkv", 2_000_000_000)]),
+                ),
+                (
+                    "t3".to_string(),
+                    info("t3", "h3", &[("Other.Thing.2002.1080p.mkv", 2_000_000_000)]),
+                ),
+            ]),
+            ..Default::default()
+        });
+        let mut app = app(store.clone(), provider, None, false).await;
+        // A TMDB that fails every request (404), recording each.
+        let tmdb = crate::trakt_client::test_http::spawn(Vec::new()).await;
+        app.tmdb_client =
+            Arc::new(TmdbClient::with_base_url("k".into(), tmdb.base_url.clone()).unwrap());
+        let seen = HashMap::from([("t1".to_string(), (info("t1", "h1", &[]), movie_meta(1)))]);
+        let mut state = ScanState::new(seen, 60);
+        state
+            .info_refresh
+            .insert("t1".into(), tokio::time::Instant::now());
+
+        done(scan_tick(&app, &mut state, &mut shutdown).await);
+        let requests = tmdb.requests();
+        assert!(
+            requests.iter().any(|r| r.contains("query=Film")),
+            "the refresh asked TMDB: {requests:?}"
+        );
+        assert!(
+            !requests.iter().any(|r| r.contains("Other")),
+            "the new torrent never asks TMDB once the refresh found it down: {requests:?}"
+        );
+        assert!(
+            state.tmdb_retry.contains_key("t3"),
+            "the new torrent is shown under its fallback and retried later"
+        );
+        assert!(state.seen_torrents["t1"].0.files.is_empty());
     }
 
     /// A torrent first identified with no files was identified by its torrent name alone, as a film
@@ -12450,6 +12932,7 @@ mod scan_tick_tests {
                 &mut state,
                 &mut data,
                 vec![(0, "t1".into())],
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .await;
             assert_eq!(data[0].0.files.len(), 2, "the fresh file list");
@@ -12492,6 +12975,7 @@ mod scan_tick_tests {
             .map(|id| (info(id, id, &[]), movie_meta(1)))
             .collect();
         let mut state = ScanState::new(HashMap::new(), 60);
+        let down = std::sync::atomic::AtomicBool::new(false);
         // A fetched torrent is asked again an hour on; one not fetched keeps its due time.
         let backed_off = |state: &ScanState, since: tokio::time::Instant| {
             state
@@ -12503,7 +12987,16 @@ mod scan_tick_tests {
 
         // First noticed: none is fetched yet, each is due after the short first delay.
         let start = tokio::time::Instant::now();
-        refresh_fileless_infos(&provider, &store, &tmdb, &mut state, &mut data, fileless()).await;
+        refresh_fileless_infos(
+            &provider,
+            &store,
+            &tmdb,
+            &mut state,
+            &mut data,
+            fileless(),
+            &down,
+        )
+        .await;
         for id in &ids {
             let due = state.info_refresh[id];
             assert!(due >= start + FIRST_INFO_REFRESH_AFTER && due < start + INFO_REFRESH_AFTER);
@@ -12514,7 +13007,16 @@ mod scan_tick_tests {
         for due in state.info_refresh.values_mut() {
             *due = now;
         }
-        refresh_fileless_infos(&provider, &store, &tmdb, &mut state, &mut data, fileless()).await;
+        refresh_fileless_infos(
+            &provider,
+            &store,
+            &tmdb,
+            &mut state,
+            &mut data,
+            fileless(),
+            &down,
+        )
+        .await;
         assert_eq!(backed_off(&state, now), MAX_INFO_REFRESHES_PER_TICK);
         assert_eq!(
             state
@@ -12529,7 +13031,16 @@ mod scan_tick_tests {
             data.iter().all(|(i, _)| i.files.is_empty()),
             "a failed or still-empty fetch keeps the cached list"
         );
-        refresh_fileless_infos(&provider, &store, &tmdb, &mut state, &mut data, fileless()).await;
+        refresh_fileless_infos(
+            &provider,
+            &store,
+            &tmdb,
+            &mut state,
+            &mut data,
+            fileless(),
+            &down,
+        )
+        .await;
         assert_eq!(
             backed_off(&state, now),
             n,

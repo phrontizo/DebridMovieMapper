@@ -792,9 +792,13 @@ impl ProxiedMediaFile {
 impl DavFile for ProxiedMediaFile {
     fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
         async move {
+            // Only a torrent the VFS hides (`Broken`/`Failed`) reads as an empty file. One
+            // mid-repair stays listed, so its opened file keeps its real size: an empty one would
+            // answer a ranged GET with `416 bytes */0`, while `read_bytes` refuses the read, a
+            // failure the reader retries once the repair is in place.
             if self
                 .repair_manager
-                .should_hide_torrent(&self.locator.torrent_id)
+                .is_hidden(&self.locator.torrent_id)
                 .await
             {
                 return Ok(Box::new(DebridMetaData {
@@ -1733,20 +1737,50 @@ mod provider_abstraction_tests {
 
     #[tokio::test]
     async fn metadata_of_a_hidden_torrent_reports_size_zero() {
-        // A Broken/hidden torrent's open file reports an empty, epoch-dated file so a player never
-        // reads it while its replacement downloads.
+        // A Broken or Failed (hidden) torrent's open file reports an empty, epoch-dated file so a
+        // player never reads it while its replacement downloads.
+        use crate::repair::RepairState;
+        for state in [RepairState::Broken, RepairState::Failed] {
+            let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
+            let locator = crate::provider::FileLocator {
+                torrent_id: "t".into(),
+                ..Default::default()
+            };
+            let mut f = proxied(provider, locator, 42);
+            f.modified_time =
+                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+            f.repair_manager
+                .set_state_for_test("t", state.clone())
+                .await;
+            let md = f.metadata().await.unwrap();
+            assert_eq!(md.len(), 0, "{state:?}");
+            assert_eq!(md.modified().unwrap(), SystemTime::UNIX_EPOCH, "{state:?}");
+            assert!(!md.is_dir());
+        }
+    }
+
+    /// A torrent mid-repair stays in the VFS, so a file opened in the repair window reports its
+    /// real size and date: an empty file there would answer a ranged GET `416 bytes */0`, telling
+    /// the reader the file is empty, where the refused read is a failure it retries.
+    #[tokio::test]
+    async fn metadata_of_a_repairing_torrent_reports_its_real_size() {
+        use crate::repair::RepairState;
         let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
         let locator = crate::provider::FileLocator {
             torrent_id: "t".into(),
             ..Default::default()
         };
         let mut f = proxied(provider, locator, 42);
-        f.modified_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        f.repair_manager.mark_broken("t").await;
+        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        f.modified_time = mtime;
+        f.repair_manager
+            .set_state_for_test("t", RepairState::Repairing)
+            .await;
         let md = f.metadata().await.unwrap();
-        assert_eq!(md.len(), 0);
-        assert_eq!(md.modified().unwrap(), SystemTime::UNIX_EPOCH);
-        assert!(!md.is_dir());
+        assert_eq!(md.len(), 42);
+        assert_eq!(md.modified().unwrap(), mtime);
+        // Its reads are still refused until the repair settles.
+        assert!(f.repair_manager.should_hide_torrent("t").await);
     }
 
     #[tokio::test]

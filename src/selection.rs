@@ -62,7 +62,8 @@ pub struct SlotRepoint {
 /// `release::wrong_audio_language` on the copy's torrent name, file name and the directories above
 /// the file (a pack may tag a season's language on its folder only), under `prefs` with
 /// `AUDIO_LANGUAGE` resolved against the title's recorded languages (the served record's, else any
-/// owned record of the title's) — the test the upgrade engine applies before it stages a release.
+/// owned record of the title's) — the test the upgrade engine applies before it stages a release,
+/// and dedup before it counts one copy as making another redundant ([`copy_tags_wrong_audio`]).
 /// Mirror copies are never probed, so a better-ranked wrong-language copy would otherwise take
 /// every slot it provides. Under the default `AUDIO_LANGUAGE=original` the test is inert for a title
 /// with no recorded language, as it is for acquisition; an explicit `AUDIO_LANGUAGE` applies it to
@@ -99,15 +100,7 @@ pub fn plan_selection_repoints(
             .or_default()
             .push((h.as_str(), *r));
     }
-    // Per title, a request that records the title's languages (any owned record, present or not).
-    let mut title_langs: HashMap<(bool, u64), &crate::store::AcquireRequest> = HashMap::new();
-    for (_, r) in owned {
-        if r.request.original_language.is_some() {
-            title_langs
-                .entry((r.request.kind == MediaKind::Movie, r.request.tmdb_id))
-                .or_insert(&r.request);
-        }
-    }
+    let title_langs = title_language_requests(owned);
     // The file a copy would serve for a slot: the largest emittable video file — for an episode,
     // among those whose first episode code is that episode. Each candidate's files are indexed once
     // per plan, on its first lookup, so a pack offered for many slots is scanned and parsed once
@@ -155,41 +148,16 @@ pub fn plan_selection_repoints(
         }
         let cur_rank = served_rank(cur.quality.as_ref(), &entry.file_path);
         // The title's audio requirement, resolved as acquisition resolves it: from the served
-        // record's languages, else from any record of the title that has them (a mirror record
-        // lacks them until the upgrade pass backfills them).
-        let lang_req = if cur.request.original_language.is_some() {
-            &cur.request
-        } else {
-            title_langs
-                .get(&(is_movie, tmdb))
-                .copied()
-                .unwrap_or(&cur.request)
-        };
-        let audio = prefs.with_resolved_audio(
-            lang_req.original_language.as_deref(),
-            lang_req.spoken_languages.as_deref().unwrap_or_default(),
+        // record's languages, else from any record of the title that has them.
+        let audio = title_audio_prefs(
+            prefs,
+            &cur.request,
+            title_langs.get(&(is_movie, tmdb)).copied(),
         );
         let wrong_language = |hash: &str, path: &str| -> bool {
-            let Some(t) = present_by_hash.get(hash) else {
-                return false;
-            };
-            let name = if t.filename.is_empty() {
-                &t.original_filename
-            } else {
-                &t.filename
-            };
-            let base = path.rsplit('/').next().unwrap_or(path);
-            // The file name and every directory above it, one per line (a pack may tag a season's
-            // language on its folder only), so no tag runs across a `/` into the next component.
-            let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
-            let release = crate::release::parse(&crate::release::RawCandidate {
-                name: name.clone(),
-                description: components.join("\n"),
-                info_hash: hash.to_string(),
-                file_idx: None,
-                file_name: Some(base.to_string()),
-            });
-            crate::release::wrong_audio_language(&release, &audio)
+            present_by_hash
+                .get(hash)
+                .is_some_and(|t| copy_tags_wrong_audio(t, path, &audio))
         };
         // Never undo what the upgrade engine adopts. Its unverified rule swaps an unchecked copy for
         // a checked one of a possibly LOWER tier at the same resolution, so a checked slot moves onto
@@ -246,6 +214,78 @@ pub fn plan_selection_repoints(
     out
 }
 
+/// Per title (`(is_movie, tmdb_id)`), the request of the first owned record (present or not) that
+/// records the title's languages (an `original_language`): a mirror record lacks them until the
+/// upgrade pass backfills them, so the title's other records stand in for it.
+pub(crate) fn title_language_requests(
+    owned: &[(String, OwnedRecord)],
+) -> std::collections::HashMap<(bool, u64), &crate::store::AcquireRequest> {
+    let mut out = std::collections::HashMap::new();
+    for (_, r) in owned {
+        if r.request.original_language.is_some() {
+            out.entry((
+                r.request.kind == crate::scraper::MediaKind::Movie,
+                r.request.tmdb_id,
+            ))
+            .or_insert(&r.request);
+        }
+    }
+    out
+}
+
+/// `prefs` with `AUDIO_LANGUAGE` resolved for a title as acquisition resolves it
+/// (`QualityPrefs::with_resolved_audio`): from `request`'s recorded languages when it has an
+/// original language, else from `fallback`'s (another record of the title,
+/// [`title_language_requests`]). With neither, the default `AUDIO_LANGUAGE=original` stays
+/// unresolved and [`copy_tags_wrong_audio`] flags nothing.
+pub(crate) fn title_audio_prefs(
+    prefs: &crate::config::QualityPrefs,
+    request: &crate::store::AcquireRequest,
+    fallback: Option<&crate::store::AcquireRequest>,
+) -> crate::config::QualityPrefs {
+    let languages = if request.original_language.is_some() {
+        request
+    } else {
+        fallback.unwrap_or(request)
+    };
+    prefs.with_resolved_audio(
+        languages.original_language.as_deref(),
+        languages.spoken_languages.as_deref().unwrap_or_default(),
+    )
+}
+
+/// Whether the file `file_path` of the present copy `torrent` is tagged only with audio languages
+/// other than the title's: [`crate::release::wrong_audio_language`] under `audio` (the prefs
+/// resolved for the title, [`title_audio_prefs`]) on the copy's torrent name, the file name and
+/// every directory above it, one per line so no tag runs across a `/` (a pack may tag a season's
+/// language on its folder only). Mirror copies are never probed, so the tags are all there is. The
+/// selection planner never moves a slot onto such a file, and dedup never lets it make a
+/// right-language copy redundant.
+pub(crate) fn copy_tags_wrong_audio(
+    torrent: &TorrentInfo,
+    file_path: &str,
+    audio: &crate::config::QualityPrefs,
+) -> bool {
+    if audio.audio == crate::config::AudioReq::Original {
+        return false; // unresolved: `wrong_audio_language` never applies (skip the parse)
+    }
+    let name = if torrent.filename.is_empty() {
+        &torrent.original_filename
+    } else {
+        &torrent.filename
+    };
+    let base = file_path.rsplit('/').next().unwrap_or(file_path);
+    let components: Vec<&str> = file_path.split('/').filter(|c| !c.is_empty()).collect();
+    let release = crate::release::parse(&crate::release::RawCandidate {
+        name: name.clone(),
+        description: components.join("\n"),
+        info_hash: torrent.hash.to_ascii_lowercase(),
+        file_idx: None,
+        file_name: Some(base.to_string()),
+    });
+    crate::release::wrong_audio_language(&release, audio)
+}
+
 /// A present copy's emittable video files (`vfs::emittable_video_files`) as
 /// [`plan_selection_repoints`] looks them up: the largest one overall (what a movie copy serves),
 /// and per FIRST episode code (`vfs::episode_of_file`) the largest one carrying it (what an episode
@@ -295,10 +335,13 @@ impl<'a> FileIndex<'a> {
 /// directory that tags it: a repackaged pack often tags only its season folders
 /// (`Pack.1080p.BluRay/Season 5 [480p DVDRip]/Show - S05E01.avi`). When no directory tags it
 /// either, the record's stands, so an engine release with untagged episode files keeps its scraped
-/// quality. A DVD source tag ([`tags_dvd_source`]; `release::parse` reads `DVDRip` as no source)
-/// stands for at most 576p, unless the same name tags a resolution, and for the lowest source
-/// tier, so a scene `show.s05e01.dvdrip.xvid-grp.avi` that tags no resolution doesn't serve at its
-/// pack record's 1080p BluRay. A directory's cam word is not read as a cam source, since in a
+/// quality. A standard-definition source tag ([`sd_hints`]: DVD, a DVD remux included, PDTV, SDTV,
+/// DSR, TVRip and VHSRip, plus HDTV and the XviD/DivX codecs, which scene naming leaves untagged
+/// only on an SD release) stands for at most 576p unless the same name tags a resolution, so a
+/// scene `show.s05e01.dvdrip.xvid-grp.avi` or `show.s01e01.hdtv.xvid-lol.avi` doesn't serve at its
+/// pack record's 1080p BluRay. A DVD, PDTV, SDTV, DSR, TVRip or VHSRip tag also stands for the
+/// lowest source tier (`release::parse` reads most of them as no source); HDTV keeps its tier, and
+/// XviD/DivX tag none. A directory's cam word is not read as a cam source, since in a
 /// folder it is far likelier a title word (`Body Cam/Season 1/`). The file counts as checked only
 /// when the record is and the file is MKV/MP4 (the containers the probe reads). Applied alike to
 /// the served copy and to every candidate, so a repoint still strictly raises the slot's rank and
@@ -320,15 +363,20 @@ pub(crate) fn served_rank(
         })
     };
     // What one path component tags: its resolution and its source tier, `None` for an axis it
-    // leaves untagged. A DVD source tag stands for an SD resolution and the lowest tier.
+    // leaves untagged. An SD source tag stands for an SD resolution, and some for the lowest tier.
     let component = |name: &str, is_file: bool| {
         let info = tags(name, is_file.then_some(name));
-        let dvd = tags_dvd_source(name);
-        let resolution = info.resolution.or(dvd.then_some(DVD_MAX_RESOLUTION));
+        let sd = sd_hints(name);
+        let resolution = info
+            .resolution
+            .or(sd.resolution.then_some(DVD_MAX_RESOLUTION));
         let tier = match info.source {
-            Source::Other => dvd.then_some(0),
-            // A directory's cam word is a title word.
-            Source::Cam if !is_file => dvd.then_some(0),
+            _ if sd.lowest_tier => Some(0),
+            Source::Other => None,
+            // A directory's cam word is a title word, and so is its bare `web` word when nothing
+            // else in its name is a release tag (`Web of Lies/`).
+            Source::Cam if !is_file => None,
+            Source::Web if !is_file && crate::release::web_source_is_a_title_word(name) => None,
             source => Some(source.tier_score()),
         };
         (info, resolution, tier)
@@ -351,23 +399,48 @@ pub(crate) fn served_rank(
     }
 }
 
-/// The highest resolution a DVD holds (PAL; NTSC is 480).
+/// The highest resolution a DVD holds (PAL; NTSC is 480), and the cap [`served_rank`] puts on any
+/// standard-definition source that tags no resolution.
 const DVD_MAX_RESOLUTION: u16 = 576;
 
-/// A DVD source tag (`DVDRip`, `DVD-Rip`, `DVD`, `DVDR`, `DVD5`, `DVD9`) bounded by a
-/// non-alphanumeric character or the string edge. The optional `hd` group catches `HD-DVD`, which
-/// is high definition and no DVD (the regex crate has no look-behind).
-static DVD_SOURCE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)(?:^|[^a-z0-9])(hd[ ._-]?)?dvd(?:[ ._-]?rip|-?r|[59])?(?:[^a-z0-9]|$)")
-        .unwrap()
-});
+/// What one path component's name says about a standard-definition source ([`sd_hints`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SdHints {
+    /// It names a source that is standard definition when no resolution is tagged: by scene
+    /// convention an `HDTV` or `XviD`/`DivX` release with no resolution tag is SD, and a DVD, PDTV,
+    /// SDTV, DSR, TVRip or VHSRip one is SD whatever it says.
+    resolution: bool,
+    /// It names a source that is never better than the lowest tier (0): DVD (`DVDRip`, `DVD-Rip`,
+    /// `DVD`, `DVDR`, `DVD5`, `DVD9`, a DVD remux), PDTV, SDTV, DSR/DSRip, TVRip, VHSRip.
+    /// `release::parse` reads most of these as no source at all.
+    lowest_tier: bool,
+}
 
-/// Whether `name` tags a DVD source. `release::parse` reads `DVDRip` as no source at all, so
-/// [`served_rank`] reads this tag itself.
-fn tags_dvd_source(name: &str) -> bool {
-    DVD_SOURCE_RE
-        .captures_iter(name)
-        .any(|c| c.get(1).is_none())
+/// The standard-definition hints of `name` ([`SdHints`]), read from its alphanumeric tokens, so a
+/// tag counts only as a whole token (`MyDVDCollection` tags nothing) and two-token spellings
+/// (`DVD-Rip`, `TV-Rip`) read like the glued ones. A DVD or TVRip token right after an `HD` token
+/// is HD DVD (`HD-DVD`, `HD.DVD`, `HD-DVDRip`), high definition and no hint; a glued `HDDVD` is no
+/// DVD token either.
+fn sd_hints(name: &str) -> SdHints {
+    let lower = name.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut hints = SdHints::default();
+    for (i, &token) in tokens.iter().enumerate() {
+        let after_hd = i > 0 && tokens[i - 1] == "hd";
+        let next = tokens.get(i + 1).copied();
+        let lowest = match token {
+            "dvd" | "dvdrip" | "dvdr" | "dvd5" | "dvd9" | "dvdremux" | "tvrip" => !after_hd,
+            "tv" | "vhs" => next == Some("rip") && !after_hd,
+            "pdtv" | "sdtv" | "dsr" | "dsrip" | "vhsrip" => true,
+            _ => false,
+        };
+        hints.lowest_tier |= lowest;
+        hints.resolution |= lowest || matches!(token, "hdtv" | "hdtvrip" | "xvid" | "divx");
+    }
+    hints
 }
 
 /// Whether a copy of rank `new` may take a slot from one of rank `cur` as far as checking goes: a
@@ -615,6 +688,9 @@ mod tests {
             "Pack.2160p.REMUX/Season 1 [480p DVDRip]/Show - S01E01.avi",
             "/Pack/Season 2 [2160p BluRay]/Show - S02E01.mkv",
             SCENE_DVDRIP_S05E01,
+            SCENE_HDTV_S05E01,
+            SCENE_PDTV_S05E01,
+            "Show.S01E01.DVD.REMUX.mkv",
             "Pack/Season 3 [DVD9]/Show - S03E01.mkv",
         ];
         for quality in &qualities {
@@ -1519,6 +1595,34 @@ mod tests {
             served_rank(bluray.as_ref(), "Body Cam/Season 1/Body Cam - S01E01.mkv"),
             rank(1080, 6_000, true)
         );
+        // Likewise a folder titled with the bare word `Web` names no WEB source, though it parses
+        // as one (control); a folder that also tags a resolution, or an explicit WEB-DL, does.
+        let folder = crate::release::parse(&crate::release::RawCandidate {
+            name: "Web of Lies".into(),
+            description: String::new(),
+            info_hash: String::new(),
+            file_idx: None,
+            file_name: None,
+        });
+        assert_eq!(folder.source, crate::release::Source::Web);
+        assert_eq!(
+            served_rank(
+                bluray.as_ref(),
+                "Web of Lies/Season 1/Web of Lies - S01E01.mkv"
+            ),
+            rank(1080, 6_000, true)
+        );
+        for path in [
+            "Show.Complete.1080p.WEB/Season 1/Show - S01E01.mkv",
+            "Show.Complete.WEB-DL/Show - S01E01.mkv",
+            "Show.Complete.WEB.x264-GRP/Show - S01E01.mkv",
+        ] {
+            assert_eq!(
+                served_rank(bluray.as_ref(), path),
+                rank(1080, 3_000, true),
+                "{path}"
+            );
+        }
         // No directory tags anything: the record's axes, as before.
         assert_eq!(
             served_rank(bluray.as_ref(), "Show/Season 1/Show - S01E01.mkv"),
@@ -1535,6 +1639,56 @@ mod tests {
     /// Another pack's S05E01: a scene DVDRip whose name and folders tag no resolution.
     const SCENE_DVDRIP_S05E01: &str =
         "Show.Complete.1080p.BluRay/Season 5/show.s05e01.dvdrip.xvid-grp.avi";
+    /// Another pack's S05E01: a 2000s scene HDTV XviD rip, standard definition by scene convention.
+    const SCENE_HDTV_S05E01: &str =
+        "Show.Complete.1080p.BluRay/Season 5/show.s05e01.hdtv.xvid-lol.avi";
+    /// Another pack's S05E01: a scene PDTV XviD rip.
+    const SCENE_PDTV_S05E01: &str =
+        "Show.Complete.1080p.BluRay/Season 5/show.s05e01.pdtv.xvid-grp.avi";
+
+    /// Scene naming leaves the resolution off a standard-definition release: an `HDTV.XviD`,
+    /// `PDTV`, `DSR`, `SDTV`, `TVRip` or `VHSRip` episode, like a DVD one, is SD, yet would serve at
+    /// its pack record's 1080p BluRay (`release::parse` reads no resolution in it, and reads `PDTV`
+    /// and the rest as no source at all). A name that tags such a source, or the SD codecs XviD or
+    /// DivX, is read as at most 576p when it tags no resolution. A DVD (a DVD remux included), PDTV,
+    /// SDTV, DSR, TVRip or VHSRip source also counts as the lowest source tier, while HDTV keeps its
+    /// tier and XviD/DivX name no source. An explicit resolution still wins (`720p.HDTV`), and the
+    /// record still caps.
+    #[test]
+    fn an_sd_source_with_no_resolution_tag_serves_as_standard_definition() {
+        use crate::release::QualityRank;
+        let rank = |resolution, source_tier, checked| QualityRank {
+            resolution,
+            source_tier,
+            checked,
+        };
+        let bluray = q(1080, 6_000, 9);
+        for (name, expected) in [
+            ("show.s01e01.hdtv.xvid-lol.avi", rank(576, 1_000, false)),
+            ("Show.S01E01.HDTVRip.mkv", rank(576, 1_000, true)),
+            ("show.s01e01.pdtv.xvid.avi", rank(576, 0, false)),
+            ("show.s01e01.dsr.xvid.avi", rank(576, 0, false)),
+            ("Show.S01E01.DSRip.mkv", rank(576, 0, true)),
+            ("Show.S01E01.SDTV.mkv", rank(576, 0, true)),
+            ("Show.S01E01.TVRip.mkv", rank(576, 0, true)),
+            ("Show.S01E01.TV-Rip.mkv", rank(576, 0, true)),
+            ("Show.S01E01.VHSRip.avi", rank(576, 0, false)),
+            ("Show.S01E01.DVDRemux.mkv", rank(576, 0, true)),
+            ("Show.S01E01.DVD.REMUX.mkv", rank(576, 0, true)),
+            ("show.s01e01.xvid-grp.avi", rank(576, 6_000, false)),
+            ("Show.S01E01.DivX.avi", rank(576, 6_000, false)),
+            // An explicit resolution wins.
+            ("show.s01e01.720p.hdtv.x264-grp.mkv", rank(720, 1_000, true)),
+            ("Show.S01E01.720p.XviD.avi", rank(720, 6_000, false)),
+            // A folder's SD tag counts for a file that tags nothing.
+            (
+                "Show.S01.HDTV.XviD/Show - S01E01.avi",
+                rank(576, 1_000, false),
+            ),
+        ] {
+            assert_eq!(served_rank(bluray.as_ref(), name), expected, "{name}");
+        }
+    }
 
     /// A DVD is standard definition, and `release::parse` reads `DVDRip` as no source at all, so a
     /// scene `DVDRip.XviD` episode that tags no resolution would serve at its pack record's 1080p
@@ -1615,8 +1769,13 @@ mod tests {
     /// WEB single, and a slot already on it moves to the single.
     #[test]
     fn a_pack_tagged_on_its_season_folders_is_ranked_by_the_folder_of_the_file_it_would_serve() {
-        // The scene DVDRip episode, which tags no resolution, behaves the same way.
-        for s05e01 in [FOLDER_TAGGED_S05E01, SCENE_DVDRIP_S05E01] {
+        // The scene SD episodes, which tag no resolution, behave the same way.
+        for s05e01 in [
+            FOLDER_TAGGED_S05E01,
+            SCENE_DVDRIP_S05E01,
+            SCENE_HDTV_S05E01,
+            SCENE_PDTV_S05E01,
+        ] {
             pack_s05e01_never_takes_a_better_singles_slot(s05e01);
         }
     }
@@ -1669,7 +1828,12 @@ mod tests {
     /// single of S05E01 redundant.
     #[test]
     fn dedup_keeps_a_single_a_folder_tagged_pack_serves_at_a_lower_resolution() {
-        for s05e01 in [FOLDER_TAGGED_S05E01, SCENE_DVDRIP_S05E01] {
+        for s05e01 in [
+            FOLDER_TAGGED_S05E01,
+            SCENE_DVDRIP_S05E01,
+            SCENE_HDTV_S05E01,
+            SCENE_PDTV_S05E01,
+        ] {
             dedup_keeps_the_single_beside(s05e01);
         }
     }
@@ -1706,6 +1870,7 @@ mod tests {
             &["single".to_string()].into(),
             &HashSet::new(),
             &files,
+            &prefs(),
         );
         assert!(
             plans.iter().all(|p| p.remove.is_empty()),

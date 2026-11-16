@@ -1065,71 +1065,32 @@ mod tests {
 
     // --- fetch_with_retry does not retry permanent (non-retryable) error statuses ---
 
-    /// Read one request from `sock`: its head and as much body as its `Content-Length` declares
-    /// (an unread body would make the close reset the connection under the client).
-    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
-        use tokio::io::AsyncReadExt;
-        let mut req = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = sock.read(&mut buf).await.unwrap_or(0);
-            req.extend_from_slice(&buf[..n]);
-            let text = String::from_utf8_lossy(&req);
-            let complete = text.split_once("\r\n\r\n").is_some_and(|(head, rest)| {
-                let len = head
-                    .lines()
-                    .find_map(|l| {
-                        l.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                    })
-                    .unwrap_or(0);
-                rest.len() >= len
-            });
-            if n == 0 || complete {
-                return text.into_owned();
-            }
-        }
+    /// The status code of an `HTTP/1.1 <code> <reason>` status line (the loopback server writes
+    /// the code's canonical reason phrase itself).
+    fn status_code(status_line: &str) -> u16 {
+        status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("not an HTTP status line: {status_line:?}"))
     }
 
-    /// Write a `Connection: close` JSON reply under `status_line`, with `extra_headers` (each
-    /// line ending in `\r\n`), then flush.
-    async fn write_json_reply(
-        sock: &mut tokio::net::TcpStream,
-        status_line: &str,
-        extra_headers: &str,
-        body: &str,
-    ) {
-        use tokio::io::AsyncWriteExt;
-        let head = format!(
-            "{status_line}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        let _ = sock.write_all(head.as_bytes()).await;
-        let _ = sock.write_all(body.as_bytes()).await;
-        let _ = sock.flush().await;
-    }
-
-    /// Loopback server that answers each request with the status line and body `respond`
+    /// Loopback server that answers each request with the status line and JSON body `respond`
     /// returns for the request's text, plus `extra_headers`, counting the connections it
     /// accepted. Returns `http://<addr>` and the count.
     async fn serve_replies(
-        extra_headers: &'static str,
-        respond: impl Fn(&str) -> (&'static str, String) + Send + Sync + 'static,
+        extra_headers: &'static [(&'static str, &'static str)],
+        respond: impl Fn(&str) -> (&'static str, String) + Send + 'static,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let c2 = count.clone();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let req = read_request(&mut sock).await;
-                let (status_line, body) = respond(&req);
-                write_json_reply(&mut sock, status_line, extra_headers, &body).await;
-            }
-        });
-        (format!("http://{addr}"), count)
+        let server = crate::test_loopback::serve_fn(move |req| {
+            let (status_line, body) = respond(req);
+            extra_headers.iter().fold(
+                crate::test_loopback::Reply::json(status_code(status_line), body),
+                |reply, (name, value)| reply.header(name, value),
+            )
+        })
+        .await;
+        (server.base, server.connections)
     }
 
     /// Spawn a loopback server that replies to EVERY connection with `status_line` + `body`,
@@ -1138,7 +1099,7 @@ mod tests {
         status_line: &'static str,
         body: &'static str,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        let (base, count) = serve_replies("", move |_| (status_line, body.to_string())).await;
+        let (base, count) = serve_replies(&[], move |_| (status_line, body.to_string())).await;
         (format!("{base}/"), count)
     }
 
@@ -1148,7 +1109,7 @@ mod tests {
         status_line: &'static str,
         body: &'static str,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        let (base, count) = serve_replies("Retry-After: 0\r\n", move |_| {
+        let (base, count) = serve_replies(&[("Retry-After", "0")], move |_| {
             (status_line, body.to_string())
         })
         .await;
@@ -1159,9 +1120,9 @@ mod tests {
     /// retryable status (a failed page) backs off at once instead of running the real exponential
     /// backoff, which would make a test take minutes. Returns (base_url, request count).
     async fn serve_torrent_pages(
-        respond: impl Fn(&str) -> (&'static str, String) + Send + Sync + 'static,
+        respond: impl Fn(&str) -> (&'static str, String) + Send + 'static,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        serve_replies("Retry-After: 0\r\n", respond).await
+        serve_replies(&[("Retry-After", "0")], respond).await
     }
 
     #[tokio::test]
@@ -1241,7 +1202,7 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let seen = c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let _ = read_request(&mut sock).await;
+                let _ = crate::test_loopback::read_request(&mut sock).await;
                 let (len, sent) = if seen < cut_first {
                     (body.len() + 100, &body[..body.len() / 2])
                 } else {
@@ -1616,25 +1577,16 @@ mod tests {
         status_line: &'static str,
         body: &'static str,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let c2 = count.clone();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let seen = c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let _ = read_request(&mut sock).await;
-                if seen == 0 {
-                    // First connection: drain the request then drop the socket WITHOUT any HTTP
-                    // response, so the client's `send()` fails at the transport level (EOF before
-                    // headers → no HTTP status) — exercising the statusless-transport-error retry arm.
-                    drop(sock);
-                    continue;
-                }
-                write_json_reply(&mut sock, status_line, "", body).await;
-            }
-        });
-        (format!("http://{}/", addr), count)
+        use crate::test_loopback::{serve, Step};
+        // First connection: drain the request then drop the socket WITHOUT any HTTP response, so
+        // the client's `send()` fails at the transport level (EOF before headers → no HTTP
+        // status), exercising the statusless-transport-error retry arm.
+        let server = serve(
+            vec![Step::DropAfterRead],
+            Some(Step::json(status_code(status_line), body)),
+        )
+        .await;
+        (format!("{}/", server.base), server.connections)
     }
 
     #[tokio::test]
@@ -1781,18 +1733,8 @@ mod tests {
     /// Spawn a loopback server that accepts every connection and reads the request but never
     /// answers — an endpoint that is up at the TCP level and then hangs.
     async fn spawn_never_answers() -> String {
-        use tokio::io::AsyncReadExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf).await;
-                held.push(sock); // keep it open, never reply
-            }
-        });
-        format!("http://{}", addr)
+        use crate::test_loopback::{serve, Step};
+        serve(Vec::new(), Some(Step::HangUntilClosed)).await.base
     }
 
     #[tokio::test(start_paused = true)]

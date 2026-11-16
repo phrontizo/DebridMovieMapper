@@ -603,9 +603,12 @@ fn find_ebml_child(
 /// a `Tracks` element itself larger than the window — return that first overrunning child's declared
 /// end (absolute offset). `probe_tracks` uses it to issue ONE larger targeted fetch instead of
 /// re-fetching the same 4 MB front forever (which would blacklist a valid release after the verify
-/// deadline). Mirrors `front_moov_extent` on the MP4 path. `None` when there is no Segment, an
-/// unknown-size child spans to the end, or the truncation is in an element HEADER (a genuine
-/// transient under-fetch the normal defer/retry handles).
+/// deadline). Mirrors `front_moov_extent` on the MP4 path. A Segment child whose HEADER (id or size
+/// vint) the end of the buffer cuts gets an extent just past the buffer: with a full front read the
+/// cut comes from the file's layout and would repeat on every re-probe, so it needs the recovery
+/// read as much as a payload overrun does. `None` when there is no Segment (or the buffer ends
+/// before the Segment's header), an unknown-size child spans to the end, or a child header is
+/// structurally invalid.
 fn front_mkv_tracks_extent(buf: &[u8]) -> Option<u64> {
     // Locate the Segment payload start without erroring (a header split at the boundary → None).
     let mut pos = 0usize;
@@ -633,8 +636,13 @@ fn front_mkv_tracks_extent(buf: &[u8]) -> Option<u64> {
     // Scan the Segment's children for the FIRST whose declared end runs past the fetched buffer.
     let mut cpos = seg_payload_start;
     while cpos < buf.len() {
-        let _id = read_ebml_id(buf, &mut cpos).ok()?;
-        let size = read_ebml_size(buf, &mut cpos).ok()?;
+        let size = match read_ebml_id(buf, &mut cpos).and_then(|_| read_ebml_size(buf, &mut cpos)) {
+            Ok(size) => size,
+            // The header runs past the buffer: any extent past it (within the cap) gets the
+            // recovery read, which covers this header and what follows it.
+            Err(ProbeError::Transient) => return Some(buf.len() as u64 + 1),
+            Err(_) => return None, // a structurally invalid id or size vint
+        };
         let payload_start = cpos;
         if size == u64::MAX {
             return None; // unknown/streaming size → no fixed extent to fetch
@@ -953,12 +961,13 @@ pub async fn probe_tracks(http: &reqwest::Client, cdn_url: &str) -> Result<Vec<T
             Err(ProbeError::Transient) => {
                 // A Segment child BEFORE `Tracks` (a large Attachments/Void/cover-art block) — or a
                 // `Tracks` element larger than the 4 MB window — declares an extent past the front
-                // read, returning `Transient`. Without this, re-probing fetches the same 4 MB and
-                // defers forever, blacklisting a valid file after the verify deadline. Issue ONE
-                // larger fetch (up to MAX_PROBE_FETCH) covering that element + the following Tracks
-                // and re-parse. If the overrun is past the cap, accept (can't verify → unknown)
-                // rather than churn; a header-split under-fetch (None) stays `Transient` (defer).
-                // Mirrors the MP4 large-`moov` recovery below.
+                // read, returning `Transient`; so does a Segment child header the window cuts.
+                // Without this, re-probing fetches the same 4 MB and defers forever, blacklisting a
+                // valid file after the verify deadline. Issue ONE larger fetch (up to
+                // MAX_PROBE_FETCH) covering that element + the following Tracks and re-parse. If the
+                // overrun is past the cap, accept (can't verify → unknown) rather than churn; no
+                // extent to fetch (None: e.g. the front ends before the Segment's header) stays
+                // `Transient` (defer). Mirrors the MP4 large-`moov` recovery below.
                 match front_mkv_tracks_extent(&front) {
                     Some(end) if end <= MAX_PROBE_FETCH as u64 => {
                         // Fetch the full MAX_PROBE_FETCH window rather than exactly `[0, end)`: `end`
@@ -1430,6 +1439,43 @@ mod tests {
     }
 
     #[test]
+    fn front_mkv_tracks_extent_offers_a_recovery_read_for_a_header_cut_by_the_window() {
+        // The Segment children before Tracks end a few bytes before the edge of the fetched window,
+        // so the window cuts the next child's header (here Tracks' id or its size vint). With a full
+        // front read the cut comes from the file's layout and repeats on every re-probe, so it must
+        // be offered the recovery read like a payload overrun. `None` would defer the probe until
+        // the verify deadline blacklists a valid release.
+        let cut_after = |tail: &[u8]| {
+            let mut seg = ebml_elem(0xEC, &[0u8; 16]);
+            seg.extend_from_slice(tail);
+            let mut bytes = ebml_elem(0x1A45DFA3, &[]);
+            bytes.extend(ebml_elem_sized(0x18538067, 8_000_000_000, &seg));
+            bytes
+        };
+        for (what, tail) in [
+            ("id", &[0x16, 0x54][..]),
+            ("size vint", &[0x16, 0x54, 0xAE, 0x6B, 0x10, 0x00][..]),
+        ] {
+            let bytes = cut_after(tail);
+            assert!(
+                matches!(parse_mkv_tracks(&bytes), Err(ProbeError::Transient)),
+                "a Tracks {what} cut by the window defers the front-window parse"
+            );
+            let extent = front_mkv_tracks_extent(&bytes);
+            assert!(
+                matches!(extent, Some(e) if e > bytes.len() as u64 && e <= MAX_PROBE_FETCH as u64),
+                "a Tracks {what} cut by the window must be offered the recovery read, got {extent:?}"
+            );
+        }
+
+        // A size vint with a leading 0 octet is structurally invalid, not an under-fetch: no
+        // recovery read.
+        let bytes = cut_after(&[0x16, 0x54, 0xAE, 0x6B, 0x00]);
+        assert!(matches!(parse_mkv_tracks(&bytes), Err(ProbeError::Corrupt)));
+        assert_eq!(front_mkv_tracks_extent(&bytes), None);
+    }
+
+    #[test]
     fn mkv_truncated_is_transient() {
         // A truncated ranged read (an element declared past the fetched bytes) is an under-fetch
         // to defer, not a broken file to blacklist.
@@ -1832,6 +1878,53 @@ mod tests {
             log.lock().unwrap().as_slice(),
             [
                 format!("bytes=0-{}", 4 * 1024 * 1024 - 1),
+                format!("bytes=0-{}", MAX_PROBE_FETCH - 1),
+            ],
+            "the front read, then one recovery read of the full window"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_tracks_mkv_front_window_cutting_the_tracks_header_recovers() {
+        // A pre-Tracks Void sized so the 4 MB front window ends 2 bytes into Tracks' id. Every front
+        // read cuts the header at the same place, so the probe must make its recovery read and parse
+        // Tracks from it rather than defer on every re-probe until the verify deadline blacklists a
+        // valid release.
+        const FRONT: usize = 4 * 1024 * 1024;
+        let mut audio = ebml_elem(0x83, &[2]);
+        audio.extend(ebml_elem(0x22B59C, b"eng"));
+        let tracks = ebml_elem(0x1654AE6B, &ebml_elem(0xAE, &audio));
+        let build = |void_len: usize| {
+            let mut seg = ebml_elem(0xEC, &vec![0u8; void_len]);
+            seg.extend(tracks.clone());
+            let mut file = ebml_elem(0x1A45DFA3, &[]);
+            file.extend(ebml_elem(0x18538067, &seg));
+            file
+        };
+        // Size the Void so Tracks starts 2 bytes before the window edge. Both Void lengths take a
+        // 4-byte size vint, so one correction lands it.
+        let first = FRONT - 64;
+        let tracks_at = build(first).len() - tracks.len();
+        let file = build(first + (FRONT - 2) - tracks_at);
+        assert_eq!(
+            file.len() - tracks.len(),
+            FRONT - 2,
+            "Tracks' id must straddle the window edge"
+        );
+        let (url, log) = serve_ranges_logged(file).await;
+        let found = probe_tracks(&reqwest::Client::new(), &url)
+            .await
+            .expect("the recovery read must yield the tracks");
+        assert!(
+            found
+                .iter()
+                .any(|t| t.kind == TrackKind::Audio && t.language.as_deref() == Some("eng")),
+            "the recovered probe must report the eng audio track, got {found:?}"
+        );
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            [
+                format!("bytes=0-{}", FRONT - 1),
                 format!("bytes=0-{}", MAX_PROBE_FETCH - 1),
             ],
             "the front read, then one recovery read of the full window"

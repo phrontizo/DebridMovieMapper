@@ -294,7 +294,22 @@ fn detect_source(lower: &str) -> Source {
         || lower.contains("brrip")
     {
         Source::BluRay
-    } else if lower.contains("web-dl")
+    } else if explicit_web_tag(lower)
+        || (lower.lines().any(|line| WEB_RE.is_match(tag_part(line)))
+            && !NON_WEB_SOURCE_TAGS.iter().any(|tag| lower.contains(tag)))
+    {
+        Source::Web
+    } else if lower.contains("hdtv") {
+        Source::Hdtv
+    } else {
+        Source::Other
+    }
+}
+
+/// Whether the (lowercased) text carries a WEB source tag other than the bare `web` token:
+/// `WEB-DL`/`WEBRip` in any spelling, or a streaming-provider code.
+fn explicit_web_tag(lower: &str) -> bool {
+    lower.contains("web-dl")
         || lower.contains("webdl")
         || lower.contains("web.dl")
         || lower.contains("webrip")
@@ -312,15 +327,23 @@ fn detect_source(lower: &str) -> Source {
         || lower.contains("pcok")
         || lower.contains("pmtp")
         || lower.contains("itunes")
-        || (lower.lines().any(|line| WEB_RE.is_match(tag_part(line)))
-            && !NON_WEB_SOURCE_TAGS.iter().any(|tag| lower.contains(tag)))
-    {
-        Source::Web
-    } else if lower.contains("hdtv") {
-        Source::Hdtv
-    } else {
-        Source::Other
-    }
+}
+
+/// Whether the WEB source [`parse`] reads in `name` rests on nothing but a bare `web` word, in a
+/// name that carries nothing else marking it as a release name: no year, SxxEyy or `Season N`
+/// anchor, no resolution, codec or other source tag, no explicit WEB tag (`WEB-DL`, `WEBRip`, a
+/// streaming code). A line with no anchor is all tag part, so a folder titled `Web of Lies` or
+/// `Web Therapy` parses as a WEB source; `selection::served_rank` reads such a folder as tagging no
+/// source, as it does a folder's cam word. `Show.Complete.1080p.WEB` and `Show.WEB.x264-GRP` keep
+/// their WEB tag.
+pub(crate) fn web_source_is_a_title_word(name: &str) -> bool {
+    let lower = name.replace('_', ".").to_ascii_lowercase();
+    detect_source(&lower) == Source::Web
+        && !explicit_web_tag(&lower)
+        && !TAGS_START_RE.is_match(&lower)
+        && QUALITY_TAG_RE
+            .find_iter(&lower)
+            .all(|tag| tag.as_str() == "web")
 }
 
 pub fn parse(c: &RawCandidate) -> ReleaseInfo {
@@ -3414,6 +3437,27 @@ mod tests {
                 "{:?}: the penalty applies exactly when the predicate holds",
                 r.languages
             );
+        }
+    }
+
+    /// A name whose only WEB evidence is a bare `web` word, with no anchor and no other tag, is a
+    /// title (`Web of Lies`); any release tag beside it, or an explicit WEB tag, makes it a source.
+    #[test]
+    fn a_bare_web_word_with_no_other_tag_is_a_title_word() {
+        for name in ["Web of Lies", "Web Therapy", "Web_of_Lies", "The Web"] {
+            assert!(web_source_is_a_title_word(name), "{name}");
+        }
+        for name in [
+            "Show.Complete.1080p.WEB",
+            "Show.Complete.WEB.x264-GRP",
+            "Show.Complete.WEB-DL",
+            "Show.S01.WEB",
+            "Show.2019.WEB",
+            "Show.Complete.AMZN.WEB",
+            "Season 1",
+            "Show.Complete.1080p.BluRay",
+        ] {
+            assert!(!web_source_is_a_title_word(name), "{name}");
         }
     }
 }

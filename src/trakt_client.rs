@@ -82,9 +82,10 @@ pub struct TraktUser {
 }
 
 /// Whether a `refresh` failure is transient (the cycle is skipped, the account is not flagged
-/// `needs_reenrolment`): a persistent 429 (`RateLimited`), an incoherent answer (`Upstream`), a
-/// transport failure (no HTTP status) or a 5xx. A 4xx such as `invalid_grant` is a genuine auth
-/// failure, and so is anything else.
+/// `needs_reenrolment`): a persistent 429 (`RateLimited`), a transport failure or an undecodable
+/// answer (an `Http` error with no status, e.g. a 200 whose body fails to decode), or a 5xx. A 4xx
+/// such as `invalid_grant` is a genuine auth failure, and so is anything else. `Upstream` counts as
+/// transient too, defensively: `TraktClientImpl::refresh` never returns it.
 pub(crate) fn refresh_error_is_transient(e: &AppError) -> bool {
     match e {
         AppError::RateLimited | AppError::Upstream(_) => true,
@@ -1077,7 +1078,7 @@ pub struct MockTrakt {
     /// Canned `show_progress` responses keyed by Trakt show id. A show with no entry returns the
     /// default (`behind: false` = caught up), so a catch-up candidate is excluded unless set.
     pub progress: std::collections::HashMap<u64, ShowProgress>,
-    /// When true, `watchlist`/`in_progress`/`watched` return `Err`.
+    /// When true, `me`/`watchlist`/`in_progress`/`watched` return `Err`.
     pub fail_reads: bool,
     /// When true, `refresh` returns `Err` (a non-transient one: an auth failure).
     pub fail_refresh: bool,
@@ -1179,6 +1180,7 @@ impl TraktClient for MockTrakt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_loopback::{serve, Step};
 
     #[test]
     fn build_device_code_body_shape() {
@@ -1733,34 +1735,10 @@ mod tests {
         drop_n: usize,
         body: &'static str,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let c2 = counter.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut seen = 0usize;
-            while let Ok((mut sock, _)) = listener.accept().await {
-                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if seen < drop_n {
-                    seen += 1;
-                    // Drop the connection without responding → transport error on the client.
-                    drop(sock);
-                    continue;
-                }
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf).await;
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(body.as_bytes()).await;
-                let _ = sock.flush().await;
-                break;
-            }
-        });
-        (format!("http://{}/", addr), counter)
+        let mut steps = vec![Step::DropBeforeRead; drop_n];
+        steps.push(Step::json(200, body));
+        let server = serve(steps, None).await;
+        (format!("{}/", server.base), server.connections)
     }
 
     #[tokio::test(start_paused = true)]
@@ -1786,73 +1764,25 @@ mod tests {
     }
 
     /// Loopback that replies with `status` (empty body) on every connection, counting requests.
+    /// Serves up to 8 connections, enough for a full retry budget.
     async fn spawn_status_repeating(
         status: u16,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let c2 = counter.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            for _ in 0..8 {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf).await;
-                let head = format!(
-                    "HTTP/1.1 {} STATUS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    status
-                );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        (format!("http://{}/", addr), counter)
+        let server = serve(vec![Step::status(status); 8], None).await;
+        (format!("{}/", server.base), server.connections)
     }
 
     /// Loopback that replies `status` (empty body) on the first `fail_n` connections, then a 200
-    /// JSON `body`, counting requests.
+    /// JSON `body`, then stops, counting requests.
     async fn spawn_status_then_json(
         status: u16,
         fail_n: usize,
         body: &'static str,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let c2 = counter.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut seen = 0usize;
-            while let Ok((mut sock, _)) = listener.accept().await {
-                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf).await;
-                if seen < fail_n {
-                    seen += 1;
-                    let head = format!(
-                        "HTTP/1.1 {} STATUS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        status
-                    );
-                    let _ = sock.write_all(head.as_bytes()).await;
-                    let _ = sock.flush().await;
-                    continue;
-                }
-                // Serve the JSON success body, then stop.
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(body.as_bytes()).await;
-                let _ = sock.flush().await;
-                break;
-            }
-        });
-        (format!("http://{}/", addr), counter)
+        let mut steps = vec![Step::status(status); fail_n];
+        steps.push(Step::json(200, body));
+        let server = serve(steps, None).await;
+        (format!("{}/", server.base), server.connections)
     }
 
     #[tokio::test(start_paused = true)]
@@ -1891,7 +1821,8 @@ mod tests {
         assert_eq!(
             counter.load(std::sync::atomic::Ordering::SeqCst),
             5,
-            "the poll is idempotent, so the 5xx is first retried for the full MAX_ATTEMPTS budget"
+            "a pending device-code poll is safe to resend, so the 5xx is first retried for the \
+             full MAX_ATTEMPTS budget (a code Trakt has already exchanged would answer 409)"
         );
     }
 
@@ -2022,6 +1953,7 @@ mod tests {
             fail_refresh: true,
             ..Default::default()
         };
+        assert!(mock.me("ignored").await.is_err());
         assert!(mock.watchlist("ignored").await.is_err());
         assert!(mock.in_progress("ignored").await.is_err());
         assert!(mock.watched("ignored").await.is_err());
@@ -2039,8 +1971,8 @@ mod tests {
 /// order. `pub(crate)` so the `tasks` sync tests can drive `sync_trakt` through a real client.
 #[cfg(test)]
 pub(crate) mod test_http {
+    use crate::test_loopback;
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Debug, Clone)]
     pub(crate) struct Reply {
@@ -2151,16 +2083,11 @@ pub(crate) mod test_http {
                 let routes = routes.clone();
                 let log = log.clone();
                 tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 4096];
-                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        match sock.read(&mut chunk).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                        }
+                    let req = test_loopback::read_request(&mut sock).await;
+                    if !req.contains("\r\n\r\n") {
+                        return; // closed before a whole request head arrived
                     }
-                    let head = String::from_utf8_lossy(&buf).to_string();
-                    let target = head
+                    let target = req
                         .lines()
                         .next()
                         .and_then(|l| l.split_whitespace().nth(1))
@@ -2173,18 +2100,11 @@ pub(crate) mod test_http {
                         .find(|r| r.path == path && r.query == query)
                         .map(|r| r.reply.clone())
                         .unwrap_or_else(|| Reply::status(404));
-                    let mut out = format!(
-                        "HTTP/1.1 {} STATUS\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-                        reply.status,
-                        reply.body.len()
-                    );
+                    let mut out = test_loopback::Reply::json(reply.status, reply.body);
                     for (k, v) in &reply.headers {
-                        out.push_str(&format!("{k}: {v}\r\n"));
+                        out = out.header(k, v);
                     }
-                    out.push_str("\r\n");
-                    out.push_str(&reply.body);
-                    let _ = sock.write_all(out.as_bytes()).await;
-                    let _ = sock.flush().await;
+                    test_loopback::write_reply(&mut sock, &out).await;
                 });
             }
         });

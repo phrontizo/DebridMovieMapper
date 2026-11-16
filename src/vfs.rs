@@ -19,23 +19,24 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// space or `_` before the `E`: `S01.E05`, `S01 E05`), a single `NxM` (`2x05`), their MULTI-episode
 /// forms (`S01E01E02`, `S01E01-E02`, `S01E01.E02`, Sonarr's "Extend" `S01E01-02`, its "Duplicate"
 /// `S01E01.S01E02` / `S01E01 - S01E02`, `1x01x02`, `1x01-1x02`, `1x01-02`), or the
-/// dash-concatenated absolute code (`Show - 409 - Title` →
-/// `[(4, 9)]`). Empty when no episode code is found. The first element is the file's FIRST code
-/// (`parse_se`).
+/// dash-concatenated absolute code (`Show - 409 - Title` → `[(4, 9)]`). Empty when no episode code
+/// is found. The first element is the file's FIRST code (`parse_se`).
 ///
 /// The VFS build uses every code for its selection gate (a double-episode file stays visible while
 /// any episode it carries is not served by another copy), and the first one for season placement.
-/// The acquisition engine uses it too, for a show's `provides`, the `selection` slots `observe`
-/// writes and the title check's episode test, so for a coded file the VFS and the engine agree on
-/// which file supplies which episode. The engine also maps a file with no code to the episode its
-/// name gives (`acquire::codeless_episode_files`), and the VFS gates such a file by that same
-/// mapping. A multi-episode file contributes every episode it carries: reporting only
-/// the first would leave the second looking un-owned, and `monitor_episodes` would re-acquire it as a
-/// duplicate singleton. The `NxM` and dash-code arms exist for the same reason: without them a pack
-/// named `Show - 2x05 - Title` or `Show - 409 - Title` derives an empty `provides`, so the
-/// reconciler sees none of its episodes as owned and re-acquires the whole show as per-episode
-/// torrents (permanent duplicates), and `observe` finds no file for the episode it added the pack
-/// for and rejects a correct release as `EpisodeMissing`.
+/// The acquisition engine, the upgrade engine and the scan loop read episodes through it too
+/// ([`episode_files`], [`show_episode_files`]): a show's `provides`, the `selection` slots
+/// `observe` writes and the title check's episode test, so for a coded file the VFS and the engines
+/// agree on which file supplies which episode. A file with no code is mapped to the episode its
+/// name gives by [`codeless_episode_files`], which the build gates such a file by too, so this
+/// module holds every rule that reads a torrent's files as episodes. A multi-episode file
+/// contributes every episode it carries: reporting only the first would leave the second looking
+/// un-owned, and `monitor_episodes` would re-acquire it as a duplicate singleton. The `NxM` and
+/// dash-code arms exist for the same reason: without them a pack named `Show - 2x05 - Title` or
+/// `Show - 409 - Title` derives an empty `provides`, so the reconciler sees none of its episodes as
+/// owned and re-acquires the whole show as per-episode torrents (permanent duplicates), and
+/// `observe` finds no file for the episode it added the pack for and rejects a correct release as
+/// `EpisodeMissing`.
 ///
 /// The `SxxEyy` arm is deliberately NOT word-anchored (unlike `SEASON_RE`); a literal `e` must
 /// follow the season digits, directly or after one separator, so a mid-token match is very unlikely
@@ -76,16 +77,15 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// episode-00 decode is rejected. The dash code needs SPACE-dash-SPACE on both sides, so a dotted
 /// scene form (`Show.-.409.-.Title`) yields no code at all (an empty `provides` for such a file), as
 /// does other absolute numbering (`Show - 041 [1080p]`) and an episode word with no season code
-/// (`E09 - Title.mkv`, `Episode 9.mkv`). The acquisition engine still maps a file with no code
-/// that names its episode by an episode word or a trailing ` - NN` number
-/// (`acquire::codeless_episode_files`, read by `acquire::show_episode_files`): a single-file
-/// release in the season the VFS places it in (season 1 unless the name or a directory names one),
-/// and a file of a multi-file pack only under an explicit season (a season token in its name or a
-/// season directory, not a `Part N` in the file name, nor a season range), and nothing when another
-/// selected file names the same episode. The dotted dash form, whose number another ` - ` follows
-/// once its dots are read as spaces, stays rejected as `EpisodeMissing`, as do an absolutely
-/// numbered pack with no explicit season and an absolute number past season 1 (`Show - 30` for
-/// S02E05): neither names an episode there.
+/// (`E09 - Title.mkv`, `Episode 9.mkv`). A file with no code that names its episode by an episode
+/// word or a trailing ` - NN` number is still mapped ([`codeless_episode_files`], read by
+/// [`show_episode_files`]): a single-file release in the season the VFS places it in (season 1
+/// unless the name or a directory names one), and a file of a multi-file pack only under an
+/// explicit season (a season token in its name or a season directory, not a `Part N` in the file
+/// name, nor a season range), and nothing when another selected file names the same episode. The
+/// dotted dash form, whose number another ` - ` follows once its dots are read as spaces, stays
+/// rejected as `EpisodeMissing`, as do an absolutely numbered pack with no explicit season and an
+/// absolute number past season 1 (`Show - 30` for S02E05): neither names an episode there.
 pub(crate) fn parse_se_all(name: &str) -> Vec<(u32, u32)> {
     if let Some(eps) = sxxeyy_codes(name).or_else(|| nxm_codes(name)) {
         return eps;
@@ -236,11 +236,17 @@ fn find_nxm(name: &str) -> Option<regex::Captures<'_>> {
 /// channel layout. `find_nxm` and `season_tokens` both skip such a token, so the episode reader and
 /// the season placement agree on it.
 fn is_channel_layout_codec(s: &str, season: &regex::Match<'_>) -> bool {
+    is_channel_layout_codec_at(s, season.start(), season.end())
+}
+
+/// [`is_channel_layout_codec`] for the token whose season digits span `start..x` of `s`, `x` being
+/// the offset of its `x`. `pub(crate)`: identification's show guess skips such a token as an `NxM`
+/// marker, so it reads `DD5.1x264` as no episode code, as the episode reader does.
+pub(crate) fn is_channel_layout_codec_at(s: &str, start: usize, x: usize) -> bool {
     let bytes = s.as_bytes();
-    let start = season.start();
     let follows_digit_dot =
         start >= 2 && bytes[start - 1] == b'.' && bytes[start - 2].is_ascii_digit();
-    let codec = season.end() + 1;
+    let codec = x + 1;
     follows_digit_dot
         && matches!(bytes.get(codec..codec + 3), Some(b"264" | b"265"))
         && !bytes.get(codec + 3).is_some_and(u8::is_ascii_digit)
@@ -307,8 +313,11 @@ fn parse_se(name: &str) -> Option<(u32, u32)> {
 }
 
 /// The selected video files of `t` the VFS can actually EMIT (`emittable_video_files_with_links`).
-/// The build's episode-slot check (`present_files`) and `selection::plan_selection_repoints` both
-/// use this, so a slot is only ever pointed at a file the build will emit.
+/// Every consumer that needs the VFS's view of a torrent's playable files reads this: the build's
+/// episode-slot check (`present_files`), `selection::plan_selection_repoints`, and the scan loop's
+/// file refresh (`tasks::refresh_fileless_infos`), the account mirror's no-video check and dedup's
+/// `tasks::holds_codeless_video`. So a slot, or a decision about a torrent's files, only ever
+/// concerns a file the build will emit.
 pub(crate) fn emittable_video_files(t: &TorrentInfo) -> Vec<&crate::rd_client::TorrentFile> {
     emittable_video_files_with_links(t)
         .map(|(f, _)| f)
@@ -320,8 +329,8 @@ pub(crate) fn emittable_video_files(t: &TorrentInfo) -> Vec<&crate::rd_client::T
 /// or not, and an unselected file takes none. TorBox resolves by `(torrent_id, file_id)` and lists
 /// no links, so every link is `None` there, as is a file past the end of `links` (Real-Debrid's
 /// `selected != links` anomaly). The one copy of this pairing: the VFS build
-/// ([`emittable_video_files_with_links`]), the instant repair's replacement locator and the
-/// acquisition engine's locators (`acquire::locator_for_selected`) all read it.
+/// ([`emittable_video_files_with_links`]) and the locators the instant repair and the acquisition
+/// engine build ([`locator_for_selected`], [`selected_locators`]) all read it.
 pub(crate) fn selected_files_with_links(
     t: &TorrentInfo,
 ) -> impl Iterator<Item = (&crate::rd_client::TorrentFile, Option<&String>)> {
@@ -330,6 +339,46 @@ pub(crate) fn selected_files_with_links(
         .filter(|f| f.selected == 1)
         .enumerate()
         .map(|(link_idx, f)| (f, t.links.get(link_idx)))
+}
+
+/// A FileLocator for the SELECTED file at `path` within `info` (the first, should two share it),
+/// its Real-Debrid link paired by position among the selected files ([`selected_files_with_links`];
+/// `None` on TorBox, which resolves by `(torrent_id, file_id)`). `None` when no selected file is at
+/// `path`. The instant repair locates the replacement's copy of a file this way, and
+/// `acquire::locator_for` builds on it.
+pub(crate) fn locator_for_selected(
+    info: &TorrentInfo,
+    hash: &str,
+    path: &str,
+) -> Option<FileLocator> {
+    selected_files_with_links(info)
+        .find(|(f, _)| f.path == path)
+        .map(|(f, link)| selected_locator(info, hash, f, link))
+}
+
+/// A FileLocator for every SELECTED file of `info`, in file order, paired as
+/// [`locator_for_selected`] pairs one. The instant repair records its redirect from these.
+pub(crate) fn selected_locators<'a>(
+    info: &'a TorrentInfo,
+    hash: &'a str,
+) -> impl Iterator<Item = FileLocator> + 'a {
+    selected_files_with_links(info).map(move |(f, link)| selected_locator(info, hash, f, link))
+}
+
+/// The FileLocator of the selected file `f` of `info`, with its paired `link`.
+fn selected_locator(
+    info: &TorrentInfo,
+    hash: &str,
+    f: &crate::rd_client::TorrentFile,
+    link: Option<&String>,
+) -> FileLocator {
+    FileLocator {
+        hash: hash.to_string(),
+        torrent_id: info.id.clone(),
+        file_id: f.id,
+        file_path: f.path.clone(),
+        link: link.cloned(),
+    }
 }
 
 /// The selected video files of `t` the VFS can actually EMIT, each with its Real-Debrid link
@@ -897,7 +946,7 @@ impl DebridVfs {
                             // longer matches) never hides anything: that episode degrades to the
                             // legacy first/largest-wins dedup below. A file with no episode code is
                             // gated the same way on the episode the engine maps it to
-                            // (`acquire::codeless_episode_files`, in the season folder it lands in
+                            // (`codeless_episode_files`, in the season folder it lands in
                             // below), so a slot moved off it (a repoint, a pack-served episode split
                             // to a single) hides it like a coded file, instead of leaving the
                             // episode listed twice. A file that maps to nothing is never hidden.
@@ -919,7 +968,7 @@ impl DebridVfs {
                                     }
                                 } else if !selection.is_empty() {
                                     let mapped = codeless.get_or_insert_with(|| {
-                                        crate::acquire::codeless_episode_files(&torrent)
+                                        codeless_episode_files(&torrent)
                                             .into_iter()
                                             .map(|(s, e, path)| (path, (s, e)))
                                             .collect()
@@ -1191,13 +1240,14 @@ impl DebridVfs {
 /// NOTE on a deliberate asymmetry: this is applied to the library-CONSTRUCTED Movie/Show folder
 /// names (the title, and the `[tmdbid-N]`-suffixed folder name; season folders (`Season NN`) and
 /// NFO names (`movie.nfo`/`tvshow.nfo`) are fixed strings that need no sanitising) but NOT to
-/// media-file LEAF names, which keep the exact torrent basename (`file.path.split('/').next_back()`). That is intentional: Jellyfin/Plex parse
-/// episode/quality metadata out of the original scene filename, so mangling it would degrade
-/// identification. It is not a path-traversal risk — `/` is already stripped by taking the basename,
-/// the WebDAV layer XML-encodes names, and `dav_fs::walk_components` rejects any `..` component. (A
-/// backslash in a leaf basename is not stripped, but debrid providers / BitTorrent path lists use
-/// POSIX `/` separators so it does not occur in practice, and the leaf key is inert within the VFS —
-/// it creates no nested node — so a stray `\` is not a traversal vector either.)
+/// media-file LEAF names, which keep the exact torrent basename
+/// (`file.path.split('/').next_back()`). That is intentional: Jellyfin/Plex parse episode/quality
+/// metadata out of the original scene filename, so mangling it would degrade identification. It is
+/// not a path-traversal risk — `/` is already stripped by taking the basename, the WebDAV layer
+/// XML-encodes names, and `dav_fs::walk_components` rejects any `..` component. (A backslash in a
+/// leaf basename is not stripped, but debrid providers / BitTorrent path lists use POSIX `/`
+/// separators so it does not occur in practice, and the leaf key is inert within the VFS — it
+/// creates no nested node — so a stray `\` is not a traversal vector either.)
 fn sanitize_filename(name: &str) -> String {
     let mut replaced = String::with_capacity(name.len());
     for c in name.chars() {
@@ -1575,8 +1625,10 @@ pub(crate) fn season_tokens(s: &str) -> (Option<u32>, Option<u32>) {
 /// `Part N` DIRECTORY, though, names a season (a show released in parts, "Show/Part 3/01.mkv"), and
 /// deliberately beats a season token in an outer directory too ("Show.S04/Part 2/01.mkv" lands in
 /// Season 02), since the root of such a pack often names a season RANGE ("Show.S01-S05/Part 3/")
-/// whose first season would be wrong. The acquisition engine reads an absolute-numbered single-file
-/// release's season from it too (`acquire::codeless_episode`), so it slots the episode the VFS
+/// whose first season would be wrong. A directory that names only a season range
+/// (`Show Seasons 2-3/01.mkv`) places the file in the range's first season, as `Show.S02-S03/`
+/// does. The episode mapping reads an absolute-numbered single-file release's season from it too
+/// ([`codeless_episode`], [`codeless_episode_files`]), so the engine slots the episode the VFS
 /// places the file under. For a file of a multi-file pack it reads
 /// [`explicit_season_of_codeless_file`], built on the same lookup ([`nearest_codeless_season`]).
 pub(crate) fn season_of_codeless_file(path: &str, filename: &str) -> u32 {
@@ -1592,10 +1644,10 @@ pub(crate) fn season_of_codeless_file(path: &str, filename: &str) -> u32 {
 /// naming one (a `Part N` directory included). `None` when nothing does (the season-1 default and a
 /// file-name `Part N`, usually a two-part episode's title, don't count), and when the nearest name
 /// that names a season names a RANGE of them (`[Group] Show (Season 1-2)`, `Show.S01-S03`,
-/// `Seasons 1-3`): which season the file is in isn't said there, and an outer directory says even
-/// less. The acquisition engine maps a code-less file of a multi-file pack only under such a season
-/// (`acquire::codeless_episode_files`), since the season-1 default would record an absolutely
-/// numbered batch's S02 episodes as S01E26 and on.
+/// `Show.S01-03`, `Season 1&2`, `Seasons 1-3`; [`season_range`]): which season the file is in isn't
+/// said there, and an outer directory says even less. A code-less file of a multi-file pack is
+/// mapped only under such a season ([`codeless_episode_files`]), since the season-1 default would
+/// record an absolutely numbered batch's S02 episodes as S01E26 and on.
 pub(crate) fn explicit_season_of_codeless_file(path: &str, filename: &str) -> Option<u32> {
     nearest_codeless_season(path, filename)
         .filter(|&(_, range)| !range)
@@ -1604,72 +1656,259 @@ pub(crate) fn explicit_season_of_codeless_file(path: &str, filename: &str) -> Op
 
 /// The lookup [`season_of_codeless_file`] and [`explicit_season_of_codeless_file`] share: the
 /// season of the strongest name that names one (the file name's strong token, else the nearest
-/// directory's strong token or `Part N`), and whether that name names a season range
-/// ([`names_season_range`]).
+/// directory's strong token or `Part N`, or the first season of the range it names when it names
+/// only a range, as `Seasons 1-3` does), and whether that name names a season range
+/// ([`season_range`]).
 fn nearest_codeless_season(path: &str, filename: &str) -> Option<(u32, bool)> {
     if let Some(season) = season_tokens(filename).0 {
-        return Some((season, names_season_range(filename)));
+        return Some((season, season_range(filename, false).is_some()));
     }
     let dir = &path[..path.len() - filename.len()];
     dir.rsplit('/').filter(|c| !c.is_empty()).find_map(|c| {
         let (strong, part) = season_tokens(c);
-        strong
-            .or(part)
-            .map(|season| (season, names_season_range(c)))
+        let range = season_range(c, true);
+        match strong.or(part) {
+            Some(season) => Some((season, range.is_some())),
+            // `Seasons 1-3` holds no token `season_tokens` reads, yet names seasons.
+            None => range.map(|first| (first, true)),
+        }
     })
 }
 
 /// A season range in one name: `S01-S03`, `S01 - S03`, `Season 1-2`, `Seasons 1 - 3`,
-/// `Season 1 to 3`, `Season 1 & 2`, `Season 1 - Season 2`. A dash with a bare number after it is a
-/// range only glued to `Season N` (`Season 1-2`) or after `Seasons`: `Show S2 - 05` and
-/// `Show Season 2 - 05` are season 2's episode 5.
+/// `Season 1 to 3`, `Season 1 & 2`, `Season 1&2`, `Season 1+2`, `Season 1 - Season 2`. A dash with
+/// a bare number after it is a range only glued to `Season N` (`Season 1-2`) or after `Seasons`:
+/// `Show S2 - 05` and `Show Season 2 - 05` are season 2's episode 5. A glued `S01-03` is read as a
+/// range only in a directory name ([`GLUED_SEASON_RANGE_RE`]).
 static SEASON_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?:^|[^a-z0-9])s(\d{1,2})[\s._]*[-~][\s._]*s(\d{1,2})(?:[^a-z0-9]|$)|season[\s._-]*(\d{1,2})[-~](\d{1,2})(?:[^a-z0-9]|$)|seasons[\s._-]*(\d{1,2})[\s._]*(?:-|~|&|to|and)[\s._]*(\d{1,2})(?:[^a-z0-9]|$)|season[\s._-]*(\d{1,2})[\s._]+(?:&|to|and)[\s._]+(?:seasons?[\s._-]*)?(\d{1,2})(?:[^a-z0-9]|$)|season[\s._-]*(\d{1,2})[\s._]*[-~][\s._]*seasons?[\s._-]*(\d{1,2})(?:[^a-z0-9]|$)",
+        r"(?i)(?:^|[^a-z0-9])s(\d{1,2})[\s._]*[-~][\s._]*s(\d{1,2})(?:[^a-z0-9]|$)|season[\s._-]*(\d{1,2})[-~](\d{1,2})(?:[^a-z0-9]|$)|seasons[\s._-]*(\d{1,2})[\s._]*(?:-|~|&|\+|to|and)[\s._]*(\d{1,2})(?:[^a-z0-9]|$)|season[\s._-]*(\d{1,2})[\s._]*[&+][\s._]*(?:seasons?[\s._-]*)?(\d{1,2})(?:[^a-z0-9]|$)|season[\s._-]*(\d{1,2})[\s._]+(?:to|and)[\s._]+(?:seasons?[\s._-]*)?(\d{1,2})(?:[^a-z0-9]|$)|season[\s._-]*(\d{1,2})[\s._]*[-~][\s._]*seasons?[\s._-]*(\d{1,2})(?:[^a-z0-9]|$)",
     )
     .unwrap()
 });
 
-/// Whether a file or directory name names a range of seasons rather than one: a range token
-/// ([`SEASON_RANGE_RE`]) of two different seasons, or two different seasons named apart
-/// (`Show.S01.S02`).
-fn names_season_range(s: &str) -> bool {
-    let ranged = SEASON_RANGE_RE.captures_iter(s).any(|c| {
+/// An `Sxx` token with a second, bare season number glued on by a dash (`Show.S01-03`,
+/// `Show S1-3 [1080p]`). A directory name holds no episode, so there the second number is a season
+/// when it is the greater one. A file name's `S2-05` may be an episode, so [`season_range`] reads
+/// this only for a directory.
+static GLUED_SEASON_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|[^a-z0-9])s(\d{1,2})[-~](\d{1,2})(?:[^a-z0-9]|$)").unwrap()
+});
+
+/// The first season of the range of seasons a file or directory name (`dir`) names rather than
+/// one season, or `None`: a range token ([`SEASON_RANGE_RE`]) of two different seasons, in a
+/// directory a glued `S01-03` ([`GLUED_SEASON_RANGE_RE`]) whose second number is the greater (not
+/// the whole part of a channel layout, `S02-5.1`), or two different seasons named apart
+/// (`Show.S01.S02`), where an aspect ratio (`16x9`, a single digit after the `x`) names no second
+/// season.
+fn season_range(s: &str, dir: bool) -> Option<u32> {
+    let ranged = SEASON_RANGE_RE.captures_iter(s).find_map(|c| {
         let mut numbers = c
             .iter()
             .skip(1)
             .flatten()
             .filter_map(|m| m.as_str().parse::<u32>().ok());
-        matches!((numbers.next(), numbers.next()), (Some(a), Some(b)) if a != b)
+        match (numbers.next(), numbers.next()) {
+            (Some(a), Some(b)) if a != b => Some(a),
+            _ => None,
+        }
     });
-    if ranged {
-        return true;
+    if ranged.is_some() {
+        return ranged;
+    }
+    if dir {
+        let glued = GLUED_SEASON_RANGE_RE.captures_iter(s).find_map(|c| {
+            let (first, second) = (c.get(1)?, c.get(2)?);
+            let a = first.as_str().parse::<u32>().ok()?;
+            let b = second.as_str().parse::<u32>().ok()?;
+            let after = &s.as_bytes()[second.end()..];
+            (b > a && !is_channel_layout(second.as_str(), after)).then_some(a)
+        });
+        if glued.is_some() {
+            return glued;
+        }
     }
     // Two different strong tokens apart: `season_tokens` reads only the first, so read on past it.
-    let Some(first) = season_tokens(s).0 else {
-        return false;
-    };
+    let first = season_tokens(s).0?;
     let mut at = 0;
     while let Some(cap) = SEASON_RE.captures_at(s, at) {
         let Some(whole) = cap.get(0) else { break };
         let number = |i| cap.get(i).and_then(|m| m.as_str().parse::<u32>().ok());
         let nxnn = cap
             .get(3)
-            .filter(|m| !is_channel_layout_codec(s, m))
+            .filter(|m| !is_channel_layout_codec(s, m) && !is_aspect_ratio(s, m))
             .and_then(|m| m.as_str().parse::<u32>().ok());
         if number(1)
             .or_else(|| number(2))
             .or(nxnn)
             .is_some_and(|n| n != first)
         {
-            return true;
+            return Some(first);
         }
         at = match whole.as_str().chars().next_back() {
             Some(c) if !c.is_ascii_alphanumeric() => whole.end() - c.len_utf8(),
             _ => whole.end(),
         };
     }
-    false
+    None
+}
+
+/// Whether the `NxNN` token whose season digits are `season` (a match in `s` that ends at the
+/// token's `x`) is an aspect ratio (`16x9`, `4x3`, `21x9`): a single digit after the `x`, where an
+/// episode number has two or three.
+fn is_aspect_ratio(s: &str, season: &regex::Match<'_>) -> bool {
+    let after = s.as_bytes().get(season.end() + 1..).unwrap_or_default();
+    after.first().is_some_and(u8::is_ascii_digit) && !after.get(1).is_some_and(u8::is_ascii_digit)
+}
+
+/// Map a torrent's SELECTED video files to `(season, episode, file_path)` by their episode codes
+/// ([`parse_se_all`]: the `SxxEyy`, `NxM`, separated and dash-concatenated forms). `pub(crate)` for
+/// the account mirror (`tasks::record_mirror_owned`) and `tasks::backfill_owned_provides`, which
+/// read episode codes only. `observe` and the upgrade engine's staging sites read
+/// [`show_episode_files`], which adds the code-less mapping.
+///
+/// Each episode appears once, from the FIRST file (in provider file order) that carries it: a pack
+/// holding one episode twice (per-language folders, two resolutions) is title-checked and probed on
+/// that file by `observe`, so its slot must serve that file and `provides` must list the episode
+/// once (a single-episode torrent with two versions is not a pack).
+pub(crate) fn episode_files(info: &TorrentInfo) -> Vec<(u32, u32, String)> {
+    let mut seen = std::collections::HashSet::new();
+    info.files
+        .iter()
+        .filter(|f| f.selected == 1 && is_video_file(&f.path))
+        .flat_map(|f| {
+            let name = f.path.rsplit('/').next().unwrap_or(&f.path);
+            // A multi-episode file contributes ALL its episodes (so `provides` is complete and the
+            // reconciler doesn't re-acquire a contained episode as a duplicate singleton).
+            parse_se_all(name)
+                .into_iter()
+                .map(move |(s, e)| (s, e, f.path.clone()))
+        })
+        .filter(|(s, e, _)| seen.insert((*s, *e)))
+        .collect()
+}
+
+/// An episode named by a word and a number (`E05`, `Ep 5`, `Episode.12`), bounded like the season
+/// tokens, which [`parse_se_all`] doesn't read apart from a season code. Capture 1 is the number.
+/// `pub(crate)`: the upgrade engine's `is_pack_stream` reads it to keep such a stream.
+pub(crate) static EPISODE_WORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|[^a-z0-9])(?:e|ep|episode)[\s._-]*(\d{1,3})(?:[^a-z0-9]|$)").unwrap()
+});
+
+/// The episode number a show file name with no [`parse_se_all`] code names by itself: an episode
+/// word (`E09 - Title.mkv`, `Episode 9.mkv`, [`EPISODE_WORD_RE`]), else a trailing ` - NN` number,
+/// the common anime form (`[Group] Show - 12 (1080p) [ABCD1234].mkv`,
+/// `identification::trailing_episode_number`). Never 0.
+fn codeless_episode_number(name: &str) -> Option<u32> {
+    EPISODE_WORD_RE
+        .captures(name)
+        .and_then(|c| c.get(1)?.as_str().parse().ok())
+        .or_else(|| crate::identification::trailing_episode_number(name))
+        .filter(|&e| e >= 1)
+}
+
+/// The episode a show file with no [`parse_se_all`] code names ([`codeless_episode_number`]), in
+/// the season the VFS places the file in ([`season_of_codeless_file`]: season 1 unless the name or
+/// a directory names one, so `Show S2 - 05 (1080p).mkv` is S02E05). `None` for a file with an
+/// episode code or no such number. An absolute number past season 1 (`Show - 30` for S02E05)
+/// therefore names no requested episode. A file of a multi-file pack is mapped only under an
+/// explicit season ([`codeless_episode_files`]); this is the acquisition title check's reading of
+/// the one file it is given.
+pub(crate) fn codeless_episode(path: &str) -> Option<(u32, u32)> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if !parse_se_all(name).is_empty() {
+        return None;
+    }
+    let episode = codeless_episode_number(name)?;
+    Some((season_of_codeless_file(path, name), episode))
+}
+
+/// The selected video files of a show torrent that carry no [`parse_se_all`] code but name their
+/// episode by [`codeless_episode_number`], each mapped to `(season, episode, file_path)`:
+///
+/// - a single-file release in the season the VFS places it in ([`codeless_episode`]; season 1
+///   unless something names one);
+/// - a file of a multi-file pack only under an explicit season
+///   ([`explicit_season_of_codeless_file`]: a `Season 04/E09 - Title.mkv`, a
+///   `[Group] Show S2 - 05.mkv`). A pack of absolutely numbered files (`[Group] Show - 01..50`)
+///   maps nothing, and nor does one under a season RANGE (`[Group] Show (Season 1-2)/`,
+///   `Show.S01-S03/`): placing a number past season 1 needs TMDB's per-season episode counts, and
+///   the season-1 default would record S01E26..E50 for what TMDB calls S02.
+///
+/// The mapping is all or nothing: when a mapped episode is also named by another selected video
+/// file (coded or not), the names are ambiguous and nothing is mapped. `observe` and the upgrade
+/// engine's staging sites map episodes with it ([`show_episode_files`]), the VFS build gates a
+/// code-less file on the episode it maps to, and `tasks::holds_codeless_video` (dedup and the
+/// show-swap prune guard) reads it to tell whether a record's `provides` accounts for a code-less
+/// file. The account mirror's `provides` reads episode codes alone ([`episode_files`]), so a
+/// user's own code-less copy keeps an empty `provides` (and stays protected), while the build
+/// hides a code-less file whose episode another present copy's slot serves.
+pub(crate) fn codeless_episode_files(info: &TorrentInfo) -> Vec<(u32, u32, String)> {
+    let videos: Vec<&crate::rd_client::TorrentFile> = info
+        .files
+        .iter()
+        .filter(|f| f.selected == 1 && is_video_file(&f.path))
+        .collect();
+    let single = videos.len() == 1;
+    let mut named: HashMap<(u32, u32), usize> = HashMap::new();
+    let mut mapped = Vec::new();
+    for f in &videos {
+        let name = f.path.rsplit('/').next().unwrap_or(&f.path);
+        let codes = parse_se_all(name);
+        if !codes.is_empty() {
+            for ep in codes {
+                *named.entry(ep).or_default() += 1;
+            }
+            continue;
+        }
+        let Some(episode) = codeless_episode_number(name) else {
+            continue;
+        };
+        let season = if single {
+            Some(season_of_codeless_file(&f.path, name))
+        } else {
+            explicit_season_of_codeless_file(&f.path, name)
+        };
+        if let Some(season) = season {
+            *named.entry((season, episode)).or_default() += 1;
+            mapped.push((season, episode, f.path.clone()));
+        }
+    }
+    if mapped.iter().any(|(s, e, _)| named[&(*s, *e)] > 1) {
+        return Vec::new();
+    }
+    mapped
+}
+
+/// Every episode a show torrent's selected video files supply, as `(season, episode, file_path)` in
+/// provider file order: the coded files' episodes ([`episode_files`], each episode once, from its
+/// first file) and the code-less files [`codeless_episode_files`] maps. What `observe` records as a
+/// verified show copy's `provides` (and slots), and what the upgrade engine's staging sites read
+/// (per-episode staging, pack correction and consolidation), so they accept and record the
+/// releases acquisition accepts the way `observe` records them.
+pub(crate) fn show_episode_files(info: &TorrentInfo) -> Vec<(u32, u32, String)> {
+    let codeless: HashMap<String, (u32, u32)> = codeless_episode_files(info)
+        .into_iter()
+        .map(|(s, e, path)| (path, (s, e)))
+        .collect();
+    if codeless.is_empty() {
+        return episode_files(info);
+    }
+    let mut coded = episode_files(info).into_iter().peekable();
+    let mut out = Vec::new();
+    for f in info
+        .files
+        .iter()
+        .filter(|f| f.selected == 1 && is_video_file(&f.path))
+    {
+        if let Some(&(s, e)) = codeless.get(&f.path) {
+            out.push((s, e, f.path.clone()));
+        }
+        while let Some(entry) = coded.next_if(|(_, _, path)| *path == f.path) {
+            out.push(entry);
+        }
+    }
+    out
 }
 
 fn xml_escape(s: &str) -> String {
@@ -2497,14 +2736,14 @@ mod tests {
         let torrents = vec![(
             TorrentInfo {
                 id: "s1".to_string(),
-                filename: "Rick and Morty - 409 - Childrick of Mort.mkv".to_string(),
+                filename: "Some Show - 409 - Episode Title.mkv".to_string(),
                 hash: "h1".to_string(),
                 bytes: 3000,
                 status: "downloaded".to_string(),
                 added: "2024-01-01".to_string(),
                 files: vec![TorrentFile {
                     id: 1,
-                    path: "/Rick and Morty - 409 - Childrick of Mort.mkv".to_string(),
+                    path: "/Some Show - 409 - Episode Title.mkv".to_string(),
                     bytes: 3000,
                     selected: 1,
                 }],
@@ -2512,10 +2751,10 @@ mod tests {
                 ..Default::default()
             },
             MediaMetadata {
-                title: "Rick and Morty".to_string(),
+                title: "Some Show".to_string(),
                 year: Some("2014".to_string()),
                 media_type: MediaType::Show,
-                external_id: Some("tmdb:60625".to_string()),
+                external_id: Some("tmdb:900011".to_string()),
             },
         )];
 
@@ -3233,7 +3472,7 @@ mod tests {
         assert_eq!(parse_se_all("Show S1E5.mkv"), vec![(1, 5)]);
         // Dash-concatenated 3-digit form ("409" = S04E09).
         assert_eq!(
-            parse_se_all("Rick and Morty - 409 - Childrick of Mort.mkv"),
+            parse_se_all("Some Show - 409 - Episode Title.mkv"),
             vec![(4, 9)]
         );
         // Must NOT misread a resolution or year as an episode code.
@@ -3310,7 +3549,7 @@ mod tests {
 
         // KNOWN LIMITATION: the dash-concatenated code fallback requires SPACE-dash-SPACE, so a
         // DOT-separated Torrentio name is not matched and yields empty `provides`.
-        assert!(parse_se_all("Rick.and.Morty.-.409.-.Childrick.of.Mort.mkv").is_empty());
+        assert!(parse_se_all("Some.Show.-.409.-.Episode.Title.mkv").is_empty());
 
         // KNOWN LIMITATION: anime ABSOLUTE numbering is indistinguishable from a concatenated
         // SxxEyy code, so absolute "409" decodes to a phantom (4, 9) rather than the real ep 409.
@@ -4006,8 +4245,9 @@ mod tests {
         // rather than silently rolling into the following month.
         assert_eq!(parse_rd_date("2023-02-30"), std::time::UNIX_EPOCH);
         assert_eq!(parse_rd_date("2023-04-31"), std::time::UNIX_EPOCH);
-        assert_eq!(parse_rd_date("2023-02-29"), std::time::UNIX_EPOCH); // 2023 not a leap year
-                                                                        // A genuine leap day must still parse.
+        // 2023 is not a leap year.
+        assert_eq!(parse_rd_date("2023-02-29"), std::time::UNIX_EPOCH);
+        // A genuine leap day must still parse.
         assert_ne!(parse_rd_date("2024-02-29"), std::time::UNIX_EPOCH);
         // Last valid day of a 30-day month must still parse.
         assert_ne!(parse_rd_date("2023-04-30"), std::time::UNIX_EPOCH);
@@ -4544,6 +4784,279 @@ mod tests {
         // must NOT match.
         assert_eq!(season_tokens("Seasonal.Documentary.mkv"), (None, None));
         assert_eq!(season_tokens("Departure.2.mkv"), (None, None));
+    }
+
+    #[test]
+    fn episode_files_extracts_dash_concatenated_pack() {
+        // A pre-existing absolute/concatenated-coded season pack must report its episodes (so the
+        // reconciler doesn't re-acquire them as per-episode duplicates).
+        let info = TorrentInfo {
+            hash: "h".into(),
+            files: vec![
+                TorrentFile {
+                    id: 0,
+                    path: "Some Show - 409 - Episode Title.mkv".into(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                },
+                TorrentFile {
+                    id: 1,
+                    path: "Some Show - 410 - Another Title.mkv".into(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut eps: Vec<(u32, u32)> = episode_files(&info)
+            .into_iter()
+            .map(|(s, e, _)| (s, e))
+            .collect();
+        eps.sort_unstable();
+        assert_eq!(eps, vec![(4, 9), (4, 10)]);
+    }
+
+    #[test]
+    fn episode_files_reports_all_episodes_of_a_multi_episode_file() {
+        // A single file covering two episodes must report BOTH (and both point to that file), so the
+        // reconciler sees the second episode as owned instead of re-acquiring it as a duplicate.
+        let info = TorrentInfo {
+            hash: "h".into(),
+            files: vec![TorrentFile {
+                id: 0,
+                path: "Show.S01E01E02.1080p.mkv".into(),
+                bytes: 2_000_000_000,
+                selected: 1,
+            }],
+            ..Default::default()
+        };
+        let eps = episode_files(&info);
+        assert_eq!(
+            eps,
+            vec![
+                (1, 1, "Show.S01E01E02.1080p.mkv".to_string()),
+                (1, 2, "Show.S01E01E02.1080p.mkv".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn episode_files_keeps_the_first_file_of_each_episode() {
+        // A pack holding one episode twice (language folders, two resolutions) yields it once, from
+        // its first file: the one `observe` title-checks and probes. A multi-episode file still
+        // yields every episode it carries.
+        let file = |id, path: &str| TorrentFile {
+            id,
+            path: path.into(),
+            bytes: 2_000_000_000,
+            selected: 1,
+        };
+        let info = TorrentInfo {
+            hash: "h".into(),
+            files: vec![
+                file(0, "A/Show.S01E01.mkv"),
+                file(1, "B/Show.S01E01.mkv"),
+                file(2, "A/Show.S01E02E03.mkv"),
+                file(3, "B/Show.S01E03.mkv"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            episode_files(&info),
+            vec![
+                (1, 1, "A/Show.S01E01.mkv".to_string()),
+                (1, 2, "A/Show.S01E02E03.mkv".to_string()),
+                (1, 3, "A/Show.S01E02E03.mkv".to_string()),
+            ]
+        );
+    }
+
+    /// `explicit_season_of_codeless_file` reads `season_of_codeless_file`'s season signals
+    /// bar the season-1 default and a file name's `Part N`: wherever it names a season, the VFS
+    /// places the file in that season. The nearest name that names a season RANGE names none.
+    #[test]
+    fn explicit_codeless_season_agrees_with_the_vfs_placement() {
+        for (path, expected) in [
+            ("Show.S04/Season 04/E09 - B.mkv", Some(4)),
+            ("Show S2 - 05 (1080p).mkv", Some(2)),
+            ("[Group] Show Season 2 - 05.mkv", Some(2)),
+            ("Show.S01-S03/Season 2/E01.mkv", Some(2)),
+            ("Show/Part 3/E01.mkv", Some(3)),
+            ("Show - 05 (1080p).mkv", None),
+            ("Pack/[Group] Show - 05.mkv", None),
+            ("Pack/E05 - Title, Part 2.mkv", None),
+            (
+                "[Group] Show (Season 1-2) [1080p]/[Group] Show - 13.mkv",
+                None,
+            ),
+            ("Show.S01-S03/Show.E01.mkv", None),
+            ("Show Seasons 1 to 3/E01.mkv", None),
+            ("Show.S01.S02/E01.mkv", None),
+            // Glued and symbol-joined ranges in a pack folder.
+            ("Show.S01-03.1080p/Show - 26.mkv", None),
+            ("Show S1-3 [1080p]/Show - 26.mkv", None),
+            ("Show Season 1&2/Show - 26.mkv", None),
+            ("Show Season 1+2/Show - 26.mkv", None),
+            ("Show Seasons 1-3/Show - 26.mkv", None),
+            // A range in an outer directory doesn't hide a season the nearer one names.
+            ("Show.S01-S03/Part 2/E01.mkv", Some(2)),
+        ] {
+            let name = path.rsplit('/').next().unwrap();
+            assert_eq!(
+                explicit_season_of_codeless_file(path, name),
+                expected,
+                "{path}"
+            );
+            if let Some(s) = expected {
+                assert_eq!(season_of_codeless_file(path, name), s, "{path}");
+            }
+        }
+    }
+
+    /// An absolutely numbered batch under a season-range folder (TorBox paths start with the torrent
+    /// folder) names no season for its files: mapping them to the range's first season would record
+    /// S01E26 and on for what TMDB calls S02.
+    #[test]
+    fn a_batch_under_a_season_range_maps_nothing() {
+        let info = TorrentInfo {
+            files: ["13", "14"]
+                .iter()
+                .enumerate()
+                .map(|(i, n)| TorrentFile {
+                    id: i as u32,
+                    path: format!("[Group] Show (Season 1-2) [1080p]/[Group] Show - {n}.mkv"),
+                    bytes: 1_000_000_000,
+                    selected: 1,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(codeless_episode_files(&info).is_empty());
+    }
+
+    /// `locator_for_selected` advances the link position ONLY for `selected == 1` files, pairing
+    /// RD's per-file restricted links positionally among the SELECTED files. With a SELECTED file
+    /// AND an UNSELECTED file both preceding the target, the target is the 2nd selected file
+    /// (`link_idx == 1`) and must pair `links[1]`; the unselected file must NOT consume an index.
+    /// The instant repair locates a replacement's file this way, and its single-selected-file tests
+    /// never reach `link_idx > 0`, so this guards it, and the redirect's `selected_locators`.
+    #[test]
+    fn locator_for_selected_pairs_link_by_position_among_selected_files() {
+        let info = TorrentInfo {
+            id: "tid".to_string(),
+            hash: "H".to_string(),
+            status: "downloaded".to_string(),
+            files: vec![
+                // Selected, but not the target → pushes link_idx to 1.
+                TorrentFile {
+                    id: 10,
+                    path: "/SelectedFirst.mkv".to_string(),
+                    bytes: 1000,
+                    selected: 1,
+                },
+                // Unselected → must be skipped WITHOUT consuming a link index.
+                TorrentFile {
+                    id: 20,
+                    path: "/Unselected.mkv".to_string(),
+                    bytes: 500,
+                    selected: 0,
+                },
+                // The target: the 2nd selected file → must pair links[1].
+                TorrentFile {
+                    id: 30,
+                    path: "/Target.mkv".to_string(),
+                    bytes: 2000,
+                    selected: 1,
+                },
+            ],
+            // RD emits one link per SELECTED file, in selected order: [SelectedFirst, Target].
+            links: vec![
+                "https://rd/selected-first".to_string(),
+                "https://rd/target".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let loc = locator_for_selected(&info, "H", "/Target.mkv")
+            .expect("target file should resolve to a locator");
+
+        assert_eq!(loc.file_id, 30);
+        assert_eq!(loc.file_path, "/Target.mkv");
+        assert_eq!(loc.hash, "H");
+        assert_eq!(loc.torrent_id, "tid");
+        assert_eq!(
+            loc.link.as_deref(),
+            Some("https://rd/target"),
+            "the 2nd selected file must pair links[1]; the unselected file must not consume an index"
+        );
+        let all: Vec<(u32, Option<String>)> = selected_locators(&info, "H")
+            .map(|l| (l.file_id, l.link))
+            .collect();
+        assert_eq!(
+            all,
+            vec![
+                (10, Some("https://rd/selected-first".to_string())),
+                (30, Some("https://rd/target".to_string())),
+            ]
+        );
+        assert!(locator_for_selected(&info, "H", "/Unselected.mkv").is_none());
+    }
+
+    /// A pack folder that names a season range with a glued second number (`S01-03`, `S1-3`), an
+    /// `&`/`+` with no spaces (`Season 1&2`), or only `Seasons N-M` names no single season, so an
+    /// absolutely numbered batch under it maps nothing (`codeless_episode_files`). A file name's
+    /// `S2 - 05` and `Season 2 - 05` stay season 2's episode 5, and a nearer season folder still
+    /// wins.
+    #[test]
+    fn explicit_season_of_codeless_file_treats_glued_and_symbol_ranges_as_ranges() {
+        for path in [
+            "Show.S01-03.1080p/Show - 26.mkv",
+            "Show S1-3 [1080p]/Show - 26.mkv",
+            "Show Season 1&2/Show - 26.mkv",
+            "Show Season 1+2/Show - 26.mkv",
+            "Show Seasons 1-3/Show - 26.mkv",
+            "Show Seasons 1 to 3/E01.mkv",
+            "Show.Season.1&Season.2/Show - 26.mkv",
+        ] {
+            let name = path.rsplit('/').next().unwrap();
+            assert_eq!(explicit_season_of_codeless_file(path, name), None, "{path}");
+        }
+        for (path, season) in [
+            ("Show S2 - 05 (1080p).mkv", 2),
+            ("[Group] Show Season 2 - 05.mkv", 2),
+            ("Show.S01-S03/Season 2/E01.mkv", 2),
+            ("Show.S01-03.1080p/Season 2/E01.mkv", 2),
+            ("Show.S02.1080p/E05.mkv", 2),
+            // A glued dash that is no range: a resolution, a bit depth, a channel layout.
+            ("Show.S02-1080p/E05.mkv", 2),
+            ("Show.S02-10bit/E05.mkv", 2),
+            ("Show.S02-5.1/E05.mkv", 2),
+            // An aspect-ratio tag beside the season is no second season.
+            ("Show S02 (16x9)/E05.mkv", 2),
+        ] {
+            let name = path.rsplit('/').next().unwrap();
+            assert_eq!(
+                explicit_season_of_codeless_file(path, name),
+                Some(season),
+                "{path}"
+            );
+        }
+        let files = |dir: &str| TorrentInfo {
+            files: ["26", "27"]
+                .iter()
+                .enumerate()
+                .map(|(i, n)| TorrentFile {
+                    id: i as u32,
+                    path: format!("{dir}/Show - {n}.mkv"),
+                    bytes: 1_000_000_000,
+                    selected: 1,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for dir in ["Show S1-3 [1080p]", "Show Season 1&2", "Show Seasons 1-3"] {
+            assert!(codeless_episode_files(&files(dir)).is_empty(), "{dir}");
+        }
     }
 
     /// Test that archive-only torrents produce an empty movie folder (no media files).

@@ -589,8 +589,17 @@ impl TorBoxClient {
             let status = resp.status();
             if let Err(e) = resp.error_for_status_ref() {
                 // Surface TorBox's error detail (e.g. why createtorrent 400s) before discarding it.
+                // A 404 goes to debug: `mylist?id=` answers a spurious 404 ("No torrents found for
+                // this user") for torrents that exist, and every caller of `get_torrent_info`
+                // retries it on purpose (`provider::torrent_info_retrying_not_found`), so at warn
+                // one flaky lookup would log up to five lines. A caller that gives up on the 404
+                // logs its own outcome (as rd_client logs its 404 terminals at debug).
                 let body = resp.text().await.unwrap_or_default();
-                warn!("TorBox {} error body: {:.300}", status, self.redact(&body));
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    debug!("TorBox {} error body: {:.300}", status, self.redact(&body));
+                } else {
+                    warn!("TorBox {} error body: {:.300}", status, self.redact(&body));
+                }
                 return Err(e.without_url());
             }
             // A body that breaks off mid-stream (a reset, a body cut short of its framing, the
@@ -1188,18 +1197,9 @@ mod tests {
     async fn resolve_locator_gives_up_on_a_hanging_endpoint_within_the_read_timeout() {
         // An endpoint that accepts the connection and never answers must cost the read at most
         // 3 × READ_PATH_REQUEST_TIMEOUT, not 3 × the client's 60 s timeout.
-        use tokio::io::AsyncReadExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf).await;
-                held.push(sock); // keep it open, never reply
-            }
-        });
-        let client = TorBoxClient::with_base("fake".to_string(), format!("http://{addr}"));
+        use crate::test_loopback::{serve, Step};
+        let server = serve(Vec::new(), Some(Step::HangUntilClosed)).await;
+        let client = TorBoxClient::with_base("fake".to_string(), server.base.clone());
         let loc = crate::provider::FileLocator {
             torrent_id: "1".to_string(),
             file_id: 2,
@@ -1681,6 +1681,46 @@ mod tests {
         }
     }
 
+    /// TorBox's `mylist?id=` answers a spurious 404 for torrents that exist, and every caller of
+    /// `get_torrent_info` retries a 404 on purpose, so the 404's error body is logged at debug. The
+    /// body of any other error status is still logged at warn.
+    #[tokio::test]
+    async fn a_404_error_body_is_logged_at_debug_and_other_error_bodies_at_warn() {
+        use crate::test_log::capture_async;
+        use crate::test_loopback::{serve, Step};
+        let not_found = Step::json(
+            404,
+            r#"{"success":false,"detail":"No torrents found for this user"}"#,
+        );
+        let bad_request = Step::json(400, r#"{"success":false}"#);
+        let server = serve(vec![not_found, bad_request], None).await;
+        let client = TorBoxClient::with_base("fake".to_string(), server.base.clone());
+
+        let (r, logs) = capture_async(tracing::Level::DEBUG, client.torrent_info_raw("7")).await;
+        assert_eq!(
+            r.expect_err("a 404 is an error").status(),
+            Some(reqwest::StatusCode::NOT_FOUND)
+        );
+        let line = logs
+            .lines()
+            .find(|l| l.contains("error body"))
+            .unwrap_or_else(|| panic!("the 404's body must still be logged:\n{logs}"));
+        assert!(
+            line.contains("DEBUG") && line.contains("No torrents found"),
+            "a 404's error body is logged at debug: {line}"
+        );
+
+        let (r, warns) = capture_async(tracing::Level::WARN, client.torrent_info_raw("7")).await;
+        assert_eq!(
+            r.expect_err("a 400 is an error").status(),
+            Some(reqwest::StatusCode::BAD_REQUEST)
+        );
+        assert!(
+            warns.contains("error body"),
+            "any other error status logs its body at warn:\n{warns}"
+        );
+    }
+
     /// Serve a `mylist` whose first page (offset 0) is `page` and every later page is empty.
     async fn serve_one_mylist_page(page: &'static str) -> String {
         serve_mylist(move |offset| if offset == 0 { page } else { "[]" }.to_string()).await
@@ -1689,38 +1729,21 @@ mod tests {
     /// Serve a `mylist` whose page at each `offset` (read from the request line) holds the items
     /// `page(offset)` returns (a JSON array), in TorBox's `{success, data}` envelope. Returns the
     /// base URL.
-    async fn serve_mylist(page: impl Fn(usize) -> String + Send + Sync + 'static) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let req = read_request(&mut sock).await;
-                let request_line = req.lines().next().unwrap_or_default();
-                let offset = request_line
-                    .split_once("offset=")
-                    .and_then(|(_, rest)| {
-                        let digits: String =
-                            rest.chars().take_while(char::is_ascii_digit).collect();
-                        digits.parse().ok()
-                    })
-                    .unwrap_or(0);
-                let body = format!(r#"{{"success":true,"data":{}}}"#, page(offset));
-                write_json_reply(&mut sock, 200, &body).await;
-            }
-        });
-        format!("http://{addr}")
-    }
-
-    /// Write a `Connection: close` reply with `status` and the JSON `body`, then flush.
-    async fn write_json_reply(sock: &mut tokio::net::TcpStream, status: u16, body: &str) {
-        use tokio::io::AsyncWriteExt;
-        let head = format!(
-            "HTTP/1.1 {status} STATUS\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        let _ = sock.write_all(head.as_bytes()).await;
-        let _ = sock.write_all(body.as_bytes()).await;
-        let _ = sock.flush().await;
+    async fn serve_mylist(page: impl Fn(usize) -> String + Send + 'static) -> String {
+        let server = crate::test_loopback::serve_fn(move |req| {
+            let request_line = req.lines().next().unwrap_or_default();
+            let offset = request_line
+                .split_once("offset=")
+                .and_then(|(_, rest)| {
+                    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                    digits.parse().ok()
+                })
+                .unwrap_or(0);
+            let body = format!(r#"{{"success":true,"data":{}}}"#, page(offset));
+            crate::test_loopback::Reply::json(200, body)
+        })
+        .await;
+        server.base
     }
 
     #[tokio::test]
@@ -1775,67 +1798,16 @@ mod tests {
         assert_eq!(p.name(), "torbox");
     }
 
-    /// Read one request from `sock`: its head and as much body as its `Content-Length` declares.
-    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
-        use tokio::io::AsyncReadExt;
-        let mut req = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = sock.read(&mut buf).await.unwrap_or(0);
-            req.extend_from_slice(&buf[..n]);
-            let text = String::from_utf8_lossy(&req);
-            let complete = text.split_once("\r\n\r\n").is_some_and(|(head, rest)| {
-                let len = head
-                    .lines()
-                    .find_map(|l| {
-                        l.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                    })
-                    .unwrap_or(0);
-                rest.len() >= len
-            });
-            if n == 0 || complete {
-                return text.into_owned();
-            }
-        }
-    }
-
-    /// A loopback server started by [`serve_sequence`].
-    struct Loopback {
-        /// `http://<addr>`, with no trailing slash.
-        base: String,
-        /// Connections accepted so far.
-        connections: Arc<std::sync::atomic::AtomicUsize>,
-        /// Each request (head and body) read so far, in order.
-        requests: Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
     /// The core of the `spawn_*` helpers: replies to successive connections with the given
     /// `(status, body)` pairs in order (JSON bodies), counting the connections and recording each
     /// request before replying to it. Serves exactly `responses.len()` connections.
-    async fn serve_sequence(responses: Vec<(u16, String)>) -> Loopback {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (count, log) = (connections.clone(), requests.clone());
-        tokio::spawn(async move {
-            for (status, body) in responses {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let req = read_request(&mut sock).await;
-                log.lock().unwrap().push(req);
-                write_json_reply(&mut sock, status, &body).await;
-            }
-        });
-        Loopback {
-            base: format!("http://{addr}"),
-            connections,
-            requests,
-        }
+    async fn serve_sequence(responses: Vec<(u16, String)>) -> crate::test_loopback::Loopback {
+        use crate::test_loopback::{serve, Step};
+        let steps = responses
+            .into_iter()
+            .map(|(status, body)| Step::json(status, body))
+            .collect();
+        serve(steps, None).await
     }
 
     /// Spawn a local HTTP server that replies once with `200 OK` and the given JSON body.

@@ -30,6 +30,8 @@ pub mod store;
 pub mod tasks;
 #[cfg(test)]
 pub(crate) mod test_log;
+#[cfg(test)]
+pub(crate) mod test_loopback;
 pub mod tmdb_client;
 pub mod torbox_client;
 pub mod trakt_client;

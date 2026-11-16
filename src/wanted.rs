@@ -275,9 +275,10 @@ pub fn reconcile_title(title: &TitleView) -> Vec<Action> {
     // Both acquire branches share the same `manual` derivation and `finished` flip-flop guard:
     // manual content is removal-protected (`has_manual_entry`), so it is never reclaimed and never
     // flip-flops — it must still re-acquire on lapse even when watched; otherwise a title every
-    // in-progress wanter has finished (watched, not watchlisted) is reclaimed by Trigger A, so the
-    // acquire path must NOT re-add it the next tick. The watchlist short-circuit inside
-    // `trigger_a_finished` keeps a watchlisted title acquiring.
+    // wanter has finished without a watchlist is reclaimed by Trigger A, so the acquire path must
+    // NOT re-add it the next tick. In practice that is a show `REMOVE_FINISHED_SHOWS` folds back in:
+    // the sync never writes a finished in-progress movie, so the Movie branch's guard is defensive.
+    // The watchlist short-circuit inside `trigger_a_finished` keeps a watchlisted title acquiring.
     let manual = title
         .owned
         .as_ref()

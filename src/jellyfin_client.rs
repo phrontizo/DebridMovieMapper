@@ -63,6 +63,18 @@ fn sample_change_paths(changes: &[VfsChange], max: usize) -> String {
     }
 }
 
+/// `e` and every error in its `source()` chain, joined with ": ". A reqwest error's Display names
+/// only its kind and URL ("error sending request for url (…)"), never the cause, so a mistyped
+/// host (DNS), a refused port and a TLS certificate error would all read the same. This is safe to
+/// log: the URL is the non-secret Jellyfin base, and the API key is sent only in the Authorization
+/// header, which no error carries.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    std::iter::successors(Some(e), |e| e.source())
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
 pub struct JellyfinClient {
     url: String,
     /// Pre-built `Authorization: MediaBrowser Token="<key>"` value, marked sensitive so the key is
@@ -155,6 +167,8 @@ impl JellyfinClient {
         // when it checks the filesystem after receiving our notification.
         tokio::time::sleep(NOTIFICATION_DELAY).await;
 
+        // Why the last retried attempt failed, for the give-up line.
+        let mut last_failure = String::new();
         for attempt in 0..MAX_SEND_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(RETRY_DELAY).await;
@@ -183,6 +197,7 @@ impl JellyfinClient {
                                 attempt + 1,
                                 MAX_SEND_ATTEMPTS
                             );
+                            last_failure = format!("Jellyfin returned {status}");
                             continue;
                         }
                         NotifyOutcome::GiveUp => {
@@ -207,8 +222,11 @@ impl JellyfinClient {
                     // choose the log label, and keep connect and timeout errors retried should a
                     // later reqwest classify them differently
                     // (`reqwest_connect_and_timeout_errors_are_request_errors` pins today's).
+                    // The log names the cause chain, which tells a DNS failure, a refused port and
+                    // a TLS error apart.
+                    last_failure = error_chain(&e);
                     tracing::warn!(
-                        "Transient Jellyfin error ({}), attempt {}/{}",
+                        "Transient Jellyfin error ({}: {}), attempt {}/{}",
                         if e.is_timeout() {
                             "timeout"
                         } else if e.is_connect() {
@@ -216,21 +234,23 @@ impl JellyfinClient {
                         } else {
                             "request failed"
                         },
+                        last_failure,
                         attempt + 1,
                         MAX_SEND_ATTEMPTS
                     );
                     continue;
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to notify Jellyfin: {}", e);
+                    tracing::warn!("Failed to notify Jellyfin: {}", error_chain(&e));
                     return;
                 }
             }
         }
 
         tracing::warn!(
-            "Jellyfin notification failed after {} attempts",
-            MAX_SEND_ATTEMPTS
+            "Jellyfin notification failed after {} attempts (last: {})",
+            MAX_SEND_ATTEMPTS,
+            last_failure
         );
     }
 
@@ -275,6 +295,9 @@ impl JellyfinClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_loopback::{serve, Loopback, Step};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
 
     #[test]
     fn classify_status_distinguishes_done_retry_giveup() {
@@ -466,49 +489,25 @@ mod tests {
         }
     }
 
-    /// Loopback that answers every request 200 and records each request's head (request line +
-    /// headers), so a test can check what the client sent.
-    async fn spawn_capturing_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-        use std::sync::{Arc, Mutex};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let heads = Arc::new(Mutex::new(Vec::new()));
-        let h2 = heads.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let mut raw = Vec::new();
-                let mut buf = [0u8; 4096];
-                while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match sock.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => raw.extend_from_slice(&buf[..n]),
-                    }
-                }
-                let text = String::from_utf8_lossy(&raw).into_owned();
-                let head = text
-                    .split("\r\n\r\n")
-                    .next()
-                    .unwrap_or_default()
-                    .to_string();
-                h2.lock().unwrap().push(head);
-                let reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = sock.write_all(reply.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        (format!("http://{}", addr), heads)
+    /// Loopback that answers every request 200 and records each request, so a test can check
+    /// what the client sent ([`Loopback::heads`]).
+    async fn spawn_capturing_server() -> Loopback {
+        serve(Vec::new(), Some(Step::status(200))).await
     }
 
     #[tokio::test(start_paused = true)]
     async fn notify_changes_authenticates_with_the_mediabrowser_authorization_header() {
         // Jellyfin 12 disables the legacy X-Emby-Token header by default; the supported form is
         // `Authorization: MediaBrowser Token="<key>"` (which Jellyfin 10.x accepts too).
-        let (url, heads) = spawn_capturing_server().await;
-        let client =
-            JellyfinClient::new(url, "test-key".to_string(), "/media".to_string()).unwrap();
+        let server = spawn_capturing_server().await;
+        let client = JellyfinClient::new(
+            server.base.clone(),
+            "test-key".to_string(),
+            "/media".to_string(),
+        )
+        .unwrap();
         client.notify_changes(&one_change()).await;
-        let heads = heads.lock().unwrap();
+        let heads = server.heads();
         assert_eq!(heads.len(), 1, "one notification request");
         let headers: Vec<(String, String)> = heads[0]
             .split("\r\n")
@@ -625,38 +624,13 @@ mod tests {
 
     /// Loopback that replies `fail_status` (empty body) on the first `fail_n` connections, then 200,
     /// counting every request.
-    async fn spawn_counting_server(
-        fail_status: u16,
-        fail_n: usize,
-    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let counter = Arc::new(AtomicUsize::new(0));
-        let c2 = counter.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut seen = 0usize;
-            while let Ok((mut sock, _)) = listener.accept().await {
-                c2.fetch_add(1, Ordering::SeqCst);
-                let mut buf = [0u8; 4096];
-                let _ = sock.read(&mut buf).await;
-                let status = if seen < fail_n {
-                    seen += 1;
-                    fail_status
-                } else {
-                    200
-                };
-                let head = format!(
-                    "HTTP/1.1 {} STATUS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    status
-                );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        (format!("http://{}", addr), counter)
+    async fn spawn_counting_server(fail_status: u16, fail_n: usize) -> (String, Arc<AtomicUsize>) {
+        let server = serve(
+            vec![Step::status(fail_status); fail_n],
+            Some(Step::status(200)),
+        )
+        .await;
+        (server.base, server.connections)
     }
 
     fn one_change() -> Vec<VfsChange> {
@@ -715,36 +689,9 @@ mod tests {
     /// Loopback that, on the first `hang_n` connections, reads the request then holds the connection
     /// open WITHOUT responding (the client times out → a transient transport error) before serving a
     /// 200 on the next connection. Counts every accepted connection.
-    async fn spawn_timeout_then_200(
-        hang_n: usize,
-    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let counter = Arc::new(AtomicUsize::new(0));
-        let c2 = counter.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut seen = 0usize;
-            while let Ok((mut sock, _)) = listener.accept().await {
-                c2.fetch_add(1, Ordering::SeqCst);
-                let mut buf = [0u8; 4096];
-                let _ = sock.read(&mut buf).await;
-                if seen < hang_n {
-                    seen += 1;
-                    // Never respond: block reading until the client times out and drops the socket
-                    // (read then returns EOF), so this connection produces an is_timeout() error.
-                    let mut sink = [0u8; 1];
-                    let _ = sock.read(&mut sink).await;
-                    continue;
-                }
-                let head = "HTTP/1.1 200 STATUS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        (format!("http://{}", addr), counter)
+    async fn spawn_timeout_then_200(hang_n: usize) -> (String, Arc<AtomicUsize>) {
+        let server = serve(vec![Step::HangUntilClosed; hang_n], Some(Step::status(200))).await;
+        (server.base, server.connections)
     }
 
     #[tokio::test(start_paused = true)]
@@ -797,38 +744,58 @@ mod tests {
         );
     }
 
+    /// A transient send error is logged with its cause. reqwest's Display names only the error kind
+    /// and the URL, so a mistyped host, a refused port and a TLS failure would all read "cannot
+    /// connect". The give-up line names the last cause too.
+    #[tokio::test(start_paused = true)]
+    async fn notify_changes_logs_the_cause_of_a_transient_send_error() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        // The innermost cause reqwest reports when nothing listens (e.g. "Connection refused (os
+        // error 111)"), read from reqwest itself so the test doesn't depend on the OS's wording.
+        let probe = reqwest::Client::new()
+            .post(&url)
+            .send()
+            .await
+            .expect_err("nothing listens");
+        let cause = std::iter::successors(Some(&probe as &dyn std::error::Error), |e| e.source())
+            .last()
+            .unwrap()
+            .to_string();
+        let client = JellyfinClient::new(url, "key".to_string(), "/media".to_string()).unwrap();
+        let ((), logs) = crate::test_log::capture_async(
+            tracing::Level::WARN,
+            client.notify_changes(&one_change()),
+        )
+        .await;
+        let attempts: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("Transient Jellyfin error"))
+            .collect();
+        assert_eq!(attempts.len(), MAX_SEND_ATTEMPTS as usize, "{logs}");
+        assert!(
+            attempts.iter().all(|l| l.contains(&cause)),
+            "every attempt must name the cause {cause:?}:\n{logs}"
+        );
+        let give_up = logs
+            .lines()
+            .find(|l| l.contains("Jellyfin notification failed after"))
+            .unwrap_or_else(|| panic!("no give-up line:\n{logs}"));
+        assert!(
+            give_up.contains(&cause),
+            "the give-up line must name the last cause {cause:?}: {give_up}"
+        );
+    }
+
     /// Loopback that, on the first `drop_n` connections, reads the request then closes the socket
     /// without answering (Jellyfin restarting mid-request), then serves 200. Counts every accepted
     /// connection.
-    async fn spawn_drop_then_200(
-        drop_n: usize,
-    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let counter = Arc::new(AtomicUsize::new(0));
-        let c2 = counter.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut seen = 0usize;
-            while let Ok((mut sock, _)) = listener.accept().await {
-                c2.fetch_add(1, Ordering::SeqCst);
-                let mut buf = [0u8; 4096];
-                let _ = sock.read(&mut buf).await;
-                if seen < drop_n {
-                    seen += 1;
-                    // Close without a response: the connection ends before any response arrives,
-                    // a request error that is neither a connect error nor a timeout.
-                    drop(sock);
-                    continue;
-                }
-                let head = "HTTP/1.1 200 STATUS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        (format!("http://{}", addr), counter)
+    async fn spawn_drop_then_200(drop_n: usize) -> (String, Arc<AtomicUsize>) {
+        // Closing without a response ends the connection before any response arrives: a request
+        // error that is neither a connect error nor a timeout.
+        let server = serve(vec![Step::DropAfterRead; drop_n], Some(Step::status(200))).await;
+        (server.base, server.connections)
     }
 
     #[tokio::test(start_paused = true)]

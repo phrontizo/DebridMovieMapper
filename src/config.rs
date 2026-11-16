@@ -238,13 +238,14 @@ impl SubReq {
                 SubReq::None
             }
             Some(v) => {
-                match parse_lang_code("SUBTITLE_LANGUAGE", &v, "none", "no subtitle check") {
+                let (fallback, fallback_means) = ("none", "no subtitle check");
+                match parse_lang_code("SUBTITLE_LANGUAGE", &v, fallback, fallback_means) {
                     Some(code) if crate::probe::is_no_language(&code) => {
                         warn!(
-                        "Invalid SUBTITLE_LANGUAGE '{v}': it means no language, which no subtitle \
-                         track is tagged with, so every release would be rejected; falling back \
-                         to 'none' (no subtitle check)"
-                    );
+                            "Invalid SUBTITLE_LANGUAGE '{v}': it means no language, which no \
+                             subtitle track is tagged with, so every release would be \
+                             rejected; falling back to '{fallback}' ({fallback_means})"
+                        );
                         SubReq::None
                     }
                     code => code.map_or(SubReq::None, SubReq::Lang),

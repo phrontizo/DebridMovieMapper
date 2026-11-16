@@ -32,6 +32,30 @@ enum UpgradeSkip {
     Busy(String),
 }
 
+/// Why [`apply_upgrade`] made no swap. It adds nothing, so unlike [`UpgradeSkip`] it never finds
+/// the provider busy.
+#[derive(Debug)]
+enum SwapSkip {
+    /// A provider listing failed, a copy the swap changes started being read (both roll the staged
+    /// copy back), a selection write failed (the staged copy stays owned, the old one in place), or
+    /// the staged copy is no longer owned (nothing pruned). Retried on a later tick.
+    Deferred(String),
+    /// None of the copies the swap replaces is in the account any more: the staged copy was rolled
+    /// back and there is nothing left to upgrade.
+    Gone(String),
+}
+
+impl From<SwapSkip> for UpgradeSkip {
+    /// The movie path's reading: a deferred swap defers the title, and a swap whose replaced copies
+    /// are gone is evaluated (its cursor stamped).
+    fn from(skip: SwapSkip) -> Self {
+        match skip {
+            SwapSkip::Deferred(reason) => UpgradeSkip::Deferred(reason),
+            SwapSkip::Gone(reason) => UpgradeSkip::NoChange(reason),
+        }
+    }
+}
+
 /// One title queued for an upgrade pass ([`run_upgrade_once_with`]): its owned hashes (`hashes`,
 /// sorted), split into those `present` (in the pass's provider listing, or `Pending`) and those
 /// `absent` from it, plus its representative owned record.
@@ -84,9 +108,14 @@ where
     // identifications) BEFORE ranking anything. A record without a quality is unknown — the lowest —
     // and is upgraded as such; but a copy whose file name shows a resolution above the ceiling must
     // never be mistaken for unknown (it stays under the corrective-downgrade rules), so its quality
-    // has to be known first. The scan loop's account-mirror pass does the same each scan; this covers
-    // an upgrade tick that runs before it (e.g. at start-up). Only a record whose file name is
-    // unknown anywhere stays `None` (and is then unknown-lowest).
+    // has to be known first. The same backfill heals an account-mirror record (empty provenance)
+    // whose recorded quality leaves a resolution or source tier untagged that its file names now
+    // tag, so a 2160p copy an older parser recorded at resolution 0 isn't replaced as unknown-lowest.
+    // The scan loop's account-mirror pass does the same each scan; this covers an upgrade tick that
+    // runs before it (e.g. at start-up). It returns at once when nothing is missing or untagged.
+    // Only a record whose torrent's file names are unknown, or list no video file, stays `None`
+    // here (and is then unknown-lowest); the scan loop's mirror pass drops a mirror record of the
+    // latter kind (no quality, no `provides`) and records it again once its files are back.
     //
     // The same persisted identifications name the multi-film collections (more than one selected
     // feature-sized video): a mirrored collection is recorded as ONE film's copy, so the movie path
@@ -95,15 +124,13 @@ where
         let owned = app.store.all_owned().await;
         let matches = app.store.load_all_matches().await;
         let infos: Vec<&crate::rd_client::TorrentInfo> = matches.values().map(|(i, _)| i).collect();
-        if owned.iter().any(|(_, r)| r.quality.is_none()) {
-            crate::tasks::backfill_owned_quality(
-                &app.store,
-                &app.config.acquisition.prefs,
-                &owned,
-                &infos,
-            )
-            .await;
-        }
+        crate::tasks::backfill_owned_quality(
+            &app.store,
+            &app.config.acquisition.prefs,
+            &owned,
+            &infos,
+        )
+        .await;
         crate::tasks::multi_feature_hashes(infos)
     };
 
@@ -591,6 +618,112 @@ async fn staging_probe(
     }
 }
 
+/// A staged candidate as [`check_staged`] judges it: its infohash, the torrent id its add returned
+/// and its `TorrentInfo` after the file selection.
+struct StagedCandidate<'a> {
+    hash: &'a str,
+    torrent_id: &'a str,
+    fresh: &'a crate::rd_client::TorrentInfo,
+}
+
+/// Why [`check_staged`] turned a staged candidate down. The candidate has already been deleted
+/// ([`discard_staged`]) and, where the verdict says something is wrong with it, blacklisted.
+#[derive(Debug)]
+enum StagedReject {
+    /// A wrong title or a probe reject (both blacklisted), or tracks that couldn't be checked (an
+    /// `Accept`, not blacklisted: nothing is known to be wrong with it). Try the next candidate.
+    NextCandidate(String),
+    /// The title check had no verdict (TMDB unreachable). Not blacklisted.
+    TitleUnavailable,
+    /// The probe deferred (a CDN fetch failed transiently). Not blacklisted.
+    ProbeDeferred,
+}
+
+impl StagedReject {
+    /// The movie and per-episode paths' reading: the next candidate on a rejected one, and a
+    /// deferral when there was no verdict.
+    fn into_skip(self) -> UpgradeSkip {
+        match self {
+            StagedReject::NextCandidate(reason) => UpgradeSkip::NoChange(reason),
+            StagedReject::TitleUnavailable => {
+                UpgradeSkip::Deferred("title check unavailable (TMDB unreachable)".into())
+            }
+            StagedReject::ProbeDeferred => UpgradeSkip::Deferred("probe deferred".into()),
+        }
+    }
+}
+
+/// The two gates every upgrade staging site runs on a staged, cached candidate before adopting it.
+/// First the title check of `path`, on the whole path and the torrent name as `observe` checks
+/// it, so a file whose name names no title is identified by its folder or torrent. Then the staging
+/// probe of that file under `probe_req` ([`staging_probe`]), the same audio/subtitle gate as
+/// acquisition. Unlike acquisition, an upgrade adopts only a `Pass`: an `Accept` (the tracks
+/// couldn't be checked) is dropped, so an upgrade never swaps a checked copy for an unchecked one.
+/// A rejected candidate is deleted, and a wrong title (`WrongTitle`) or a probe reject (its reason)
+/// is blacklisted under `(kind, tmdb_id)`. Each site maps the [`StagedReject`] to its own next step.
+async fn check_staged(
+    app: &AppState,
+    staged: StagedCandidate<'_>,
+    path: &str,
+    kind: MediaKind,
+    tmdb_id: u64,
+    (season, episode): (Option<u32>, Option<u32>),
+    probe_req: &crate::store::AcquireRequest,
+) -> Result<(), StagedReject> {
+    let StagedCandidate {
+        hash,
+        torrent_id,
+        fresh,
+    } = staged;
+    match app
+        .engine
+        .validate_title(
+            path,
+            crate::acquire::torrent_name_of(fresh),
+            tmdb_id,
+            kind,
+            season,
+            episode,
+        )
+        .await
+    {
+        TitleCheck::Match => {}
+        TitleCheck::Mismatch => {
+            discard_staged(app, hash, torrent_id).await;
+            let _ = app
+                .store
+                .blacklist_add(kind, tmdb_id, hash.to_string(), "WrongTitle", now_secs())
+                .await;
+            return Err(StagedReject::NextCandidate("title mismatch".into()));
+        }
+        TitleCheck::Unavailable => {
+            discard_staged(app, hash, torrent_id).await;
+            return Err(StagedReject::TitleUnavailable);
+        }
+    }
+    match staging_probe(app, fresh, hash, path, probe_req).await {
+        crate::acquire::VerifyResult::Pass => Ok(()),
+        crate::acquire::VerifyResult::Accept => {
+            discard_staged(app, hash, torrent_id).await;
+            Err(StagedReject::NextCandidate("unverifiable release".into()))
+        }
+        crate::acquire::VerifyResult::Reject(reason) => {
+            discard_staged(app, hash, torrent_id).await;
+            let _ = app
+                .store
+                .blacklist_add(kind, tmdb_id, hash.to_string(), reason, now_secs())
+                .await;
+            Err(StagedReject::NextCandidate(format!(
+                "probe rejected: {reason}"
+            )))
+        }
+        crate::acquire::VerifyResult::Defer => {
+            discard_staged(app, hash, torrent_id).await;
+            Err(StagedReject::ProbeDeferred)
+        }
+    }
+}
+
 /// True when the in-hand representative `rec` or ANY owned record in `hashes` has never had its
 /// TMDB spoken languages fetched (`None`). A hash with no record (pruned concurrently) is skipped.
 async fn group_needs_language_backfill(
@@ -941,14 +1074,14 @@ impl PackPrune {
 /// account and that no copy the swap changes is being read, repoints every slot to the staged
 /// release, then prunes what `prune` resolves to against that listing. Non-destructive rollback: a
 /// mid-stage read of a changed copy (`Deferred`), or the replaced copies leaving the account
-/// (`NoChange`), fully deletes the staged torrent + drops its records and leaves the current
-/// release intact.
+/// (`Gone`), fully deletes the staged torrent + drops its records and leaves the current
+/// release intact. It adds nothing, so it never finds the provider busy ([`SwapSkip`]).
 async fn apply_upgrade(
     app: &AppState,
     staged: StagedUpgrade,
     prune: PrunePlan,
     idle_window: Duration,
-) -> Result<(), UpgradeSkip> {
+) -> Result<(), SwapSkip> {
     // Fetch the provider listing for the prune ONCE, and BEFORE the idle re-check below, so there is
     // NO network round-trip between the idle confirmation and the destructive prune — a read
     // starting in that window could otherwise have the old torrent deleted out from under it.
@@ -961,7 +1094,7 @@ async fn apply_upgrade(
         Ok(l) => l,
         Err(_) => {
             roll_back_recorded(app, &staged).await;
-            return Err(UpgradeSkip::Deferred(
+            return Err(SwapSkip::Deferred(
                 "provider listing unavailable; deferring".into(),
             ));
         }
@@ -971,7 +1104,7 @@ async fn apply_upgrade(
     // reached this title, and staging takes many seconds more. A copy the user deleted meanwhile
     // reads as "already gone" to the prune, which would drop its record and keep the staged release:
     // a title (or episode) the user just removed would come back. When none of them is listed any
-    // more, roll the staged candidate back and move on (`NoChange`: nothing is left to upgrade).
+    // more, roll the staged candidate back and move on (`Gone`: nothing is left to upgrade).
     let mut replaced = prune.candidates();
     for (slot, _) in &staged.slot_files {
         if let Some(sel) = app.store.get_selection(slot.clone()).await {
@@ -981,7 +1114,7 @@ async fn apply_upgrade(
     replaced.retain(|h| !h.eq_ignore_ascii_case(&staged.hash));
     if !replaced.is_empty() && !any_listed(&replaced, &listing) {
         roll_back_recorded(app, &staged).await;
-        return Err(UpgradeSkip::NoChange(format!(
+        return Err(SwapSkip::Gone(format!(
             "the copy {} replaces left the provider account; rolled it back",
             staged.hash
         )));
@@ -1001,7 +1134,7 @@ async fn apply_upgrade(
         // onto it (it is a better copy), which then leaves the old copy in place with no slot, for
         // an enabled `DEDUP_REMOVE_DUPLICATES` to remove.
         roll_back_recorded(app, &staged).await;
-        return Err(UpgradeSkip::Deferred(
+        return Err(SwapSkip::Deferred(
             "a copy this swap changes started being read during staging; deferring".into(),
         ));
     }
@@ -1018,7 +1151,7 @@ async fn apply_upgrade(
     // Defer with the slots untouched. `prune_behind_staged` checks again for a removal that lands
     // between the slot writes and the prune.
     if app.store.get_owned(staged.hash.clone()).await.is_none() {
-        return Err(UpgradeSkip::Deferred(format!(
+        return Err(SwapSkip::Deferred(format!(
             "staged {} no longer owned; not pruning what it supersedes",
             staged.hash
         )));
@@ -1035,7 +1168,7 @@ async fn apply_upgrade(
             )
             .await
         {
-            return Err(UpgradeSkip::Deferred(format!(
+            return Err(SwapSkip::Deferred(format!(
                 "selection write failed; deferring prune: {e}"
             )));
         }
@@ -1043,7 +1176,7 @@ async fn apply_upgrade(
     // What a swap prunes is a copy the pass's own listing showed, never one adopted this visit, so
     // the listing alone locates its torrents.
     if !prune_behind_staged(app, &staged.hash, &prune.resolve(&listing), &listing, &[]).await {
-        return Err(UpgradeSkip::Deferred(format!(
+        return Err(SwapSkip::Deferred(format!(
             "staged {} no longer owned; not pruning what it supersedes",
             staged.hash
         )));
@@ -1511,7 +1644,8 @@ async fn staged_torrent_info(
     crate::provider::torrent_info_retrying_not_found(provider, id, &STAGED_INFO_BACKOFF).await
 }
 
-/// Add the candidate, wait briefly for it to resolve (it should be cached), validate + record it
+/// Add the candidate, select its feature file and wait for it to resolve (it should be cached) via
+/// [`stage_and_await_cached`], run the shared title and probe gates ([`check_staged`]), record it
 /// Verified with sticky provenance, and return (hash, torrent_id, selected_file_path). On any
 /// failure the candidate is cleaned up and the current release is left untouched (non-destructive).
 async fn stage_and_verify(
@@ -1524,51 +1658,23 @@ async fn stage_and_verify(
     let hash = cand.info_hash.clone();
     // A provider add/info failure is transient → Deferred (retry next tick, keep the cursor) rather
     // than NoChange (which would skip this title — with its real upgrade candidate — for a full wrap).
-    // A candidate already in the account is never staged (NoChange → the next candidate).
-    let added = add_staging_candidate(app, &hash).await?;
-    let info = match staged_torrent_info(app.provider.as_ref(), &added.id).await {
-        Ok(i) => i,
-        Err(e) => {
-            discard_staged(app, &hash, &added.id).await;
-            return Err(UpgradeSkip::Deferred(format!("info failed: {e}")));
-        }
-    };
-    // Select the single feature file FIRST: RD only reports a (cached) torrent as `downloaded`
-    // after selection, so gating on cached-ness before selecting would reject every candidate on
-    // RD (mirrors the `observe` ordering). The file list is populated pre-selection.
-    let Some(file) = info
-        .files
-        .iter()
-        .filter(|f| crate::vfs::is_video_file(&f.path))
-        .max_by_key(|f| f.bytes)
-    else {
-        discard_staged(app, &hash, &added.id).await;
+    // A candidate already in the account, one with no video file and one that isn't cached are
+    // never staged (NoChange → the next candidate).
+    let StagedTorrent {
+        torrent_id,
+        fresh,
+        largest_video,
+    } = stage_and_await_cached(app, &hash, FileSelection::LargestVideo).await?;
+    let Some(selected_path) = largest_video else {
+        // `LargestVideo` already turns a candidate with no video file down; kept for totality.
+        discard_staged(app, &hash, &torrent_id).await;
         return Err(UpgradeSkip::NoChange("no video file".into()));
     };
-    let csv = file.id.to_string();
-    let selected_path = file.path.clone();
-    // A select_files error is caught downstream by the `status != "downloaded"` gate, but log it so a
-    // real provider failure isn't invisible on the movie path (parity with the consolidation path).
-    if let Err(e) = app.provider.select_files(&added.id, &csv).await {
-        warn!(
-            "upgrade: select_files for staged candidate {} failed: {}",
-            hash, e
-        );
-    }
-    // Re-fetch and wait for the cached verdict; only a `downloaded` torrent may be staged (we never
-    // speculatively download upgrades). All later gates run against this post-selection `fresh`.
-    let fresh = await_downloaded(app.provider.as_ref(), &added.id)
-        .await
-        .unwrap_or(info);
-    if fresh.status != "downloaded" {
-        discard_staged(app, &hash, &added.id).await;
-        return Err(UpgradeSkip::NoChange("candidate not cached".into()));
-    }
     // Movie-pack guard: a candidate that materialises into more than one feature-sized
     // video is a multi-movie pack (providers like TorBox auto-select all files) — never adopt it.
     // Run BEFORE title-validation to save a TMDB lookup on a pack that would be rejected anyway.
     if crate::acquire::count_feature_videos(&fresh) > 1 {
-        discard_staged(app, &hash, &added.id).await;
+        discard_staged(app, &hash, &torrent_id).await;
         let _ = app
             .store
             .blacklist_add(
@@ -1581,69 +1687,24 @@ async fn stage_and_verify(
             .await;
         return Err(UpgradeSkip::NoChange("multi-feature pack".into()));
     }
-    // Title validation: a mismatch is blacklisted; no verdict (TMDB unreachable) is not held
-    // against the release — the title is retried on a later tick. The whole path and the torrent
-    // name, as `observe` checks it: a film whose file name names no title is identified by its
-    // folder or torrent.
-    match app
-        .engine
-        .validate_title(
-            &selected_path,
-            crate::acquire::torrent_name_of(&fresh),
-            tmdb_id,
-            MediaKind::Movie,
-            None,
-            None,
-        )
-        .await
-    {
-        TitleCheck::Match => {}
-        TitleCheck::Mismatch => {
-            discard_staged(app, &hash, &added.id).await;
-            let _ = app
-                .store
-                .blacklist_add(
-                    MediaKind::Movie,
-                    tmdb_id,
-                    hash.clone(),
-                    "WrongTitle",
-                    now_secs(),
-                )
-                .await;
-            return Err(UpgradeSkip::NoChange("title mismatch".into()));
-        }
-        TitleCheck::Unavailable => {
-            discard_staged(app, &hash, &added.id).await;
-            return Err(UpgradeSkip::Deferred(
-                "title check unavailable (TMDB unreachable)".into(),
-            ));
-        }
-    }
-    // Probe gate: run the SAME audio/subtitle probe as acquisition before adopting. A
-    // wrong-language/corrupt release is blacklisted + dropped; a transient probe failure is
-    // dropped without blacklisting (retried next tick) so we never degrade the working release.
-    // Unlike acquisition, an upgrade adopts ONLY a `Pass`: an `Accept` (tracks couldn't be checked —
-    // unreadable container / no tracks) is dropped WITHOUT blacklisting (nothing is known to be wrong
-    // with it), so an upgrade never swaps a checked copy for an unchecked one.
-    match staging_probe(app, &fresh, &hash, &selected_path, base_req).await {
-        crate::acquire::VerifyResult::Pass => {}
-        crate::acquire::VerifyResult::Accept => {
-            discard_staged(app, &hash, &added.id).await;
-            return Err(UpgradeSkip::NoChange("unverifiable release".into()));
-        }
-        crate::acquire::VerifyResult::Reject(reason) => {
-            discard_staged(app, &hash, &added.id).await;
-            let _ = app
-                .store
-                .blacklist_add(MediaKind::Movie, tmdb_id, hash.clone(), reason, now_secs())
-                .await;
-            return Err(UpgradeSkip::NoChange(format!("probe rejected: {reason}")));
-        }
-        crate::acquire::VerifyResult::Defer => {
-            discard_staged(app, &hash, &added.id).await;
-            return Err(UpgradeSkip::Deferred("probe deferred".into()));
-        }
-    }
+    // A wrong title or a probe reject is blacklisted and the next candidate tried; no verdict (TMDB
+    // unreachable, or a deferred probe) is not held against the release, and the title is retried
+    // on a later tick.
+    check_staged(
+        app,
+        StagedCandidate {
+            hash: &hash,
+            torrent_id: &torrent_id,
+            fresh: &fresh,
+        },
+        &selected_path,
+        MediaKind::Movie,
+        tmdb_id,
+        (None, None),
+        base_req,
+    )
+    .await
+    .map_err(StagedReject::into_skip)?;
     // Record Verified with sticky provenance from the owned record we are upgrading; on a failed
     // write the candidate is rolled back and the title deferred ([`record_staged`]). Sticky
     // provenance = that of the copies the swap supersedes, computed ONCE by the caller from records
@@ -1651,7 +1712,7 @@ async fn stage_and_verify(
     record_staged(
         app,
         &hash,
-        &added.id,
+        &torrent_id,
         OwnedRecord {
             request: base_req.clone(),
             provenance: prov.clone(),
@@ -1663,7 +1724,7 @@ async fn stage_and_verify(
     )
     .await
     .map_err(UpgradeSkip::Deferred)?;
-    Ok((hash, added.id, selected_path))
+    Ok((hash, torrent_id, selected_path))
 }
 
 /// Record a staged, verified candidate (`hash`, added as `torrent_id`) as owned + authoritative — the
@@ -1720,7 +1781,9 @@ async fn record_staged(
 /// unidentified manual add, or one the account mirror hasn't recorded yet): without it that
 /// torrent would be deleted, or adopted as a staged copy. Checked against a fresh listing
 /// immediately before the add (one extra `get_torrents` per staged candidate); a listing failure is
-/// `Deferred`, like an add failure — presence can't be ruled out, so nothing is added — while an
+/// `Deferred`, like an add failure — presence can't be ruled out, so nothing is added — and so is a
+/// suspect empty listing ([`crate::tasks::listing_is_suspect`]: empty while identifications are
+/// cached, which TorBox can answer as a glitch, and against which every hash reads absent), while an
 /// add the provider was too busy to start ([`crate::provider::is_provider_busy`]) is `Busy`, which
 /// every staging site passes up so [`run_upgrade_once`] ends the pass. The add
 /// claims a staging intent ([`crate::store::StagingIntent`],
@@ -1739,6 +1802,14 @@ async fn add_staging_candidate(
         .get_torrents()
         .await
         .map_err(|e| UpgradeSkip::Deferred(format!("listing failed before staging: {e}")))?;
+    // An empty listing while identifications are cached is taken for a provider glitch (TorBox can
+    // answer one): the pass started from a trusted listing that held this title's copies. Every
+    // hash reads absent against it, so nothing is claimed or added.
+    if crate::tasks::listing_is_suspect(&app.store, &listing).await {
+        return Err(UpgradeSkip::Deferred(
+            "provider listing empty while torrents are known; not staging".into(),
+        ));
+    }
     if listing.iter().any(|t| t.hash.eq_ignore_ascii_case(hash)) {
         debug!(
             "upgrade: candidate {} is already in the provider account; not staging it",
@@ -2170,7 +2241,7 @@ fn is_pack_stream(c: &crate::release::RawCandidate) -> bool {
     match codes.len() {
         0 => {
             crate::vfs::season_tokens(name).0.is_some()
-                && !crate::acquire::EPISODE_WORD_RE.is_match(name)
+                && !crate::vfs::EPISODE_WORD_RE.is_match(name)
                 && crate::identification::trailing_episode_number(name).is_none()
         }
         1 => false,
@@ -2244,15 +2315,42 @@ fn remember_not_a_season_pack(app: &AppState, tmdb_id: u64, season: u32, hash: &
 
 // ── per-episode upgrade/downgrade + over-ceiling pack correction ──────────────────────────────
 
-/// Add `hash`, select its video files, and poll for the cached verdict. Shared staging head for
-/// `stage_episode_candidate`, `correct_over_ceiling_packs` and consolidation (they differ only in
-/// what they do with the resolved `TorrentInfo` afterwards — this covers exactly the add/select/
-/// poll/cached-gate steps common to all three). On any failure the staged torrent is deleted so
-/// nothing leaks; returns the torrent id + the post-selection `TorrentInfo` on success.
+/// Which video files [`stage_and_await_cached`] selects on a staged candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileSelection {
+    /// The largest video file only (a film). A candidate with no video file is turned down.
+    LargestVideo,
+    /// Every video file (an episode or a season pack).
+    AllVideos,
+}
+
+/// A staged candidate's torrent once [`stage_and_await_cached`] has found it cached.
+struct StagedTorrent {
+    /// The id the add returned.
+    torrent_id: String,
+    /// The torrent's `TorrentInfo` after the file selection: every later gate runs against it.
+    fresh: crate::rd_client::TorrentInfo,
+    /// Under [`FileSelection::LargestVideo`], the path of the file it selected; `None` under
+    /// `AllVideos`.
+    largest_video: Option<String>,
+}
+
+/// Add `hash`, select its video files (`selection`), and poll for the cached verdict. The staging
+/// head every upgrade staging site shares: the movie's [`stage_and_verify`],
+/// [`stage_episode_candidate`], [`correct_over_ceiling_packs`] and consolidation, which differ only
+/// in which files they select and what they do with the resolved `TorrentInfo` afterwards. The
+/// files are selected FIRST: Real-Debrid reports a (cached) torrent as `downloaded` only after the
+/// selection, so gating on it before selecting would reject every candidate on RD (the `observe`
+/// ordering; the file list is populated before the selection). Only a `downloaded` torrent is
+/// staged: an upgrade is never downloaded speculatively. A failed add or lookup is `Deferred`, a
+/// busy provider `Busy`, and a candidate already in the account ([`add_staging_candidate`]), one
+/// with no video file under `LargestVideo` and one that isn't cached are `NoChange`. On any failure
+/// the staged torrent is deleted so nothing leaks.
 async fn stage_and_await_cached(
     app: &AppState,
     hash: &str,
-) -> Result<(String, crate::rd_client::TorrentInfo), UpgradeSkip> {
+    selection: FileSelection,
+) -> Result<StagedTorrent, UpgradeSkip> {
     let added = add_staging_candidate(app, hash).await?;
     let info = match staged_torrent_info(app.provider.as_ref(), &added.id).await {
         Ok(i) => i,
@@ -2261,12 +2359,22 @@ async fn stage_and_await_cached(
             return Err(UpgradeSkip::Deferred(format!("info failed: {e}")));
         }
     };
-    let ids: Vec<u32> = info
+    let videos = info
         .files
         .iter()
-        .filter(|f| crate::vfs::is_video_file(&f.path))
-        .map(|f| f.id)
-        .collect();
+        .filter(|f| crate::vfs::is_video_file(&f.path));
+    let (ids, largest_video): (Vec<u32>, Option<String>) = match selection {
+        FileSelection::LargestVideo => match videos.max_by_key(|f| f.bytes) {
+            Some(file) => (vec![file.id], Some(file.path.clone())),
+            None => {
+                discard_staged(app, hash, &added.id).await;
+                return Err(UpgradeSkip::NoChange("no video file".into()));
+            }
+        },
+        FileSelection::AllVideos => (videos.map(|f| f.id).collect(), None),
+    };
+    // A select_files error is caught by the `downloaded` gate below, but it is logged so a real
+    // provider failure isn't invisible.
     if !ids.is_empty() {
         if let Err(e) = app
             .provider
@@ -2292,7 +2400,11 @@ async fn stage_and_await_cached(
         discard_staged(app, hash, &added.id).await;
         return Err(UpgradeSkip::NoChange("candidate not cached".into()));
     }
-    Ok((added.id, fresh))
+    Ok(StagedTorrent {
+        torrent_id: added.id,
+        fresh,
+        largest_video,
+    })
 }
 
 /// Stage ONE per-episode candidate: add + select + poll cached (via [`stage_and_await_cached`]),
@@ -2302,7 +2414,7 @@ async fn stage_and_await_cached(
 /// On success records the episode `OwnedRecord` (Verified, sticky provenance) + authoritative id and
 /// returns `(hash, torrent_id, file_path)`. On any failure the staged torrent is cleaned up and the
 /// current release is left untouched (non-destructive). Episodes are read as acquisition reads them
-/// ([`crate::acquire::show_episode_files`]), so a single-file release that names its episode by an
+/// ([`crate::vfs::show_episode_files`]), so a single-file release that names its episode by an
 /// absolute number and no code (`[Group] Show - 05 (1080p).mkv`) is a single. A candidate that is
 /// no single for ANY episode — its files carry more than one distinct episode, or none that maps to
 /// one — is added to `not_singles` ([`EpisodeTick::not_singles`]): it is rejected here for every
@@ -2317,8 +2429,10 @@ async fn stage_episode_candidate(
     not_singles: &mut std::collections::HashSet<String>,
 ) -> Result<(String, String, String), UpgradeSkip> {
     let hash = cand.info_hash.clone();
-    let (torrent_id, fresh) = stage_and_await_cached(app, &hash).await?;
-    let eps = crate::acquire::show_episode_files(&fresh);
+    let StagedTorrent {
+        torrent_id, fresh, ..
+    } = stage_and_await_cached(app, &hash, FileSelection::AllVideos).await?;
+    let eps = crate::vfs::show_episode_files(&fresh);
     // Adopt a per-episode release ONLY when it is a TRUE singleton for the target (season, episode):
     // every parsed episode file must be exactly that episode. A multi-episode (or multi-season) pack
     // is left to the consolidation / pack-correction paths — adopting it here would record it with
@@ -2350,70 +2464,30 @@ async fn stage_episode_candidate(
         ));
     };
     let file_path = path.clone();
-    // The whole path and the torrent name, as `observe` checks it: a file with no episode code may
-    // take its season from a directory, and one whose name names no title is identified by its
-    // folder or torrent.
-    match app
-        .engine
-        .validate_title(
-            &file_path,
-            crate::acquire::torrent_name_of(&fresh),
-            tmdb_id,
-            MediaKind::Series,
-            Some(season),
-            Some(episode),
-        )
-        .await
-    {
-        TitleCheck::Match => {}
-        TitleCheck::Mismatch => {
-            discard_staged(app, &hash, &torrent_id).await;
-            let _ = app
-                .store
-                .blacklist_add(
-                    MediaKind::Series,
-                    tmdb_id,
-                    hash.clone(),
-                    "WrongTitle",
-                    now_secs(),
-                )
-                .await;
-            return Err(UpgradeSkip::NoChange("title mismatch".into()));
-        }
-        // No verdict (TMDB unreachable): not blacklisted; the episode is retried on a later visit.
-        TitleCheck::Unavailable => {
-            discard_staged(app, &hash, &torrent_id).await;
-            return Err(UpgradeSkip::Deferred(
-                "title check unavailable (TMDB unreachable)".into(),
-            ));
-        }
-    }
     let probe_req = crate::store::AcquireRequest {
         season: Some(season),
         episode: Some(episode),
         ..base_req.clone()
     };
-    // Adopt only a probe `Pass` (see `stage_and_verify`): an unverifiable `Accept` is dropped
-    // without blacklisting.
-    match staging_probe(app, &fresh, &hash, &file_path, &probe_req).await {
-        crate::acquire::VerifyResult::Pass => {}
-        crate::acquire::VerifyResult::Accept => {
-            discard_staged(app, &hash, &torrent_id).await;
-            return Err(UpgradeSkip::NoChange("unverifiable release".into()));
-        }
-        crate::acquire::VerifyResult::Reject(reason) => {
-            discard_staged(app, &hash, &torrent_id).await;
-            let _ = app
-                .store
-                .blacklist_add(MediaKind::Series, tmdb_id, hash.clone(), reason, now_secs())
-                .await;
-            return Err(UpgradeSkip::NoChange(format!("probe rejected: {reason}")));
-        }
-        crate::acquire::VerifyResult::Defer => {
-            discard_staged(app, &hash, &torrent_id).await;
-            return Err(UpgradeSkip::Deferred("probe deferred".into()));
-        }
-    }
+    // The title check runs on the whole path (a file with no episode code may take its season from
+    // a directory) and the torrent name. A wrong title or a probe reject is blacklisted and the next
+    // candidate tried; no verdict is not held against the release, and the caller moves on to the
+    // next episode, which is retried on a later visit.
+    check_staged(
+        app,
+        StagedCandidate {
+            hash: &hash,
+            torrent_id: &torrent_id,
+            fresh: &fresh,
+        },
+        &file_path,
+        MediaKind::Series,
+        tmdb_id,
+        (Some(season), Some(episode)),
+        &probe_req,
+    )
+    .await
+    .map_err(StagedReject::into_skip)?;
     record_staged(
         app,
         &hash,
@@ -2517,7 +2591,7 @@ async fn other_owned_coverage(
 /// shown by the VFS and held by no other copy, so no show swap prunes the copy: phase (a) and (a2)
 /// keep it after moving its slot, consolidation doesn't supersede it, and pack correction doesn't
 /// replace it (as `tasks::plan_dedup` never removes one). A code-less file acquisition mapped to an
-/// episode the record provides (`acquire::codeless_episode_files`) is accounted for, so an
+/// episode the record provides (`vfs::codeless_episode_files`) is accounted for, so an
 /// engine-verified absolute-numbered single is pruned like any other. A copy with no persisted
 /// identification is judged by its record alone. Reads the whole cache, so callers ask only when a
 /// prune is at hand.
@@ -2632,7 +2706,7 @@ struct EpisodeTick {
     adopted: Vec<(String, String)>,
     /// Lowercased infohashes that staged this tick as a torrent that is no single for ANY episode:
     /// its files carry more than one distinct episode, or none that maps to one
-    /// ([`crate::acquire::show_episode_files`]: a multi-file pack of absolutely numbered
+    /// ([`crate::vfs::show_episode_files`]: a multi-file pack of absolutely numbered
     /// `Show - 05.mkv` files with no explicit season). A single-file absolute-numbered release is a
     /// single and is adopted. The per-episode path adopts only a TRUE singleton, so such a torrent
     /// is rejected for EVERY target episode: skip it for the rest of the tick instead of re-staging
@@ -2765,7 +2839,7 @@ async fn upgrade_episode_slot(
                     }
                     // The copy the swap replaces left the account during the pass: the staged copy
                     // was rolled back and there is nothing left to upgrade → the next episode.
-                    Err(UpgradeSkip::NoChange(reason)) => {
+                    Err(SwapSkip::Gone(reason)) => {
                         debug!(
                             "upgrade: tmdb {} s{}e{} no change: {}",
                             tmdb_id, season, episode, reason
@@ -2778,8 +2852,7 @@ async fn upgrade_episode_slot(
                     // (nothing pruned). Each must propagate so the caller leaves the round-robin
                     // cursor unstamped and this work is reconsidered next tick — NOT swallowed as
                     // a false "swapped".
-                    Err(UpgradeSkip::Deferred(_)) => return EpisodeUpgrade::Deferred,
-                    Err(UpgradeSkip::Busy(_)) => return EpisodeUpgrade::Busy,
+                    Err(SwapSkip::Deferred(_)) => return EpisodeUpgrade::Deferred,
                 }
             }
             // Candidate-specific reject → try the next-best candidate for THIS episode.
@@ -2918,15 +2991,17 @@ async fn correct_over_ceiling_packs(
                 return PackCorrection::Deferred; // the pack is being read; leave the cursor unstamped, retry next tick
             }
 
-            let (torrent_id, fresh) = match stage_and_await_cached(app, &cand.info_hash).await {
+            let StagedTorrent {
+                torrent_id, fresh, ..
+            } = match stage_and_await_cached(app, &cand.info_hash, FileSelection::AllVideos).await {
                 Ok(v) => v,
                 // The provider queued the add: every other pack's would be queued too.
                 Err(UpgradeSkip::Busy(_)) => return PackCorrection::Busy,
                 Err(_) => continue,
             };
             // Episodes as `observe` records them for the same torrent, code-less pack files under
-            // an explicit season included ([`crate::acquire::show_episode_files`]).
-            let eps = crate::acquire::show_episode_files(&fresh);
+            // an explicit season included ([`crate::vfs::show_episode_files`]).
+            let eps = crate::vfs::show_episode_files(&fresh);
             if eps.iter().any(|(s, _, _)| *s != season) {
                 discard_staged(app, &cand.info_hash, &torrent_id).await;
                 continue; // multi-season pack; not a clean single-season replacement
@@ -2939,76 +3014,42 @@ async fn correct_over_ceiling_packs(
                 discard_staged(app, &cand.info_hash, &torrent_id).await;
                 continue;
             };
-            // The whole path and the torrent name, as `observe` checks it.
-            match app
-                .engine
-                .validate_title(
-                    rpath,
-                    crate::acquire::torrent_name_of(&fresh),
-                    tmdb_id,
-                    MediaKind::Series,
-                    Some(*rs),
-                    Some(*re),
-                )
-                .await
-            {
-                TitleCheck::Match => {}
-                TitleCheck::Mismatch => {
-                    discard_staged(app, &cand.info_hash, &torrent_id).await;
-                    let _ = app
-                        .store
-                        .blacklist_add(
-                            MediaKind::Series,
-                            tmdb_id,
-                            cand.info_hash.clone(),
-                            "WrongTitle",
-                            now_secs(),
-                        )
-                        .await;
-                    continue;
-                }
-                // No verdict (TMDB unreachable): not blacklisted; defer the pack to a later tick.
-                TitleCheck::Unavailable => {
-                    discard_staged(app, &cand.info_hash, &torrent_id).await;
-                    return PackCorrection::Deferred;
-                }
-            }
             let probe_req = crate::store::AcquireRequest {
                 imdb_id: imdb_id.to_string(),
                 season: Some(*rs),
                 episode: Some(*re),
                 ..rec.request.clone()
             };
-            // Adopt only a probe `Pass` (see `stage_and_verify`): an unverifiable `Accept` is
-            // dropped without blacklisting and the next candidate is tried.
-            match staging_probe(app, &fresh, &cand.info_hash, rpath, &probe_req).await {
-                crate::acquire::VerifyResult::Pass => {}
-                crate::acquire::VerifyResult::Accept => {
-                    discard_staged(app, &cand.info_hash, &torrent_id).await;
+            match check_staged(
+                app,
+                StagedCandidate {
+                    hash: &cand.info_hash,
+                    torrent_id: &torrent_id,
+                    fresh: &fresh,
+                },
+                rpath,
+                MediaKind::Series,
+                tmdb_id,
+                (Some(*rs), Some(*re)),
+                &probe_req,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(StagedReject::NextCandidate(reason)) => {
                     debug!(
-                        "upgrade: tmdb {} s{} pack candidate {} unverifiable; not adopted",
-                        tmdb_id, season, cand.info_hash
+                        "upgrade: tmdb {} s{} pack candidate {} not adopted: {}",
+                        tmdb_id, season, cand.info_hash, reason
                     );
                     continue;
                 }
-                crate::acquire::VerifyResult::Reject(reason) => {
-                    discard_staged(app, &cand.info_hash, &torrent_id).await;
-                    let _ = app
-                        .store
-                        .blacklist_add(
-                            MediaKind::Series,
-                            tmdb_id,
-                            cand.info_hash.clone(),
-                            reason,
-                            now_secs(),
-                        )
-                        .await;
-                    continue;
-                }
-                crate::acquire::VerifyResult::Defer => {
-                    discard_staged(app, &cand.info_hash, &torrent_id).await;
-                    continue;
-                }
+                // No verdict (TMDB unreachable): not blacklisted; defer the pack to a later tick.
+                Err(StagedReject::TitleUnavailable) => return PackCorrection::Deferred,
+                // A deferred probe (a CDN fetch that failed transiently) is not held against the
+                // candidate. Like a failed add or an uncached pack, it moves on to the next
+                // candidate pack, which is staged and probed afresh (the movie path defers the
+                // title instead, and the per-episode path moves on to the next episode).
+                Err(StagedReject::ProbeDeferred) => continue,
             }
             let base_req = crate::store::AcquireRequest {
                 imdb_id: imdb_id.to_string(),
@@ -3076,7 +3117,7 @@ async fn correct_over_ceiling_packs(
                 }
                 // The old pack left the account during the pass: the replacement was rolled back
                 // and there is nothing left to correct → the next pack.
-                Err(UpgradeSkip::NoChange(reason)) => {
+                Err(SwapSkip::Gone(reason)) => {
                     debug!(
                         "upgrade: tmdb {} s{} pack {}: {}",
                         tmdb_id, season, pack_hash, reason
@@ -3088,8 +3129,7 @@ async fn correct_over_ceiling_packs(
                 // the old pack stays), or the staged pack was no longer owned (nothing pruned).
                 // Each must propagate so the caller leaves the round-robin cursor unstamped and
                 // this pack is reconsidered next tick — NOT swallowed as a false "pack corrected".
-                Err(UpgradeSkip::Deferred(_)) => return PackCorrection::Deferred,
-                Err(UpgradeSkip::Busy(_)) => return PackCorrection::Busy,
+                Err(SwapSkip::Deferred(_)) => return PackCorrection::Deferred,
             }
         }
     }
@@ -3120,8 +3160,10 @@ enum PackCorrection {
 ///
 /// Returns [`ShowEpisodePass::deferred`] on such a deferral. The caller then signals `Deferred`
 /// so the round-robin cursor is NOT stamped and the skipped work is reconsidered next tick (rather
-/// than waiting a full cursor wrap). Either way it also returns what the phases adopted, for
-/// consolidation.
+/// than waiting a full cursor wrap). A staging add that finds the provider busy
+/// ([`UpgradeSkip::Busy`]) stops the show work too and returns [`ShowEpisodePass::busy`]; the
+/// caller then ends the pass without consolidating. Either way it also returns what the phases
+/// adopted, for consolidation.
 async fn upgrade_show_episodes_and_packs(
     app: &AppState,
     tmdb_id: u64,
@@ -3496,7 +3538,9 @@ struct ShowEpisodePass {
 /// NOT defer, propagate consolidation's own `Result`. Consolidation is SKIPPED (its TMDB +
 /// per-season scrapes would be wasted) when the phase deferred AND a copy of the show is still being
 /// read — consolidation's own read check would discard the work anyway; a defer for another reason
-/// (e.g. a transient listing failure) still lets consolidation run.
+/// (e.g. a transient listing failure) still lets consolidation run. When a staging add of the phase
+/// found the provider busy ([`ShowEpisodePass::busy`]), it returns `Busy` before consolidating,
+/// which ends the pass: consolidation's pack adds would be queued too.
 async fn try_upgrade_show<A, AFut>(
     app: &AppState,
     tmdb_id: u64,
@@ -3818,15 +3862,17 @@ async fn consolidate_show_seasons(
             // account is never staged (see `add_staging_candidate`); it, a failed add and an
             // uncached pack all move on to the next pack (the helper deletes what it added). A busy
             // provider would queue the next pack's add too, so it ends the pass.
-            let (torrent_id, fresh) = match stage_and_await_cached(app, &r.info_hash).await {
+            let StagedTorrent {
+                torrent_id, fresh, ..
+            } = match stage_and_await_cached(app, &r.info_hash, FileSelection::AllVideos).await {
                 Ok(v) => v,
                 Err(busy @ UpgradeSkip::Busy(_)) => return Err(busy),
                 Err(_) => continue,
             };
             // (season, episode, path) of each selected video, as `observe` records them for the
             // same torrent: code-less pack files under an explicit season included
-            // ([`crate::acquire::show_episode_files`]).
-            let eps = crate::acquire::show_episode_files(&fresh);
+            // ([`crate::vfs::show_episode_files`]).
+            let eps = crate::vfs::show_episode_files(&fresh);
             // Consolidation adopts a single-season pack only. A multi-season ("complete series") pack
             // would leave its other seasons recorded-as-owned but un-repointed/un-pruned — reject it
             // so provides/selection/prune stay consistent for the target season.
@@ -3871,80 +3917,47 @@ async fn consolidate_show_seasons(
                 discard_staged(app, &r.info_hash, &torrent_id).await;
                 continue;
             };
-            // The whole path and the torrent name, as `observe` checks it.
-            match app
-                .engine
-                .validate_title(
-                    path,
-                    crate::acquire::torrent_name_of(&fresh),
-                    tmdb_id,
-                    MediaKind::Series,
-                    Some(*es),
-                    Some(*ee),
-                )
-                .await
-            {
-                TitleCheck::Match => {}
-                TitleCheck::Mismatch => {
-                    discard_staged(app, &r.info_hash, &torrent_id).await;
-                    let _ = app
-                        .store
-                        .blacklist_add(
-                            MediaKind::Series,
-                            tmdb_id,
-                            r.info_hash.clone(),
-                            "WrongTitle",
-                            now_secs(),
-                        )
-                        .await;
-                    continue;
-                }
-                // No verdict (TMDB unreachable): not blacklisted; retry the season next tick.
-                TitleCheck::Unavailable => {
-                    discard_staged(app, &r.info_hash, &torrent_id).await;
-                    return Err(UpgradeSkip::Deferred(format!(
-                        "s{season} title check unavailable (TMDB unreachable)"
-                    )));
-                }
-            }
             // Per-episode request so the probe's language check uses the right original_language.
             let probe_req = crate::store::AcquireRequest {
                 season: Some(*es),
                 episode: Some(*ee),
                 ..sample.request.clone()
             };
-            // Adopt only a probe `Pass` (see `stage_and_verify`): an unverifiable `Accept` is
-            // dropped without blacklisting and the next candidate pack is tried.
-            match staging_probe(app, &fresh, &r.info_hash, path, &probe_req).await {
-                crate::acquire::VerifyResult::Pass => {}
-                crate::acquire::VerifyResult::Accept => {
-                    discard_staged(app, &r.info_hash, &torrent_id).await;
+            match check_staged(
+                app,
+                StagedCandidate {
+                    hash: &r.info_hash,
+                    torrent_id: &torrent_id,
+                    fresh: &fresh,
+                },
+                path,
+                MediaKind::Series,
+                tmdb_id,
+                (Some(*es), Some(*ee)),
+                &probe_req,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(StagedReject::NextCandidate(reason)) => {
                     debug!(
-                        "consolidate: tmdb {} s{} pack {} unverifiable; not adopted",
-                        tmdb_id, season, r.info_hash
+                        "consolidate: tmdb {} s{} pack {} not adopted: {}",
+                        tmdb_id, season, r.info_hash, reason
                     );
                     continue;
                 }
-                crate::acquire::VerifyResult::Reject(reason) => {
-                    discard_staged(app, &r.info_hash, &torrent_id).await;
-                    let _ = app
-                        .store
-                        .blacklist_add(
-                            MediaKind::Series,
-                            tmdb_id,
-                            r.info_hash.clone(),
-                            reason,
-                            now_secs(),
-                        )
-                        .await;
-                    continue;
+                // No verdict (TMDB unreachable): not blacklisted. Consolidation stops for the rest
+                // of the show and is retried on a later tick.
+                Err(StagedReject::TitleUnavailable) => {
+                    return Err(UpgradeSkip::Deferred(format!(
+                        "s{season} title check unavailable (TMDB unreachable)"
+                    )));
                 }
-                crate::acquire::VerifyResult::Defer => {
-                    // Transient probe failure: drop the staged pack and retry next tick (no
-                    // blacklist).
-                    discard_staged(app, &r.info_hash, &torrent_id).await;
-                    continue;
-                }
+                // A deferred probe (a CDN fetch that failed transiently) is not held against the
+                // pack. Like a failed add or an uncached pack, it moves on to the next candidate
+                // pack, which is staged and probed afresh; the deferred one is tried again on a
+                // later visit.
+                Err(StagedReject::ProbeDeferred) => continue,
             }
             // Fetch the provider listing for the prune BEFORE the idle gate, so there is NO network
             // round-trip between the idle check and the destructive repoint+prune below — a stream
@@ -4042,9 +4055,10 @@ async fn consolidate_show_seasons(
                 )));
             }
             // Record the pack owned+verified with full-season provides + sticky provenance, BEFORE
-            // the repoint+prune: on a failed write the pack is rolled back and the season deferred
-            // ([`record_staged`]), so the scattered episodes are never pruned against an unrecorded
-            // pack, and the next tick stages it afresh.
+            // the repoint+prune: on a failed write the pack is rolled back ([`record_staged`]) and,
+            // like any consolidation deferral, consolidation is deferred for the rest of the show,
+            // so the scattered episodes are never pruned against an unrecorded pack, and the next
+            // tick stages it afresh.
             let provides: Vec<(u32, u32)> = eps.iter().map(|(s, e, _)| (*s, *e)).collect();
             // The pack inherits the provenance of exactly the copies it supersedes.
             let prov = superseded_provenance(superseded.iter().map(|(_, rec)| rec));
@@ -5644,7 +5658,7 @@ mod tests {
             Duration::from_secs(300),
         )
         .await;
-        assert!(matches!(r, Err(UpgradeSkip::Deferred(_))), "{r:?}");
+        assert!(matches!(r, Err(SwapSkip::Deferred(_))), "{r:?}");
         assert!(
             deleted.lock().unwrap().is_empty(),
             "nothing is deleted: {:?}",
@@ -5890,6 +5904,42 @@ mod tests {
             "upgrade must select files before gating on `downloaded`, so the cached REMUX is \
              adopted even though RD reports `waiting_files_selection` until selection"
         );
+    }
+
+    /// The upgrade engine never speculatively downloads a release: a staged movie candidate the
+    /// provider still reports downloading after the cached poll is deleted by the id its add
+    /// returned, never recorded, and the owned copy and its slot are kept.
+    #[tokio::test(start_paused = true)]
+    async fn a_movie_candidate_that_is_not_cached_is_discarded() {
+        let store = mem_store();
+        let hold = put_movie_copy(&store, 27205, "tt1", "hold").await;
+        let mut info = remux_info();
+        info.status = "downloading".into();
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            added: added.clone(),
+            deleted: deleted.clone(),
+            ..staging_mock(vec![hold], info)
+        });
+        let app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![remux_candidate()],
+            }),
+            provider,
+            store.clone(),
+        );
+        run_upgrade_once(&app).await;
+        assert_eq!(*added.lock().unwrap(), vec!["hnew".to_string()]);
+        assert_eq!(*deleted.lock().unwrap(), vec!["tnew".to_string()]);
+        assert!(store.get_owned("hnew".into()).await.is_none());
+        assert!(store.authoritative_meta("hnew".into()).await.is_none());
+        assert!(store.get_owned("hold".into()).await.is_some());
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hold"
+        );
+        assert!(store.all_staging_intents().await.is_empty());
     }
 
     #[tokio::test]
@@ -6887,6 +6937,66 @@ mod tests {
         let mut rec = store.get_owned(hash.into()).await.unwrap();
         rec.provenance = mirror();
         store.put_owned(hash.into(), rec).await.unwrap();
+    }
+
+    /// The upgrade tick heals an account-mirror record whose recorded quality leaves an axis
+    /// untagged that its file name now tags (`tasks::backfill_owned_quality`), even when no owned
+    /// record lacks a quality: the heal must not wait for an unrelated `quality: None` record.
+    #[tokio::test]
+    async fn upgrade_tick_heals_an_untagged_mirror_quality_when_every_record_has_one() {
+        let store = mem_store();
+        let copy = put_movie_copy(&store, 27205, "tt1", "hmir").await;
+        let mut rec = store.get_owned("hmir".into()).await.unwrap();
+        rec.provenance = mirror();
+        rec.quality = Some(QualitySummary {
+            source_tier: 0,
+            ..q1080_web_scored(10)
+        });
+        store.put_owned("hmir".into(), rec).await.unwrap();
+        store
+            .put_matches(vec![(
+                copy.id.clone(),
+                TorrentInfo {
+                    id: copy.id.clone(),
+                    hash: "hmir".into(),
+                    status: "downloaded".into(),
+                    files: vec![TorrentFile {
+                        id: 0,
+                        path: "M.2020.1080p.BluRay.x264.mkv".into(),
+                        bytes: 30_000_000_000,
+                        selected: 1,
+                    }],
+                    ..Default::default()
+                },
+                movie_meta(),
+            )])
+            .await
+            .unwrap();
+        let app = app_with(
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(MockProvider {
+                torrents: vec![copy],
+                ..Default::default()
+            }),
+            store.clone(),
+        );
+        run_upgrade_once_with(
+            &app,
+            |_, _| async { panic!("no language backfill: every record has its languages") },
+            |_| async { panic!("no aired lookup for a film") },
+        )
+        .await;
+        let healed = store
+            .get_owned("hmir".into())
+            .await
+            .unwrap()
+            .quality
+            .unwrap();
+        assert_ne!(
+            healed.source_tier, 0,
+            "the source tier is healed: {healed:?}"
+        );
+        assert_eq!(healed.resolution, 1080);
     }
 
     /// A film owned both as an engine copy and as the user's own (mirror) copy: the swap prunes
@@ -11669,6 +11779,226 @@ mod tests {
         rebuilt
     }
 
+    /// Rebuild a harness's app around `scraper` and `provider`, keeping its store and downgrade
+    /// flag (a passing prober).
+    fn with_scraper_and_provider(
+        app: &AppState,
+        scraper: Arc<dyn Scraper>,
+        provider: Arc<dyn DebridProvider>,
+    ) -> AppState {
+        let mut rebuilt = app_with(scraper, provider, app.store.clone());
+        let mut cfg = (*rebuilt.config).clone();
+        cfg.allow_resolution_downgrade = app.config.allow_resolution_downgrade;
+        rebuilt.config = Arc::new(cfg);
+        rebuilt
+    }
+
+    /// The per-episode staging head ([`stage_and_await_cached`]) never adopts a release the provider
+    /// still reports downloading: the candidate is deleted by its add id, never recorded, and the
+    /// owned singleton and its slot are kept.
+    #[tokio::test(start_paused = true)]
+    async fn an_episode_candidate_that_is_not_cached_is_discarded() {
+        let h = show_harness_singleton_720_ep().await;
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent {
+                id: "told720".into(),
+                hash: h.old_720_hash.clone(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            add_magnet: Some(AddMagnetResponse {
+                id: "tep1080".into(),
+                uri: String::new(),
+            }),
+            torrent_info: Some(TorrentInfo {
+                id: "tep1080".into(),
+                hash: h.cand_1080_hash.clone(),
+                status: "downloading".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: "S.S01E01.1080p.WEB-DL.mkv".into(),
+                    bytes: 2_000_000_000,
+                    selected: 1,
+                }],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/ep1080".into()),
+            added: added.clone(),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = with_scraper_and_provider(&h.app, h.app.scraper.clone(), provider);
+        let pass =
+            upgrade_show_episodes_and_packs(&app, h.tmdb, &h.group_hashes, Duration::from_secs(0))
+                .await;
+        assert!(!pass.deferred && !pass.busy);
+        assert_eq!(*added.lock().unwrap(), vec![h.cand_1080_hash.clone()]);
+        assert_eq!(*deleted.lock().unwrap(), vec!["tep1080".to_string()]);
+        assert!(app
+            .store
+            .get_owned(h.cand_1080_hash.clone())
+            .await
+            .is_none());
+        assert!(app
+            .store
+            .authoritative_meta(h.cand_1080_hash.clone())
+            .await
+            .is_none());
+        assert!(app.store.get_owned(h.old_720_hash.clone()).await.is_some());
+        assert_eq!(
+            app.store
+                .get_selection(crate::store::episode_slot(h.tmdb, 1, 1))
+                .await
+                .unwrap()
+                .hash,
+            h.old_720_hash
+        );
+        assert!(app.store.all_staging_intents().await.is_empty());
+    }
+
+    /// A busy provider (TorBox queued the add) stops phase (a2) at its first staging add: the next
+    /// pack-served episode is not staged, and the visit reports the provider busy.
+    #[tokio::test]
+    async fn a_busy_provider_stops_the_pack_served_phase() {
+        let f = pack_fixture_with(
+            &[(1, q1080_web()), (2, q1080_web())],
+            &[1, 2, 3, 4],
+            &[3, 4],
+            q_sd_web_unverified(),
+            vec![
+                (3, single_candidate(3, "hy3", "1080p", "1080p.WEB-DL")),
+                (4, single_candidate(4, "hy4", "1080p", "1080p.WEB-DL")),
+            ],
+            PackOpts {
+                busy: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let pass = upgrade_show_episodes_and_packs(
+            &f.app,
+            SHOW_TMDB,
+            &f.group_hashes,
+            Duration::from_secs(0),
+        )
+        .await;
+        assert!(pass.busy, "the visit reports the provider busy");
+        assert_eq!(*f.added.lock().unwrap(), vec!["hy3".to_string()]);
+        assert!(f.deleted.lock().unwrap().is_empty());
+        assert_eq!(slot_hash(&f.store, 3).await, PACK);
+        assert_eq!(slot_hash(&f.store, 4).await, PACK);
+    }
+
+    /// A second cached within-ceiling replacement pack for the over-ceiling S01 pack (WEB, below the
+    /// harness's BluRay one).
+    fn second_1080_pack_candidate() -> RawCandidate {
+        RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "S.2019.S01.1080p.WEB-DL.x265\nRD+".into(),
+            info_hash: "hpack1080b".into(),
+            file_idx: None,
+            file_name: None,
+        }
+    }
+
+    /// A busy provider stops over-ceiling pack correction at its first staging add: the next
+    /// replacement pack is not staged, and the visit reports the provider busy.
+    #[tokio::test]
+    async fn a_busy_provider_stops_pack_correction() {
+        let mut h = show_harness_pack_2160_with_1080_candidate().await;
+        h.set_allow_downgrade(true);
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: vec![Torrent {
+                id: "tpack2160".into(),
+                hash: h.pack_hash.clone(),
+                status: "downloaded".into(),
+                ..Default::default()
+            }],
+            add_magnet_busy: true,
+            added: added.clone(),
+            deleted: h.deleted.clone(),
+            ..Default::default()
+        });
+        let scraper = Arc::new(MockScraper {
+            candidates: vec![
+                show_harness_pack_candidate(&h),
+                second_1080_pack_candidate(),
+            ],
+        });
+        let app = with_scraper_and_provider(&h.app, scraper, provider);
+        let pass =
+            upgrade_show_episodes_and_packs(&app, h.tmdb, &h.group_hashes, Duration::from_secs(0))
+                .await;
+        assert!(pass.busy, "the visit reports the provider busy");
+        assert_eq!(
+            added.lock().unwrap().len(),
+            1,
+            "one add met the busy provider"
+        );
+        assert!(h.deleted.lock().unwrap().is_empty(), "the pack is kept");
+        assert!(app.store.get_owned(h.pack_hash.clone()).await.is_some());
+    }
+
+    /// The harness's replacement-pack candidate ([`show_harness_pack_2160_with_1080_candidate`]).
+    fn show_harness_pack_candidate(h: &ShowUpgradeHarness) -> RawCandidate {
+        RawCandidate {
+            name: "Torrentio\n1080p".into(),
+            description: "S.2019.S01.1080p.BluRay.x265\nRD+".into(),
+            info_hash: h.cand_1080_hash.clone(),
+            file_idx: None,
+            file_name: None,
+        }
+    }
+
+    /// A busy provider stops consolidation at its first pack's staging add: the next pack is not
+    /// staged, and consolidation returns `Busy` so the pass ends.
+    #[tokio::test]
+    async fn a_busy_provider_stops_consolidation() {
+        let store = mem_store();
+        seed_two_scattered_episodes(&store).await;
+        let mut second = season_pack_candidate();
+        second.description = "S.2019.S01.1080p.WEB-DL.x265\nRD+".into();
+        second.info_hash = "hpack2".into();
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+            torrents: show_listing(),
+            add_magnet_busy: true,
+            added: added.clone(),
+            deleted: deleted.clone(),
+            ..Default::default()
+        });
+        let app = app_with(
+            Arc::new(MockScraper {
+                candidates: vec![season_pack_candidate(), second],
+            }),
+            provider,
+            store.clone(),
+        );
+        let res = consolidate_show_seasons(
+            &app,
+            SHOW_TMDB,
+            &group_two(),
+            &owned_two(),
+            &[(1, 1), (1, 2)],
+            &[],
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(matches!(res, Err(UpgradeSkip::Busy(_))), "{res:?}");
+        assert_eq!(
+            added.lock().unwrap().len(),
+            1,
+            "one add met the busy provider"
+        );
+        assert!(deleted.lock().unwrap().is_empty());
+        assert!(store.get_owned("e1".into()).await.is_some());
+        assert!(store.get_owned("e2".into()).await.is_some());
+    }
+
     #[tokio::test]
     async fn episode_upgrade_rejects_unverifiable_staged_candidate() {
         // Per-episode staging adopts only a probe `Pass`: a better 1080p single whose tracks can't be
@@ -12719,6 +13049,8 @@ mod tests {
         /// Serve the account listing through a [`LiveListingProvider`], so it reflects every add and
         /// delete (a pruned pack leaves the listing and can be re-staged, as on a real account).
         live_listing: bool,
+        /// Every staging add finds the provider busy (TorBox queued it).
+        busy: bool,
     }
 
     /// A provider whose `get_torrents` reflects `add_magnet` and `delete_torrent`, as a real account
@@ -12896,6 +13228,7 @@ mod tests {
             added: added.clone(),
             // Call 1 = the staged candidate's pre-add presence check; later = the prune listing.
             fail_get_torrents_after: opts.fail_listing.then_some(1),
+            add_magnet_busy: opts.busy,
             ..Default::default()
         };
         let provider: Arc<dyn DebridProvider> = if opts.live_listing {
@@ -14802,6 +15135,156 @@ mod tests {
                 "owned={owned}: only the other stager's intent is left"
             );
         }
+    }
+
+    /// TorBox can answer an empty-but-OK listing as a glitch. Against such a listing the presence
+    /// check passes for a torrent already in the account, whose add returns the EXISTING id, and any
+    /// rejection would then delete the user's torrent. While identifications are cached (so the
+    /// account is known not to be empty) an empty listing before a staging add defers, with nothing
+    /// claimed, added or deleted. With nothing cached an empty listing is a genuinely empty account,
+    /// and staging goes ahead.
+    #[tokio::test]
+    async fn staging_defers_on_a_suspect_empty_listing() {
+        for cached in [true, false] {
+            let store = mem_store();
+            if cached {
+                store
+                    .put_matches(vec![(
+                        "tother".into(),
+                        TorrentInfo {
+                            id: "tother".into(),
+                            hash: "hother".into(),
+                            status: "downloaded".into(),
+                            ..Default::default()
+                        },
+                        movie_meta(),
+                    )])
+                    .await
+                    .unwrap();
+            }
+            let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider {
+                added: added.clone(),
+                deleted: deleted.clone(),
+                ..staging_mock(vec![], remux_info())
+            });
+            let app = app_with(
+                Arc::new(MockScraper { candidates: vec![] }),
+                provider,
+                store.clone(),
+            );
+            let res = add_staging_candidate(&app, "hnew").await;
+            if cached {
+                assert!(matches!(res, Err(UpgradeSkip::Deferred(_))), "{res:?}");
+                assert!(added.lock().unwrap().is_empty(), "nothing added");
+                assert!(store.all_staging_intents().await.is_empty(), "no intent");
+            } else {
+                assert!(res.is_ok(), "an empty account is no glitch: {res:?}");
+                assert_eq!(*added.lock().unwrap(), vec!["hnew".to_string()]);
+            }
+            assert!(deleted.lock().unwrap().is_empty(), "nothing deleted");
+        }
+    }
+
+    /// A provider whose first `good` listings are the wrapped mock's and every later one is empty
+    /// (an empty-but-OK listing, as TorBox can answer one as a glitch).
+    #[derive(Debug)]
+    struct EmptyingListingProvider {
+        inner: MockProvider,
+        good: usize,
+    }
+    #[async_trait]
+    impl DebridProvider for EmptyingListingProvider {
+        fn name(&self) -> &'static str {
+            "emptying-listing"
+        }
+        async fn get_torrents(&self) -> Result<Vec<Torrent>, reqwest::Error> {
+            let call = self.inner.get_torrents_calls.load(Ordering::SeqCst);
+            let listing = self.inner.get_torrents().await?;
+            Ok(if call < self.good { listing } else { vec![] })
+        }
+        async fn get_torrent_info(&self, id: &str) -> Result<TorrentInfo, reqwest::Error> {
+            self.inner.get_torrent_info(id).await
+        }
+        async fn add_magnet(&self, magnet: &str) -> Result<AddMagnetResponse, reqwest::Error> {
+            self.inner.add_magnet(magnet).await
+        }
+        async fn select_files(&self, id: &str, file_ids: &str) -> Result<(), reqwest::Error> {
+            self.inner.select_files(id, file_ids).await
+        }
+        async fn delete_torrent(&self, id: &str) -> Result<(), reqwest::Error> {
+            self.inner.delete_torrent(id).await
+        }
+        async fn resolve_url(
+            &self,
+            loc: &crate::provider::FileLocator,
+        ) -> Result<String, crate::error::AppError> {
+            self.inner.resolve_url(loc).await
+        }
+        async fn invalidate(&self, loc: &crate::provider::FileLocator) {
+            self.inner.invalidate(loc).await
+        }
+    }
+
+    /// The pass-level form of the test above: the pass's own listing is trusted, but the listing
+    /// taken before the staging add comes back empty while the candidate's torrent is in the account
+    /// (unowned) and its add would return that existing id. The candidate is never added, the
+    /// user's torrent never deleted, and the title's cursor is left unstamped.
+    #[tokio::test]
+    async fn a_suspect_listing_before_staging_never_deletes_a_present_torrent() {
+        let store = mem_store();
+        let hold = put_movie_copy(&store, 27205, "tt1", "hold").await;
+        let present = Torrent {
+            id: "tnew".into(),
+            hash: "hnew".into(),
+            status: "downloaded".into(),
+            ..Default::default()
+        };
+        store
+            .put_matches(vec![(
+                "t-hold".into(),
+                TorrentInfo {
+                    id: "t-hold".into(),
+                    hash: "hold".into(),
+                    status: "downloaded".into(),
+                    ..Default::default()
+                },
+                movie_meta(),
+            )])
+            .await
+            .unwrap();
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn DebridProvider> = Arc::new(EmptyingListingProvider {
+            inner: MockProvider {
+                added: added.clone(),
+                deleted: deleted.clone(),
+                ..staging_mock(vec![hold, present], remux_info())
+            },
+            good: 1,
+        });
+        let app = app_with_prober(
+            Arc::new(MockScraper {
+                candidates: vec![remux_candidate()],
+            }),
+            provider,
+            store.clone(),
+            unverifiable_prober(),
+        );
+        run_upgrade_once(&app).await;
+        assert!(added.lock().unwrap().is_empty(), "never staged");
+        assert!(deleted.lock().unwrap().is_empty(), "nothing deleted");
+        assert!(store.all_staging_intents().await.is_empty());
+        assert_eq!(
+            store.get_upgrade_checked(&MediaType::Movie, 27205).await,
+            0,
+            "the cursor is unstamped"
+        );
+        assert_eq!(
+            store.get_selection(movie_slot(27205)).await.unwrap().hash,
+            "hold"
+        );
     }
 
     #[tokio::test]
