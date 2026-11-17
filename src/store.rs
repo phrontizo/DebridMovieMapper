@@ -1992,6 +1992,30 @@ impl Store {
         expected: SelectionEntry,
         new: SelectionEntry,
     ) -> Result<bool, AppError> {
+        self.write_selection_if(slot, Some(expected), new).await
+    }
+
+    /// Atomically create `slot` serving `new` only while the slot holds no entry (one write
+    /// transaction). Returns whether it wrote. Used by `selection::repoint_to_better_copies` for an
+    /// owned episode no slot covers: a slot `observe` or the upgrade engine wrote since the plan's
+    /// snapshot wins.
+    pub async fn create_selection_if_absent(
+        &self,
+        slot: String,
+        new: SelectionEntry,
+    ) -> Result<bool, AppError> {
+        self.write_selection_if(slot, None, new).await
+    }
+
+    /// The compare-and-set behind [`Store::repoint_selection_if`] and
+    /// [`Store::create_selection_if_absent`]: write `new` to `slot` only while its current entry is
+    /// `expected` (`None`: no entry).
+    async fn write_selection_if(
+        &self,
+        slot: String,
+        expected: Option<SelectionEntry>,
+        new: SelectionEntry,
+    ) -> Result<bool, AppError> {
         let bytes = serde_json::to_vec(&new)
             .map_err(|e| AppError::Task(format!("serialise SelectionEntry for {slot}: {e}")))?;
         let db = self.db.clone();
@@ -2005,7 +2029,7 @@ impl Store {
                     .get(slot.as_str())
                     .map_err(|e| AppError::Db(e.into()))?
                     .and_then(|v| serde_json::from_slice(v.value()).ok());
-                if current.as_ref() == Some(&expected) {
+                if current == expected {
                     table
                         .insert(slot.as_str(), bytes.as_slice())
                         .map_err(|e| AppError::Db(e.into()))?;
@@ -4855,6 +4879,35 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(store.get_selection(gone).await, None);
+    }
+
+    /// Creating a slot is a compare-and-set against "no entry": a slot `observe` or the upgrade
+    /// engine wrote since the selection planner's snapshot is never overwritten.
+    #[tokio::test]
+    async fn create_selection_if_absent_writes_only_a_missing_slot() {
+        let store = Store::in_memory();
+        let entry = |h: &str, p: &str| SelectionEntry {
+            hash: h.into(),
+            file_path: p.into(),
+        };
+        let slot = episode_slot(7, 1, 1);
+        assert!(store
+            .create_selection_if_absent(slot.clone(), entry("a", "a.mkv"))
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get_selection(slot.clone()).await,
+            Some(entry("a", "a.mkv"))
+        );
+        assert!(!store
+            .create_selection_if_absent(slot.clone(), entry("b", "b.mkv"))
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get_selection(slot).await,
+            Some(entry("a", "a.mkv")),
+            "an existing slot is left alone"
+        );
     }
 
     #[tokio::test]

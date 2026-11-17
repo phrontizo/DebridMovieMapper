@@ -202,6 +202,7 @@ pub async fn run_scan_loop(app: AppState, mut shutdown: tokio::sync::watch::Rece
             &app.repair_manager,
             &None,
             &app.store,
+            app.config.episode_file_names,
         )
         .await;
         info!(
@@ -742,7 +743,15 @@ async fn scan_tick(
                 if !pending_db_writes.is_empty() {
                     flush_db_writes(store, &mut pending_db_writes).await;
                 }
-                update_vfs(vfs, &current_data, repair_manager, jellyfin_client, store).await;
+                update_vfs(
+                    vfs,
+                    &current_data,
+                    repair_manager,
+                    jellyfin_client,
+                    store,
+                    config.episode_file_names,
+                )
+                .await;
                 return TickEnd::Shutdown;
             }
         } {
@@ -789,11 +798,27 @@ async fn scan_tick(
                     "Progress: {}/{} new torrents identified",
                     processed_new, new_total
                 );
-                update_vfs(vfs, &current_data, repair_manager, jellyfin_client, store).await;
+                update_vfs(
+                    vfs,
+                    &current_data,
+                    repair_manager,
+                    jellyfin_client,
+                    store,
+                    config.episode_file_names,
+                )
+                .await;
             }
         }
     } else {
-        update_vfs(vfs, &current_data, repair_manager, jellyfin_client, store).await;
+        update_vfs(
+            vfs,
+            &current_data,
+            repair_manager,
+            jellyfin_client,
+            store,
+            config.episode_file_names,
+        )
+        .await;
     }
 
     // Account-mirror: record every identified present torrent the engine doesn't already
@@ -819,8 +844,9 @@ async fn scan_tick(
 
     // Serve the best copy present: a slot whose copy is beaten by another present,
     // settled copy of strictly better quality (e.g. a pre-existing or re-added REMUX
-    // behind an engine-acquired BluRay pack — such a copy never gets a slot of its own)
-    // is repointed to it. Idle-gated; the VFS shows the change on the next tick.
+    // behind an engine-acquired BluRay pack, which gets no slot of its own) is repointed
+    // to it, and an episode two such copies hold with no slot at all gets one on the
+    // better copy. Idle-gated; the VFS shows the change on the next tick.
     crate::selection::repoint_to_better_copies(
         store,
         &app.read_activity,
@@ -973,6 +999,7 @@ async fn update_vfs(
     repair_manager: &Arc<RepairManager>,
     jellyfin_client: &Option<Arc<crate::jellyfin_client::JellyfinClient>>,
     store: &Store,
+    names: crate::vfs::EpisodeNames,
 ) {
     let hidden_ids = repair_manager.hidden_torrent_ids().await;
     let filtered: Vec<_> = current_data
@@ -987,14 +1014,17 @@ async fn update_vfs(
     // doing it inline would stall byte-serving for large libraries. (The lock is also not held during
     // the build — only the cheap diff+swap below is.) A panic in the build task is logged and this
     // update is skipped, keeping the previous VFS rather than tearing down the scan.
-    let new_vfs =
-        match tokio::task::spawn_blocking(move || DebridVfs::build(filtered, &selection)).await {
-            Ok(v) => v,
-            Err(e) => {
-                error!("VFS build task failed: {e:?}; keeping previous VFS for this tick");
-                return;
-            }
-        };
+    let new_vfs = match tokio::task::spawn_blocking(move || {
+        DebridVfs::build_with(filtered, &selection, names)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            error!("VFS build task failed: {e:?}; keeping previous VFS for this tick");
+            return;
+        }
+    };
     // Diff old vs new, then swap
     let mut vfs_lock = vfs.write().await;
     let changes = crate::vfs::diff_trees(&vfs_lock.root, &new_vfs.root, "");

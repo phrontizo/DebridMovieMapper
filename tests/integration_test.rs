@@ -21,7 +21,9 @@ use debridmoviemapper::provider::{
 use debridmoviemapper::rd_client::{AddMagnetResponse, Torrent, TorrentFile, TorrentInfo};
 use debridmoviemapper::store::Store;
 use debridmoviemapper::tmdb_client::track_search_failures;
-use debridmoviemapper::vfs::{is_video_file, DebridVfs, MediaMetadata, MediaType, VfsNode};
+use debridmoviemapper::vfs::{
+    is_video_file, DebridVfs, EpisodeNames, MediaMetadata, MediaType, VfsNode,
+};
 use futures_util::FutureExt;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -424,6 +426,106 @@ fn check_vfs_completeness(label: &str, data: &[(TorrentInfo, MediaMetadata)]) {
     );
 }
 
+/// Test 4: canonical episode names (`EPISODE_FILE_NAMES`'s default) lose no episode. The library
+/// is built twice with no managed selection, with the torrents' own names and with canonical names,
+/// and every episode an original name shows (its first `SxxEyy` code) must have a file in the same
+/// season folder under canonical names. Every canonical name's code must name that folder's season.
+#[tokio::test]
+#[ignore]
+async fn test_vfs_canonical_names() {
+    for_each_provider("test_vfs_canonical_names", |label, data| {
+        let problems = canonical_name_problems(data);
+        println!(
+            "\n=== Canonical names ({label}) === {} problem(s)",
+            problems.len()
+        );
+        assert!(
+            problems.is_empty(),
+            "[{label}] canonical names lost or misplaced episodes: {problems:#?}"
+        );
+    })
+    .await;
+}
+
+/// What [`test_vfs_canonical_names`] checks, as a list of problems (empty when there are none).
+fn canonical_name_problems(data: &[(TorrentInfo, MediaMetadata)]) -> Vec<String> {
+    static CODE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)s(\d{1,2})[ ._]?e(\d{1,3})").unwrap());
+    static CANONICAL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:^| - )S(\d{2,})E(\d{2,})(?:-E(\d{2,}))?\.[a-z0-9]+$").unwrap()
+    });
+    let number = |c: &regex::Captures, i: usize| -> u32 { c[i].parse().unwrap_or(0) };
+    let none = debridmoviemapper::vfs::SelectionMap::new();
+    let original = season_files(&DebridVfs::build(data.to_vec(), &none).root);
+    let canonical =
+        season_files(&DebridVfs::build_with(data.to_vec(), &none, EpisodeNames::Canonical).root);
+    let mut problems = Vec::new();
+    for ((show, season), names) in &original {
+        let folder_season: u32 = season.trim_start_matches("Season ").parse().unwrap_or(0);
+        let mut shown: HashSet<(u32, u32)> = HashSet::new();
+        for name in canonical
+            .get(&(show.clone(), season.clone()))
+            .into_iter()
+            .flatten()
+        {
+            if let Some(c) = CANONICAL.captures(name) {
+                let (s, first) = (number(&c, 1), number(&c, 2));
+                let last = if c.get(3).is_some() {
+                    number(&c, 3)
+                } else {
+                    first
+                };
+                if s != folder_season {
+                    problems.push(format!("{show}/{season}/{name}: names season {s}"));
+                }
+                shown.extend((first..=last).map(|e| (s, e)));
+            } else if let Some(c) = CODE.captures(name) {
+                shown.insert((number(&c, 1), number(&c, 2)));
+            }
+        }
+        for name in names {
+            if let Some(c) = CODE.captures(name) {
+                let episode = (number(&c, 1), number(&c, 2));
+                if !shown.contains(&episode) {
+                    problems.push(format!(
+                        "{show}/{season}: {name} ({episode:?}) has no file under canonical names"
+                    ));
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// The media-file names of every `Shows/<show>/<season>` folder under `root`.
+fn season_files(root: &VfsNode) -> HashMap<(String, String), Vec<String>> {
+    let mut out = HashMap::new();
+    let VfsNode::Directory { children } = root else {
+        return out;
+    };
+    let Some(VfsNode::Directory { children: shows }) = children.get("Shows") else {
+        return out;
+    };
+    for (show, node) in shows {
+        let VfsNode::Directory { children: seasons } = node else {
+            continue;
+        };
+        for (season, node) in seasons {
+            if let VfsNode::Directory { children: files } = node {
+                out.insert(
+                    (show.clone(), season.clone()),
+                    files
+                        .iter()
+                        .filter(|(_, n)| matches!(n, VfsNode::MediaFile { .. }))
+                        .map(|(name, _)| name.clone())
+                        .collect(),
+                );
+            }
+        }
+    }
+    out
+}
+
 /// What [`check_completeness`] found.
 #[derive(Debug, Default)]
 struct Completeness {
@@ -563,7 +665,8 @@ fn basename(path: &str) -> &str {
 /// (`S01E05`, `S01.E05`, `1x05`, or a three-digit ` - 105 - `). For a file with no code, the first
 /// `Sxx` / `Season N` / `NxNN` token in the file name; else the NEAREST directory naming a season
 /// (by such a token, else by a `Part N`), so each season of a multi-season pack keeps its own
-/// folder; else a `Part N` in the file name; else season 1. It reads only the season from an
+/// folder; else a `Part N` in the file name; else season 1. A `Part N` that numbers a part of a
+/// total (`Part 2 of 4`, an episode) names no season, in a folder name or the file name. It reads only the season from an
 /// episode code, where the build decodes the whole code. As in the build, an `NxM` code may carry a
 /// version suffix (`2x05v2`), and neither an `NxM` code nor an `NxNN` season token counts when it
 /// is a channel layout run into an `x264`/`x265` codec (`DD5.1x264`, `AAC2.0x264`) or, for a code,
@@ -614,7 +717,24 @@ fn season_folder(path: &str) -> String {
         }
         None
     };
-    let part = |s: &str| PART.captures(s).and_then(|c| number(c.get(1)));
+    // `Part N of M`: that `Part N` is the part of a total, an episode, not a season.
+    static PART_OF_TOTAL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)(?:^|[^a-z0-9])part[\s._-]*(\d{1,2})[\s._-]*of[\s._-]*(\d{1,2})(?:[^a-z0-9]|$)",
+        )
+        .unwrap()
+    });
+    let part_of_total = |s: &str| {
+        PART_OF_TOTAL.captures(s).and_then(|c| {
+            let (n, m) = (number(c.get(1))?, number(c.get(2))?);
+            (n >= 1 && n <= m).then_some(n)
+        })
+    };
+    let part = |s: &str| {
+        PART.captures(s)
+            .and_then(|c| number(c.get(1)))
+            .filter(|&n| part_of_total(s) != Some(n))
+    };
 
     let name = basename(path);
     let nxm_code = || {
@@ -832,6 +952,26 @@ fn completeness_reports_a_dropped_file_named_like_another_seasons() {
     assert_eq!(report.hidden, 1, "{report:#?}");
 }
 
+/// The canonical-name check passes on the sample library and on a show whose episode titles hold
+/// codes a player misreads (an extra titled after an episode, a title of digits and dashes).
+#[test]
+fn canonical_names_lose_no_episode_of_the_sample_library() {
+    let mut data = sample_library();
+    data.push((
+        rd_torrent(
+            "70",
+            3_000,
+            &[
+                "/Pack/Other.Show.S03E03.4-5-1.1080p.mkv",
+                "/Pack/S00E41 - Inside the Episode S2 E1.mkv",
+                "/Pack/Other.Show.S01E01E02.mkv",
+            ],
+        ),
+        title("Other Show", 70, MediaType::Show),
+    ));
+    assert_eq!(canonical_name_problems(&data), Vec::<String>::new());
+}
+
 /// `season_folder` and the build agree on the season folder of each kind of show file name, so the
 /// live check never reports a copy as missing because the two disagree.
 #[test]
@@ -852,6 +992,13 @@ fn season_folder_agrees_with_the_build() {
         // A directory's season beats a `Part N` in the file name, which is the weakest signal.
         ("/Show/Season 3/05 - Title, Part 2.mkv", "Season 03"),
         ("/Show/05 - Title, Part 2.mkv", "Season 02"),
+        // ... unless it numbers a part of a total: that is the episode, in a folder too.
+        ("/Show/Doc - Part 2 of 4.mkv", "Season 01"),
+        (
+            "/Doc.Part.2.of.4.1080p/Doc.Part.2.of.4.1080p.mkv",
+            "Season 01",
+        ),
+        ("/Show Part 3 - Episode 2 of 6.mkv", "Season 03"),
         ("/Show/01.mkv", "Season 01"),
         // An `NxM` code with a version suffix, and one after a year or a title ending in a digit.
         ("/Show/Show.2x05v2.mkv", "Season 02"),

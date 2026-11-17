@@ -37,6 +37,9 @@ services:
       - SCAN_INTERVAL_SECS=${SCAN_INTERVAL_SECS:-}
       # Size (MB) of the first read-ahead CDN fetch when a media file is opened (default 8, clamped 2–16).
       - CDN_FIRST_READ_MB=${CDN_FIRST_READ_MB:-}
+      # Episode file names: canonical (default; Show (Year) - S01E02.mkv) or original (the
+      # torrents' own names). Changing it renames every episode file.
+      - EPISODE_FILE_NAMES=${EPISODE_FILE_NAMES:-}
       # Log verbosity (default: info). Scope to this crate to avoid dependency noise; takes
       # effect when the container is recreated. e.g. debridmoviemapper=debug, or
       # debridmoviemapper::acquire=debug,info

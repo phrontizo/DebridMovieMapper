@@ -1,13 +1,15 @@
 //! Serve the best copy already in the account: repoint a movie or episode `selection` slot from the
-//! copy it serves to a strictly better one that is present.
+//! copy it serves to a strictly better one that is present, and give a show episode that several
+//! present copies hold, and no slot covers, a slot on the best of them.
 //!
 //! The VFS shows only a slot's selected file. Slots are written when the engine verifies a copy
-//! (`observe`) or swaps in an upgrade, and nothing else ever moved one, so a better copy that
-//! arrived any other way — an account-mirror copy (pre-existing, or re-added by hand) never gets a
-//! slot of its own — stayed hidden behind the worse copy the slot already named. The scan loop runs
-//! [`repoint_to_better_copies`] after dedup, so every slot ends up serving the best present copy,
-//! judged by the file it would serve (a mixed-quality pack is not ranked by its best file). Movie
-//! slots never move onto or off a multi-film collection.
+//! (`observe`) or swaps in an upgrade, so a better copy that arrived any other way (an
+//! account-mirror copy, pre-existing or re-added by hand, gets no slot of its own) stayed hidden
+//! behind the worse copy the slot already named, and an episode whose copies all came that way had
+//! no slot at all, so the VFS listed it once per copy. The scan loop runs
+//! [`repoint_to_better_copies`] after dedup, so every such episode gets a slot and every slot ends
+//! up serving the best present copy, judged by the file it would serve (a mixed-quality pack is not
+//! ranked by its best file). Movie slots never move onto or off a multi-film collection.
 
 use crate::rd_client::TorrentInfo;
 use crate::read_activity::ReadActivity;
@@ -50,8 +52,9 @@ pub struct SlotRepoint {
 /// mixed-quality pack whose record reflects its best file never takes a slot with a worse one,
 /// whether the file's name or its season folder shows that. Among several better copies the
 /// highest rank wins, then score, then the smallest hash. A slot whose served copy is absent,
-/// unsettled or unowned is left alone (the VFS already falls back for a stale slot), and a slot is
-/// never created. `present` is the provider listing's identified torrents with their files.
+/// unsettled or unowned is left alone (the VFS already falls back for a stale slot), and this
+/// planner creates no slot ([`plan_missing_episode_slots`] does). `present` is the provider
+/// listing's identified torrents with their files.
 /// Two exceptions keep the planner from undoing the upgrade engine (`rules`): a slot serving a
 /// checked copy moves onto an unchecked one only for a strictly higher resolution, and with
 /// `ALLOW_RESOLUTION_DOWNGRADE` no slot moves onto a copy above `MAX_RESOLUTION`. A movie slot
@@ -208,6 +211,147 @@ pub fn plan_selection_repoints(
                     file_path: path,
                 },
             });
+        }
+    }
+    out.sort_by(|a, b| a.slot.cmp(&b.slot));
+    out
+}
+
+/// One planned new slot: `slot` holds no entry and will serve `to`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotCreation {
+    pub slot: String,
+    pub to: SelectionEntry,
+}
+
+/// A copy that supplies an episode: its hash, its record and the file it would serve.
+type Supplier<'a> = (&'a str, &'a OwnedRecord, &'a str);
+
+/// PURE planner for the show episodes no `selection` slot covers. The VFS lists every distinct file
+/// name of such an episode, so when two or more present, `Verified` owned copies supply it (each
+/// lists it in `provides` and has an emittable video file whose FIRST episode code is that episode,
+/// as [`plan_selection_repoints`] reads a candidate) the episode shows once per copy. Plan a slot on
+/// the copy that serves it best, ranked and filtered as [`plan_selection_repoints`] ranks
+/// candidates: [`served_rank`] of the file it would serve, then score, then the smallest hash;
+/// never a copy tagged only with other audio languages ([`copy_tags_wrong_audio`]), nor, with
+/// `ALLOW_RESOLUTION_DOWNGRADE` on, one above `MAX_RESOLUTION`. When only one supplier qualifies it
+/// still gets the slot, which hides the other copy's file. A slot that exists, even one serving an
+/// absent copy (the VFS falls back for it), is not this planner's business, and nor are movies: the
+/// VFS shows one copy of a film without a slot. Slots otherwise come only from `observe` and the
+/// upgrade engine, so an episode whose engine copy came back without its records (deleted, re-added
+/// by hand and adopted by the account mirror) stayed listed twice for good.
+pub fn plan_missing_episode_slots(
+    owned: &[(String, OwnedRecord)],
+    selection: &[(String, SelectionEntry)],
+    present: &[&TorrentInfo],
+    rules: RepointRules,
+    prefs: &crate::config::QualityPrefs,
+) -> Vec<SlotCreation> {
+    use crate::scraper::MediaKind;
+    use std::collections::{BTreeMap, HashMap};
+
+    let present_by_hash: HashMap<String, &TorrentInfo> = present
+        .iter()
+        .map(|t| (t.hash.to_ascii_lowercase(), *t))
+        .collect();
+    let slotted: HashSet<&str> = selection.iter().map(|(slot, _)| slot.as_str()).collect();
+    // Settled, present owned show copies per show.
+    let mut by_show: BTreeMap<u64, Vec<(String, &OwnedRecord)>> = BTreeMap::new();
+    for (h, r) in owned {
+        let hash = h.to_ascii_lowercase();
+        if r.status == OwnedStatus::Verified
+            && r.request.kind != MediaKind::Movie
+            && present_by_hash.contains_key(&hash)
+        {
+            by_show
+                .entry(r.request.tmdb_id)
+                .or_default()
+                .push((hash, r));
+        }
+    }
+    let title_langs = title_language_requests(owned);
+    let mut out = Vec::new();
+    for (tmdb, copies) in &by_show {
+        if copies.len() < 2 {
+            continue;
+        }
+        // Skip the file scans below once every episode the copies supply has a slot.
+        let unslotted = copies.iter().any(|(_, r)| {
+            r.provides
+                .iter()
+                .any(|&(s, e)| !slotted.contains(crate::store::episode_slot(*tmdb, s, e).as_str()))
+        });
+        if !unslotted {
+            continue;
+        }
+        let audio = title_audio_prefs(
+            prefs,
+            &copies[0].1.request,
+            title_langs.get(&(false, *tmdb)).copied(),
+        );
+        // Every episode the copies supply, with the file each copy would serve for it.
+        let mut suppliers: BTreeMap<(u32, u32), Vec<Supplier>> = BTreeMap::new();
+        for (hash, r) in copies {
+            for (episode, file) in FileIndex::of(present_by_hash[hash]).by_episode {
+                if r.provides.contains(&episode) {
+                    suppliers.entry(episode).or_default().push((
+                        hash.as_str(),
+                        *r,
+                        file.path.as_str(),
+                    ));
+                }
+            }
+        }
+        // Planned slots per episode; a chosen multi-episode file's later episodes join them below.
+        let mut planned: BTreeMap<(u32, u32), SelectionEntry> = BTreeMap::new();
+        let mut later: Vec<((u32, u32), SelectionEntry)> = Vec::new();
+        for ((season, episode), candidates) in suppliers {
+            if candidates.len() < 2 {
+                continue;
+            }
+            let slot = crate::store::episode_slot(*tmdb, season, episode);
+            if slotted.contains(slot.as_str()) {
+                continue;
+            }
+            let best = candidates
+                .into_iter()
+                .map(|(h, r, path)| (h, r, served_rank(r.quality.as_ref(), path), path))
+                .filter(|(h, _, rank, path)| {
+                    !(rules.allow_resolution_downgrade && rank.resolution > rules.max_resolution)
+                        && !copy_tags_wrong_audio(present_by_hash[*h], path, &audio)
+                })
+                .max_by(|(ha, ra, rank_a, _), (hb, rb, rank_b, _)| {
+                    let score =
+                        |r: &OwnedRecord| r.quality.as_ref().map(|q| q.score).unwrap_or(i64::MIN);
+                    // Highest rank, then score; on a full tie the SMALLER hash wins.
+                    (rank_a, score(ra))
+                        .cmp(&(rank_b, score(rb)))
+                        .then_with(|| hb.cmp(ha))
+                });
+            if let Some((hash, record, _, path)) = best {
+                let entry = SelectionEntry {
+                    hash: hash.to_string(),
+                    file_path: path.to_string(),
+                };
+                // The file serves every episode it carries, as `observe` slots it: without a slot on
+                // its later episodes the VFS keeps the other copy's file for them.
+                let name = path.rsplit('/').next().unwrap_or(path);
+                for ep in crate::vfs::parse_se_all(name).into_iter().skip(1) {
+                    if record.provides.contains(&ep) {
+                        later.push((ep, entry.clone()));
+                    }
+                }
+                planned.insert((season, episode), entry);
+            }
+        }
+        for (ep, entry) in later {
+            planned.entry(ep).or_insert(entry);
+        }
+        for ((season, episode), to) in planned {
+            let slot = crate::store::episode_slot(*tmdb, season, episode);
+            if !slotted.contains(slot.as_str()) {
+                out.push(SlotCreation { slot, to });
+            }
         }
     }
     out.sort_by(|a, b| a.slot.cmp(&b.slot));
@@ -503,12 +647,14 @@ pub(crate) fn parse_slot(slot: &str) -> Option<SlotKey> {
     }
 }
 
-/// Plan [`plan_selection_repoints`] over the current library and, when the library is idle (a
-/// repoint changes which file an episode shows, so it would cut off a stream of that episode), apply
-/// it. Each repoint is a compare-and-set ([`Store::repoint_selection_if`]), so a slot the upgrade
-/// engine swapped or dedup cleared since the plan is left alone. Torrents hidden by repair are not
-/// candidates, and a wholesale-empty listing plans nothing. Returns how many slots moved; the VFS
-/// shows the change on the next scan tick.
+/// Plan [`plan_missing_episode_slots`] and [`plan_selection_repoints`] over the current library and,
+/// when the library is idle (a new or moved slot changes which file an episode shows, so it would
+/// cut off a stream of that episode), apply them. Each write is a compare-and-set: a created slot
+/// only while the slot is still absent ([`Store::create_selection_if_absent`]), a repoint only while
+/// the slot still holds what was planned from ([`Store::repoint_selection_if`]), so a slot the
+/// upgrade engine or `observe` wrote, or dedup cleared, since the plan is left alone. Torrents hidden
+/// by repair are not candidates, and a wholesale-empty listing plans nothing. Returns how many slots
+/// were created or moved; the VFS shows the change on the next scan tick.
 pub async fn repoint_to_better_copies(
     store: &Store,
     read_activity: &ReadActivity,
@@ -528,19 +674,43 @@ pub async fn repoint_to_better_copies(
     }
     let owned = store.all_owned().await;
     let selection = store.all_selection().await;
+    let creations = plan_missing_episode_slots(&owned, &selection, &present, rules, prefs);
     let plan = plan_selection_repoints(&owned, &selection, &present, rules, prefs);
-    if plan.is_empty() {
+    if plan.is_empty() && creations.is_empty() {
         return 0;
     }
     if !read_activity.all_idle(idle_window).await {
         debug!(
-            "selection: {} slot(s) could serve a better copy — library not idle, deferring",
-            plan.len()
+            "selection: {} slot(s) could serve a better copy and {} episode(s) held by several \
+             copies have none — library not idle, deferring",
+            plan.len(),
+            creations.len()
         );
         return 0;
     }
     let short = |h: &str| h.chars().take(8).collect::<String>();
     let mut moved = 0usize;
+    for c in &creations {
+        match store
+            .create_selection_if_absent(c.slot.clone(), c.to.clone())
+            .await
+        {
+            Ok(true) => {
+                moved += 1;
+                info!(
+                    "selection: {} now served from {} ({}) — several copies hold it and it had no slot",
+                    c.slot,
+                    short(&c.to.hash),
+                    c.to.file_path.rsplit('/').next().unwrap_or(&c.to.file_path)
+                );
+            }
+            Ok(false) => debug!(
+                "selection: {} was written since planning — left alone",
+                c.slot
+            ),
+            Err(e) => warn!("selection: creating {} failed: {}", c.slot, e),
+        }
+    }
     for r in &plan {
         match store
             .repoint_selection_if(r.slot.clone(), r.from.clone(), r.to.clone())
@@ -996,6 +1166,274 @@ mod tests {
         assert!(
             plan_selection_repoints(&base(), &selection, &[&better], OFF, &prefs()).is_empty(),
             "a slot serving an absent copy is left alone (the VFS already falls back)"
+        );
+    }
+
+    /// Two packs of one show hold the same three episodes and no slot covers them (as when a copy
+    /// lost its record and slots, then came back as an account-mirror record): the VFS would list
+    /// every distinct file name, so each episode would show twice. Each gets a slot on the copy
+    /// that serves it best. An episode with a slot already, and one only one copy supplies, get none.
+    #[test]
+    fn an_unslotted_episode_two_copies_supply_gets_a_slot_on_the_better_copy() {
+        let mut avi_eps = eps(1, 4);
+        avi_eps.push((2, 1));
+        let owned = vec![
+            (
+                "avi".to_string(),
+                rec(MediaKind::Series, 7, avi_eps, q(0, 0, 1_000_022)),
+            ),
+            (
+                "web".to_string(),
+                rec(MediaKind::Series, 7, eps(1, 3), q(0, 3_000, 1_005_000)),
+            ),
+        ];
+        let avi = info(
+            "avi",
+            &[
+                ("A/Season 1/Show - S01E01 - One [dd].avi", 5),
+                ("A/Season 1/Show - S01E02 - Two [dd].avi", 5),
+                ("A/Season 1/Show - S01E03 - Three [dd].avi", 5),
+                ("A/Season 1/Show - S01E04 - Four [dd].avi", 5),
+                ("A/Season 2/Show - S02E01 - Five [dd].avi", 5),
+            ],
+        );
+        let web = info(
+            "web",
+            &[
+                ("W/Show.S01E01.One.AMZN.WEB-DL.DD+2.0.H.264.mkv", 3),
+                ("W/Show.S01E02.Two.AMZN.WEB-DL.DD+2.0.H.264.mkv", 3),
+                ("W/Show.S01E03.Three.AMZN.WEB-DL.DD+2.0.H.264.mkv", 3),
+                ("W/RARBG.txt", 1),
+            ],
+        );
+        let selection = vec![
+            (
+                episode_slot(7, 1, 4),
+                sel("avi", "A/Season 1/Show - S01E04 - Four [dd].avi"),
+            ),
+            (
+                episode_slot(7, 2, 1),
+                sel("avi", "A/Season 2/Show - S02E01 - Five [dd].avi"),
+            ),
+        ];
+        let plan = plan_missing_episode_slots(&owned, &selection, &[&avi, &web], OFF, &prefs());
+        let created = |e: u32, name: &str| SlotCreation {
+            slot: episode_slot(7, 1, e),
+            to: sel(
+                "web",
+                &format!("W/Show.S01E0{e}.{name}.AMZN.WEB-DL.DD+2.0.H.264.mkv"),
+            ),
+        };
+        assert_eq!(
+            plan,
+            vec![created(1, "One"), created(2, "Two"), created(3, "Three")]
+        );
+        // With the slots in place nothing more is planned, and the repoint keeps them.
+        let mut after = selection.clone();
+        after.extend(plan.iter().map(|c| (c.slot.clone(), c.to.clone())));
+        assert!(
+            plan_missing_episode_slots(&owned, &after, &[&avi, &web], OFF, &prefs()).is_empty()
+        );
+        assert!(plan_selection_repoints(&owned, &after, &[&avi, &web], OFF, &prefs()).is_empty());
+    }
+
+    /// A double-episode file serves both its episodes, so the slot created for its first episode
+    /// comes with one for the second, as `observe` slots every episode a file carries. Otherwise the
+    /// VFS would keep the other copy's double file for the second episode.
+    #[test]
+    fn a_created_slot_covers_every_episode_of_a_multi_episode_file() {
+        let owned = vec![
+            (
+                "good".to_string(),
+                rec(MediaKind::Series, 7, eps(1, 2), q(1080, 6_000, 1)),
+            ),
+            (
+                "poor".to_string(),
+                rec(MediaKind::Series, 7, eps(1, 2), q(480, 3_000, 1)),
+            ),
+        ];
+        let good = info("good", &[("G/Show.S01E01E02.1080p.BluRay.mkv", 2)]);
+        let poor = info("poor", &[("P/Show.S01E01E02.480p.WEB.mkv", 9)]);
+        let plan = plan_missing_episode_slots(&owned, &[], &[&good, &poor], OFF, &prefs());
+        let to = sel("good", "G/Show.S01E01E02.1080p.BluRay.mkv");
+        assert_eq!(
+            plan,
+            vec![
+                SlotCreation {
+                    slot: episode_slot(7, 1, 1),
+                    to: to.clone()
+                },
+                SlotCreation {
+                    slot: episode_slot(7, 1, 2),
+                    to
+                },
+            ]
+        );
+    }
+
+    /// A slot is created only where it decides something: two settled, present copies supply the
+    /// episode. One copy alone, a `Pending` or absent second copy, and a movie (the VFS shows one
+    /// copy of a film without a slot) get none.
+    #[test]
+    fn no_slot_is_created_for_one_copy_an_unsettled_one_or_a_movie() {
+        let show = |h: &str, tier: i64| {
+            (
+                h.to_string(),
+                rec(MediaKind::Series, 7, eps(1, 1), q(1080, tier, 1)),
+            )
+        };
+        let a = info("a", &[("A/Show.S01E01.1080p.WEB.mkv", 2)]);
+        let b = info("b", &[("B/Show.S01E01.1080p.BluRay.mkv", 2)]);
+        assert!(
+            plan_missing_episode_slots(&[show("a", 3_000)], &[], &[&a], OFF, &prefs()).is_empty()
+        );
+        let mut pending = show("b", 6_000);
+        pending.1.status = OwnedStatus::Pending;
+        assert!(plan_missing_episode_slots(
+            &[show("a", 3_000), pending],
+            &[],
+            &[&a, &b],
+            OFF,
+            &prefs()
+        )
+        .is_empty());
+        assert!(plan_missing_episode_slots(
+            &[show("a", 3_000), show("b", 6_000)],
+            &[],
+            &[&a],
+            OFF,
+            &prefs()
+        )
+        .is_empty());
+        let film = |h: &str| {
+            (
+                h.to_string(),
+                rec(MediaKind::Movie, 9, vec![], q(1080, 3_000, 1)),
+            )
+        };
+        let fa = info("fa", &[("Film.2020.1080p.WEB.mkv", 2)]);
+        let fb = info("fb", &[("Film.2020.1080p.BluRay.mkv", 2)]);
+        assert!(plan_missing_episode_slots(
+            &[film("fa"), film("fb")],
+            &[],
+            &[&fa, &fb],
+            OFF,
+            &prefs()
+        )
+        .is_empty());
+        // Both settled and present: the BluRay copy gets the slot.
+        let plan = plan_missing_episode_slots(
+            &[show("a", 3_000), show("b", 6_000)],
+            &[],
+            &[&a, &b],
+            OFF,
+            &prefs(),
+        );
+        assert_eq!(
+            plan,
+            vec![SlotCreation {
+                slot: episode_slot(7, 1, 1),
+                to: sel("b", "B/Show.S01E01.1080p.BluRay.mkv"),
+            }]
+        );
+    }
+
+    /// A created slot follows the repoint's rules: never onto a copy tagged only with another audio
+    /// language, nor, with `ALLOW_RESOLUTION_DOWNGRADE` on, onto one above `MAX_RESOLUTION`. When
+    /// only one copy qualifies it still gets the slot, which hides the other copy's file.
+    #[test]
+    fn a_created_slot_skips_wrong_language_and_over_ceiling_copies() {
+        let english = |mut r: OwnedRecord| {
+            r.request.original_language = Some("en".into());
+            r
+        };
+        let owned = vec![
+            (
+                "web".to_string(),
+                english(rec(MediaKind::Series, 7, eps(1, 1), q(1080, 3_000, 9))),
+            ),
+            (
+                "rus".to_string(),
+                rec(MediaKind::Series, 7, eps(1, 1), q(1080, 6_000, 9)),
+            ),
+        ];
+        let web = info("web", &[("W/Show.S01E01.1080p.WEB.mkv", 4)]);
+        let mut rus = info("rus", &[("R/Show.S01E01.1080p.BluRay.mkv", 8)]);
+        rus.filename = "Show.S01.1080p.BluRay.RUS".into();
+        let plan = plan_missing_episode_slots(&owned, &[], &[&web, &rus], OFF, &prefs());
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            plan[0].to.hash, "web",
+            "the English copy serves the English show"
+        );
+
+        let ceiling = RepointRules {
+            max_resolution: 1080,
+            allow_resolution_downgrade: true,
+        };
+        let owned = vec![
+            (
+                "hd".to_string(),
+                rec(MediaKind::Series, 7, eps(1, 1), q(1080, 3_000, 1)),
+            ),
+            (
+                "uhd".to_string(),
+                rec(MediaKind::Series, 7, eps(1, 1), q(2160, 6_000, 1)),
+            ),
+        ];
+        let hd = info("hd", &[("H/Show.S01E01.1080p.WEB.mkv", 4)]);
+        let uhd = info("uhd", &[("U/Show.S01E01.2160p.BluRay.mkv", 8)]);
+        let plan = plan_missing_episode_slots(&owned, &[], &[&hd, &uhd], ceiling, &prefs());
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].to.hash, "hd");
+        let plan = plan_missing_episode_slots(&owned, &[], &[&hd, &uhd], OFF, &prefs());
+        assert_eq!(
+            plan[0].to.hash, "uhd",
+            "with downgrades off the ceiling plays no part"
+        );
+    }
+
+    /// The executor creates the missing slots too, under the same idle gate (a new slot hides the
+    /// other copy's file, which would cut off a stream of it).
+    #[tokio::test]
+    async fn the_executor_creates_a_missing_slot_when_idle() {
+        let (store, current) = better_copy_fixture().await;
+        // No slot at all: the episode is listed from both copies.
+        store.remove_selection(episode_slot(7, 1, 1)).await.unwrap();
+        let busy = ReadActivity::without_startup_grace();
+        busy.touch("pack").await;
+        let window = Duration::from_secs(300);
+        assert_eq!(
+            repoint_to_better_copies(
+                &store,
+                &busy,
+                window,
+                &HashSet::new(),
+                &current,
+                OFF,
+                &prefs()
+            )
+            .await,
+            0
+        );
+        assert_eq!(store.get_selection(episode_slot(7, 1, 1)).await, None);
+        let idle = ReadActivity::without_startup_grace();
+        assert_eq!(
+            repoint_to_better_copies(
+                &store,
+                &idle,
+                window,
+                &HashSet::new(),
+                &current,
+                OFF,
+                &prefs()
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            store.get_selection(episode_slot(7, 1, 1)).await,
+            Some(sel("remux", "Show.S01E01.REMUX.mkv"))
         );
     }
 

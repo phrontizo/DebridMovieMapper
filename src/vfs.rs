@@ -11,8 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// `SelectionEntry`. A slot with no managed selection (or a stale one) gets the pre-SP3 behaviour,
 /// so external / un-managed torrents are unaffected: a movie falls back to its largest streamable
 /// torrent, and an unmanaged show episode keeps every distinct file name, same-named copies
-/// resolving to the largest torrent. A multi-episode file is hidden only when every episode it
-/// carries is selected from another present copy.
+/// resolving to the largest torrent (under canonical names, [`EpisodeNames::Canonical`], every copy
+/// of an episode has the same name, so one copy shows). A multi-episode file is hidden only when
+/// every episode it carries is selected from another present copy.
 pub type SelectionMap = std::collections::HashMap<String, crate::store::SelectionEntry>;
 
 /// Parse ALL `(season, episode)` pairs a file name declares: a single `SxxEyy` (also with one `.`,
@@ -78,11 +79,12 @@ pub type SelectionMap = std::collections::HashMap<String, crate::store::Selectio
 /// scene form (`Show.-.409.-.Title`) yields no code at all (an empty `provides` for such a file), as
 /// does other absolute numbering (`Show - 041 [1080p]`) and an episode word with no season code
 /// (`E09 - Title.mkv`, `Episode 9.mkv`). A file with no code that names its episode by an episode
-/// word or a trailing ` - NN` number is still mapped ([`codeless_episode_files`], read by
-/// [`show_episode_files`]): a single-file release in the season the VFS places it in (season 1
-/// unless the name or a directory names one), and a file of a multi-file pack only under an
-/// explicit season (a season token in its name or a season directory, not a `Part N` in the file
-/// name, nor a season range), and nothing when another selected file names the same episode. The
+/// word, a part of a total (`Doc.2of4.mkv`, `Part 2 of 4`) or a trailing ` - NN` number is still
+/// mapped ([`codeless_episode_files`], read by [`show_episode_files`]): a single-file release in the
+/// season the VFS places it in (season 1 unless the name or a directory names one), and a file of a
+/// multi-file pack only under an explicit season (a season token in its name or a season directory,
+/// not a `Part N` in the file name, nor a season range) or, for a part of a total, in season 1 when
+/// nothing names a season, and nothing when another selected file names the same episode. The
 /// dotted dash form, whose number another ` - ` follows once its dots are read as spaces, stays
 /// rejected as `EpisodeMissing`, as do an absolutely numbered pack with no explicit season and an
 /// absolute number past season 1 (`Show - 30` for S02E05): neither names an episode there.
@@ -659,6 +661,22 @@ impl Hash for MediaMetadata {
     }
 }
 
+/// How the VFS names a show's episode files (`EPISODE_FILE_NAMES`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EpisodeNames {
+    /// `Show (2020) - S01E02.mkv`, built from the episodes the VFS places the file under
+    /// ([`canonical_episode_name`]), so every media server and player reads the episode the
+    /// service means. Kodi's default rules read further codes out of an episode title
+    /// (`S00E41 - Inside the Episode S2 E1` as S02E01 too, `S03E03.4-5-1` as three episodes), and
+    /// its watched state is keyed by path, so switching modes on a library costs its Kodi users
+    /// their watched marks. Copies of an episode share the name, so a season folder shows one. A
+    /// file the service can't number, or whose codes aren't one contiguous run, keeps its own name.
+    #[default]
+    Canonical,
+    /// The torrent's own file name.
+    Original,
+}
+
 pub struct DebridVfs {
     pub root: VfsNode,
     pub timestamps: HashMap<String, SystemTime>,
@@ -692,7 +710,20 @@ impl DebridVfs {
         }
     }
 
+    /// [`DebridVfs::build_with`] serving each file under its own name ([`EpisodeNames::Original`]):
+    /// the tests and the live test binaries' builder. The scan loop builds with the configured
+    /// `EPISODE_FILE_NAMES`.
     pub fn build(torrents: Vec<(TorrentInfo, MediaMetadata)>, selection: &SelectionMap) -> Self {
+        Self::build_with(torrents, selection, EpisodeNames::Original)
+    }
+
+    /// Build the tree from the provider listing's identified torrents and the managed `selection`,
+    /// naming episode files as `names` says.
+    pub fn build_with(
+        torrents: Vec<(TorrentInfo, MediaMetadata)>,
+        selection: &SelectionMap,
+        names: EpisodeNames,
+    ) -> Self {
         let mut movies_nodes = BTreeMap::new();
         let mut shows_nodes = BTreeMap::new();
         let mut timestamps: HashMap<String, SystemTime> = HashMap::new();
@@ -831,10 +862,11 @@ impl DebridVfs {
                     // (`tasks::multi_feature_hashes`). The stored `file_path` still matters elsewhere:
                     // `selection::plan_selection_repoints` ranks the served copy by it (`served_rank`)
                     // and writes the movie's largest emittable file there. A stale episode selection
-                    // falls back to every distinct file name, same-named copies resolving to the
-                    // largest torrent; a movie has no such fallback within its selected torrent, so
-                    // enforcing the path here would risk HIDING the movie after a re-acquire shifted
-                    // the path. The hash-only match is deliberate.
+                    // falls back to every distinct file name (one per episode under canonical
+                    // names), same-named copies resolving to the largest torrent; a movie has no
+                    // such fallback within its selected torrent, so enforcing the path here would
+                    // risk HIDING the movie after a re-acquire shifted the path. The hash-only match
+                    // is deliberate.
                     let selected_hash = tmdb_id_of(&metadata)
                         .and_then(|id| selection.get(&crate::store::movie_slot(id)))
                         .map(|sel| sel.hash.clone());
@@ -918,6 +950,11 @@ impl DebridVfs {
                         } else {
                             std::collections::HashSet::new()
                         };
+                    // Every file a season folder shows, keyed `Season NN/<name>`, or for a canonical
+                    // name `Season NN/<name without its extension>`: copies of an episode in other
+                    // containers (`.avi` beside `.mkv`) are the same episode. A copy that collides
+                    // with one shown replaces it only when it beats it (`ShownCopy::beats`).
+                    let mut shown: HashMap<String, ShownCopy> = HashMap::new();
                     for torrent in torrents {
                         let torrent_ts = parse_rd_date(&torrent.added);
                         if torrent_ts > show_max_ts {
@@ -926,7 +963,7 @@ impl DebridVfs {
                         note_link_count_mismatch(&torrent);
                         // The episodes this torrent's code-less files name, as the acquisition
                         // engine maps (and slots) them: built on the first code-less file the
-                        // selection gate meets.
+                        // selection gate or a canonical name needs it for.
                         let mut codeless: Option<HashMap<String, (u32, u32)>> = None;
                         for (file, link) in emittable_video_files_with_links(&torrent) {
                             let filename = file.path.split('/').next_back().unwrap_or(&file.path);
@@ -935,6 +972,24 @@ impl DebridVfs {
                             // free).
                             let codes = parse_se_all(filename);
                             let se = codes.first().copied();
+                            // The episode a code-less file maps to, for the selection gate and a
+                            // canonical name.
+                            let mapped = if codes.is_empty()
+                                && (names == EpisodeNames::Canonical
+                                    || (show_tmdb.is_some() && !selection.is_empty()))
+                            {
+                                codeless
+                                    .get_or_insert_with(|| {
+                                        codeless_episode_files(&torrent)
+                                            .into_iter()
+                                            .map(|(s, e, path)| (path, (s, e)))
+                                            .collect()
+                                    })
+                                    .get(&file.path)
+                                    .copied()
+                            } else {
+                                None
+                            };
                             // SP3 selection gate: a file is skipped only when EVERY episode it
                             // carries has a managed selection naming another present (hash,
                             // file_path). A multi-episode file (`S01E01E02`) is therefore kept
@@ -966,16 +1021,8 @@ impl DebridVfs {
                                     if codes.iter().all(selected_elsewhere) {
                                         continue;
                                     }
-                                } else if !selection.is_empty() {
-                                    let mapped = codeless.get_or_insert_with(|| {
-                                        codeless_episode_files(&torrent)
-                                            .into_iter()
-                                            .map(|(s, e, path)| (path, (s, e)))
-                                            .collect()
-                                    });
-                                    if mapped.get(&file.path).is_some_and(selected_elsewhere) {
-                                        continue;
-                                    }
+                                } else if mapped.as_ref().is_some_and(selected_elsewhere) {
+                                    continue;
                                 }
                             }
                             // Prefer the FIRST episode code for the folder season: it handles
@@ -991,6 +1038,46 @@ impl DebridVfs {
                                 .map(|(s, _)| s)
                                 .unwrap_or_else(|| season_of_codeless_file(&file.path, filename));
 
+                            // The name the file is served under: its own, or, under canonical names,
+                            // one built from the episodes it is placed under (a code-less file's
+                            // mapped episode counts only in the season folder it lands in).
+                            let canonical = match names {
+                                EpisodeNames::Original => None,
+                                EpisodeNames::Canonical => {
+                                    let mapped_here: Vec<(u32, u32)> =
+                                        mapped.filter(|&(s, _)| s == season).into_iter().collect();
+                                    let episodes = if codes.is_empty() {
+                                        &mapped_here[..]
+                                    } else {
+                                        &codes[..]
+                                    };
+                                    canonical_episode_name(
+                                        &base_name,
+                                        metadata.year.as_deref(),
+                                        episodes,
+                                        filename,
+                                    )
+                                }
+                            };
+                            let served_name = canonical.as_deref().unwrap_or(filename);
+                            // Whether a slot selects this file for an episode it carries: it then
+                            // wins any name collision.
+                            let selected = show_tmdb.is_some_and(|tmdb| {
+                                let episodes = if codes.is_empty() {
+                                    mapped.as_slice()
+                                } else {
+                                    &codes[..]
+                                };
+                                episodes.iter().any(|&(s, e)| {
+                                    selection
+                                        .get(&crate::store::episode_slot(tmdb, s, e))
+                                        .is_some_and(|sel| {
+                                            sel.hash.eq_ignore_ascii_case(&torrent.hash)
+                                                && sel.file_path == file.path
+                                        })
+                                })
+                            });
+
                             let season_name = format!("Season {:02}", season);
                             let season_dir = show_children
                                 .entry(season_name.clone())
@@ -1002,14 +1089,38 @@ impl DebridVfs {
                                 children: season_children,
                             } = season_dir
                             {
-                                // Skip if this episode already exists (from a larger/earlier
-                                // torrent).
-                                if season_children.contains_key(filename) {
-                                    continue;
+                                // A name the season folder already shows (from a larger or earlier
+                                // torrent) is kept unless this copy beats it. Under canonical names
+                                // every copy of an episode has the same name, whatever its
+                                // container, so one shows.
+                                let key = match &canonical {
+                                    Some(name) => format!(
+                                        "{season_name}/{}",
+                                        name.rsplit_once('.')
+                                            .map_or(name.as_str(), |(stem, _)| stem)
+                                    ),
+                                    None => format!("{season_name}/{served_name}"),
+                                };
+                                let incoming = ShownCopy {
+                                    name: String::new(),
+                                    selected,
+                                    coded: !codes.is_empty(),
+                                    path: file.path.clone(),
+                                    bytes: file.bytes,
+                                };
+                                if let Some(existing) = shown.get(&key) {
+                                    if !incoming.beats(existing, names) {
+                                        continue;
+                                    }
+                                    season_children.remove(&existing.name);
+                                    timestamps.remove(&format!(
+                                        "{}/{}/{}",
+                                        show_prefix, season_name, existing.name
+                                    ));
                                 }
                                 let file_name = Self::add_path_to_tree(
                                     season_children,
-                                    filename,
+                                    served_name,
                                     file.bytes,
                                     FileLocator {
                                         hash: torrent.hash.clone(),
@@ -1022,6 +1133,13 @@ impl DebridVfs {
                                 timestamps.insert(
                                     format!("{}/{}/{}", show_prefix, season_name, file_name),
                                     torrent_ts,
+                                );
+                                shown.insert(
+                                    key,
+                                    ShownCopy {
+                                        name: file_name,
+                                        ..incoming
+                                    },
                                 );
                             }
                         }
@@ -1232,6 +1350,117 @@ impl DebridVfs {
     }
 }
 
+/// A file a show's season folder shows, as a name collision weighs it ([`ShownCopy::beats`]).
+struct ShownCopy {
+    /// The name it is shown under.
+    name: String,
+    /// A slot selects it for an episode it carries.
+    selected: bool,
+    /// Its name carries an episode code (a code-less file is shown by the episode it maps to).
+    coded: bool,
+    path: String,
+    bytes: u64,
+}
+
+impl ShownCopy {
+    /// Whether this copy replaces `other` when the two collide on a name: the slot's file always
+    /// wins (a double-episode file's second episode may have no slot, so the other copy's file isn't
+    /// hidden). Under canonical names a coded file then beats a code-less one, then the better
+    /// resolution and source tier the names tag ([`tagged_quality`]), then the larger file. Anything
+    /// else keeps the copy already shown, the larger torrent's under original names.
+    fn beats(&self, other: &ShownCopy, names: EpisodeNames) -> bool {
+        if self.selected != other.selected {
+            return self.selected;
+        }
+        if names == EpisodeNames::Original {
+            return false;
+        }
+        if self.coded != other.coded {
+            return self.coded;
+        }
+        let (mine, theirs) = (tagged_quality(&self.path), tagged_quality(&other.path));
+        if mine != theirs {
+            return mine > theirs;
+        }
+        self.bytes > other.bytes
+    }
+}
+
+/// The resolution and source tier a file's name tags, else its nearest directory that tags one, 0
+/// for an axis tagged nowhere. A directory's cam word is read as a title word.
+fn tagged_quality(path: &str) -> (u16, i64) {
+    use crate::release::Source;
+    let (mut resolution, mut tier) = (None, None);
+    for (i, component) in path.rsplit('/').filter(|c| !c.is_empty()).enumerate() {
+        let info = crate::release::parse(&crate::release::RawCandidate {
+            name: component.to_string(),
+            description: String::new(),
+            info_hash: String::new(),
+            file_idx: None,
+            file_name: (i == 0).then(|| component.to_string()),
+        });
+        resolution = resolution.or(info.resolution);
+        tier = tier.or(match info.source {
+            Source::Other => None,
+            Source::Cam if i > 0 => None,
+            source => Some(source.tier_score()),
+        });
+        if resolution.is_some() && tier.is_some() {
+            break;
+        }
+    }
+    (resolution.unwrap_or(0), tier.unwrap_or(0))
+}
+
+/// An episode code in a show's title (`Show S1E1`), as a player's first matching rule would read
+/// it: a title holding one is left out of the canonical name, since the player could read it first.
+static TITLE_EPISODE_CODE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)s[0-9]+[ ._x-]*e[0-9]+").unwrap());
+
+/// The canonical name of a show's episode file ([`EpisodeNames::Canonical`]):
+/// `<title> (<year>) - S01E02.<ext>`, or `S01E01-E02` for a contiguous multi-episode file, with the
+/// extension lower-cased. Kodi reads more episode codes out of an episode title
+/// (`S00E41 - Inside the Episode S2 E1`, `S03E03.4-5-1`), and a name with nothing after the code but
+/// its extension leaves it nothing to read. `title` is the sanitised show title; the year is left
+/// out unless it is a plain four-digit one, and the title too when it holds an episode code of its
+/// own. `None` (the file keeps its own name) when `episodes` is empty, spans seasons or isn't one
+/// contiguous run, or `filename` has no extension.
+fn canonical_episode_name(
+    title: &str,
+    year: Option<&str>,
+    episodes: &[(u32, u32)],
+    filename: &str,
+) -> Option<String> {
+    let (_, extension) = filename.rsplit_once('.')?;
+    if extension.is_empty() {
+        return None;
+    }
+    let mut run = episodes.to_vec();
+    run.sort_unstable();
+    run.dedup();
+    let (&(season, first), &(_, last)) = (run.first()?, run.last()?);
+    let contiguous = run
+        .windows(2)
+        .all(|w| w[1].0 == season && w[1].1 == w[0].1 + 1);
+    if !contiguous {
+        return None;
+    }
+    let code = if first == last {
+        format!("S{season:02}E{first:02}")
+    } else {
+        format!("S{season:02}E{first:02}-E{last:02}")
+    };
+    let extension = extension.to_ascii_lowercase();
+    if TITLE_EPISODE_CODE_RE.is_match(title) {
+        return Some(format!("{code}.{extension}"));
+    }
+    let year = year
+        .filter(|y| y.len() == 4 && y.bytes().all(|b| b.is_ascii_digit()))
+        .map(|y| format!(" ({y})"))
+        .unwrap_or_default();
+    Some(format!("{title}{year} - {code}.{extension}"))
+}
+
 /// Replace characters that are invalid in filenames or interpreted as path separators.
 /// Covers POSIX path separators, Windows-reserved characters, trailing dots/spaces (which Windows
 /// silently strips), and bare Windows reserved device names (CON, NUL, COM1…) — important for
@@ -1239,10 +1468,11 @@ impl DebridVfs {
 ///
 /// NOTE on a deliberate asymmetry: this is applied to the library-CONSTRUCTED Movie/Show folder
 /// names (the title, and the `[tmdbid-N]`-suffixed folder name; season folders (`Season NN`) and
-/// NFO names (`movie.nfo`/`tvshow.nfo`) are fixed strings that need no sanitising) but NOT to
-/// media-file LEAF names, which keep the exact torrent basename
-/// (`file.path.split('/').next_back()`). That is intentional: Jellyfin/Plex parse episode/quality
-/// metadata out of the original scene filename, so mangling it would degrade identification. It is
+/// NFO names (`movie.nfo`/`tvshow.nfo`) are fixed strings that need no sanitising) and to the title
+/// in a canonical episode name ([`canonical_episode_name`]), but NOT to media-file LEAF names served
+/// as they are (movies, and episodes under [`EpisodeNames::Original`] or with no canonical name),
+/// which keep the exact torrent basename (`file.path.split('/').next_back()`): a media server parses
+/// episode and quality tags out of it, and a mangled one could read differently. It is
 /// not a path-traversal risk — `/` is already stripped by taking the basename, the WebDAV layer
 /// XML-encodes names, and `dav_fs::walk_components` rejects any `..` component. (A backslash in a
 /// leaf basename is not stripped, but debrid providers / BitTorrent path lists use POSIX `/`
@@ -1633,6 +1863,8 @@ pub(crate) fn season_tokens(s: &str) -> (Option<u32>, Option<u32>) {
 /// [`explicit_season_of_codeless_file`], built on the same lookup ([`nearest_codeless_season`]).
 pub(crate) fn season_of_codeless_file(path: &str, filename: &str) -> u32 {
     let (_, part) = season_tokens(filename);
+    // A `Part N` that numbers a part of a total (`Part 2 of 4`) is the episode, not a season.
+    let part = part.filter(|&p| !part_is_of_total(filename, p));
     nearest_codeless_season(path, filename)
         .map(|(season, _)| season)
         .or(part)
@@ -1666,6 +1898,9 @@ fn nearest_codeless_season(path: &str, filename: &str) -> Option<(u32, bool)> {
     let dir = &path[..path.len() - filename.len()];
     dir.rsplit('/').filter(|c| !c.is_empty()).find_map(|c| {
         let (strong, part) = season_tokens(c);
+        // A folder named after a single file's release (`Doc.Part.2.of.4/`, as a TorBox path
+        // starts) names that part, not a season.
+        let part = part.filter(|&p| !part_is_of_total(c, p));
         let range = season_range(c, true);
         match strong.or(part) {
             Some(season) => Some((season, range.is_some())),
@@ -1795,14 +2030,56 @@ pub(crate) static EPISODE_WORD_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:^|[^a-z0-9])(?:e|ep|episode)[\s._-]*(\d{1,3})(?:[^a-z0-9]|$)").unwrap()
 });
 
+/// A part number out of a total, the numbering of documentary and miniseries releases: glued
+/// (`1of4`) or after the word `Part` (`Part 2 of 4`, `Part.2.of.4`), bounded like
+/// [`EPISODE_WORD_RE`]. A spaced `N of M` without `Part` is as often an episode title's own words
+/// (`Finale (1 of 2)`, `Season 2 of 3`, `Disc.2.of.4`) and doesn't count. Captures 1 and 2 are the
+/// worded form's part and total, 3 and 4 the glued form's.
+static PART_OF_TOTAL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:^|[^a-z0-9])(?:part[\s._-]*(\d{1,2})[\s._-]*of[\s._-]*(\d{1,2})|(\d{1,2})of(\d{1,2}))(?:[^a-z0-9]|$)",
+    )
+    .unwrap()
+});
+
+/// A name's part of a total ([`PART_OF_TOTAL_RE`]), when the part is between 1 and the total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartOfTotal {
+    part: u32,
+    total: u32,
+    /// Written `Part N of M`, so its `Part N` is this part and not a season.
+    worded: bool,
+}
+
+fn part_of_total(name: &str) -> Option<PartOfTotal> {
+    let c = PART_OF_TOTAL_RE.captures(name)?;
+    let worded = c.get(1).is_some();
+    let (part, total) = if worded { (1, 2) } else { (3, 4) };
+    let part: u32 = c.get(part)?.as_str().parse().ok()?;
+    let total: u32 = c.get(total)?.as_str().parse().ok()?;
+    (1..=total).contains(&part).then_some(PartOfTotal {
+        part,
+        total,
+        worded,
+    })
+}
+
+/// Whether `name`'s `Part N` (season number `part`, from [`season_tokens`]) is the part of a total
+/// written `Part N of M`, an episode rather than a season.
+fn part_is_of_total(name: &str, part: u32) -> bool {
+    part_of_total(name).is_some_and(|p| p.worded && p.part == part)
+}
+
 /// The episode number a show file name with no [`parse_se_all`] code names by itself: an episode
-/// word (`E09 - Title.mkv`, `Episode 9.mkv`, [`EPISODE_WORD_RE`]), else a trailing ` - NN` number,
-/// the common anime form (`[Group] Show - 12 (1080p) [ABCD1234].mkv`,
+/// word (`E09 - Title.mkv`, `Episode 9.mkv`, [`EPISODE_WORD_RE`]), else a part of a total
+/// (`Doc.2of4.mkv`, `Part 2 of 4`, [`part_of_total`]), else a trailing ` - NN` number, the common
+/// anime form (`[Group] Show - 12 (1080p) [ABCD1234].mkv`,
 /// `identification::trailing_episode_number`). Never 0.
 fn codeless_episode_number(name: &str) -> Option<u32> {
     EPISODE_WORD_RE
         .captures(name)
         .and_then(|c| c.get(1)?.as_str().parse().ok())
+        .or_else(|| part_of_total(name).map(|p| p.part))
         .or_else(|| crate::identification::trailing_episode_number(name))
         .filter(|&e| e >= 1)
 }
@@ -1836,7 +2113,9 @@ pub(crate) fn codeless_episode(path: &str) -> Option<(u32, u32)> {
 ///   the season-1 default would record S01E26..E50 for what TMDB calls S02.
 ///
 /// The mapping is all or nothing: when a mapped episode is also named by another selected video
-/// file (coded or not), the names are ambiguous and nothing is mapped. `observe` and the upgrade
+/// file (coded or not), the names are ambiguous and nothing is mapped, and so is a multi-file pack
+/// whose parts of a total are not one run (every code-less video a part of the same total, each
+/// part once). `observe` and the upgrade
 /// engine's staging sites map episodes with it ([`show_episode_files`]), the VFS build gates a
 /// code-less file on the episode it maps to, and `tasks::holds_codeless_video` (dedup and the
 /// show-swap prune guard) reads it to tell whether a record's `provides` accounts for a code-less
@@ -1852,6 +2131,9 @@ pub(crate) fn codeless_episode_files(info: &TorrentInfo) -> Vec<(u32, u32, Strin
     let single = videos.len() == 1;
     let mut named: HashMap<(u32, u32), usize> = HashMap::new();
     let mut mapped = Vec::new();
+    // The code-less videos, and the parts of a total among them (a part whose number names the
+    // episode: no episode word comes first).
+    let (mut codeless_videos, mut parts) = (0usize, Vec::new());
     for f in &videos {
         let name = f.path.rsplit('/').next().unwrap_or(&f.path);
         let codes = parse_se_all(name);
@@ -1861,13 +2143,21 @@ pub(crate) fn codeless_episode_files(info: &TorrentInfo) -> Vec<(u32, u32, Strin
             }
             continue;
         }
+        codeless_videos += 1;
+        if !EPISODE_WORD_RE.is_match(name) {
+            parts.extend(part_of_total(name));
+        }
         let Some(episode) = codeless_episode_number(name) else {
             continue;
         };
         let season = if single {
             Some(season_of_codeless_file(&f.path, name))
         } else {
-            explicit_season_of_codeless_file(&f.path, name)
+            // A part of a total (`2of4`) is one run, so with nothing naming a season it is season 1.
+            explicit_season_of_codeless_file(&f.path, name).or_else(|| {
+                (part_of_total(name).is_some() && nearest_codeless_season(&f.path, name).is_none())
+                    .then_some(1)
+            })
         };
         if let Some(season) = season {
             *named.entry((season, episode)).or_default() += 1;
@@ -1876,6 +2166,17 @@ pub(crate) fn codeless_episode_files(info: &TorrentInfo) -> Vec<(u32, u32, Strin
     }
     if mapped.iter().any(|(s, e, _)| named[&(*s, *e)] > 1) {
         return Vec::new();
+    }
+    // Parts of a total in a pack are one run only when every code-less video is a part of the same
+    // total, each part once; otherwise the numbers are as likely the files' own words.
+    if !single && !parts.is_empty() {
+        let one_total = parts.iter().all(|p| p.total == parts[0].total);
+        let mut numbers: Vec<u32> = parts.iter().map(|p| p.part).collect();
+        numbers.sort_unstable();
+        numbers.dedup();
+        if parts.len() != codeless_videos || !one_total || numbers.len() != parts.len() {
+            return Vec::new();
+        }
     }
     mapped
 }
@@ -2187,7 +2488,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{dir, media_file, only_show};
+    use super::test_support::{dir, media_file, only_show, show_torrent};
     use super::*;
     use crate::rd_client::{TorrentFile, TorrentInfo};
 
@@ -4932,6 +5233,454 @@ mod tests {
             ..Default::default()
         };
         assert!(codeless_episode_files(&info).is_empty());
+    }
+
+    /// A documentary or miniseries numbered as parts of a total (`1of4`, `Part 2 of 4`) names its
+    /// episode by the part number. The total says the files are one run, so a multi-file pack of
+    /// them maps under season 1 without an explicit season, unlike an anime absolute-number batch,
+    /// and a file-name `Part N` followed by `of M` names no season.
+    #[test]
+    fn n_of_m_parts_name_their_episode_in_season_one() {
+        let pack = |names: &[&str]| TorrentInfo {
+            files: names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| TorrentFile {
+                    id: i as u32,
+                    path: format!("Some.Doc.2026.1080p.HDTV.x265-GRP/{n}"),
+                    bytes: 900_000_000,
+                    selected: 1,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let glued = pack(&[
+            "Some.Doc.1of4.1080p.HDTV.x265.mkv",
+            "Some.Doc.2of4.1080p.HDTV.x265.mkv",
+            "Some.Doc.3of4.1080p.HDTV.x265.mkv",
+            "Some.Doc.4of4.1080p.HDTV.x265.mkv",
+        ]);
+        let mapped: Vec<(u32, u32)> = codeless_episode_files(&glued)
+            .into_iter()
+            .map(|(s, e, _)| (s, e))
+            .collect();
+        assert_eq!(mapped, vec![(1, 1), (1, 2), (1, 3), (1, 4)]);
+
+        let spelled = pack(&["Some Doc - Part 1 of 2.mkv", "Some Doc - Part 2 of 2.mkv"]);
+        let mapped: Vec<(u32, u32)> = codeless_episode_files(&spelled)
+            .into_iter()
+            .map(|(s, e, _)| (s, e))
+            .collect();
+        assert_eq!(mapped, vec![(1, 1), (1, 2)]);
+        let path = "Some.Doc.2026.1080p.HDTV.x265-GRP/Some Doc - Part 2 of 2.mkv";
+        assert_eq!(
+            season_of_codeless_file(path, "Some Doc - Part 2 of 2.mkv"),
+            1,
+            "Part 2 of 2 is the second part, not season 2"
+        );
+        assert_eq!(codeless_episode(path), Some((1, 2)));
+        // A season named elsewhere still wins, and a part past the total names nothing.
+        assert_eq!(
+            codeless_episode("Some.Doc.S02/Some.Doc.3of6.mkv"),
+            Some((2, 3))
+        );
+        assert_eq!(codeless_episode("Some.Doc.5of4.mkv"), None);
+        assert_eq!(codeless_episode("Some.Doc.0of4.mkv"), None);
+    }
+
+    /// Only the glued `1of4` and the worded `Part N of M` number an episode: a spaced `N of M` is as
+    /// often an episode title's own words (`Finale (1 of 2)`, `Season 2 of 3`, `Disc 2 of 4`). In a
+    /// multi-file pack the parts must also be one run, every code-less video a part of the same total
+    /// and each part once, or nothing maps.
+    #[test]
+    fn only_a_consistent_run_of_parts_numbers_episodes() {
+        let pack = |names: &[&str]| TorrentInfo {
+            files: names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| TorrentFile {
+                    id: i as u32,
+                    path: format!("Pack/{n}"),
+                    bytes: 900_000_000,
+                    selected: 1,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let finale = pack(&[
+            "Show - 01 - Pilot.mkv",
+            "Show - 02 - Second.mkv",
+            "Show - 05 - Finale (1 of 2).mkv",
+            "Show - 06 - Finale (2 of 2).mkv",
+        ]);
+        assert!(codeless_episode_files(&finale).is_empty());
+        assert_eq!(codeless_episode("/Show - Finale (1 of 2).mkv"), None);
+        assert_eq!(codeless_episode("/Show.S01.Disc.2.of.4.mkv"), None);
+        assert!(codeless_episode_files(&pack(&["Doc.1of2.mkv", "Doc.2of3.mkv"])).is_empty());
+        assert!(codeless_episode_files(&pack(&[
+            "Doc.1of2.mkv",
+            "Doc.2of2.mkv",
+            "Doc.Epilogue.mkv"
+        ]))
+        .is_empty());
+    }
+
+    /// A `Part N` that is the part of a total names no season, in a folder as in the file name (a
+    /// TorBox path starts with the torrent's folder, which repeats a single file's release name).
+    /// Another `Part N` still names its season.
+    #[test]
+    fn a_part_of_a_total_names_no_season_in_a_folder_either() {
+        let path =
+            "Some.Doc.Part.2.of.4.1080p.HDTV.x264-GRP/Some.Doc.Part.2.of.4.1080p.HDTV.x264-GRP.mkv";
+        assert_eq!(codeless_episode(path), Some((1, 2)));
+        let name = "Show Part 3 - Episode 2 of 6.mkv";
+        assert_eq!(season_of_codeless_file(&format!("/{name}"), name), 3);
+    }
+
+    /// When copies of an episode collide on a name, the slot's file wins over a larger copy no slot
+    /// selects (a double-episode file whose second episode has no slot). Under canonical names a
+    /// coded file then wins over a mapped code-less one, then the better quality its name tags,
+    /// then the larger file.
+    #[test]
+    fn a_name_collision_keeps_the_slot_s_file_then_the_coded_then_the_better_file() {
+        let poor = show_torrent("1", "poor", 9_000, &["P/Some.Show.S01E01E02.480p.mkv"]);
+        let good = show_torrent(
+            "2",
+            "good",
+            1_000,
+            &["G/Some.Show.S01E01E02.1080p.BluRay.mkv"],
+        );
+        let pack = show_torrent(
+            "3",
+            "pack",
+            2_000,
+            &[
+                "Pack/720p/Some.Show.S02E01.720p.WEB.mkv",
+                "Pack/1080p/Some.Show.S02E01.1080p.WEB.mkv",
+            ],
+        );
+        let mapped = show_torrent("4", "mapped", 8_000, &["M/Season 3/E05 - Title.mkv"]);
+        let coded = show_torrent("5", "coded", 1_000, &["C/Some.Show.S03E05.mkv"]);
+        let data: Vec<_> = [poor, good, pack, mapped, coded]
+            .into_iter()
+            .map(|t| (t, some_show()))
+            .collect();
+        let mut selection = SelectionMap::new();
+        selection.insert(
+            crate::store::episode_slot(5, 1, 1),
+            crate::store::SelectionEntry {
+                hash: "good".into(),
+                file_path: "G/Some.Show.S01E01E02.1080p.BluRay.mkv".into(),
+            },
+        );
+        let vfs = DebridVfs::build_with(data, &selection, EpisodeNames::Canonical);
+        let show = "Shows/Some Show [tmdbid-5]";
+        let served = |path: &str| {
+            media_file(&vfs.root, &format!("{show}/{path}"))
+                .1
+                .file_path
+                .clone()
+        };
+        assert_eq!(
+            dir(&vfs.root, &format!("{show}/Season 01")).len(),
+            1,
+            "one copy of the double episode"
+        );
+        assert_eq!(
+            served("Season 01/Some Show (2020) - S01E01-E02.mkv"),
+            "G/Some.Show.S01E01E02.1080p.BluRay.mkv"
+        );
+        assert_eq!(
+            served("Season 02/Some Show (2020) - S02E01.mkv"),
+            "Pack/1080p/Some.Show.S02E01.1080p.WEB.mkv"
+        );
+        assert_eq!(
+            served("Season 03/Some Show (2020) - S03E05.mkv"),
+            "C/Some.Show.S03E05.mkv"
+        );
+    }
+
+    /// Kodi's reading of an episode file name under its default `tvshowmatching` rules
+    /// (`EpisodeUtils::EnumerateEpisodeItem` with the defaults in `AdvancedSettings.cpp`), for a name
+    /// that holds an `SxxEyy` code, which the first default rule matches:
+    /// `s([0-9]+)[ ._x-]*e([0-9]+(?:(?:[a-i]|\.[1-9])(?![0-9]))?)([^\\/]*)$`. Kodi then searches the
+    /// rest of the name again, with that rule and with `tvmultipartmatching`
+    /// (`^([-_]?e|x|-)([0-9]{1,3})(?![0-9])(.*)`), adding an episode for each hit; a `-` before the
+    /// number makes it the end of a range. The `regex` crate has no lookahead, so the two `(?![0-9])`
+    /// are checked by hand.
+    fn kodi_episodes(name: &str) -> Vec<(u32, u32)> {
+        static CODE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?i)s([0-9]+)[ ._x-]*e([0-9]+)").unwrap());
+        let digit_next = |s: &[u8]| s.first().is_some_and(u8::is_ascii_digit);
+        let code = |s: &str| -> Option<(u32, u32, usize)> {
+            let c = CODE.captures(s)?;
+            let mut end = c.get(0)?.end();
+            // The episode number's optional suffix: a part letter or a decimal (`E03.4`).
+            let tail = &s.as_bytes()[end..];
+            end += match tail {
+                [c, rest @ ..]
+                    if (b'a'..=b'i').contains(&c.to_ascii_lowercase()) && !digit_next(rest) =>
+                {
+                    1
+                }
+                [b'.', d, rest @ ..] if (b'1'..=b'9').contains(d) && !digit_next(rest) => 2,
+                _ => 0,
+            };
+            Some((c[1].parse().ok()?, c[2].parse().ok()?, end))
+        };
+        let multipart = |s: &str| -> Option<(u32, bool, usize)> {
+            let b = s.as_bytes();
+            let (skip, range) = match b {
+                [b'-' | b'_', b'e' | b'E', ..] => (2, b[0] == b'-'),
+                [b'e' | b'E' | b'x' | b'X', ..] => (1, false),
+                [b'-', ..] => (1, true),
+                _ => return None,
+            };
+            let digits = b[skip..].iter().take_while(|c| c.is_ascii_digit()).count();
+            if !(1..=3).contains(&digits) {
+                return None;
+            }
+            Some((s[skip..skip + digits].parse().ok()?, range, skip + digits))
+        };
+        let Some((season, episode, end)) = code(name) else {
+            return Vec::new();
+        };
+        let mut out = vec![(season, episode)];
+        let mut rest = &name[end..];
+        loop {
+            if let Some((episode, range, used)) = multipart(rest) {
+                let (season, last) = *out.last().unwrap();
+                if range && episode > last {
+                    out.extend((last + 1..=episode).map(|e| (season, e)));
+                } else {
+                    out.push((season, episode));
+                }
+                rest = &rest[used..];
+            } else if let Some((season, episode, end)) = code(rest) {
+                out.push((season, episode));
+                rest = &rest[end..];
+            } else {
+                return out;
+            }
+        }
+    }
+
+    /// The port reproduces what Kodi users see: an extra titled after the episode it covers reads as
+    /// that episode too, and a title of digits and dashes after the code reads as more episodes.
+    #[test]
+    fn kodi_reads_episode_codes_out_of_episode_titles() {
+        assert_eq!(
+            kodi_episodes("S00E41 - Inside the Episode꞉ S2 E1.mkv"),
+            vec![(0, 41), (2, 1)]
+        );
+        let read = kodi_episodes("Some.Show.S03E03.4-5-1.1080p.BluRay.mkv");
+        assert_eq!(read.first(), Some(&(3, 3)));
+        assert!(read.len() > 1, "{read:?}");
+    }
+
+    /// Every canonical name reads, under Kodi's default rules, as exactly the episodes it was built
+    /// from, whatever digits or dashes the show's title holds.
+    #[test]
+    fn kodi_reads_every_canonical_name_as_its_episodes() {
+        let titles = [
+            "Some Show",
+            "9-1-1",
+            "24",
+            "1923",
+            "Show 4-5-1",
+            "The X-Files",
+        ];
+        let runs: &[&[(u32, u32)]] = &[
+            &[(1, 1)],
+            &[(0, 41)],
+            &[(3, 3)],
+            &[(1, 1), (1, 2)],
+            &[(2, 9), (2, 10), (2, 11)],
+            &[(1, 100)],
+            &[(12, 5)],
+        ];
+        for title in titles {
+            for year in [Some("2020"), None] {
+                for run in runs {
+                    let name = canonical_episode_name(title, year, run, "x.MKV")
+                        .unwrap_or_else(|| panic!("{title} {run:?} has a canonical name"));
+                    assert_eq!(kodi_episodes(&name), run.to_vec(), "{name}");
+                }
+            }
+        }
+    }
+
+    /// The canonical name: the title, the year when it is a plain four-digit one, the episode code
+    /// (a range for a contiguous multi-episode file) and the file's extension, lower-cased. A title
+    /// holding an episode code of its own is left out, since a player could read that code first.
+    /// No canonical name for a file whose episodes span seasons or aren't contiguous, or that has no
+    /// extension.
+    #[test]
+    fn canonical_episode_names_are_built_from_the_episodes() {
+        let name =
+            |title, year, eps: &[(u32, u32)], file| canonical_episode_name(title, year, eps, file);
+        assert_eq!(
+            name("Some Show", Some("2020"), &[(3, 3)], "a.MKV").as_deref(),
+            Some("Some Show (2020) - S03E03.mkv")
+        );
+        assert_eq!(
+            name("Some Show", Some("2020"), &[(1, 2), (1, 1)], "a.mp4").as_deref(),
+            Some("Some Show (2020) - S01E01-E02.mp4")
+        );
+        assert_eq!(
+            name("Some Show", Some("20"), &[(1, 5)], "a.avi").as_deref(),
+            Some("Some Show - S01E05.avi")
+        );
+        assert_eq!(
+            name("Show S1E1", Some("2020"), &[(1, 5)], "a.mkv").as_deref(),
+            Some("S01E05.mkv")
+        );
+        assert_eq!(name("Some Show", None, &[(1, 5), (2, 1)], "a.mkv"), None);
+        assert_eq!(name("Some Show", None, &[(1, 4), (1, 6)], "a.mkv"), None);
+        assert_eq!(name("Some Show", None, &[], "a.mkv"), None);
+        assert_eq!(name("Some Show", None, &[(1, 5)], "noextension"), None);
+    }
+
+    fn some_show() -> MediaMetadata {
+        MediaMetadata {
+            title: "Some Show".into(),
+            year: Some("2020".into()),
+            media_type: MediaType::Show,
+            external_id: Some("tmdb:5".into()),
+        }
+    }
+
+    /// Under canonical names every file the service can number is served under its episode code;
+    /// one it can't number, and one whose codes aren't one contiguous run, keep their own names.
+    /// The locator still names the torrent's file.
+    #[test]
+    fn canonical_names_carry_the_episodes_the_vfs_places_each_file_under() {
+        let t = show_torrent(
+            "1",
+            "h1",
+            6_000,
+            &[
+                "P/Some.Show.S03E03.4-5-1.1080p.BluRay.REMUX.mkv",
+                "P/S00E41 - Inside the Episode꞉ S2 E1.mkv",
+                "P/Some.Show.S01E01E02.1080p.mkv",
+                "P/Some.Show.S01E04.S01E06.mkv",
+                "P/Season 2/The Long Night.mkv",
+                "P/Some.Show.S04E01.MKV",
+            ],
+        );
+        let doc = MediaMetadata {
+            title: "Some Doc".into(),
+            year: Some("2026".into()),
+            media_type: MediaType::Show,
+            external_id: Some("tmdb:6".into()),
+        };
+        let parts = show_torrent(
+            "2",
+            "h2",
+            2_000,
+            &[
+                "D/Some.Doc.1of2.1080p.HDTV.mkv",
+                "D/Some.Doc.2of2.1080p.HDTV.mkv",
+            ],
+        );
+        let data = vec![(t, some_show()), (parts, doc)];
+        let vfs =
+            DebridVfs::build_with(data.clone(), &SelectionMap::new(), EpisodeNames::Canonical);
+        let show = "Shows/Some Show [tmdbid-5]";
+        let names = |season: &str| -> Vec<String> {
+            dir(&vfs.root, &format!("{show}/{season}"))
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(names("Season 03"), ["Some Show (2020) - S03E03.mkv"]);
+        assert_eq!(names("Season 00"), ["Some Show (2020) - S00E41.mkv"]);
+        assert_eq!(
+            names("Season 01"),
+            [
+                "Some Show (2020) - S01E01-E02.mkv",
+                "Some.Show.S01E04.S01E06.mkv"
+            ]
+        );
+        assert_eq!(names("Season 02"), ["The Long Night.mkv"]);
+        assert_eq!(names("Season 04"), ["Some Show (2020) - S04E01.mkv"]);
+        let (_, locator) = media_file(
+            &vfs.root,
+            &format!("{show}/Season 03/Some Show (2020) - S03E03.mkv"),
+        );
+        assert_eq!(
+            locator.file_path,
+            "P/Some.Show.S03E03.4-5-1.1080p.BluRay.REMUX.mkv"
+        );
+        assert_eq!(
+            dir(&vfs.root, "Shows/Some Doc [tmdbid-6]/Season 01")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                "Some Doc (2026) - S01E01.mkv",
+                "Some Doc (2026) - S01E02.mkv"
+            ]
+        );
+        // Original names are served as they are.
+        let vfs = DebridVfs::build(data, &SelectionMap::new());
+        media_file(
+            &vfs.root,
+            &format!("{show}/Season 03/Some.Show.S03E03.4-5-1.1080p.BluRay.REMUX.mkv"),
+        );
+    }
+
+    /// Copies of one episode share its canonical name, so the season folder shows one: the copy its
+    /// slot selects, else the largest torrent's.
+    #[test]
+    fn canonical_names_show_one_copy_of_an_episode() {
+        let big = show_torrent("1", "big", 9_000, &["B/Some.Show.S01E01.1080p.WEB.mkv"]);
+        let small = show_torrent(
+            "2",
+            "small",
+            1_000,
+            &["S/Some Show - S01E01 - Pilot [dd].avi"],
+        );
+        let data = vec![(big, some_show()), (small, some_show())];
+        let folder = "Shows/Some Show [tmdbid-5]/Season 01";
+        let vfs =
+            DebridVfs::build_with(data.clone(), &SelectionMap::new(), EpisodeNames::Canonical);
+        assert_eq!(
+            dir(&vfs.root, folder).keys().cloned().collect::<Vec<_>>(),
+            ["Some Show (2020) - S01E01.mkv"]
+        );
+        assert_eq!(
+            media_file(
+                &vfs.root,
+                &format!("{folder}/Some Show (2020) - S01E01.mkv")
+            )
+            .1
+            .hash,
+            "big"
+        );
+
+        let mut selection = SelectionMap::new();
+        selection.insert(
+            crate::store::episode_slot(5, 1, 1),
+            crate::store::SelectionEntry {
+                hash: "small".into(),
+                file_path: "S/Some Show - S01E01 - Pilot [dd].avi".into(),
+            },
+        );
+        let vfs = DebridVfs::build_with(data, &selection, EpisodeNames::Canonical);
+        assert_eq!(
+            dir(&vfs.root, folder).keys().cloned().collect::<Vec<_>>(),
+            ["Some Show (2020) - S01E01.avi"]
+        );
+        assert_eq!(
+            media_file(
+                &vfs.root,
+                &format!("{folder}/Some Show (2020) - S01E01.avi")
+            )
+            .1
+            .hash,
+            "small"
+        );
     }
 
     /// `locator_for_selected` advances the link position ONLY for `selected == 1` files, pairing

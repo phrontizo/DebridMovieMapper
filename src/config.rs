@@ -830,6 +830,26 @@ pub struct Config {
     /// round-trips before playback. Subsequent reads use the normal `BUFFER_SIZE` (2 MB) window.
     /// From `CDN_FIRST_READ_MB` (default 8, clamped 2–16 MB; 2 = no enlargement).
     pub cdn_first_read_bytes: u64,
+    /// How the VFS names episode files, from `EPISODE_FILE_NAMES` (default canonical).
+    pub episode_file_names: crate::vfs::EpisodeNames,
+}
+
+/// Parse `EPISODE_FILE_NAMES`: `canonical` (also unset or blank) or `original`, case-insensitive.
+/// Anything else falls back to canonical with a warning.
+fn parse_episode_file_names(raw: Option<String>) -> crate::vfs::EpisodeNames {
+    use crate::vfs::EpisodeNames;
+    let value = raw.unwrap_or_default();
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "canonical" => EpisodeNames::Canonical,
+        "original" => EpisodeNames::Original,
+        other => {
+            warn!(
+                "Invalid EPISODE_FILE_NAMES value '{other}' (expected canonical or original), \
+                 falling back to canonical"
+            );
+            EpisodeNames::Canonical
+        }
+    }
 }
 
 /// Default first-read window in MB (used when `CDN_FIRST_READ_MB` is unset/invalid).
@@ -885,6 +905,7 @@ impl std::fmt::Debug for Config {
                 &self.allow_resolution_downgrade,
             )
             .field("cdn_first_read_bytes", &self.cdn_first_read_bytes)
+            .field("episode_file_names", &self.episode_file_names)
             .finish()
     }
 }
@@ -905,6 +926,7 @@ impl Config {
         cfg.upgrade = UpgradeConfig::from_env();
         cfg.cdn_first_read_bytes =
             parse_cdn_first_read_bytes(std::env::var("CDN_FIRST_READ_MB").ok());
+        cfg.episode_file_names = parse_episode_file_names(std::env::var("EPISODE_FILE_NAMES").ok());
         cfg.apply_household_flags(|name| std::env::var(name).ok());
         Ok(cfg)
     }
@@ -985,6 +1007,7 @@ impl Config {
             // Default window; `from_env` overrides from `CDN_FIRST_READ_MB`. (Not a `from_parts`
             // parameter — it's a perf knob, not part of the core provider/port/db wiring.)
             cdn_first_read_bytes: CDN_FIRST_READ_MB_DEFAULT * 1024 * 1024,
+            episode_file_names: crate::vfs::EpisodeNames::default(),
         })
     }
 }
@@ -2184,6 +2207,36 @@ mod tests {
         assert_eq!(parse_cdn_first_read_bytes(Some("0".into())), mb(2));
         assert_eq!(parse_cdn_first_read_bytes(Some("1".into())), mb(2));
         assert_eq!(parse_cdn_first_read_bytes(Some("999".into())), mb(16));
+    }
+
+    /// `EPISODE_FILE_NAMES` picks how the VFS names episode files: canonical by default (unset or
+    /// blank), `original` keeps the torrents' names, and anything else falls back to canonical with
+    /// a warning.
+    #[test]
+    fn episode_file_names_parses_and_defaults_to_canonical() {
+        use crate::vfs::EpisodeNames;
+        let c = parts(Some("rd"), None, Some("tmdb"), None, None, None).unwrap();
+        assert_eq!(c.episode_file_names, EpisodeNames::Canonical);
+        assert_eq!(parse_episode_file_names(None), EpisodeNames::Canonical);
+        assert_eq!(
+            parse_episode_file_names(Some("  ".into())),
+            EpisodeNames::Canonical
+        );
+        assert_eq!(
+            parse_episode_file_names(Some("canonical".into())),
+            EpisodeNames::Canonical
+        );
+        assert_eq!(
+            parse_episode_file_names(Some(" Original ".into())),
+            EpisodeNames::Original
+        );
+        let logs = crate::test_log::capture(tracing::Level::WARN, || {
+            assert_eq!(
+                parse_episode_file_names(Some("scene".into())),
+                EpisodeNames::Canonical
+            );
+        });
+        assert!(logs.contains("EPISODE_FILE_NAMES"), "{logs}");
     }
 
     // The `dotenv_failure` tests build dotenvy's results without touching the process environment.
