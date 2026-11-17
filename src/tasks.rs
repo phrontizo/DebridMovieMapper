@@ -196,15 +196,7 @@ pub async fn run_scan_loop(app: AppState, mut shutdown: tokio::sync::watch::Rece
         // Pre-populate the VFS from persisted data so the first scan's diff
         // only captures genuinely new/changed content, not the entire library.
         let persisted_data: Vec<_> = persisted.values().cloned().collect();
-        update_vfs(
-            &app.vfs,
-            &persisted_data,
-            &app.repair_manager,
-            &None,
-            &app.store,
-            app.config.episode_file_names,
-        )
-        .await;
+        prepopulate_vfs(&app, &persisted_data).await;
         info!(
             "Pre-populated VFS with {} persisted entries",
             persisted_data.len()
@@ -993,6 +985,31 @@ async fn flush_db_writes(
     }
 }
 
+/// Pre-populate the VFS from the persisted identifications, so the first scan's diff holds only
+/// what changed. It is built in the episode naming the previous process served
+/// (`Store::served_episode_names`), else in the torrents' own names, which every version before
+/// `EPISODE_FILE_NAMES` served: when the naming changes, the first scan's diff then holds every
+/// renamed folder and Jellyfin is told about them.
+async fn prepopulate_vfs(
+    app: &AppState,
+    persisted_data: &[(crate::rd_client::TorrentInfo, MediaMetadata)],
+) {
+    let names = app
+        .store
+        .served_episode_names()
+        .await
+        .unwrap_or(crate::vfs::EpisodeNames::Original);
+    update_vfs(
+        &app.vfs,
+        persisted_data,
+        &app.repair_manager,
+        &None,
+        &app.store,
+        names,
+    )
+    .await;
+}
+
 async fn update_vfs(
     vfs: &Arc<RwLock<DebridVfs>>,
     current_data: &[(crate::rd_client::TorrentInfo, MediaMetadata)],
@@ -1000,7 +1017,7 @@ async fn update_vfs(
     jellyfin_client: &Option<Arc<crate::jellyfin_client::JellyfinClient>>,
     store: &Store,
     names: crate::vfs::EpisodeNames,
-) {
+) -> Vec<crate::vfs::VfsChange> {
     let hidden_ids = repair_manager.hidden_torrent_ids().await;
     let filtered: Vec<_> = current_data
         .iter()
@@ -1022,7 +1039,7 @@ async fn update_vfs(
         Ok(v) => v,
         Err(e) => {
             error!("VFS build task failed: {e:?}; keeping previous VFS for this tick");
-            return;
+            return Vec::new();
         }
     };
     // Diff old vs new, then swap
@@ -1030,15 +1047,23 @@ async fn update_vfs(
     let changes = crate::vfs::diff_trees(&vfs_lock.root, &new_vfs.root, "");
     *vfs_lock = new_vfs;
     drop(vfs_lock);
+    // Record the naming now served, so a restart pre-populates in it (`prepopulate_vfs`).
+    if store.served_episode_names().await != Some(names) {
+        if let Err(e) = store.record_served_episode_names(names).await {
+            warn!("recording the episode naming the VFS serves failed: {e}");
+        }
+    }
 
     if !changes.is_empty() {
         if let Some(client) = jellyfin_client {
             let client = client.clone();
+            let changes = changes.clone();
             tokio::spawn(async move {
                 client.notify_changes(&changes).await;
             });
         }
     }
+    changes
 }
 
 // ── Trakt → wanted sync (SP2) ────────────────────────────────────────────────
@@ -12698,6 +12723,74 @@ mod scan_tick_tests {
             TickEnd::Skipped => panic!("tick skipped"),
             TickEnd::Shutdown => panic!("tick shut down"),
         }
+    }
+
+    /// A restart pre-populates the VFS in the episode naming the previous process served, which the
+    /// database records, and in original names when nothing is recorded (every version before
+    /// `EPISODE_FILE_NAMES` served those). The first scan after an upgrade turns canonical names on,
+    /// or after the setting changes, therefore diffs every renamed folder, and Jellyfin is told; the
+    /// scan then records the new naming, so the restart after that reports nothing. Pre-populating
+    /// in the configured naming left the first scan nothing to report, and Jellyfin kept the old
+    /// paths until its next library scan.
+    #[tokio::test]
+    async fn the_first_scan_after_a_naming_change_reports_the_renamed_files() {
+        use crate::vfs::EpisodeNames;
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
+        let first = app(Store::in_memory(), provider, None, false).await;
+        assert_eq!(first.config.episode_file_names, EpisodeNames::Canonical);
+        let show = MediaMetadata {
+            title: "Some Show".into(),
+            year: Some("2020".into()),
+            media_type: MediaType::Show,
+            external_id: Some("tmdb:5".into()),
+        };
+        let data = vec![(
+            info("t1", "h1", &[("P/Some.Show.S01E01.1080p.WEB.mkv", 1)]),
+            show,
+        )];
+        let served =
+            |vfs: &DebridVfs| crate::vfs::test_support::season_file_names(vfs, "Season 01");
+        async fn scan(
+            state: &AppState,
+            data: &[(TorrentInfo, MediaMetadata)],
+        ) -> Vec<crate::vfs::VfsChange> {
+            update_vfs(
+                &state.vfs,
+                data,
+                &state.repair_manager,
+                &None,
+                &state.store,
+                state.config.episode_file_names,
+            )
+            .await
+        }
+
+        prepopulate_vfs(&first, &data).await;
+        assert_eq!(
+            served(&*first.vfs.read().await),
+            ["Some.Show.S01E01.1080p.WEB.mkv"]
+        );
+        assert!(
+            !scan(&first, &data).await.is_empty(),
+            "the renamed season folder is reported"
+        );
+        assert_eq!(
+            served(&*first.vfs.read().await),
+            ["Some Show (2020) - S01E01.mkv"]
+        );
+        assert_eq!(
+            first.store.served_episode_names().await,
+            Some(EpisodeNames::Canonical)
+        );
+
+        let provider: Arc<dyn DebridProvider> = Arc::new(MockProvider::default());
+        let restarted = app(first.store.clone(), provider, None, false).await;
+        prepopulate_vfs(&restarted, &data).await;
+        assert_eq!(
+            served(&*restarted.vfs.read().await),
+            ["Some Show (2020) - S01E01.mkv"]
+        );
+        assert!(scan(&restarted, &data).await.is_empty());
     }
 
     /// A wholesale-empty listing while torrents are known is trusted only once it has been seen

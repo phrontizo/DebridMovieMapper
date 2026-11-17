@@ -36,6 +36,8 @@ const MATCHES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("matche
 /// Internal metadata (schema version, etc.).
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const SCHEMA_VERSION_KEY: &str = "schema_version";
+/// `meta` key of the episode naming the VFS last served ([`Store::served_episode_names`]).
+const SERVED_EPISODE_NAMES_KEY: &str = "served_episode_names";
 /// Per-hash acquisition spec + status: infohash -> serde_json(OwnedRecord).
 const OWNED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_hashes");
 /// Authoritative identification override: infohash -> serde_json(MediaMetadata).
@@ -2120,6 +2122,55 @@ impl Store {
             {
                 txn.open_table(UPGRADE_CHECKS_TABLE)?
                     .insert(key.as_str(), &at)?;
+            }
+            txn.commit()?;
+            Ok(())
+        })
+        .await;
+        Self::flatten_join(result)
+    }
+
+    /// The episode naming the VFS last served ([`crate::vfs::EpisodeNames`]), `None` when nothing
+    /// is recorded (every version before `EPISODE_FILE_NAMES` served the torrents' own names).
+    pub async fn served_episode_names(&self) -> Option<crate::vfs::EpisodeNames> {
+        use crate::vfs::EpisodeNames;
+        let db = self.db.clone();
+        let r = tokio::task::spawn_blocking(move || -> Result<Option<u64>, redb::Error> {
+            let txn = db.begin_read()?;
+            let table = txn.open_table(META_TABLE)?;
+            Ok(table.get(SERVED_EPISODE_NAMES_KEY)?.map(|v| v.value()))
+        })
+        .await;
+        match r {
+            Ok(Ok(Some(0))) => Some(EpisodeNames::Original),
+            Ok(Ok(Some(_))) => Some(EpisodeNames::Canonical),
+            Ok(Ok(None)) => None,
+            Ok(Err(e)) => {
+                error!("served_episode_names: {e}");
+                None
+            }
+            Err(e) => {
+                error!("served_episode_names task: {e}");
+                None
+            }
+        }
+    }
+
+    /// Record the episode naming the VFS now serves (`meta`: 0 original, 1 canonical).
+    pub async fn record_served_episode_names(
+        &self,
+        names: crate::vfs::EpisodeNames,
+    ) -> Result<(), AppError> {
+        let value: u64 = match names {
+            crate::vfs::EpisodeNames::Original => 0,
+            crate::vfs::EpisodeNames::Canonical => 1,
+        };
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            let txn = db.begin_write()?;
+            {
+                txn.open_table(META_TABLE)?
+                    .insert(SERVED_EPISODE_NAMES_KEY, &value)?;
             }
             txn.commit()?;
             Ok(())
@@ -4879,6 +4930,19 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(store.get_selection(gone).await, None);
+    }
+
+    /// The naming the VFS last served round-trips through the `meta` table, and reads as unknown
+    /// on a database that never recorded one.
+    #[tokio::test]
+    async fn served_episode_names_round_trips() {
+        use crate::vfs::EpisodeNames;
+        let store = Store::in_memory();
+        assert_eq!(store.served_episode_names().await, None);
+        for names in [EpisodeNames::Canonical, EpisodeNames::Original] {
+            store.record_served_episode_names(names).await.unwrap();
+            assert_eq!(store.served_episode_names().await, Some(names));
+        }
     }
 
     /// Creating a slot is a compare-and-set against "no entry": a slot `observe` or the upgrade
