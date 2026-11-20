@@ -98,6 +98,8 @@ The weekly run uses main's copy of the file, so it audits both lines' lockfiles 
 It is a separate workflow, so an advisory never blocks lint, test or publish.
 Dependabot alerts cover only main's Cargo.lock, and dependabot.yml takes effect only from main.
 Run `cargo audit --deny warnings` locally after a dependency change.
+An advisory with no fix is ignored by id in `.cargo/audit.toml`, each entry with a comment that says why and when to remove it.
+`RUSTSEC-2026-0543` (chrono is unmaintained) is listed there because `dav-server` depends on chrono, 0.12.0 included, so chrono stays in Cargo.lock whatever this crate uses for its own dates.
 
 ## Test gate
 

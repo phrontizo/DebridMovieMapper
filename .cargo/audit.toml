@@ -1,0 +1,10 @@
+# cargo-audit configuration, read by `cargo audit` locally and in .github/workflows/audit.yml.
+
+[advisories]
+ignore = [
+    # chrono is unmaintained (informational, no vulnerability, no patched version). dav-server
+    # depends on it, 0.12.0 included, so it stays in Cargo.lock whatever this crate uses for its
+    # own dates. Remove the entry once a dav-server release drops chrono, and move this crate's
+    # own uses (tmdb_client, tasks, trakt_client, identification) to jiff or time with it.
+    "RUSTSEC-2026-0543",
+]
