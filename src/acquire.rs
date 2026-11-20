@@ -1458,6 +1458,23 @@ impl AcquisitionEngine {
             }
             let locator = locator_for(&info, hash, &selected_path);
             match self.verify_file(&locator, &rec.request).await {
+                // The tracks couldn't be read, so the release's own name is the only evidence of
+                // its audio, and it tags only languages the title doesn't want (a `Rus` dub in an
+                // `.avi`). Accepting it would count the title as owned, and nothing would look for
+                // another release until the daily upgrade pass.
+                VerifyResult::Accept
+                    if self.named_wrong_audio(&info, &selected_path, &rec.request) =>
+                {
+                    self.reject(
+                        hash,
+                        ids,
+                        &rec.request,
+                        "BadAudio",
+                        &rec.provenance,
+                        &mut deleted,
+                    )
+                    .await;
+                }
                 verdict @ (VerifyResult::Pass | VerifyResult::Accept) => {
                     // Acquisition policy is unchanged — an unverifiable release (`Accept`: unreadable
                     // container / no tracks) is still accepted when nothing better was found — but it
@@ -1715,6 +1732,32 @@ impl AcquisitionEngine {
                 req.tmdb_id
             ),
         }
+    }
+
+    /// Whether the names of a release tag it with the wrong audio language for `req`'s title
+    /// ([`release::wrong_audio_language`], under the audio requirement `acquire` ranks with): its
+    /// torrent name and `file_path`, the file `observe` picked, name audio languages and none is
+    /// one the title wants. `observe` asks it of a release whose tracks it couldn't read. A language
+    /// word in the title itself is no evidence (every release of "Russian Doll" carries `Russian`),
+    /// so the languages the title's own words tag don't count.
+    fn named_wrong_audio(&self, info: &TorrentInfo, file_path: &str, req: &AcquireRequest) -> bool {
+        let prefs = self.prefs.with_resolved_audio(
+            req.original_language.as_deref(),
+            req.spoken_languages.as_deref().unwrap_or_default(),
+        );
+        let parse_names = |name: &str, description: &str| {
+            release::parse(&release::RawCandidate {
+                name: name.to_string(),
+                description: description.to_string(),
+                info_hash: String::new(),
+                file_idx: None,
+                file_name: None,
+            })
+        };
+        let in_title = parse_names(&req.metadata.title, "").languages;
+        let mut named = parse_names(torrent_name_of(info), file_path);
+        named.languages.retain(|l| !in_title.contains(l));
+        release::wrong_audio_language(&named, &prefs)
     }
 
     /// Whether a probe of a file for `req` checked no audio language at all: under
@@ -5861,6 +5904,125 @@ mod tests {
         assert!(
             rec.quality.expect("quality kept").unverified,
             "an unverifiable Accept must be flagged unverified"
+        );
+    }
+
+    /// Run one `observe` tick over a downloaded torrent `hd` named `torrent_name`, whose one file
+    /// `file_path` is in a container the probe can't read. The torrent is owned `Pending` for S01E06
+    /// of an English-original show titled `title`. Returns the store and the provider.
+    async fn observe_unprobeable_episode(
+        title: &str,
+        torrent_name: &str,
+        file_path: &str,
+    ) -> (Store, Arc<MockProvider>) {
+        let st = store();
+        let mut request = series_req_for(6);
+        request.metadata.title = title.into();
+        st.put_owned(
+            "hd".into(),
+            OwnedRecord {
+                request,
+                provenance: Provenance::watchlist("alice"),
+                added_at: now_secs(),
+                status: OwnedStatus::Pending,
+                provides: vec![(1, 6)],
+                quality: Some(crate::release::QualitySummary {
+                    cached: true,
+                    source_tier: 3_000,
+                    resolution: 0,
+                    score: 1_003_002,
+                    unverified: false,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let provider = Arc::new(MockProvider {
+            torrents: vec![torrent("tid_hd", "hd", "downloaded", 100.0)],
+            torrent_info: Some(TI {
+                id: "tid_hd".into(),
+                hash: "hd".into(),
+                filename: torrent_name.into(),
+                status: "downloaded".into(),
+                files: vec![TorrentFile {
+                    id: 0,
+                    path: file_path.into(),
+                    bytes: 400_000_000,
+                    selected: 1,
+                }],
+                links: vec!["https://cdn/file".into()],
+                ..Default::default()
+            }),
+            resolved_url: Some("https://cdn/file".into()),
+            ..Default::default()
+        });
+        let eng = engine(
+            provider.clone(),
+            Arc::new(MockScraper { candidates: vec![] }),
+            Arc::new(OkValidator(true)),
+            Arc::new(CannedProber(Err(ProbeError::Unsupported))),
+            st.clone(),
+        );
+        eng.observe(&[torrent("tid_hd", "hd", "downloaded", 100.0)])
+            .await;
+        (st, provider)
+    }
+
+    /// On 2026-11-20 the only release of YAGA S01E06 (an English-original show) was a Russian dub in
+    /// an `.avi`. The probe can't read an AVI's tracks, so the dub was accepted unverified, the
+    /// episode counted as owned and nothing looked for another release until the daily upgrade pass.
+    /// A release that can't be checked and whose own name tags only another audio language is
+    /// rejected like a probed wrong-language one.
+    #[tokio::test]
+    async fn observe_rejects_an_unverifiable_release_named_as_another_audio_language() {
+        let (st, provider) = observe_unprobeable_episode(
+            "YAGA",
+            "Yaga.s01.WEBRip.XviD.Rus.RuDub.tv",
+            "Yaga.s01.WEBRip.XviD.Rus.RuDub.tv/Yaga.s01e06.WEBRip.XviD.Rus.RuDub.tv.avi",
+        )
+        .await;
+        assert!(
+            st.get_owned("hd".into()).await.is_none(),
+            "the Russian dub must not be kept as the episode's copy"
+        );
+        assert!(
+            st.is_blacklisted(MediaKind::Series, 27205, "hd".into())
+                .await,
+            "the dub is blacklisted so the next scrape skips it"
+        );
+        assert_eq!(
+            *provider.deleted.lock().unwrap(),
+            vec!["tid_hd".to_string()]
+        );
+        assert!(
+            st.get_selection(crate::store::episode_slot(27205, 1, 6))
+                .await
+                .is_none(),
+            "no slot serves the dub"
+        );
+    }
+
+    /// A language word that is part of the show's own title says nothing about the audio: every
+    /// release of "Russian Doll" carries `Russian`. Such a release stays acceptable when its tracks
+    /// can't be read, flagged for the upgrade pass as before.
+    #[tokio::test]
+    async fn observe_accepts_an_unverifiable_release_whose_language_word_is_its_title() {
+        let (st, provider) = observe_unprobeable_episode(
+            "Russian Doll",
+            "Russian.Doll.S01E06.XviD-AFG",
+            "Russian.Doll.S01E06.XviD-AFG/Russian.Doll.S01E06.XviD-AFG.avi",
+        )
+        .await;
+        let rec = st
+            .get_owned("hd".into())
+            .await
+            .expect("the release is kept");
+        assert_eq!(rec.status, OwnedStatus::Verified);
+        assert!(rec.quality.expect("quality kept").unverified);
+        assert!(provider.deleted.lock().unwrap().is_empty());
+        assert!(
+            !st.is_blacklisted(MediaKind::Series, 27205, "hd".into())
+                .await
         );
     }
 

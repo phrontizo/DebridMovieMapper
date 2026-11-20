@@ -45,6 +45,9 @@ The blacklist is written only after the delete because a kept Pending record may
 Before re-acquiring from a stored request that has no TMDB languages (`spoken_languages == None`: an account-mirror record the upgrade pass has not backfilled yet) under `AUDIO_LANGUAGE=original`, it looks them up (`fill_missing_languages` → `TitleValidator::title_languages`; `TmdbTitleValidator` calls TMDB `details`).
 Ranking then resolves the audio requirement, and the replacement's record carries the languages.
 Acquisition still accepts a release whose tracks can't be checked (`VerifyResult::Accept`: `Unsupported`/`TracksNotFound` container, e.g. `.avi`, or no tracks) when nothing better was found, but `record_verified` stamps its `quality.unverified = true` (a `Pass` stamps `false`, unless it checked no audio language: `AUDIO_LANGUAGE=original` with no TMDB languages known, `AcquisitionEngine::audio_unchecked`, the case of a failed language lookup on a dead-reap re-acquire) so the upgrade pass later replaces it with a checked copy.
+An `Accept` is rejected as `BadAudio` (blacklist, delete, re-acquire) when the release's names tag the wrong audio language (`AcquisitionEngine::named_wrong_audio`): `release::wrong_audio_language`, under the audio requirement `acquire` ranks with, applied to the torrent name and the picked file's path.
+The languages the title's own words tag don't count, so an `.avi` of `Russian Doll` is still accepted.
+On 2026-11-20 the only release of an English show's new episode was a `Rus` dub in an `.avi`: it was accepted unverified, the episode counted as owned, and `monitor_episodes` stopped looking for another release until the daily upgrade pass.
 It settles the record through the atomic `Store::mark_verified_if_present` and writes no `selection` for a record removed while its probe ran.
 Reaps genuinely-dead torrents after `ACQUIRE_DEAD_TIMEOUT_SECS` (default 600s).
 Stall detection (`STALL_TIMEOUT_SECS`) is preserved.
