@@ -5654,9 +5654,10 @@ mod tests {
     #[tokio::test]
     async fn is_stalled_resets_when_progress_advances() {
         // The stall timer must RESET whenever download progress ADVANCES across ticks — a moving
-        // download is never "stalled", even under the strictest possible timeout. CLAUDE.md flags the
-        // "resets only on a progress change" contract: the past TorBox bug was a constant 0.0% that
-        // never advanced and so was falsely reaped; here we prove the reset arm fires on real movement.
+        // download is never "stalled", even under the strictest possible timeout.
+        // docs/design/providers.md flags the "resets only on a progress change" contract: the past
+        // TorBox bug was a constant 0.0% that never advanced and so was falsely reaped; here we
+        // prove the reset arm fires on real movement.
         // stall_timeout=ZERO is the strictest case — a NON-advancing tick is always "stalled"
         // (elapsed >= 0), so the ONLY thing that can return `false` is the progress-advanced reset.
         let eng = AcquisitionEngine::new(

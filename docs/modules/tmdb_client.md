@@ -1,0 +1,5 @@
+# `tmdb_client.rs`
+
+TMDB search for movies and TV shows; `details` → `TitleDetails { title, year, original_language, spoken_languages }` (`spoken_languages[].iso_639_1`, lowercased, empties dropped) feeds `build_acquire_request` and the upgrade pass's spoken-language backfill; also exposes `show_status` (Ended/Returning/Other), per-season episode air dates, and season enumeration — feeding the SP2 episode monitor + finish lifecycle.
+Requests are built on `base_url` (default `https://api.themoviedb.org/3`; tests use `with_base_url` / `offline()`, a loopback 404 server, so unit tests never reach TMDB) and paced by a fixed 100 ms interval (`MIN_REQUEST_INTERVAL`).
+`track_search_failures` reports whether a search inside a future failed; `is_well_formed_imdb_id` (`pub(crate)`) also guards the scraper; `error_is_permanent` = a 4xx other than 401, 403 and 429 (a rejected key fails every request until it is fixed, so it counts as transient: the upgrade language backfill defers, `backfill_missing_imdb_ids` stops, and the mirror's IMDB lookup trips its breaker)

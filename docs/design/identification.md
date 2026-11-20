@@ -1,0 +1,25 @@
+# Identification
+
+## Identification scoring
+
+`identification.rs` cleans filenames extensively before TMDB lookup.
+A ` - NN` episode number that ends the name (the anime form `Show - 12 (1080p)`, `Show.Name - 101`, optionally `Ep`-prefixed or `v2`-suffixed, never a 19xx/20xx year, a single digit, or a number followed by a bracketed release year: `Prefix - 21 (2008)` is a numeric film title, kept with its year) and an `Ep01`/`Ep 5` marker end the title, so the episode number never reaches the TMDB query.
+Shows vs. movies are guessed from file structure (`is_show_guess`): an episode marker (SxxEyy, NxM, `Season N`, the trailing ` - NN` / ` - EpNN` episode number `trailing_episode_number` reads, as in `[Group] Show - 12 (1080p).mkv`, …) in any selected file name makes it a show, otherwise more than one selected video of at least 100 MB does, so a sample or extra doesn't count.
+Names are tried in order (`identification_names`): the largest selected video file's name when it names a title of its own (`names_a_title`), else its nearest folder that names one, else the torrent name (`identification_name`, shared with the acquisition title check); then the torrent name; then the file name.
+A file name with no title of its own (`S04E09 - Episode Title.mkv`) is searched last because what `clean_name` leaves of it is the episode title.
+A match cached under the earlier first-name rule stays until its `matches` entry is dropped (the torrent leaves the account).
+A short all-digit title that comes with a release year (`9.2009.1080p.BluRay.mkv`) is searched (`is_generic_title_given_year`), and the short-title rule accepts only an exact title of that year; a bare `1.mkv` stays generic.
+`Series N`, `Staffel N`, `Stagione N`, `Sezon N`, `Seizoen N`, `Temporada N` and `Saison N` open no title, nor does `Season One` (`LEADING_NUMBERING_RE`), and a name that is only `Series N`, `Staffel N` and the like is generic (`GENERIC_RE`).
+The show guess reads a dotted `Season.2` as a marker, and a channel layout glued to its codec (`DD5.1x264`, `vfs::is_channel_layout_codec_at`) as no `NxM` marker.
+The marker check and the choice of the largest file read only the selected files (`served_files`; every file counts while none is selected, e.g. a Real-Debrid torrent waiting for its file selection), because Real-Debrid lists unselected files too and the VFS never shows one, so a partly selected collection is named after the film it serves.
+A cached `matches` entry keeps the identification it was made with.
+The guess helps pick between TMDB's TV and movie results when neither is an exact title-and-year match, and it is the media type of an unidentified torrent (`fallback_metadata`).
+A TMDB search returns a `SearchOutcome` that distinguishes a genuine empty result (a real "no such title") from a **failed** request (`Unavailable` — a transport error, a 429 or 5xx after the retry budget, another 4xx, or an undecodable body).
+During a TMDB outage `identify_name` short-circuits its multi-stage fallback ladder (CamelCase split / prefix strip / after-dash / no-year retry) on the first `Unavailable` rather than re-issuing a full ~2.5-min retry cycle per stage (which would burn ~10 min of doomed retries on one unidentifiable torrent); a genuine empty result still drives the whole ladder.
+`identify_name` returns `Identification::{Identified, NoMatch, Unavailable}`.
+`Unavailable` means a TMDB search failed (an outage past the client's retry budget, or a 4xx such as a rejected API key), whether or not something matched: with one half of the joined TV/movie search missing, or the ladder cut short, the best pick among the remaining results can be an unrelated title, so it is no verdict on the name (the scan loop doesn't cache it and the title check defers instead of rejecting).
+`identify_torrent` skips the torrent-name retry once TMDB is unreachable and returns the name-derived fallback (`external_id: None`); the scan loop detects that outage with `tmdb_client::track_search_failures`.
+A torrent left unidentified because a TMDB search FAILED (`tmdb_client::track_search_failures`) is not cached: the scan loop shows it under its fallback title and identifies it again after 15 minutes (`TMDB_RETRY_AFTER`); a genuine no-match is cached as before.
+Within one scan tick, the first file-less refresh or identification that TMDB leaves unidentified trips a circuit breaker (`resolve_metadata_unless_tmdb_down`, shared by `refresh_fileless_infos` and `identify_new_torrent`): the rest of the tick's refreshes and the batch skip TMDB (an authoritative identification still resolves).
+A skipped torrent of the batch is shown under its previous fallback (or `identification::fallback_metadata`, the title a TMDB no-match yields, so the folder isn't renamed when TMDB answers), a skipped refresh stays out of the VFS, and both are retried after 15 min, so an outage costs one TMDB retry budget per tick, not one per due retry.
+A due retry keeps its fallback in the VFS until its new result replaces it in place.

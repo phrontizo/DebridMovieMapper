@@ -1,0 +1,3 @@
+# `rd_client.rs`
+
+Real-Debrid implementation of `DebridProvider`; shared adaptive rate limiter (250 ms request pacing), 1-hour unrestrict cache; `get_torrents` re-lists (up to `provider::MAX_LISTING_ATTEMPTS` = 3, then `Err`) when one of this process's own deletes may have shifted the pages of a multi-page listing (`provider::DeleteTracker`); the listing carries each torrent id once: `drop_repeated_ids` drops a page-boundary repeat (an add landing between two page fetches of the newest-first listing pushes the previous page's last torrent onto the next page), so a consumer that deletes every id it finds for a hash never deletes one twice
